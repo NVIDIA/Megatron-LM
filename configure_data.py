@@ -46,7 +46,7 @@ def make_data_loader(dataset, batch_size, args):
 
     shuffle = args.shuffle
     if shuffle:
-        sampler = torch.utils.data.RandomSampler(dataset)
+        sampler = data_utils.samplers.RandomSampler(dataset, replacement=True, num_samples=batch_size*args.train_iters)
     else:
         sampler = torch.utils.data.SequentialSampler(dataset)
     world_size = args.world_size
@@ -81,8 +81,10 @@ def make_tfrecord_loaders(args):
                      'max_seq_len': args.seq_length,
                      'max_preds_per_seq': args.max_preds_per_seq,
                      'train': True,
-                     'num_workers': args.num_workers,
-                     'seed': args.seed+args.rank+1}
+                     'num_workers': max(args.num_workers, 1),
+                     'seed': args.seed + args.rank + 1,
+                     'threaded_dl': args.num_workers > 0
+                     }
     train = data_utils.tf_dl.TFRecordDataLoader(args.train_data,
                                                 **data_set_args)
     data_set_args['train'] = False
@@ -140,7 +142,8 @@ def make_loaders(args):
         'vocab_size': args.vocab_size,
         'model_type': args.tokenizer_model_type,
         'cache_dir': args.cache_dir,
-        'max_preds_per_seq': args.max_preds_per_seq}
+        'max_preds_per_seq': args.max_preds_per_seq,
+        'presplit_sentences': args.presplit_sentences}
 
     eval_set_args = copy.copy(data_set_args)
     eval_set_args['split'] = [1.]
@@ -218,7 +221,6 @@ def configure_data():
         'rank': -1,
         'persist_state': 0,
         'lazy': False,
-        'shuffle': False,
         'transpose': False,
         'data_set_type': 'supervised',
         'seq_length': 256,

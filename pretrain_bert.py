@@ -434,6 +434,8 @@ def main():
             train_data.batch_sampler.start_iter = total_iters % len(train_data)
         # For all epochs.
         for epoch in range(start_epoch, args.epochs+1):
+            if args.shuffle:
+                train_data.batch_sampler.sampler.set_epoch(epoch+args.seed)
             timers('epoch time').start()
             iteration, skipped = train_epoch(epoch, model, optimizer,
                                              train_data, lr_scheduler,

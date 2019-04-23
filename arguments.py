@@ -184,6 +184,9 @@ def add_data_args(parser):
 
     group = parser.add_argument_group('data', 'data configurations')
 
+    group.add_argument('--shuffle', action='store_true',
+                       help='Shuffle data. Shuffling is deterministic '
+                       'based on seed and current epoch.')
     group.add_argument('--train-data', nargs='+', required=True,
                        help='Filename (or whitespace separated filenames) '
                        'for training.')
@@ -208,6 +211,9 @@ def add_data_args(parser):
                        help='Use loose json (one json-formatted string per '
                        'newline), instead of tight json (data file is one '
                        'json string)')
+    group.add_argument('--presplit-sentences', action='store_true',
+                       help='Dataset content consists of documents where '
+                       'each document consists of newline separated sentences')
     group.add_argument('--num-workers', type=int, default=2,
                        help="""Number of workers to use for dataloading""")
     group.add_argument('--tokenizer-model-type', type=str,

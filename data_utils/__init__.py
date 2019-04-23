@@ -46,7 +46,7 @@ def get_dataset(path, **kwargs):
     if supported_corpus(path):
         return corpora.NAMED_CORPORA[path](**kwargs)
     ext = get_ext(path)
-    if ext =='.json':
+    if '.json' in ext:
         text = json_dataset(path, **kwargs)
     elif ext in ['.csv', '.tsv']:
         text = csv_dataset(path, **kwargs)
@@ -108,8 +108,10 @@ def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=N
     if should_split(split):
         ds = split_ds(ds, split)
         if ds_type.lower() == 'bert':
-            ds = [bert_sentencepair_dataset(d, max_seq_len=seq_length) for d in ds]
+            presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
+            ds = [bert_sentencepair_dataset(d, max_seq_len=seq_length, presplit_sentences=presplit_sentences) for d in ds]
     else:
         if ds_type.lower() == 'bert':
-            ds = bert_sentencepair_dataset(ds, max_seq_len=seq_length)
+            presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
+            ds = bert_sentencepair_dataset(ds, max_seq_len=seq_length, presplit_sentences=presplit_sentences)
     return ds, tokenizer
