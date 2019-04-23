@@ -449,7 +449,7 @@ class bert_sentencepair_dataset(data.Dataset):
         dataset_size (int): number of random sentencepairs in the dataset. Default: len(ds)*(len(ds)-1)
 
     """
-    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, **kwargs):
+    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, presplit_sentences=False, **kwargs):
         self.ds = ds
         self.ds_len = len(self.ds)
         self.tokenizer = self.ds.GetTokenizer()
@@ -464,6 +464,7 @@ class bert_sentencepair_dataset(data.Dataset):
         self.dataset_size = dataset_size
         if self.dataset_size is None:
             self.dataset_size = self.ds_len * (self.ds_len-1)
+        self.presplit_sentences = presplit_sentences
 
     def __len__(self):
         return self.dataset_size
@@ -494,7 +495,14 @@ class bert_sentencepair_dataset(data.Dataset):
 
     def sentence_split(self, document):
         """split document into sentences"""
-        return tokenize.sent_tokenize(document)
+        lines = document.split('\n')
+        if self.presplit_sentences:
+            return [line for line in lines if line]
+        rtn = []
+        for line in lines:
+            if line != '':
+                rtn.extend(tokenize.sent_tokenize(line))
+        return rtn
 
     def sentence_tokenize(self, sent, sentence_num=0, beginning=False, ending=False):
         """tokenize sentence and get token types"""

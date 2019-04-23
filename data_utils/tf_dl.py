@@ -14,12 +14,16 @@
 # limitations under the License.
 """PyTorch DataLoader for TFRecords"""
 
+import queue
+import threading
+
 import tensorflow as tf
 tf.enable_eager_execution()
 import torch
+import numpy as np
 
 class TFRecordDataLoader(object):
-    def __init__(self, records, batch_size, max_seq_len, max_preds_per_seq, train, num_workers=2, seed=1):
+    def __init__(self, records, batch_size, max_seq_len, max_preds_per_seq, train, num_workers=2, seed=1, threaded_dl=False):
         assert max_preds_per_seq is not None, "--max-preds-per-seq MUST BE SPECIFIED when using tfrecords"
         tf.set_random_seed(seed)
         if isinstance(records, str):
@@ -55,11 +59,18 @@ class TFRecordDataLoader(object):
                        'num_parallel_batches': num_workers,
                        'drop_remainder': train}
         self.dataloader = self.dataset.apply(tf.contrib.data.map_and_batch(self.record_converter, **loader_args))
+        self.threaded_dl = threaded_dl
+        self.num_workers = num_workers
 
     def __iter__(self):
-        data_iter = iter(self.dataloader)
-        for item in data_iter:
-            yield convert_tf_example_to_torch_tensors(item)
+        if self.threaded_dl:
+            data_iter = iter(MultiprocessLoader(self.dataloader, self.num_workers))
+            for item in data_iter:
+                yield item
+        else:
+            data_iter = iter(self.dataloader)
+            for item in data_iter:
+                yield convert_tf_example_to_torch_tensors(item)
 
 class Record2Example(object):
     def __init__(self, feature_map):
@@ -74,14 +85,37 @@ class Record2Example(object):
         return example
 
 def convert_tf_example_to_torch_tensors(example):
-    item = {k: torch.from_numpy(v.numpy()) for k,v in example.items()}
-    mask = torch.zeros_like(item['input_ids'])
-    mask_labels = torch.ones_like(item['input_ids'])*-1
-    for b, row in enumerate(item['masked_lm_positions'].long()):
+    item = {k: (v.numpy()) for k,v in example.items()}
+    mask = np.zeros_like(item['input_ids'])
+    mask_labels = np.ones_like(item['input_ids'])*-1
+    for b, row in enumerate(item['masked_lm_positions'].astype(int)):
         for i, idx in enumerate(row):
             if item['masked_lm_weights'][b, i] != 0:
                 mask[b, idx] = 1
                 mask_labels[b, idx] = item['masked_lm_ids'][b, i]
-    return {'text': item['input_ids'], 'types': item['segment_ids'],'is_random': item['next_sentence_labels'],
-            'pad_mask': 1-item['input_mask'], 'mask': mask, 'mask_labels': mask_labels}  
+    output = {'text': item['input_ids'], 'types': item['segment_ids'],'is_random': item['next_sentence_labels'],
+            'pad_mask': 1-item['input_mask'], 'mask': mask, 'mask_labels': mask_labels}
+    return {k: torch.from_numpy(v) for k,v in output.items()}
 
+class MultiprocessLoader(object):
+    def __init__(self, dataloader, num_workers=2):
+        self.dl = dataloader
+        self.queue_size = 2*num_workers
+
+    def __iter__(self):
+        output_queue = queue.Queue(self.queue_size)
+        output_thread = threading.Thread(target=_multiproc_iter,
+                                         args=(self.dl, output_queue))
+        output_thread.daemon = True
+        output_thread.start()
+
+        while output_thread.is_alive():
+            yield output_queue.get(block=True)
+        else:
+            print(RuntimeError('TF record data loader thread exited unexpectedly'))
+
+def _multiproc_iter(dl, output_queue):
+    data_iter = iter(dl)
+    for item in data_iter:
+        tensors = convert_tf_example_to_torch_tensors(item)
+        output_queue.put(tensors, block=True)
