@@ -10,6 +10,7 @@ python pretrain_bert.py \
     --tokenizer-model-type bert-large-uncased \
     --vocab-size 30522 \
     --train-data wikipedia \
+    --presplit-sentences \
     --loose-json \
     --text-key text \
     --split 1000,1,1 \
