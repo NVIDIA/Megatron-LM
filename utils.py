@@ -149,7 +149,7 @@ def save_checkpoint(model_suffix, epoch, i, model, optimizer, lr_scheduler, args
                  np.random.get_state(),
                  random.getstate())
     if not (torch.distributed.is_initialized() and \
-            torch.distributed.get_rank() > 1):
+            torch.distributed.get_rank() > 0):
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
         total_iters = args.train_iters * (epoch-1) + i
