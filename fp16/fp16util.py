@@ -18,6 +18,8 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+import mpu
+
 
 class tofp16(nn.Module):
     """
@@ -194,7 +196,9 @@ def to_python_float(t):
 
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
-if TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
-    clip_grad_norm = torch.nn.utils.clip_grad_norm
-else:
-    clip_grad_norm = torch.nn.utils.clip_grad_norm_
+
+clip_grad_norm = mpu.clip_grad_norm
+#elif TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
+#    clip_grad_norm = torch.nn.utils.clip_grad_norm
+#else:
+#    clip_grad_norm = torch.nn.utils.clip_grad_norm_

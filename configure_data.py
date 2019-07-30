@@ -19,6 +19,7 @@ import copy
 import torch
 import data_utils
 
+import mpu
 
 class DataConfig:
 
@@ -27,7 +28,8 @@ class DataConfig:
         self.defaults = defaults
 
     def apply(self, args):
-        print('configuring data')
+        if torch.distributed.get_rank() == 0:
+            print('configuring data')
         self.apply_defaults(args)
         return make_loaders(args)
 
@@ -49,8 +51,9 @@ def make_data_loader(dataset, batch_size, args):
         sampler = data_utils.samplers.RandomSampler(dataset, replacement=True, num_samples=batch_size*args.train_iters)
     else:
         sampler = torch.utils.data.SequentialSampler(dataset)
-    world_size = args.world_size
-    rank = args.rank
+    world_size = torch.distributed.get_world_size(
+        group=mpu.get_data_parallel_group())
+    rank = torch.distributed.get_rank(group=mpu.get_data_parallel_group())
     distributed = world_size > 1
     drop_last = distributed
 
@@ -76,7 +79,7 @@ def make_data_loader(dataset, batch_size, args):
 def make_tfrecord_loaders(args):
     """Load train/val/test dataset from shuffled TFRecords"""
 
-    import data_utils.tf_dl 
+    import data_utils.tf_dl
     data_set_args = {'batch_size': args.batch_size,
                      'max_seq_len': args.seq_length,
                      'max_preds_per_seq': args.max_preds_per_seq,
@@ -115,16 +118,18 @@ def make_loaders(args):
 
     if args.use_tfrecords:
         return make_tfrecord_loaders(args)
-    batch_size = args.batch_size * args.world_size
+    world_size = torch.distributed.get_world_size(
+        group=mpu.get_data_parallel_group())
+    batch_size = args.batch_size * world_size
     eval_batch_size = batch_size
     if args.eval_batch_size is not None:
-        eval_batch_size = args.eval_batch_size * args.world_size
+        eval_batch_size = args.eval_batch_size * world_size
     seq_length = args.seq_length
     if seq_length < 0:
-        seq_length = seq_length * args.world_size
+        seq_length = seq_length * world_size
     eval_seq_length = args.eval_seq_length
     if eval_seq_length is not None and eval_seq_length < 0:
-        eval_seq_length = eval_seq_length * args.world_size
+        eval_seq_length = eval_seq_length * world_size
     split = get_split(args)
     data_set_args = {
         'path': args.train_data,
@@ -165,24 +170,34 @@ def make_loaders(args):
         train, tokenizer = data_utils.make_dataset(**data_set_args)
         if data_utils.should_split(split):
             train, valid, test = train
-    eval_set_args['tokenizer'] = tokenizer
+        eval_set_args['tokenizer'] = tokenizer
 
     # make training and val dataset if necessary
     if valid is None and args.valid_data is not None:
         eval_set_args['path'] = args.valid_data
-        valid, _ = data_utils.make_dataset(**eval_set_args)
+        valid, tokenizer = data_utils.make_dataset(**eval_set_args)
+        eval_set_args['tokenizer'] = tokenizer
     if test is None and args.test_data is not None:
         eval_set_args['path'] = args.test_data
-        test, _ = data_utils.make_dataset(**eval_set_args)
+        test, tokenizer = data_utils.make_dataset(**eval_set_args)
 
     # wrap datasets with data loader
     if train is not None and args.batch_size > 0:
         train = make_data_loader(train, batch_size, args)
+        args.do_train = True
+    else:
+        args.do_train = False
     eval_batch_size = eval_batch_size if eval_batch_size != 0 else batch_size
     if valid is not None:
         valid = make_data_loader(valid, eval_batch_size, args)
+        args.do_valid = True
+    else:
+        args.do_valid = False
     if test is not None:
         test = make_data_loader(test, eval_batch_size, args)
+        args.do_test = True
+    else:
+        args.do_test = False
 
     return (train, valid, test), tokenizer
 

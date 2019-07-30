@@ -17,13 +17,16 @@ from collections import namedtuple
 import random
 import os
 import csv
+import torch
 
 import nltk
-nltk.download('punkt')
 from nltk import tokenize as nltk_tokenize
 import sentencepiece as spm
 
 from .wordpiece import BertTokenizer, PRETRAINED_VOCAB_ARCHIVE_MAP
+
+from .tokenization_gpt2 import GPT2Tokenizer
+import regex as re
 
 def make_tokenizer(tokenizer_type, corpus, model_path=None, vocab_size=None, model_type='bpe', pad_token=0, character_coverage=1.0, command_tokens=None, type_tokens=None, **kwargs):
     """
@@ -34,6 +37,8 @@ def make_tokenizer(tokenizer_type, corpus, model_path=None, vocab_size=None, mod
         tokenizer_class = eval(tokenizer_class)
     if tokenizer_class is BertWordPieceTokenizer:
         return BertWordPieceTokenizer(model_type, **kwargs)
+    elif tokenizer_class is GPT2BPETokenizer:
+        return GPT2BPETokenizer(**kwargs)
     text_tokenizer =  tokenizer_class(corpus=corpus, vocab_size=vocab_size, model_path=model_path, model_type=model_type,
                                       pad_token=pad_token, character_coverage=character_coverage)
     return Tokenizer(text_tokenizer, command_tokens, type_tokens)
@@ -84,11 +89,11 @@ class Tokenization(object):
         if isinstance(other, (CommandToken, TypeToken)):
             self.tokenization.insert(idx, other.Id)
             if idx == 0:
-                self.text.insert(0, other.token)
-                self.original_text.insert(0, other.token)
+                self.text = other.token + self.text
+                self.original_text = other.token + self.original_text
             elif idx == len(self.tokenization)-1:
-                self.text.insert(-1, other.token)
-                self.original_text.insert(-1, other.token)
+                self.text += other.token
+                self.original_text += other.token
         elif isinstance(other, Tokenization):
             self.tokenization = self.tokenization[:idx] + other.tokenization + self.tokenization[idx:]
         else:
@@ -97,8 +102,8 @@ class Tokenization(object):
     def append(self, other):
         if isinstance(other, (CommandToken, TypeToken)):
             self.tokenization.append(other.Id)
-            self.text.append(other.token)
-            self.original_text.append(other.token)
+            self.text += other.token
+            self.original_text += other.token
         elif isinstance(other, Tokenization):
             self.tokenization.extend(other.tokenization)
             self.text += other.text
@@ -110,8 +115,8 @@ class Tokenization(object):
     def extend(self, other):
         if isinstance(other, (CommandToken, TypeToken)):
             self.tokenization.append(other.Id)
-            self.text.append(other.token)
-            self.original_text.append(other.token)
+            self.text += other.token
+            self.original_text += other.token
         elif isinstance(other, list) and isinstance(other[0], (CommandToken, TypeToken)):
             self.tokenization.extend([o.Id for o in other])
             self.text += [o.token for o in other]
@@ -522,6 +527,7 @@ def get_corpus_freq(dataset, filepath, filetype='tsv'):
     Write frequencies to `filepath` as a tsv. Only write the first
     MAX_SENTENCEPIECE_SENTENCES most common words to the file.
     """
+    nltk.download('punkt', download_dir="./nltk")
     if filetype == 'tsv':
         delimiter = '\t'
     else:
@@ -687,10 +693,12 @@ class BertWordPieceTokenizer(Tokenizer):
         # default to bert-large-uncased tokenizer
         if tokenizer_model_type not in PRETRAINED_VOCAB_ARCHIVE_MAP:
             tokenizer_model_type = 'bert-large-uncased'
-        print('loading BertWordPieceTokenizer (', tokenizer_model_type, ') from cache_dir ', cache_dir)
+        if torch.distributed.get_rank() == 0:
+            print('loading BertWordPieceTokenizer (', tokenizer_model_type, ') from cache_dir ', cache_dir)
         do_lower_case = not ('-cased' in tokenizer_model_type or 'chinese' in tokenizer_model_type)
         self.text_tokenizer = BertTokenizer.from_pretrained(tokenizer_model_type, do_lower_case=do_lower_case, cache_dir=cache_dir)
-        print('loaded', tokenizer_model_type)
+        if torch.distributed.get_rank() == 0:
+            print('loaded', tokenizer_model_type)
         # disable max len warnings by increasing max len
         self.text_tokenizer.max_len = int(1e12)
 
@@ -786,3 +794,97 @@ class BertWordPieceTokenizer(Tokenizer):
         if isinstance(Tokens, Tokenization):
             Tokens = Tokens.tokenization
         return ' '.join(Tokens)
+
+
+class GPT2BPETokenizer(Tokenizer):
+    def __init__(self, cache_dir=None, **kwargs):
+        self.text_tokenizer = GPT2Tokenizer.from_pretrained('gpt2',
+                                                            cache_dir=cache_dir)
+
+        #disable max len warnings by increasing max len
+        self.text_tokenizer.max_len = int(1e12)
+        self.num_command_tokens = 2
+        self.num_tokens = len(self.text_tokenizer.encoder)
+        self.num_text_tokens = self.num_tokens-1
+        self.num_type_tokens = 2
+
+        self._command_tokens = [
+            CommandToken('pad', '<|endoftext|>', self.text_tokenizer.encoder['<|endoftext|>']),
+            CommandToken('eos', '<|endoftext|>', self.text_tokenizer.encoder['<|endoftext|>']),
+        ]
+        self.command_name_map = {tok.name: tok for tok in self._command_tokens}
+        self.command_token_map = {tok.token: tok for tok in self._command_tokens}
+        self.command_id_map = {tok.Id: tok for tok in self._command_tokens}
+
+        self.type_tokens = [
+            TypeToken('str0', '<str0>', 0),
+            TypeToken('str1', '<str1>', 1),
+        ]
+        self.type_name_map = {tok.name: tok for tok in self.type_tokens}
+        self.type_token_map = {tok.token: tok for tok in self.type_tokens}
+        self.type_id_map = {tok.Id: tok for tok in self.type_tokens}
+
+        self._tokens = list(self.text_tokenizer.encoder.keys())
+        self._vocab = {k:v for k,v in self.text_tokenizer.encoder.items()}
+
+        self._text_tokens = list(self._tokens)
+        self._text_token_vocab = {k:v for k,v in self.text_tokenizer.encoder.items()}
+
+        self._command_token_tokens = list(self.command_token_map.keys())
+        self._command_token_vocab = {t:Id for Id,t in self.command_id_map.items()}
+
+        self._token_types = list(self.type_token_map.keys())
+        self._token_type_vocab = {t:Id for Id, t in self.type_id_map.items()}
+
+    def EncodeAsIds(self, text, process_fn=None):
+        processed_text = text
+        if process_fn is not None:
+            processed_text = process_fn(processed_text)
+        Ids = self.text_tokenizer.encode(processed_text)
+        #return Tokenization(Ids, processed_text, text)
+        tokenization = Tokenization(Ids, processed_text, text)
+        tokenization.set_command_tokens(self._command_tokens)
+        return tokenization
+
+
+    def EncodeAsTokens(self, text, process_fn=None):
+        processed_text = text
+        if process_fn is not None:
+            processed_text = process_fn(processed_text)
+        tokens = []
+        for token in re.findall(self.text_tokenizer.pat, processed_text):
+            token = ''.join(self.text_tokenizer.bye_encoder[b] for b in token.encode('utf-8'))
+            tokens.extend(bpe_token for bpe_token in self.text_tokenizer.bpe(token).split(' '))
+        tokenization=Tokenization(tokens, processed_text, text, asIds=False)
+        tokenization.set_command_tokens(self._command_tokens)
+        return tokenization
+        #return Tokenization(tokens, processed_text, text, asIds=False)
+
+    def IdToToken(self, Id, type_token=False):
+        if isinstance(Id, (TypeToken, CommandToken)):
+            return Id.token
+        if type_token:
+            return self.type_id_map[Id].token
+        return self.text_tokenizer.decoder[Id]
+
+    def TokenToId(self, token, type_token=False):
+        if isinstance(token, (TypeToken, CommandToken)):
+            return token.Id
+        if type_token:
+            return self.type_token_map[token].Id
+        return self.text_tokenizer.encoder[token]
+
+    def DecodeIds(self, Ids, type_token=False):
+        if type_token:
+            return ' '.join(Id.token if isinstance(Id, TypeToken) else self.type_id_map[Id].token for Id in Ids)
+        if isinstance(Ids, Tokenization):
+            Ids = Ids.tokenization
+        return self.text_tokenizer.decode(Ids)
+
+    def DecodeTokens(self, Tokens, type_token=False):
+        if type_token:
+            return ' '.join(t.token if isinstance(t, TypeToken) else t for t in Tokens)
+        if isinstance(Tokens, Tokenization):
+            Tokens = Tokens.tokenization
+        return self.text_tokenizer.decode([self.TokenToId(tok) for tok in Tokens])
+

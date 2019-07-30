@@ -18,14 +18,14 @@
 import torch
 
 from .modeling import BertConfig
-from .modeling import BertForPreTraining
+from .modeling import BertForPreTraining, BertForMaskedLM
 from .modeling import BertLayerNorm
 
 
 def get_params_for_weight_decay_optimization(module):
 
     weight_decay_params = {'params': []}
-    no_weight_decay_params = {'params': [], 'weight_decay': 0}
+    no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
     for module_ in module.modules():
         if isinstance(module_, (BertLayerNorm, torch.nn.LayerNorm)):
             no_weight_decay_params['params'].extend(
@@ -44,7 +44,7 @@ def get_params_for_weight_decay_optimization(module):
 
 class BertModel(torch.nn.Module):
 
-    def __init__(self, tokenizer, args):
+    def __init__(self, args):
         super(BertModel, self).__init__()
         if args.pretrained_bert:
             self.model = BertForPreTraining.from_pretrained(
@@ -59,7 +59,7 @@ class BertModel(torch.nn.Module):
             else:
                 intermediate_size = args.intermediate_size
             self.config = BertConfig(
-                tokenizer.num_tokens,
+                args.tokenizer_num_tokens,
                 hidden_size=args.hidden_size,
                 num_hidden_layers=args.num_layers,
                 num_attention_heads=args.num_attention_heads,
@@ -67,11 +67,12 @@ class BertModel(torch.nn.Module):
                 hidden_dropout_prob=args.hidden_dropout,
                 attention_probs_dropout_prob=args.attention_dropout,
                 max_position_embeddings=args.max_position_embeddings,
-                type_vocab_size=tokenizer.num_type_tokens,
+                type_vocab_size=args.tokenizer_num_type_tokens,
                 fp32_layernorm=args.fp32_layernorm,
                 fp32_embedding=args.fp32_embedding,
                 fp32_tokentypes=args.fp32_tokentypes,
-                layernorm_epsilon=args.layernorm_epsilon)
+                layernorm_epsilon=args.layernorm_epsilon,
+                deep_init=args.deep_init)
             self.model = BertForPreTraining(self.config)
 
     def forward(self, input_tokens, token_type_ids=None,
@@ -86,3 +87,4 @@ class BertModel(torch.nn.Module):
 
     def load_state_dict(self, state_dict, strict=True):
         return self.model.load_state_dict(state_dict, strict=strict)
+

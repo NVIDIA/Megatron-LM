@@ -18,9 +18,9 @@ import mmap
 import pickle as pkl
 import time
 from itertools import accumulate
-from threading import Lock
 
 import torch
+from torch.multiprocessing import Lock
 
 def get_lazy_path(path):
     """
@@ -187,7 +187,7 @@ class lazy_array_loader(object):
         self.read_lock.release()
         #TODO: @raulp figure out mem map byte string bug
         #if mem map'd need to decode byte string to string
-        rtn = rtn.decode('utf-8')
+        rtn = rtn.decode('utf-8', 'ignore')
         # rtn = str(rtn)
         if self.mem_map:
             rtn = rtn.decode('unicode_escape')

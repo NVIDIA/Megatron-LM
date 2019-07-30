@@ -4,35 +4,32 @@ RANK=0
 WORLD_SIZE=1
 
 python pretrain_bert.py \
-    --batch-size 4 \
-    --tokenizer-type SentencePieceTokenizer \
-    --tokenizer-model-type bpe \
-    --tokenizer-path tokenizer.model \
-    --vocab-size 30522 \
-    --train-data wikipedia \
-    --presplit-sentences \
-    --loose-json \
-    --text-key text \
-    --split 1000,1,1 \
-    --lazy-loader \
-    --max-preds-per-seq 80 \
-    --seq-length 512 \
-    --max-position-embeddings 512 \
-    --num-layers 24 \
-    --hidden-size 1024 \
-    --intermediate-size 4096 \
-    --num-attention-heads 16 \
-    --hidden-dropout 0.1 \
-    --attention-dropout 0.1 \
-    --train-iters 1000000 \
-    --lr 0.0001 \
-    --lr-decay-style linear \
-    --lr-decay-iters 990000 \
-    --warmup .01 \
-    --weight-decay 1e-2 \
-    --clip-grad 1.0 \
-    --fp16 \
-    --fp32-layernorm \
-    --fp32-embedding \
-    --hysteresis 2 \
-    --num-workers 2
+       --num-layers 24 \
+       --hidden-size 1024 \
+       --num-attention-heads 16 \
+       --batch-size 4 \
+       --seq-length 512 \
+       --max-preds-per-seq 80 \
+       --max-position-embeddings 512 \
+       --train-iters 1000000 \
+       --save checkpoints/bert_345m \
+       --load checkpoints/bert_345m \
+       --resume-dataloader \
+       --train-data wikipedia \
+       --lazy-loader \
+       --tokenizer-type SentencePieceTokenizer \
+       --tokenizer-model-type bpe \
+       --tokenizer-path tokenizer.model \
+       --presplit-sentences \
+       --cache-dir cache \
+       --split 949,50,1 \
+       --distributed-backend nccl \
+       --lr 0.0001 \
+       --lr-decay-style linear \
+       --lr-decay-iters 990000 \
+       --weight-decay 1e-2 \
+       --clip-grad 1.0 \
+       --warmup .01 \
+       --fp16 \
+       --fp32-layernorm \
+       --fp32-embedding

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import torch
+import mpu
 
 # item() is a recent addition, so this helps with backward compatibility.
 def to_python_float(t):
@@ -103,12 +104,24 @@ class DynamicLossScaler:
         self.consecutive_hysteresis = consecutive_hysteresis
 
     # `params` is a list / generator of torch.Variable
-    def has_overflow(self, params):
+    def has_overflow_serial(self, params):
         for p in params:
             if p.grad is not None and DynamicLossScaler._has_inf_or_nan(p.grad.data):
                 return True
 
         return False
+
+    def has_overflow(self, params):
+        overflow = self.has_overflow_serial(params)
+        # Since each model parallel GPU carries only part of the model,
+        # make sure overflow flag is synced across all the model parallel GPUs
+        overflow_gpu = torch.cuda.ByteTensor([overflow])
+        torch.distributed.all_reduce(overflow_gpu,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=mpu.get_model_parallel_group())
+        overflow = overflow_gpu[0].item()
+        return bool(overflow)
+
 
     # `x` is a torch.Tensor
     def _has_inf_or_nan(x):
@@ -133,6 +146,7 @@ class DynamicLossScaler:
 
     # `overflow` is boolean indicating whether the gradient overflowed
     def update_scale(self, overflow):
+
         if not hasattr(self, 'min_scale'):
             self.min_scale = 1
         if not hasattr(self, 'delayed_shift'):

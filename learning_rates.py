@@ -14,6 +14,7 @@
 # limitations under the License.
 """PyTorch DataLoader for TFRecords"""
 
+import torch
 from torch.optim.lr_scheduler import _LRScheduler
 import math
 
@@ -30,7 +31,8 @@ class AnnealingLR(_LRScheduler):
         self.end_iter = num_iters
         self.decay_style = decay_style.lower() if isinstance(decay_style, str) else None
         self.step(self.num_iters)
-        print('learning rate decaying', decay_style)
+        if torch.distributed.get_rank() == 0:
+            print('learning rate decaying', decay_style)
 
     def get_lr(self):
         # https://openreview.net/pdf?id=BJYwwY9ll pg. 4

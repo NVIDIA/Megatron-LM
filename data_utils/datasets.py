@@ -22,13 +22,13 @@ import json
 import csv
 import math
 import random
+from itertools import accumulate
 
 from torch.utils import data
 import pandas as pd
 import numpy as np
 
 import nltk
-nltk.download('punkt')
 from nltk import tokenize
 
 from .lazy_loader import lazy_array_loader, exists_lazy, make_lazy
@@ -57,9 +57,11 @@ class ConcatDataset(data.Dataset):
         super(ConcatDataset, self).__init__()
         assert len(datasets) > 0, 'datasets should not be an empty iterable'
         self.datasets = list(datasets)
+        self.is_lazy = sum([isinstance(ds, lazy_array_loader) for ds in self.datasets]) == len(self.datasets)
         self.cumulative_sizes = self.cumsum(self.datasets)
         self._X = None
         self._Y = None
+        self._lens = None
 
     def SetTokenizer(self, tokenizer):
         for ds in self.datasets:
@@ -78,6 +80,18 @@ class ConcatDataset(data.Dataset):
         else:
             sample_idx = idx - self.cumulative_sizes[dataset_idx - 1]
         return self.datasets[dataset_idx][sample_idx]
+
+    @property
+    def lens(self):
+        if self._lens is None:
+            self._lens = []
+            if self.is_lazy:
+                for data in self.datasets:
+                    self._lens.extend(data.lens)
+            else:
+                for data in self.datasets:
+                    self._lens.extend([len(d['text']) if isinstance(d, dict) else len(d) for d in data])
+        return self._lens
 
     @property
     def X(self):
@@ -115,7 +129,7 @@ class SplitDataset(data.Dataset):
     def __init__(self, ds, split_inds, **kwargs):
         self.split_inds = list(split_inds)
         self.wrapped_data = ds
-        self.is_lazy = isinstance(ds, lazy_array_loader)
+        self.is_lazy = isinstance(ds, lazy_array_loader) or (hasattr(ds, 'is_lazy') and ds.is_lazy)
         if self.is_lazy:
             self.lens = itemgetter(*self.split_inds)(list(self.wrapped_data.lens))
         self._X = None
@@ -203,6 +217,7 @@ class csv_dataset(data.Dataset):
     def __init__(self, path, tokenizer=None, preprocess_fn=None, delim=',',
                 binarize_sent=False, drop_unlabeled=False, text_key='sentence', label_key='label',
                 **kwargs):
+        self.is_lazy = False
         self.preprocess_fn = preprocess_fn
         self.SetTokenizer(tokenizer)
         self.path = path
@@ -314,6 +329,7 @@ class json_dataset(data.Dataset):
     """
     def __init__(self, path, tokenizer=None, preprocess_fn=None, binarize_sent=False,
                 text_key='sentence', label_key='label', loose_json=False, **kwargs):
+        self.is_lazy = False
         self.preprocess_fn = preprocess_fn
         self.path = path
         self.SetTokenizer(tokenizer)
@@ -437,6 +453,117 @@ class json_dataset(data.Dataset):
                 j[self.label_key] = -1
             yield j
 
+class GPT2Dataset(data.Dataset):
+
+    def __init__(self, ds,
+                 max_seq_len=1024,
+                 num_samples=None,
+                 weighted=True,
+                 sample_across_doc=True,
+                 random_across_doc_sampling=True,
+                 sentence_start=False, **kwargs):
+        self.ds = ds
+        self.ds_len = len(self.ds)
+        self.num_samples = num_samples
+        if num_samples is None:
+            self.num_samples = 1000 * self.ds_len
+        self.max_seq_len = max_seq_len
+        self.tokenizer = self.ds.GetTokenizer()
+        self.ds.SetTokenizer(None)
+        self.weighted = weighted
+        self.sample_across_doc = sample_across_doc
+        self.random_across_doc_sampling = random_across_doc_sampling
+        self.sentence_start = sentence_start
+        self.init_weighting()
+
+    def init_weighting(self):
+        if self.weighted:
+            if hasattr(self.ds, 'is_lazy') and self.ds.is_lazy:
+                lens = np.array(self.ds.lens)
+            else:
+                lens = np.array([len(d['text']) if isinstance(d, dict)
+                                 else len(d) for d in self.ds])
+            self.total_len = np.sum(lens)
+            self.weighting = list(accumulate(lens))
+        else:
+            self.weighting = None
+
+    def get_weighted_samples(self, np_rng):
+        if self.weighting is not None:
+            idx = np_rng.randint(self.total_len)
+            return bisect_right(self.weighting, idx)
+        else:
+            return np_rng.randint(self.ds_len)
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # init rng
+        rng = random.Random(idx)
+        rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
+
+        # get possibly weighted random index from dataset
+        data_idx = self.get_weighted_samples(rng)
+#        data_idx = rng.choice(self.ds_len, p=self.weighting)
+        tokens = self.getidx(data_idx)
+
+        # truncate or pad tokens
+        num_tokens = len(tokens)
+        tokens_to_strip = num_tokens - self.max_seq_len - 1
+        if tokens_to_strip > 0:
+            strip_left_tokens = rng.randint(tokens_to_strip + 1)
+            tokens = tokens[strip_left_tokens:]
+            if self.sentence_start:
+                token_copy = list(tokens)
+                not_done = True
+                while (len(token_copy) > 0) and not_done:
+                    tok = token_copy.pop(0)
+                    if self.contains_sentence_end(tok):
+                        tokens = token_copy
+                        not_done = False
+            strip_right_rokens = len(tokens) - self.max_seq_len - 1
+            if strip_right_rokens > 0:
+                tokens = tokens[:-strip_right_rokens]
+
+        if self.sample_across_doc:
+            while (len(tokens) < (self.max_seq_len + 1)):
+                if self.random_across_doc_sampling:
+                    data_idx = self.get_weighted_samples(rng)
+                else:
+                    data_idx = (data_idx + 1) % self.ds_len
+                tokens += self.getidx(data_idx)
+            tokens = tokens[:(self.max_seq_len+1)]
+
+        tokens = self.pad_seq(tokens)
+        return {'text': np.array(tokens),}
+
+    def getidx(self, data_idx):
+        data = self.ds[data_idx]
+        if isinstance(data, dict):
+            data = data['text']
+        # tokenize
+        tokenization = self.tokenizer.EncodeAsIds(data)
+        tokenization.append(self.tokenizer.get_command('eos'))
+        tokens = tokenization.tokenization
+        return tokens
+
+    def pad_seq(self, seq):
+        total_tokens = self.max_seq_len + 1
+        num_pad_tokens = max(0, total_tokens - len(seq))
+        seq += [self.tokenizer.get_command('pad').Id]*(num_pad_tokens)
+        return seq
+
+    def contains_sentence_end(self, tok):
+        tok = self.tokenizer.IdToToken(tok)
+        if '.' in tok:
+            return True
+        if '?' in tok:
+            return True
+        if '!' in tok:
+            return True
+        return False
+
 class bert_sentencepair_dataset(data.Dataset):
     """
     Dataset containing sentencepairs for BERT training. Each index corresponds to a randomly generated sentence pair.
@@ -449,7 +576,7 @@ class bert_sentencepair_dataset(data.Dataset):
         dataset_size (int): number of random sentencepairs in the dataset. Default: len(ds)*(len(ds)-1)
 
     """
-    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, presplit_sentences=False, **kwargs):
+    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, presplit_sentences=False, weighted=True,**kwargs):
         self.ds = ds
         self.ds_len = len(self.ds)
         self.tokenizer = self.ds.GetTokenizer()
@@ -465,6 +592,28 @@ class bert_sentencepair_dataset(data.Dataset):
         if self.dataset_size is None:
             self.dataset_size = self.ds_len * (self.ds_len-1)
         self.presplit_sentences = presplit_sentences
+        if not self.presplit_sentences:
+            nltk.download('punkt', download_dir="./nltk")
+        self.weighted = weighted
+        self.get_weighting()
+
+    def get_weighting(self):
+        if self.weighted:
+            if hasattr(self.ds, 'is_lazy') and self.ds.is_lazy:
+                lens = np.array(self.ds.lens)
+            else:
+                lens = np.array([len(d['text']) if isinstance(d, dict) else len(d) for d in self.ds])
+            self.total_len = np.sum(lens)
+            self.weighting = list(accumulate(lens))
+        else:
+            self.weighting = None
+
+    def get_weighted_samples(self, np_rng):
+        if self.weighting is not None:
+            idx = np_rng.randint(self.total_len)
+            return bisect_right(self.weighting, idx)
+        else:
+            return np_rng.randint(self.ds_len)
 
     def __len__(self):
         return self.dataset_size
@@ -472,20 +621,23 @@ class bert_sentencepair_dataset(data.Dataset):
     def __getitem__(self, idx):
         # get rng state corresponding to index (allows deterministic random pair)
         rng = random.Random(idx)
+        np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
         # get seq length
         target_seq_length = self.max_seq_len
         short_seq = False
         if rng.random() < self.short_seq_prob:
             target_seq_length = rng.randint(2, target_seq_length)
             short_seq = True
+
         # get sentence pair and label
         is_random_next = None
         lena = 0
         lenb = 0
         while (is_random_next is None) or (lena < 1) or (lenb < 1):
-            tokensa, tokensb, is_random_next = self.create_random_sentencepair(target_seq_length, rng)
+            tokensa, tokensb, is_random_next = self.create_random_sentencepair(target_seq_length, rng, np_rng)
             lena = len(tokensa[0])
             lenb = len(tokensb[0])
+
         # truncate sentence pair to max_seq_len
         tokensa, tokensb = self.truncate_seq_pair(tokensa, tokensb, self.max_seq_len, rng)
         # join sentence pair, mask, and pad
@@ -518,7 +670,7 @@ class bert_sentencepair_dataset(data.Dataset):
             rtn = rtn['text']
         return rtn
 
-    def create_random_sentencepair(self, target_seq_length, rng):
+    def create_random_sentencepair(self, target_seq_length, rng, np_rng):
         """
         fetches a random sentencepair corresponding to rng state similar to
         https://github.com/google-research/bert/blob/master/create_pretraining_data.py#L248-L294
@@ -533,7 +685,11 @@ class bert_sentencepair_dataset(data.Dataset):
             curr_len = 0
             doc_a = None
             while doc_a is None:
-                doc_a_idx = rng.randint(0, self.ds_len-1)
+                if self.weighted:
+                    # doc_a_idx = np_rng.choice(self.ds_len, p=self.weighting)
+                    doc_a_idx = self.get_weighted_samples(np_rng)
+                else:
+                    doc_a_idx = rng.randint(0, self.ds_len-1)
                 doc_a = self.sentence_split(self.get_doc(doc_a_idx))
                 if not doc_a:
                     doc_a = None

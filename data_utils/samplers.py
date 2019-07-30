@@ -81,6 +81,7 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
     def __init__(self, sampler, batch_size, drop_last, rank=-1, world_size=2, wrap_last=False):
         super(DistributedBatchSampler, self).__init__(sampler, batch_size, drop_last)
         if rank == -1:
+            assert False, 'should not be here'
             rank = torch.distributed.get_rank()
         self.rank = rank
         self.world_size = world_size

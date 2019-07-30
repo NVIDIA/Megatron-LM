@@ -32,9 +32,25 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
-from torch.utils.checkpoint import checkpoint
+#from torch.utils.checkpoint import checkpoint
 
 from data_utils.file_utils import cached_path
+
+import mpu
+
+
+def normal_init_method(mean, std):
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=mean, std=std)
+    return init_
+
+def scaled_init_method(mean, std, num_layers):
+    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
+    std = std / math.sqrt(2.0 * num_layers)
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=mean, std=std)
+
+    return init_
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +157,7 @@ class BertConfig(object):
                  max_position_embeddings=512,
                  type_vocab_size=2,
                  initializer_range=0.02,
+                 deep_init=False,
                  fp32_layernorm=False,
                  fp32_embedding=False,
                  fp32_tokentypes=False,
@@ -186,6 +203,7 @@ class BertConfig(object):
             self.max_position_embeddings = max_position_embeddings
             self.type_vocab_size = type_vocab_size
             self.initializer_range = initializer_range
+            self.deep_init = deep_init
             self.fp32_layernorm = fp32_layernorm
             self.fp32_embedding = fp32_embedding
             self.layernorm_epsilon = layernorm_epsilon
@@ -221,46 +239,35 @@ class BertConfig(object):
         """Serializes this instance to a JSON string."""
         return json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n"
 
-# try:
-#     from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
-# except ImportError:
-#     print("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex.")
-#     class BertLayerNorm(nn.Module):
-#         def __init__(self, hidden_size, eps=1e-12):
-#             """Construct a layernorm module in the TF style (epsilon inside the square root).
-#             """
-#             super(BertLayerNorm, self).__init__()
-#             self.weight = nn.Parameter(torch.ones(hidden_size))
-#             self.bias = nn.Parameter(torch.zeros(hidden_size))
-#             self.variance_epsilon = eps
+try:
+    from apex.normalization.fused_layer_norm import FusedLayerNorm as BertLayerNorm
+except ImportError:
+    print("Better speed can be achieved with apex installed from https://www.github.com/nvidia/apex.")
+    class BertLayerNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-12):
+            """Construct a layernorm module in the TF style (epsilon inside the square root).
+            """
+            super(BertLayerNorm, self).__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.bias = nn.Parameter(torch.zeros(hidden_size))
+            self.variance_epsilon = eps
 
-#         def forward(self, x):
-#             u = x.mean(-1, keepdim=True)
-#             s = (x - u).pow(2).mean(-1, keepdim=True)
-#             x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-#             return self.weight * x + self.bias
-
-class BertLayerNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-12):
-        """Construct a layernorm module in the TF style (epsilon inside the square root).
-        """
-        super(BertLayerNorm, self).__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.bias = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, x):
-        u = x.mean(-1, keepdim=True)
-        s = (x - u).pow(2).mean(-1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.variance_epsilon)
-        return self.weight * x + self.bias
+        def forward(self, x):
+            u = x.mean(-1, keepdim=True)
+            s = (x - u).pow(2).mean(-1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.variance_epsilon)
+            return self.weight * x + self.bias
 
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
     """
     def __init__(self, config):
         super(BertEmbeddings, self).__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        #self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.word_embeddings = mpu.VocabParallelEmbedding(
+            config.vocab_size, config.hidden_size,
+            init_method=normal_init_method(mean=0.0,
+                                           std=config.initializer_range))
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
@@ -369,7 +376,20 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super(BertSelfOutput, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if hasattr(config, 'deep_init') and config.deep_init:
+            init_method = scaled_init_method(mean=0.0,
+                                             std=config.initializer_range,
+                                             num_layers=config.num_hidden_layers)
+        else:
+            init_method = normal_init_method(mean=0.0,
+                                             std=config.initializer_range)
+        self.dense = mpu.RowParallelLinear(
+            input_size=config.hidden_size,
+            output_size=config.hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            stride=1,
+            init_method=init_method)
         self.fp32_layernorm = config.fp32_layernorm
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -390,7 +410,13 @@ class BertSelfOutput(nn.Module):
 class BertAttention(nn.Module):
     def __init__(self, config):
         super(BertAttention, self).__init__()
-        self.self = BertSelfAttention(config)
+        self.self = mpu.BertParallelSelfAttention(
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            dropout_prob=config.attention_probs_dropout_prob,
+            output_parallel=True,
+            init_method=normal_init_method(mean=0.0,
+                                           std=config.initializer_range))
         self.output = BertSelfOutput(config)
 
     def forward(self, input_tensor, attention_mask):
@@ -402,7 +428,14 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super(BertIntermediate, self).__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.dense = mpu.ColumnParallelLinear(
+            input_size=config.hidden_size,
+            output_size=config.intermediate_size,
+            bias=True,
+            gather_output=False,
+            stride=1,
+            init_method=normal_init_method(mean=0.0,
+                                           std=config.initializer_range))
         self.intermediate_act_fn = ACT2FN[config.hidden_act] \
             if isinstance(config.hidden_act, str) else config.hidden_act
 
@@ -415,7 +448,20 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super(BertOutput, self).__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        if hasattr(config, 'deep_init') and  config.deep_init:
+            init_method = scaled_init_method(mean=0.0,
+                                             std=config.initializer_range,
+                                             num_layers=config.num_hidden_layers)
+        else:
+            init_method = normal_init_method(mean=0.0,
+                                             std=config.initializer_range)
+        self.dense = mpu.RowParallelLinear(
+            input_size=config.intermediate_size,
+            output_size=config.hidden_size,
+            bias=True,
+            input_is_parallel=True,
+            stride=1,
+            init_method=init_method)
         self.fp32_layernorm = config.fp32_layernorm
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layernorm_epsilon)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -450,8 +496,9 @@ class BertLayer(nn.Module):
 class BertEncoder(nn.Module):
     def __init__(self, config):
         super(BertEncoder, self).__init__()
-        layer = BertLayer(config)
-        self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
+        #layer = BertLayer(config)
+        #self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
+        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
 
     # def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
     #     all_encoder_layers = []
@@ -476,9 +523,9 @@ class BertEncoder(nn.Module):
         if checkpoint_activations:
             l = 0
             num_layers = len(self.layer)
-            chunk_length = math.ceil(math.sqrt(num_layers))
+            chunk_length = 1 #math.ceil(math.sqrt(num_layers))
             while l < num_layers:
-                hidden_states = checkpoint(custom(l, l+chunk_length), hidden_states, attention_mask*1)
+                hidden_states = mpu.checkpoint(custom(l, l+chunk_length), hidden_states, attention_mask*1)
                 l += chunk_length
             # decoder layers
         else:
@@ -536,11 +583,12 @@ class BertLMPredictionHead(nn.Module):
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
-        self.decoder = nn.Linear(bert_model_embedding_weights.size(1),
-                                 bert_model_embedding_weights.size(0),
-                                 bias=False)
-        self.decoder.weight = bert_model_embedding_weights
+        #self.decoder = nn.Linear(bert_model_embedding_weights.size(1),
+        #                         bert_model_embedding_weights.size(0),
+        #                         bias=False)
+        self.decoder_weight = bert_model_embedding_weights
         self.bias = nn.Parameter(torch.zeros(bert_model_embedding_weights.size(0)))
+        self.bias.model_parallel = True
         self.fp32_embedding = config.fp32_embedding
         self.fp32_layernorm = config.fp32_layernorm
         def convert_to_type(tensor):
@@ -560,7 +608,10 @@ class BertLMPredictionHead(nn.Module):
                     self.transform.LayerNorm.float()
         hidden_states = self.transform(self.type_converter(hidden_states))
         # hidden_states = self.decoder(hidden_states) + self.bias
-        hidden_states = F.linear(self.type_converter(hidden_states), self.type_converter(self.decoder.weight), self.type_converter(self.bias))
+        hidden_states = mpu.copy_to_model_parallel_region(hidden_states)
+        hidden_states = F.linear(self.type_converter(hidden_states),
+                                 self.type_converter(self.decoder_weight),
+                                 self.type_converter(self.bias))
         return hidden_states
 
 
@@ -896,8 +947,8 @@ class BertForPreTraining(PreTrainedBertModel):
 
         if masked_lm_labels is not None and next_sentence_label is not None:
             loss_fct = CrossEntropyLoss(ignore_index=-1)
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), masked_lm_labels.view(-1))
-            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2), next_sentence_label.view(-1))
+            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size).float(), masked_lm_labels.view(-1))
+            next_sentence_loss = loss_fct(seq_relationship_score.view(-1, 2).float(), next_sentence_label.view(-1))
             total_loss = masked_lm_loss + next_sentence_loss
             return total_loss
         else:
@@ -1212,12 +1263,21 @@ class BertForTokenClassification(PreTrainedBertModel):
         self.num_labels = num_labels
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(config.hidden_size, num_labels)
+        #self.classifier = nn.Linear(config.hidden_size, num_labels)
+        self.classifier = mpu.RowParallelLinear(
+            input_size=config.hidden_size,
+            output_size=num_labels,
+            bias=True,
+            input_is_parallel=True,
+            stride=1,
+            init_method=normal_init_method(mean=0.0,
+                                           std=config.initializer_range))
         self.apply(self.init_bert_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, checkpoint_activations=False):
         sequence_output, _ = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False, checkpoint_activations=checkpoint_activations)
-        sequence_output = self.dropout(sequence_output)
+        with mpu.get_cuda_rng_tracker().fork():
+            sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
 
         if labels is not None:
@@ -1280,7 +1340,15 @@ class BertForQuestionAnswering(PreTrainedBertModel):
         self.bert = BertModel(config)
         # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
         # self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        #self.qa_outputs = nn.Linear(config.hidden_size, 2)
+        self.qa_outputs = mpu.RowParallelLinear(
+            input_size=config.hidden_size,
+            output_size=2,
+            bias=True,
+            input_is_parallel=True,
+            stride=1,
+            init_method=normal_init_method(mean=0.0,
+                                           std=config.initializer_range))
         self.apply(self.init_bert_weights)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, start_positions=None, end_positions=None, checkpoint_activations=False):

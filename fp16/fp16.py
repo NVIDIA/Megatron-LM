@@ -197,6 +197,8 @@ class FP16_Optimizer(object):
                         fp16_params_this_group.append(param)
                         master_param = param.detach().clone().float()
                         master_param.requires_grad = True
+                        # Copythe model parallel flag.
+                        master_param.model_parallel = param.model_parallel
                         param_group['params'][i] = master_param
                         fp32_from_fp16_params_this_group.append(master_param)
                         # Reset existing state dict key to the new master param.
