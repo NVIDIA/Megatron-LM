@@ -480,10 +480,9 @@ class BertParallelSelfAttention(torch.nn.Module):
         value_layer = self._transpose_for_scores(mixed_value_layer)
 
         # Raw attention scores. [b, np, s, s]
-        attention_scores = torch.matmul(query_layer,
-                                        key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(
-            self.hidden_size_per_attention_head)
+        norm_factor = math.sqrt(math.sqrt(self.hidden_size_per_attention_head))
+        attention_scores = torch.matmul(query_layer/norm_factor,
+                                        key_layer.transpose(-1, -2)/norm_factor)
         # Apply the attention mask.
         attention_scores += attention_mask
 

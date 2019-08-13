@@ -34,10 +34,7 @@ from model import DistributedDataParallel as DDP
 import mpu
 from apex.optimizers import FusedAdam as Adam
 from utils import Timers
-from utils import save_checkpoint
-from utils import save_checkpoint_model_parallel
 from utils import load_checkpoint
-from utils import load_checkpoint_model_parallel
 from utils import report_memory
 from utils import print_params_min_max_norm
 from utils import print_rank_0
@@ -84,7 +81,7 @@ def setup_model(args):
     model = get_model(args)
 
     if args.load is not None:
-        _ = load_checkpoint_model_parallel(
+        _ = load_checkpoint(
             model, None, None, args)
 
     return model

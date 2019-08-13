@@ -60,6 +60,17 @@ def make_gpt2_dataloaders(args):
     valid = make_data_loader_(args.val_data_path)
     test = make_data_loader_(args.test_data_path)
 
+    args.do_train = False
+    args.do_valid = False
+    args.do_test = False
+
+    if train is not None:
+        args.do_train = True
+    if valid is not None:
+        args.do_valid = True
+    if test is not None:
+        args.do_test = True
+
     # Tokenizer.
     tokenizer = GPT2Tokenizer.from_pretrained('gpt2', cache_dir=args.cache_dir)
     eod_token = tokenizer.encoder['<|endoftext|>']
@@ -126,7 +137,8 @@ class GPT2Dataset(Dataset):
     def build_dataset_(self, shard_index):
         # Garbage collect so we don't use a lot of memory.
         # Leave the last one in case other threads have not catche up yet.
-        for i in range(shard_index - 1):
+        #for i in range(shard_index - 1):
+        for i in range(shard_index):
             self.shards_data[i] = None
             self.shards_sample_index[i] = None
         # Read the shard.

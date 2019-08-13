@@ -221,7 +221,6 @@ def forward_step(data_iterator, model, args, timers):
     losses = mpu.vocab_parallel_cross_entropy(
         output.contiguous().float(), lm_labels.contiguous())
     loss_mask = loss_mask.contiguous()
-    loss_mask = loss_mask.view(-1)
     lm_loss = torch.sum(
         losses.view(-1) * loss_mask.view(-1).float()) / loss_mask.sum()
 
