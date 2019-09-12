@@ -79,6 +79,7 @@ elif args.webtext_eval:
     CMD = 'pretrain_gpt2.py' + CMD
     print('Running Webtext Eval Command:', flush=True)
 else:
+    CMD += ' --valid-data {} '.format(args.data_path)
     CMD = 'evaluate_gpt2.py' + CMD
     print('Running PPL Eval Command:', flush=True)
 
