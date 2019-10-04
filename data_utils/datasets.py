@@ -461,6 +461,7 @@ class GPT2Dataset(data.Dataset):
                  weighted=True,
                  sample_across_doc=True,
                  random_across_doc_sampling=True,
+                 bias_for_single_doc=False,
                  sentence_start=False, **kwargs):
         self.ds = ds
         self.ds_len = len(self.ds)
@@ -473,6 +474,7 @@ class GPT2Dataset(data.Dataset):
         self.weighted = weighted
         self.sample_across_doc = sample_across_doc
         self.random_across_doc_sampling = random_across_doc_sampling
+        self.bias_for_single_doc = bias_for_single_doc
         self.sentence_start = sentence_start
         self.init_weighting()
 
@@ -510,7 +512,10 @@ class GPT2Dataset(data.Dataset):
 
         # truncate or pad tokens
         num_tokens = len(tokens)
-        tokens_to_strip = num_tokens - self.max_seq_len - 1
+        if self.bias_for_single_doc:
+            tokens_to_strip = num_tokens - self.max_seq_len - 1
+        else:
+            tokens_to_strip = num_tokens - 1
         if tokens_to_strip > 0:
             strip_left_tokens = rng.randint(tokens_to_strip + 1)
             tokens = tokens[strip_left_tokens:]
@@ -576,7 +581,7 @@ class bert_sentencepair_dataset(data.Dataset):
         dataset_size (int): number of random sentencepairs in the dataset. Default: len(ds)*(len(ds)-1)
 
     """
-    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, presplit_sentences=False, weighted=True,**kwargs):
+    def __init__(self, ds, max_seq_len=512, mask_lm_prob=.15, max_preds_per_seq=None, short_seq_prob=.01, dataset_size=None, presplit_sentences=False, weighted=True, **kwargs):
         self.ds = ds
         self.ds_len = len(self.ds)
         self.tokenizer = self.ds.GetTokenizer()
@@ -758,7 +763,8 @@ class bert_sentencepair_dataset(data.Dataset):
         """
         tokens_a, token_types_a = a
         tokens_b, token_types_b = b
-        max_num_tokens = max_seq_len - 3
+        max_num_tokens = self.calc_seq_len(max_seq_len)
+        # max_num_tokens = max_seq_len - 3
         while True:
             len_a = len(tokens_a)
             len_b = len(tokens_b)
@@ -781,6 +787,9 @@ class bert_sentencepair_dataset(data.Dataset):
                 trunc_tokens.pop()
                 trunc_types.pop()
         return (tokens_a, token_types_a), (tokens_b, token_types_b)
+
+    def calc_seq_len(self, max_seq_len):
+        return max_seq_len - 3
 
     def mask_token(self, idx, tokens, types, vocab_words, rng):
         """
@@ -807,6 +816,11 @@ class bert_sentencepair_dataset(data.Dataset):
         seq += [self.tokenizer.get_command('pad').Id] * num_pad
         return seq, pad_mask
 
+    def concat_tokens(self, tokens_a, token_types_a, tokens_b, token_types_b):
+        tokens = [self.tokenizer.get_command('ENC').Id] + tokens_a + [self.tokenizer.get_command('sep').Id] + tokens_b + [self.tokenizer.get_command('sep').Id]
+        token_types = [token_types_a[0]] + token_types_a + [token_types_a[0]] + token_types_b + [token_types_b[0]]
+        return tokens, token_types
+
     def create_masked_lm_predictions(self, a, b, mask_lm_prob, max_preds_per_seq, vocab_words, rng):
         """
         Mask sequence pair for BERT training according to:
@@ -814,8 +828,7 @@ class bert_sentencepair_dataset(data.Dataset):
         """
         tokens_a, token_types_a = a
         tokens_b, token_types_b = b
-        tokens = [self.tokenizer.get_command('ENC').Id] + tokens_a + [self.tokenizer.get_command('sep').Id] + tokens_b + [self.tokenizer.get_command('sep').Id]
-        token_types = [token_types_a[0]] + token_types_a + [token_types_a[0]] + token_types_b + [token_types_b[0]]
+        tokens, token_types = self.concat_tokens(tokens_a, token_types_a, tokens_b, token_types_b)
 
         len_a = len(tokens_a)
         len_b = len(tokens_b)

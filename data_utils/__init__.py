@@ -16,6 +16,8 @@
 import os
 import math
 
+import torch
+
 from .samplers import DistributedBatchSampler
 from .datasets import json_dataset, csv_dataset, split_ds, ConcatDataset, SplitDataset, bert_sentencepair_dataset, GPT2Dataset
 from .lazy_loader import exists_lazy, make_lazy, lazy_array_loader
@@ -61,7 +63,8 @@ def supported_corpus(corpus_name):
 def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=None, split=[1.],
                 delim=',', loose=False, binarize_sent=False, drop_unlabeled=False, tokenizer=None,
                 tokenizer_type='CharacterLevelTokenizer', tokenizer_model_path=None, vocab_size=None,
-                model_type='bpe', pad_token=0, character_converage=1.0, non_binary_cols=None, **kwargs):
+                model_type='bpe', pad_token=0, character_converage=1.0, non_binary_cols=None,
+                 parallel_group=None, **kwargs):
     """function to create datasets+tokenizers for common options"""
     if isinstance(process_fn, str):
         process_fn = eval(process_fn)
@@ -76,11 +79,19 @@ def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=N
                 named_corpora = True
                 name = path_
                 path_ = corpora.NAMED_CORPORA[path_].PATH
-            if not exists_lazy(path_, data_type='data'):
+            if torch.distributed.get_rank() == 0 and not exists_lazy(path_, data_type='data'):
                 # create cached version of dataset for lazy loading if it doesn't exist
                 text = get_dataset(name if named_corpora else path_, text_key=text_key, label_key=label_key, binarize_sent=binarize_sent,
                     delim=delim, drop_unlabeled=drop_unlabeled, loose_json=loose)
                 make_lazy(path_, text.X, data_type='data')
+            # This should be a barrier but nccl barrier assumes
+            # device_index=rank which is not the case for model
+            # parallel case
+            counts = torch.cuda.LongTensor([1])
+            torch.distributed.all_reduce(counts, group=parallel_group)
+            assert counts[0].item() == torch.distributed.get_world_size(
+                group=parallel_group)
+
             text = lazy_array_loader(path_, data_type='data', map_fn=process_fn)
         else:
             # get dataset
@@ -107,15 +118,17 @@ def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=N
     # Split dataset into train/val/test (and wrap bert dataset)
     if should_split(split):
         ds = split_ds(ds, split)
-        if ds_type.lower() == 'bert':
+        if 'bert' in ds_type.lower():
             presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
-            ds = [bert_sentencepair_dataset(d, max_seq_len=seq_length, presplit_sentences=presplit_sentences)  if d is not None else None  for d in ds]
+            dstype = bert_sentencepair_dataset
+            ds = [dstype(d, max_seq_len=seq_length, presplit_sentences=presplit_sentences)  if d is not None else None  for d in ds]
         elif ds_type.lower() == 'gpt2':
             ds = [GPT2Dataset(d, max_seq_len=seq_length) if d is not None else None for d in ds]
     else:
-        if ds_type.lower() == 'bert':
+        if 'bert' in ds_type.lower():
             presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
-            ds = bert_sentencepair_dataset(ds, max_seq_len=seq_length, presplit_sentences=presplit_sentences)
+            dstype = bert_sentencepair_dataset
+            ds = dstype(ds, max_seq_len=seq_length, presplit_sentences=presplit_sentences)
         elif ds_type.lower() == 'gpt2':
             ds = GPT2Dataset(ds, max_seq_len=seq_length)
     return ds, tokenizer

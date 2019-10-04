@@ -114,7 +114,8 @@ def add_training_args(parser):
                        help='report interval')
     group.add_argument('--exit-interval', type=int, default=None,
                        help='Exit the program after this many new iterations.')
-
+    group.add_argument('--tensorboard-dir', type=str, default=None,
+                       help='Write TensorBoard logs to this directory')
     group.add_argument('--seed', type=int, default=1234,
                        help='random seed')
     # Batch prodecuer arguments
@@ -123,6 +124,8 @@ def add_training_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
                        'end-of-document token.')
+    group.add_argument('--eod-mask-loss', action='store_true',
+                       help='Mask loss for the end of document tokens')
 
     # Learning rate.
     group.add_argument('--lr-decay-iters', type=int, default=None,
@@ -133,9 +136,25 @@ def add_training_args(parser):
                        help='learning rate decay function')
     group.add_argument('--lr', type=float, default=1.0e-4,
                        help='initial learning rate')
+    group.add_argument('--min-lr', type=float, default=0.0,
+                       help='Minumum value for learning rate. The scheduler'
+                       'clip values below this threshold.')
     group.add_argument('--warmup', type=float, default=0.01,
                        help='percentage of data to warmup on (.01 = 1% of all '
                        'training iters). Default 0.01')
+    group.add_argument('--override-lr-scheduler', action='store_true',
+                       help='Reset the values of the scheduler (learning rate,'
+                       'warmup iterations, minimum learning rate, maximum '
+                       'number of iterations, and decay style from input '
+                       'arguments and ignore values from checkpoints. Note'
+                       'that all the above values will be reset.')
+    group.add_argument('--use-checkpoint-lr-scheduler', action='store_true',
+                       help='Use checkpoint to set the values of the scheduler '
+                       '(learning rate, warmup iterations, minimum learning '
+                       'rate, maximum number of iterations, and decay style '
+                       'from input arguments and ignore values from '
+                       'checkpoints. Notethat all the above values will be '
+                       'reset.')
     # model checkpointing
     group.add_argument('--save', type=str, default=None,
                        help='Output directory to save checkpoints to.')
@@ -163,8 +182,17 @@ def add_training_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        help='which backend to use for distributed '
                        'training. One of [gloo, nccl]')
+    group.add_argument('--DDP-impl', default='local',
+                       help='which DistributedDataParallel implementation '
+                       'to use. One of [local, torch]')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher')
+    # autoresume
+    group.add_argument('--adlr-autoresume', action='store_true',
+                       help='enable autoresume on adlr cluster.')
+    group.add_argument('--adlr-autoresume-interval', type=int, default=1000,
+                       help='intervals over which check for autoresume'
+                       'termination signal')
 
     return parser
 
@@ -193,6 +221,8 @@ def add_evaluation_args(parser):
                        help='sliding window for overlapping eval ')
     group.add_argument('--cloze-eval', action='store_true',
                        help='Evaluation dataset from `--valid-data` is a cloze task')
+    group.add_argument('--strict-lambada', action='store_true',
+                       help='use more difficult formulation of lambada')
     group.add_argument('--eval-hf', action='store_true',
                        help='perform evaluation with huggingface openai model.'
                        'use `--load` to specify weights path to be loaded')
@@ -207,9 +237,23 @@ def add_text_generate_args(parser):
 
     group = parser.add_argument_group('Text generation', 'configurations')
     group.add_argument("--temperature", type=float, default=1.0)
+    group.add_argument("--greedy", action='store_true', default=False)
     group.add_argument("--top_p", type=float, default=0.0)
     group.add_argument("--top_k", type=int, default=0)
-    group.add_argument("--out-seq-length", type=int, default=256)
+    group.add_argument("--out-seq-length", type=int, default=1024)
+    group.add_argument("--sample-input-file", type=str, default="",
+                      help='get input from file instead of interactive mode, '
+                           'each line is an input' )
+    group.add_argument("--sample-output-file", type=str, default="",
+                      help='output file got from --sample-input-file')
+    group.add_argument("--num-samples", type=int, default=0,
+                       help='number of samples to generate unconditionally, '
+                       'defaults to 0 and interactive conditional sampling')
+    group.add_argument("--genfile", type=str,
+                       help='output file when generating unconditionally')
+    group.add_argument("--recompute", action='store_true',
+                       help='during generation recompute all attention '
+                       'instead of using previously computed keys/values.')
     return parser
 
 

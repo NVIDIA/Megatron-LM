@@ -210,10 +210,13 @@ def forward_step(data_iterator, model, args, timers):
         lm_loss = torch.sum(
             losses.view(-1) * loss_mask.float())
     else:
-        outputs = torch.argmax(output, -1).contiguous().view(-1)
-        acc = (outputs == lm_labels.contiguous().view(-1)).float()
-        loss_mask = loss_mask.contiguous().view(-1).float()
-        lm_loss = torch.sum(acc * loss_mask)
+        outputs = torch.argmax(output, -1)
+        correct = (outputs == lm_labels).float()
+        correct[(1-loss_mask).bool()] = 1
+        correct = correct.prod(-1)
+        lm_loss = correct.sum()
+#        loss_mask = loss_mask.contiguous().view(-1).float()
+#        lm_loss = torch.sum(acc * loss_mask)
 
     return lm_loss
 
@@ -345,7 +348,7 @@ def set_random_seed(seed):
 
 
 class LM_Eval_Dataset(torch.utils.data.Dataset):
-    def __init__(self, tokens, seq_len, pad_idx, overalapping_eval=None):
+    def __init__(self, tokens, seq_len, pad_idx, overalapping_eval=None, **kwargs):
         self.tokens = tokens
         self.seq_len = seq_len
         self.pad_idx = pad_idx
@@ -379,15 +382,30 @@ class LM_Eval_Dataset(torch.utils.data.Dataset):
         return {'text': np.array(tokens), 'pad_mask': pad_mask}
 
 class Lambada_Eval_Dataset(torch.utils.data.Dataset):
-    def __init__(self, path, tokenizer, seq_len):
+    def __init__(self, path, tokenizer, seq_len, strict=False, **kwargs):
         self.seq_len = seq_len
         self.pad_idx = tokenizer.get_command('pad').Id
+        self.tokenizer = tokenizer
+        self.strict = strict
 
         self.tokens = []
+        self.labels = []
         with open(path, 'r') as f:
             for line in f.readlines():
                 text = json.loads(line)['text']
-                self.tokens.append(tokenizer.EncodeAsIds(text).tokenization)
+                tokens, labels = self.get_tokens(text)
+                self.tokens.append(tokens)
+                self.labels.append(labels)
+
+    def get_tokens(self, text):
+        if not self.strict:
+            tokens = self.tokenizer.EncodeAsIds(text).tokenization
+            return tokens[:-1], [tokens[-1]]
+        last_token = text.split()[-1]
+        start_idx = text.rfind(last_token)
+        beginning_tokens = self.tokenizer.EncodeAsIds(text[:start_idx].strip()).tokenization
+        last_token = self.tokenizer.EncodeAsIds(' '+last_token).tokenization
+        return beginning_tokens, last_token
 
     def __len__(self):
         return len(self.tokens)
@@ -397,7 +415,10 @@ class Lambada_Eval_Dataset(torch.utils.data.Dataset):
         tokens = self.tokens[idx]
         num_tokens = len(tokens)
         pad_mask = [0]*num_tokens
-        pad_mask[-1] = 1
+        labels = self.labels[idx]
+        pad_mask += [1]*len(labels)
+        tokens = tokens+labels
+        num_tokens = len(tokens)
         if num_tokens < self.seq_len+1:
             num_pad = (self.seq_len+1-num_tokens) 
             pad_mask += [0]*(num_pad)
@@ -442,7 +463,7 @@ def get_eval_data(args):
             val_dataset = LM_Eval_Dataset(tokenized_data, seq_len, eod_token,
                                           args.overlapping_eval)
         else:
-            val_dataset = Lambada_Eval_Dataset(valid_data, tokenizer, seq_len)
+            val_dataset = Lambada_Eval_Dataset(valid_data, tokenizer, seq_len, args.strict_lambada)
             num_tokenized_tokens = 0
             num_original_tokens = 0
         val_dataloader = torch.utils.data.DataLoader(
@@ -450,7 +471,9 @@ def get_eval_data(args):
 
         before = tokenizer.num_tokens
         after = before
-        while after % mpu.get_model_parallel_world_size() != 0:
+        multiple = args.make_vocab_size_divisible_by * \
+                   mpu.get_model_parallel_world_size()
+        while (after % multiple) != 0:
             after += 1
         print_rank_0('> padded vocab (size: {}) with {} dummy tokens (new size: {})'.
               format(before, after - before, after))

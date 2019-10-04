@@ -28,6 +28,8 @@ parser.add_argument('--data-path', type=str, required=True,
                     help='Data path for evaluation data')
 parser.add_argument('--cloze-eval', action='store_true',
                     help='Run lambada cloze eval instead of perplexity eval.')
+parser.add_argument('--strict-lambada', action='store_true',
+                       help='use more difficult formulation of lambada')
 parser.add_argument('--webtext-eval', action='store_true',
                     help='Run webtext PPL eval instead of wikitext PPL eval.')
 parser.add_argument('--eval-iters', default=5000, type=int,
@@ -38,6 +40,9 @@ parser.add_argument('--load-openai', action='store_true',
                     help='Load weights from saved openai/hf checkpoints')
 parser.add_argument('--cache-dir', type=str, default='cache',
                     help='directory to cache gpt2 tokenizers')
+parser.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
+                       help='Pad the vocab size to be divisible by this value.'
+                       'This is added for computational efficieny reasons.')
 args = parser.parse_args()
 
 multinode_args = ''
@@ -60,18 +65,23 @@ CMD = ' --model-parallel-size {model_par} \
        --attention-dropout 0.1 \
        --fp16 \
        --overlapping-eval 32 \
+       --make-vocab-size-divisible-by {make_vocab_size_divisible_by} \
        --cache-dir {cache} '.format(model_par=args.model_parallel_size,
                                     nlayers=args.num_layers,
                                     hidden=args.hidden_size,
                                     model=args.model_path,
                                     batch=args.batch_size,
                                     natt=args.num_attention_heads,
+                                    make_vocab_size_divisible_by=args.make_vocab_size_divisible_by,
                                     cache=args.cache_dir)
 
 if args.load_openai:
     CMD += ' --load-openai '
 if args.cloze_eval:
+    CMD += ' --valid-data {} '.format(args.data_path)
     CMD += ' --cloze-eval '
+    if args.strict_lambada:
+      CMD += ' --strict-lambada '
     CMD = 'evaluate_gpt2.py' + CMD
     print('Running Lambada Eval Command:', flush=True)
 elif args.webtext_eval:

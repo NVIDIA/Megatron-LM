@@ -98,7 +98,7 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         tensor = tensor.view(*new_tensor_shape)
         return tensor.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states, ltor_mask):
+    def forward(self, hidden_states, ltor_mask, layer_past=None, get_present=False):
         # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
 
@@ -112,13 +112,24 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         query_layer = self._transpose_for_scores(mixed_query_layer)
         key_layer = self._transpose_for_scores(mixed_key_layer)
         value_layer = self._transpose_for_scores(mixed_value_layer)
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            key_layer = torch.cat((past_key.type_as(key_layer), key_layer), dim=-2)
+            value_layer = torch.cat((past_value.type_as(value_layer), value_layer), dim=-2)
+        present = (key_layer, value_layer)
 
         # Raw attention scores. [b, np, s, s]
-        attention_scores = torch.matmul(query_layer,
-                                        key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(
-            self.hidden_size_per_attention_head)
+        norm_factor = math.sqrt(math.sqrt(self.hidden_size_per_attention_head))
+        attention_scores = torch.matmul(query_layer/norm_factor,
+                                        key_layer.transpose(-1, -2)/norm_factor)
+                                        
         # Apply the left to right attention mask.
+        if get_present:
+            with torch.no_grad():
+                if layer_past is not None:
+                    ltor_mask = ltor_mask[...,attention_scores.size(3)-1, :attention_scores.size(3)].unsqueeze(2)
+                else:
+                    ltor_mask = ltor_mask[...,:attention_scores.size(3), :attention_scores.size(3)]
         attention_scores = torch.mul(attention_scores, ltor_mask) - \
                            10000.0 * (1.0 - ltor_mask)
 
@@ -142,6 +153,9 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         # Output. [b, s, h]
         output = self.dense(context_layer)
         output = self.output_dropout(output)
+
+        if get_present:
+            output = [output, present]
 
         return output
 
@@ -268,14 +282,16 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
             init_method,
             output_layer_init_method=output_layer_init_method)
 
-    def forward(self, hidden_states, ltor_mask):
+    def forward(self, hidden_states, ltor_mask, layer_past=None, get_present=False):
         # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
 
         # Layer norm at the begining of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
-        attention_output = self.attention(layernorm_output, ltor_mask)
+        attention_output = self.attention(layernorm_output, ltor_mask, layer_past=layer_past, get_present=get_present)
+        if get_present:
+            attention_output, presents = attention_output
         # Residual connection.
         layernorm_input = hidden_states + attention_output
         # Layer norm post the self attention.
@@ -284,6 +300,9 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
         mlp_output = self.mlp(layernorm_output)
         # Second residual connection.
         output = layernorm_input + mlp_output
+
+        if get_present:
+            output = [output, presents]
 
         return output
 
@@ -376,7 +395,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
         # Final layer norm before output.
         self.final_layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
 
-    def forward(self, hidden_states, attention_mask):
+    def forward(self, hidden_states, attention_mask, layer_past=None, get_present=False):
 
         def custom(start, end):
             def custom_forward(*inputs):
@@ -387,7 +406,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
                 return x_
             return custom_forward
 
-        if self.checkpoint_activations:
+        if self.checkpoint_activations and not get_present:
             l = 0
             num_layers = len(self.layers)
             chunk_length = self.checkpoint_num_layers
@@ -396,11 +415,20 @@ class GPT2ParallelTransformer(torch.nn.Module):
                                            hidden_states, attention_mask)
                 l += chunk_length
         else:
-            for layer in self.layers:
-                hidden_states = layer(hidden_states, attention_mask)
+            presents = []
+            for i, layer in enumerate(self.layers):
+                past = None
+                if layer_past is not None:
+                    past = layer_past[i]
+                hidden_states = layer(hidden_states, attention_mask, layer_past=past, get_present=get_present)
+                if get_present:
+                    hidden_states, present = hidden_states
+                    presents.append(present)
 
         # Final layer norm.
         output = self.final_layernorm(hidden_states)
+        if get_present:
+            output = [output, presents]
 
         return output
 
