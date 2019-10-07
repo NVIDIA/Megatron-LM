@@ -1,10 +1,10 @@
 #!/bin/bash
 
-CHECKPOINT_PATH=/path/to/checkpoint
+CHECKPOINT_PATH=checkpoints/gpt2_345m/
 MPSIZE=1
-NLAYERS=24
-NHIDDEN=1024
-NATT=16
+NLAYERS=12
+NHIDDEN=768
+NATT=12
 MAXSEQLEN=1024
 
 #SAMPLING ARGS
@@ -26,4 +26,7 @@ python generate_samples.py \
        --out-seq-length $MAXSEQLEN \
        --temperature $TEMP \
        --top_k $TOPK \
-       --top_p $TOPP
+       --genfile dbg_unconditional.json \
+       --num-samples 10 \
+       --top_p $TOPP \
+       --recompute

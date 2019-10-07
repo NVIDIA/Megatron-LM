@@ -148,7 +148,8 @@ def make_loaders(args):
         'model_type': args.tokenizer_model_type,
         'cache_dir': args.cache_dir,
         'max_preds_per_seq': args.max_preds_per_seq,
-        'presplit_sentences': args.presplit_sentences}
+        'presplit_sentences': args.presplit_sentences,
+        'parallel_group': mpu.get_data_parallel_group()}
 
     eval_set_args = copy.copy(data_set_args)
     eval_set_args['split'] = [1.]

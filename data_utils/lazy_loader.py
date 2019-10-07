@@ -111,7 +111,7 @@ class lazy_array_loader(object):
         lazypath = get_lazy_path(path)
         datapath = os.path.join(lazypath, data_type)
         #get file where array entries are concatenated into one big string
-        self._file = open(datapath, 'rb')
+        self._file = open(datapath, 'rb', buffering=0)
         self.file = self._file
         #memory map file if necessary
         self.mem_map = mem_map
