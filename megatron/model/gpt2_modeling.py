@@ -18,7 +18,7 @@
 import torch
 import torch.nn.functional as F
 
-import mpu
+from megatron import mpu
 
 
 def init_method_normal(std=0.02):

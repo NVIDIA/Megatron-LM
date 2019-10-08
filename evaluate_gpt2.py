@@ -25,21 +25,21 @@ import torch
 
 from arguments import get_args
 from configure_data import configure_data
-from fp16 import FP16_Module
-from fp16 import FP16_Optimizer
-from learning_rates import AnnealingLR
-from model import GPT2Model
-from model import gpt2_get_params_for_weight_decay_optimization
-from model import DistributedDataParallel as DDP
-import mpu
+from megatron.fp16 import FP16_Module
+from megatron.fp16 import FP16_Optimizer
+from megatron.learning_rates import AnnealingLR
+from megatron.model import GPT2Model
+from megatron.model import gpt2_get_params_for_weight_decay_optimization
+from megatron.model import DistributedDataParallel as DDP
+from megatron import mpu
 from apex.optimizers import FusedAdam as Adam
-from utils import Timers
-from utils import load_checkpoint
-from utils import report_memory
-from utils import print_params_min_max_norm
-from utils import print_rank_0
+from megatron.utils import Timers
+from megatron.utils import load_checkpoint
+from megatron.utils import report_memory
+from megatron.utils import print_params_min_max_norm
+from megatron.utils import print_rank_0
 
-from data_utils import make_tokenizer
+from megatron.data_utils import make_tokenizer
 
 from detokenizer import *
 
@@ -539,7 +539,7 @@ def main():
             model = GPT2LMHeadModel.from_pretrained('gpt2', cache_dir='gpt2_weights').cuda()
     else:
         if args.load_openai:
-            from utils import move_weights
+            from megatron.utils import move_weights
             model_path = args.load
             args.load = None
             model = setup_model(args)

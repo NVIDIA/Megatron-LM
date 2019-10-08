@@ -21,9 +21,9 @@ import torch
 from torch.multiprocessing import Lock
 from torch.utils.data import Dataset
 
-import mpu
-from data_utils.samplers import DistributedBatchSampler
-from data_utils.tokenization_gpt2 import GPT2Tokenizer
+from megatron import mpu
+from megatron.data_utils.samplers import DistributedBatchSampler
+from megatron.data_utils.tokenization_gpt2 import GPT2Tokenizer
 
 
 def make_gpt2_dataloaders(args):

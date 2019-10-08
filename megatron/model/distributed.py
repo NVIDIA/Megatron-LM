@@ -19,7 +19,7 @@ import torch.distributed as dist
 from torch.nn.modules import Module
 from torch.autograd import Variable
 
-import mpu
+from megatron import mpu
 
 class DistributedDataParallel(Module):
 

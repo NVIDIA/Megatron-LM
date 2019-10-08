@@ -17,9 +17,9 @@
 
 import copy
 import torch
-import data_utils
 
-import mpu
+from megatron import data_utils
+from megatron import mpu
 
 class DataConfig:
 

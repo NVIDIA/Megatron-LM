@@ -25,20 +25,20 @@ import torch.nn.functional as F
 import argparse
 import time
 from arguments import get_args
-from utils import Timers
+from megatron.utils import Timers
 from pretrain_gpt2 import initialize_distributed
 from pretrain_gpt2 import set_random_seed
 from pretrain_gpt2 import get_train_val_test_data
 from pretrain_gpt2 import get_masks_and_position_ids
-from utils import load_checkpoint
-from data_utils import make_tokenizer
+from megatron.utils import load_checkpoint
+from megatron.data_utils import make_tokenizer
 from configure_data import configure_data
-import mpu
+from megatron import mpu
 
-from fp16 import FP16_Module
-from model import GPT2Model
-from model import DistributedDataParallel as DDP
-from utils import print_rank_0
+from megatron.fp16 import FP16_Module
+from megatron.model import GPT2Model
+from megatron.model import DistributedDataParallel as DDP
+from megatron.utils import print_rank_0
 
 def get_model(args):
     """Build the model."""
