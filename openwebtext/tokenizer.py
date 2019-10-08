@@ -16,7 +16,7 @@
 import sys
 sys.path.append('..')
 
-from data_utils.tokenization_gpt2 import GPT2Tokenizer
+from megatron.data_utils.tokenization_gpt2 import GPT2Tokenizer
 
 
 class Tokenizer:

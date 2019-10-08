@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import torch
-import mpu
+from megatron import mpu
 
 # item() is a recent addition, so this helps with backward compatibility.
 def to_python_float(t):

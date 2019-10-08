@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-import mpu
+from megatron import mpu
 
 
 class tofp16(nn.Module):
