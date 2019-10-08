@@ -30,7 +30,6 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import BertModel
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model import gpt2_get_params_for_weight_decay_optimization
-from megatron.model import DistributedDataParallel as LocalDDP
 from megatron import mpu
 from apex.optimizers import FusedAdam as Adam
 from megatron.utils import Timers
@@ -42,6 +41,10 @@ from megatron.utils import print_params_min_max_norm
 from megatron.utils import print_rank_0
 from megatron.utils import enable_adlr_autoresume
 from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import initialize_distributed
+from megatron.utils import set_random_seed
+from megatron.utils import wrap_model_for_distributed_training
+
 
 def get_model(args):
     """Build the model."""
@@ -72,18 +75,7 @@ def get_model(args):
                     _module.float()
 
     # Wrap model for distributed training.
-    if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
-        args.DDP_type = torch.nn.parallel.distributed.DistributedDataParallel
-        model = args.DDP_type(model, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
-    elif args.DDP_impl == 'local':
-        args.DDP_type = LocalDDP
-        model = args.DDP_type(model)
-    else:
-        print_rank_0('Unknown DDP implementation specified: {}. '
-                     'Exiting.'.format(args.DDP_impl))
-        exit()
+    model = wrap_model_for_distributed_training(model, args)
 
     return model
 
@@ -472,38 +464,6 @@ def evaluate_and_print_results(prefix, data_iterator, model,
         writer.add_scalar('val_total_loss', val_loss, iteration)
 
     return val_loss
-
-
-def initialize_distributed(args):
-    """Initialize torch.distributed."""
-
-    # Manually set the device ids.
-    device = args.rank % torch.cuda.device_count()
-    if args.local_rank is not None:
-        device = args.local_rank
-    torch.cuda.set_device(device)
-    # Call the init process
-    init_method = 'tcp://'
-    master_ip = os.getenv('MASTER_ADDR', 'localhost')
-    master_port = os.getenv('MASTER_PORT', '6000')
-    init_method += master_ip + ':' + master_port
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        init_method=init_method)
-
-    # Set the model-parallel / data-parallel communicators.
-    mpu.initialize_model_parallel(args.model_parallel_size)
-
-
-def set_random_seed(seed):
-    """Set random seed for reproducability."""
-
-    if seed is not None and seed > 0:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        mpu.model_parallel_cuda_manual_seed(seed)
 
 
 def get_train_val_test_data(args):

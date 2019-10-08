@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.fp16 import FP16_Optimizer
 from megatron import mpu
 from megatron import model
@@ -183,13 +184,67 @@ def report_memory(name):
         torch.cuda.max_memory_cached()/ mega_bytes)
     print_rank_0(string)
 
-def get_checkpoint_name(checkpoints_path, iteration, release=False, mp_rank=None):
+
+def initialize_distributed(args):
+    """Initialize torch.distributed."""
+
+    # Manually set the device ids.
+    device = args.rank % torch.cuda.device_count()
+    if args.local_rank is not None:
+        device = args.local_rank
+    torch.cuda.set_device(device)
+    # Call the init process
+    init_method = 'tcp://'
+    master_ip = os.getenv('MASTER_ADDR', 'localhost')
+    master_port = os.getenv('MASTER_PORT', '6000')
+    init_method += master_ip + ':' + master_port
+    torch.distributed.init_process_group(
+        backend=args.distributed_backend,
+        world_size=args.world_size, rank=args.rank,
+        init_method=init_method)
+
+    # Set the model-parallel / data-parallel communicators.
+    mpu.initialize_model_parallel(args.model_parallel_size)
+
+
+def wrap_model_for_distributed_training(model, args):
+    """Wrap model for distributed training."""
+    if args.DDP_impl == 'torch':
+        i = torch.cuda.current_device()
+        args.DDP_type = torchDDP
+        model = args.DDP_type(model, device_ids=[i], output_device=i,
+                              process_group=mpu.get_data_parallel_group())
+        return model
+    elif args.DDP_impl == 'local':
+        args.DDP_type = LocalDDP
+        model = args.DDP_type(model)
+        return model
+    else:
+        print_rank_0('Unknown DDP implementation specified: {}. '
+                     'Exiting.'.format(args.DDP_impl))
+        exit()
+
+
+def set_random_seed(seed):
+    """Set random seed for reproducability."""
+
+    if seed is not None and seed > 0:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        mpu.model_parallel_cuda_manual_seed(seed)
+
+
+def get_checkpoint_name(checkpoints_path, iteration, release=False,
+                        mp_rank=None):
     if release:
         d = 'release'
     else:
         d = 'iter_{:07d}'.format(iteration)
     return os.path.join(checkpoints_path, d,
-                        'mp_rank_{:02d}'.format(mpu.get_model_parallel_rank() if mp_rank is None else mp_rank),
+                        'mp_rank_{:02d}'.format(
+                            mpu.get_model_parallel_rank() if mp_rank is None \
+                            else mp_rank),
                         'model_optim_rng.pt')
 
 
