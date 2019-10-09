@@ -44,7 +44,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import initialize_distributed
 from megatron.utils import set_random_seed
 from megatron.utils import wrap_model_for_distributed_training
-
+from megatron.utils import vocab_size_with_padding
 
 def get_model(args):
     """Build the model."""
@@ -477,19 +477,13 @@ def get_train_val_test_data(args):
         ds_type = 'BERT'
         data_config.set_defaults(data_set_type=ds_type, transpose=False)
         (train_data, val_data, test_data), tokenizer = data_config.apply(args)
-        before = tokenizer.num_tokens
-        after = before
-        multiple = args.make_vocab_size_divisible_by * \
-                   mpu.get_model_parallel_world_size()
-        while (after % multiple) != 0:
-            after += 1
-        print_rank_0('> padded vocab (size: {}) with {} dummy '
-                     'tokens (new size: {})'.format(
-                         before, after - before, after))
+        num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)
         # Need to broadcast num_tokens and num_type_tokens.
-        token_counts = torch.cuda.LongTensor([after,
+        token_counts = torch.cuda.LongTensor([num_tokens,
                                               tokenizer.num_type_tokens,
-                                              int(args.do_train), int(args.do_valid), int(args.do_test)])
+                                              int(args.do_train),
+                                              int(args.do_valid),
+                                              int(args.do_test)])
     else:
         token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
 

@@ -185,6 +185,19 @@ def report_memory(name):
     print_rank_0(string)
 
 
+def vocab_size_with_padding(num_tokens, args):
+
+    after = num_tokens
+    multiple = args.make_vocab_size_divisible_by * \
+               mpu.get_model_parallel_world_size()
+    while (after % multiple) != 0:
+        after += 1
+    print_rank_0('> padded vocab (size: {}) with {} dummy '
+                 'tokens (new size: {})'.format(
+                     num_tokens, after - num_tokens, after))
+    return after
+
+
 def initialize_distributed(args):
     """Initialize torch.distributed."""
 
