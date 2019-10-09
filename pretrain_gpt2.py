@@ -43,6 +43,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import initialize_distributed
 from megatron.utils import set_random_seed
 from megatron.utils import wrap_model_for_distributed_training
+from megatron.utils import vocab_size_with_padding
 
 from gpt2_data_loader import make_gpt2_dataloaders
 
@@ -509,17 +510,13 @@ def get_train_val_test_data(args):
             num_tokens = tokenizer.num_tokens
             eod_token = tokenizer.get_command('eos').Id
             assert eod_token == tokenizer.get_command('pad').Id
-        before = num_tokens
-        after = before
-        multiple = args.make_vocab_size_divisible_by * \
-                   mpu.get_model_parallel_world_size()
-        while (after % multiple) != 0:
-            after += 1
-        print_rank_0('> padded vocab (size: {}) with {} dummy '
-                     'tokens (new size: {})'.format(
-                         before, after - before, after))
+        # pad.
+        num_tokens = vocab_size_with_padding(num_tokens, args)
         print_rank_0('> found end-of-document token: {}'.format(eod_token))
-        token_counts = torch.cuda.LongTensor([after, eod_token, int(args.do_train), int(args.do_valid), int(args.do_test)])
+        token_counts = torch.cuda.LongTensor([num_tokens, eod_token,
+                                              int(args.do_train),
+                                              int(args.do_valid),
+                                              int(args.do_test)])
     else:
         token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
 
