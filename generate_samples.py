@@ -26,9 +26,8 @@ import argparse
 import time
 from arguments import get_args
 from megatron.utils import Timers
-from pretrain_gpt2 import initialize_distributed
-from pretrain_gpt2 import set_random_seed
-from pretrain_gpt2 import get_train_val_test_data
+from megatron.utils import initialize_distributed
+from megatron.utils import set_random_seed
 from pretrain_gpt2 import get_masks_and_position_ids
 from megatron.utils import load_checkpoint
 from megatron.data_utils import make_tokenizer
@@ -96,7 +95,8 @@ def get_batch(context_tokens, args):
         tokens,
         args.eod_token,
         args.reset_position_ids,
-        args.reset_attention_mask)
+        args.reset_attention_mask,
+        False)
 
     return tokens, attention_mask, position_ids
 
@@ -361,7 +361,7 @@ def switch(val1, val2, boolean):
     boolean = boolean.type_as(val1)
     return (1-boolean)*val1 + boolean*val2
 
-def sample_sequence_batch(model, context_tokens, context_lengths, attention_mask, position_ids, tokenizer, args, maxlen=None):
+def sample_sequence_batch(model, context_tokens, context_lengths, attention_mask, position_ids, tokenizer, args, maxlen=None, type_ids=None):
     model.eval()
     with torch.no_grad():
         context_length = context_lengths.min().item()
@@ -384,16 +384,21 @@ def sample_sequence_batch(model, context_tokens, context_lengths, attention_mask
         while context_length <= (maxlen):
 
             if args.recompute:
-                logits = model(tokens, position_ids, attention_mask)
-                logits = logits[:, context_length - 1, :] 
+                logits = model(tokens, position_ids, attention_mask, tokentype_ids=type_ids)
+                logits = logits[:, context_length - 1, :]
             else:
+                types2use = None
                 if counter == 0:
                     tokens2use = tokens[:, :context_length]
                     positions2use = position_ids[:, :context_length]
+                    if type_ids is not None:
+                        types2use = type_ids[:, :context_length]
                 else:
                     tokens2use = tokens[:, context_length - 1].view(batch_size, -1)
                     positions2use = position_ids[:, context_length - 1].view(batch_size, -1)
-                logits, layer_past = model(tokens2use, positions2use, attention_mask, layer_past=layer_past, get_present=True)
+                    if type_ids is not None:
+                        types2use = type_ids[:, context_length - 1].view(batch_size, -1)
+                logits, layer_past = model(tokens2use, positions2use, attention_mask, layer_past=layer_past, get_key_value=True, tokentype_ids=types2use)
                 logits = logits[:, -1].view(batch_size,-1).contiguous()
 
             if args.greedy:

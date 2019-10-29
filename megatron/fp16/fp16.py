@@ -22,6 +22,9 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .loss_scaler import DynamicLossScaler, LossScaler
 from .fp16util import model_grads_to_master_grads, master_params_to_model_params, clip_grad_norm
 
+
+from megatron.module import MegatronModule
+
 FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 
@@ -56,7 +59,7 @@ def fp16_to_fp32(val):
         return val
     return conversion_helper(val, float_conversion)
 
-class FP16_Module(nn.Module):
+class FP16_Module(MegatronModule):
     def __init__(self, module):
         super(FP16_Module, self).__init__()
         self.add_module('module', module.half())
@@ -66,6 +69,11 @@ class FP16_Module(nn.Module):
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
+                                       keep_vars=False):
+        return self.module.state_dict_for_save_checkpoint(destination, prefix,
+                                                          keep_vars)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

@@ -29,7 +29,6 @@ from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
 from megatron.learning_rates import AnnealingLR
 from megatron.model import GPT2Model
-from megatron.model import gpt2_get_params_for_weight_decay_optimization
 from megatron.model import DistributedDataParallel as DDP
 from megatron import mpu
 from apex.optimizers import FusedAdam as Adam

@@ -28,8 +28,8 @@ parser.add_argument('--data-path', type=str, required=True,
                     help='Data path for evaluation data')
 parser.add_argument('--cloze-eval', action='store_true',
                     help='Run lambada cloze eval instead of perplexity eval.')
-parser.add_argument('--strict-lambada', action='store_true',
-                       help='use more difficult formulation of lambada')
+parser.add_argument('--easy-lambada', action='store_true',
+                       help='use easier formulation of lambada')
 parser.add_argument('--webtext-eval', action='store_true',
                     help='Run webtext PPL eval instead of wikitext PPL eval.')
 parser.add_argument('--eval-iters', default=5000, type=int,
@@ -80,7 +80,7 @@ if args.load_openai:
 if args.cloze_eval:
     CMD += ' --valid-data {} '.format(args.data_path)
     CMD += ' --cloze-eval '
-    if args.strict_lambada:
+    if not args.easy_lambada:
       CMD += ' --strict-lambada '
     CMD = 'evaluate_gpt2.py' + CMD
     print('Running Lambada Eval Command:', flush=True)
