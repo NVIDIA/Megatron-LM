@@ -20,8 +20,10 @@ from torch.nn.modules import Module
 from torch.autograd import Variable
 
 from megatron import mpu
+from megatron.module import MegatronModule
 
-class DistributedDataParallel(Module):
+
+class DistributedDataParallel(MegatronModule):
 
     def __init__(self, module):
         super(DistributedDataParallel, self).__init__()
@@ -85,6 +87,11 @@ class DistributedDataParallel(Module):
        #     d[handle.id] = hook
 
         return sd
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
+                                       keep_vars=False):
+        return self.module.state_dict_for_save_checkpoint(destination, prefix,
+                                                          keep_vars)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

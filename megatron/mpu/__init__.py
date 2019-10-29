@@ -46,7 +46,5 @@ from .random import checkpoint
 from .random import get_cuda_rng_tracker
 from .random import model_parallel_cuda_manual_seed
 
-from .transformer import BertParallelSelfAttention
-from .transformer import BertParallelTransformerLayer
-from .transformer import GPT2ParallelTransformer
-from .transformer import LayerNorm
+from .utils import divide
+from .utils import split_tensor_along_last_dim

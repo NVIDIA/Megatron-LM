@@ -20,12 +20,29 @@ import random
 import time
 import numpy as np
 import torch
-
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.fp16 import FP16_Optimizer
+
+from apex.optimizers import FusedAdam as Adam
+
 from megatron import mpu
-from megatron import model
+from megatron.fp16 import FP16_Module
+from megatron.fp16 import FP16_Optimizer
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import get_params_for_weight_decay_optimization
+
+
+def get_tensorboard_writer(args):
+    writer = None
+    if args.tensorboard_dir and args.rank == 0:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(log_dir=args.tensorboard_dir)
+        except ModuleNotFoundError:
+            print_rank_0('WARNING: TensorBoard writing requested but is not '
+                         'available (are you using PyTorch 1.1.0 or later?), '
+                         'no TensorBoard logs will be written.')
+            writer = None
+    return writer
 
 
 def print_rank_0(message):
@@ -39,18 +56,18 @@ def print_rank_0(message):
 def enable_adlr_autoresume(args):
     print_rank_0('enabling autoresume ...')
     import sys
-    sys.path.append(os.environ.get('SUBMIT_SCRIPTS','.'))
+    sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
     try:
         from userlib.auto_resume import AutoResume
     except:
         print_rank_0('ADLR autoresume is not available, exiting ...')
-        exit(0)
+        exit()
     args.AutoResume = AutoResume
     args.AutoResume.init()
 
 
 def check_adlr_autoresume_termination(iteration, model, optimizer,
-                                       lr_scheduler, args):
+                                      lr_scheduler, args):
     # Add barrier to ensure consistnecy.
     torch.distributed.barrier()
     if args.AutoResume.termination_requested():
@@ -73,6 +90,7 @@ def print_args(args, writer=None):
 
         if writer:
             writer.add_text(arg, str(getattr(args, arg)))
+
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
@@ -220,24 +238,6 @@ def initialize_distributed(args):
     mpu.initialize_model_parallel(args.model_parallel_size)
 
 
-def wrap_model_for_distributed_training(model, args):
-    """Wrap model for distributed training."""
-    if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
-        args.DDP_type = torchDDP
-        model = args.DDP_type(model, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
-        return model
-    elif args.DDP_impl == 'local':
-        args.DDP_type = LocalDDP
-        model = args.DDP_type(model)
-        return model
-    else:
-        print_rank_0('Unknown DDP implementation specified: {}. '
-                     'Exiting.'.format(args.DDP_impl))
-        exit()
-
-
 def set_random_seed(seed):
     """Set random seed for reproducability."""
 
@@ -284,7 +284,7 @@ def save_checkpoint(iteration, model, optimizer,
 
         sd = {}
         sd['iteration'] = iteration
-        sd['model'] = model.state_dict()
+        sd['model'] = model.state_dict_for_save_checkpoint()
 
         # Optimizer stuff.
         if not args.no_save_optim:
@@ -378,7 +378,6 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
                 print_rank_0('A metadata file exists but Unable to load iteration '
                              ' from checkpoint {}, exiting'.format(checkpoint_name))
                 exit()
-
     # Model.
     try:
         model.load_state_dict(sd['model'])
@@ -410,7 +409,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
             torch.cuda.set_rng_state(sd['cuda_rng_state'])
             mpu.get_cuda_rng_tracker().set_states(sd['rng_tracker_states'])
         except KeyError:
-            print_rank_0('Unable to load optimizer from checkpoint {}, exiting. '
+            print_rank_0('Unable to load optimizer from checkpoint {}, exiting.'
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer '
                          'state.'.format(checkpoint_name))
@@ -421,6 +420,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, args):
         print('  successfully loaded {}'.format(checkpoint_name))
 
     return iteration
+
 
 def load_weights(src, dst, dst2src=False):
     """
