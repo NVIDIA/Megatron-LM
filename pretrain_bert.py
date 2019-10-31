@@ -22,6 +22,7 @@ from configure_data import configure_data
 from megatron import mpu
 from megatron.model import BertModel
 from megatron.utils import print_rank_0
+from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
 from megatron.training import run
 
@@ -99,14 +100,9 @@ def forward_step(data_iterator, model, args, timers):
 
     loss = lm_loss + nsp_loss
 
-    reduced_losses = torch.cat((lm_loss.clone().detach().view(1),
-                                nsp_loss.clone().detach().view(1)))
-    torch.distributed.all_reduce(reduced_losses)
-    reduced_losses = reduced_losses / torch.distributed.get_world_size()
-    lm_loss_reduced = reduced_losses[0]
-    nsp_loss_reduced = reduced_losses[1]
+    reduced_losses = reduce_losses([lm_loss, nsp_loss])
 
-    return loss, {'lm loss': lm_loss_reduced, 'nsp loss': nsp_loss_reduced}
+    return loss, {'lm loss': reduced_losses[0], 'nsp loss': reduced_losses[1]}
 
 
 def get_train_val_test_data(args):
