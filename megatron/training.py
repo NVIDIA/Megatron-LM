@@ -71,28 +71,17 @@ def run(top_level_message, train_val_test_data_provider,
             function add `batch generator` to the timers class.
     """
 
-    # Timer.
-    timers = Timers()
-
     # Arguments.
     args = get_args()
+
+    # Timer.
+    timers = Timers()
 
     # Tensorboard writer
     writer = get_tensorboard_writer(args)
 
-    # Pytorch distributed.
-    initialize_distributed(args)
-    if torch.distributed.get_rank() == 0:
-        print(top_level_message, flush=True)
-        print_args(args, writer)
-
-    # Autoresume.
-    torch.distributed.barrier()
-    if args.adlr_autoresume:
-        enable_adlr_autoresume(args)
-
-    # Random seeds for reproducability.
-    set_random_seed(args.seed)
+    # Initalize.
+    initialize_megatron(top_level_message, args, writer)
 
     # Data stuff.
     train_data, val_data, test_data = train_val_test_data_provider(args)
@@ -133,6 +122,24 @@ def run(top_level_message, train_val_test_data_provider,
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    args, None, 0, timers, True)
+
+
+def initialize_megatron(message, args, writer):
+    """"Initialize distributed, random seed, and autoresume."""
+
+    # Pytorch distributed.
+    initialize_distributed(args)
+    if torch.distributed.get_rank() == 0:
+        print(message, flush=True)
+        print_args(args, writer)
+
+    # Autoresume.
+    torch.distributed.barrier()
+    if args.adlr_autoresume:
+        enable_adlr_autoresume(args)
+
+    # Random seeds for reproducability.
+    set_random_seed(args.seed)
 
 
 def get_model(model_provider_func, args):
@@ -301,6 +308,62 @@ def train_step(forward_step_func, data_iterator, model, optimizer, lr_scheduler,
     return loss_reduced, skipped_iter
 
 
+def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
+                 loss_scale, report_memory_flag, writer, args, timers):
+
+    # Update losses.
+    for key in loss_dict:
+        total_loss_dict[key] = total_loss_dict.get(key, 0.) + loss_dict[key]
+
+    # Logging.
+    timers_to_log = []
+    def add_to_logging(name):
+        if name in timers.timers:
+            timers_to_log.append(name)
+    add_to_logging('forward')
+    add_to_logging('backward')
+    add_to_logging('allreduce')
+    add_to_logging('optimizer')
+    add_to_logging('batch generator')
+
+    # Tensorboard values.
+    if writer and torch.distributed.get_rank() == 0:
+        writer.add_scalar('learning_rate', learning_rate, iteration)
+        for key in loss_dict:
+            writer.add_scalar(key, loss_dict[key], iteration)
+        if args.fp16:
+            writer.add_scalar('loss_scale', loss_scale, iteration)
+        normalizer = iteration % args.log_interval
+        if normalizer == 0:
+            normalizer = args.log_interval
+        timers.write(timers_to_log, writer, iteration,
+                     normalizer=normalizer)
+
+    if iteration % args.log_interval == 0:
+        elapsed_time = timers('interval time').elapsed()
+        if writer and torch.distributed.get_rank() == 0:
+            writer.add_scalar('iteration_time',
+                              elapsed_time / args.log_interval, iteration)
+        log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
+                                                       args.train_iters)
+        log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
+            elapsed_time * 1000.0 / args.log_interval)
+        log_string += ' learning rate: {:.3E} |'.format(learning_rate)
+        for key in total_loss_dict:
+            avg = total_loss_dict[key].item() / args.log_interval
+            log_string += ' {}: {:.6E} |'.format(key, avg)
+            total_loss_dict[key] = 0.0
+        if args.fp16:
+            log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+        print_rank_0(log_string)
+        if report_memory_flag:
+            report_memory('after {} iterations'.format(iteration))
+            report_memory_flag = False
+        timers.log(timers_to_log, normalizer=args.log_interval)
+
+    return report_memory_flag
+
+
 def train(forward_step_func, model, optimizer, lr_scheduler,
           train_data_iterator, val_data_iterator, timers, args, writer):
     """Train the model function."""
@@ -328,54 +391,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         skipped_iters += skipped_iter
         iteration += 1
 
-        # Update losses.
-        for key in loss_dict:
-            total_loss_dict[key] = total_loss_dict.get(key, 0.) + loss_dict[key]
-
         # Logging.
-        if args.DDP_impl == 'torch':
-            timers_to_log = ['forward', 'backward', 'optimizer',
-                             'batch generator']
-        else:
-            timers_to_log = ['forward', 'backward', 'allreduce', 'optimizer',
-                             'batch generator']
-
-        learning_rate = optimizer.param_groups[0]['lr']
-
-        if writer and torch.distributed.get_rank() == 0:
-            writer.add_scalar('learning_rate', learning_rate, iteration)
-            for key in total_loss_dict:
-                writer.add_scalar(key, total_loss_dict[key], iteration)
-            if args.fp16:
-                writer.add_scalar('loss_scale', optimizer.loss_scale, iteration)
-            normalizer = iteration % args.log_interval
-            if normalizer == 0:
-                normalizer = args.log_interval
-            timers.write(timers_to_log, writer, iteration,
-                         normalizer=normalizer)
-
-        if iteration % args.log_interval == 0:
-            elapsed_time = timers('interval time').elapsed()
-            if writer and torch.distributed.get_rank() == 0:
-                writer.add_scalar('iteration_time',
-                                  elapsed_time / args.log_interval, iteration)
-            log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
-                                                           args.train_iters)
-            log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
-                elapsed_time * 1000.0 / args.log_interval)
-            log_string += ' learning rate: {:.3E} |'.format(learning_rate)
-            for key in total_loss_dict:
-                avg = total_loss_dict[key].item() / args.log_interval
-                log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = 0.0
-            if args.fp16:
-                log_string += ' loss scale: {:.1f} |'.format(
-                    optimizer.loss_scale)
-            print_rank_0(log_string)
-            if report_memory_flag:
-                report_memory('after {} iterations'.format(iteration))
-                report_memory_flag = False
-            timers.log(timers_to_log, normalizer=args.log_interval)
+        report_memory_flag = training_log(loss_dict, total_loss_dict,
+                                          optimizer.param_groups[0]['lr'],
+                                          iteration, optimizer.loss_scale,
+                                          report_memory_flag, writer, args,
+                                          timers)
 
         # Autoresume
         if (iteration % args.adlr_autoresume_interval == 0) and \

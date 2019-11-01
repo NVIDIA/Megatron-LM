@@ -31,9 +31,19 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 
 
+def reduce_losses(losses):
+    reduced_losses = torch.cat(
+        [loss.clone().detach().view(1) for loss in losses])
+    torch.distributed.all_reduce(reduced_losses)
+    reduced_losses = reduced_losses / torch.distributed.get_world_size()
+
+    return reduced_losses
+
+
 def get_tensorboard_writer(args):
     writer = None
-    if args.tensorboard_dir and args.rank == 0:
+    if hasattr(args, 'tensorboard_dir') and \
+       args.tensorboard_dir and args.rank == 0:
         try:
             from torch.utils.tensorboard import SummaryWriter
             writer = SummaryWriter(log_dir=args.tensorboard_dir)
