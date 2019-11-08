@@ -45,7 +45,6 @@ class Encoder(object):
             tokens = Encoder.tokenizer.tokenize(sentence)
             ids = Encoder.tokenizer.convert_tokens_to_ids(tokens)
             doc_ids.append(ids)
-        doc_ids.append([])
         return doc_ids, len(json_line)
 
 def main():
@@ -71,8 +70,6 @@ def main():
     print("Opening", args.input)
     fin = open(args.input, 'r', encoding='utf-8')
 
-    vocab_size = 1
-
     nltk.download("punkt", quiet=True)
 
     encoder = Encoder(args)
@@ -80,11 +77,13 @@ def main():
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
     encoded_docs = pool.imap(encoder.encode, fin, 25)
 
+    print(f"Vocab size: {tokenizer.vocab_size()}")
+
     output_bin_file = "{}.bin".format(args.output_prefix)
     output_idx_file = "{}.idx".format(args.output_prefix)
-    ds = indexed_dataset.make_builder(output_bin_file,
+    builder = indexed_dataset.make_builder(output_bin_file,
                                       impl=args.dataset_impl,
-                                      vocab_size=vocab_size)
+                                      vocab_size=tokenizer.vocab_size())
 
     startup_end = time.time()
     proc_start = time.time()
@@ -93,30 +92,19 @@ def main():
     for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         for sentence in doc:
-            print(sentence)
-            print(tokenizer.convert_ids_to_tokens(sentence))
-            ds.add_item(torch.IntTensor(sentence))
+            #print(sentence)
+            #print(tokenizer.convert_ids_to_tokens(sentence))
+            builder.add_item(torch.IntTensor(sentence))
+        builder.end_document()
         if i % args.log_interval == 0:
             current = time.time()
             elapsed = current - proc_start
             mbs = total_bytes_processed/elapsed/1024/1024
-            print(f'Processed {i} documents',
+            print(f"Processed {i} documents",
                   f"({i/elapsed} docs/s, {mbs} MB/s).",
                   file=sys.stderr)
 
-    ds.finalize(output_idx_file)
+    builder.finalize(output_idx_file)
 
 if __name__ == '__main__':
     main()
-    # print('processing data ...')
-
-    # input_file = '/raid/mshoeybi/data/albert/sample/samples_11.json'
-    # vocab_file = '/raid/mshoeybi/data/albert/bert_vocab/vocab.txt'
-
-    # tokenizer = FullTokenizer(vocab_file, do_lower_case=True)
-    # document_generator = document_generator_provider(input_file)
-    # for sentences in document_generator:
-    #     for sentence in sentences:
-    #         tokens = tokenizer.tokenize(sentence)
-    #         print(sentence)
-    #         print(tokens)

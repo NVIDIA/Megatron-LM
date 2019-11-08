@@ -7,6 +7,8 @@
 # copied from fairseq/fairseq/data/indexed_dataset.py
 # Removed IndexedRawTextDataset since it relied on Fairseq dictionary
 # other slight modifications to remove fairseq dependencies
+# Added document index to index file and made it accessible.
+#    An empty sentence no longer separates documents.
 
 from functools import lru_cache
 import os
@@ -101,6 +103,12 @@ def index_file_path(prefix_path):
 def data_file_path(prefix_path):
     return prefix_path + '.bin'
 
+def create_doc_idx(sizes):
+    doc_idx = [0]
+    for i, s in enumerate(sizes):
+        if s == 0:
+            doc_idx.append(i+1)
+    return doc_idx
 
 class IndexedDataset(torch.utils.data.Dataset):
     """Loader for IndexedDataset"""
@@ -125,9 +133,11 @@ class IndexedDataset(torch.utils.data.Dataset):
             code, self.element_size = struct.unpack('<QQ', f.read(16))
             self.dtype = dtypes[code]
             self._len, self.s = struct.unpack('<QQ', f.read(16))
+            self.doc_count = struct.unpack('<Q', f.read(8))
             self.dim_offsets = read_longs(f, self._len + 1)
             self.data_offsets = read_longs(f, self._len + 1)
             self.sizes = read_longs(f, self.s)
+            self.doc_idx = read_longs(f, self.doc_count)
 
     def read_data(self, path):
         self.data_file = open(data_file_path(path), 'rb', buffering=0)
@@ -240,14 +250,17 @@ class IndexedDatasetBuilder(object):
         self.dim_offsets = [0]
         self.sizes = []
         self.element_size = self.element_sizes[self.dtype]
+        self.doc_idx = [0]
 
     def add_item(self, tensor):
-        # +1 for Lua compatibility
-        bytes = self.out_file.write(np.array(tensor.numpy() + 1, dtype=self.dtype))
+        bytes = self.out_file.write(np.array(tensor.numpy(), dtype=self.dtype))
         self.data_offsets.append(self.data_offsets[-1] + bytes / self.element_size)
         for s in tensor.size():
             self.sizes.append(s)
         self.dim_offsets.append(self.dim_offsets[-1] + len(tensor.size()))
+
+    def end_document(self):
+        self.doc_idx.append(len(self.sizes))
 
     def merge_file_(self, another_file):
         index = IndexedDataset(another_file)
@@ -276,9 +289,11 @@ class IndexedDatasetBuilder(object):
         index.write(struct.pack('<Q', 1))
         index.write(struct.pack('<QQ', code(self.dtype), self.element_size))
         index.write(struct.pack('<QQ', len(self.data_offsets) - 1, len(self.sizes)))
+        index.write(struct.pack('<Q', len(self.doc_idx)))
         write_longs(index, self.dim_offsets)
         write_longs(index, self.data_offsets)
         write_longs(index, self.sizes)
+        write_longs(index, self.doc_idx)
         index.close()
 
 
@@ -316,10 +331,11 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
                     return pointers
 
-                def write(self, sizes):
+                def write(self, sizes, doc_idx):
                     pointers = self._get_pointers(sizes)
 
                     self._file.write(struct.pack('<Q', len(sizes)))
+                    self._file.write(struct.pack('<Q', len(doc_idx)))
 
                     sizes = np.array(sizes, dtype=np.int32)
                     self._file.write(sizes.tobytes(order='C'))
@@ -328,6 +344,9 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                     pointers = np.array(pointers, dtype=np.int64)
                     self._file.write(pointers.tobytes(order='C'))
                     del pointers
+
+                    doc_idx = np.array(doc_idx, dtype=np.int64)
+                    self._file.write(doc_idx.tobytes(order='C'))
 
                 def __exit__(self, exc_type, exc_val, exc_tb):
                     self._file.close()
@@ -349,6 +368,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                 self._dtype_size = self._dtype().itemsize
 
                 self._len = struct.unpack('<Q', stream.read(8))[0]
+                self._doc_count = struct.unpack('<Q', stream.read(8))[0]
                 offset = stream.tell()
 
             _warmup_mmap_file(path)
@@ -358,7 +378,8 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             self._sizes = np.frombuffer(self._bin_buffer, dtype=np.int32, count=self._len, offset=offset)
             self._pointers = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._len,
                                            offset=offset + self._sizes.nbytes)
-
+            self._doc_idx = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._doc_count,
+                                          offset=offset + self._sizes.nbytes + self._pointers.nbytes)
         def __del__(self):
             self._bin_buffer_mmap._mmap.close()
             del self._bin_buffer_mmap
@@ -370,6 +391,10 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         @property
         def sizes(self):
             return self._sizes
+
+        @property
+        def doc_idx(self):
+            return self._doc_idx
 
         @lru_cache(maxsize=8)
         def __getitem__(self, i):
@@ -423,6 +448,10 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         return self._index.sizes
 
     @property
+    def doc_idx(self):
+        return self._index.doc_idx
+
+    @property
     def supports_prefetch(self):
         return False
 
@@ -438,11 +467,15 @@ class MMapIndexedDatasetBuilder(object):
         self._data_file = open(out_file, 'wb')
         self._dtype = dtype
         self._sizes = []
+        self._doc_idx = [0]
 
     def add_item(self, tensor):
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
+
+    def end_document(self):
+        self._doc_idx.append(len(self._sizes))
 
     def merge_file_(self, another_file):
         # Concatenate index
@@ -460,4 +493,30 @@ class MMapIndexedDatasetBuilder(object):
         self._data_file.close()
 
         with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
-            index.write(self._sizes)
+            index.write(self._sizes, self._doc_idx)
+
+class indexed_doc_dataset(torch.utils.data.Dataset):
+    def __init__(self, path):
+        impl = infer_dataset_impl(path)
+        self.ds = make_dataset(path, impl)
+        self._docs = []
+        doc_idxs = []
+        for i, s in enumerate(self._sizes):
+            if s > 0:
+                doc_idxs.append(i)
+            else:
+                self._docs.append(doc_idxs)
+                doc_idxs = []
+
+    def __getitem__(self, i):
+        if not isinstance(i, tuple):
+            raise ValueError("Index into indexed_doc_dataset must be a tuple")
+        idx = self._docs[i[0]][i[1]]
+        return self.ds[idx]
+
+    def __len__(self):
+        """Returns number of documents, not number of sentences"""
+        return len(self._docs)
+
+    def doc_len(self, d):
+        return len(self._docs[d])
