@@ -5,13 +5,18 @@ import collections
 import numpy as np
 
 
-def build_training_sample(sample, vocab_id_list, vocab_id_to_token_dict,
+def build_training_sample(sample,
+                          target_seq_length, max_seq_length,
+                          vocab_id_list, vocab_id_to_token_dict,
                           cls_id, sep_id, mask_id, pad_id,
-                          masked_lm_prob, max_seq_length, rng):
+                          masked_lm_prob, rng):
     """Biuld training sample.
 
     Arguments:
         sample: A list of sentences in which each sentence is a list token ids.
+        target_seq_length: Desired sequence length.
+        max_seq_length: Maximum length of the sequence. All values are padded to
+            this length.
         vocab_id_list: List of vocabulary ids. Used to pick a random id.
         vocab_id_to_token_dict: A dictionary from vocab ids to text tokens.
         cls_id: Start of example id.
@@ -19,20 +24,19 @@ def build_training_sample(sample, vocab_id_list, vocab_id_to_token_dict,
         mask_id: Mask token id.
         pad_id: Padding token id.
         masked_lm_prob: Probability to mask tokens.
-        max_seq_length: Maximum length of the sequence. All values are padded to
-            this length.
         rng: Random number genenrator.
     """
 
     # We assume that we have at least two sentences in the sample
     assert len(sample) > 1
+    assert target_seq_length <= max_seq_length
 
     # Divide sample into two segments (A and B).
     tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, rng)
 
-    # Truncate to `max_sequence_length`.
+    # Truncate to `target_sequence_length`.
     # Note that we have account for [CLS] A [SEP] B [SEP]
-    max_num_tokens = max_seq_length - 3
+    max_num_tokens = target_seq_length - 3
     truncate_segments(tokens_a, tokens_b, len(tokens_a), len(tokens_b),
                       max_num_tokens, rng)
 
@@ -421,11 +425,13 @@ if __name__ == '__main__':
     for s in samples[0]:
         sample.append(tokenizer.convert_tokens_to_ids(s))
     max_seq_length = 512
+    target_seq_length = 444
     masked_lm_prob = 0.15
     example = build_training_sample(sample,
+                                    target_seq_length, max_seq_length,
                                     vocab_id_list, vocab_id_to_token_dict,
                                     cls_id, sep_id, mask_id, pad_id,
-                                    masked_lm_prob, max_seq_length, rng)
+                                    masked_lm_prob, rng)
 
     orig_tokens = []
     for s in samples[0]:

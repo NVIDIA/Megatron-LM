@@ -7,18 +7,55 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from dataset_utils import build_training_sample
 
-# WILL BE REPLACED WITH JARED'S
-class JaredDataset(object):
 
-    def __init__(self, doc_idx, sizes, sentences):
-        self.doc_idx = doc_idx
-        self.num_docs = len(self.doc_idx) - 1
-        self.sizes = sizes
-        self.sentences = sentences
+class AlbertDataSet(Dataset):
+
+    def __init__(self, indexed_dataset, tokenizer, num_epochs,
+                 masked_lm_prob, max_seq_length, short_seq_prob, seed):
+
+        # Params to store.
+        self.seed = seed
+        self.masked_lm_prob = masked_lm_prob
+        self.max_seq_length = max_seq_length
+
+        # Indexed dataset.
+        self.indexed_dataset = indexed_dataset
+
+        # Build the samples mapping.
+        self.samples_mapping = build_training_samples_mapping(
+            indexed_dataset,
+            num_epochs,
+            self.max_seq_length,
+            short_seq_prob,
+            self.seed)
+
+        # Vocab stuff.
+        self.vocab_id_list = list(tokenizer.inv_vocab.keys())
+        self.vocab_id_to_token_dict = tokenizer.inv_vocab
+        self.cls_id = tokenizer.vocab['[CLS]']
+        self.sep_id = tokenizer.vocab['[SEP]']
+        self.mask_id = tokenizer.vocab['[MASK]']
+        self.pad_id = tokenizer.vocab['[PAD]']
+
+
+    def __len__(self):
+        return self.samples.shape[0]
 
     def __getitem__(self, idx):
-        return self.sentences[idx]
+        rng = random.Random(self.seed + idx)
+        start_index, end_index, seq_length = self.samples_mapping[idx]
+        sample = []
+        for index in range(start_index, end_index):
+            sample.append(self.indexed_dataset[index])
+        return build_training_sample(sample, seq_length,
+                                     self.max_seq_length,
+                                     self.vocab_id_list,
+                                     self.vocab_id_to_token_dict,
+                                     self.cls_id, self.sep_id,
+                                     self.mask_id, self.pad_id,
+                                     self.masked_lm_prob, rng)
 
 
 def get_target_seq_length(max_num_tokens, short_seq_prob, np_rng):
@@ -87,6 +124,7 @@ def build_training_samples_mapping(indexed_dataset, num_epochs, max_seq_length,
             while sent_index < sent_index_last:
 
                 # Get the size.
+                assert indexed_dataset.sizes[sent_index] > 0
                 size += indexed_dataset.sizes[sent_index]
                 sent_index += 1
 
@@ -133,51 +171,17 @@ def build_training_samples_mapping(indexed_dataset, num_epochs, max_seq_length,
     return samples_np
 
 
-class AlbertDataSet(Dataset):
+# WILL BE REPLACED WITH JARED'S
+class JaredDataset(object):
 
-    def __init__(self, indexed_dataset, tokenizer, num_epochs,
-                 masked_lm_prob, max_seq_length, short_seq_prob, seed):
-
-        # Params to store.
-        self.seed = seed
-        self.masked_lm_prob = masked_lm_prob
-        self.max_seq_length = max_seq_length
-
-        # Indexed dataset.
-        self.indexed_dataset = indexed_dataset
-
-        # Build the samples mapping.
-        self.samples_mapping = build_training_samples_mapping(
-            indexed_dataset,
-            num_epochs,
-            self.max_seq_length,
-            short_seq_prob,
-            self.seed)
-
-        # Vocab stuff.
-        self.vocab_id_list = list(tokenizer.inv_vocab.keys())
-        self.vocab_id_to_token_dict = tokenizer.inv_vocab
-        self.cls_id = tokenizer.vocab['[CLS]']
-        self.sep_id = tokenizer.vocab['[SEP]']
-        self.mask_id = tokenizer.vocab['[MASK]']
-        self.pad_id = tokenizer.vocab['[PAD]']
-
-
-    def __len__(self):
-        return self.samples.shape[0]
+    def __init__(self, doc_idx, sizes, sentences):
+        self.doc_idx = doc_idx
+        self.num_docs = len(self.doc_idx) - 1
+        self.sizes = sizes
+        self.sentences = sentences
 
     def __getitem__(self, idx):
-        rng = random.Random(self.seed + idx)
-        start_index, end_index = self.samples_mapping[idx]
-        sample = []
-        for index in range(start_index, end_index):
-            sample.append(self.indexed_dataset[index])
-        return build_training_sample(sample, self.vocab_id_list,
-                                     self.vocab_id_to_token_dict,
-                                     self.cls_id, self.sep_id,
-                                     self.mask_id, self.pad_id,
-                                     self.masked_lm_prob, self.max_seq_length,
-                                     rng)
+        return self.sentences[idx]
 
 
 
@@ -198,10 +202,12 @@ if __name__ == '__main__':
                 sentences = []
                 for line in text.split('\n'):
                     if line != '\n':
-                        sentences.extend(nltk.tokenize.sent_tokenize(line))
+                        sent = nltk.tokenize.sent_tokenize(line)
+                        if sent:
+                            sentences.extend(sent)
                 yield sentences
 
-    input_file = '/raid/mshoeybi/data/albert/sample/samples_11.json'
+    input_file = '/raid/mshoeybi/data/albert/sample/samples_1000.json'
     vocab_file = '/raid/mshoeybi/data/albert/bert_vocab/vocab.txt'
 
     tokenizer = FullTokenizer(vocab_file, do_lower_case=True)
@@ -212,19 +218,28 @@ if __name__ == '__main__':
     sentences_list = []
 
     for sentences in document_generator:
-        doc_idx.append(len(sentences))
+        num_sent = 0
         for sentence in sentences:
             tokens = tokenizer.tokenize(sentence)
-            ids = tokenizer.convert_tokens_to_ids(tokens)
-            sizes.append(len(ids))
-            sentences_list.append(ids)
+            if tokens:
+                ids = tokenizer.convert_tokens_to_ids(tokens)
+                if len(ids) == 0:
+                    print('****************')
+                    print(sentence)
+                    print(tokens)
+                    print(ids)
+                    print('****************')
+                sizes.append(len(ids))
+                sentences_list.append(ids)
+                num_sent += 1
+        doc_idx.append(num_sent)
     for i in range(1, len(doc_idx)):
         doc_idx[i] += doc_idx[i-1]
 
     indexed_dataset = JaredDataset(doc_idx, sizes, sentences_list)
     dataset = AlbertDataSet(indexed_dataset=indexed_dataset,
                             tokenizer=tokenizer,
-                            num_epochs=3,
+                            num_epochs=10,
                             masked_lm_prob=0.15,
                             max_seq_length=512,
                             short_seq_prob=0.1,
