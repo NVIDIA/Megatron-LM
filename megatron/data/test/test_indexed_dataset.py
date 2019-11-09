@@ -18,14 +18,14 @@ def test_indexed_dataset(args):
     if ds.supports_prefetch:
         # just prefetch the whole thing in test (so assume it is small)
         ds.prefetch(range(len(ds)))
-    for i in range(1):
+    for i in range(2):
         start = ds.doc_idx[i]
         end = ds.doc_idx[i+1]
-        print(start, end)
-        for j in range(start, end):
-            ids = ds[j].data.tolist()
-            print(ids)
-            tokens = tokenizer.convert_ids_to_tokens(ids)
+        ids = ds[start:end]
+        for s in ids:
+            l = s.data.tolist()
+            print(l)
+            tokens = tokenizer.convert_ids_to_tokens(l)
             print(tokens)
         print("******** END DOCUMENT **********")
 
