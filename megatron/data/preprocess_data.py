@@ -44,7 +44,8 @@ class Encoder(object):
         for sentence in Encoder.splitter.tokenize(text):
             tokens = Encoder.tokenizer.tokenize(sentence)
             ids = Encoder.tokenizer.convert_tokens_to_ids(tokens)
-            doc_ids.append(ids)
+            if len(ids) > 0:
+                doc_ids.append(ids)
         return doc_ids, len(json_line)
 
 def main():
