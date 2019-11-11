@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 from dataset_utils import build_training_sample
-
+#from data.mapping import build_training_samples_mapping
 
 class AlbertDataSet(Dataset):
 
@@ -57,7 +57,7 @@ class AlbertDataSet(Dataset):
                                      self.mask_id, self.pad_id,
                                      self.masked_lm_prob, rng)
 
-
+'''
 def get_target_seq_length(max_num_tokens, short_seq_prob, np_rng):
     """With probability `short_seq_prob` generate a smaller sequence lenght."""
     if np_rng.random() < short_seq_prob:
@@ -169,7 +169,7 @@ def build_training_samples_mapping(indexed_dataset, num_epochs, max_seq_length,
     print('****************************************************************\n')
 
     return samples_np
-
+'''
 
 # WILL BE REPLACED WITH JARED'S
 class JaredDataset(object):
@@ -207,7 +207,7 @@ if __name__ == '__main__':
                             sentences.extend(sent)
                 yield sentences
 
-    input_file = '/raid/mshoeybi/data/albert/sample/samples_1000.json'
+    input_file = '/raid/mshoeybi/data/albert/sample/samples_11.json'
     vocab_file = '/raid/mshoeybi/data/albert/bert_vocab/vocab.txt'
 
     tokenizer = FullTokenizer(vocab_file, do_lower_case=True)
@@ -235,6 +235,55 @@ if __name__ == '__main__':
         doc_idx.append(num_sent)
     for i in range(1, len(doc_idx)):
         doc_idx[i] += doc_idx[i-1]
+
+    #max_size = np.iinfo(np.int32).max // 32
+
+    import time
+
+    docs_np = np.array(doc_idx, dtype=np.uint32)
+    sizes_np = np.array(sizes, dtype=np.uint16)
+
+    start_time = time.time()
+    max_seq_length = 512
+    max_size = docs_np.shape[0]
+    lens = np.full(max_size, max_seq_length-3, dtype=np.uint16)
+    lens_rand = np.random.randint(low=2, high=(max_seq_length-2),
+                                  size=max_size//10, dtype=np.uint16)
+    lens_view = lens[:max_size//10]
+    np.copyto(lens_view, lens_rand)
+    np.random.shuffle(lens)
+    print('num docs', max_size)
+    print('lens time', time.time() - start_time)
+
+    import helpers
+    start_time = time.time()
+    maps = helpers.build_mapping(docs_np, sizes_np, 10, 100, 509, 0.1, 1234)
+    print('maps time', time.time() - start_time)
+    print(maps)
+    exit()
+
+    start_time = time.time()
+    max_size = 10 #np.iinfo(np.int32).max 32
+    docs = np.arange(10, dtype=np.uint32)
+    print(docs)
+
+    a = example.doit(docs, max_size)
+    print(type(a))
+    print(a.shape)
+    print(a)
+    print(time.time() - start_time)
+    exit()
+
+
+    #start_time = time.time()
+    count = doit(maps, docs_np, sizes_np, lens,docs_np.shape[0]-1, 10)
+    print(count)
+    maps = maps[:count]
+    np.random.shuffle(maps)
+    print(time.time() - start_time)
+
+
+    exit()
 
     indexed_dataset = JaredDataset(doc_idx, sizes, sentences_list)
     dataset = AlbertDataSet(indexed_dataset=indexed_dataset,
