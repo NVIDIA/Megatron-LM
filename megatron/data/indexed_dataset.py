@@ -458,7 +458,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             if self._index.dtype != np.int64:
                 np_array = np_array.astype(np.int64)
 
-            return torch.from_numpy(np_array)
+            return np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step != 1:

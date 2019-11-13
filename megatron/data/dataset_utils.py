@@ -35,10 +35,9 @@ def build_training_sample(sample,
     tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, rng)
 
     # Truncate to `target_sequence_length`.
-    # Note that we have account for [CLS] A [SEP] B [SEP]
-    max_num_tokens = target_seq_length - 3
-    truncate_segments(tokens_a, tokens_b, len(tokens_a), len(tokens_b),
-                      max_num_tokens, rng)
+    max_num_tokens = target_seq_length
+    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a), len(tokens_b),
+                                  max_num_tokens, rng)
 
     # Build tokens and toketypes.
     tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b,
@@ -48,7 +47,7 @@ def build_training_sample(sample,
     max_predictions_per_seq = masked_lm_prob * max_num_tokens
     (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
         tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
-        cls_id, sep_id, mask_id, max_predictions_per_seq)
+        cls_id, sep_id, mask_id, max_predictions_per_seq, rng)
 
     # Padding.
     tokens_np, tokentypes_np, labels, padding_mask, loss_mask \
@@ -61,7 +60,8 @@ def build_training_sample(sample,
         'labels': labels,
         'is_random': int(is_next_random),
         'loss_mask': loss_mask,
-        'padding_mask': padding_mask}
+        'padding_mask': padding_mask,
+        'truncated': int(truncated)}
     return train_sample
 
 
@@ -99,11 +99,12 @@ def get_a_and_b_segments(sample, rng):
 
 def truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, rng):
     """Truncates a pair of sequences to a maximum sequence length."""
+    #print(len_a, len_b, max_num_tokens)
     assert len_a > 0
     assert len_b > 0
-    if (len_a + len_b) <= max_num_tokens:
-        return
-    else:
+    if len_a + len_b <= max_num_tokens:
+        return False
+    while len_a + len_b > max_num_tokens:
         if len_a > len_b:
             len_a -= 1
             tokens = tokens_a
@@ -114,8 +115,7 @@ def truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, rng):
             del tokens[0]
         else:
             tokens.pop()
-        truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, rng)
-
+    return True
 
 def create_tokens_and_tokentypes(tokens_a, tokens_b, cls_id, sep_id):
     """Merge segments A and B, add [CLS] and [SEP] and build tokentypes."""
@@ -161,6 +161,7 @@ def create_masked_lm_predictions(tokens,
                                  masked_lm_prob,
                                  cls_id, sep_id, mask_id,
                                  max_predictions_per_seq,
+                                 rng,
                                  max_ngrams=3,
                                  do_whole_word_mask=True,
                                  favor_longer_ngram=False,
@@ -468,4 +469,3 @@ if __name__ == '__main__':
         string += '{:5d}'.format(tokentype)
         string += '{:5d}'.format(padding_mask)
         print(string)
-

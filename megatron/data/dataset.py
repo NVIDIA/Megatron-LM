@@ -7,27 +7,36 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from dataset_utils import build_training_sample
+from .dataset_utils import build_training_sample
 #from data.mapping import build_training_samples_mapping
 
-class AlbertDataSet(Dataset):
+from . import helpers
+from megatron.data import FullBertTokenizer, indexed_dataset
 
-    def __init__(self, indexed_dataset, tokenizer, num_epochs,
+
+class AlbertDataset(Dataset):
+
+    def __init__(self, indexed_dataset, tokenizer, num_epochs, max_num_samples,
                  masked_lm_prob, max_seq_length, short_seq_prob, seed):
 
         # Params to store.
         self.seed = seed
         self.masked_lm_prob = masked_lm_prob
         self.max_seq_length = max_seq_length
+        self.tokenizer = tokenizer
 
         # Indexed dataset.
         self.indexed_dataset = indexed_dataset
 
         # Build the samples mapping.
-        self.samples_mapping = build_training_samples_mapping(
-            indexed_dataset,
+        if not max_num_samples:
+            max_num_samples = len(indexed_dataset) * num_epochs
+        self.samples_mapping = helpers.build_mapping(
+            indexed_dataset.doc_idx,
+            indexed_dataset.sizes,
             num_epochs,
-            self.max_seq_length,
+            max_num_samples,
+            self.max_seq_length-3, # account for added tokens
             short_seq_prob,
             self.seed)
 
@@ -40,8 +49,17 @@ class AlbertDataSet(Dataset):
         self.pad_id = tokenizer.vocab['[PAD]']
 
 
+    @classmethod
+    def from_paths(cls, vocab, data_prefix, data_impl,
+                   num_epochs, max_num_samples, masked_lm_prob,
+                   max_seq_length, short_seq_prob, seed):
+        tokenizer = FullBertTokenizer(vocab, do_lower_case=True)
+        idx_ds = indexed_dataset.make_dataset(data_prefix, data_impl)
+        return cls(idx_ds, tokenizer, num_epochs, max_num_samples, masked_lm_prob,
+                   max_seq_length, short_seq_prob, seed)
+
     def __len__(self):
-        return self.samples.shape[0]
+        return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
         rng = random.Random(self.seed + idx)
@@ -49,6 +67,9 @@ class AlbertDataSet(Dataset):
         sample = []
         for index in range(start_index, end_index):
             sample.append(self.indexed_dataset[index])
+        for s in sample:
+            if len(s) > 1000:
+                print(self.tokenizer.convert_ids_to_tokens(s))
         return build_training_sample(sample, seq_length,
                                      self.max_seq_length,
                                      self.vocab_id_list,
@@ -186,7 +207,6 @@ class JaredDataset(object):
 
 
 if __name__ == '__main__':
-
     print('dataset ...')
 
     from bert_tokenization import FullTokenizer
@@ -207,8 +227,8 @@ if __name__ == '__main__':
                             sentences.extend(sent)
                 yield sentences
 
-    input_file = '/raid/mshoeybi/data/albert/sample/samples_11.json'
-    vocab_file = '/raid/mshoeybi/data/albert/bert_vocab/vocab.txt'
+    input_file = 'test/samples_10000.json'
+    vocab_file = 'test/vocab.txt'
 
     tokenizer = FullTokenizer(vocab_file, do_lower_case=True)
     document_generator = document_generator_provider(input_file)
