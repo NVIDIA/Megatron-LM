@@ -32,12 +32,36 @@ def should_split(split):
     """
     given split proportions checks if should split
     Examples:
-    >>> should_split([10,0,0]) 
+    >>> should_split([10,0,0])
     False
     >>> should_split([1,.1,.2])
     True
     """
     return max(split)/sum(split) != 1.
+
+def get_split(args):
+    """
+    Get dataset splits from comma separated string list
+    """
+    splits = []
+    if args.split.find(',') != -1:
+        splits = [float(s) for s in args.split.split(',')]
+    elif args.split.find('/') != -1:
+        splits = [float(s) for s in args.split.split('/')]
+    else:
+        splits = [float(args.split)]
+    split_total = sum(splits)
+    if split_total < 1.:
+        splits.append(1-split_total)
+    while len(splits) < 3:
+        splits.append(0.)
+    splits = splits[:3]
+    if args.valid_data is not None:
+        splits[1] = 0.
+    if args.test_data is not None:
+        splits[2] = 0.
+    final_sum = sum(splits)
+    return [s/final_sum for s in splits]
 
 def get_ext(path):
     """gets path extension"""
@@ -108,7 +132,7 @@ def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=N
         ds = ConcatDataset(datasets)
     # make tokenizer for dataset
     if tokenizer is None:
-        tokenizer = make_tokenizer(tokenizer_type, ds, tokenizer_model_path, vocab_size, model_type, 
+        tokenizer = make_tokenizer(tokenizer_type, ds, tokenizer_model_path, vocab_size, model_type,
                                     pad_token, character_converage, **kwargs)
 
     ds_type = ''

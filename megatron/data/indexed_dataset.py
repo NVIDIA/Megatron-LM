@@ -51,13 +51,15 @@ def make_builder(out_file, impl, vocab_size=None):
         return IndexedDatasetBuilder(out_file)
 
 
-def make_dataset(path, impl):
+def make_dataset(path, impl, skip_warmup=False):
+    if impl == 'infer':
+        impl = infer_dataset_impl(path)
     if impl == 'lazy' and IndexedDataset.exists(path):
         return IndexedDataset(path)
     elif impl == 'cached' and IndexedDataset.exists(path):
         return IndexedCachedDataset(path)
     elif impl == 'mmap' and MMapIndexedDataset.exists(path):
-        return MMapIndexedDataset(path)
+        return MMapIndexedDataset(path, skip_warmup)
     return None
 
 
@@ -315,7 +317,7 @@ class IndexedDatasetBuilder(object):
 
 def _warmup_mmap_file(path):
     with open(path, 'rb') as stream:
-        while stream.read(100 * 1024 * 1024):
+        while stream.read(1 * 1024 * 1024):
             pass
 
 
@@ -369,7 +371,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
             return _Writer()
 
-        def __init__(self, path):
+        def __init__(self, path, skip_warmup=False):
             with open(path, 'rb') as stream:
                 magic_test = stream.read(9)
                 assert self._HDR_MAGIC == magic_test, (
@@ -387,13 +389,18 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                 self._doc_count = struct.unpack('<Q', stream.read(8))[0]
                 offset = stream.tell()
 
-            _warmup_mmap_file(path)
+            if not skip_warmup:
+                print(">    Warming up index mmap file...")
+                _warmup_mmap_file(path)
 
             self._bin_buffer_mmap = np.memmap(path, mode='r', order='C')
             self._bin_buffer = memoryview(self._bin_buffer_mmap)
+            print(">    Reading sizes...")
             self._sizes = np.frombuffer(self._bin_buffer, dtype=np.int32, count=self._len, offset=offset)
+            print(">    Reading pointers...")
             self._pointers = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._len,
                                            offset=offset + self._sizes.nbytes)
+            print(">    Reading document index...")
             self._doc_idx = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._doc_count,
                                           offset=offset + self._sizes.nbytes + self._pointers.nbytes)
         def __del__(self):
@@ -419,14 +426,14 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         def __len__(self):
             return self._len
 
-    def __init__(self, path):
+    def __init__(self, path, skip_warmup=False):
         super().__init__()
 
         self._path = None
         self._index = None
         self._bin_buffer = None
 
-        self._do_init(path)
+        self._do_init(path, skip_warmup)
 
     def __getstate__(self):
         return self._path
@@ -434,13 +441,18 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     def __setstate__(self, state):
         self._do_init(state)
 
-    def _do_init(self, path):
+    def _do_init(self, path, skip_warmup):
         self._path = path
-        self._index = self.Index(index_file_path(self._path))
+        self._index = self.Index(index_file_path(self._path), skip_warmup)
 
-        _warmup_mmap_file(data_file_path(self._path))
+        if not skip_warmup:
+            print(">    Warming up data mmap file...")
+            _warmup_mmap_file(data_file_path(self._path))
+        print(">    Creating numpy buffer of mmap...")
         self._bin_buffer_mmap = np.memmap(data_file_path(self._path), mode='r', order='C')
+        print(">    Creating memory view of numpy buffer...")
         self._bin_buffer = memoryview(self._bin_buffer_mmap)
+        print(">    Done")
 
     def __del__(self):
         self._bin_buffer_mmap._mmap.close()
@@ -522,29 +534,3 @@ class MMapIndexedDatasetBuilder(object):
 
         with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
             index.write(self._sizes, self._doc_idx)
-
-class indexed_doc_dataset(torch.utils.data.Dataset):
-    def __init__(self, path):
-        impl = infer_dataset_impl(path)
-        self.ds = make_dataset(path, impl)
-        self._docs = []
-        doc_idxs = []
-        for i, s in enumerate(self._sizes):
-            if s > 0:
-                doc_idxs.append(i)
-            else:
-                self._docs.append(doc_idxs)
-                doc_idxs = []
-
-    def __getitem__(self, i):
-        if not isinstance(i, tuple):
-            raise ValueError("Index into indexed_doc_dataset must be a tuple")
-        idx = self._docs[i[0]][i[1]]
-        return self.ds[idx]
-
-    def __len__(self):
-        """Returns number of documents, not number of sentences"""
-        return len(self._docs)
-
-    def doc_len(self, d):
-        return len(self._docs[d])

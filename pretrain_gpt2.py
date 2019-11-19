@@ -168,10 +168,10 @@ def get_train_val_test_data(args):
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if args.use_npy_data_loader:
+        if args.data_loader == 'numpy':
             (train_data, val_data, test_data), num_tokens, \
                 eod_token = make_gpt2_dataloaders(args)
-        else:
+        elif args.data_loader == 'raw' or args.data_loader == 'tfrecords'
             data_config = configure_data()
             data_config.set_defaults(data_set_type='GPT2', transpose=False)
             (train_data, val_data, test_data), tokenizer = data_config.apply(

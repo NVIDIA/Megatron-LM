@@ -116,7 +116,7 @@ def make_tfrecord_loaders(args):
 def make_loaders(args):
     """makes training/val/test"""
 
-    if args.use_tfrecords:
+    if args.data_loader == 'tfrecords':
         return make_tfrecord_loaders(args)
     world_size = torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group())
@@ -134,7 +134,7 @@ def make_loaders(args):
     data_set_args = {
         'path': args.train_data,
         'seq_length': seq_length,
-        'lazy': args.lazy_loader,
+        'lazy': args.data_loader == 'lazy',
         'delim': args.delim,
         'text_key': args.text_key,
         'label_key': 'label',

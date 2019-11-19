@@ -29,8 +29,13 @@ class AlbertDataset(Dataset):
         self.indexed_dataset = indexed_dataset
 
         # Build the samples mapping.
+        if not num_epochs:
+            if not max_num_samples:
+                raise ValueError("Need to specify either max_num_samples or num_epochs")
+            num_epochs = int(max_num_samples / len(indexed_dataset)) + 1
         if not max_num_samples:
             max_num_samples = len(indexed_dataset) * num_epochs
+        print(f"Building the sample map for {num_epochs} epochs or {max_num_samples} samples.")
         self.samples_mapping = helpers.build_mapping(
             indexed_dataset.doc_idx,
             indexed_dataset.sizes,
@@ -52,11 +57,16 @@ class AlbertDataset(Dataset):
     @classmethod
     def from_paths(cls, vocab, data_prefix, data_impl,
                    num_epochs, max_num_samples, masked_lm_prob,
-                   max_seq_length, short_seq_prob, seed):
+                   max_seq_length, short_seq_prob, seed, skip_warmup=False):
         tokenizer = FullBertTokenizer(vocab, do_lower_case=True)
-        idx_ds = indexed_dataset.make_dataset(data_prefix, data_impl)
+        print("> Reading dataset index")
+        idx_ds = indexed_dataset.make_dataset(data_prefix, data_impl, skip_warmup)
+        print("> Finished creating indexed dataset")
         return cls(idx_ds, tokenizer, num_epochs, max_num_samples, masked_lm_prob,
                    max_seq_length, short_seq_prob, seed)
+
+    def num_tokens(self):
+        return self.tokenizer.vocab_size()
 
     def __len__(self):
         return self.samples_mapping.shape[0]

@@ -30,8 +30,9 @@ py::array build_mapping_impl(const py::array_t<uint32_t>& docs_,
                              const double short_seq_prob,
                              const int seed) {
 
-    cout << "> building dataset mapping for " << docs_.shape(0) - 1 <<
-            " documents with " << sizes_.shape(0) << " sentences ..." << endl;
+    cout << "> building dataset mapping for " << docs_.shape(0) - 1\
+         << " documents with " << sizes_.shape(0) << " sentences ..."
+         << std::flush << endl;
 
     // For efficiency, convert probability to ratio.
     const auto short_seq_ratio = static_cast<int>(round(1.0 / short_seq_prob));
@@ -72,8 +73,8 @@ py::array build_mapping_impl(const py::array_t<uint32_t>& docs_,
         // For each epoch:
         for (int epoch=0; epoch < num_epochs; ++epoch) {
             if (map_index >= max_num_samples && !second) {
-                cout << " > reached " << max_num_samples << " samples after " <<
-                        epoch << " epochs ..." << endl;
+                cout << " > reached " << max_num_samples << " samples after "
+                     << epoch << " epochs ..." << std::flush << endl;
                 break;
             }
             // For each document:
@@ -96,8 +97,8 @@ py::array build_mapping_impl(const py::array_t<uint32_t>& docs_,
                         empty_docs += 1;
                     }
                     if (num_remain_sent == 1) {
-                        cout << "***WARNING*** document " << doc <<
-                                " has one sentence" << endl;
+                        // cout << "***WARNING*** document " << doc <<
+                        //         " has one sentence" << endl;
                         one_sent_docs += 1;
                     }
                 }
