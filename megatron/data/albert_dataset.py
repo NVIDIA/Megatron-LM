@@ -12,6 +12,7 @@ from .dataset_utils import build_training_sample
 
 from . import helpers
 from megatron.data import FullBertTokenizer, indexed_dataset
+from megatron.utils import print_rank_0
 
 
 class AlbertDataset(Dataset):
@@ -31,11 +32,19 @@ class AlbertDataset(Dataset):
         # Build the samples mapping.
         if not num_epochs:
             if not max_num_samples:
-                raise ValueError("Need to specify either max_num_samples or num_epochs")
-            num_epochs = int(max_num_samples / len(indexed_dataset)) + 1
+                raise ValueError("Need to specify either max_num_samples "
+                                 "or num_epochs")
+            num_epochs = np.iinfo(np.int32).max - 1
         if not max_num_samples:
-            max_num_samples = len(indexed_dataset) * num_epochs
-        print(f"Building the sample map for {num_epochs} epochs or {max_num_samples} samples.")
+            max_num_samples = np.iinfo(np.int64).max - 1
+
+        # Make sure the types match the helpers input types.
+        assert indexed_dataset.doc_idx.dtype == np.int64
+        assert indexed_dataset.sizes.dtype == np.int32
+
+        # Build samples mapping
+        verbose = torch.distributed.get_rank()==0
+        start_time = time.time()
         self.samples_mapping = helpers.build_mapping(
             indexed_dataset.doc_idx,
             indexed_dataset.sizes,
@@ -43,7 +52,14 @@ class AlbertDataset(Dataset):
             max_num_samples,
             self.max_seq_length-3, # account for added tokens
             short_seq_prob,
-            self.seed)
+            self.seed,
+            verbose)
+        # Make sure all the ranks have built the mapping
+        torch.distributed.barrier()
+        print_rank_0('> elasped time to build samples mapping (seconds): '
+                     '{:2f}'.format(time.time() - start_time))
+
+        exit()
 
         # Vocab stuff.
         self.vocab_id_list = list(tokenizer.inv_vocab.keys())
@@ -59,11 +75,12 @@ class AlbertDataset(Dataset):
                    num_epochs, max_num_samples, masked_lm_prob,
                    max_seq_length, short_seq_prob, seed, skip_warmup=False):
         tokenizer = FullBertTokenizer(vocab, do_lower_case=True)
-        print("> Reading dataset index")
-        idx_ds = indexed_dataset.make_dataset(data_prefix, data_impl, skip_warmup)
-        print("> Finished creating indexed dataset")
-        return cls(idx_ds, tokenizer, num_epochs, max_num_samples, masked_lm_prob,
-                   max_seq_length, short_seq_prob, seed)
+        print_rank_0("> Reading dataset index ...")
+        idx_ds = indexed_dataset.make_dataset(data_prefix, data_impl,
+                                              skip_warmup)
+        print_rank_0("> Finished creating indexed dataset")
+        return cls(idx_ds, tokenizer, num_epochs, max_num_samples,
+                   masked_lm_prob, max_seq_length, short_seq_prob, seed)
 
     def num_tokens(self):
         return self.tokenizer.vocab_size()
