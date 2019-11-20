@@ -121,14 +121,19 @@ def get_train_val_test_data(args):
             if not args.data_path:
                 print("Albert currently only supports a unified dataset specified with --data-path")
                 exit(1)
-            print("Creating AlbertDataset...")
-            full_data = AlbertDataset.from_paths(args.vocab, args.data_path,
-                                                 args.data_impl, args.data_epochs,
-                                                 args.max_num_samples,
-                                                 args.mask_prob, args.seq_length,
-                                                 args.short_seq_prob,
-                                                 args.seed, args.skip_mmap_warmup)
-            print("Finished creating AlbertDataset...")
+            print_rank_0("Creating AlbertDataset...")
+            full_data = AlbertDataset(
+                vocab_file=args.vocab,
+                data_prefix=args.data_path,
+                data_impl=args.data_impl,
+                skip_warmup=args.skip_mmap_warmup,
+                num_epochs=args.data_epochs,
+                max_num_samples=args.max_num_samples,
+                masked_lm_prob=args.mask_prob,
+                max_seq_length=args.seq_length,
+                short_seq_prob=args.short_seq_prob,
+                seed=args.seed)
+            print_rank_0("Finished creating AlbertDataset...")
             split = split_dataset.get_split(args)
             if split_dataset.should_split(split):
                 train_ds, val_ds, test_ds = split_dataset.split_ds(full_data, split, args.shuffle)
