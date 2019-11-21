@@ -72,7 +72,7 @@ def get_batch(data_iterator, timers):
     next_sentence = data_b['is_random'].long()
     loss_mask = data_b['mask'].float()
     lm_labels = data_b['mask_labels'].long()
-    padding_mask = data_b['pad_mask'].byte()
+    padding_mask = data_b['pad_mask'].long()
 
     return tokens, types, next_sentence, loss_mask, lm_labels, padding_mask
 

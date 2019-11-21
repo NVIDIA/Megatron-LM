@@ -73,7 +73,7 @@ def get_batch(data_iterator, timers):
     sentence_order = data_b['is_random'].long()
     loss_mask = data_b['loss_mask'].float()
     lm_labels = data_b['labels'].long()
-    padding_mask = data_b['padding_mask'].byte()
+    padding_mask = data_b['padding_mask'].long()
 
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
@@ -88,7 +88,7 @@ def forward_step(data_iterator, model, args, timers):
     timers('batch generator').stop()
 
     # Forward model.
-    lm_logits, sop_logits = model(tokens, 1-padding_mask, tokentype_ids=types)
+    lm_logits, sop_logits = model(tokens, padding_mask, tokentype_ids=types)
 
     sop_loss = F.cross_entropy(sop_logits.view(-1, 2).contiguous().float(),
                                sentence_order.view(-1).contiguous(),

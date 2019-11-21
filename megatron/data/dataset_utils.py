@@ -24,7 +24,9 @@ def build_training_sample(sample,
         mask_id: Mask token id.
         pad_id: Padding token id.
         masked_lm_prob: Probability to mask tokens.
-        rng: Random number genenrator.
+        rng: Random number genenrator. Note that this rng state should be
+              python and not numpy since python randint is inclusive for
+              the opper bound whereas the numpy one is exclusive.
     """
 
     # We assume that we have at least two sentences in the sample
@@ -36,8 +38,8 @@ def build_training_sample(sample,
 
     # Truncate to `target_sequence_length`.
     max_num_tokens = target_seq_length
-    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a), len(tokens_b),
-                                  max_num_tokens, rng)
+    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a),
+                                  len(tokens_b), max_num_tokens, rng)
 
     # Build tokens and toketypes.
     tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b,
@@ -50,17 +52,17 @@ def build_training_sample(sample,
         cls_id, sep_id, mask_id, max_predictions_per_seq, rng)
 
     # Padding.
-    tokens_np, tokentypes_np, labels, padding_mask, loss_mask \
+    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
         = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
                                    masked_labels, pad_id, max_seq_length)
 
     train_sample = {
         'text': tokens_np,
         'types': tokentypes_np,
-        'labels': labels,
+        'labels': labels_np,
         'is_random': int(is_next_random),
-        'loss_mask': loss_mask,
-        'padding_mask': padding_mask,
+        'loss_mask': loss_mask_np,
+        'padding_mask': padding_mask_np,
         'truncated': int(truncated)}
     return train_sample
 
@@ -357,7 +359,8 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     tokentypes_np = np.array(tokentypes + filler, dtype=np.int64)
 
     # Padding mask.
-    padding_mask_np = np.array([1]*num_tokens + [0]*padding_length, dtype=np.int64)
+    padding_mask_np = np.array([1]*num_tokens + [0]*padding_length,
+                               dtype=np.int64)
 
     # Lables and loss mask.
     labels = [-1] * max_seq_length
@@ -372,8 +375,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     return tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np
 
 
-
-
+'''
 if __name__ == '__main__':
 
 
@@ -469,3 +471,4 @@ if __name__ == '__main__':
         string += '{:5d}'.format(tokentype)
         string += '{:5d}'.format(padding_mask)
         print(string)
+'''
