@@ -137,9 +137,6 @@ class AlbertDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        # Note that this rng state should be python and not numpy since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        rng = random.Random(self.seed + idx)
         start_index, end_index, seq_length = self.samples_mapping[idx]
         sample = []
         for index in range(start_index, end_index):
@@ -149,13 +146,16 @@ class AlbertDataset(Dataset):
             if len(s) > 1000:
                 print(self.tokenizer.convert_ids_to_tokens(s))
         '''
+        # Note that this rng state should be numpy and not python since
+        # python randint is inclusive whereas the numpy one is exclusive.
+        np_rng = np.random.RandomState(seed=(self.seed + idx))
         return build_training_sample(sample, seq_length,
                                      self.max_seq_length, # needed for padding
                                      self.vocab_id_list,
                                      self.vocab_id_to_token_dict,
                                      self.cls_id, self.sep_id,
                                      self.mask_id, self.pad_id,
-                                     self.masked_lm_prob, rng)
+                                     self.masked_lm_prob, np_rng)
 
 
 def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
