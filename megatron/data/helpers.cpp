@@ -39,12 +39,6 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
        and sequence-length is the target sequence length.
     */
 
-    if (verbose) {
-         cout << " > using " << docs_.shape(0) - 1 <<
-	   " documents with " << sizes_.shape(0) << " sentences ..." <<
-	   endl << std::flush;
-    }
-
     // Consistency checks.
     assert(num_epochs > 0);
     assert(max_seq_length > 1);
@@ -52,16 +46,36 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
     assert(short_seq_prob <= 1.0);
     assert(seed > 0);
 
-    // For efficiency, convert probability to ratio. Note: rand() generates int.
-    const auto short_seq_ratio = static_cast<int32_t>(round(1.0 / short_seq_prob));
-
     // Remove bound checks.
     auto docs = docs_.unchecked<1>();
     auto sizes = sizes_.unchecked<1>();
-    if (docs[docs.shape(0) - 1] != sizes.shape(0)) {
-        cout << "document values is not consistent with length of sizes: " <<
-                docs[docs.shape(0) - 1] << " != " << sizes.shape(0) << endl;
-        throw std::length_error("docs and sizes");
+
+    // For efficiency, convert probability to ratio. Note: rand() generates int.
+    const auto short_seq_ratio = static_cast<int32_t>(round(1.0 / short_seq_prob));
+
+    if (verbose) {
+        const auto sent_start_index = docs[0];
+	const auto sent_end_index = docs[docs_.shape(0) - 1];
+	const auto num_sentences = sent_end_index - sent_start_index;
+	cout << "    using:" << endl << std::flush;
+	cout << "     number of documents:            " << docs_.shape(0) - 1 <<
+	  endl << std::flush;
+	cout << "     sentences range:                [" << sent_start_index <<
+	", " << sent_end_index << ")" << endl << std::flush;
+	cout << "     total number of sentences:      " << num_sentences <<
+	  endl << std::flush;
+	cout << "     number of epochs:               " << num_epochs <<
+	  endl << std::flush;
+	cout << "     maximum number of samples:      " << max_num_samples <<
+	  endl << std::flush;
+	cout << "     maximum sequence length:        " << max_seq_length <<
+	  endl << std::flush;
+	cout << "     short sequence probability:     " << short_seq_prob <<
+	endl << std::flush;
+	cout << "     short sequence ration (1/prob): " << short_seq_ratio <<
+	  endl << std::flush;
+	cout << "     seed:                           " << seed << endl <<
+	  std::flush;
     }
 
     // Mapping and it's length (1D).
@@ -90,7 +104,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
         for (int32_t epoch=0; epoch<num_epochs; ++epoch) {
             if (map_index >= max_num_samples) {
 	        if (verbose && (!second)) {
-		  cout << " > reached " << max_num_samples << " samples after "
+		  cout << "    reached " << max_num_samples << " samples after "
 		       << epoch << " epochs ..." << endl << std::flush;
 		}
                 break;
@@ -181,11 +195,11 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
 
         if (!second) {
 	    if (verbose) {
-	        cout << " > number of empty documents: " << empty_docs <<
+	        cout << "   number of empty documents: " << empty_docs <<
 		  endl << std::flush;
-		cout << " > number of documents with one sentence: " <<
+		cout << "   number of documents with one sentence: " <<
 		  one_sent_docs << endl << std::flush;
-		cout << " > will create mapping for " << map_index <<
+		cout << "   will create mapping for " << map_index <<
 		  " samples" << endl << std::flush;
 	    }
 	    assert(maps == NULL);
@@ -208,10 +222,6 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
       swap(maps[i0], maps[j0]);
       swap(maps[i0 + 1], maps[j0 + 1]);
       swap(maps[i0 + 2], maps[j0 + 2]);
-    }
-
-    if (verbose) {
-        cout << "> done building the mapping." << endl;
     }
 
     // Method to deallocate memory.
@@ -239,34 +249,20 @@ py::array build_mapping(const py::array_t<int64_t>& docs_,
                         const int seed,
 			const bool verbose) {
 
-    if (verbose) {
-        cout << "> building sample map using: " << endl << std::flush;
-	cout << "     number of epochs:           " << num_epochs << endl
-	     << std::flush;
-	cout << "     maximum number of samples:  " << max_num_samples << endl
-	     << std::flush;
-	cout << "     maximum sequence length:    " << max_seq_length << endl
-	     << std::flush;
-	cout << "     short sequence probability: " << short_seq_prob << endl
-	     << std::flush;
-	cout << "     seed:                       " << seed << endl
-	     << std::flush;
-    }
-
     if (sizes_.size() > std::numeric_limits<uint32_t>::max()) {
         if (verbose) {
-	    cout << " > using uint64 for data mapping..." << endl << std::flush;
-        }
-        return build_mapping_impl<uint64_t>(docs_, sizes_, num_epochs,
+	   cout << "    using uint64 for data mapping..." << endl << std::flush;
+	}
+	return build_mapping_impl<uint64_t>(docs_, sizes_, num_epochs,
 					    max_num_samples, max_seq_length,
 					    short_seq_prob, seed, verbose);
     } else {
-        if (verbose) {
-	    cout << " > using uint32 for data mapping..." << endl << std::flush;
-        }
-        return build_mapping_impl<uint32_t>(docs_, sizes_, num_epochs,
-					    max_num_samples, max_seq_length,
-					    short_seq_prob, seed, verbose);
+       if (verbose) {
+	   cout << "    using uint32 for data mapping..." << endl << std::flush;
+       }
+       return build_mapping_impl<uint32_t>(docs_, sizes_, num_epochs,
+					   max_num_samples, max_seq_length,
+					   short_seq_prob, seed, verbose);
     }
 }
 

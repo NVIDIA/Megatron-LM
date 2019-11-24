@@ -13,43 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """dataset to split one large one into multiple smaller datasets"""
+
 import torch
 import numpy as np
 
-def should_split(split):
-    """
-    given split proportions checks if should split
-    Examples:
-    >>> should_split([10,0,0])
-    False
-    >>> should_split([1,.1,.2])
-    True
-    """
-    return max(split)/sum(split) != 1.
+def get_train_valid_test_split(splits_string, size):
+    """ Get dataset splits from comma or '/' separated string list."""
 
-def get_split(args):
-    """
-    Get dataset splits from comma separated string list
-    """
     splits = []
-    if args.split.find(',') != -1:
-        splits = [float(s) for s in args.split.split(',')]
-    elif args.split.find('/') != -1:
-        splits = [float(s) for s in args.split.split('/')]
+    if splits_string.find(',') != -1:
+        splits = [float(s) for s in splits_string.split(',')]
+    elif splits_string.find('/') != -1:
+        splits = [float(s) for s in splits_string.split('/')]
     else:
-        splits = [float(args.split)]
-    split_total = sum(splits)
-    if split_total < 1.:
-        splits.append(1-split_total)
+        splits = [float(splits_string)]
     while len(splits) < 3:
         splits.append(0.)
     splits = splits[:3]
-    if args.valid_data is not None:
-        splits[1] = 0.
-    if args.test_data is not None:
-        splits[2] = 0.
-    final_sum = sum(splits)
-    return [s/final_sum for s in splits]
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits = [split/splits_sum for split in splits]
+    splits_index = [0]
+    for index, split in enumerate(splits):
+        splits_index.append(splits_index[index] +
+                            int(round(split * float(size))))
+    diff = splits_index[-1] - size
+    for index in range(1, len(splits_index)):
+        splits_index[index] -= diff
+    return splits_index
 
 class SplitDataset(torch.utils.data.Dataset):
     """

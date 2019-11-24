@@ -13,20 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pretrain BERT"""
+"""Pretrain ALBERT"""
 
 import torch
 import torch.nn.functional as F
 
-from configure_data import configure_data
 from megatron import mpu
 from megatron.model import BertModel
 from megatron.utils import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
 from megatron.training import run
-from megatron.data import AlbertDataset, split_dataset
+from megatron.data.albert_dataset import build_train_valid_test_datasets
 from megatron.data_utils.samplers import DistributedBatchSampler
+
 
 def model_provider(args):
     """Build the model."""
@@ -109,94 +109,98 @@ def forward_step(data_iterator, model, args, timers):
 def get_train_val_test_data(args):
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
 
-    (train_data, val_data, test_data) = (None, None, None)
+    (train_data, valid_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if args.data_loader == None:
+        print_rank_0('> building train, validation, and test datasets '
+                     'for ALBERT ...')
+
+        if args.data_loader is None:
             args.data_loader = 'binary'
-        if args.data_loader == 'binary':
-            if not args.max_num_samples:
-                args.max_num_samples = (args.train_iters + 2 * args.eval_iters) * args.batch_size
-            if not args.data_path:
-                print("Albert currently only supports a unified dataset specified with --data-path")
-                exit(1)
-            print_rank_0("Creating AlbertDataset...")
-            full_data = AlbertDataset(
-                vocab_file=args.vocab,
-                data_prefix=args.data_path,
-                data_impl=args.data_impl,
-                skip_warmup=args.skip_mmap_warmup,
-                num_epochs=args.data_epochs,
-                max_num_samples=args.max_num_samples,
-                masked_lm_prob=args.mask_prob,
-                max_seq_length=args.seq_length,
-                short_seq_prob=args.short_seq_prob,
-                seed=args.seed)
-            print_rank_0("Finished creating AlbertDataset...")
-            split = split_dataset.get_split(args)
-            if split_dataset.should_split(split):
-                train_ds, val_ds, test_ds = split_dataset.split_ds(full_data, split, args.shuffle)
-            else:
-                train_ds = full_data
-            num_tokens = train_ds.num_tokens()
-
-            world_size = mpu.get_data_parallel_world_size()
-            rank = mpu.get_data_parallel_rank()
-            global_batch_size = args.batch_size * world_size
-            num_workers = args.num_workers
-
-            def make_data_loader_(dataset):
-                if not dataset:
-                    return None
-                # Use a simple sampler with distributed batch sampler.
-                sampler = torch.utils.data.SequentialSampler(dataset)
-                batch_sampler = DistributedBatchSampler(
-                    sampler=sampler,
-                    batch_size=global_batch_size,
-                    drop_last=True,
-                    rank=rank,
-                    world_size=world_size)
-                # Torch dataloader.
-                return torch.utils.data.DataLoader(dataset,
-                                                   batch_sampler=batch_sampler,
-                                                   num_workers=num_workers,
-                                                   pin_memory=True)
-
-            train_data = make_data_loader_(train_ds)
-            valid_data = make_data_loader_(val_ds)
-            test_data = make_data_loader_(test_ds)
-
-            do_train = train_data is not None and args.train_iters > 0
-            do_valid = valid_data is not None and args.eval_iters > 0
-            do_test = test_data is not None and args.eval_iters > 0
-            # Need to broadcast num_tokens and num_type_tokens.
-            token_counts = torch.cuda.LongTensor([num_tokens,
-                                                  2, # hard coded num_type_tokens for now
-                                                  int(do_train),
-                                                  int(do_valid),
-                                                  int(do_test)])
-        else:
-            print("Unsupported data loader for BERT.")
+        if args.data_loader != 'binary':
+            print('Unsupported {} data loader for ALBERT.'.format(
+                args.data_loader))
             exit(1)
+        if not args.data_path:
+            print('ALBERT only supports a unified dataset specified '
+                  'with --data-path')
+            exit(1)
+
+        data_parallel_size = mpu.get_data_parallel_world_size()
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        global_batch_size = args.batch_size * data_parallel_size
+
+        # Number of train/valid/test samples.
+        train_iters = args.train_iters
+        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+        test_iters = args.eval_iters
+        train_val_test_num_samples = [args.train_iters * global_batch_size,
+                                      eval_iters * global_batch_size,
+                                      test_iters * global_batch_size]
+        print_rank_0(' > datasets target sizes (minimum size):')
+        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            vocab_file=args.vocab,
+            data_prefix=args.data_path,
+            data_impl=args.data_impl,
+            splits_string=args.split,
+            train_valid_test_num_samples=train_val_test_num_samples,
+            max_seq_length=args.seq_length,
+            masked_lm_prob=args.mask_prob,
+            short_seq_prob=args.short_seq_prob,
+            seed=args.seed,
+            skip_warmup=args.skip_mmap_warmup)
+        print_rank_0("> finished creating ALBERT datasets ...")
+
+        def make_data_loader_(dataset):
+            if not dataset:
+                return None
+            # Use a simple sampler with distributed batch sampler.
+            sampler = torch.utils.data.SequentialSampler(dataset)
+            batch_sampler = DistributedBatchSampler(
+                sampler=sampler,
+                batch_size=global_batch_size,
+                drop_last=True,
+                rank=data_parallel_rank,
+                world_size=data_parallel_size)
+            # Torch dataloader.
+            return torch.utils.data.DataLoader(dataset,
+                                               batch_sampler=batch_sampler,
+                                               num_workers=args.num_workers,
+                                               pin_memory=True)
+
+        train_data = make_data_loader_(train_ds)
+        valid_data = make_data_loader_(valid_ds)
+        test_data = make_data_loader_(test_ds)
+
+        do_train = train_data is not None and args.train_iters > 0
+        do_valid = valid_data is not None and args.eval_iters > 0
+        do_test = test_data is not None and args.eval_iters > 0
+        # Need to broadcast num_tokens and num_type_tokens.
+        num_tokens = vocab_size_with_padding(train_ds.num_tokens(), args)
+        token_counts = torch.cuda.LongTensor([num_tokens,
+                                              2, # hard coded num_type_tokens
+                                              int(do_train),
+                                              int(do_valid),
+                                              int(do_test)])
     else:
         token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
-
 
     # Broadcast num tokens.
     torch.distributed.broadcast(token_counts,
                                 mpu.get_model_parallel_src_rank(),
                                 group=mpu.get_model_parallel_group())
-    num_tokens = token_counts[0].item()
-    num_type_tokens = token_counts[1].item()
+    args.vocab_size = token_counts[0].item()
+    args.tokentype_size = token_counts[1].item()
     args.do_train = token_counts[2].item()
     args.do_valid = token_counts[3].item()
     args.do_test = token_counts[4].item()
 
-    args.vocab_size = num_tokens
-    args.tokentype_size = num_type_tokens
-
-    return train_data, val_data, test_data
+    return train_data, valid_data, test_data
 
 
 if __name__ == "__main__":
