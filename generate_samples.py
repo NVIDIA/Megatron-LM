@@ -28,7 +28,7 @@ from arguments import get_args
 from megatron.utils import Timers
 from megatron.utils import initialize_distributed
 from megatron.utils import set_random_seed
-from pretrain_gpt2 import get_masks_and_position_ids
+from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import load_checkpoint
 from megatron.data_utils import make_tokenizer
 from configure_data import configure_data
@@ -91,7 +91,7 @@ def get_batch(context_tokens, args):
     tokens = tokens.to(device)
 
     # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_masks_and_position_ids(
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         args.eod_token,
         args.reset_position_ids,
