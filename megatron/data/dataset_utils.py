@@ -1,4 +1,17 @@
-"""TO BE ADDED"""
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors, and NVIDIA.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 
 import collections
@@ -373,102 +386,3 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     loss_mask_np = np.array(loss_mask, dtype=np.int64)
 
     return tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np
-
-
-'''
-if __name__ == '__main__':
-
-
-    print('building the dataset ...')
-
-    from bert_tokenization import FullTokenizer
-    import json
-    import nltk
-    nltk.download('punkt')
-
-    def document_generator_provider(input_file):
-        with open(input_file, 'r') as ifile:
-            for document in ifile:
-                data = json.loads(document)
-                text = data['text']
-                sentences = []
-                for line in text.split('\n'):
-                    if line != '\n':
-                        sentences.extend(nltk.tokenize.sent_tokenize(line))
-                yield sentences
-
-    input_file = '/raid/mshoeybi/data/albert/sample/samples_11.json'
-    vocab_file = '/raid/mshoeybi/data/albert/bert_vocab/vocab.txt'
-
-    tokenizer = FullTokenizer(vocab_file, do_lower_case=True)
-
-    document_generator = document_generator_provider(input_file)
-    samples = []
-    sizes = []
-    for sentences in document_generator:
-        tokens_list = []
-        size = 0
-        for sentence in sentences:
-            tokens = tokenizer.tokenize(sentence)
-            tokens_list.append(tokens)
-            size += len(tokens)
-        samples.append(tokens_list)
-        sizes.append(size)
-    print(sizes)
-
-    import random
-    rng = random.Random(123567)
-    vocab_id_list = list(tokenizer.inv_vocab.keys())
-    cls_id = tokenizer.vocab['[CLS]']
-    sep_id = tokenizer.vocab['[SEP]']
-    mask_id = tokenizer.vocab['[MASK]']
-    pad_id = tokenizer.vocab['[PAD]']
-    vocab_id_to_token_dict = tokenizer.inv_vocab
-    sample = []
-    for s in samples[0]:
-        sample.append(tokenizer.convert_tokens_to_ids(s))
-    max_seq_length = 512
-    target_seq_length = 444
-    masked_lm_prob = 0.15
-    example = build_training_sample(sample,
-                                    target_seq_length, max_seq_length,
-                                    vocab_id_list, vocab_id_to_token_dict,
-                                    cls_id, sep_id, mask_id, pad_id,
-                                    masked_lm_prob, rng)
-
-    orig_tokens = []
-    for s in samples[0]:
-        orig_tokens.extend(s)
-    is_random = example['is_random']
-    if is_random:
-        print('random')
-    else:
-        print('not-random')
-    #exit()
-    ii = 0
-    for i in range(max_seq_length):
-        token = tokenizer.inv_vocab[example['text'][i]]
-        if token in ['[CLS]', '[SEP]'] :
-            orig_token = token
-        elif ii < len(orig_tokens):
-            orig_token = orig_tokens[ii]
-            ii += 1
-        else:
-            orig_token = 'EMPTY'
-        tokentype = example['types'][i]
-        label_id = example['labels'][i]
-        label = 'NONE'
-        if label_id >= 0:
-            label = tokenizer.inv_vocab[label_id]
-        loss_mask = example['loss_mask'][i]
-        padding_mask = example['padding_mask'][i]
-
-        string = ''
-        string += '{:15s}'.format(orig_token)
-        string += '{:15s}'.format(token)
-        string += '{:15s}'.format(label)
-        string += '{:5d}'.format(loss_mask)
-        string += '{:5d}'.format(tokentype)
-        string += '{:5d}'.format(padding_mask)
-        print(string)
-'''
