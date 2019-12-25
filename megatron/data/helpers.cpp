@@ -30,6 +30,8 @@
 namespace py = pybind11;
 using namespace std;
 
+const int32_t LONG_SENTENCE_LEN = 256;
+
 
 inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
 				     const int32_t max_length,
@@ -114,6 +116,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
         // Counters:
         uint64_t empty_docs = 0;
         uint64_t one_sent_docs = 0;
+	uint64_t long_sent_docs = 0;
 
         // Current map index.
         uint64_t map_index = 0;
@@ -151,8 +154,23 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
                     }
                 }
 
+		// Detect documents with long sentences
+		bool contains_long_sentence = false;
+		if (num_remain_sent > 1) {
+		    for (auto sent_index=sent_index_first;
+			 sent_index < sent_index_last; ++sent_index) {
+		        if (sizes[sent_index] > LONG_SENTENCE_LEN){
+			    if ((epoch == 0) && (!second)) {
+			        ++long_sent_docs;
+			    }
+			    contains_long_sentence = true;
+			    break;
+			}
+		    }
+		}
+
                 // If we have more than two sentences.
-                if (num_remain_sent > 1) {
+                if ((num_remain_sent > 1) && (!contains_long_sentence)) {
 
                     // Set values.
                     auto seq_len = int32_t{0};
@@ -217,6 +235,8 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
 		  endl << std::flush;
 		cout << "   number of documents with one sentence: " <<
 		  one_sent_docs << endl << std::flush;
+		cout << "   number of documents with long sentences: " <<
+		  long_sent_docs << endl << std::flush;
 		cout << "   will create mapping for " << map_index <<
 		  " samples" << endl << std::flush;
 	    }
