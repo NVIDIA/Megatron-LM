@@ -30,7 +30,7 @@
 namespace py = pybind11;
 using namespace std;
 
-const int32_t LONG_SENTENCE_LEN = 256;
+const int32_t LONG_SENTENCE_LEN = 512;
 
 
 inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
@@ -154,7 +154,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
                     }
                 }
 
-		// Detect documents with long sentences
+		// Detect documents with long sentences.
 		bool contains_long_sentence = false;
 		if (num_remain_sent > 1) {
 		    for (auto sent_index=sent_index_first;
