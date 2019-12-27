@@ -278,7 +278,7 @@ def add_data_args(parser):
                        help='path(s) to the validation data.')
     group.add_argument('--test-data', nargs='*', default=None,
                        help='path(s) to the testing data.')
-    group.add_argument('--data-path', type=str, default=None,
+    group.add_argument('--data-path', nargs='+', default=None,
                        help='path to combined dataset to split')
     group.add_argument('--split', default='1000,1,1',
                        help='comma-separated list of proportions for training,'

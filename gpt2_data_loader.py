@@ -57,7 +57,7 @@ def make_gpt2_dataloaders(args):
                                            pin_memory=True)
 
     train = make_data_loader_(args.train_data)
-    valid = make_data_loader_(args.val_data)
+    valid = make_data_loader_(args.valid_data)
     test = make_data_loader_(args.test_data)
 
     args.do_train = False

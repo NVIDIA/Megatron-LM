@@ -131,6 +131,8 @@ def make_loaders(args):
     if eval_seq_length is not None and eval_seq_length < 0:
         eval_seq_length = eval_seq_length * world_size
     split = get_split(args)
+    if args.data_path is not None:
+        args.train_data = args.data_path
     data_set_args = {
         'path': args.train_data,
         'seq_length': seq_length,
