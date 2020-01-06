@@ -145,7 +145,7 @@ class BertModel(MegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method_normal(init_method_std,
                                                          num_layers),
-            residual_connection_post_layernorm=True)
+            residual_connection_post_layernorm=False)
 
         self.lm_head = BertLMHead(
             self.language_model.embedding.word_embeddings.weight.size(0),

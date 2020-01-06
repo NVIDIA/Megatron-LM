@@ -72,7 +72,7 @@ def get_batch(data_iterator, timers):
     next_sentence = data_b['is_random'].long()
     loss_mask = data_b['mask'].float()
     lm_labels = data_b['mask_labels'].long()
-    padding_mask = data_b['pad_mask'].byte()
+    padding_mask = data_b['pad_mask'].long()
 
     return tokens, types, next_sentence, loss_mask, lm_labels, padding_mask
 
@@ -112,17 +112,23 @@ def get_train_val_test_data(args):
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        data_config = configure_data()
-        ds_type = 'BERT'
-        data_config.set_defaults(data_set_type=ds_type, transpose=False)
-        (train_data, val_data, test_data), tokenizer = data_config.apply(args)
-        num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)
-        # Need to broadcast num_tokens and num_type_tokens.
-        token_counts = torch.cuda.LongTensor([num_tokens,
-                                              tokenizer.num_type_tokens,
-                                              int(args.do_train),
-                                              int(args.do_valid),
-                                              int(args.do_test)])
+        if (args.data_loader == 'raw'
+            or args.data_loader == 'lazy'
+            or args.data_loader == 'tfrecords'):
+            data_config = configure_data()
+            ds_type = 'BERT'
+            data_config.set_defaults(data_set_type=ds_type, transpose=False)
+            (train_data, val_data, test_data), tokenizer = data_config.apply(args)
+            num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)
+            # Need to broadcast num_tokens and num_type_tokens.
+            token_counts = torch.cuda.LongTensor([num_tokens,
+                                                  tokenizer.num_type_tokens,
+                                                  int(args.do_train),
+                                                  int(args.do_valid),
+                                                  int(args.do_test)])
+        else:
+            print("Unsupported data loader for BERT.")
+            exit(1)
     else:
         token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
 

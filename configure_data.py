@@ -116,7 +116,7 @@ def make_tfrecord_loaders(args):
 def make_loaders(args):
     """makes training/val/test"""
 
-    if args.use_tfrecords:
+    if args.data_loader == 'tfrecords':
         return make_tfrecord_loaders(args)
     world_size = torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group())
@@ -131,10 +131,12 @@ def make_loaders(args):
     if eval_seq_length is not None and eval_seq_length < 0:
         eval_seq_length = eval_seq_length * world_size
     split = get_split(args)
+    if args.data_path is not None:
+        args.train_data = args.data_path
     data_set_args = {
         'path': args.train_data,
         'seq_length': seq_length,
-        'lazy': args.lazy_loader,
+        'lazy': args.data_loader == 'lazy',
         'delim': args.delim,
         'text_key': args.text_key,
         'label_key': 'label',

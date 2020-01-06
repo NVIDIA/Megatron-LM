@@ -381,7 +381,6 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers('interval time').start()
     report_memory_flag = True
     while iteration < args.train_iters:
-
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,

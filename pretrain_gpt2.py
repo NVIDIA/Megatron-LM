@@ -112,10 +112,16 @@ def get_train_val_test_data(args):
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if args.use_npy_data_loader:
+        if args.data_loader == 'numpy':
+            assert len(args.train_data) == 1
+            args.train_data = args.train_data[0]
+            assert len(args.valid_data) == 1
+            args.valid_data = args.valid_data[0]
+            assert len(args.test_data) == 1
+            args.test_data = args.test_data[0]
             (train_data, val_data, test_data), num_tokens, \
                 eod_token = make_gpt2_dataloaders(args)
-        else:
+        elif args.data_loader == 'raw' or args.data_loader == 'lazy':
             data_config = configure_data()
             data_config.set_defaults(data_set_type='GPT2', transpose=False)
             (train_data, val_data, test_data), tokenizer = data_config.apply(
@@ -123,6 +129,9 @@ def get_train_val_test_data(args):
             num_tokens = tokenizer.num_tokens
             eod_token = tokenizer.get_command('eos').Id
             assert eod_token == tokenizer.get_command('pad').Id
+        else:
+            print("Unsupported data loader for GPT2.")
+            exit(1)
         # pad.
         num_tokens = vocab_size_with_padding(num_tokens, args)
         print_rank_0('> found end-of-document token: {}'.format(eod_token))

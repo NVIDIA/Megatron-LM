@@ -267,23 +267,52 @@ def add_data_args(parser):
     group.add_argument('--shuffle', action='store_true',
                        help='Shuffle data. Shuffling is deterministic '
                        'based on seed and current epoch.')
+    group.add_argument('--data-loader', type=str, default=None,
+                       choices=['raw', 'lazy', 'tfrecords', 'numpy', 'binary'],
+                       help='Which data loader to use. Default varies by model.')
+
     group.add_argument('--train-data', nargs='+', default=None,
-                       help='Whitespace separated filenames or corpora names '
+                       help='Whitespace separated paths or corpora names '
                        'for training.')
+    group.add_argument('--valid-data', nargs='*', default=None,
+                       help='path(s) to the validation data.')
+    group.add_argument('--test-data', nargs='*', default=None,
+                       help='path(s) to the testing data.')
+    group.add_argument('--data-path', nargs='+', default=None,
+                       help='path to combined dataset to split')
+    group.add_argument('--split', default='1000,1,1',
+                       help='comma-separated list of proportions for training,'
+                       ' validation, and test split')
 
-    group.add_argument('--use-npy-data-loader', action='store_true',
-                       help='Use the numpy data loader. If set, then'
-                       'train-data-path, val-data-path, and test-data-path'
-                       'should also be provided.')
-    group.add_argument('--train-data-path', type=str, default='',
-                       help='path to the training data')
-    group.add_argument('--val-data-path', type=str, default='',
-                       help='path to the validation data')
-    group.add_argument('--test-data-path', type=str, default='',
-                       help='path to the test data')
+    group.add_argument('--seq-length', type=int, default=512,
+                       help="Maximum sequence length to process")
+    group.add_argument('--max-preds-per-seq', type=int, default=None,
+                       help='Maximum number of predictions to use per sequence.'
+                       'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
+                       'MUST BE SPECIFIED IF `--data-loader tfrecords`.')
+
+    # arguments for binary data loader
+    parser.add_argument('--vocab', type=str, default='vocab.txt',
+                        help='path to vocab file')
+    parser.add_argument('--data-impl', type=str, default='infer',
+                        help='implementation of indexed datasets',
+                        choices=['lazy', 'cached', 'mmap', 'infer'])
+    parser.add_argument('--max-num-samples', type=int, default=None,
+                        help='Maximum number of samples to plan for, defaults to total iters * batch-size.')
+    parser.add_argument('--data-epochs', type=int, default=None,
+                        help='Number of epochs to plan for, defaults to using --max-num-samples')
+    parser.add_argument('--mask-prob', default=0.15, type=float,
+                        help='probability of replacing a token with mask')
+    parser.add_argument('--short-seq-prob', default=0.1, type=float,
+                        help='probability of producing a short sequence')
+    parser.add_argument('--skip-mmap-warmup', action='store_true',
+                        help='skip warming up mmap files')
+
+    # arguments for numpy data loader
     group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
-                       help='the filename containing all the shards sizes')
+                       help='the filename containing all the shards sizes for numpy data loader')
 
+    # arguments for raw/tfrecords data loader
     group.add_argument('--delim', default=',',
                        help='delimiter used to parse csv data files')
     group.add_argument('--text-key', default='sentence',
@@ -291,16 +320,6 @@ def add_data_args(parser):
     group.add_argument('--eval-text-key', default=None,
                        help='key to use to extract text from '
                        'json/csv evaluation datasets')
-    group.add_argument('--valid-data', nargs='*', default=None,
-                       help="""Filename for validation data.""")
-    group.add_argument('--split', default='1000,1,1',
-                       help='comma-separated list of proportions for training,'
-                       ' validation, and test split')
-    group.add_argument('--test-data', nargs='*', default=None,
-                       help="""Filename for testing""")
-
-    group.add_argument('--lazy-loader', action='store_true',
-                       help='whether to lazy read the data set')
     group.add_argument('--loose-json', action='store_true',
                        help='Use loose json (one json-formatted string per '
                        'newline), instead of tight json (data file is one '
@@ -308,6 +327,7 @@ def add_data_args(parser):
     group.add_argument('--presplit-sentences', action='store_true',
                        help='Dataset content consists of documents where '
                        'each document consists of newline separated sentences')
+
     group.add_argument('--num-workers', type=int, default=2,
                        help="""Number of workers to use for dataloading""")
     group.add_argument('--tokenizer-model-type', type=str,
@@ -328,16 +348,6 @@ def add_data_args(parser):
                        help='what type of tokenizer to use')
     group.add_argument("--cache-dir", default=None, type=str,
                        help="Where to store pre-trained BERT downloads")
-    group.add_argument('--use-tfrecords', action='store_true',
-                       help='load `--train-data`, `--valid-data`, '
-                       '`--test-data` from BERT tf records instead of '
-                       'normal data pipeline')
-    group.add_argument('--seq-length', type=int, default=512,
-                       help="Maximum sequence length to process")
-    group.add_argument('--max-preds-per-seq', type=int, default=None,
-                       help='Maximum number of predictions to use per sequence.'
-                       'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
-                       'MUST BE SPECIFIED IF `--use-tfrecords` is True.')
 
     return parser
 
@@ -355,7 +365,7 @@ def get_args():
 
     args = parser.parse_args()
 
-    if not args.train_data and not args.train_data_path:
+    if not args.train_data and not args.data_path:
         print('WARNING: No training data specified')
 
     args.cuda = torch.cuda.is_available()
