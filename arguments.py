@@ -70,6 +70,12 @@ def add_fp16_config_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode')
+    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
+                       help='Scale Q * K^T by 1 / layer-number. If this flag '
+                       'is set, then it will automatically set '
+                       'attention-softmax-in-fp32 to true')
+    group.add_argument('--attention-softmax-in-fp32', action='store_true',
+                       help='Run attention masking and softmax in fp32.')
     group.add_argument('--fp32-embedding', action='store_true',
                        help='embedding in fp32')
     group.add_argument('--fp32-layernorm', action='store_true',

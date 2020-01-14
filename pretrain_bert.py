@@ -46,7 +46,9 @@ def model_provider(args):
         add_binary_head=True,
         layernorm_epsilon=args.layernorm_epsilon,
         num_tokentypes=args.tokentype_size,
-        parallel_output=True)
+        parallel_output=True,
+        apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
+        attention_softmax_in_fp32=args.attention_softmax_in_fp32)
 
     return model
 

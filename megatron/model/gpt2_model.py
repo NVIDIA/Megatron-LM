@@ -48,7 +48,9 @@ class GPT2Model(MegatronModule):
                  layernorm_epsilon=1.0e-5,
                  init_method_std=0.02,
                  num_tokentypes=0,
-                 parallel_output=True):
+                 parallel_output=True,
+                 apply_query_key_layer_scaling=False,
+                 attention_softmax_in_fp32=False):
 
         super(GPT2Model, self).__init__()
 
@@ -72,7 +74,9 @@ class GPT2Model(MegatronModule):
             init_method=init_method_normal(init_method_std),
             scaled_init_method=scaled_init_method_normal(init_method_std,
                                                          num_layers),
-            residual_connection_post_layernorm=False)
+            residual_connection_post_layernorm=False,
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            attention_softmax_in_fp32=attention_softmax_in_fp32)
 
 
     def forward(self, input_ids, position_ids, attention_mask,
