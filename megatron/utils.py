@@ -275,9 +275,8 @@ def vocab_size_with_padding(num_tokens, args):
     after = num_tokens
     multiple = args.make_vocab_size_divisible_by * \
                mpu.get_model_parallel_world_size()
-    if multiple > 0:
-        while (after % multiple) != 0:
-            after += 1
+    while (after % multiple) != 0:
+        after += 1
     print_rank_0('> padded vocab (size: {}) with {} dummy '
                  'tokens (new size: {})'.format(
                      num_tokens, after - num_tokens, after))
