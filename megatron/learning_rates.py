@@ -24,7 +24,7 @@ from megatron.utils import print_rank_0
 class AnnealingLR(_LRScheduler):
     """Anneals the learning rate"""
 
-    DECAY_STYLES = ['linear', 'cosine', 'constant', 'None']
+    DECAY_STYLES = ['linear', 'cosine', 'exponential', 'constant', 'None']
 
     def __init__(self, optimizer, start_lr, warmup_iter, num_iters,
                  decay_style=None, last_iter=-1, min_lr=0.0,
@@ -57,6 +57,9 @@ class AnnealingLR(_LRScheduler):
                 lr = self.start_lr * ((self.end_iter - (num_iters_ - self.warmup_iter)) / self.end_iter)
             elif self.decay_style == self.DECAY_STYLES[1]:
                 lr = self.start_lr / 2.0 * (math.cos(math.pi * (num_iters_ - self.warmup_iter) / self.end_iter) + 1)
+            elif self.decay_style == self.DECAY_STYLES[2]:
+                # exp(-0.693) = 1/2
+                lr = self.start_lr * math.exp(-0.693 * (num_iters_ - self.warmup_iter) / self.end_iter)
             else:
                 lr = self.start_lr
             return max(lr, self.min_lr)

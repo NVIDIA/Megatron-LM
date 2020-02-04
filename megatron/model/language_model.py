@@ -60,7 +60,9 @@ def get_language_model(num_layers,
                        layernorm_epsilon,
                        init_method,
                        scaled_init_method,
-                       residual_connection_post_layernorm):
+                       residual_connection_post_layernorm,
+                       apply_query_key_layer_scaling,
+                       attention_softmax_in_fp32):
     # Transformer hyperparameters.
     transformer_hparams = TransformerHyperparameters(
         hidden_size=hidden_size,
@@ -74,7 +76,9 @@ def get_language_model(num_layers,
         output_layer_init_method=scaled_init_method,
         checkpoint_activations=checkpoint_activations,
         checkpoint_num_layers=checkpoint_num_layers,
-        apply_residual_connection_post_layernorm=residual_connection_post_layernorm)
+        apply_residual_connection_post_layernorm=residual_connection_post_layernorm,
+        apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+        attention_softmax_in_fp32=attention_softmax_in_fp32)
     # Language model.
     language_model = TransformerLanguageModel(
         transformer_hparams=transformer_hparams,

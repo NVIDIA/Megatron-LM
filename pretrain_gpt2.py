@@ -43,7 +43,9 @@ def model_provider(args):
                       checkpoint_activations=args.checkpoint_activations,
                       checkpoint_num_layers=args.checkpoint_num_layers,
                       layernorm_epsilon=args.layernorm_epsilon,
-                      parallel_output=True)
+                      parallel_output=True,
+                      apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
+                      attention_softmax_in_fp32=args.attention_softmax_in_fp32)
 
     return model
 

@@ -119,7 +119,9 @@ class BertModel(MegatronModule):
                  layernorm_epsilon=1.0e-5,
                  init_method_std=0.02,
                  num_tokentypes=0,
-                 parallel_output=True):
+                 parallel_output=True,
+                 apply_query_key_layer_scaling=False,
+                 attention_softmax_in_fp32=False):
 
         super(BertModel, self).__init__()
 
@@ -145,7 +147,9 @@ class BertModel(MegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method_normal(init_method_std,
                                                          num_layers),
-            residual_connection_post_layernorm=False)
+            residual_connection_post_layernorm=False,
+            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
+            attention_softmax_in_fp32=attention_softmax_in_fp32)
 
         self.lm_head = BertLMHead(
             self.language_model.embedding.word_embeddings.weight.size(0),
