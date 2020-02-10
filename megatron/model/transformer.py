@@ -372,6 +372,7 @@ class ParallelTransformerLayer(MegatronModule):
     def __init__(self, hyperparameters, attention_mask_func, layer_number):
 
         super(ParallelTransformerLayer, self).__init__()
+        self.layer_number = layer_number
 
         self.apply_residual_connection_post_layernorm \
             = hyperparameters['apply_residual_connection_post_layernorm']

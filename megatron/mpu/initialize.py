@@ -26,6 +26,10 @@ _MODEL_PARALLEL_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
+# These values enable us to change the mpu sizes on the fly.
+_MPU_WORLD_SIZE = None
+_MPU_RANK = None
+
 
 def initialize_model_parallel(model_parallel_size_):
     """
@@ -99,13 +103,31 @@ def get_data_parallel_group():
     return _DATA_PARALLEL_GROUP
 
 
+def set_model_parallel_world_size(world_size):
+    """Set the model parallel size"""
+    global _MPU_WORLD_SIZE
+    _MPU_WORLD_SIZE = world_size
+
+
 def get_model_parallel_world_size():
     """Return world size for the model parallel group."""
+    global _MPU_WORLD_SIZE
+    if _MPU_WORLD_SIZE is not None:
+        return _MPU_WORLD_SIZE
     return torch.distributed.get_world_size(group=get_model_parallel_group())
+
+
+def set_model_parallel_rank(rank):
+    """Set model parallel rank."""
+    global _MPU_RANK
+    _MPU_RANK = rank
 
 
 def get_model_parallel_rank():
     """Return my rank for the model parallel group."""
+    global _MPU_RANK
+    if _MPU_RANK is not None:
+        return _MPU_RANK
     return torch.distributed.get_rank(group=get_model_parallel_group())
 
 

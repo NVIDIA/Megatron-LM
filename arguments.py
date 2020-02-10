@@ -47,7 +47,7 @@ def add_model_config_args(parser):
                        help='dropout probability for hidden state transformer')
     group.add_argument('--max-position-embeddings', type=int, default=512,
                        help='maximum number of position embeddings to use')
-    group.add_argument('--vocab-size', type=int, default=30522,
+    group.add_argument('--vocab-size', type=int, default=None,
                        help='vocab size to use for non-character-level '
                        'tokenization. This value will only be used when '
                        'creating a tokenizer')
