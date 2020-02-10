@@ -46,6 +46,11 @@ def _initialize_affine_weight(weight, output_size, input_size,
 
     Build the master weight on all processes and scatter
     the relevant chunk."""
+
+    weight.model_parallel = True
+    weight.partition_dim = partition_dim
+    weight.stride = stride
+
     # If we only use 1 process for model parallelism, bypass scatter.
     world_size = get_model_parallel_world_size()
     if world_size == 1:
@@ -108,7 +113,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings_per_partition,
                                              self.embedding_dim))
-        self.weight.model_parallel = True
         # And initialize.
         _initialize_affine_weight(
             self.weight, self.num_embeddings, self.embedding_dim,
@@ -165,7 +169,6 @@ class ParallelEmbedding(torch.nn.Module):
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings,
                                              self.embedding_dim_per_partition))
-        self.weight.model_parallel = True
         # And initialize.
         _initialize_affine_weight(
             self.weight, self.num_embeddings, self.embedding_dim,
@@ -220,10 +223,11 @@ class ColumnParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         self.weight = Parameter(torch.Tensor(self.output_size_per_partition,
                                              self.input_size))
-        self.weight.model_parallel = True
         if bias:
             self.bias = Parameter(torch.Tensor(self.output_size_per_partition))
             self.bias.model_parallel = True
+            self.bias.partition_dim = 0
+            self.bias.stride = stride
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()
@@ -294,7 +298,6 @@ class RowParallelLinear(torch.nn.Module):
         # we allocate the transpose.
         self.weight = Parameter(torch.Tensor(self.output_size,
                                              self.input_size_per_partition))
-        self.weight.model_parallel = True
         if bias:
             self.bias = Parameter(torch.Tensor(self.output_size))
             # Always initialize bias to zero.
