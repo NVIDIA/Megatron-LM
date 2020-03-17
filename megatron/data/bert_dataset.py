@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""ALBERT Style dataset."""
+"""BERT Style dataset."""
 
 import os
 import time
@@ -79,7 +79,7 @@ def build_train_valid_test_datasets(vocab_file, data_prefix, data_impl,
             # New doc_idx view.
             indexed_dataset.set_doc_idx(doc_idx_ptr[start_index:end_index])
             # Build the dataset accordingly.
-            dataset = AlbertDataset(
+            dataset = BertDataset(
                 name=name,
                 indexed_dataset=indexed_dataset,
                 tokenizer=tokenizer,
@@ -105,7 +105,7 @@ def build_train_valid_test_datasets(vocab_file, data_prefix, data_impl,
     return (train_dataset, valid_dataset, test_dataset)
 
 
-class AlbertDataset(Dataset):
+class BertDataset(Dataset):
 
     def __init__(self, name, indexed_dataset, tokenizer, data_prefix,
                  num_epochs, max_num_samples, masked_lm_prob,
