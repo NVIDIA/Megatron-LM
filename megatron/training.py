@@ -43,7 +43,7 @@ from megatron.utils import Timers
 
 
 def run(top_level_message, train_val_test_data_provider,
-        model_provider, forward_step_func):
+        model_provider, forward_step_func, extra_args_provider=None):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -71,17 +71,9 @@ def run(top_level_message, train_val_test_data_provider,
             function add `batch generator` to the timers class.
     """
 
-    # Arguments.
-    args = get_args()
-
-    # Timer.
-    timers = Timers()
-
-    # Tensorboard writer
-    writer = get_tensorboard_writer(args)
-
-    # Initalize.
-    initialize_megatron(top_level_message, args, writer)
+    # Initalize and get arguments, timers, and Tensorboard writer.
+    args = get_args(extra_args_provider=extra_args_provider)
+    timers, writer = initialize_megatron(top_level_message, args)
 
     # Data stuff.
     train_data, val_data, test_data = train_val_test_data_provider(args)
@@ -124,8 +116,14 @@ def run(top_level_message, train_val_test_data_provider,
                                    args, None, 0, timers, True)
 
 
-def initialize_megatron(message, args, writer):
+def initialize_megatron(message, args):
     """"Initialize distributed, random seed, and autoresume."""
+
+    # Timer.
+    timers = Timers()
+
+    # Tensorboard writer.
+    writer = get_tensorboard_writer(args)
 
     # Pytorch distributed.
     initialize_distributed(args)
@@ -140,6 +138,8 @@ def initialize_megatron(message, args, writer):
 
     # Random seeds for reproducability.
     set_random_seed(args.seed)
+
+    return timers, writer
 
 
 def get_model(model_provider_func, args):
