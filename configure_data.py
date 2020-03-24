@@ -45,9 +45,7 @@ class DataConfig:
 
 
 def make_data_loader(dataset, batch_size, args):
-
-    shuffle = args.shuffle
-    if shuffle:
+    if args.shuffle:
         sampler = data_utils.samplers.RandomSampler(dataset, replacement=True, num_samples=batch_size*args.train_iters)
     else:
         sampler = torch.utils.data.SequentialSampler(dataset)

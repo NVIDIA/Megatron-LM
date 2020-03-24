@@ -855,14 +855,13 @@ class InverseClozeDataset(data.Dataset):
     Dataset containing sentences and various 'blocks' for an inverse cloze task.
     Arguments:
         ds (Dataset or array-like): data corpus to use for training
-        max_seq_len (int): maximum sequence length to use for a target sentence
-        short_seq_prob (float): Proportion of sentence pairs purposefully shorter than max_seq_len
-        dataset_size (int): number of random sentencepairs in the dataset. Default: len(ds)*(len(ds)-1)
+        max_seq_len (int): maximum sequence length to use for an input sentence
+        short_seq_prob (float): Proportion of input sentences purposefully shorter than max_seq_len
+        dataset_size (int): number of input sentences in the dataset.
     """
     def __init__(self,
                  ds,
                  max_seq_len=512,
-                 max_preds_per_seq=None,
                  short_seq_prob=.01,
                  dataset_size=None,
                  presplit_sentences=False,
@@ -877,6 +876,7 @@ class InverseClozeDataset(data.Dataset):
         self.short_seq_prob = short_seq_prob
         self.dataset_size = dataset_size
         if self.dataset_size is None:
+            # this is wrong
             self.dataset_size = self.ds_len * (self.ds_len-1)
         self.presplit_sentences = presplit_sentences
         if not self.presplit_sentences:
