@@ -346,10 +346,10 @@ def add_data_args(parser):
                        help='path used to save/load sentencepiece tokenization '
                        'models')
     group.add_argument('--tokenizer-type', type=str,
-                       default='BertWordPieceTokenizer',
+                       default='BertWordPieceLowerCase',
                        choices=['CharacterLevelTokenizer',
                                 'SentencePieceTokenizer',
-                                'BertWordPieceTokenizer',
+                                'BertWordPieceLowerCase',
                                 'GPT2BPETokenizer'],
                        help='what type of tokenizer to use')
     group.add_argument("--cache-dir", default=None, type=str,
@@ -358,7 +358,7 @@ def add_data_args(parser):
     return parser
 
 
-def get_args():
+def get_args(extra_args_provider=None):
     """Parse all the args."""
 
     parser = argparse.ArgumentParser(description='PyTorch BERT Model')
@@ -368,6 +368,8 @@ def get_args():
     parser = add_evaluation_args(parser)
     parser = add_text_generate_args(parser)
     parser = add_data_args(parser)
+    if extra_args_provider is not None:
+        parser = extra_args_provider(parser)
 
     args = parser.parse_args()
 
