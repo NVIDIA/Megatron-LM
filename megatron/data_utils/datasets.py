@@ -327,8 +327,8 @@ class json_dataset(data.Dataset):
         all_strs (list): list of all strings from the dataset
         all_labels (list): list of all labels from the dataset (if they have it)
     """
-    def __init__(self, path, tokenizer=None, preprocess_fn=None, binarize_sent=False,
-                text_key='sentence', label_key='label', loose_json=False, **kwargs):
+    def __init__(self, path, tokenizer=None, preprocess_fn=None,
+                 text_key='sentence', label_key='label', loose_json=False, **kwargs):
         self.is_lazy = False
         self.preprocess_fn = preprocess_fn
         self.path = path
@@ -343,9 +343,6 @@ class json_dataset(data.Dataset):
             s = j[text_key]
             self.X.append(s)
             self.Y.append(j[label_key])
-
-        if binarize_sent:
-            self.Y = binarize_labels(self.Y, hard=binarize_sent)
 
     def SetTokenizer(self, tokenizer):
         if tokenizer is None:
@@ -452,6 +449,7 @@ class json_dataset(data.Dataset):
             if self.label_key not in j:
                 j[self.label_key] = -1
             yield j
+
 
 class GPT2Dataset(data.Dataset):
 
@@ -629,10 +627,8 @@ class bert_sentencepair_dataset(data.Dataset):
         np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
         # get seq length
         target_seq_length = self.max_seq_len
-        short_seq = False
         if rng.random() < self.short_seq_prob:
             target_seq_length = rng.randint(2, target_seq_length)
-            short_seq = True
 
         # get sentence pair and label
         is_random_next = None
