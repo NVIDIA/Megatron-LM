@@ -20,134 +20,118 @@ import os
 import torch
 
 
-def add_model_config_args(parser):
-    """Model arguments"""
+_GLOBAL_ARGS = None
 
-    group = parser.add_argument_group('model', 'model configuration')
 
-    group.add_argument('--pretrained-bert', action='store_true',
-                       help='use a pretrained bert-large-uncased model instead'
-                       'of initializing from scratch. See '
-                       '--tokenizer-model-type to specify which pretrained '
-                       'BERT model to use')
-    group.add_argument('--attention-dropout', type=float, default=0.1,
-                       help='dropout probability for attention weights')
-    group.add_argument('--num-attention-heads', type=int, default=16,
-                       help='num of transformer attention heads')
-    group.add_argument('--hidden-size', type=int, default=1024,
-                       help='tansformer hidden size')
-    group.add_argument('--intermediate-size', type=int, default=None,
-                       help='transformer embedding dimension for FFN'
-                       'set to 4*`--hidden-size` if it is None')
-    group.add_argument('--num-layers', type=int, default=24,
-                       help='num decoder layers')
-    group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
-                       help='layer norm epsilon')
-    group.add_argument('--hidden-dropout', type=float, default=0.1,
-                       help='dropout probability for hidden state transformer')
-    group.add_argument('--max-position-embeddings', type=int, default=512,
-                       help='maximum number of position embeddings to use')
-    group.add_argument('--vocab-size', type=int, default=None,
-                       help='vocab size to use for non-character-level '
-                       'tokenization. This value will only be used when '
-                       'creating a tokenizer')
-    group.add_argument('--deep-init', action='store_true',
-                       help='initialize bert model similar to gpt2 model.'
-                       'scales initialization of projection layers by a '
-                       'factor of 1/sqrt(2N). Necessary to train bert '
-                       'models larger than BERT-Large.')
+def parse_args(extra_args_provider=None):
+
+    global _GLOBAL_ARGS
+    assert _GLOBAL_ARGS is None, 'args already initializeed'
+    _GLOBAL_ARGS = get_args_(extra_args_provider=extra_args_provider)
+    return _GLOBAL_ARGS
+
+
+def get_args(extra_args_provider=None):
+
+    global _GLOBAL_ARGS
+    if _GLOBAL_ARGS is None:
+        return parse_args(extra_args_provider=extra_args_provider)
+    else:
+        return _GLOBAL_ARGS
+
+
+def add_network_size_args(parser):
+    group = parser.add_argument_group(title='network size')
+    
+    group.add_argument('--num-layers', type=int, required=True,
+                       help='Number of transformer layers.')
+    group.add_argument('--hidden-size', type=int, required=True,
+                       help='Tansformer hidden size.')
+    group.add_argument('--num-attention-heads', type=int, required=True,
+                       help='Number of transformer attention heads.')
+    group.add_argument('--max-position-embeddings', type=int, required=True,
+                       help='Maximum number of position embeddings to use. '
+                       'This is the size of position embedding.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
-
+    
     return parser
 
 
-def add_fp16_config_args(parser):
-    """Mixed precision arguments."""
+def add_regularization_args(parser):
+    group = parser.add_argument_group(title='regularization')
 
-    group = parser.add_argument_group('fp16', 'fp16 configurations')
-
-    group.add_argument('--fp16', action='store_true',
-                       help='Run model in fp16 mode')
-    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
-                       help='Scale Q * K^T by 1 / layer-number. If this flag '
-                       'is set, then it will automatically set '
-                       'attention-softmax-in-fp32 to true')
-    group.add_argument('--attention-softmax-in-fp32', action='store_true',
-                       help='Run attention masking and softmax in fp32.')
-    group.add_argument('--fp32-embedding', action='store_true',
-                       help='embedding in fp32')
-    group.add_argument('--fp32-layernorm', action='store_true',
-                       help='layer norm in fp32')
-    group.add_argument('--fp32-tokentypes', action='store_true',
-                       help='embedding token types in fp32')
-    group.add_argument('--fp32-allreduce', action='store_true',
-                       help='all-reduce in fp32')
-    group.add_argument('--hysteresis', type=int, default=2,
-                       help='hysteresis for dynamic loss scaling')
-    group.add_argument('--loss-scale', type=float, default=None,
-                       help='Static loss scaling, positive power of 2 '
-                       'values can improve fp16 convergence. If None, dynamic'
-                       'loss scaling is used.')
-    group.add_argument('--loss-scale-window', type=float, default=1000,
-                       help='Window over which to raise/lower dynamic scale')
-    group.add_argument('--min-scale', type=float, default=1,
-                       help='Minimum loss scale for dynamic loss scale')
+    group.add_argument('--attention-dropout', type=float, default=0.1,
+                       help='Post attention dropout ptobability.')
+    group.add_argument('--hidden-dropout', type=float, default=0.1,
+                       help='Dropout probability for hidden state transformer.')
+    group.add_argument('--weight-decay', type=float, default=0.01,
+                       help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--clip-grad', type=float, default=1.0,
+                       help='Gradient clipping based on global L2 norm.')
 
     return parser
-
+    
 
 def add_training_args(parser):
-    """Training arguments."""
+    group = parser.add_argument_group(title='training')
 
-    group = parser.add_argument_group('train', 'training configurations')
-
-    group.add_argument('--batch-size', type=int, default=4,
-                       help='Data Loader batch size')
-    group.add_argument('--weight-decay', type=float, default=0.01,
-                       help='weight decay coefficient for L2 regularization')
+    group.add_argument('--batch-size', type=int, required=True,
+                       help='Batch size per model instance (local batch size). '
+                       'Global batch size is local batch size times data '
+                       'parallel size.')
     group.add_argument('--checkpoint-activations', action='store_true',
-                       help='checkpoint activation to allow for training '
-                       'with larger models and sequences')
+                       help='Checkpoint activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
     group.add_argument('--checkpoint-num-layers', type=int, default=1,
-                       help='chunk size (number of layers) for checkpointing')
-    group.add_argument('--clip-grad', type=float, default=1.0,
-                       help='gradient clipping')
-    group.add_argument('--train-iters', type=int, default=1000000,
-                       help='total number of iterations to train over all training runs')
+                       help='chunk size (number of layers) for checkpointing.')
+    group.add_argument('--train-iters', type=int, required=True,
+                       help='Total number of iterations to train over all '
+                       'training runs.')
     group.add_argument('--log-interval', type=int, default=100,
-                       help='report interval')
+                       help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
-                       help='Exit the program after this many new iterations.')
+                       help='Exit the program after the iteration is divisible '
+                       'by this value.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
-                       help='Write TensorBoard logs to this directory')
-    group.add_argument('--seed', type=int, default=1234,
-                       help='random seed')
-    # Batch prodecuer arguments
-    group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
-    group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
-                       'end-of-document token.')
-    group.add_argument('--eod-mask-loss', action='store_true',
-                       help='Mask loss for the end of document tokens')
+                       help='Write TensorBoard logs to this directory.')
 
-    # Learning rate.
-    group.add_argument('--lr-decay-iters', type=int, default=None,
-                       help='number of iterations to decay LR over,'
-                       ' If None defaults to `--train-iters`*`--epochs`')
+    return parser
+
+
+def add_initialization_args(parser):
+    group = parser.add_argument_group(title='initialization')
+
+    group.add_argument('--seed', type=int, default=1234,
+                       help='Random seed used for python, numpy, '
+                       'pytorch, and cuda.')
+    group.add_argument('--init-method-std', type=float, default=0.02,
+                       help='Standard deviation of the zero mean normal '
+                       'distribution used for weight initialization.')
+    
+    return parser
+
+
+def add_learning_rate_args(parser):
+    group = parser.add_argument_group(title='learning rate')
+
+    group.add_argument('--lr', type=float, required=True,
+                       help='Initial learning rate. Depending on decay style '
+                       'and initial warmup, the learing rate at each '
+                       'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
                        choices=['constant', 'linear', 'cosine', 'exponential'],
-                       help='learning rate decay function')
-    group.add_argument('--lr', type=float, default=1.0e-4,
-                       help='initial learning rate')
+                       help='Learning rate decay function.')
+    group.add_argument('--lr-decay-iters', type=int, default=None,
+                       help='number of iterations to decay learning rate over,'
+                       ' If None defaults to `--train-iters`')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
     group.add_argument('--warmup', type=float, default=0.01,
-                       help='percentage of data to warmup on (.01 = 1% of all '
-                       'training iters). Default 0.01')
+                       help='Percentage of total iterations to warmup on '
+                       '(.01 = 1 percent of all training iters).')
     group.add_argument('--override-lr-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
@@ -158,20 +142,24 @@ def add_training_args(parser):
                        help='Use checkpoint to set the values of the scheduler '
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
-                       'from input arguments and ignore values from '
-                       'checkpoints. Notethat all the above values will be '
-                       'reset.')
-    # model checkpointing
+                       'from checkpoint and ignore input arguments.')
+
+    return parser
+
+
+def add_checkpointing_args(parser):
+    group = parser.add_argument_group(title='checkpointing')
+
     group.add_argument('--save', type=str, default=None,
                        help='Output directory to save checkpoints to.')
-    group.add_argument('--save-interval', type=int, default=5000,
-                       help='number of iterations between saves')
+    group.add_argument('--save-interval', type=int, default=None,
+                       help='Number of iterations between checkpoint saves.')
     group.add_argument('--no-save-optim', action='store_true',
                        help='Do not save current optimizer.')
     group.add_argument('--no-save-rng', action='store_true',
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
-                       help='Path to a directory containing a model checkpoint.')
+                       help='Directory containing a model checkpoint.')
     group.add_argument('--no-load-optim', action='store_true',
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true',
@@ -180,19 +168,134 @@ def add_training_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+
+    return parser
+
+
+def add_mixed_precision_args(parser):
+    group = parser.add_argument_group(title='mixed precision')
+
+    group.add_argument('--fp16', action='store_true',
+                       help='Run model in fp16 mode.')
+    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
+                       help='Scale Q * K^T by 1 / layer-number. If this flag '
+                       'is set, then it will automatically set '
+                       'attention-softmax-in-fp32 to true')
+    group.add_argument('--attention-softmax-in-fp32', action='store_true',
+                       help='Run attention masking and softmax in fp32.')
+    group.add_argument('--hysteresis', type=int, default=2,
+                       help='hysteresis for dynamic loss scaling')
+    group.add_argument('--loss-scale', type=float, default=None,
+                       help='Static loss scaling, positive power of 2 '
+                       'values can improve fp16 convergence. If None, dynamic'
+                       'loss scaling is used.')
+    group.add_argument('--loss-scale-window', type=float, default=1000,
+                       help='Window over which to raise/lower dynamic scale.')
+    group.add_argument('--min-scale', type=float, default=1,
+                       help='Minimum loss scale for dynamic loss scale.')
+
+    return parser
+
+
+def add_distributed_args(parser):
+    group = parser.add_argument_group(title='mixed precision')
+
+    group.add_argument('--distributed-backend', default='nccl',
+                       choices=['nccl', 'gloo'],
+                       help='Which backend to use for distributed training.')
+    group.add_argument('--DDP-impl', default='local',
+                       choices=['local', 'torch'], 
+                       help='which DistributedDataParallel implementation '
+                       'to use.')
+    group.add_argument('--local_rank', type=int, default=None,
+                       help='local rank passed from distributed launcher.')
+
+    return parser
+
+
+def add_validation_args(parser):
+    group = parser.add_argument_group(title='validation')
+
+    group.add_argument('--eval-iters', type=int, default=100,
+                       help='Number of iterations to run for evaluation'
+                       'validation/test for.')
+    group.add_argument('--eval-interval', type=int, default=1000,
+                       help='Interval between running evaluation on '
+                       'validation set.')
+
+    return parser
+
+########################
+
+
+def add_model_config_args(parser):
+    """Model arguments"""
+    
+    group = parser.add_argument_group('model', 'model configuration')
+    
+    group.add_argument('--pretrained-bert', action='store_true',
+                       help='use a pretrained bert-large-uncased model instead'
+                       'of initializing from scratch. See '
+                       '--tokenizer-model-type to specify which pretrained '
+                       'BERT model to use')
+    group.add_argument('--intermediate-size', type=int, default=None,
+                       help='transformer embedding dimension for FFN'
+                       'set to 4*`--hidden-size` if it is None')
+    group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
+                       help='layer norm epsilon')
+    group.add_argument('--deep-init', action='store_true',
+                       help='initialize bert model similar to gpt2 model.'
+                       'scales initialization of projection layers by a '
+                       'factor of 1/sqrt(2N). Necessary to train bert '
+                       'models larger than BERT-Large.')
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='vocabulary size to use for non-character-level '
+                       'tokenization. This value will only be used when '
+                       'creating a tokenizer')
+
+
+    return parser
+
+
+def add_fp16_config_args(parser):
+    """Mixed precision arguments."""
+
+    group = parser.add_argument_group('fp16', 'fp16 configurations')
+
+    group.add_argument('--fp32-embedding', action='store_true',
+                       help='embedding in fp32')
+    group.add_argument('--fp32-layernorm', action='store_true',
+                       help='layer norm in fp32')
+    group.add_argument('--fp32-tokentypes', action='store_true',
+                       help='embedding token types in fp32')
+    group.add_argument('--fp32-allreduce', action='store_true',
+                       help='all-reduce in fp32')
+
+    return parser
+
+
+def add_training_args_(parser):
+    """Training arguments."""
+
+    group = parser.add_argument_group('train', 'training configurations')
+
+    # Batch prodecuer arguments
+    group.add_argument('--reset-position-ids', action='store_true',
+                       help='Reset posistion ids after end-of-document token.')
+    group.add_argument('--reset-attention-mask', action='store_true',
+                       help='Reset self attention maske after '
+                       'end-of-document token.')
+    group.add_argument('--eod-mask-loss', action='store_true',
+                       help='Mask loss for the end of document tokens')
+
+    # Learning rate.
+
+    # model checkpointing
     group.add_argument('--resume-dataloader', action='store_true',
                        help='Resume the dataloader when resuming training. '
                        'Does not apply to tfrecords dataloader, try resuming'
                        'with a different seed in this case.')
     # distributed training args
-    group.add_argument('--distributed-backend', default='nccl',
-                       help='which backend to use for distributed '
-                       'training. One of [gloo, nccl]')
-    group.add_argument('--DDP-impl', default='local',
-                       help='which DistributedDataParallel implementation '
-                       'to use. One of [local, torch]')
-    group.add_argument('--local_rank', type=int, default=None,
-                       help='local rank passed from distributed launcher')
     # autoresume
     group.add_argument('--adlr-autoresume', action='store_true',
                        help='enable autoresume on adlr cluster.')
@@ -211,11 +314,6 @@ def add_evaluation_args(parser):
     group.add_argument('--eval-batch-size', type=int, default=None,
                        help='Data Loader batch size for evaluation datasets.'
                        'Defaults to `--batch-size`')
-    group.add_argument('--eval-iters', type=int, default=100,
-                       help='number of iterations to run for evaluation'
-                       'validation/test for')
-    group.add_argument('--eval-interval', type=int, default=1000,
-                       help='interval between running evaluation on validation set')
     group.add_argument('--eval-seq-length', type=int, default=None,
                        help='Maximum sequence length to process for '
                        'evaluation. Defaults to `--seq-length`')
@@ -358,21 +456,42 @@ def add_data_args(parser):
     return parser
 
 
-def get_args(extra_args_provider=None):
+def get_args_(extra_args_provider=None):
     """Parse all the args."""
 
-    parser = argparse.ArgumentParser(description='PyTorch BERT Model')
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments')
+
+    parser = add_network_size_args(parser)
+    parser = add_regularization_args(parser)
+    parser = add_training_args(parser)
+    parser = add_initialization_args(parser)
+    parser = add_learning_rate_args(parser)
+    parser = add_checkpointing_args(parser)
+    parser = add_mixed_precision_args(parser)
+    parser = add_distributed_args(parser)
+    parser = add_validation_args(parser)
+
+    #parser.print_help()
+    #exit()
+
     parser = add_model_config_args(parser)
     parser = add_fp16_config_args(parser)
-    parser = add_training_args(parser)
+    parser = add_training_args_(parser)
     parser = add_evaluation_args(parser)
     parser = add_text_generate_args(parser)
     parser = add_data_args(parser)
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
 
+
     args = parser.parse_args()
 
+    # Checks.
+    if args.save is not None:
+        assert args.save_interval is not None, \
+            'expected \'--save-interval\' in the input arguments.'
+
+    
     if not args.train_data and not args.data_path:
         print('WARNING: No training data specified')
 
