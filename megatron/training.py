@@ -486,20 +486,19 @@ def evaluate_and_print_results(prefix, forward_step_func,
 def get_train_val_test_data_iterators(train_data, val_data, test_data, args):
     """Build train/validation/test iterators"""
 
-    # If resume is on, shift the start iterations.
-    if args.resume_dataloader:
-        if train_data is not None:
-            train_data.batch_sampler.start_iter = args.iteration % \
-                                                  len(train_data)
-            print_rank_0('setting training data start iteration to {}'.
-                         format(train_data.batch_sampler.start_iter))
-        if val_data is not None:
-            start_iter_val = (args.iteration // args.eval_interval) * \
-                             args.eval_iters
-            val_data.batch_sampler.start_iter = start_iter_val % \
-                                                len(val_data)
-            print_rank_0('setting validation data start iteration to {}'.
-                         format(val_data.batch_sampler.start_iter))
+    # Shift the start iterations.
+    if train_data is not None:
+        train_data.batch_sampler.start_iter = args.iteration % \
+                                              len(train_data)
+        print_rank_0('setting training data start iteration to {}'.
+                     format(train_data.batch_sampler.start_iter))
+    if val_data is not None:
+        start_iter_val = (args.iteration // args.eval_interval) * \
+                         args.eval_iters
+        val_data.batch_sampler.start_iter = start_iter_val % \
+                                            len(val_data)
+        print_rank_0('setting validation data start iteration to {}'.
+                     format(val_data.batch_sampler.start_iter))
 
     if train_data is not None:
         train_data_iterator = iter(train_data)

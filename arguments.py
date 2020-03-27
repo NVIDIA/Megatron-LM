@@ -225,6 +225,35 @@ def add_validation_args(parser):
 
     return parser
 
+
+def add_data_args(parser):
+    group = parser.add_argument_group(title='data and dataloader')
+
+    group.add_argument('--data-path', type=str, required=True,
+                       help='Path to combined dataset to split.')
+    group.add_argument('--split', type=str, required=True,
+                       help='Comma-separated list of proportions for training,'
+                       ' validation, and test split. For example the split '
+                       '`90,5,5` will use 90% of data for training, 5% for '
+                       'validation and 5% for test.')
+    group.add_argument('--vocab-file', type=str, required=True,
+                       help='Path to the vocab file.')
+    group.add_argument('--seq-length', type=int, required=True,
+                       help="Maximum sequence length to process.")
+    group.add_argument('--mask-prob', type=float, default=0.15,
+                       help='Probability of replacing a token with mask.')
+    group.add_argument('--short-seq-prob', type=float, default=0.1,
+                       help='Probability of producing a short sequence.')
+    group.add_argument('--mmap-warmup', action='store_true',
+                       help='Warm up mmap files.')
+    group.add_argument('--num-workers', type=int, default=2,
+                       help="Dataloader number of workers.")
+
+
+
+
+    return parser
+
 ########################
 
 
@@ -290,12 +319,6 @@ def add_training_args_(parser):
 
     # Learning rate.
 
-    # model checkpointing
-    group.add_argument('--resume-dataloader', action='store_true',
-                       help='Resume the dataloader when resuming training. '
-                       'Does not apply to tfrecords dataloader, try resuming'
-                       'with a different seed in this case.')
-    # distributed training args
     # autoresume
     group.add_argument('--adlr-autoresume', action='store_true',
                        help='enable autoresume on adlr cluster.')
@@ -361,7 +384,7 @@ def add_text_generate_args(parser):
     return parser
 
 
-def add_data_args(parser):
+def add_data_args_(parser):
     """Train/valid/test data arguments."""
 
     group = parser.add_argument_group('data', 'data configurations')
@@ -382,22 +405,13 @@ def add_data_args(parser):
                        help='path(s) to the validation data.')
     group.add_argument('--test-data', nargs='*', default=None,
                        help='path(s) to the testing data.')
-    group.add_argument('--data-path', nargs='+', default=None,
-                       help='path to combined dataset to split')
-    group.add_argument('--split', default='1000,1,1',
-                       help='comma-separated list of proportions for training,'
-                       ' validation, and test split')
 
-    group.add_argument('--seq-length', type=int, default=512,
-                       help="Maximum sequence length to process")
     group.add_argument('--max-preds-per-seq', type=int, default=None,
                        help='Maximum number of predictions to use per sequence.'
                        'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
                        'MUST BE SPECIFIED IF `--data-loader tfrecords`.')
 
     # arguments for binary data loader
-    parser.add_argument('--vocab', type=str, default='vocab.txt',
-                        help='path to vocab file')
     parser.add_argument('--data-impl', type=str, default='infer',
                         help='implementation of indexed datasets',
                         choices=['lazy', 'cached', 'mmap', 'infer'])
@@ -405,12 +419,6 @@ def add_data_args(parser):
                         help='Maximum number of samples to plan for, defaults to total iters * batch-size.')
     parser.add_argument('--data-epochs', type=int, default=None,
                         help='Number of epochs to plan for, defaults to using --max-num-samples')
-    parser.add_argument('--mask-prob', default=0.15, type=float,
-                        help='probability of replacing a token with mask')
-    parser.add_argument('--short-seq-prob', default=0.1, type=float,
-                        help='probability of producing a short sequence')
-    parser.add_argument('--skip-mmap-warmup', action='store_true',
-                        help='skip warming up mmap files')
 
     # arguments for numpy data loader
     group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
@@ -432,8 +440,6 @@ def add_data_args(parser):
                        help='Dataset content consists of documents where '
                        'each document consists of newline separated sentences')
 
-    group.add_argument('--num-workers', type=int, default=2,
-                       help="""Number of workers to use for dataloading""")
     group.add_argument('--tokenizer-model-type', type=str,
                        default='bert-large-uncased',
                        help="Model type to use for sentencepiece tokenization \
@@ -470,6 +476,7 @@ def get_args_(extra_args_provider=None):
     parser = add_mixed_precision_args(parser)
     parser = add_distributed_args(parser)
     parser = add_validation_args(parser)
+    parser = add_data_args(parser)
 
     #parser.print_help()
     #exit()
@@ -479,7 +486,7 @@ def get_args_(extra_args_provider=None):
     parser = add_training_args_(parser)
     parser = add_evaluation_args(parser)
     parser = add_text_generate_args(parser)
-    parser = add_data_args(parser)
+    parser = add_data_args_(parser)
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
 

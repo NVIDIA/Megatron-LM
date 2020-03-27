@@ -118,17 +118,6 @@ def get_train_val_test_data(args):
         print_rank_0('> building train, validation, and test datasets '
                      'for BERT ...')
 
-        if args.data_loader is None:
-            args.data_loader = 'binary'
-        if args.data_loader != 'binary':
-            print('Unsupported {} data loader for BERT.'.format(
-                args.data_loader))
-            exit(1)
-        if not args.data_path:
-            print('BERT only supports a unified dataset specified '
-                  'with --data-path')
-            exit(1)
-
         data_parallel_size = mpu.get_data_parallel_world_size()
         data_parallel_rank = mpu.get_data_parallel_rank()
         global_batch_size = args.batch_size * data_parallel_size
@@ -137,7 +126,7 @@ def get_train_val_test_data(args):
         train_iters = args.train_iters
         eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
         test_iters = args.eval_iters
-        train_val_test_num_samples = [args.train_iters * global_batch_size,
+        train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,
                                       test_iters * global_batch_size]
         print_rank_0(' > datasets target sizes (minimum size):')
@@ -145,10 +134,9 @@ def get_train_val_test_data(args):
         print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
         print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
-        assert len(args.data_path) == 1
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            vocab_file=args.vocab,
-            data_prefix=args.data_path[0],
+            vocab_file=args.vocab_file,
+            data_prefix=args.data_path,
             data_impl=args.data_impl,
             splits_string=args.split,
             train_valid_test_num_samples=train_val_test_num_samples,
@@ -156,7 +144,7 @@ def get_train_val_test_data(args):
             masked_lm_prob=args.mask_prob,
             short_seq_prob=args.short_seq_prob,
             seed=args.seed,
-            skip_warmup=args.skip_mmap_warmup)
+            skip_warmup=(not args.mmap_warmup))
         print_rank_0("> finished creating BERT datasets ...")
 
         def make_data_loader_(dataset):
