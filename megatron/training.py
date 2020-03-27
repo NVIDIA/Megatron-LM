@@ -22,7 +22,7 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
-from arguments import get_args
+from megatron.arguments import get_args
 from megatron import mpu
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
@@ -129,7 +129,7 @@ def initialize_megatron(message, args):
     initialize_distributed(args)
     if torch.distributed.get_rank() == 0:
         print(message, flush=True)
-        print_args(args, writer)
+    print_args(args, writer)
 
     # Autoresume.
     torch.distributed.barrier()

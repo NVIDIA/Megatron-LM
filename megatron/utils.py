@@ -150,13 +150,15 @@ def check_adlr_autoresume_termination(iteration, model, optimizer,
 def print_args(args, writer=None):
     """Print arguments."""
 
-    print('arguments:', flush=True)
+    print_rank_0('arguments:')
+    str_list = []
     for arg in vars(args):
         dots = '.' * (29 - len(arg))
-        print('  {} {} {}'.format(arg, dots, getattr(args, arg)), flush=True)
-
+        str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         if writer:
             writer.add_text(arg, str(getattr(args, arg)))
+    for arg in sorted(str_list, key= lambda a: a.lower()):
+        print_rank_0(arg)
 
 
 def print_params_min_max_norm(optimizer, iteration):
@@ -290,6 +292,7 @@ def initialize_distributed(args):
     device = args.rank % torch.cuda.device_count()
     if args.local_rank is not None:
         device = args.local_rank
+
     torch.cuda.set_device(device)
     # Call the init process
     init_method = 'tcp://'

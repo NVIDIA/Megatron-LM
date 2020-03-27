@@ -1,30 +1,66 @@
+# coding=utf-8
+# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Megatron tokenizer."""
-
 
 from abc import ABC
 from abc import abstractmethod
 
-from megatron.utils import vocab_size_with_padding
+from megatron.arguments import get_args
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 
 
-def add_tokenizer_to_args(args, tokenizer_type):
-    """Instantiate tokenizer based on input type and add it to args."""
+def build_tokenizer():
+    """Initialize tokenizer."""
 
-    # Make sure we have not already called this method.
-    if hasattr(args, 'tokenizer'):
-        raise Exception('args already has a tokenizer')
+    # Retrieve args.
+    args = get_args()
+
+    if args.rank == 0:
+        print('building {} tokenizer ...'.format(args.tokenizer_type),
+              flush=True)
+
     # Select and instantiate the tokenizer.
-    if tokenizer_type == 'BertWordPieceLowerCase':
-        args.tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab,
-                                                 lower_case=True)
+    if args.tokenizer_type == 'BertWordPieceLowerCase':
+        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                                    lower_case=True)
     else:
         raise NotImplementedError('{} tokenizer is not '
-                                  'implemented.'.format(tokenizer_type))
+                                  'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size.
-    args.vocab_size = vocab_size_with_padding(args.tokenizer.vocab_size, args)
+    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size)
+
+    return tokenizer
+
+
+def _vocab_size_with_padding(orig_vocab_size):
+    """Pad vocab size so it is divisible by model parallel size and
+    still having GPU friendly size."""
+
+    args = get_args()
+    after = orig_vocab_size
+    multiple = args.make_vocab_size_divisible_by * \
+               args.model_parallel_size
+    while (after % multiple) != 0:
+        after += 1
+    if args.rank == 0:
+        print(' > padded vocab (size: {}) with {} dummy tokens '
+              '(new size: {})'.format(
+                  orig_vocab_size, after - orig_vocab_size, after), flush=True)
+    return after
 
 
 class AbstractTokenizer(ABC):

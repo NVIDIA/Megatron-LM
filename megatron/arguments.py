@@ -23,6 +23,7 @@ import torch
 _GLOBAL_ARGS = None
 
 
+
 def parse_args(extra_args_provider=None):
 
     global _GLOBAL_ARGS
@@ -200,6 +201,8 @@ def add_mixed_precision_args(parser):
 def add_distributed_args(parser):
     group = parser.add_argument_group(title='mixed precision')
 
+    group.add_argument('--model-parallel-size', type=int, default=1,
+                       help='Size of the model parallel.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -389,8 +392,6 @@ def add_data_args_(parser):
 
     group = parser.add_argument_group('data', 'data configurations')
 
-    group.add_argument('--model-parallel-size', type=int, default=1,
-                       help='size of the model parallel.')
     group.add_argument('--shuffle', action='store_true',
                        help='Shuffle data. Shuffling is deterministic '
                        'based on seed and current epoch.')
