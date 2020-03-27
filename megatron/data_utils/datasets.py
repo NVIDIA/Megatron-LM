@@ -924,6 +924,7 @@ class InverseClozeDataset(data.Dataset):
             'context_types': np.array(context_token_types),
             'context_pad_mask': np.array(context_pad_mask)
         }
+
         return sample
 
     def get_sentence_split_doc(self, idx):
@@ -1015,4 +1016,5 @@ class InverseClozeDataset(data.Dataset):
         num_pad = max(0, self.max_seq_len - len(tokens))
         pad_mask = [0] * len(tokens) + [1] * num_pad
         tokens += [self.tokenizer.get_command('pad').Id] * num_pad
+        token_types += [token_types[0]] * num_pad
         return tokens, token_types, pad_mask

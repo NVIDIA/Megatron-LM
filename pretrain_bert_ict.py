@@ -96,7 +96,7 @@ def forward_step(data_iterator, model, args, timers):
                              context_tokens, 1 - context_pad_mask, context_types)
 
     softmaxed = F.softmax(retrieval_scores, dim=0).float()
-    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(softmaxed.size()[0]))
+    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(softmaxed.size()[0]).cuda())
 
     reduced_losses = reduce_losses([retrieval_loss])
 
@@ -114,7 +114,7 @@ def get_train_val_test_data(args):
                 or args.data_loader == 'lazy'
                 or args.data_loader == 'tfrecords'):
             data_config = configure_data()
-            ds_type = 'BERT'
+            ds_type = 'BERT_ict'
             data_config.set_defaults(data_set_type=ds_type, transpose=False)
             (train_data, val_data, test_data), tokenizer = data_config.apply(args)
             num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)

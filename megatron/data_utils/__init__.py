@@ -19,7 +19,7 @@ import math
 import torch
 
 from .samplers import DistributedBatchSampler
-from .datasets import json_dataset, csv_dataset, split_ds, ConcatDataset, SplitDataset, bert_sentencepair_dataset, GPT2Dataset
+from .datasets import json_dataset, csv_dataset, split_ds, ConcatDataset, SplitDataset, bert_sentencepair_dataset, GPT2Dataset, InverseClozeDataset
 from .lazy_loader import exists_lazy, make_lazy, lazy_array_loader
 from .tokenization import Tokenization, CommandToken, Tokenizer, CharacterLevelTokenizer, BertWordPieceTokenizer, GPT2BPETokenizer, make_tokenizer
 from . import corpora
@@ -120,14 +120,20 @@ def make_dataset(path, seq_length, text_key, label_key, lazy=False, process_fn=N
         ds = split_ds(ds, split)
         if 'bert' in ds_type.lower():
             presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
-            dstype = bert_sentencepair_dataset
-            ds = [dstype(d, max_seq_len=seq_length, presplit_sentences=presplit_sentences)  if d is not None else None  for d in ds]
+            if 'ict' in ds_type.lower():
+                dstype = InverseClozeDataset
+            else:
+                dstype = bert_sentencepair_dataset
+            ds = [dstype(d, max_seq_len=seq_length, presplit_sentences=presplit_sentences) if d is not None else None for d in ds]
         elif ds_type.lower() == 'gpt2':
             ds = [GPT2Dataset(d, max_seq_len=seq_length) if d is not None else None for d in ds]
     else:
         if 'bert' in ds_type.lower():
             presplit_sentences = kwargs['presplit_sentences'] if 'presplit_sentences' in kwargs else False
-            dstype = bert_sentencepair_dataset
+            if 'ict' in ds_type.lower():
+                dstype = InverseClozeDataset
+            else:
+                dstype = bert_sentencepair_dataset
             ds = dstype(ds, max_seq_len=seq_length, presplit_sentences=presplit_sentences)
         elif ds_type.lower() == 'gpt2':
             ds = GPT2Dataset(ds, max_seq_len=seq_length)
