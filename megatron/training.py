@@ -22,7 +22,7 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
-from megatron.arguments import get_args
+from megatron.arguments import parse_args
 from megatron import mpu
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
@@ -72,7 +72,7 @@ def run(top_level_message, train_val_test_data_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    args = get_args(extra_args_provider=extra_args_provider)
+    args = parse_args(extra_args_provider=extra_args_provider)
     timers, writer = initialize_megatron(top_level_message, args)
 
     # Data stuff.

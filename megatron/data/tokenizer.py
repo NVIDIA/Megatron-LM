@@ -18,18 +18,13 @@
 from abc import ABC
 from abc import abstractmethod
 
-from megatron.arguments import get_args
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 
 
-def build_tokenizer():
+def build_tokenizer(args):
     """Initialize tokenizer."""
-
-    # Retrieve args.
-    args = get_args()
-
     if args.rank == 0:
-        print('building {} tokenizer ...'.format(args.tokenizer_type),
+        print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
     # Select and instantiate the tokenizer.
@@ -41,16 +36,16 @@ def build_tokenizer():
                                   'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size.
-    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size)
+    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
+                                                      args)
 
     return tokenizer
 
 
-def _vocab_size_with_padding(orig_vocab_size):
+def _vocab_size_with_padding(orig_vocab_size, args):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
-    args = get_args()
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
                args.model_parallel_size

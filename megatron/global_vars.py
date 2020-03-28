@@ -59,36 +59,38 @@ def get_timers():
     return _GLOBAL_TIMERS
 
 
-def set_global_variables(extra_args_provider=None):
+def set_global_variables(extra_args_provider=None, args_defaults={}):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
-    _parse_args(extra_args_provider=extra_args_provider)
-    _build_tokenizer()
-    _set_tensorboard_writer()
-    _set_adlr_autoresume()
+    args = _parse_args(extra_args_provider=extra_args_provider,
+                       defaults=args_defaults)
+    _build_tokenizer(args)
+    _set_tensorboard_writer(args)
+    _set_adlr_autoresume(args)
     _set_timers()
 
 
-def _parse_args(extra_args_provider=None):
+def _parse_args(extra_args_provider=None, defaults={}):
     """Parse entire arguments."""
     global _GLOBAL_ARGS
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider)
+    _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
+                              defaults=defaults)
+    return _GLOBAL_ARGS
 
 
-def _build_tokenizer():
+def _build_tokenizer(args):
     """Initialize tokenizer."""
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
-    _GLOBAL_TOKENIZER = build_tokenizer()
+    _GLOBAL_TOKENIZER = build_tokenizer(args)
 
 
-def _set_tensorboard_writer():
+def _set_tensorboard_writer(args):
     """Set tensorboard writer."""
     global _GLOBAL_TENSORBOARD_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
-    args = get_args()
     if hasattr(args, 'tensorboard_dir') and \
        args.tensorboard_dir and args.rank == 0:
         try:
@@ -102,12 +104,11 @@ def _set_tensorboard_writer():
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _set_adlr_autoresume():
+def _set_adlr_autoresume(args):
     """Initialize ADLR autoresume."""
     global _GLOBAL_ADLR_AUTORESUME
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
-    args = get_args()
     if args.adlr_autoresume:
         if args.rank == 0:
             print('enabling autoresume ...', flush=True)

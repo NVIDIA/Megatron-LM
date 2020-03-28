@@ -196,5 +196,11 @@ def get_train_val_test_data(args):
 
 if __name__ == "__main__":
 
+    '''
+    from megatron.initialize import initialize_megatron
+    initialize_megatron(args_defaults={
+        'tokenizer_type': 'BertWordPieceLowerCase'})
+    exit()
+    '''
     run('Pretrain BERT model', get_train_val_test_data,
         model_provider, forward_step)

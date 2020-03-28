@@ -24,15 +24,20 @@ import torch
 from megatron import mpu
 from .global_vars import get_adlr_autoresume
 from .global_vars import get_args
+from .global_vars import get_tensorboard_writer
 from .global_vars import set_global_variables
 
 
-def initialize_megatron(extra_args_provider=None):
+def initialize_megatron(extra_args_provider=None, args_defaults={}):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds."""
+    # Male sure cuda is avaiable.
+    assert torch.cuda.is_available(), 'Megatron requires CUDA.'
+
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    set_global_variables(extra_args_provider=extra_args_provider)
+    set_global_variables(extra_args_provider=extra_args_provider,
+                         args_defaults=args_defaults)
 
     # Pytorch distributed.
     _initialize_distributed()
@@ -45,6 +50,9 @@ def initialize_megatron(extra_args_provider=None):
     if args.rank == 0:
         print('> setting random seeds to {} ...'.format(args.seed))
     _set_random_seed(args.seed)
+
+    # Write arguments to tensorboard.
+    _write_args_to_tensorboard()
 
 
 def _initialize_distributed():
@@ -107,3 +115,12 @@ def _set_random_seed(seed):
         mpu.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
+
+
+def _write_args_to_tensorboard():
+    """Write arguments to tensorboard."""
+    args = get_args()
+    writer = get_tensorboard_writer()
+    if writer:
+        for arg in vars(args):
+            writer.add_text(arg, str(getattr(args, arg)))
