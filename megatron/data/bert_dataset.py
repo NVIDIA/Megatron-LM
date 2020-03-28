@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 
 from megatron import mpu
 from megatron.data import helpers
-from megatron.data import FullBertTokenizer
+from megatron.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron.utils import print_rank_0

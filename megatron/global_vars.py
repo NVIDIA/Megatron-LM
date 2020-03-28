@@ -21,7 +21,7 @@ import time
 
 import torch
 
-from megatron.data.tokenizer import build_tokenizer
+from megatron.tokenizer import build_tokenizer
 from .arguments import parse_args
 
 _GLOBAL_ARGS = None
