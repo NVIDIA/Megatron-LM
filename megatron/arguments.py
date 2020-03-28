@@ -24,6 +24,22 @@ _GLOBAL_ARGS = None
 
 
 
+def _print_args():
+    """Print arguments."""
+
+    args = get_args()
+    writer = get_tensorboard_writer()
+    print_rank_0('arguments:')
+    str_list = []
+    for arg in vars(args):
+        dots = '.' * (29 - len(arg))
+        str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
+        if writer:
+            writer.add_text(arg, str(getattr(args, arg)))
+    for arg in sorted(str_list, key= lambda x: x.lower()):
+        print_rank_0(arg)
+
+
 def parse_args(extra_args_provider=None):
 
     global _GLOBAL_ARGS
