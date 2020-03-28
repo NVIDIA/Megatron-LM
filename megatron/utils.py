@@ -22,13 +22,50 @@ import numpy as np
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from apex.optimizers import FusedAdam as Adam
+#from megatron.global_vars import get_args
+#from megatron.global_vars import get_adlr_autoresume
 
 from megatron import mpu
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
+
+
+
+def print_rank_0(message):
+    """If distributed is initialized print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def reduce_losses(losses):
+    """Reduce a tensor of losses across all GPUs."""
+    reduced_losses = torch.cat(
+        [loss.clone().detach().view(1) for loss in losses])
+    torch.distributed.all_reduce(reduced_losses)
+    reduced_losses = reduced_losses / torch.distributed.get_world_size()
+
+    return reduced_losses
+
+
+def check_adlr_autoresume_termination(iteration, model, optimizer,
+                                      lr_scheduler, args):
+    # Add barrier to ensure consistnecy.
+    torch.distributed.barrier()
+    if args.AutoResume.termination_requested():
+        if args.save:
+            save_checkpoint(iteration, model, optimizer, lr_scheduler, args)
+        print_rank_0(">>> autoresume termination request found!")
+        if torch.distributed.get_rank() == 0:
+            args.AutoResume.request_resume()
+        print_rank_0(">>> training terminated. Returning")
+        exit(0)
+
+
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -88,78 +125,6 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
-def reduce_losses(losses):
-    reduced_losses = torch.cat(
-        [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(reduced_losses)
-    reduced_losses = reduced_losses / torch.distributed.get_world_size()
-
-    return reduced_losses
-
-
-def get_tensorboard_writer(args):
-    writer = None
-    if hasattr(args, 'tensorboard_dir') and \
-       args.tensorboard_dir and args.rank == 0:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(log_dir=args.tensorboard_dir)
-        except ModuleNotFoundError:
-            print_rank_0('WARNING: TensorBoard writing requested but is not '
-                         'available (are you using PyTorch 1.1.0 or later?), '
-                         'no TensorBoard logs will be written.')
-            writer = None
-    return writer
-
-
-def print_rank_0(message):
-    if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            print(message, flush=True)
-    else:
-        print(message, flush=True)
-
-
-def enable_adlr_autoresume(args):
-    print_rank_0('enabling autoresume ...')
-    import sys
-    sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
-    try:
-        from userlib.auto_resume import AutoResume
-    except:
-        print_rank_0('ADLR autoresume is not available, exiting ...')
-        exit()
-    args.AutoResume = AutoResume
-    args.AutoResume.init()
-
-
-def check_adlr_autoresume_termination(iteration, model, optimizer,
-                                      lr_scheduler, args):
-    # Add barrier to ensure consistnecy.
-    torch.distributed.barrier()
-    if args.AutoResume.termination_requested():
-        if args.save:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler, args)
-        print_rank_0(">>> autoresume termination request found!")
-        if torch.distributed.get_rank() == 0:
-            args.AutoResume.request_resume()
-        print_rank_0(">>> training terminated. Returning")
-        exit(0)
-
-
-def print_args(args, writer=None):
-    """Print arguments."""
-
-    print_rank_0('arguments:')
-    str_list = []
-    for arg in vars(args):
-        dots = '.' * (29 - len(arg))
-        str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
-        if writer:
-            writer.add_text(arg, str(getattr(args, arg)))
-    for arg in sorted(str_list, key= lambda a: a.lower()):
-        print_rank_0(arg)
-
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
@@ -179,82 +144,6 @@ def print_params_min_max_norm(optimizer, iteration):
                 iteration, rank, index, int(param.model_parallel))
             string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
     print(string, flush=True)
-
-
-class Timers:
-    """Group of timers."""
-
-    class Timer:
-        """Timer."""
-
-        def __init__(self, name):
-            self.name_ = name
-            self.elapsed_ = 0.0
-            self.started_ = False
-            self.start_time = time.time()
-
-        def start(self):
-            """Start the timer."""
-            assert not self.started_, 'timer has already been started'
-            torch.cuda.synchronize()
-            self.start_time = time.time()
-            self.started_ = True
-
-        def stop(self):
-            """Stop the timer."""
-            assert self.started_, 'timer is not started'
-            torch.cuda.synchronize()
-            self.elapsed_ += (time.time() - self.start_time)
-            self.started_ = False
-
-        def reset(self):
-            """Reset timer."""
-            self.elapsed_ = 0.0
-            self.started_ = False
-
-        def elapsed(self, reset=True):
-            """Calculate the elapsed time."""
-            started_ = self.started_
-            # If the timing in progress, end it first.
-            if self.started_:
-                self.stop()
-            # Get the elapsed time.
-            elapsed_ = self.elapsed_
-            # Reset the elapsed time
-            if reset:
-                self.reset()
-            # If timing was in progress, set it back.
-            if started_:
-                self.start()
-            return elapsed_
-
-    def __init__(self):
-        self.timers = {}
-
-    def __call__(self, name):
-        if name not in self.timers:
-            self.timers[name] = self.Timer(name)
-        return self.timers[name]
-
-    def write(self, names, writer, iteration, normalizer=1.0, reset=False):
-        """Write timers to a tensorboard writer"""
-        # currently when using add_scalars,
-        # torch.utils.add_scalars makes each timer its own run, which
-        # polutes the runs list, so we just add each as a scalar
-        assert normalizer > 0.0
-        for name in names:
-            value = self.timers[name].elapsed(reset=reset) / normalizer
-            writer.add_scalar(name + '_time', value, iteration)
-
-    def log(self, names, normalizer=1.0, reset=True):
-        """Log a group of timers."""
-        assert normalizer > 0.0
-        string = 'time (ms)'
-        for name in names:
-            elapsed_time = self.timers[name].elapsed(
-                reset=reset) * 1000.0/ normalizer
-            string += ' | {}: {:.2f}'.format(name, elapsed_time)
-        print_rank_0(string)
 
 
 def report_memory(name):
@@ -283,39 +172,6 @@ def vocab_size_with_padding(num_tokens, args):
                  'tokens (new size: {})'.format(
                      num_tokens, after - num_tokens, after))
     return after
-
-
-def initialize_distributed(args):
-    """Initialize torch.distributed."""
-
-    # Manually set the device ids.
-    device = args.rank % torch.cuda.device_count()
-    if args.local_rank is not None:
-        device = args.local_rank
-
-    torch.cuda.set_device(device)
-    # Call the init process
-    init_method = 'tcp://'
-    master_ip = os.getenv('MASTER_ADDR', 'localhost')
-    master_port = os.getenv('MASTER_PORT', '6000')
-    init_method += master_ip + ':' + master_port
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        init_method=init_method)
-
-    # Set the model-parallel / data-parallel communicators.
-    mpu.initialize_model_parallel(args.model_parallel_size)
-
-
-def set_random_seed(seed):
-    """Set random seed for reproducability."""
-
-    if seed is not None and seed > 0:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        mpu.model_parallel_cuda_manual_seed(seed)
 
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,

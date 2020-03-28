@@ -203,4 +203,5 @@ if __name__ == "__main__":
     exit()
     '''
     run('Pretrain BERT model', get_train_val_test_data,
-        model_provider, forward_step)
+        model_provider, forward_step,
+        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

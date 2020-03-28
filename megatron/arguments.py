@@ -45,6 +45,11 @@ def parse_args(extra_args_provider=None, defaults={}):
 
     # Set input defaults.
     for key in defaults:
+        # For default to be valid, it should not be provided in the
+        # arguments that are passed to the program. We check this by
+        # ensuring the arg is set to None.
+        assert getattr(args, key) is None, \
+            'defaults can only be overwritten for args with None values.'
         setattr(args, key, defaults[key])
 
     # Distributed args.
@@ -59,7 +64,6 @@ def parse_args(extra_args_provider=None, defaults={}):
     args.dynamic_loss_scale = False
     if args.loss_scale is None:
         args.dynamic_loss_scale = True
-
 
     # Checks.
     assert args.hidden_size % args.num_attention_heads == 0

@@ -22,7 +22,12 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
-from megatron.arguments import parse_args
+from megatron.global_vars import get_args
+from megatron.global_vars import get_timers
+from megatron.global_vars import get_tensorboard_writer
+from megatron.global_vars import get_adlr_autoresume
+from megatron.initialize import initialize_megatron
+
 from megatron import mpu
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
@@ -30,20 +35,15 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import enable_adlr_autoresume
-from megatron.utils import get_tensorboard_writer
-from megatron.utils import initialize_distributed
 from megatron.utils import load_checkpoint
-from megatron.utils import print_args
 from megatron.utils import print_rank_0
 from megatron.utils import report_memory
 from megatron.utils import save_checkpoint
-from megatron.utils import set_random_seed
-from megatron.utils import Timers
 
 
 def run(top_level_message, train_val_test_data_provider,
-        model_provider, forward_step_func, extra_args_provider=None):
+        model_provider, forward_step_func, extra_args_provider=None,
+        args_defaults={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -72,8 +72,11 @@ def run(top_level_message, train_val_test_data_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    args = parse_args(extra_args_provider=extra_args_provider)
-    timers, writer = initialize_megatron(top_level_message, args)
+    initialize_megatron(extra_args_provider=extra_args_provider,
+                        args_defaults=args_defaults)
+    args = get_args()
+    timers = get_timers()
+    writer = get_tensorboard_writer()
 
     # Data stuff.
     train_data, val_data, test_data = train_val_test_data_provider(args)
@@ -114,32 +117,6 @@ def run(top_level_message, train_val_test_data_provider,
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    args, None, 0, timers, True)
-
-
-def initialize_megatron(message, args):
-    """"Initialize distributed, random seed, and autoresume."""
-
-    # Timer.
-    timers = Timers()
-
-    # Tensorboard writer.
-    writer = get_tensorboard_writer(args)
-
-    # Pytorch distributed.
-    initialize_distributed(args)
-    if torch.distributed.get_rank() == 0:
-        print(message, flush=True)
-    print_args(args, writer)
-
-    # Autoresume.
-    torch.distributed.barrier()
-    if args.adlr_autoresume:
-        enable_adlr_autoresume(args)
-
-    # Random seeds for reproducability.
-    set_random_seed(args.seed)
-
-    return timers, writer
 
 
 def get_model(model_provider_func, args):
