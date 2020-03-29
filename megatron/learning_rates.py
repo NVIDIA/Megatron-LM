@@ -18,7 +18,7 @@ import torch
 from torch.optim.lr_scheduler import _LRScheduler
 import math
 
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 
 
 class AnnealingLR(_LRScheduler):

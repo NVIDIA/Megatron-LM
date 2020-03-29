@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from megatron import mpu
 from megatron.model import BertModel
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
 from megatron.training import run

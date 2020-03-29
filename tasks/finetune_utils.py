@@ -26,7 +26,7 @@ from megatron.training import train_step
 from megatron.training import training_log
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import load_checkpoint
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import save_checkpoint
 

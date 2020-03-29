@@ -27,7 +27,7 @@ from megatron.data import helpers
 from megatron.tokenizer.bert_tokenization import FullTokenizer as FullBertTokenizer
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 
 
 def build_train_valid_test_datasets(vocab_file, data_prefix, data_impl,

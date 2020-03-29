@@ -22,7 +22,7 @@ from gpt2_data_loader import make_gpt2_dataloaders
 from megatron import mpu
 from megatron.model import GPT2Model
 from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
 from megatron.training import run

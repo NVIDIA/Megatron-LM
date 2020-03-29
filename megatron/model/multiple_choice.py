@@ -25,7 +25,7 @@ from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from megatron.module import MegatronModule
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 
 
 class MultipleChoice(MegatronModule):

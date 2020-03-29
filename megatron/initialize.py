@@ -21,11 +21,11 @@ import numpy as np
 
 import torch
 
+from megatron import get_adlr_autoresume
+from megatron import get_args
+from megatron import get_tensorboard_writer
 from megatron import mpu
-from .global_vars import get_adlr_autoresume
-from .global_vars import get_args
-from .global_vars import get_tensorboard_writer
-from .global_vars import set_global_variables
+from megatron.global_vars import set_global_variables
 
 
 def initialize_megatron(extra_args_provider=None, args_defaults={}):

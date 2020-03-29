@@ -35,10 +35,10 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import load_checkpoint
-from megatron.utils import print_rank_0
+from megatron.checkpointing import load_checkpoint
+from megatron import print_rank_0
 from megatron.utils import report_memory
-from megatron.utils import save_checkpoint
+from megatron.checkpointing import save_checkpoint
 
 
 def run(top_level_message, train_val_test_data_provider,
@@ -108,8 +108,7 @@ def run(top_level_message, train_val_test_data_provider,
                                    timers, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer,
-                        lr_scheduler, args)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -220,7 +219,7 @@ def setup_model_and_optimizer(model_provider_func, args):
     lr_scheduler = get_learning_rate_scheduler(optimizer, args)
 
     if args.load is not None:
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler, args)
+        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
         args.iteration = 0
 
@@ -378,12 +377,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         if (iteration % args.adlr_autoresume_interval == 0) and \
            args.adlr_autoresume:
             check_adlr_autoresume_termination(iteration, model, optimizer,
-                                              lr_scheduler, args)
+                                              lr_scheduler)
 
         # Checkpointing
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler, args)
+            save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \

@@ -15,7 +15,7 @@
 
 """GLUE finetuning/evaluation."""
 
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 from megatron.model.classification import Classification
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
