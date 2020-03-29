@@ -18,24 +18,28 @@
 import torch
 import torch.nn.functional as F
 
+from megatron import get_args
+from megatron import get_timers
+
 from megatron import mpu
 from megatron.model import BertModel
 from megatron import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
-from megatron.training import run
+from megatron.training import pretrain
 from megatron.data.bert_dataset import build_train_valid_test_datasets
 from megatron.data_utils.samplers import DistributedBatchSampler
 
 
-def model_provider(args):
+def model_provider():
     """Build the model."""
+    args = get_args()
 
     print_rank_0('building BERT model ...')
 
     model = BertModel(
         num_layers=args.num_layers,
-        vocab_size=args.vocab_size,
+        vocab_size=args.padded_vocab_size,
         hidden_size=args.hidden_size,
         num_attention_heads=args.num_attention_heads,
         embedding_dropout_prob=args.hidden_dropout,
@@ -46,7 +50,7 @@ def model_provider(args):
         checkpoint_num_layers=args.checkpoint_num_layers,
         add_binary_head=True,
         layernorm_epsilon=args.layernorm_epsilon,
-        num_tokentypes=args.tokentype_size,
+        num_tokentypes=2,
         parallel_output=True,
         apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
         attention_softmax_in_fp32=args.attention_softmax_in_fp32)
@@ -54,19 +58,17 @@ def model_provider(args):
     return model
 
 
-def get_batch(data_iterator, timers):
+def get_batch(data_iterator):
 
     # Items and their type.
     keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
     datatype = torch.int64
 
     # Broadcast data.
-    timers('data loader').start()
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    timers('data loader').stop()
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -80,13 +82,14 @@ def get_batch(data_iterator, timers):
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
 
-def forward_step(data_iterator, model, args, timers):
+def forward_step(data_iterator, model):
     """Forward step."""
+    timers = get_timers()
 
     # Get the batch.
     timers('batch generator').start()
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask \
-        = get_batch(data_iterator, timers)
+        = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
@@ -108,9 +111,10 @@ def forward_step(data_iterator, model, args, timers):
     return loss, {'lm loss': reduced_losses[0], 'sop loss': reduced_losses[1]}
 
 
-def get_train_val_test_data(args):
+def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
-
+    args = get_args()
+    
     (train_data, valid_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
@@ -202,6 +206,6 @@ if __name__ == "__main__":
         'tokenizer_type': 'BertWordPieceLowerCase'})
     exit()
     '''
-    run('Pretrain BERT model', get_train_val_test_data,
-        model_provider, forward_step,
-        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    pretrain(get_train_val_test_data,
+             model_provider, forward_step,
+             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

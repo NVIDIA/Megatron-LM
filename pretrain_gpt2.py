@@ -17,6 +17,10 @@
 
 import torch
 
+
+from megatron import get_args
+from megatron import get_timers
+
 from configure_data import configure_data
 from gpt2_data_loader import make_gpt2_dataloaders
 from megatron import mpu
@@ -25,15 +29,16 @@ from megatron.utils import get_ltor_masks_and_position_ids
 from megatron import print_rank_0
 from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
-from megatron.training import run
+from megatron.training import pretrain
 
 
-def model_provider(args):
+def model_provider():
     """Build the model."""
+    args = get_args()
 
     print_rank_0('building GPT2 model ...')
     model = GPT2Model(num_layers=args.num_layers,
-                      vocab_size=args.vocab_size,
+                      vocab_size=args.padded_vocab_size,
                       hidden_size=args.hidden_size,
                       num_attention_heads=args.num_attention_heads,
                       embedding_dropout_prob=args.hidden_dropout,
@@ -50,20 +55,19 @@ def model_provider(args):
     return model
 
 
-def get_batch(data_iterator, args, timers):
+def get_batch(data_iterator):
     """Generate a batch"""
+    args = get_args()
 
     # Items and their type.
     keys = ['text']
     datatype = torch.int64
 
     # Broadcast data.
-    timers('data loader').start()
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    timers('data loader').stop()
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -85,8 +89,10 @@ def get_batch(data_iterator, args, timers):
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 
-def forward_step(data_iterator, model, args, timers):
+def forward_step(data_iterator, model):
     """Forward step."""
+    args = get_args()
+    timers = get_timers()
 
     # Get the batch.
     timers('batch generator').start()
@@ -107,9 +113,10 @@ def forward_step(data_iterator, model, args, timers):
     return loss, {'lm loss': reduced_loss[0]}
 
 
-def get_train_val_test_data(args):
+def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
-
+    args = get_args()
+    
     (train_data, val_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
@@ -162,5 +169,5 @@ def get_train_val_test_data(args):
 
 if __name__ == "__main__":
 
-    run('Pretrain GPT-2 model', get_train_val_test_data,
-        model_provider, forward_step)
+    pretrain(get_train_val_test_data,
+             model_provider, forward_step)

@@ -234,6 +234,8 @@ def _add_mixed_precision_args(parser):
                        'attention-softmax-in-fp32 to true')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
                        help='Run attention masking and softmax in fp32.')
+    group.add_argument('--fp32-allreduce', action='store_true',
+                       help='All-reduce in fp32')
     group.add_argument('--hysteresis', type=int, default=2,
                        help='hysteresis for dynamic loss scaling')
     group.add_argument('--loss-scale', type=float, default=None,
