@@ -22,15 +22,11 @@ import numpy as np
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-#from megatron.global_vars import get_args
-#from megatron.global_vars import get_adlr_autoresume
+from megatron.global_vars import get_args
+from megatron.global_vars import get_adlr_autoresume
 
 from megatron import mpu
-from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import get_params_for_weight_decay_optimization
-
 
 
 def print_rank_0(message):
@@ -52,6 +48,41 @@ def reduce_losses(losses):
     return reduced_losses
 
 
+def report_memory(name):
+    """Simple GPU memory report."""
+    mega_bytes = 1024.0 * 1024.0
+    string = name + ' memory (MB)'
+    string += ' | allocated: {}'.format(
+        torch.cuda.memory_allocated() / mega_bytes)
+    string += ' | max allocated: {}'.format(
+        torch.cuda.max_memory_allocated() / mega_bytes)
+    string += ' | cached: {}'.format(torch.cuda.memory_cached() / mega_bytes)
+    string += ' | max cached: {}'.format(
+        torch.cuda.max_memory_cached()/ mega_bytes)
+    print_rank_0(string)
+
+
+def print_params_min_max_norm(optimizer, iteration):
+    """Print min, max, and norm of all parameters."""
+    index = 0
+    rank = torch.distributed.get_rank()
+    string = 'iteration, rank, index, model-parallel,min, max, norm\n'
+    optimizer_ = optimizer
+    if isinstance(optimizer, FP16_Optimizer):
+        optimizer_ = optimizer.optimizer
+    for param_group in optimizer_.param_groups:
+        for param in param_group['params']:
+            index += 1
+            min_ = param.data.min()
+            max_ = param.data.max()
+            norm = param.data.norm()
+            string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
+                iteration, rank, index, int(param.model_parallel))
+            string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
+    print(string, flush=True)
+
+#######################################
+
 def check_adlr_autoresume_termination(iteration, model, optimizer,
                                       lr_scheduler, args):
     # Add barrier to ensure consistnecy.
@@ -64,8 +95,6 @@ def check_adlr_autoresume_termination(iteration, model, optimizer,
             args.AutoResume.request_resume()
         print_rank_0(">>> training terminated. Returning")
         exit(0)
-
-
 
 
 def get_ltor_masks_and_position_ids(data,
@@ -123,42 +152,6 @@ def get_ltor_masks_and_position_ids(data,
                     prev_index = i + 1
 
     return attention_mask, loss_mask, position_ids
-
-
-
-def print_params_min_max_norm(optimizer, iteration):
-    """Print min, max, and norm of all parameters."""
-    index = 0
-    rank = torch.distributed.get_rank()
-    string = 'iteration, rank, index, model-parallel,min, max, norm\n'
-    optimizer_ = optimizer
-    if isinstance(optimizer, FP16_Optimizer):
-        optimizer_ = optimizer.optimizer
-    for param_group in optimizer_.param_groups:
-        for param in param_group['params']:
-            index += 1
-            min_ = param.data.min()
-            max_ = param.data.max()
-            norm = param.data.norm()
-            string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
-                iteration, rank, index, int(param.model_parallel))
-            string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
-    print(string, flush=True)
-
-
-def report_memory(name):
-    """Simple GPU memory report."""
-
-    mega_bytes = 1024.0 * 1024.0
-    string = name + ' memory (MB)'
-    string += ' | allocated: {}'.format(
-        torch.cuda.memory_allocated() / mega_bytes)
-    string += ' | max allocated: {}'.format(
-        torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | cached: {}'.format(torch.cuda.memory_cached() / mega_bytes)
-    string += ' | max cached: {}'.format(
-        torch.cuda.max_memory_cached()/ mega_bytes)
-    print_rank_0(string)
 
 
 def vocab_size_with_padding(num_tokens, args):
