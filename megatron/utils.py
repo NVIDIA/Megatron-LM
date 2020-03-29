@@ -89,8 +89,6 @@ def check_adlr_autoresume_termination(iteration, model,
 
 ###################################################
 
-from megatron import mpu
-
 
 def get_ltor_masks_and_position_ids(data,
                                     eod_token,
@@ -147,17 +145,4 @@ def get_ltor_masks_and_position_ids(data,
                     prev_index = i + 1
 
     return attention_mask, loss_mask, position_ids
-
-
-def vocab_size_with_padding(num_tokens, args):
-
-    after = num_tokens
-    multiple = args.make_vocab_size_divisible_by * \
-               mpu.get_model_parallel_world_size()
-    while (after % multiple) != 0:
-        after += 1
-    print_rank_0('> padded vocab (size: {}) with {} dummy '
-                 'tokens (new size: {})'.format(
-                     num_tokens, after - num_tokens, after))
-    return after
 
