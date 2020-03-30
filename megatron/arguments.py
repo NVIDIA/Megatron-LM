@@ -35,6 +35,8 @@ def parse_args(extra_args_provider=None, defaults={}):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
+    # TODO: Refactor
+    parser = _add_gpt2_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -293,6 +295,8 @@ def _add_data_args(parser):
                        'validation and 5% for test.')
     group.add_argument('--vocab-file', type=str, required=True,
                        help='Path to the vocab file.')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file.')
     group.add_argument('--seq-length', type=int, required=True,
                        help="Maximum sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,
@@ -330,19 +334,19 @@ def _add_autoresume_args(parser):
 ########################################################################
 
 
-def add_training_args_(parser):
-    """Training arguments."""
+def _add_gpt2_args(parser):
+    group = parser.add_argument_group(title='gpt2')
 
-    group = parser.add_argument_group('train', 'training configurations')
-
-    # Batch prodecuer arguments
+    group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
+                       help='The filename containing all the shards '
+                       'sizes for numpy data loader')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention maske after '
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
-                       help='Mask loss for the end of document tokens')
+                       help='Mask loss for the end of document tokens.')
 
     return parser
 
@@ -411,18 +415,6 @@ def add_data_args_(parser):
                        choices=['raw', 'lazy', 'tfrecords', 'numpy', 'binary'],
                        help='Which data loader to use. Default varies by model.')
 
-    group.add_argument('--train-data', nargs='+', default=None,
-                       help='Whitespace separated paths or corpora names '
-                       'for training.')
-    group.add_argument('--valid-data', nargs='*', default=None,
-                       help='path(s) to the validation data.')
-    group.add_argument('--test-data', nargs='*', default=None,
-                       help='path(s) to the testing data.')
-
-    # arguments for binary data loader
-    # arguments for numpy data loader
-    group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
-                       help='the filename containing all the shards sizes for numpy data loader')
 
     return parser
 

@@ -17,20 +17,16 @@
 
 import torch
 
-
+from gpt2_data_loader import make_gpt2_dataloaders
 from megatron import get_args
 from megatron import get_timers
-
-from configure_data import configure_data
-from gpt2_data_loader import make_gpt2_dataloaders
 from megatron import mpu
-from megatron.model import GPT2Model
-from megatron.utils import get_ltor_masks_and_position_ids
 from megatron import print_rank_0
-from megatron.utils import reduce_losses
-from megatron.utils import vocab_size_with_padding
+from megatron.model import GPT2Model
 from megatron.training import pretrain
-
+from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import reduce_losses
+import os
 
 def model_provider():
     """Build the model."""
@@ -97,7 +93,7 @@ def forward_step(data_iterator, model):
     # Get the batch.
     timers('batch generator').start()
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator, args, timers)
+        data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
@@ -121,28 +117,17 @@ def get_train_val_test_data():
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if args.data_loader == 'numpy':
-            assert len(args.train_data) == 1
-            args.train_data = args.train_data[0]
-            assert len(args.valid_data) == 1
-            args.valid_data = args.valid_data[0]
-            assert len(args.test_data) == 1
-            args.test_data = args.test_data[0]
-            (train_data, val_data, test_data), num_tokens, \
-                eod_token = make_gpt2_dataloaders(args)
-        elif args.data_loader == 'raw' or args.data_loader == 'lazy':
-            data_config = configure_data()
-            data_config.set_defaults(data_set_type='GPT2', transpose=False)
-            (train_data, val_data, test_data), tokenizer = data_config.apply(
-                args)
-            num_tokens = tokenizer.num_tokens
-            eod_token = tokenizer.get_command('eos').Id
-            assert eod_token == tokenizer.get_command('pad').Id
-        else:
-            print("Unsupported data loader for GPT2.")
-            exit(1)
+
+        args.cache_dir = 'cache'
+        args.train_data = os.path.join(args.data_path, 'train')
+        args.valid_data = os.path.join(args.data_path, 'valid')
+        args.test_data = os.path.join(args.data_path, 'test')
+        (train_data, val_data, test_data), num_tokens, \
+            eod_token = make_gpt2_dataloaders(args)
+
         # pad.
-        num_tokens = vocab_size_with_padding(num_tokens, args)
+        from megatron.tokenizer.tokenizer import _vocab_size_with_padding
+        num_tokens = _vocab_size_with_padding(num_tokens, args)
         print_rank_0('> found end-of-document token: {}'.format(eod_token))
         token_counts = torch.cuda.LongTensor([num_tokens, eod_token,
                                               int(args.do_train),
@@ -161,7 +146,6 @@ def get_train_val_test_data():
     args.do_valid = token_counts[3].item()
     args.do_test = token_counts[4].item()
 
-    args.vocab_size = num_tokens
     args.eod_token = eod_token
 
     return train_data, val_data, test_data
@@ -169,5 +153,5 @@ def get_train_val_test_data():
 
 if __name__ == "__main__":
 
-    pretrain(get_train_val_test_data,
-             model_provider, forward_step)
+    pretrain(get_train_val_test_data, model_provider, forward_step,
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

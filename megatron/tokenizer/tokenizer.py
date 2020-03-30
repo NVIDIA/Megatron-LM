@@ -19,6 +19,7 @@ from abc import ABC
 from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
+from .gpt2_tokenization import GPT2Tokenizer
 
 
 def build_tokenizer(args):
@@ -28,9 +29,13 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
+    assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                                     lower_case=True)
+    elif args.tokenizer_type == 'GPT2BPETokenizer':
+        assert args.merge_file is not None
+        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -129,3 +134,26 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     @property
     def pad(self):
         return self.pad_id
+
+
+class _GPT2BPETokenizer(AbstractTokenizer):
+    """Original GPT2 BPE tokenizer."""
+
+    def __init__(self, vocab_file, merge_file):
+        name = 'GPT2 BPE'
+        super().__init__(name)
+
+        self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
+                                       special_tokens=[], max_len=None)
+        self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer.encoder)
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    @property
+    def eod(self):
+        return self.eod_id
