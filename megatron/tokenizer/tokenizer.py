@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Megatron tokenizer."""
+"""Megatron tokenizers."""
 
 from abc import ABC
 from abc import abstractmethod
@@ -98,7 +98,6 @@ class AbstractTokenizer(ABC):
     def eod(self):
         raise NotImplementedError('EOD is not provided for {} '
                                   'tokenizer'.format(self.name))
-
 
 
 class _BertWordPieceTokenizer(AbstractTokenizer):
