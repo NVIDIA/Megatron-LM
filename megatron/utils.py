@@ -24,7 +24,7 @@ from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron import print_rank_0
 from megatron.checkpointing import save_checkpoint
-from megatron.data_utils.samplers import DistributedBatchSampler
+from megatron.data.samplers import DistributedBatchSampler
 from megatron.fp16 import FP16_Optimizer
 
 
