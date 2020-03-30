@@ -137,7 +137,6 @@ def get_train_val_test_data():
         print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            vocab_file=args.vocab_file,
             data_prefix=args.data_path,
             data_impl=args.data_impl,
             splits_string=args.split,

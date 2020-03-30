@@ -75,6 +75,18 @@ class AbstractTokenizer(ABC):
     def vocab_size(self):
         pass
 
+    @property
+    @abstractmethod
+    def vocab(self):
+        """Dictionary from vocab text token to id token."""
+        pass
+
+    @property
+    @abstractmethod
+    def inv_vocab(self):
+        """Dictionary from vocab id token to text token."""
+        pass
+
     @abstractmethod
     def tokenize(self, text):
         pass
@@ -99,6 +111,11 @@ class AbstractTokenizer(ABC):
         raise NotImplementedError('EOD is not provided for {} '
                                   'tokenizer'.format(self.name))
 
+    @property
+    def mask(self):
+        raise NotImplementedError('MASK is not provided for {} '
+                                  'tokenizer'.format(self.name))
+
 
 class _BertWordPieceTokenizer(AbstractTokenizer):
     """Original BERT wordpiece tokenizer."""
@@ -113,10 +130,19 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         self.cls_id = self.tokenizer.vocab['[CLS]']
         self.sep_id = self.tokenizer.vocab['[SEP]']
         self.pad_id = self.tokenizer.vocab['[PAD]']
+        self.mask_id = self.tokenizer.vocab['[MASK]']  
 
     @property
     def vocab_size(self):
         return self.tokenizer.vocab_size()
+
+    @property
+    def vocab(self):
+        return self.tokenizer.vocab
+
+    @property
+    def inv_vocab(self):
+        return self.tokenizer.inv_vocab
 
     def tokenize(self, text):
         text_tokens = self.tokenizer.tokenize(text)
@@ -134,6 +160,9 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     def pad(self):
         return self.pad_id
 
+    @property
+    def mask(self):
+        return self.mask_id
 
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""
@@ -149,6 +178,14 @@ class _GPT2BPETokenizer(AbstractTokenizer):
     @property
     def vocab_size(self):
         return len(self.tokenizer.encoder)
+
+    @property
+    def vocab(self):
+        return self.tokenizer.encoder
+
+    @property
+    def inv_vocab(self):
+        return self.tokenizer.decoder
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)
