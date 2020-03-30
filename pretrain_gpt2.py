@@ -25,10 +25,10 @@ from megatron import get_tokenizer
 from megatron import mpu
 from megatron import print_rank_0
 from megatron.data.gpt2_dataset import GPT2Dataset
-from megatron.data_utils.samplers import DistributedBatchSampler
 from megatron.model import GPT2Model
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
 
 
@@ -121,32 +121,19 @@ def make_gpt2_dataloaders():
     seq_length = args.seq_length
     initial_seed = args.seed
 
-    # Data parallel arguments.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
-    global_batch_size = args.batch_size * world_size
-    num_workers = args.num_workers
+    # Build the datasets.
+    def build_dataset_(name):
+        return GPT2Dataset(os.path.join(args.data_path, name),
+                           args.input_data_sizes_file,
+                           args.seq_length, args.seed)
+    train_ds = build_dataset_('train')
+    valid_ds = build_dataset_('valid')
+    test_ds = build_dataset_('test')
 
-    def make_data_loader_(data_path):
-        # Build the dataset.
-        dataset = GPT2Dataset(data_path, input_data_sizes_file,
-                              seq_length, initial_seed)
-        # Use a simple sampler with distributed batch sampler.
-        sampler = torch.utils.data.SequentialSampler(dataset)
-        batch_sampler = DistributedBatchSampler(sampler=sampler,
-                                                batch_size=global_batch_size,
-                                                drop_last=True,
-                                                rank=rank,
-                                                world_size=world_size)
-        # Torch dataloader.
-        return torch.utils.data.DataLoader(dataset,
-                                           batch_sampler=batch_sampler,
-                                           num_workers=num_workers,
-                                           pin_memory=True)
-
-    train = make_data_loader_(os.path.join(args.data_path, 'train'))
-    valid = make_data_loader_(os.path.join(args.data_path, 'valid'))
-    test = make_data_loader_(os.path.join(args.data_path, 'test'))
+    # Dataloaders
+    train = make_data_loader(train_ds)
+    valid = make_data_loader(valid_ds)
+    test = make_data_loader(test_ds)
 
     args.do_train = False
     args.do_valid = False

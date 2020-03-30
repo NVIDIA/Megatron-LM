@@ -23,12 +23,10 @@ from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
 from megatron.data.bert_dataset import build_train_valid_test_datasets
-from megatron.data_utils.samplers import DistributedBatchSampler
 from megatron.model import BertModel
 from megatron.training import pretrain
+from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
-
-
 
 
 def model_provider():
@@ -151,26 +149,9 @@ def get_train_val_test_data():
             skip_warmup=(not args.mmap_warmup))
         print_rank_0("> finished creating BERT datasets ...")
 
-        def make_data_loader_(dataset):
-            if not dataset:
-                return None
-            # Use a simple sampler with distributed batch sampler.
-            sampler = torch.utils.data.SequentialSampler(dataset)
-            batch_sampler = DistributedBatchSampler(
-                sampler=sampler,
-                batch_size=global_batch_size,
-                drop_last=True,
-                rank=data_parallel_rank,
-                world_size=data_parallel_size)
-            # Torch dataloader.
-            return torch.utils.data.DataLoader(dataset,
-                                               batch_sampler=batch_sampler,
-                                               num_workers=args.num_workers,
-                                               pin_memory=True)
-
-        train_data = make_data_loader_(train_ds)
-        valid_data = make_data_loader_(valid_ds)
-        test_data = make_data_loader_(test_ds)
+        train_data = make_data_loader(train_ds)
+        valid_data = make_data_loader(valid_ds)
+        test_data = make_data_loader(test_ds)
 
         do_train = train_data is not None and args.train_iters > 0
         do_valid = valid_data is not None and args.eval_iters > 0

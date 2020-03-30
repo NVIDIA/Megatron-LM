@@ -312,9 +312,16 @@ def _add_data_args(parser):
                        choices=['BertWordPieceLowerCase',
                                 'GPT2BPETokenizer'],
                        help='What type of tokenizer to use.')
-    parser.add_argument('--data-impl', type=str, default='infer',
-                        choices=['lazy', 'cached', 'mmap', 'infer'],
-                        help='Implementation of indexed datasets.')
+    group.add_argument('--data-impl', type=str, default='infer',
+                       choices=['lazy', 'cached', 'mmap', 'infer'],
+                       help='Implementation of indexed datasets.')
+    group.add_argument('--reset-position-ids', action='store_true',
+                       help='Reset posistion ids after end-of-document token.')
+    group.add_argument('--reset-attention-mask', action='store_true',
+                       help='Reset self attention maske after '
+                       'end-of-document token.')
+    group.add_argument('--eod-mask-loss', action='store_true',
+                       help='Mask loss for the end of document tokens.')
 
     return parser
 
@@ -340,13 +347,6 @@ def _add_gpt2_args(parser):
     group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
                        help='The filename containing all the shards '
                        'sizes for numpy data loader')
-    group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
-    group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
-                       'end-of-document token.')
-    group.add_argument('--eod-mask-loss', action='store_true',
-                       help='Mask loss for the end of document tokens.')
 
     return parser
 
