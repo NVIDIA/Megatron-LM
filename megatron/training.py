@@ -253,6 +253,7 @@ def setup_model_and_optimizer(model_provider_func, args):
 def backward_step(optimizer, model, loss, args, timers):
     """Backward step."""
 
+    print("back1")
     # Backward pass.
     optimizer.zero_grad()
     if args.fp16:
@@ -260,6 +261,7 @@ def backward_step(optimizer, model, loss, args, timers):
     else:
         loss.backward()
 
+    print("back2")
     # All-reduce if needed.
     if args.DDP_impl == 'local':
         timers('allreduce').start()
@@ -267,10 +269,12 @@ def backward_step(optimizer, model, loss, args, timers):
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
 
+    print("back3")
     # Update master gradients.
     if args.fp16:
         optimizer.update_master_grads()
 
+    print("back4")
     # Clipping gradients helps prevent the exploding gradient.
     if args.clip_grad > 0:
         if not args.fp16:
@@ -278,6 +282,7 @@ def backward_step(optimizer, model, loss, args, timers):
         else:
             optimizer.clip_master_grads(args.clip_grad)
 
+    print("back5")
 
 def train_step(forward_step_func, data_iterator, model, optimizer, lr_scheduler,
                args, timers):
@@ -287,16 +292,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, lr_scheduler,
     timers('forward').start()
     loss, loss_reduced = forward_step_func(data_iterator, model, args, timers)
     timers('forward').stop()
+    torch.cuda.synchronize()
+    print("confirm forward")
 
     # Calculate gradients, reduce across processes, and clip.
     timers('backward').start()
     backward_step(optimizer, model, loss, args, timers)
     timers('backward').stop()
+    torch.cuda.synchronize()
+    print("did backward step")
 
     # Update parameters.
     timers('optimizer').start()
     optimizer.step()
     timers('optimizer').stop()
+    torch.cuda.synchronize()
+    print("did optim step")
 
     # Update learning rate.
     skipped_iter = 0

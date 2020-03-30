@@ -904,7 +904,7 @@ class InverseClozeDataset(data.Dataset):
 
     def __getitem__(self, idx):
         # get rng state corresponding to index (allows deterministic random pair)
-        rng = random.Random(idx)
+        rng = random.Random(idx + 1000)
         np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
 
         # get seq length. Save 2 tokens for beginning and end
@@ -924,6 +924,7 @@ class InverseClozeDataset(data.Dataset):
             'context_types': np.array(context_token_types),
             'context_pad_mask': np.array(context_pad_mask)
         }
+        print("got item")
 
         return sample
 
@@ -957,7 +958,7 @@ class InverseClozeDataset(data.Dataset):
             doc = self.get_sentence_split_doc(doc_idx)
             if not doc:
                 doc = None
-
+        print("got doc sentences")
         # set up and tokenize the entire selected document
         num_sentences = len(doc)
         all_token_lists = []
@@ -967,6 +968,7 @@ class InverseClozeDataset(data.Dataset):
             all_token_lists.append(tokens)
             all_token_type_lists.append(token_types)
 
+        print("got tokenized sentences")
         sentence_token_lens = [len(l) for l in all_token_lists]
         inclusion_mask = [True] * num_sentences
 
@@ -993,6 +995,7 @@ class InverseClozeDataset(data.Dataset):
                 inclusion_mask[num_sentences - view_radius] = False
             remove_preceding = not remove_preceding
 
+        print("got inclusion mask")
         # assemble the tokens and token types of the context
         context_tokens = list(itertools.chain(
             *[l for i, l in enumerate(all_token_lists) if inclusion_mask[i]]))
@@ -1004,6 +1007,8 @@ class InverseClozeDataset(data.Dataset):
             input_tokens, input_token_types)
         context_tokens, context_token_types, context_pad_mask = self.concat_and_pad_tokens(
             context_tokens, context_token_types)
+
+        print("got all tokens")
 
         return (input_tokens, input_token_types, input_pad_mask), \
                (context_tokens, context_token_types, context_pad_mask)

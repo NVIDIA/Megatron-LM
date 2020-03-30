@@ -26,6 +26,7 @@ from megatron.utils import reduce_losses
 from megatron.utils import vocab_size_with_padding
 from megatron.training import run
 
+num_batches = 0
 
 def model_provider(args):
     """Build the model."""
@@ -78,6 +79,9 @@ def get_batch(data_iterator, timers):
     context_types = data_b['context_types'].long()
     context_pad_mask = data_b['context_pad_mask'].long()
 
+    global num_batches
+    print("got batch {}".format(num_batches))
+
     return input_tokens, input_types, input_pad_mask,\
            context_tokens, context_types, context_pad_mask
 
@@ -94,12 +98,19 @@ def forward_step(data_iterator, model, args, timers):
     # Forward model.
     retrieval_scores = model(input_tokens, 1 - input_pad_mask, input_types,
                              context_tokens, 1 - context_pad_mask, context_types)
+    print("ran model to get retrieval scores")
 
-    softmaxed = F.softmax(retrieval_scores, dim=0).float()
-    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(softmaxed.size()[0]).cuda())
+    softmaxed = F.softmax(retrieval_scores, dim=0)
+    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(softmaxed.shape[0]).cuda())
+    print(type(retrieval_loss))
 
     reduced_losses = reduce_losses([retrieval_loss])
 
+    global num_batches
+    print("did forward step {}".format(num_batches))
+    num_batches += 1
+
+    print(retrieval_loss, {'retrieval loss': reduced_losses[0]})
     return retrieval_loss, {'retrieval loss': reduced_losses[0]}
 
 
