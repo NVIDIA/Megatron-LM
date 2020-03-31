@@ -37,20 +37,7 @@ def model_provider():
     args = get_args()
 
     print_rank_0('building GPT2 model ...')
-    model = GPT2Model(num_layers=args.num_layers,
-                      vocab_size=args.padded_vocab_size,
-                      hidden_size=args.hidden_size,
-                      num_attention_heads=args.num_attention_heads,
-                      embedding_dropout_prob=args.hidden_dropout,
-                      attention_dropout_prob=args.attention_dropout,
-                      output_dropout_prob=args.hidden_dropout,
-                      max_sequence_length=args.max_position_embeddings,
-                      checkpoint_activations=args.checkpoint_activations,
-                      checkpoint_num_layers=args.checkpoint_num_layers,
-                      layernorm_epsilon=args.layernorm_epsilon,
-                      parallel_output=True,
-                      apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
-                      attention_softmax_in_fp32=args.attention_softmax_in_fp32)
+    model = GPT2Model(num_tokentypes=0, parallel_output=True)
 
     return model
 

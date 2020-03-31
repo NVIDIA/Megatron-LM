@@ -17,6 +17,7 @@
 
 import torch
 
+from megatron import get_args
 from megatron.model.bert_model import bert_attention_mask_func
 from megatron.model.bert_model import bert_extended_attention_mask
 from megatron.model.bert_model import bert_position_ids
@@ -30,54 +31,24 @@ from megatron import print_rank_0
 
 class Classification(MegatronModule):
 
-    def __init__(self,
-                 num_classes,
-                 num_layers,
-                 vocab_size,
-                 hidden_size,
-                 num_attention_heads,
-                 embedding_dropout_prob,
-                 attention_dropout_prob,
-                 output_dropout_prob,
-                 max_sequence_length,
-                 checkpoint_activations,
-                 checkpoint_num_layers=1,
-                 layernorm_epsilon=1.0e-5,
-                 init_method_std=0.02,
-                 num_tokentypes=2,
-                 apply_query_key_layer_scaling=False,
-                 attention_softmax_in_fp32=False):
-
+    def __init__(self, num_classes, num_tokentypes=2):
         super(Classification, self).__init__()
+        args = get_args()
 
         self.num_classes = num_classes
-        init_method = init_method_normal(init_method_std)
+        init_method = init_method_normal(args.init_method_std)
 
         self.language_model, self._language_model_key = get_language_model(
-            num_layers=num_layers,
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            embedding_dropout_prob=embedding_dropout_prob,
-            attention_dropout_prob=attention_dropout_prob,
-            output_dropout_prob=output_dropout_prob,
-            max_sequence_length=max_sequence_length,
+            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=True,
-            attention_mask_func=bert_attention_mask_func,
-            checkpoint_activations=checkpoint_activations,
-            checkpoint_num_layers=checkpoint_num_layers,
-            layernorm_epsilon=layernorm_epsilon,
             init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(init_method_std,
-                                                         num_layers),
-                        residual_connection_post_layernorm=False,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            attention_softmax_in_fp32=attention_softmax_in_fp32)
+            scaled_init_method=scaled_init_method_normal(args.init_method_std,
+                                                         args.num_layers))
 
         # Multi-choice head.
-        self.classification_dropout = torch.nn.Dropout(output_dropout_prob)
-        self.classification_head = get_linear_layer(hidden_size,
+        self.classification_dropout = torch.nn.Dropout(args.hidden_dropout)
+        self.classification_head = get_linear_layer(args.hidden_size,
                                                     self.num_classes,
                                                     init_method)
         self._classification_head_key = 'classification_head'

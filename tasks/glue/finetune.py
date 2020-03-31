@@ -46,17 +46,7 @@ def glue_classification(num_classes, Dataset,
         print_rank_0('building classification model for {} ...'.format(
             args.task))
 
-        return Classification(
-            num_classes=num_classes,
-            num_layers=args.num_layers,
-            vocab_size=args.padded_vocab_size,
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.num_attention_heads,
-            embedding_dropout_prob=args.hidden_dropout,
-            attention_dropout_prob=args.attention_dropout,
-            output_dropout_prob=args.hidden_dropout,
-            max_sequence_length=args.max_position_embeddings,
-            checkpoint_activations=args.checkpoint_activations)
+        return Classification(num_classes=num_classes, num_tokentypes=2)
 
 
     def metrics_func_provider():

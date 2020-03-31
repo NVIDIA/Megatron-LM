@@ -20,6 +20,7 @@ import math
 import torch
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
+from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
 
@@ -45,85 +46,6 @@ from megatron.module import MegatronModule
                                      unmaksed-attention-scores, attention-mask)
 """
 
-
-class TransformerHyperparameters:
-    """Hyperparameters used to build and run the transformer.
-
-    Arguments:
-        hidden_size: hidden size (h)
-        num_layers: number of layers (l)
-        num_attention_heads: number of attention heads (n)
-        attention_dropout_prob: dropout probability for the attention
-                                probabiliies
-        output_dropout_prob: dropout probability for the output
-                             layers (attention output and mlp output)
-        mlp_activation_func: activation function for the mlp layer
-        layernorm_epsilon: tolerance parameters used for layer norm
-                           dividions
-        init_method: init method used for all weights except layer
-                     norm and output weights
-        output_layer_init_method: init method for output weights (
-                                  attention output and mlp output)
-        checkpoint_activations: flag to use activation checkpointing
-        checkpoint_num_layers: number of layers use in each chunk of
-                               activation checkpointing
-        apply_residual_connection_post_layernorm: Take the post layer-norm
-            values for resudual connecton. BERT: True, GPT-2: False
-    """
-    def __init__(self,
-                 hidden_size=None,
-                 num_layers=None,
-                 num_attention_heads=None,
-                 attention_dropout_prob=None,
-                 output_dropout_prob=None,
-                 mlp_activation_func=None,
-                 layernorm_epsilon=None,
-                 init_method=None,
-                 output_layer_init_method=None,
-                 checkpoint_activations=None,
-                 checkpoint_num_layers=None,
-                 apply_residual_connection_post_layernorm=None,
-                 apply_query_key_layer_scaling=None,
-                 attention_softmax_in_fp32=None):
-        self.params_dict = {}
-        self.params_dict['hidden_size'] = hidden_size
-        self.params_dict['num_layers'] = num_layers
-        self.params_dict['num_attention_heads'] = num_attention_heads
-        self.params_dict['attention_dropout_prob'] = attention_dropout_prob
-        self.params_dict['output_dropout_prob'] = output_dropout_prob
-        self.params_dict['mlp_activation_func'] = mlp_activation_func
-        self.params_dict['layernorm_epsilon'] = layernorm_epsilon
-        self.params_dict['init_method'] = init_method
-        self.params_dict['output_layer_init_method'] = output_layer_init_method
-        self.params_dict['checkpoint_activations'] = checkpoint_activations
-        self.params_dict['checkpoint_num_layers'] = checkpoint_num_layers
-        self.params_dict['apply_residual_connection_post_layernorm'] \
-            = apply_residual_connection_post_layernorm
-        self.params_dict['apply_query_key_layer_scaling'] \
-            = apply_query_key_layer_scaling
-        self.params_dict['attention_softmax_in_fp32'] \
-            = attention_softmax_in_fp32
-
-
-    def __getitem__(self, key):
-        """Custom retrieval with error checks."""
-        try:
-            value = self.params_dict[key]
-        except KeyError:
-            raise Exception(
-                'could not find {} in transformer hyperparameters'.format(key))
-        except Exception as e:
-            print('unexpected error in transformer hyperparameters:', e)
-            raise Exception()
-        else:
-            assert value is not None, \
-                'parameter value for {} is not set in transformer '\
-                'hyperparameters'.format(key)
-            return value
-        raise Exception('should not be here')
-
-
-
 class ParallelMLP(MegatronModule):
     """MLP.
 
@@ -133,26 +55,28 @@ class ParallelMLP(MegatronModule):
     applied.
     """
 
-    def __init__(self, hyperparameters):
+    def __init__(self, mlp_activation_func, init_method,
+                 output_layer_init_method):
         super(ParallelMLP, self).__init__()
+        args = get_args()
 
         # Project to 4h.
         self.dense_h_to_4h = mpu.ColumnParallelLinear(
-            hyperparameters['hidden_size'],
-            4*hyperparameters['hidden_size'],
+            args.hidden_size,
+            4*args.hidden_size,
             gather_output=False,
-            init_method=hyperparameters['init_method'])
+            init_method=init_method)
 
-        self.activation_func = hyperparameters['mlp_activation_func']
+        self.activation_func = mlp_activation_func
 
         # Project back to h.
         self.dense_4h_to_h = mpu.RowParallelLinear(
-            4*hyperparameters['hidden_size'],
-            hyperparameters['hidden_size'],
+            4*args.hidden_size,
+            args.hidden_size,
             input_is_parallel=True,
-            init_method=hyperparameters['output_layer_init_method'])
+            init_method=output_layer_init_method)
 
-        self.dropout = torch.nn.Dropout(hyperparameters['output_dropout_prob'])
+        self.dropout = torch.nn.Dropout(args.hidden_dropout)
 
 
     def forward(self, hidden_states):
@@ -174,51 +98,47 @@ class ParallelSelfAttention(MegatronModule):
     Self-attention layer takes input with size [b, s, h]
     and returns output of the same size.
     """
-
-    def __init__(self, hyperparameters, attention_mask_func, layer_number):
+    def __init__(self, attention_mask_func, init_method,
+                 output_layer_init_method, layer_number):
         super(ParallelSelfAttention, self).__init__()
+        args = get_args()
 
         self.attention_mask_func = attention_mask_func
-        self.apply_query_key_layer_scaling \
-            = hyperparameters['apply_query_key_layer_scaling']
-        self.attention_softmax_in_fp32 \
-            = hyperparameters['attention_softmax_in_fp32']
+        self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
+        self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
         self.layer_number = max(1, layer_number)
 
         # Per attention head and per partition values.
         world_size = mpu.get_model_parallel_world_size()
-        self.hidden_size_per_partition = mpu.divide(
-            hyperparameters['hidden_size'], world_size)
+        self.hidden_size_per_partition = mpu.divide(args.hidden_size,
+                                                    world_size)
         self.hidden_size_per_attention_head = mpu.divide(
-            hyperparameters['hidden_size'],
-            hyperparameters['num_attention_heads'])
+            args.hidden_size, args.num_attention_heads)
         self.num_attention_heads_per_partition = mpu.divide(
-            hyperparameters['num_attention_heads'], world_size)
+            args.num_attention_heads, world_size)
 
         # Strided linear layer.
         self.query_key_value = mpu.ColumnParallelLinear(
-            hyperparameters['hidden_size'],
-            3*hyperparameters['hidden_size'],
+            args.hidden_size,
+            3*args.hidden_size,
             stride=3,
             gather_output=False,
-            init_method=hyperparameters['init_method'])
+            init_method=init_method)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(
-            hyperparameters['attention_dropout_prob'])
+        self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
 
         # Output.
         self.dense = mpu.RowParallelLinear(
-            hyperparameters['hidden_size'],
-            hyperparameters['hidden_size'],
+            args.hidden_size,
+            args.hidden_size,
             input_is_parallel=True,
-            init_method=hyperparameters['output_layer_init_method'])
-        self.output_dropout = torch.nn.Dropout(
-            hyperparameters['output_dropout_prob'])
+            init_method=output_layer_init_method)
+        self.output_dropout = torch.nn.Dropout(args.hidden_dropout)
 
 
     def _transpose_for_scores(self, tensor):
@@ -369,30 +289,34 @@ class ParallelTransformerLayer(MegatronModule):
     Transformore layer takes input with size [b, s, h] and returns an
     output of the same size.
     """
-    def __init__(self, hyperparameters, attention_mask_func, layer_number):
+    def __init__(self, attention_mask_func, mlp_activation_func,
+                 init_method, output_layer_init_method, layer_number):
+        args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
         self.layer_number = layer_number
 
         self.apply_residual_connection_post_layernorm \
-            = hyperparameters['apply_residual_connection_post_layernorm']
+            = args.apply_residual_connection_post_layernorm
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
-            hyperparameters['hidden_size'],
-            eps=hyperparameters['layernorm_epsilon'])
+            args.hidden_size,
+            eps=args.layernorm_epsilon)
 
         # Self attention.
-        self.attention = ParallelSelfAttention(
-            hyperparameters, attention_mask_func, layer_number)
+        self.attention = ParallelSelfAttention(attention_mask_func, init_method,
+                                               output_layer_init_method,
+                                               layer_number)
 
         # Layernorm on the input data.
         self.post_attention_layernorm = LayerNorm(
-            hyperparameters['hidden_size'],
-            eps=hyperparameters['layernorm_epsilon'])
+            args.hidden_size,
+            eps=args.layernorm_epsilon)
 
         # MLP
-        self.mlp = ParallelMLP(hyperparameters)
+        self.mlp = ParallelMLP(mlp_activation_func, init_method,
+                               output_layer_init_method)
 
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
@@ -434,25 +358,28 @@ class ParallelTransformerLayer(MegatronModule):
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
-    def __init__(self, hyperparameters, attention_mask_func):
+    def __init__(self, attention_mask_func, mlp_activation_func,
+                 init_method, output_layer_init_method):
         super(ParallelTransformer, self).__init__()
+        args = get_args()
 
         # Store activation checkpoiting flag.
-        self.checkpoint_activations = hyperparameters['checkpoint_activations']
-        self.checkpoint_num_layers = hyperparameters['checkpoint_num_layers']
+        self.checkpoint_activations = args.checkpoint_activations
+        self.checkpoint_num_layers = args.checkpoint_num_layers
 
         def get_layer(layer_number):
             return ParallelTransformerLayer(
-                hyperparameters, attention_mask_func, layer_number)
+                attention_mask_func, mlp_activation_func,
+                init_method, output_layer_init_method, layer_number)
 
         # Transformer layers.
         self.layers = torch.nn.ModuleList(
-            [get_layer(i+1) for i in range(hyperparameters['num_layers'])])
+            [get_layer(i+1) for i in range(args.num_layers)])
 
         # Final layer norm before output.
         self.final_layernorm = LayerNorm(
-            hyperparameters['hidden_size'],
-            eps=hyperparameters['layernorm_epsilon'])
+            args.hidden_size,
+            eps=args.layernorm_epsilon)
 
 
     def _checkpointed_forward(self, hidden_states, attention_mask):

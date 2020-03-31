@@ -39,20 +39,10 @@ def train_valid_datasets_provider():
 
 def model_provider():
     """Build the model."""
-    args = get_args()
 
     print_rank_0('building multichoice model for RACE ...')
 
-    return MultipleChoice(
-        num_layers=args.num_layers,
-        vocab_size=args.padded_vocab_size,
-        hidden_size=args.hidden_size,
-        num_attention_heads=args.num_attention_heads,
-        embedding_dropout_prob=args.hidden_dropout,
-        attention_dropout_prob=args.attention_dropout,
-        output_dropout_prob=args.hidden_dropout,
-        max_sequence_length=args.max_position_embeddings,
-        checkpoint_activations=args.checkpoint_activations)
+    return MultipleChoice(num_tokentypes=2)
 
 
 def metrics_func_provider():
