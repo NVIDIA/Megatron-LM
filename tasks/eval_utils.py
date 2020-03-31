@@ -20,26 +20,28 @@ import time
 
 import torch
 
+from megatron import get_args
 from megatron import mpu
 from megatron import print_rank_0
-from .finetune_utils import build_data_loader
-from .finetune_utils import process_batch
+from tasks.finetune_utils import build_data_loader
+from tasks.finetune_utils import process_batch
 
 
-def accuracy_func_provider(args, single_dataset_provider):
+def accuracy_func_provider(single_dataset_provider):
     """Provide function that calculates accuracies."""
+    args = get_args()
 
     # Build dataloaders.
     datapaths = args.valid_data
     dataloaders = []
     for datapath in datapaths:
-        dataset = single_dataset_provider(datapath, args)
+        dataset = single_dataset_provider(datapath)
         dataloader = build_data_loader(
             dataset, args.batch_size, num_workers=args.num_workers,
             drop_last=(mpu.get_data_parallel_world_size() > 1))
         dataloaders.append((dataset.dataset_name, dataloader))
 
-    def metrics_func(model, args_, epoch, output_predictions=False):
+    def metrics_func(model, epoch, output_predictions=False):
         print_rank_0('calculating metrics ...')
         correct = 0
         total = 0
@@ -48,7 +50,7 @@ def accuracy_func_provider(args, single_dataset_provider):
             named_predictions = []
             names = 'predictions'
         for name, dataloader in dataloaders:
-            output = calculate_correct_answers(name, model, dataloader, args_,
+            output = calculate_correct_answers(name, model, dataloader,
                                                epoch, output_predictions)
             if not output_predictions:
                 correct_ans, total_count = output
@@ -70,7 +72,7 @@ def accuracy_func_provider(args, single_dataset_provider):
     return metrics_func
 
 
-def calculate_correct_answers(name, model, dataloader, args,
+def calculate_correct_answers(name, model, dataloader,
                               epoch, output_predictions):
     """Calculate correct over total answers and return prediction if the
     `output_predictions` is true."""
@@ -89,7 +91,7 @@ def calculate_correct_answers(name, model, dataloader, args,
             ids = []
         for _, batch in enumerate(dataloader):
             # Run the model forward.
-            tokens, types, labels_, attention_mask = process_batch(batch, args)
+            tokens, types, labels_, attention_mask = process_batch(batch)
             logits = model(tokens, attention_mask, types)
             # Add output predictions.
             if output_predictions:
