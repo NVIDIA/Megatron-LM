@@ -292,13 +292,10 @@ class ICTBertModel(MegatronModule):
                 context_tokens, context_attention_mask, context_types):
 
         question_ict_logits, _ = self.question_model.forward(input_tokens, input_attention_mask, input_types)
-        print("(bert ict forward) got question logits")
         context_ict_logits, _ = self.context_model.forward(context_tokens, context_attention_mask, context_types)
-        print("(bert ict forward) got context logits")
 
         # [batch x h] * [h x batch]
         retrieval_scores = question_ict_logits.matmul(torch.transpose(context_ict_logits, 0, 1))
-        print("(bert ict forward) got retrieval scores")
 
         return retrieval_scores
 

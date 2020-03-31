@@ -924,7 +924,6 @@ class InverseClozeDataset(data.Dataset):
             'context_types': np.array(context_token_types),
             'context_pad_mask': np.array(context_pad_mask)
         }
-        print("got item")
 
         return sample
 
@@ -958,7 +957,7 @@ class InverseClozeDataset(data.Dataset):
             doc = self.get_sentence_split_doc(doc_idx)
             if not doc:
                 doc = None
-        print("got doc sentences")
+
         # set up and tokenize the entire selected document
         num_sentences = len(doc)
         all_token_lists = []
@@ -968,39 +967,42 @@ class InverseClozeDataset(data.Dataset):
             all_token_lists.append(tokens)
             all_token_type_lists.append(token_types)
 
-        print("got tokenized sentences")
         sentence_token_lens = [len(l) for l in all_token_lists]
-        inclusion_mask = [True] * num_sentences
+        inclusion_mask = [False] * num_sentences
 
         # select a random sentence from the document as input
         input_sentence_idx = rng.randint(0, len(all_token_lists) - 1)
-        input_tokens = all_token_lists[input_sentence_idx].copy()
-        input_token_types = all_token_type_lists[input_sentence_idx].copy()
+        input_tokens = all_token_lists[input_sentence_idx].copy()[:self.max_seq_len - 2]
+        input_token_types = all_token_type_lists[input_sentence_idx].copy()[:self.max_seq_len - 2]
 
         # 10% of the time, the input sentence is left in the context.
         # The other 90% of the time, remove it.
-        if rng.random() > 0.1:
-            inclusion_mask[input_sentence_idx] = False
+        if rng.random() < 0.1:
+            inclusion_mask[input_sentence_idx] = True
 
         # parameters for examining sentences to remove from the context
-        remove_preceding = True
-        view_radius = 0
-        while sum(s for i, s in enumerate(sentence_token_lens) if inclusion_mask[i]) > target_seq_length:
+        view_preceding = True
+        view_radius = 1
+        while sum(s for i, s in enumerate(sentence_token_lens) if inclusion_mask[i]) < self.max_seq_len - 2:
             # keep removing sentences while the context is too large.
-            if remove_preceding:
-                if view_radius < input_sentence_idx:
-                    inclusion_mask[view_radius] = False
+            if view_preceding:
+                examine_idx = input_sentence_idx - view_radius
+                if examine_idx >= 0:
+                    inclusion_mask[examine_idx] = True
+            else:
+                examine_idx = input_sentence_idx + view_radius
+                if examine_idx < num_sentences:
+                    inclusion_mask[examine_idx] = True
                 view_radius += 1
-            elif not remove_preceding and num_sentences - view_radius > input_sentence_idx:
-                inclusion_mask[num_sentences - view_radius] = False
-            remove_preceding = not remove_preceding
+            view_preceding = not view_preceding
+            if view_radius > num_sentences:
+                break
 
-        print("got inclusion mask")
         # assemble the tokens and token types of the context
         context_tokens = list(itertools.chain(
-            *[l for i, l in enumerate(all_token_lists) if inclusion_mask[i]]))
+            *[l for i, l in enumerate(all_token_lists) if inclusion_mask[i]]))[:self.max_seq_len - 2]
         context_token_types = list(itertools.chain(
-            *[l for i, l in enumerate(all_token_type_lists) if inclusion_mask[i]]))
+            *[l for i, l in enumerate(all_token_type_lists) if inclusion_mask[i]]))[:self.max_seq_len - 2]
 
         # concatenate 'CLS' and 'SEP' tokens and add extra token types
         input_tokens, input_token_types, input_pad_mask = self.concat_and_pad_tokens(
@@ -1008,7 +1010,6 @@ class InverseClozeDataset(data.Dataset):
         context_tokens, context_token_types, context_pad_mask = self.concat_and_pad_tokens(
             context_tokens, context_token_types)
 
-        print("got all tokens")
 
         return (input_tokens, input_token_types, input_pad_mask), \
                (context_tokens, context_token_types, context_pad_mask)
@@ -1018,6 +1019,7 @@ class InverseClozeDataset(data.Dataset):
         tokens = [self.tokenizer.get_command('ENC').Id] + tokens + [self.tokenizer.get_command('sep').Id]
         token_types = [token_types[0]] + token_types + [token_types[0]]
 
+        assert len(tokens) <= self.max_seq_len
         num_pad = max(0, self.max_seq_len - len(tokens))
         pad_mask = [0] * len(tokens) + [1] * num_pad
         tokens += [self.tokenizer.get_command('pad').Id] * num_pad
