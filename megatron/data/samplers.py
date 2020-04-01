@@ -76,12 +76,11 @@ class RandomSampler(data.sampler.Sampler):
 
 
 class DistributedBatchSampler(data.sampler.BatchSampler):
-    """
-    similar to normal implementation of distributed sampler, except
+    """Similar to normal implementation of distributed sampler, except
     implementation is at the batch sampler level, instead of just the
     sampler level. This allows wrapping of arbitrary data samplers
-    (sequential, random, WeightedRandomSampler, etc.) with this batch sampler.
-    """
+    (sequential, random, WeightedRandomSampler, etc.) with this batch
+    sampler."""
     def __init__(self, sampler, batch_size, drop_last, rank=-1,
                  world_size=2, wrap_last=False):
         super(DistributedBatchSampler, self).__init__(sampler, batch_size,

@@ -17,8 +17,8 @@
 
 import random
 import os
-import numpy as np
 
+import numpy as np
 import torch
 
 from megatron import get_adlr_autoresume
@@ -31,7 +31,7 @@ from megatron.global_vars import set_global_variables
 def initialize_megatron(extra_args_provider=None, args_defaults={}):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds."""
-    # Male sure cuda is avaiable.
+    # Make sure cuda is available.
     assert torch.cuda.is_available(), 'Megatron requires CUDA.'
 
     # Parse args, build tokenizer, and set adlr-autoresume,
@@ -45,7 +45,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={}):
     # Autoresume.
     _init_autoresume()
 
-    # Random seeds for reproducability.
+    # Random seeds for reproducibility.
     args = get_args()
     if args.rank == 0:
         print('> setting random seeds to {} ...'.format(args.seed))

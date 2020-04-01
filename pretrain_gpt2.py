@@ -109,13 +109,13 @@ def make_gpt2_dataloaders():
     initial_seed = args.seed
 
     # Build the datasets.
-    def build_dataset_(name):
+    def _build_dataset(name):
         return GPT2Dataset(os.path.join(args.data_path, name),
                            args.input_data_sizes_file,
                            args.seq_length, args.seed)
-    train_ds = build_dataset_('train')
-    valid_ds = build_dataset_('valid')
-    test_ds = build_dataset_('test')
+    train_ds = _build_dataset('train')
+    valid_ds = _build_dataset('valid')
+    test_ds = _build_dataset('test')
 
     # Dataloaders
     train = make_data_loader(train_ds)

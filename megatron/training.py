@@ -97,7 +97,7 @@ def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
     print_rank_0('training ...')
 
     iteration = 0
-    if args.train_iters > 0:
+    if args.do_train and args.train_iters > 0:
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
@@ -151,7 +151,7 @@ def get_model(model_provider_func):
         model = LocalDDP(model)
         return model
 
-    print_rank_0('Unknown DDP implementation specified: {}. '
+    raise NotImplementedError('Unknown DDP implementation specified: {}. '
                  'Exiting.'.format(args.DDP_impl))
     sys.exit()
 
@@ -385,8 +385,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                           report_memory_flag)
 
         # Autoresume
-        if (iteration % args.adlr_autoresume_interval == 0) and \
-           args.adlr_autoresume:
+        if args.adlr_autoresume and \
+           (iteration % args.adlr_autoresume_interval == 0):
             check_adlr_autoresume_termination(iteration, model, optimizer,
                                               lr_scheduler)
 
