@@ -966,7 +966,7 @@ class InverseClozeDataset(data.Dataset):
             padless_max_len = self.max_seq_len - 2
 
             # select a random sentence from the document as input
-            input_sentence_idx = rng.randint(num_sentences)
+            input_sentence_idx = rng.randint(0, num_sentences - 1)
             tokens, token_types = self.sentence_tokenize(doc[input_sentence_idx], 0)
             input_tokens, input_token_types = tokens[:target_seq_length], token_types[:target_seq_length]
             if not len(input_tokens) > 0:
