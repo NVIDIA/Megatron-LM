@@ -13,70 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""GPT2 dataset."""
+
 import json
 import os
-
 import numpy as np
+
 import torch
-from torch.multiprocessing import Lock
 from torch.utils.data import Dataset
-
-from megatron import mpu
-from megatron.data_utils.samplers import DistributedBatchSampler
-from megatron.data_utils.tokenization_gpt2 import GPT2Tokenizer
-
-
-def make_gpt2_dataloaders(args):
-
-    # Input parameters.
-    input_data_sizes_file = args.input_data_sizes_file
-    seq_length = args.seq_length
-    initial_seed = args.seed
-
-    # Data parallel arguments.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
-    global_batch_size = args.batch_size * world_size
-    num_workers = args.num_workers
-
-    def make_data_loader_(data_path):
-        # Build the dataset.
-        dataset = GPT2Dataset(data_path, input_data_sizes_file,
-                              seq_length, initial_seed)
-        # Use a simple sampler with distributed batch sampler.
-        sampler = torch.utils.data.SequentialSampler(dataset)
-        batch_sampler = DistributedBatchSampler(sampler=sampler,
-                                                batch_size=global_batch_size,
-                                                drop_last=True,
-                                                rank=rank,
-                                                world_size=world_size)
-        # Torch dataloader.
-        return torch.utils.data.DataLoader(dataset,
-                                           batch_sampler=batch_sampler,
-                                           num_workers=num_workers,
-                                           pin_memory=True)
-
-    train = make_data_loader_(args.train_data)
-    valid = make_data_loader_(args.valid_data)
-    test = make_data_loader_(args.test_data)
-
-    args.do_train = False
-    args.do_valid = False
-    args.do_test = False
-
-    if train is not None:
-        args.do_train = True
-    if valid is not None:
-        args.do_valid = True
-    if test is not None:
-        args.do_test = True
-
-    # Tokenizer.
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2', cache_dir=args.cache_dir)
-    eod_token = tokenizer.encoder['<|endoftext|>']
-    num_tokens = eod_token + 1
-
-    return (train, valid, test), num_tokens, eod_token
 
 
 class GPT2Dataset(Dataset):
@@ -89,8 +33,6 @@ class GPT2Dataset(Dataset):
         self.seq_length = seq_length
         self.initial_seed = initial_seed
         self.max_epochs = max_epochs
-        # Lock for building the dataset.
-        self.lock = Lock()
 
         # Shard stuff.
         # Dictionary from shard nameto its size (number of element).
@@ -120,13 +62,11 @@ class GPT2Dataset(Dataset):
         # data index in the shard.
         data_idx = idx - self.shards_start_index[shard_index]
         # Load the shard if it is not in memory.
-        #self.lock.acquire()
         if self.shards_data[shard_index] is None:
             print('global rank {} is building data for shard index {} ...'.
                   format(torch.distributed.get_rank(), shard_index))
             self.build_dataset_(shard_index)
         #assert self.shards_data[shard_index] is not None
-        #self.lock.release()
         # Start index.
         start_index = self.shards_sample_index[shard_index][data_idx]
         # Add one for label shift.
@@ -194,18 +134,3 @@ class GPT2Dataset(Dataset):
             size = self.shard_size_dict[shard]
             self.shards_start_index[i] = self.shards_start_index[i-1] + \
                                          size // self.seq_length
-
-'''
-if __name__ == '__main__':
-
-    print('gpt2 data loader ...')
-    path = '/raid/mshoeybi/data/gpt2/adlr/reddit_all_ftfy_lg200/npys'
-
-    dataset = GPT2Dataset(path, 'sizes.txt', 1024, 1234, 100)
-    print('dataset contains {} samples'.format(dataset.data_length))
-
-    for i in range(len(dataset)):
-        if i % 512000 == 0:
-            print(i)
-        data = dataset[i]
-'''

@@ -37,7 +37,7 @@ from megatron import mpu
 from megatron.fp16 import FP16_Module
 from megatron.model import GPT2Model
 from megatron.model import DistributedDataParallel as DDP
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 
 def get_model(args):
     """Build the model."""

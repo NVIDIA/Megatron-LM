@@ -20,29 +20,38 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 
-from arguments import get_args
+from megatron import get_args
+from megatron.initialize import initialize_megatron
 
 
 def get_tasks_args(parser):
     """Provide extra arguments required for tasks."""
-    group = parser.add_argument_group('tasks', 'tasks configurations')
-    parser.add_argument('--task', type=str, required=True,
-                        help='task name.')
+    group = parser.add_argument_group(title='tasks')
+
+    group.add_argument('--task', type=str, required=True,
+                       help='Task name.')
     group.add_argument('--epochs', type=int, required=True,
-                       help='number of finetunning epochs. Zero results in '
+                       help='Number of finetunning epochs. Zero results in '
                        'evaluation only.')
-    parser.add_argument('--pretrained-checkpoint', type=str, default=None,
-                        help='pretrained checkpoint used for finetunning.')
+    group.add_argument('--pretrained-checkpoint', type=str, default=None,
+                       help='Pretrained checkpoint used for finetunning.')
     group.add_argument('--keep-last', action='store_true',
-                       help='keep the last batch (maybe incomplete) in'
+                       help='Keep the last batch (maybe incomplete) in'
                        'the data loader')
+    group.add_argument('--train-data', nargs='+', default=None,
+                       help='Whitespace separated paths or corpora names '
+                       'for training.')
+    group.add_argument('--valid-data', nargs='*', default=None,
+                       help='path(s) to the validation data.')
+
     return parser
 
 
 if __name__ == '__main__':
 
-    args = get_args(extra_args_provider=get_tasks_args)
+    initialize_megatron(extra_args_provider=get_tasks_args)
 
+    args = get_args()
     if args.task == 'RACE':
         from race.finetune import main
     elif args.task in ['MNLI', 'QQP']:
@@ -51,4 +60,4 @@ if __name__ == '__main__':
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))
 
-    main(args)
+    main()

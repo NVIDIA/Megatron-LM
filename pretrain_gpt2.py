@@ -15,55 +15,46 @@
 
 """Pretrain GPT2"""
 
+import os
+
 import torch
 
-from configure_data import configure_data
-from gpt2_data_loader import make_gpt2_dataloaders
+from megatron import get_args
+from megatron import get_timers
+from megatron import get_tokenizer
 from megatron import mpu
+from megatron import print_rank_0
+from megatron.data.gpt2_dataset import GPT2Dataset
 from megatron.model import GPT2Model
+from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import print_rank_0
+from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
-from megatron.utils import vocab_size_with_padding
-from megatron.training import run
 
 
-def model_provider(args):
+def model_provider():
     """Build the model."""
+    args = get_args()
 
     print_rank_0('building GPT2 model ...')
-    model = GPT2Model(num_layers=args.num_layers,
-                      vocab_size=args.vocab_size,
-                      hidden_size=args.hidden_size,
-                      num_attention_heads=args.num_attention_heads,
-                      embedding_dropout_prob=args.hidden_dropout,
-                      attention_dropout_prob=args.attention_dropout,
-                      output_dropout_prob=args.hidden_dropout,
-                      max_sequence_length=args.max_position_embeddings,
-                      checkpoint_activations=args.checkpoint_activations,
-                      checkpoint_num_layers=args.checkpoint_num_layers,
-                      layernorm_epsilon=args.layernorm_epsilon,
-                      parallel_output=True,
-                      apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
-                      attention_softmax_in_fp32=args.attention_softmax_in_fp32)
+    model = GPT2Model(num_tokentypes=0, parallel_output=True)
 
     return model
 
 
-def get_batch(data_iterator, args, timers):
+def get_batch(data_iterator):
     """Generate a batch"""
+    args = get_args()
 
     # Items and their type.
     keys = ['text']
     datatype = torch.int64
 
     # Broadcast data.
-    timers('data loader').start()
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    timers('data loader').stop()
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -85,13 +76,14 @@ def get_batch(data_iterator, args, timers):
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 
-def forward_step(data_iterator, model, args, timers):
+def forward_step(data_iterator, model):
     """Forward step."""
+    timers = get_timers()
 
     # Get the batch.
     timers('batch generator').start()
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator, args, timers)
+        data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
@@ -107,60 +99,74 @@ def forward_step(data_iterator, model, args, timers):
     return loss, {'lm loss': reduced_loss[0]}
 
 
-def get_train_val_test_data(args):
+def make_gpt2_dataloaders():
+    """Build gpt2 dataloders."""
+    args = get_args()
+
+    # Input parameters.
+    input_data_sizes_file = args.input_data_sizes_file
+    seq_length = args.seq_length
+    initial_seed = args.seed
+
+    # Build the datasets.
+    def _build_dataset(name):
+        return GPT2Dataset(os.path.join(args.data_path, name),
+                           args.input_data_sizes_file,
+                           args.seq_length, args.seed)
+    train_ds = _build_dataset('train')
+    valid_ds = _build_dataset('valid')
+    test_ds = _build_dataset('test')
+
+    # Dataloaders
+    train = make_data_loader(train_ds)
+    valid = make_data_loader(valid_ds)
+    test = make_data_loader(test_ds)
+
+    args.do_train = False
+    args.do_valid = False
+    args.do_test = False
+
+    if train is not None:
+        args.do_train = True
+    if valid is not None:
+        args.do_valid = True
+    if test is not None:
+        args.do_test = True
+
+    return (train, valid, test)
+
+
+def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
+    args = get_args()
 
     (train_data, val_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if args.data_loader == 'numpy':
-            assert len(args.train_data) == 1
-            args.train_data = args.train_data[0]
-            assert len(args.valid_data) == 1
-            args.valid_data = args.valid_data[0]
-            assert len(args.test_data) == 1
-            args.test_data = args.test_data[0]
-            (train_data, val_data, test_data), num_tokens, \
-                eod_token = make_gpt2_dataloaders(args)
-        elif args.data_loader == 'raw' or args.data_loader == 'lazy':
-            data_config = configure_data()
-            data_config.set_defaults(data_set_type='GPT2', transpose=False)
-            (train_data, val_data, test_data), tokenizer = data_config.apply(
-                args)
-            num_tokens = tokenizer.num_tokens
-            eod_token = tokenizer.get_command('eos').Id
-            assert eod_token == tokenizer.get_command('pad').Id
-        else:
-            print("Unsupported data loader for GPT2.")
-            exit(1)
-        # pad.
-        num_tokens = vocab_size_with_padding(num_tokens, args)
-        print_rank_0('> found end-of-document token: {}'.format(eod_token))
-        token_counts = torch.cuda.LongTensor([num_tokens, eod_token,
-                                              int(args.do_train),
-                                              int(args.do_valid),
-                                              int(args.do_test)])
+
+        (train_data, val_data, test_data) = make_gpt2_dataloaders()
+        flags = torch.cuda.LongTensor([int(args.do_train),
+                                       int(args.do_valid),
+                                       int(args.do_test)])
     else:
-        token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
+        flags = torch.cuda.LongTensor([0, 0, 0])
 
     # Broadcast num tokens.
-    torch.distributed.broadcast(token_counts,
+    torch.distributed.broadcast(flags,
                                 mpu.get_model_parallel_src_rank(),
                                 group=mpu.get_model_parallel_group())
-    num_tokens = token_counts[0].item()
-    eod_token = token_counts[1].item()
-    args.do_train = token_counts[2].item()
-    args.do_valid = token_counts[3].item()
-    args.do_test = token_counts[4].item()
+    args.do_train = flags[0].item()
+    args.do_valid = flags[1].item()
+    args.do_test = flags[2].item()
 
-    args.vocab_size = num_tokens
-    args.eod_token = eod_token
+    tokenizer = get_tokenizer()
+    args.eod_token = tokenizer.eod_id
 
     return train_data, val_data, test_data
 
 
 if __name__ == "__main__":
 
-    run('Pretrain GPT-2 model', get_train_val_test_data,
-        model_provider, forward_step)
+    pretrain(get_train_val_test_data, model_provider, forward_step,
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

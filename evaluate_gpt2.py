@@ -36,7 +36,7 @@ from megatron.utils import Timers
 from megatron.utils import load_checkpoint
 from megatron.utils import report_memory
 from megatron.utils import print_params_min_max_norm
-from megatron.utils import print_rank_0
+from megatron import print_rank_0
 
 from megatron.data_utils import make_tokenizer
 

@@ -15,60 +15,63 @@
 
 """GLUE finetuning/evaluation."""
 
-from megatron.utils import print_rank_0
+from megatron import get_args
+from megatron import get_tokenizer
+from megatron import print_rank_0
 from megatron.model.classification import Classification
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
 
 
-def glue_classification(args, num_classes, Dataset,
+def glue_classification(num_classes, Dataset,
                         name_from_datapath_func):
 
-    def train_valid_datasets_provider(args):
+    def train_valid_datasets_provider():
         """Build train and validation dataset."""
+        args = get_args()
+        tokenizer = get_tokenizer()
+
         train_dataset = Dataset('training', args.train_data,
-                                args.tokenizer, args.seq_length)
+                                tokenizer, args.seq_length)
         valid_dataset = Dataset('validation', args.valid_data,
-                                args.tokenizer, args.seq_length)
+                                tokenizer, args.seq_length)
+
         return train_dataset, valid_dataset
 
 
-    def model_provider(args):
+    def model_provider():
         """Build the model."""
+        args = get_args()
+
         print_rank_0('building classification model for {} ...'.format(
             args.task))
-        return Classification(
-            num_classes=num_classes,
-            num_layers=args.num_layers,
-            vocab_size=args.vocab_size,
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.num_attention_heads,
-            embedding_dropout_prob=args.hidden_dropout,
-            attention_dropout_prob=args.attention_dropout,
-            output_dropout_prob=args.hidden_dropout,
-            max_sequence_length=args.max_position_embeddings,
-            checkpoint_activations=args.checkpoint_activations)
+
+        return Classification(num_classes=num_classes, num_tokentypes=2)
 
 
-    def metrics_func_provider(args):
+    def metrics_func_provider():
         """Privde metrics callback function."""
-        def single_dataset_provider(datapath, args):
+        def single_dataset_provider(datapath):
+            args = get_args()
+            tokenizer = get_tokenizer()
+
             name = name_from_datapath_func(datapath)
-            return Dataset(name, [datapath], args.tokenizer, args.seq_length)
-        return accuracy_func_provider(args, single_dataset_provider)
+            return Dataset(name, [datapath], tokenizer, args.seq_length)
+        return accuracy_func_provider(single_dataset_provider)
 
 
     """Finetune/evaluate."""
-    finetune(args, train_valid_datasets_provider, model_provider,
+    finetune(train_valid_datasets_provider, model_provider,
              end_of_epoch_callback_provider=metrics_func_provider)
 
 
-def main(args):
+def main():
+    args = get_args()
 
     if args.task == 'MNLI':
 
         num_classes = 3
-        from .mnli import MNLIDataset as Dataset
+        from tasks.glue.mnli import MNLIDataset as Dataset
         def name_from_datapath(datapath):
             return datapath.split('MNLI')[-1].strip(
                 '.tsv').strip('/').replace('_', '-')
@@ -76,7 +79,7 @@ def main(args):
     elif args.task == 'QQP':
 
         num_classes = 2
-        from .qqp import QQPDataset as Dataset
+        from tasks.glue.qqp import QQPDataset as Dataset
         def name_from_datapath(datapath):
             return datapath.split('QQP')[-1].strip(
                 '.tsv').strip('/').replace('_', '-')
@@ -85,4 +88,4 @@ def main(args):
         raise NotImplementedError('GLUE task {} is not implemented.'.format(
             args.task))
 
-    glue_classification(args, num_classes, Dataset, name_from_datapath)
+    glue_classification(num_classes, Dataset, name_from_datapath)
