@@ -45,6 +45,7 @@ def model_provider():
 def get_batch(data_iterator):
     """Generate a batch"""
     args = get_args()
+    tokenizer = get_tokenizer()
 
     # Items and their type.
     keys = ['text']
@@ -65,13 +66,11 @@ def get_batch(data_iterator):
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
-        args.eod_token,
+        tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
-    # Convert
-    if args.fp16:
-        attention_mask = attention_mask.half()
+        args.eod_mask_loss,
+        args.fp16)
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
@@ -159,9 +158,6 @@ def get_train_val_test_data():
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
-
-    tokenizer = get_tokenizer()
-    args.eod_token = tokenizer.eod_id
 
     return train_data, val_data, test_data
 

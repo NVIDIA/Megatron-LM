@@ -30,7 +30,7 @@ def get_tasks_args(parser):
 
     group.add_argument('--task', type=str, required=True,
                        help='Task name.')
-    group.add_argument('--epochs', type=int, required=True,
+    group.add_argument('--epochs', type=int, default=None,
                        help='Number of finetunning epochs. Zero results in '
                        'evaluation only.')
     group.add_argument('--pretrained-checkpoint', type=str, default=None,
@@ -43,6 +43,10 @@ def get_tasks_args(parser):
                        'for training.')
     group.add_argument('--valid-data', nargs='*', default=None,
                        help='path(s) to the validation data.')
+    group.add_argument('--overlapping-eval', type=int, default=32,
+                       help='Sliding window for overlapping evaluation.')
+    group.add_argument('--strict-lambada', action='store_true',
+                       help='Use more difficult formulation of lambada.')    
 
     return parser
 
@@ -56,6 +60,8 @@ if __name__ == '__main__':
         from race.finetune import main
     elif args.task in ['MNLI', 'QQP']:
         from glue.finetune import main
+    elif args.task in ['LAMBADA', 'WIKITEXT103']:
+        from zeroshot_gpt2.evaluate import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))
