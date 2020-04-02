@@ -132,7 +132,7 @@ def _build_lambada_dataset():
     tokenizer = get_tokenizer()
 
     assert len(args.valid_data) == 1
-    val_dataset = _LambadaDataset(args.valid_data, tokenizer.eod, tokenizer,
+    val_dataset = _LambadaDataset(args.valid_data[0], tokenizer.eod, tokenizer,
                                   args.seq_length, args.strict_lambada)
     print_rank_0(' > found {} samples.'.format(len(val_dataset)))
 
@@ -145,10 +145,10 @@ def _build_wikitext103_dataset():
     tokenizer = get_tokenizer()
 
     assert len(args.valid_data) == 1
-    with open(args.valid_data, "rb") as reader:
+    with open(args.valid_data[0], "rb") as reader:
         entire_data = reader.read().decode('utf-8')
     num_original_tokens = len(entire_data.strip().split(" "))
-    entire_data = get_detokenizer(args.valid_data)(entire_data)
+    entire_data = get_detokenizer(args.valid_data[0])(entire_data)
     tokenized_data = tokenizer.tokenize(entire_data)
     num_tokenized_tokens = len(tokenized_data)
 

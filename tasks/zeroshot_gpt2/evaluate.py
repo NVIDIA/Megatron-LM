@@ -29,7 +29,7 @@ from megatron.training import get_model
 from megatron.utils import get_ltor_masks_and_position_ids
 from tasks.finetune_utils import build_data_loader
 
-from .dataset import build_dataset
+from .datasets import build_dataset
 
 
 def get_model_provider(eval_metric):
@@ -71,7 +71,8 @@ def process_batch(batch):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.eod_mask_loss,
+        args.fp16)
 
     return tokens, labels, attention_mask, position_ids, loss_mask
 

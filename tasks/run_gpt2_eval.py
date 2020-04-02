@@ -30,19 +30,8 @@ parser.add_argument('--cloze-eval', action='store_true',
                     help='Run lambada cloze eval instead of perplexity eval.')
 parser.add_argument('--easy-lambada', action='store_true',
                        help='use easier formulation of lambada')
-parser.add_argument('--webtext-eval', action='store_true',
-                    help='Run webtext PPL eval instead of wikitext PPL eval.')
-parser.add_argument('--eval-iters', default=5000, type=int,
-                    help='number of iterations to run webtext evaluation')
 parser.add_argument('--model-parallel-size', type=int, default=1,
                     help='model parallel size to use')
-parser.add_argument('--load-openai', action='store_true',
-                    help='Load weights from saved openai/hf checkpoints')
-parser.add_argument('--cache-dir', type=str, default='cache',
-                    help='directory to cache gpt2 tokenizers')
-parser.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
-                       help='Pad the vocab size to be divisible by this value.'
-                       'This is added for computational efficieny reasons.')
 args = parser.parse_args()
 
 multinode_args = ''
@@ -54,43 +43,36 @@ CMD = ' --model-parallel-size {model_par} \
        --hidden-size {hidden} \
        --log-interval 100 \
        --load {model} \
-       --eval-batch-size {batch} \
+       --batch-size {batch} \
        --num-attention-heads {natt} \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --tokenizer-type GPT2BPETokenizer \
-       --text-key text \
        --distributed-backend nccl \
        --hidden-dropout 0.1 \
        --attention-dropout 0.1 \
        --fp16 \
+       --lr 1 --no-load-optim --no-load-rng --epochs 0 \
        --overlapping-eval 32 \
-       --make-vocab-size-divisible-by {make_vocab_size_divisible_by} \
-       --cache-dir {cache} '.format(model_par=args.model_parallel_size,
+       --merge-file /home/universal-lm-data.cosmos549/repos/megatron_latest/vocab_cache/merges.txt \
+       --vocab-file /home/universal-lm-data.cosmos549/repos/megatron_latest/vocab_cache/vocab.json'.format(model_par=args.model_parallel_size,
                                     nlayers=args.num_layers,
                                     hidden=args.hidden_size,
                                     model=args.model_path,
                                     batch=args.batch_size,
-                                    natt=args.num_attention_heads,
-                                    make_vocab_size_divisible_by=args.make_vocab_size_divisible_by,
-                                    cache=args.cache_dir)
+                                    natt=args.num_attention_heads,)
 
-if args.load_openai:
-    CMD += ' --load-openai '
 if args.cloze_eval:
     CMD += ' --valid-data {} '.format(args.data_path)
-    CMD += ' --cloze-eval '
+    CMD += ' --task LAMBADA '
     if not args.easy_lambada:
       CMD += ' --strict-lambada '
-    CMD = 'evaluate_gpt2.py' + CMD
+    CMD = 'main.py' + CMD
     print('Running Lambada Eval Command:', flush=True)
-elif args.webtext_eval:
-    CMD += '--train-iters 0 --eval-iters {} --test-data {} --loose-json '.format(args.eval_iters, args.data_path)
-    CMD = 'pretrain_gpt2.py' + CMD
-    print('Running Webtext Eval Command:', flush=True)
 else:
     CMD += ' --valid-data {} '.format(args.data_path)
-    CMD = 'evaluate_gpt2.py' + CMD
+    CMD += ' --task WIKITEXT103 '
+    CMD = 'main.py' + CMD
     print('Running PPL Eval Command:', flush=True)
 
 CMD = 'python3 '+multinode_args+CMD

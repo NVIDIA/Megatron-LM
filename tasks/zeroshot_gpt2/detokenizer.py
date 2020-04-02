@@ -19,7 +19,7 @@ import re
 
 
 def ptb_detokenizer(string):
-        string = string.replace(" '", "'")
+	string = string.replace(" '", "'")
 	string = string.replace(" \n", "\n")
 	string = string.replace("\n ", "\n")
 	string = string.replace(" n't", "n't")
@@ -75,7 +75,7 @@ _DETOKENIZERS = {
 
 
 def get_detokenizer(path):
-	for key in DETOKENIZERS.keys():
+	for key in _DETOKENIZERS.keys():
 		if key in path:
 			print(key)
 			return _DETOKENIZERS[key]
