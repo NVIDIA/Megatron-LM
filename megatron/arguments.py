@@ -173,7 +173,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     group = parser.add_argument_group(title='learning rate')
 
-    group.add_argument('--lr', type=float, required=True,
+    group.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate. Depending on decay style '
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
@@ -297,7 +297,7 @@ def _add_data_args(parser):
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90% of data for training, 5% for '
                        'validation and 5% for test.')
-    group.add_argument('--vocab-file', type=str, required=True,
+    group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')

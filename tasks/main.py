@@ -30,7 +30,7 @@ def get_tasks_args(parser):
 
     group.add_argument('--task', type=str, required=True,
                        help='Task name.')
-    group.add_argument('--epochs', type=int, required=True,
+    group.add_argument('--epochs', type=int, default=None,
                        help='Number of finetunning epochs. Zero results in '
                        'evaluation only.')
     group.add_argument('--pretrained-checkpoint', type=str, default=None,
