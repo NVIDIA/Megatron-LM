@@ -355,35 +355,7 @@ def _add_gpt2_args(parser):
     return parser
 
 
-def add_evaluation_args(parser):
-    """Evaluation arguments."""
 
-    group = parser.add_argument_group('validation', 'validation configurations')
-
-    group.add_argument('--eval-batch-size', type=int, default=None,
-                       help='Data Loader batch size for evaluation datasets.'
-                       'Defaults to `--batch-size`')
-    group.add_argument('--eval-seq-length', type=int, default=None,
-                       help='Maximum sequence length to process for '
-                       'evaluation. Defaults to `--seq-length`')
-    group.add_argument('--eval-max-preds-per-seq', type=int, default=None,
-                       help='Maximum number of predictions to use for '
-                       'evaluation. Defaults to '
-                       'math.ceil(`--eval-seq-length`*.15/10)*10')
-    group.add_argument('--overlapping-eval', type=int, default=32,
-                       help='sliding window for overlapping eval ')
-    group.add_argument('--cloze-eval', action='store_true',
-                       help='Evaluation dataset from `--valid-data` is a cloze task')
-    group.add_argument('--strict-lambada', action='store_true',
-                       help='use more difficult formulation of lambada')
-    group.add_argument('--eval-hf', action='store_true',
-                       help='perform evaluation with huggingface openai model.'
-                       'use `--load` to specify weights path to be loaded')
-    group.add_argument('--load-openai', action='store_true',
-                       help='load openai weights into our model. Use `--load` '
-                       'to specify weights path to be loaded')
-
-    return parser
 
 def add_text_generate_args(parser):
     """Text generate arguments."""

@@ -43,6 +43,10 @@ def get_tasks_args(parser):
                        'for training.')
     group.add_argument('--valid-data', nargs='*', default=None,
                        help='path(s) to the validation data.')
+    group.add_argument('--overlapping-eval', type=int, default=32,
+                       help='Sliding window for overlapping evaluation.')
+    group.add_argument('--strict-lambada', action='store_true',
+                       help='Use more difficult formulation of lambada.')    
 
     return parser
 
