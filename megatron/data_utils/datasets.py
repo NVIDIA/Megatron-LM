@@ -966,6 +966,7 @@ class InverseClozeDataset(data.Dataset):
             padless_max_len = self.max_seq_len - 2
 
             # select a random sentence from the document as input
+            # TODO: consider adding multiple input sentences.
             input_sentence_idx = rng.randint(0, num_sentences - 1)
             tokens, token_types = self.sentence_tokenize(doc[input_sentence_idx], 0)
             input_tokens, input_token_types = tokens[:target_seq_length], token_types[:target_seq_length]
@@ -976,14 +977,17 @@ class InverseClozeDataset(data.Dataset):
             # 10% of the time, the input sentence is left in the context.
             # The other 90% of the time, remove it.
             if rng.random() < 0.1:
+            # if True:
                 context_tokens = input_tokens.copy()
                 context_token_types = input_token_types.copy()
 
             # parameters for examining sentences to remove from the context
+            # TODO: test detokenized stuff, make sure it's the same doc in the same order.
+            #       change preceding rng condition to always true
             view_preceding = True
             view_radius = 1
             while len(context_tokens) < padless_max_len:
-                # keep removing sentences while the context is too large.
+                # keep adding sentences while the context can accommodate more.
                 if view_preceding:
                     examine_idx = input_sentence_idx - view_radius
                     if examine_idx >= 0:
@@ -1000,6 +1004,25 @@ class InverseClozeDataset(data.Dataset):
                 view_preceding = not view_preceding
                 if view_radius > num_sentences:
                     break
+
+            # detokenized_input = self.tokenizer.DecodeIds(input_tokens)
+            # detokenized_context = self.tokenizer.DecodeIds(context_tokens)
+
+            # encoded_sentences = [self.tokenizer.EncodeAsIds(s).tokenization for s in doc]
+            # full_document_encoded = list(itertools.chain(*encoded_sentences))
+            # detokenized_doc = self.tokenizer.DecodeIds(full_document_encoded)
+
+            # b1 = detokenized_input in detokenized_doc
+            # b2 = detokenized_context in detokenized_doc
+            # print("-" * 100)
+            # print('> input idx: {}'.format(input_sentence_idx))
+            # print('> input in doc: {}'.format(b1))
+            # print('> context in doc: {}'.format(b2))
+            # print('> input: {}'.format(detokenized_input))
+            # print('> context: {}'.format(detokenized_context))
+            # print('\n> doc: {}'.format(detokenized_doc))
+            # if not (b1 and b2):
+            #     raise ValueError("you dun goofed")
 
             # assemble the tokens and token types of the context
             context_tokens = context_tokens[:padless_max_len]

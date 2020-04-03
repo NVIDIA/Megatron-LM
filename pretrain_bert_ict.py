@@ -93,14 +93,23 @@ def forward_step(data_iterator, model, args, timers):
     timers('batch generator').stop()
 
     # Forward model.
-    retrieval_scores = model(input_tokens, 1 - input_pad_mask, input_types,
-                             context_tokens, 1 - context_pad_mask, context_types)
+    # TODO: important to make sure that everything, including padding mask is as expected here.
+    retrieval_scores = model(input_tokens, input_pad_mask, input_types,
+                             context_tokens, context_pad_mask, context_types).float()
 
-    softmaxed = F.softmax(retrieval_scores, dim=0)
-    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(softmaxed.shape[0]).cuda())
-    reduced_losses = reduce_losses([retrieval_loss])
+    softmaxed = F.softmax(retrieval_scores, dim=1)
+    top5_vals, top5_indices = torch.topk(softmaxed, k=5, sorted=True)
+    batch_size = softmaxed.shape[0]
 
-    return retrieval_loss, {'retrieval loss': reduced_losses[0]}
+    top1_acc = torch.cuda.FloatTensor([sum([int(top5_indices[i, 0] == i) for i in range(batch_size)]) / batch_size])
+    top5_acc = torch.cuda.FloatTensor([sum([int(i in top5_indices[i]) for i in range(batch_size)]) / batch_size])
+
+    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(batch_size).cuda())
+    reduced_losses = reduce_losses([retrieval_loss, top1_acc, top5_acc])
+
+    return retrieval_loss, {'retrieval loss': reduced_losses[0],
+                            'top1_acc': reduced_losses[1],
+                            'top5_acc': reduced_losses[2]}
 
 
 def get_train_val_test_data(args):

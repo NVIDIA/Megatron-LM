@@ -215,9 +215,10 @@ class BertModel(MegatronModule):
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
-        state_dict_[self._lm_head_key] \
-            = self.lm_head.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+        if not self.add_ict_head:
+            state_dict_[self._lm_head_key] \
+                = self.lm_head.state_dict_for_save_checkpoint(
+                    destination, prefix, keep_vars)
         if self.add_binary_head:
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
@@ -232,8 +233,9 @@ class BertModel(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        self.lm_head.load_state_dict(
-            state_dict[self._lm_head_key], strict=strict)
+        if not self.add_ict_head:
+            self.lm_head.load_state_dict(
+                state_dict[self._lm_head_key], strict=strict)
         if self.add_binary_head:
             self.binary_head.load_state_dict(
                 state_dict[self._binary_head_key], strict=strict)
@@ -291,8 +293,8 @@ class ICTBertModel(MegatronModule):
     def forward(self, input_tokens, input_attention_mask, input_types,
                 context_tokens, context_attention_mask, context_types):
 
-        question_ict_logits, _ = self.question_model.forward(input_tokens, input_attention_mask, input_types)
-        context_ict_logits, _ = self.context_model.forward(context_tokens, context_attention_mask, context_types)
+        question_ict_logits, _ = self.question_model.forward(input_tokens, 1 - input_attention_mask, input_types)
+        context_ict_logits, _ = self.context_model.forward(context_tokens, 1 - context_attention_mask, context_types)
 
         # [batch x h] * [h x batch]
         retrieval_scores = question_ict_logits.matmul(torch.transpose(context_ict_logits, 0, 1))
