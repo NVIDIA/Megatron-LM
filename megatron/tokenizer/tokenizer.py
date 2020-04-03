@@ -91,6 +91,10 @@ class AbstractTokenizer(ABC):
     def tokenize(self, text):
         pass
 
+    def detokenize(self, token_ids):
+        raise NotImplementedError('detokenizer is not implemented for {} '
+                                  'tokenizer'.format(self.name))
+
     @property
     def cls(self):
         raise NotImplementedError('CLS is not provided for {} '
@@ -189,6 +193,9 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
 
     @property
     def eod(self):

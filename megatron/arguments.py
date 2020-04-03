@@ -69,8 +69,10 @@ def parse_args(extra_args_provider=None, defaults={}):
 
     # Checks.
     assert args.hidden_size % args.num_attention_heads == 0
-    assert args.max_position_embeddings >= args.seq_length
-    assert args.min_lr <= args.lr
+    if args.seq_length is not None:
+        assert args.max_position_embeddings >= args.seq_length
+    if args.lr is not None:
+        assert args.min_lr <= args.lr
     if args.save is not None:
         assert args.save_interval is not None
 
@@ -134,7 +136,7 @@ def _add_regularization_args(parser):
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
 
-    group.add_argument('--batch-size', type=int, required=True,
+    group.add_argument('--batch-size', type=int, default=None,
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size.')
@@ -301,7 +303,7 @@ def _add_data_args(parser):
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
-    group.add_argument('--seq-length', type=int, required=True,
+    group.add_argument('--seq-length', type=int, default=None,
                        help="Maximum sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
@@ -354,32 +356,6 @@ def _add_gpt2_args(parser):
 
     return parser
 
-
-
-
-def add_text_generate_args(parser):
-    """Text generate arguments."""
-
-    group = parser.add_argument_group('Text generation', 'configurations')
-    group.add_argument("--temperature", type=float, default=1.0)
-    group.add_argument("--greedy", action='store_true', default=False)
-    group.add_argument("--top_p", type=float, default=0.0)
-    group.add_argument("--top_k", type=int, default=0)
-    group.add_argument("--out-seq-length", type=int, default=1024)
-    group.add_argument("--sample-input-file", type=str, default="",
-                      help='get input from file instead of interactive mode, '
-                           'each line is an input' )
-    group.add_argument("--sample-output-file", type=str, default="",
-                      help='output file got from --sample-input-file')
-    group.add_argument("--num-samples", type=int, default=0,
-                       help='number of samples to generate unconditionally, '
-                       'defaults to 0 and interactive conditional sampling')
-    group.add_argument("--genfile", type=str,
-                       help='output file when generating unconditionally')
-    group.add_argument("--recompute", action='store_true',
-                       help='during generation recompute all attention '
-                       'instead of using previously computed keys/values.')
-    return parser
 
 
 def add_data_args_(parser):
