@@ -13,21 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Megatron Module"""
-
 import torch
 
-
-class MegatronModule(torch.nn.Module):
-    """Megatron specific extentions of torch Module."""
-
-
-    def __init__(self):
-        super(MegatronModule, self).__init__()
+from .global_vars import get_args
+from .global_vars import get_tokenizer
+from .global_vars import get_tensorboard_writer
+from .global_vars import get_adlr_autoresume
+from .global_vars import get_timers
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
-        """Use this function to override the state dict for
-        saving checkpoints."""
-        return self.state_dict(destination, prefix, keep_vars)
+def print_rank_0(message):
+    """If distributed is initialized print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)

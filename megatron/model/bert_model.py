@@ -17,6 +17,7 @@
 
 import torch
 
+from megatron import get_args
 from megatron.module import MegatronModule
 
 from .language_model import parallel_lm_logits
@@ -106,27 +107,10 @@ class BertLMHead(MegatronModule):
 class BertModel(MegatronModule):
     """Bert Language model."""
 
-    def __init__(self,
-                 num_layers,
-                 vocab_size,
-                 hidden_size,
-                 num_attention_heads,
-                 embedding_dropout_prob,
-                 attention_dropout_prob,
-                 output_dropout_prob,
-                 max_sequence_length,
-                 checkpoint_activations,
-                 checkpoint_num_layers=1,
-                 add_binary_head=False,
-                 ict_head_size=None,
-                 layernorm_epsilon=1.0e-5,
-                 init_method_std=0.02,
-                 num_tokentypes=0,
-                 parallel_output=True,
-                 apply_query_key_layer_scaling=False,
-                 attention_softmax_in_fp32=False):
-
+    def __init__(self, num_tokentypes=2, add_binary_head=True,
+                 ict_head_size=None, parallel_output=True):
         super(BertModel, self).__init__()
+        args = get_args()
 
         self.add_binary_head = add_binary_head
         self.ict_head_size = ict_head_size
@@ -134,46 +118,31 @@ class BertModel(MegatronModule):
         assert not (self.add_binary_head and self.add_ict_head)
 
         self.parallel_output = parallel_output
-        init_method = init_method_normal(init_method_std)
+        init_method = init_method_normal(args.init_method_std)
         add_pooler = self.add_binary_head or self.add_ict_head
-
+        scaled_init_method = scaled_init_method_normal(args.init_method_std,
+                                                       args.num_layers)
         self.language_model, self._language_model_key = get_language_model(
-            num_layers=num_layers,
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            embedding_dropout_prob=embedding_dropout_prob,
-            attention_dropout_prob=attention_dropout_prob,
-            output_dropout_prob=output_dropout_prob,
-            max_sequence_length=max_sequence_length,
+            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=add_pooler,
-            attention_mask_func=bert_attention_mask_func,
-            checkpoint_activations=checkpoint_activations,
-            checkpoint_num_layers=checkpoint_num_layers,
-            layernorm_epsilon=layernorm_epsilon,
             init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(init_method_std,
-                                                         num_layers),
-            residual_connection_post_layernorm=False,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            attention_softmax_in_fp32=attention_softmax_in_fp32)
+            scaled_init_method=scaled_init_method)
 
         if not self.add_ict_head:
             self.lm_head = BertLMHead(
                 self.language_model.embedding.word_embeddings.weight.size(0),
-                hidden_size, init_method, layernorm_epsilon, parallel_output)
+                args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
             self._lm_head_key = 'lm_head'
-
         if self.add_binary_head:
-            self.binary_head = get_linear_layer(hidden_size, 2, init_method)
+            self.binary_head = get_linear_layer(args.hidden_size, 2,
+                                                init_method)
             self._binary_head_key = 'binary_head'
         elif self.add_ict_head:
-            self.ict_head = get_linear_layer(hidden_size, ict_head_size, init_method)
+            self.ict_head = get_linear_layer(args.hidden_size, ict_head_size, init_method)
             self._ict_head_key = 'ict_head'
 
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
+    def forward(self, input_ids, attention_mask, tokentype_ids=None):
 
         extended_attention_mask = bert_extended_attention_mask(
             attention_mask, next(self.language_model.parameters()).dtype)
