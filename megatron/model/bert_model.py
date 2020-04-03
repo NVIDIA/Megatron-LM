@@ -137,8 +137,7 @@ class BertModel(MegatronModule):
             self._binary_head_key = 'binary_head'
 
 
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
+    def forward(self, input_ids, attention_mask, tokentype_ids=None):
 
         extended_attention_mask = bert_extended_attention_mask(
             attention_mask, next(self.language_model.parameters()).dtype)

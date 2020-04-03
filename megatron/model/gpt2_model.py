@@ -51,7 +51,8 @@ class GPT2Model(MegatronModule):
 
 
     def forward(self, input_ids, position_ids, attention_mask,
-                tokentype_ids=None, layer_past=None, get_key_value=False):
+                tokentype_ids=None, layer_past=None, get_key_value=False,
+                forward_method_parallel_output=None):
 
         # Language model.
         lm_output = self.language_model(input_ids,
@@ -65,10 +66,13 @@ class GPT2Model(MegatronModule):
             lm_output, presents = lm_output
 
         # Output.
+        parallel_output = self.parallel_output
+        if forward_method_parallel_output is not None:
+            parallel_output = forward_method_parallel_output
         output = parallel_lm_logits(
             lm_output,
             self.language_model.embedding.word_embeddings.weight,
-            self.parallel_output)
+            parallel_output)
 
         if get_key_value:
             output = [output, presents]
