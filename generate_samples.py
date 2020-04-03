@@ -319,7 +319,7 @@ def get_token_stream(model, context_tokens):
                                 group=mpu.get_model_parallel_group())
 
     context_length = context_length_tensor.min().item()
-    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor, args)
+    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
 
     batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
                                                  context_length_tensor,
@@ -469,7 +469,7 @@ def main():
 
     # Generate samples.
     if args.num_samples == 0:
-        assert args.batch_size == 1
+        args.batch_size = 1
         if args.sample_input_file != "":
             generate_samples_input_from_file(model)
         else:
