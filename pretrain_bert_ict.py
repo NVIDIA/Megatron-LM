@@ -18,43 +18,32 @@
 import torch
 import torch.nn.functional as F
 
-from configure_data import configure_data
+from megatron import get_args
+from megatron import get_timers
 from megatron import mpu
+from megatron import print_rank_0
+from megatron.data.bert_dataset import build_train_valid_test_datasets
 from megatron.model import ICTBertModel
-from megatron.utils import print_rank_0
+from megatron.training import pretrain
+from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
-from megatron.utils import vocab_size_with_padding
-from megatron.training import run
 
 num_batches = 0
 
-def model_provider(args):
+def model_provider():
     """Build the model."""
-
+    args = get_args()
     print_rank_0('building BERT models ...')
 
     model = ICTBertModel(
-        num_layers=args.num_layers,
-        vocab_size=args.vocab_size,
-        hidden_size=args.hidden_size,
-        num_attention_heads=args.num_attention_heads,
-        embedding_dropout_prob=args.hidden_dropout,
-        attention_dropout_prob=args.attention_dropout,
-        output_dropout_prob=args.hidden_dropout,
-        max_sequence_length=args.max_position_embeddings,
-        checkpoint_activations=args.checkpoint_activations,
         ict_head_size=128,
-        checkpoint_num_layers=args.checkpoint_num_layers,
-        layernorm_epsilon=args.layernorm_epsilon,
-        num_tokentypes=args.tokentype_size,
-        parallel_output=True,
-        apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
-        attention_softmax_in_fp32=args.attention_softmax_in_fp32)
+        num_tokentypes=2,
+        parallel_output=True)
 
     return model
 
 
-def get_batch(data_iterator, timers):
+def get_batch(data_iterator):
 
     # Items and their type.
     keys = ['input_text', 'input_types', 'input_pad_mask',
@@ -62,13 +51,10 @@ def get_batch(data_iterator, timers):
     datatype = torch.int64
 
     # Broadcast data.
-    timers('data loader').start()
     if data_iterator is None:
         data = None
     else:
         data = next(data_iterator)
-
-    timers('data loader').stop()
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -83,17 +69,17 @@ def get_batch(data_iterator, timers):
            context_tokens, context_types, context_pad_mask
 
 
-def forward_step(data_iterator, model, args, timers):
+def forward_step(data_iterator, model):
     """Forward step."""
+    timers = get_timers()
 
     # Get the batch.
     timers('batch generator').start()
     input_tokens, input_types, input_pad_mask,\
-    context_tokens, context_types, context_pad_mask = get_batch(data_iterator, timers)
+    context_tokens, context_types, context_pad_mask = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
-    # TODO: important to make sure that everything, including padding mask is as expected here.
     retrieval_scores = model(input_tokens, input_pad_mask, input_types,
                              context_tokens, context_pad_mask, context_types).float()
 
@@ -112,50 +98,71 @@ def forward_step(data_iterator, model, args, timers):
                             'top5_acc': reduced_losses[2]}
 
 
-def get_train_val_test_data(args):
+def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
+    args = get_args()
 
     (train_data, val_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        if (args.data_loader == 'raw'
-                or args.data_loader == 'lazy'
-                or args.data_loader == 'tfrecords'):
-            data_config = configure_data()
-            ds_type = 'BERT_ict'
-            data_config.set_defaults(data_set_type=ds_type, transpose=False)
-            (train_data, val_data, test_data), tokenizer = data_config.apply(args)
-            num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)
-            # Need to broadcast num_tokens and num_type_tokens.
-            token_counts = torch.cuda.LongTensor([num_tokens,
-                                                  tokenizer.num_type_tokens,
-                                                  int(args.do_train),
-                                                  int(args.do_valid),
-                                                  int(args.do_test)])
-        else:
-            print("Unsupported data loader for BERT.")
-            exit(1)
+        print_rank_0('> building train, validation, and test datasets '
+                     'for BERT ...')
+
+        data_parallel_size = mpu.get_data_parallel_world_size()
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        global_batch_size = args.batch_size * data_parallel_size
+
+        # Number of train/valid/test samples.
+        train_iters = args.train_iters
+        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+        test_iters = args.eval_iters
+        train_val_test_num_samples = [train_iters * global_batch_size,
+                                      eval_iters * global_batch_size,
+                                      test_iters * global_batch_size]
+        print_rank_0(' > datasets target sizes (minimum size):')
+        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            data_prefix=args.data_path,
+            data_impl=args.data_impl,
+            splits_string=args.split,
+            train_valid_test_num_samples=train_val_test_num_samples,
+            max_seq_length=args.seq_length,
+            masked_lm_prob=args.mask_prob,
+            short_seq_prob=args.short_seq_prob,
+            seed=args.seed,
+            skip_warmup=(not args.mmap_warmup),
+            ict_dataset=True)
+        print_rank_0("> finished creating BERT ICT datasets ...")
+
+        train_data = make_data_loader(train_ds)
+        valid_data = make_data_loader(valid_ds)
+        test_data = make_data_loader(test_ds)
+
+        do_train = train_data is not None and args.train_iters > 0
+        do_valid = valid_data is not None and args.eval_iters > 0
+        do_test = test_data is not None and args.eval_iters > 0
+        # Need to broadcast num_tokens and num_type_tokens.
+        flags = torch.cuda.LongTensor(
+            [int(do_train), int(do_valid), int(do_test)])
     else:
-        token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
+        flags = torch.cuda.LongTensor([0, 0, 0])
 
     # Broadcast num tokens.
-    torch.distributed.broadcast(token_counts,
+    torch.distributed.broadcast(flags,
                                 mpu.get_model_parallel_src_rank(),
                                 group=mpu.get_model_parallel_group())
-    num_tokens = token_counts[0].item()
-    num_type_tokens = token_counts[1].item()
-    args.do_train = token_counts[2].item()
-    args.do_valid = token_counts[3].item()
-    args.do_test = token_counts[4].item()
-
-    args.vocab_size = num_tokens
-    args.tokentype_size = num_type_tokens
+    args.do_train = flags[0].item()
+    args.do_valid = flags[1].item()
+    args.do_test = flags[2].item()
 
     return train_data, val_data, test_data
 
 
 if __name__ == "__main__":
 
-    run('Pretrain ICT BERT model', get_train_val_test_data,
-        model_provider, forward_step)
+    pretrain(get_train_val_test_data, model_provider, forward_step,
+             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

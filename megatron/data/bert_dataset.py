@@ -27,13 +27,15 @@ from megatron import mpu
 from megatron.data import helpers
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.data.ict_dataset import InverseClozeDataset
 from megatron import print_rank_0
 
 
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_valid_test_num_samples,
                                     max_seq_length, masked_lm_prob,
-                                    short_seq_prob, seed, skip_warmup):
+                                    short_seq_prob, seed, skip_warmup,
+                                    ict_dataset=False):
 
     # Indexed dataset.
     indexed_dataset = get_indexed_dataset_(data_prefix,
@@ -74,16 +76,21 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             # New doc_idx view.
             indexed_dataset.set_doc_idx(doc_idx_ptr[start_index:end_index])
             # Build the dataset accordingly.
-            dataset = BertDataset(
+            kwargs = dict(
                 name=name,
                 indexed_dataset=indexed_dataset,
                 data_prefix=data_prefix,
                 num_epochs=None,
                 max_num_samples=train_valid_test_num_samples[index],
-                masked_lm_prob=masked_lm_prob,
                 max_seq_length=max_seq_length,
                 short_seq_prob=short_seq_prob,
-                seed=seed)
+                seed=seed
+            )
+
+            if ict_dataset:
+                dataset = InverseClozeDataset(**kwargs)
+            else:
+                dataset = BertDataset(masked_lm_prob=masked_lm_prob, **kwargs)
             # Set the original pointer so dataset remains the main dataset.
             indexed_dataset.set_doc_idx(doc_idx_ptr)
             # Checks.
