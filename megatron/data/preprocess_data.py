@@ -6,9 +6,10 @@ import sys
 import time
 
 import torch
-
-from bert_tokenization import FullTokenizer
-import indexed_dataset
+sys.path.insert(0, '../')
+sys.path.insert(0, '../../')
+from tokenizer.bert_tokenization import FullTokenizer
+from data.indexed_dataset import make_builder
 
 class CustomLanguageVars(nltk.tokenize.punkt.PunktLanguageVars):
 
@@ -23,6 +24,8 @@ class CustomLanguageVars(nltk.tokenize.punkt.PunktLanguageVars):
         ))"""
 
 class Encoder(object):
+    splitter = None
+    tokenizer = None
     def __init__(self, args):
         self.args = args
 
@@ -32,7 +35,7 @@ class Encoder(object):
         spliter = nltk.load("tokenizers/punkt/english.pickle")
         if self.args.keep_newlines:
             # this prevents punkt from eating newlines after sentences
-            Encoder.spliter = nltk.tokenize.punkt.PunktSentenceTokenizer(
+            Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
                 train_text = spliter._params,
                 lang_vars = CustomLanguageVars())
         else:
@@ -82,7 +85,7 @@ def main():
 
     output_bin_file = "{}.bin".format(args.output_prefix)
     output_idx_file = "{}.idx".format(args.output_prefix)
-    builder = indexed_dataset.make_builder(output_bin_file,
+    builder = make_builder(output_bin_file,
                                       impl=args.dataset_impl,
                                       vocab_size=tokenizer.vocab_size())
 
