@@ -98,10 +98,9 @@ def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
 
     iteration = 0
     if args.do_train and args.train_iters > 0:
-        if args.do_train:
-            iteration, _ = train(forward_step_func,
-                                 model, optimizer, lr_scheduler,
-                                 train_data_iterator, val_data_iterator)
+        iteration, _ = train(forward_step_func,
+                             model, optimizer, lr_scheduler,
+                             train_data_iterator, val_data_iterator)
 
 
     if args.do_valid:
@@ -485,8 +484,8 @@ def get_train_val_test_data_iterators(train_data, val_data, test_data):
     if val_data is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
                          args.eval_iters
-        val_data.batch_sampler.start_iter = start_iter_val % \
-                                            len(val_data)
+        val_data.batch_sampler.start_iter = 0
+
         print_rank_0('setting validation data start iteration to {}'.
                      format(val_data.batch_sampler.start_iter))
 

@@ -35,7 +35,7 @@ class InverseClozeDataset(Dataset):
 
     def __getitem__(self, idx):
         # get rng state corresponding to index (allows deterministic random pair)
-        rng = random.Random(idx + self.seed)
+        rng = random.Random(idx + 20000 + self.seed)
         np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
 
         # get seq length. Save 2 tokens for beginning and end

@@ -115,7 +115,7 @@ def get_train_val_test_data():
 
         # Number of train/valid/test samples.
         train_iters = args.train_iters
-        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+        eval_iters = args.eval_iters
         test_iters = args.eval_iters
         train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,
@@ -159,7 +159,7 @@ def get_train_val_test_data():
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
 
-    return train_data, val_data, test_data
+    return train_data, valid_data, test_data
 
 
 if __name__ == "__main__":
