@@ -36,14 +36,13 @@ class InverseClozeDataset(Dataset):
     def __getitem__(self, idx):
         # get rng state corresponding to index (allows deterministic random pair)
         rng = random.Random(idx + 20000 + self.seed)
-        np_rng = np.random.RandomState(seed=[rng.randint(0, 2**32-1) for _ in range(16)])
 
         # get seq length. Save 2 tokens for beginning and end
         target_seq_length = self.max_seq_length - 2
         if rng.random() < self.short_seq_prob:
             target_seq_length = rng.randint(5, target_seq_length)
 
-        input_data, context_data = self.get_input_and_context(target_seq_length, rng, np_rng)
+        input_data, context_data = self.get_input_and_context(idx, target_seq_length, rng)
         input_tokens, input_token_types, input_pad_mask = input_data
         context_tokens, context_token_types, context_pad_mask = context_data
 
@@ -79,16 +78,14 @@ class InverseClozeDataset(Dataset):
         token_types = [0] * self.max_seq_length
         return tokens, token_types, pad_mask
 
-    def get_input_and_context(self, target_seq_length, rng, np_rng):
+    def get_input_and_context(self, idx, target_seq_length, rng):
         """fetches a sentence and its surrounding context"""
         num_tries = 0
         while num_tries < 20:
             num_tries += 1
             doc = None
             while doc is None:
-                doc_idx = np_rng.randint(len(self) - 1)
-                # doc is a list of sentences
-                doc = self.get_sentence_split_doc(doc_idx)
+                doc = self.get_sentence_split_doc(idx)
                 if not doc:
                     doc = None
 
@@ -140,5 +137,3 @@ class InverseClozeDataset(Dataset):
                    (context_tokens, context_token_types, context_pad_mask)
         else:
             raise RuntimeError("Could not get a valid data point from InverseClozeDataset")
-
-

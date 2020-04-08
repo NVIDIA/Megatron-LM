@@ -15,6 +15,7 @@
 
 """BERT model."""
 
+import numpy as np
 import torch
 
 from megatron import get_args
@@ -241,6 +242,11 @@ class ICTBertModel(MegatronModule):
         retrieval_scores = question_ict_logits.matmul(torch.transpose(context_ict_logits, 0, 1))
 
         return retrieval_scores
+
+    def embed_doc(self, doc_tokens, doc_attention_mask, doc_types):
+        doc_logits, _ = self.context_model.forward(doc_tokens, 1 - doc_attention_mask, doc_types)
+
+        return doc_logits
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
