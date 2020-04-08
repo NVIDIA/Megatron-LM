@@ -137,14 +137,20 @@ def main():
     encoded_docs = pool.imap(encoder.encode, fin, 25)
     #encoded_docs = map(encoder.encode, fin)
 
+    level = "document"
+    if args.split_sentences:
+        level = "sentence"
+
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"Output prefix: {args.output_prefix}")
     output_bin_files = {}
     output_idx_files = {}
     builders = {}
     for key in args.json_keys:
-        output_bin_files[key] = "{}_{}.bin".format(args.output_prefix, key)
-        output_idx_files[key] = "{}_{}.idx".format(args.output_prefix, key)
+        output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
+                                                      key, level)
+        output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
+                                                      key, level)
         builders[key] = indexed_dataset.make_builder(output_bin_files[key],
                                                impl=args.dataset_impl,
                                                vocab_size=tokenizer.vocab_size)
