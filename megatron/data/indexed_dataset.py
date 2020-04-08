@@ -487,6 +487,11 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             return sents
 
     def get(self, idx, offset=0, length=None):
+        """ Retrieves a single item from the dataset with the option to only
+        return a portion of the item.
+
+        get(idx) is the same as [idx] but get() does not support slicing.
+        """
         ptr, size = self._index[idx]
         if length is None:
             length = size - offset
