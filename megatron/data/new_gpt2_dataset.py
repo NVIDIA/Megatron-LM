@@ -22,9 +22,71 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+import helpers
+#from bert_dataset import get_train_valid_test_split_
+
 
 def print_rank_0(message):
     print(message)
+
+
+def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+                                    train_valid_test_num_samples,
+                                    seq_length, seed, skip_warmup):
+
+    # Indexed dataset.
+    indexed_dataset = get_indexed_dataset_(data_prefix,
+                                           data_impl,
+                                           skip_warmup)
+
+    total_num_of_documents = indexed_dataset.sizes.shape[0]
+    splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
+
+    # Print stats about the splits.
+    print_rank_0(' > dataset split:')
+    def print_split_stats(name, index):
+        print_rank_0('    {}:'.format(name))
+        print_rank_0('     document indices in [{}, {}) total of {} '
+                     'documents'.format(splits[index], splits[index + 1],
+                                        splits[index + 1] - splits[index]))
+    print_split_stats('train', 0)
+    print_split_stats('validation', 1)
+    print_split_stats('test', 2)
+
+    def build_dataset(index, name):
+        dataset = None
+        if splits[index + 1] > splits[index]:
+            documents = np.arange(start=splits[index], end=splits[index+1],
+                                  step=1, dtype=np.int32)
+            dataset = GPT2Dataset(name, data_prefix,
+                                  documents, indexed_dataset,
+                                  train_valid_test_num_samples[index],
+                                  seq_length, seed)
+        return dataset
+
+    train_dataset = build_dataset(0, 'train')
+    valid_dataset = build_dataset(1, 'valid')
+    test_dataset = build_dataset(2, 'test')
+
+    return (train_dataset, valid_dataset, test_dataset)
+
+
+def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
+
+    print_rank_0(' > building dataset index ...')
+
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset(data_prefix,
+                                           data_impl,
+                                           skip_warmup)
+    print_rank_0(' > finished creating indexed dataset in {:4f} '
+                 'seconds'.format(time.time() - start_time))
+
+    print_rank_0(' > indexed dataset stats:')
+    print_rank_0('    number of documents: {}'.format(
+        indexed_dataset.sizes.shape[0]))
+
+    return indexed_dataset
 
 
 class GPT2Dataset(Dataset):
@@ -121,8 +183,11 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
                          '(seconds): {:4f}'.format(time.time() - start_time))
             # sample-idx.
             start_time = time.time()
-            sample_idx = _build_sample_idx(sizes, doc_idx, seq_length,
-                                           num_epochs, tokens_per_epoch)
+            import helpers
+            sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
+                                                  num_epochs, tokens_per_epoch)
+            #sample_idx = _build_sample_idx(sizes, doc_idx, seq_length,
+            #                               num_epochs, tokens_per_epoch)
             np.save(sample_idx_filename, sample_idx, allow_pickle=True)
             print_rank_0(' > elasped time to build and save sample-idx mapping '
                          '(seconds): {:4f}'.format(time.time() - start_time))
@@ -186,6 +251,7 @@ def _build_doc_idx(documents, num_epochs, np_rng):
     doc_idx = np.mgrid[0:num_epochs, 0:len(documents)][1]
     doc_idx[:] = documents
     doc_idx = doc_idx.reshape(-1)
+    doc_idx = doc_idx.astype(np.int32)
     np_rng.shuffle(doc_idx)
     return doc_idx
 
@@ -323,7 +389,7 @@ if __name__ == '__main__':
 
     import random
     data_prefix = 'junk/'
-    for seed in range(1234, 1240):
+    for seed in range(1234, 1245):
         random.seed(seed)
         num_docs = random.randint(1, 999)
         min_doc_length = random.randint(1, 99)
