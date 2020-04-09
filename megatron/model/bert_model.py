@@ -233,7 +233,7 @@ class ICTBertModel(MegatronModule):
         self._context_key = 'context_model'
 
     def forward(self, input_tokens, input_attention_mask, input_types,
-                context_tokens, context_attention_mask, context_types):
+                context_tokens, context_attention_mask, context_types, return_logits=False):
 
         question_ict_logits, _ = self.question_model.forward(input_tokens, 1 - input_attention_mask, input_types)
         context_ict_logits, _ = self.context_model.forward(context_tokens, 1 - context_attention_mask, context_types)
@@ -241,12 +241,11 @@ class ICTBertModel(MegatronModule):
         # [batch x h] * [h x batch]
         retrieval_scores = question_ict_logits.matmul(torch.transpose(context_ict_logits, 0, 1))
 
+        if return_logits:
+            return question_ict_logits, context_ict_logits, retrieval_scores
+
         return retrieval_scores
 
-    def embed_doc(self, doc_tokens, doc_attention_mask, doc_types):
-        doc_logits, _ = self.context_model.forward(doc_tokens, 1 - doc_attention_mask, doc_types)
-
-        return doc_logits
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

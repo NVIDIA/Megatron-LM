@@ -29,6 +29,7 @@ class InverseClozeDataset(Dataset):
         self.sep_id = tokenizer.sep
         self.mask_id = tokenizer.mask
         self.pad_id = tokenizer.pad
+        self.offset = 0
 
     def __len__(self):
         return self.indexed_dataset.doc_idx.shape[0]
@@ -85,9 +86,10 @@ class InverseClozeDataset(Dataset):
             num_tries += 1
             doc = None
             while doc is None:
-                doc = self.get_sentence_split_doc(idx)
+                doc = self.get_sentence_split_doc(idx + self.offset)
                 if not doc:
                     doc = None
+                    self.offset += 1
 
             num_sentences = len(doc)
             padless_max_len = self.max_seq_length - 2
@@ -97,6 +99,7 @@ class InverseClozeDataset(Dataset):
             input_sentence_idx = rng.randint(0, num_sentences - 1)
             input_tokens = doc[input_sentence_idx][:target_seq_length]
             if not len(input_tokens) > 0:
+                self.offset += 1
                 continue
 
             context_tokens = []
@@ -127,6 +130,7 @@ class InverseClozeDataset(Dataset):
             # assemble the tokens and token types of the context
             context_tokens = context_tokens[:padless_max_len]
             if not len(context_tokens) > 0:
+                self.offset += 1
                 continue
 
             # concatenate 'CLS' and 'SEP' tokens and add extra token types
