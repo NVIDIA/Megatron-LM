@@ -24,7 +24,7 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron import print_rank_0
-from megatron.data.gpt2_dataset import build_train_valid_test_datasets
+from megatron.data.old_gpt2_dataset import GPT2Dataset
 from megatron.model import GPT2Model
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
@@ -98,53 +98,56 @@ def forward_step(data_iterator, model):
     return loss, {'lm loss': reduced_loss[0]}
 
 
+def make_gpt2_dataloaders():
+    """Build gpt2 dataloders."""
+    args = get_args()
+
+    # Input parameters.
+    input_data_sizes_file = args.input_data_sizes_file
+    seq_length = args.seq_length
+    initial_seed = args.seed
+
+    # Build the datasets.
+    def _build_dataset(name):
+        return GPT2Dataset(os.path.join(args.data_path, name),
+                           args.input_data_sizes_file,
+                           args.seq_length, args.seed)
+    train_ds = _build_dataset('train')
+    valid_ds = _build_dataset('valid')
+    test_ds = _build_dataset('test')
+
+    # Dataloaders
+    train = make_data_loader(train_ds)
+    valid = make_data_loader(valid_ds)
+    test = make_data_loader(test_ds)
+
+    args.do_train = False
+    args.do_valid = False
+    args.do_test = False
+
+    if train is not None:
+        args.do_train = True
+    if valid is not None:
+        args.do_valid = True
+    if test is not None:
+        args.do_test = True
+
+    return (train, valid, test)
+
+
 def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
     args = get_args()
 
-    (train_data, valid_data, test_data) = (None, None, None)
+    (train_data, val_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        print_rank_0('> building train, validation, and test datasets '
-                     'for GPT2 ...')
 
-        data_parallel_size = mpu.get_data_parallel_world_size()
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        global_batch_size = args.batch_size * data_parallel_size
-
-        # Number of train/valid/test samples.
-        train_iters = args.train_iters
-        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
-        test_iters = args.eval_iters
-        train_val_test_num_samples = [train_iters * global_batch_size,
-                                      eval_iters * global_batch_size,
-                                      test_iters * global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
-
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            data_prefix=args.data_path,
-            data_impl=args.data_impl,
-            splits_string=args.split,
-            train_valid_test_num_samples=train_val_test_num_samples,
-            seq_length=args.seq_length,
-            seed=args.seed,
-            skip_warmup=(not args.mmap_warmup))
-        print_rank_0("> finished creating GPT2 datasets ...")
-
-        train_data = make_data_loader(train_ds)
-        valid_data = make_data_loader(valid_ds)
-        test_data = make_data_loader(test_ds)
-
-        do_train = train_data is not None and args.train_iters > 0
-        do_valid = valid_data is not None and args.eval_iters > 0
-        do_test = test_data is not None and args.eval_iters > 0
-        # Need to broadcast num_tokens and num_type_tokens.
-        flags = torch.cuda.LongTensor(
-            [int(do_train), int(do_valid), int(do_test)])
+        (train_data, val_data, test_data) = make_gpt2_dataloaders()
+        flags = torch.cuda.LongTensor([int(args.do_train),
+                                       int(args.do_valid),
+                                       int(args.do_test)])
     else:
         flags = torch.cuda.LongTensor([0, 0, 0])
 
@@ -156,7 +159,7 @@ def get_train_val_test_data():
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
 
-    return train_data, valid_data, test_data
+    return train_data, val_data, test_data
 
 
 if __name__ == "__main__":
