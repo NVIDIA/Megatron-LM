@@ -379,9 +379,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         iteration += 1
 
         # Logging.
+        loss_scale = None
+        if args.fp16:
+            loss_scale = optimizer.loss_scale
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
-                                          iteration, optimizer.loss_scale,
+                                          iteration, loss_scale,
                                           report_memory_flag)
 
         # Autoresume
