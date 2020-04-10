@@ -253,7 +253,7 @@ def _build_sample_idx(sizes, doc_idx, seq_length,
                       num_epochs, tokens_per_epoch):
     """Sample index mapping is a 2D array with sizes
     [number-of-samples + 1, 2] where [..., 0] contains
-    the index into `doc_idx` and [..., 0] is the
+    the index into `doc_idx` and [..., 1] is the
     starting offset in that document."""
 
     # Total number of samples. For -1 see comments in `_num_epochs`.
