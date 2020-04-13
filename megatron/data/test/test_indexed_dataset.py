@@ -1,3 +1,7 @@
+# This file isn't really a formal automated test, it's just a place to
+# put some code used during development and manual testing of
+# indexed_dataset.
+
 import argparse
 import os
 import sys
