@@ -470,8 +470,6 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             ptr, size = self._index[idx]
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=size, offset=ptr)
-            if self._index.dtype != np.int64:
-                np_array = np_array.astype(np.int64)
             return np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
@@ -498,8 +496,6 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         ptr += offset * np.dtype(self._index.dtype).itemsize
         np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                  count=length, offset=ptr)
-        if self._index.dtype != np.int64:
-            np_array = np_array.astype(np.int64)
         return np_array
 
     @property
