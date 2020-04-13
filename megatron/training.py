@@ -37,11 +37,12 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import make_data_loader
 from megatron.utils import report_memory
 
 
-def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
-             extra_args_provider=None, args_defaults={}):
+def pretrain(train_valid_test_dataset_provider, model_provider,
+             forward_step_func, extra_args_provider=None, args_defaults={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -51,9 +52,9 @@ def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
         4) train the modle using the forward_step_func.
 
     Arguments:
-        train_val_test_data_provider: a function that builds datasets
-            and returns `train, val, test` dataloaders.
-        model_provider: a function that  returns a vanilla version of the
+        train_valid_test_dataset_provider: a function that takes the size of
+            train/valid/test dataset and returns `train, valid, test` datasets.
+        model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
         forward_step_func: a function that takes a `data iterator` and `model`,
             and returns a `loss` scalar with a dictionary with key:values being
@@ -78,22 +79,15 @@ def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
     timers('model and optimizer').stop()
 
     # Data stuff.
-    timers('train/valid/test dataset').start()
-    train_data, val_data, test_data = train_val_test_data_provider()
-    timers('train/valid/test dataset').stop()
-
-    # Train, validation, and test data.
-    timers('train/valid/test dataloader').start()
-    train_data_iterator, val_data_iterator, \
-        test_data_iterator = get_train_val_test_data_iterators(train_data,
-                                                               val_data,
-                                                               test_data)
-    timers('train/valid/test dataloader').stop()
+    timers('train/valid/test data iterators').start()
+    train_data_iterator, valid_data_iterator, test_data_iterator \
+        = build_train_valid_test_data_iterators(
+            train_valid_test_dataset_provider)
+    timers('train/valid/test data iterators').stop()
 
     # Print setup timing.
     print_rank_0('done with setups ...')
-    timers.log(['model and optimizer', 'train/valid/test dataset',
-                'train/valid/test dataloader'])
+    timers.log(['model and optimizer', 'train/valid/test data iterators'])
     print_rank_0('training ...')
 
     iteration = 0
@@ -101,13 +95,13 @@ def pretrain(train_val_test_data_provider, model_provider, forward_step_func,
         if args.do_train:
             iteration, _ = train(forward_step_func,
                                  model, optimizer, lr_scheduler,
-                                 train_data_iterator, val_data_iterator)
+                                 train_data_iterator, valid_data_iterator)
 
 
     if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func,
-                                   val_data_iterator, model,
+                                   valid_data_iterator, model,
                                    iteration, False)
 
     if args.save and iteration != 0:
@@ -152,8 +146,7 @@ def get_model(model_provider_func):
         return model
 
     raise NotImplementedError('Unknown DDP implementation specified: {}. '
-                 'Exiting.'.format(args.DDP_impl))
-    sys.exit()
+                              'Exiting.'.format(args.DDP_impl))
 
 
 def get_optimizer(model):
@@ -352,7 +345,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, val_data_iterator):
+          train_data_iterator, valid_data_iterator):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -403,7 +396,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
            args.do_valid:
             prefix = 'iteration {}'.format(iteration)
             evaluate_and_print_results(prefix, forward_step_func,
-                                       val_data_iterator, model,
+                                       valid_data_iterator, model,
                                        iteration, False)
 
         if args.exit_interval and iteration % args.exit_interval == 0:
@@ -472,37 +465,87 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_0('-' * length)
 
 
-def get_train_val_test_data_iterators(train_data, val_data, test_data):
-    """Build train/validation/test iterators"""
+def build_train_valid_test_data_iterators(
+        build_train_valid_test_datasets_provider):
+    """XXX"""
     args = get_args()
 
+    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+
+    print_rank_0('> building train, validation, and test datasets ...')
+    # Data loader only on rank 0 of each model parallel group.
+    if mpu.get_model_parallel_rank() == 0:
+        # Rank, size, and global batch size.
+        data_parallel_size = mpu.get_data_parallel_world_size()
+        global_batch_size = args.batch_size * data_parallel_size
+
+        # Number of train/valid/test samples.
+        train_iters = args.train_iters
+        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+        test_iters = args.eval_iters
+        train_val_test_num_samples = [train_iters * global_batch_size,
+                                      eval_iters * global_batch_size,
+                                      test_iters * global_batch_size]
+        print_rank_0(' > datasets target sizes (minimum size):')
+        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+        # Build the datasets.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
+            train_val_test_num_samples)
+
+        # Build dataloders.
+        train_dataloader = make_data_loader(train_ds)
+        valid_dataloader = make_data_loader(valid_ds)
+        test_dataloader = make_data_loader(test_ds)
+
+        # Flags to know if we need to do training/validation/testing.
+        do_train = train_dataloader is not None and args.train_iters > 0
+        do_valid = valid_dataloader is not None and args.eval_iters > 0
+        do_test = test_dataloader is not None and args.eval_iters > 0
+        # Need to broadcast num_tokens and num_type_tokens.
+        flags = torch.cuda.LongTensor(
+            [int(do_train), int(do_valid), int(do_test)])
+    else:
+        flags = torch.cuda.LongTensor([0, 0, 0])
+
+    # Broadcast num tokens.
+    torch.distributed.broadcast(flags,
+                                mpu.get_model_parallel_src_rank(),
+                                group=mpu.get_model_parallel_group())
+    args.do_train = flags[0].item()
+    args.do_valid = flags[1].item()
+    args.do_test = flags[2].item()
+
     # Shift the start iterations.
-    if train_data is not None:
-        train_data.batch_sampler.start_iter = args.iteration % \
-                                              len(train_data)
+    if train_dataloader is not None:
+        train_dataloader.batch_sampler.start_iter = args.iteration % \
+                                                    len(train_dataloader)
         print_rank_0('setting training data start iteration to {}'.
-                     format(train_data.batch_sampler.start_iter))
-    if val_data is not None:
+                     format(train_dataloader.batch_sampler.start_iter))
+    if valid_dataloader is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
                          args.eval_iters
-        val_data.batch_sampler.start_iter = start_iter_val % \
-                                            len(val_data)
+        valid_dataloader.batch_sampler.start_iter = start_iter_val % \
+                                                    len(valid_dataloader)
         print_rank_0('setting validation data start iteration to {}'.
-                     format(val_data.batch_sampler.start_iter))
+                     format(valid_dataloader.batch_sampler.start_iter))
 
-    if train_data is not None:
-        train_data_iterator = iter(train_data)
+    # Build iterators.
+    if train_dataloader is not None:
+        train_data_iterator = iter(train_dataloader)
     else:
         train_data_iterator = None
 
-    if val_data is not None:
-        val_data_iterator = iter(val_data)
+    if valid_dataloader is not None:
+        valid_data_iterator = iter(valid_dataloader)
     else:
-        val_data_iterator = None
+        valid_data_iterator = None
 
-    if test_data is not None:
-        test_data_iterator = iter(test_data)
+    if test_dataloader is not None:
+        test_data_iterator = iter(test_dataloader)
     else:
         test_data_iterator = None
 
-    return train_data_iterator, val_data_iterator, test_data_iterator
+    return train_data_iterator, valid_data_iterator, test_data_iterator
