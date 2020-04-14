@@ -24,7 +24,6 @@ from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.data import helpers
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron import print_rank_0
@@ -249,6 +248,7 @@ def get_samples_mapping_(indexed_dataset,
         start_time = time.time()
         print_rank_0(' > building sapmles index mapping for {} ...'.format(
             name))
+        from megatron.data import helpers
         samples_mapping = helpers.build_mapping(
             indexed_dataset.doc_idx,
             indexed_dataset.sizes,
