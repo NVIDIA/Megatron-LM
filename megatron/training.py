@@ -97,7 +97,6 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                  model, optimizer, lr_scheduler,
                                  train_data_iterator, valid_data_iterator)
 
-
     if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func,
@@ -174,7 +173,7 @@ def get_optimizer(model):
                                    dynamic_loss_scale=args.dynamic_loss_scale,
                                    dynamic_loss_args={
                                        'scale_window': args.loss_scale_window,
-                                       'min_scale':args.min_scale,
+                                       'min_scale': args.min_scale,
                                        'delayed_shift': args.hysteresis})
 
     return optimizer
@@ -297,6 +296,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     # Logging.
     timers_to_log = []
+
     def add_to_logging(name):
         if name in timers.timers:
             timers_to_log.append(name)
@@ -431,7 +431,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             # Reduce across processes.
             for key in loss_dict:
                 total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
-                                       loss_dict[key]
+                    loss_dict[key]
     # Move model back to the train mode.
     model.train()
 
@@ -521,14 +521,14 @@ def build_train_valid_test_data_iterators(
     # Shift the start iterations.
     if train_dataloader is not None:
         train_dataloader.batch_sampler.start_iter = args.iteration % \
-                                                    len(train_dataloader)
+            len(train_dataloader)
         print_rank_0('setting training data start iteration to {}'.
                      format(train_dataloader.batch_sampler.start_iter))
     if valid_dataloader is not None:
         start_iter_val = (args.iteration // args.eval_interval) * \
-                         args.eval_iters
+            args.eval_iters
         valid_dataloader.batch_sampler.start_iter = start_iter_val % \
-                                                    len(valid_dataloader)
+            len(valid_dataloader)
         print_rank_0('setting validation data start iteration to {}'.
                      format(valid_dataloader.batch_sampler.start_iter))
 

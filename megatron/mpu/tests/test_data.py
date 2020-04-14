@@ -13,17 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from commons import print_separator
+from commons import initialize_distributed
+from mpu import data as data_utils
+import mpu
+import torch
 import functools
 import operator
 import sys
 sys.path.append("../..")
-
-import torch
-import mpu
-from mpu import data as data_utils
-
-from commons import initialize_distributed
-from commons import print_separator
 
 
 def test_boradcast_data(model_parallel_size):
@@ -88,5 +86,3 @@ if __name__ == '__main__':
         print_separator('test test boradcast data')
         test_boradcast_data(model_parallel_size)
         model_parallel_size *= 2
-
-

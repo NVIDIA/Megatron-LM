@@ -64,12 +64,12 @@ class _LMDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         start_idx = idx * self.overalapping_eval
         end_idx = start_idx + self.seq_len
-        tokens = self.tokens[start_idx:end_idx+1]
+        tokens = self.tokens[start_idx:end_idx + 1]
         num_tokens = len(tokens)
-        pad_mask = [1]*num_tokens
-        if num_tokens < self.seq_len+1:
-            num_pad = (self.seq_len+1-num_tokens)
-            pad_mask += [0]*(num_pad)
+        pad_mask = [1] * num_tokens
+        if num_tokens < self.seq_len + 1:
+            num_pad = (self.seq_len + 1 - num_tokens)
+            pad_mask += [0] * (num_pad)
             tokens += [self.pad_idx] * num_pad
         pad_mask = np.array(pad_mask[1:])
         if self.overalapping_eval != self.seq_len and idx != 0:
@@ -103,7 +103,7 @@ class _LambadaDataset(torch.utils.data.Dataset):
         last_token = text.split()[-1]
         start_idx = text.rfind(last_token)
         beginning_tokens = self.tokenizer.tokenize(text[:start_idx].strip())
-        last_token = self.tokenizer.tokenize(' '+last_token)
+        last_token = self.tokenizer.tokenize(' ' + last_token)
         return beginning_tokens, last_token
 
     def __len__(self):
@@ -112,14 +112,14 @@ class _LambadaDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         tokens = self.tokens[idx]
         num_tokens = len(tokens)
-        pad_mask = [0]*num_tokens
+        pad_mask = [0] * num_tokens
         labels = self.labels[idx]
-        pad_mask += [1]*len(labels)
-        tokens = tokens+labels
+        pad_mask += [1] * len(labels)
+        tokens = tokens + labels
         num_tokens = len(tokens)
-        if num_tokens < self.seq_len+1:
-            num_pad = (self.seq_len+1-num_tokens)
-            pad_mask += [0]*(num_pad)
+        if num_tokens < self.seq_len + 1:
+            num_pad = (self.seq_len + 1 - num_tokens)
+            pad_mask += [0] * (num_pad)
             tokens += [self.pad_idx] * num_pad
         pad_mask = np.array(pad_mask[1:])
 

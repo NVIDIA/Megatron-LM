@@ -2,6 +2,8 @@
 # put some code used during development and manual testing of
 # indexed_dataset.
 
+from megatron.data import indexed_dataset
+from megatron.tokenizer import build_tokenizer
 import argparse
 import os
 import sys
@@ -11,8 +13,6 @@ import torch
 script_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(script_dir, "../../../"))
 
-from megatron.tokenizer import build_tokenizer
-from megatron.data import indexed_dataset
 
 def test_indexed_dataset(args):
     ds = indexed_dataset.make_dataset(args.data, args.dataset_impl)
@@ -23,12 +23,12 @@ def test_indexed_dataset(args):
     if ds.supports_prefetch:
         # just prefetch the whole thing in test (so assume it is small)
         ds.prefetch(range(len(ds)))
-    if args.count > len(ds.doc_idx)-1:
-        args.count = len(ds.doc_idx)-1
+    if args.count > len(ds.doc_idx) - 1:
+        args.count = len(ds.doc_idx) - 1
 
     for i in range(args.count):
         start = ds.doc_idx[i]
-        end = ds.doc_idx[i+1]
+        end = ds.doc_idx[i + 1]
         ids = ds[start:end]
         print(f"Document {i}:")
         print("--------------")
@@ -39,6 +39,7 @@ def test_indexed_dataset(args):
             print(text)
             print("---")
 
+
 def test_indexed_dataset_get(args):
     ds = indexed_dataset.make_dataset(args.data, args.dataset_impl)
     tokenizer = build_tokenizer(args)
@@ -46,19 +47,19 @@ def test_indexed_dataset_get(args):
     print(f"size: {size}")
     full = ds.get(0)
     print(full)
-    #print(tokenizer.detokenize(full.data.tolist()))
+    # print(tokenizer.detokenize(full.data.tolist()))
     print("---")
-    end = ds.get(0, offset=size-10)
+    end = ds.get(0, offset=size - 10)
     print(end)
-    #print(tokenizer.detokenize(end.data.tolist()))
+    # print(tokenizer.detokenize(end.data.tolist()))
 
     start = ds.get(0, length=10)
     print(start)
-    #print(tokenizer.detokenize(start.data.tolist()))
+    # print(tokenizer.detokenize(start.data.tolist()))
 
     part = ds.get(0, offset=2, length=8)
     print(part)
-    #print(tokenizer.detokenize(part.data.tolist()))
+    # print(tokenizer.detokenize(part.data.tolist()))
 
 # def test_albert_dataset(args):
 #     # tokenizer = FullBertTokenizer(args.vocab, do_lower_case=True)
@@ -76,6 +77,7 @@ def test_indexed_dataset_get(args):
 #         print(tokens)
 #         if i >= args.count-1:
 #             exit()
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -117,6 +119,7 @@ def main():
 
 #    test_albert_dataset(args)
     test_indexed_dataset_get(args)
+
 
 if __name__ == "__main__":
     main()

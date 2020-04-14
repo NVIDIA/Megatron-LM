@@ -66,7 +66,6 @@ def bert_position_ids(token_ids):
     return position_ids
 
 
-
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
@@ -77,6 +76,7 @@ class BertLMHead(MegatronModule):
         layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: wether output logits being distributed or not.
     """
+
     def __init__(self, mpu_vocab_size, hidden_size, init_method,
                  layernorm_epsilon, parallel_output):
 
@@ -91,7 +91,6 @@ class BertLMHead(MegatronModule):
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
 
-
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
         hidden_states = gelu(hidden_states)
@@ -101,7 +100,6 @@ class BertLMHead(MegatronModule):
                                     self.parallel_output,
                                     bias=self.bias)
         return output
-
 
 
 class BertModel(MegatronModule):
@@ -136,7 +134,6 @@ class BertModel(MegatronModule):
                                                 init_method)
             self._binary_head_key = 'binary_head'
 
-
     def forward(self, input_ids, attention_mask, tokentype_ids=None):
 
         extended_attention_mask = bert_extended_attention_mask(
@@ -166,7 +163,6 @@ class BertModel(MegatronModule):
 
         return lm_logits, None
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load when model is combined with other heads,
@@ -183,7 +179,6 @@ class BertModel(MegatronModule):
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

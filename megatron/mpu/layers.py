@@ -89,6 +89,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: size of hidden state.
         init_method: method to initialize weights.
     """
+
     def __init__(self, num_embeddings, embedding_dim,
                  init_method=init.xavier_normal_):
         super(VocabParallelEmbedding, self).__init__()
@@ -108,7 +109,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 self.num_embeddings, get_model_parallel_rank(),
                 get_model_parallel_world_size())
         self.num_embeddings_per_partition = self.vocab_end_index - \
-                                            self.vocab_start_index
+            self.vocab_start_index
 
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings_per_partition,
@@ -147,6 +148,7 @@ class ParallelEmbedding(torch.nn.Module):
         embedding_dim: size of hidden state.
         init_method: method to initialize weights.
     """
+
     def __init__(self, num_embeddings, embedding_dim,
                  init_method=init.xavier_normal_,
                  keep_master_weight_for_test=False):
@@ -205,6 +207,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
     """
+
     def __init__(self, input_size, output_size, bias=True, gather_output=True,
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False):
@@ -279,6 +282,7 @@ class RowParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
     """
+
     def __init__(self, input_size, output_size, bias=True,
                  input_is_parallel=False,
                  init_method=init.xavier_normal_, stride=1,
@@ -327,4 +331,3 @@ class RowParallelLinear(torch.nn.Module):
         else:
             output = output_
         return output
-

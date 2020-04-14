@@ -15,13 +15,12 @@
 
 """Main tasks functionality."""
 
+from megatron.initialize import initialize_megatron
+from megatron import get_args
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
-
-from megatron import get_args
-from megatron.initialize import initialize_megatron
 
 
 def get_tasks_args(parser):
@@ -46,7 +45,7 @@ def get_tasks_args(parser):
     group.add_argument('--overlapping-eval', type=int, default=32,
                        help='Sliding window for overlapping evaluation.')
     group.add_argument('--strict-lambada', action='store_true',
-                       help='Use more difficult formulation of lambada.')    
+                       help='Use more difficult formulation of lambada.')
 
     return parser
 

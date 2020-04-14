@@ -73,6 +73,7 @@ class CudaRNGStatesTracker:
     rng state, we can perform operations and return to our starting
     cuda state.
     """
+
     def __init__(self):
         # Map from a string name to the cuda rng state.
         self.states_ = {}

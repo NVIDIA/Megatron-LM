@@ -13,19 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from commons import set_random_seed
+from commons import IdentityLayer
+from commons import print_separator
+from commons import initialize_distributed
+from mpu.cross_entropy import vocab_parallel_cross_entropy
+import mpu
+import torch.nn.functional as F
+import torch
 import random
 import sys
 sys.path.append("../..")
-
-import torch
-import torch.nn.functional as F
-import mpu
-from mpu.cross_entropy import vocab_parallel_cross_entropy
-
-from commons import initialize_distributed
-from commons import print_separator
-from commons import IdentityLayer
-from commons import set_random_seed
 
 
 def torch_cross_entropy(batch_size, seq_length, vocab_size,

@@ -31,7 +31,6 @@ class MNLIDataset(GLUEAbstractDataset):
         super().__init__('MNLI', name, datapaths,
                          tokenizer, max_seq_length)
 
-
     def process_samples_from_single_path(self, filename):
         """"Implement abstract method."""
         print_rank_0(' > Processing {} ...'.format(filename))

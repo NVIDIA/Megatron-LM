@@ -39,14 +39,11 @@ class RaceDataset(Dataset):
         print_rank_0('  >> total number of samples: {}'.format(
             len(self.samples)))
 
-
     def __len__(self):
         return len(self.samples)
 
-
     def __getitem__(self, idx):
         return self.samples[idx]
-
 
 
 def process_single_datapath(datapath, tokenizer, max_qa_length, max_seq_length):

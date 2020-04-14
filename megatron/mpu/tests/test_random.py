@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from commons import print_separator
+from commons import initialize_distributed
+import mpu
+import torch
 import sys
 sys.path.append("../..")
-
-import torch
-import mpu
-
-from commons import initialize_distributed
-from commons import print_separator
 
 
 def test_set_cuda_rng_state(model_parallel_size):
@@ -204,4 +202,3 @@ if __name__ == '__main__':
         print_separator('test model parallel cuda manual seed')
         test_model_parallel_cuda_manual_seed(model_parallel_size)
         model_parallel_size *= 2
-

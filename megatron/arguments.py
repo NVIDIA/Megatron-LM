@@ -357,7 +357,6 @@ def _add_gpt2_args(parser):
     return parser
 
 
-
 def add_data_args_(parser):
     """Train/valid/test data arguments."""
 
@@ -367,6 +366,4 @@ def add_data_args_(parser):
                        choices=['raw', 'lazy', 'tfrecords', 'numpy', 'binary'],
                        help='Which data loader to use. Default varies by model.')
 
-
     return parser
-

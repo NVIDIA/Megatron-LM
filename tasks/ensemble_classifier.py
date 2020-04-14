@@ -5,6 +5,7 @@ import collections
 import numpy as np
 import torch
 
+
 def process_files(args):
     all_predictions = collections.OrderedDict()
     all_labels = collections.OrderedDict()
@@ -40,12 +41,12 @@ def get_threshold(all_predictions, all_labels, one_threshold=False):
     for dataset in all_predictions:
         preds = all_predictions[dataset]
         labels = all_labels[dataset]
-        out_thresh.append(calc_threshold(preds,labels))
+        out_thresh.append(calc_threshold(preds, labels))
     return out_thresh
 
 
 def calc_threshold(p, l):
-    trials = [(i)*(1./100.) for i in range(100)]
+    trials = [(i) * (1. / 100.) for i in range(100)]
     best_acc = float('-inf')
     best_thresh = 0
     for t in trials:
@@ -58,7 +59,7 @@ def calc_threshold(p, l):
 
 def apply_threshold(preds, t):
     assert (np.allclose(preds.sum(-1), np.ones(preds.shape[0])))
-    prob = preds[:,-1]
+    prob = preds[:, -1]
     thresholded = (prob >= t).astype(int)
     preds = np.zeros_like(preds)
     preds[np.arange(len(thresholded)), thresholded.reshape(-1)] = 1
@@ -66,8 +67,8 @@ def apply_threshold(preds, t):
 
 
 def threshold_predictions(all_predictions, threshold):
-    if len(threshold)!=len(all_predictions):
-        threshold = [threshold[-1]]*(len(all_predictions)-len(threshold))
+    if len(threshold) != len(all_predictions):
+        threshold = [threshold[-1]] * (len(all_predictions) - len(threshold))
     for i, dataset in enumerate(all_predictions):
         thresh = threshold[i]
         preds = all_predictions[dataset]
@@ -77,7 +78,7 @@ def threshold_predictions(all_predictions, threshold):
 
 def postprocess_predictions(all_predictions, all_labels, args):
     for d in all_predictions:
-        all_predictions[d] = all_predictions[d]/len(args.paths)
+        all_predictions[d] = all_predictions[d] / len(args.paths)
 
     if args.calc_threshold:
         args.threshold = get_threshold(all_predictions, all_labels, args.one_threshold)
@@ -98,19 +99,22 @@ def write_predictions(all_predictions, all_labels, all_uid, args):
         if args.eval:
             correct = (preds == all_labels[dataset]).sum()
             num = len(all_labels[dataset])
-            accuracy = correct/num
+            accuracy = correct / num
             count += num
             all_correct += correct
             accuracy = (preds == all_labels[dataset]).mean()
             print(accuracy)
         if not os.path.exists(os.path.join(args.outdir, dataset)):
             os.makedirs(os.path.join(args.outdir, dataset))
-        outpath = os.path.join(args.outdir, dataset, os.path.splitext(args.prediction_name)[0]+'.tsv')
+        outpath = os.path.join(
+            args.outdir, dataset, os.path.splitext(
+                args.prediction_name)[0] + '.tsv')
         with open(outpath, 'w') as f:
             f.write('id\tlabel\n')
-            f.write('\n'.join(str(uid)+'\t'+str(args.labels[p]) for uid, p in zip(all_uid[dataset], preds.tolist())))
+            f.write('\n'.join(str(uid) + '\t' + str(args.labels[p])
+                              for uid, p in zip(all_uid[dataset], preds.tolist())))
     if args.eval:
-        print(all_correct/count)
+        print(all_correct / count)
 
 
 def ensemble_predictions(args):
@@ -119,7 +123,7 @@ def ensemble_predictions(args):
     write_predictions(all_predictions, all_labels, all_uid, args)
 
 
-def  main():
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--paths', required=True, nargs='+',
                         help='paths to checkpoint directories used in ensemble')
@@ -135,7 +139,7 @@ def  main():
                         help='use on threshold for all subdatasets')
     parser.add_argument('--threshold', nargs='+', default=None, type=float,
                         help='user supplied threshold for classification')
-    parser.add_argument('--labels',nargs='+', default=None,
+    parser.add_argument('--labels', nargs='+', default=None,
                         help='whitespace separated list of label names')
     args = parser.parse_args()
     ensemble_predictions(args)

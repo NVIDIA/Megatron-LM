@@ -71,8 +71,8 @@ class DistributedDataParallel(MegatronModule):
             def allreduce_hook(*unused):
                 Variable._execution_engine.queue_callback(allreduce_params)
         #    handle = param.register_hook(allreduce_hook)
-            #self.hooks.append(allreduce_hook)
-            #self.hook_handles.append(handle)
+            # self.hooks.append(allreduce_hook)
+            # self.hook_handles.append(handle)
         self.allreduce_params = allreduce_params
 
     def forward(self, *inputs, **kwargs):
@@ -114,4 +114,3 @@ class DistributedDataParallel(MegatronModule):
         super(DistributedDataParallel, self).train(mode)
         self.module.train(mode)
     '''
-

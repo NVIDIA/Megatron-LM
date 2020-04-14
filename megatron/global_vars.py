@@ -124,7 +124,7 @@ def _set_adlr_autoresume(args):
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
-        except:
+        except BaseException:
             print('ADLR autoresume is not available, exiting ...')
             sys.exit()
 

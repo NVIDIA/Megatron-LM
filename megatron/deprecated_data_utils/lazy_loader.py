@@ -22,11 +22,13 @@ from itertools import accumulate
 import torch
 from torch.multiprocessing import Lock
 
+
 def get_lazy_path(path):
     """
     Gets directory path where lazy files are stored.
     """
-    return os.path.splitext(path)[0]+'.lazy'
+    return os.path.splitext(path)[0] + '.lazy'
+
 
 def exists_lazy(path, data_type='data'):
     """
@@ -37,9 +39,10 @@ def exists_lazy(path, data_type='data'):
     contents = os.listdir(get_lazy_path(path))
     if data_type not in contents:
         return False
-    if data_type+'.len.pkl' not in contents:
+    if data_type + '.len.pkl' not in contents:
         return False
     return True
+
 
 def make_lazy(path, strs, data_type='data'):
     """
@@ -50,7 +53,7 @@ def make_lazy(path, strs, data_type='data'):
     if not os.path.exists(lazypath):
         os.makedirs(lazypath)
     datapath = os.path.join(lazypath, data_type)
-    lenpath = os.path.join(lazypath, data_type+'.len.pkl')
+    lenpath = os.path.join(lazypath, data_type + '.len.pkl')
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         with open(datapath, 'wb') as f:
             str_lens = []
@@ -67,27 +70,31 @@ def make_lazy(path, strs, data_type='data'):
         while not os.path.exists(lenpath):
             time.sleep(1)
 
+
 def split_strings(strings, start, chr_lens):
     """
     Split strings based on string lengths and given start.
     """
-    return [strings[i-start:j-start] for i, j in zip([start]+chr_lens[:-1], chr_lens)]
+    return [strings[i - start:j - start] for i, j in zip([start] + chr_lens[:-1], chr_lens)]
+
 
 class ProcessorTokenizer:
     """
     callable class that runs a preprocessing, as well as tokenization step,
     on input text.
     """
+
     def __init__(self, tokenizer, process_fn=None):
         self.tokenizer = tokenizer
         self.process_fn = process_fn
 
     def __call__(self, string):
         if self.tokenizer is not None:
-            string =  self.tokenizer(string, process_fn=self.process_fn)
+            string = self.tokenizer(string, process_fn=self.process_fn)
         elif self.process_fn is not None:
-            string =  self.process_fn(string)
+            string = self.process_fn(string)
         return string
+
 
 class lazy_array_loader(object):
     """
@@ -107,17 +114,18 @@ class lazy_array_loader(object):
         data_type2
         data_type2.len.pkl
     """
+
     def __init__(self, path, data_type='data', mem_map=False, map_fn=None):
         lazypath = get_lazy_path(path)
         datapath = os.path.join(lazypath, data_type)
-        #get file where array entries are concatenated into one big string
+        # get file where array entries are concatenated into one big string
         self._file = open(datapath, 'rb', buffering=0)
         self.file = self._file
-        #memory map file if necessary
+        # memory map file if necessary
         self.mem_map = mem_map
         if self.mem_map:
             self.file = mmap.mmap(self.file.fileno(), 0, prot=mmap.PROT_READ)
-        lenpath = os.path.join(lazypath, data_type+'.len.pkl')
+        lenpath = os.path.join(lazypath, data_type + '.len.pkl')
         self.lens = pkl.load(open(lenpath, 'rb'))
         self.ends = list(accumulate(self.lens))
         self.dumb_ends = list(self.ends)
@@ -149,7 +157,7 @@ class lazy_array_loader(object):
             if index == 0:
                 start = 0
             else:
-                start = self.ends[index-1]
+                start = self.ends[index - 1]
             end = self.ends[index]
             rtn = self.file_read(start, end)
             if self.map_fn is not None:
@@ -160,7 +168,7 @@ class lazy_array_loader(object):
             if index.start == 0 or index.start is None:
                 start = 0
             else:
-                start = self.ends[index.start-1]
+                start = self.ends[index.start - 1]
             stop = chr_lens[-1]
             strings = self.file_read(start, stop)
             rtn = split_strings(strings, start, chr_lens)
@@ -181,15 +189,14 @@ class lazy_array_loader(object):
         # read to end of file if no end point provided
         if end is None:
             rtn = self.file.read()
-        #else read amount needed to reach end point
+        # else read amount needed to reach end point
         else:
-            rtn = self.file.read(end-start)
+            rtn = self.file.read(end - start)
         self.read_lock.release()
-        #TODO: @raulp figure out mem map byte string bug
-        #if mem map'd need to decode byte string to string
+        # TODO: @raulp figure out mem map byte string bug
+        # if mem map'd need to decode byte string to string
         rtn = rtn.decode('utf-8', 'ignore')
         # rtn = str(rtn)
         if self.mem_map:
             rtn = rtn.decode('unicode_escape')
         return rtn
-

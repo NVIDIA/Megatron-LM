@@ -38,7 +38,6 @@ def glue_classification(num_classes, Dataset,
 
         return train_dataset, valid_dataset
 
-
     def model_provider():
         """Build the model."""
         args = get_args()
@@ -47,7 +46,6 @@ def glue_classification(num_classes, Dataset,
             args.task))
 
         return Classification(num_classes=num_classes, num_tokentypes=2)
-
 
     def metrics_func_provider():
         """Privde metrics callback function."""
@@ -58,7 +56,6 @@ def glue_classification(num_classes, Dataset,
             name = name_from_datapath_func(datapath)
             return Dataset(name, [datapath], tokenizer, args.seq_length)
         return accuracy_func_provider(single_dataset_provider)
-
 
     """Finetune/evaluate."""
     finetune(train_valid_datasets_provider, model_provider,
@@ -72,6 +69,7 @@ def main():
 
         num_classes = 3
         from tasks.glue.mnli import MNLIDataset as Dataset
+
         def name_from_datapath(datapath):
             return datapath.split('MNLI')[-1].strip(
                 '.tsv').strip('/').replace('_', '-')
@@ -80,6 +78,7 @@ def main():
 
         num_classes = 2
         from tasks.glue.qqp import QQPDataset as Dataset
+
         def name_from_datapath(datapath):
             return datapath.split('QQP')[-1].strip(
                 '.tsv').strip('/').replace('_', '-')
