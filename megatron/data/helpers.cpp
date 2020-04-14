@@ -361,11 +361,6 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
         // Set the flag on second iteration.
         second = (iteration == 1);
 
-        // Counters:
-        uint64_t empty_docs = 0;
-        uint64_t one_sent_docs = 0;
-        uint64_t long_sent_docs = 0;
-
         // Current map index.
         uint64_t map_index = 0;
 
@@ -384,7 +379,7 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
                 // Document sentences are in [sent_index_first, sent_index_last)
                 const auto sent_index_first = docs[doc];
                 const auto sent_index_last = docs[doc + 1];
-                const auto target_seq_len = max_seq_length - titles_sizes[doc]
+                const auto target_seq_len = max_seq_length - titles_sizes[doc];
 
                 // At the begining of the document previous index is the
                 // start index.
@@ -515,5 +510,5 @@ py::array build_blocks_mapping(const py::array_t<int64_t>& docs_,
 
 PYBIND11_MODULE(helpers, m) {
     m.def("build_mapping", &build_mapping);
-    m.def("build_blocks_mapping", &build_blocks_mapping)
+    m.def("build_blocks_mapping", &build_blocks_mapping);
 }
