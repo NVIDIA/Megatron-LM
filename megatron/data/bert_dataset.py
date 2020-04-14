@@ -42,6 +42,11 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                            data_impl,
                                            skip_warmup)
 
+    if ict_dataset:
+        titles_dataset = get_indexed_dataset_(data_prefix + '-titles',
+                                              data_impl,
+                                              skip_warmup)
+
     # Get start and end indices of train/valid/train into doc-idx
     # Note that doc-idx is desinged to be num-docs + 1 so we can
     # easily iterate over it.
@@ -88,7 +93,10 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             )
 
             if ict_dataset:
-                dataset = InverseClozeDataset(**kwargs)
+                titles_idx_ptr = titles_dataset.get_doc_idx()
+                titles_dataset.set_doc_idx(titles_idx_ptr[start_index:end_index])
+                dataset = InverseClozeDataset(titles_dataset=titles_dataset, **kwargs)
+                titles_dataset.set_doc_idx(titles_idx_ptr)
             else:
                 dataset = BertDataset(masked_lm_prob=masked_lm_prob, **kwargs)
             # Set the original pointer so dataset remains the main dataset.
