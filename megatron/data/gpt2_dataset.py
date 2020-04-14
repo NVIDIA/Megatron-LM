@@ -141,7 +141,12 @@ class GPT2Dataset(torch.utils.data.Dataset):
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
                           num_samples, seq_length, seed):
-    """doc-idx, sample-idx, and shuffle-idx."""
+    """Build doc-idx, sample-idx, and shuffle-idx.
+    doc-idx: is an array (ordered) of documents to be used in training.
+    sample-idx: is the start document index and document offset for each
+       training sample.
+    shuffle-idx: maps the sample index into a random index into sample-idx.
+    """
     # Number of tokens in each epoch and number of required epochs.
     tokens_per_epoch = _num_tokens(documents, sizes)
     num_epochs = _num_epochs(tokens_per_epoch, seq_length, num_samples)
