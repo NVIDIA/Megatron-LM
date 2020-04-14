@@ -29,7 +29,8 @@ try:
     from functools import lru_cache
 except ImportError:
     # Just a dummy decorator to get the checks to run on python2
-    # because honestly I don't want to support a byte-level unicode BPE tokenizer on python 2 right now.
+    # because honestly I don't want to support a byte-level unicode BPE
+    # tokenizer on python 2 right now.
     def lru_cache():
         return lambda func: func
 
@@ -49,6 +50,7 @@ VOCAB_NAME = 'vocab.json'
 MERGES_NAME = 'merges.txt'
 SPECIAL_TOKENS_NAME = 'special_tokens.txt'
 
+
 @lru_cache()
 def bytes_to_unicode():
     """
@@ -61,16 +63,18 @@ def bytes_to_unicode():
     And avoids mapping to whitespace/control characters the bpe code barfs on.
     """
     _chr = unichr if sys.version_info[0] == 2 else chr
-    bs = list(range(ord("!"), ord("~")+1))+list(range(ord("¡"), ord("¬")+1))+list(range(ord("®"), ord("ÿ")+1))
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + \
+        list(range(ord("®"), ord("ÿ") + 1))
     cs = bs[:]
     n = 0
     for b in range(2**8):
         if b not in bs:
             bs.append(b)
-            cs.append(2**8+n)
+            cs.append(2**8 + n)
             n += 1
     cs = [_chr(n) for n in cs]
     return dict(zip(bs, cs))
+
 
 def get_pairs(word):
     """Return set of symbol pairs in a word.
@@ -83,6 +87,7 @@ def get_pairs(word):
         pairs.add((prev_char, char))
         prev_char = char
     return pairs
+
 
 class GPT2Tokenizer(object):
     """
@@ -140,23 +145,31 @@ class GPT2Tokenizer(object):
             special_tokens = open(special_tokens_file, encoding='utf-8').read().split('\n')[:-1]
         else:
             special_tokens = kwargs.pop('special_tokens', [])
-        tokenizer = cls(resolved_vocab_file, resolved_merges_file, special_tokens=special_tokens, *inputs, **kwargs)
+        tokenizer = cls(
+            resolved_vocab_file,
+            resolved_merges_file,
+            special_tokens=special_tokens,
+            *inputs,
+            **kwargs)
         return tokenizer
 
-    def __init__(self, vocab_file, merges_file, errors='replace', special_tokens=None, max_len=None):
+    def __init__(self, vocab_file, merges_file, errors='replace',
+                 special_tokens=None, max_len=None):
         self.max_len = max_len if max_len is not None else int(1e12)
         self.encoder = json.load(open(vocab_file))
-        self.decoder = {v:k for k,v in self.encoder.items()}
-        self.errors = errors # how to handle errors in decoding
+        self.decoder = {v: k for k, v in self.encoder.items()}
+        self.errors = errors  # how to handle errors in decoding
         self.byte_encoder = bytes_to_unicode()
-        self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
         bpe_data = open(merges_file, encoding='utf-8').read().split('\n')[1:-1]
         bpe_merges = [tuple(merge.split()) for merge in bpe_data]
         self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
         self.cache = {}
 
-        # Should haved added re.IGNORECASE so BPE merges can happen for capitalized versions of contractions
-        self.pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+        # Should haved added re.IGNORECASE so BPE merges can happen for
+        # capitalized versions of contractions
+        self.pat = re.compile(
+            r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
         self.special_tokens = {}
         self.special_tokens_decoder = {}
@@ -174,8 +187,9 @@ class GPT2Tokenizer(object):
             self.special_tokens = {}
             self.special_tokens_decoder = {}
             return
-        self.special_tokens = dict((tok, len(self.encoder) + i) for i, tok in enumerate(special_tokens))
-        self.special_tokens_decoder = {v:k for k, v in self.special_tokens.items()}
+        self.special_tokens = dict((tok, len(self.encoder) + i)
+                                   for i, tok in enumerate(special_tokens))
+        self.special_tokens_decoder = {v: k for k, v in self.special_tokens.items()}
         logger.info("Special tokens {}".format(self.special_tokens))
 
     def bpe(self, token):
@@ -188,7 +202,7 @@ class GPT2Tokenizer(object):
             return token
 
         while True:
-            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float('inf')))
+            bigram = min(pairs, key=lambda pair: self.bpe_ranks.get(pair, float('inf')))
             if bigram not in self.bpe_ranks:
                 break
             first, second = bigram
@@ -199,12 +213,12 @@ class GPT2Tokenizer(object):
                     j = word.index(first, i)
                     new_word.extend(word[i:j])
                     i = j
-                except:
+                except BaseException:
                     new_word.extend(word[i:])
                     break
 
-                if word[i] == first and i < len(word)-1 and word[i+1] == second:
-                    new_word.append(first+second)
+                if word[i] == first and i < len(word) - 1 and word[i + 1] == second:
+                    new_word.append(first + second)
                     i += 2
                 else:
                     new_word.append(word[i])
@@ -247,7 +261,8 @@ class GPT2Tokenizer(object):
             logger.warning(
                 "Token indices sequence length is longer than the specified maximum "
                 " sequence length for this OpenAI GPT model ({} > {}). Running this"
-                " sequence through the model will result in indexing errors".format(len(ids), self.max_len)
+                " sequence through the model will result in indexing errors".format(
+                    len(ids), self.max_len)
             )
         return ids
 

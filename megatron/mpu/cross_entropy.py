@@ -72,7 +72,6 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=get_model_parallel_group())
 
-
         # Loss = log(sum(exp(logits))) - predicted-logit.
         loss = torch.log(sum_exp_logits) - predicted_logits
 

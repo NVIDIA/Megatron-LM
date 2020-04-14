@@ -47,6 +47,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     # Print stats about the splits.
     print_rank_0(' > dataset split:')
+
     def print_split_stats(name, index):
         print_rank_0('    {}:'.format(name))
         print_rank_0('     document indices in [{}, {}) total of {} '
@@ -113,7 +114,6 @@ class BertDataset(Dataset):
         # Dataset.
         self.indexed_dataset = indexed_dataset
 
-
         # Build the samples mapping.
         self.samples_mapping = get_samples_mapping_(self.indexed_dataset,
                                                     data_prefix,
@@ -133,10 +133,8 @@ class BertDataset(Dataset):
         self.mask_id = tokenizer.mask
         self.pad_id = tokenizer.pad
 
-
     def __len__(self):
         return self.samples_mapping.shape[0]
-
 
     def __getitem__(self, idx):
 
@@ -148,7 +146,7 @@ class BertDataset(Dataset):
         # python randint is inclusive whereas the numpy one is exclusive.
         np_rng = np.random.RandomState(seed=(self.seed + idx))
         return build_training_sample(sample, seq_length,
-                                     self.max_seq_length, # needed for padding
+                                     self.max_seq_length,  # needed for padding
                                      self.vocab_id_list,
                                      self.vocab_id_to_token_dict,
                                      self.cls_id, self.sep_id,
@@ -192,7 +190,7 @@ def get_train_valid_test_split_(splits_string, size):
     splits = splits[:3]
     splits_sum = sum(splits)
     assert splits_sum > 0.0
-    splits = [split/splits_sum for split in splits]
+    splits = [split / splits_sum for split in splits]
     splits_index = [0]
     for index, split in enumerate(splits):
         splits_index.append(splits_index[index] +
@@ -254,7 +252,7 @@ def get_samples_mapping_(indexed_dataset,
             indexed_dataset.sizes,
             num_epochs,
             max_num_samples,
-            max_seq_length-3, # account for added tokens
+            max_seq_length - 3,  # account for added tokens
             short_seq_prob,
             seed,
             verbose)

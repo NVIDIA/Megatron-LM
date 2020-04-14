@@ -81,6 +81,7 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
     sampler level. This allows wrapping of arbitrary data samplers
     (sequential, random, WeightedRandomSampler, etc.) with this batch
     sampler."""
+
     def __init__(self, sampler, batch_size, drop_last, rank=-1,
                  world_size=2, wrap_last=False):
         super(DistributedBatchSampler, self).__init__(sampler, batch_size,
@@ -120,7 +121,7 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
     def data_iterator(self, _iter, wrap_around=False):
         """iterates through data and handles wrap around"""
         for i, idx in enumerate(_iter):
-            if i < self.wrap_around%self.batch_size:
+            if i < self.wrap_around % self.batch_size:
                 continue
             if wrap_around:
                 self.wrap_around += 1
@@ -129,6 +130,6 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
 
     def _batch(self, batch):
         """extracts samples only pertaining to this worker's batch"""
-        start = self.rank*self.batch_size//self.world_size
-        end = (self.rank+1)*self.batch_size//self.world_size
+        start = self.rank * self.batch_size // self.world_size
+        end = (self.rank + 1) * self.batch_size // self.world_size
         return batch[start:end]

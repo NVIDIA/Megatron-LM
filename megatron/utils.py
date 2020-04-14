@@ -48,7 +48,7 @@ def report_memory(name):
         torch.cuda.max_memory_allocated() / mega_bytes)
     string += ' | cached: {}'.format(torch.cuda.memory_cached() / mega_bytes)
     string += ' | max cached: {}'.format(
-        torch.cuda.max_memory_cached()/ mega_bytes)
+        torch.cuda.max_memory_cached() / mega_bytes)
     print_rank_0(string)
 
 
@@ -164,10 +164,10 @@ def get_ltor_masks_and_position_ids(data,
                 i = eod_index[j]
                 # Mask attention loss.
                 if reset_attention_mask:
-                    attention_mask[b, 0, (i+1):, :(i+1)] = 0
+                    attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
                 # Reset positions.
                 if reset_position_ids:
-                    position_ids[b, (i+1):] -= (i + 1 - prev_index)
+                    position_ids[b, (i + 1):] -= (i + 1 - prev_index)
                     prev_index = i + 1
 
     # Convert

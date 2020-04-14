@@ -21,6 +21,7 @@ import torch
 from torch.utils import data
 import numpy as np
 
+
 class RandomSampler(data.sampler.Sampler):
     r"""
     Based off of pytorch RandomSampler and DistributedSampler. Essentially a RandomSampler,
@@ -63,7 +64,8 @@ class RandomSampler(data.sampler.Sampler):
         if self.epoch >= 0:
             g.manual_seed(self.epoch)
         if self.replacement:
-            return iter(torch.randint(high=n, size=(self.num_samples,), dtype=torch.int64, generator=g).tolist())
+            return iter(torch.randint(high=n, size=(self.num_samples,),
+                                      dtype=torch.int64, generator=g).tolist())
         return iter(torch.randperm(n, generator=g).tolist())
 
     def __len__(self):
@@ -72,12 +74,14 @@ class RandomSampler(data.sampler.Sampler):
     def set_epoch(self, epoch):
         self.epoch = epoch
 
+
 class DistributedBatchSampler(data.sampler.BatchSampler):
     """
     similar to normal implementation of distributed sampler, except implementation is at the
     batch sampler level, instead of just the sampler level. This allows wrapping of arbitrary
     data samplers (sequential, random, WeightedRandomSampler, etc.) with this batch sampler.
     """
+
     def __init__(self, sampler, batch_size, drop_last, rank=-1, world_size=2, wrap_last=False):
         super(DistributedBatchSampler, self).__init__(sampler, batch_size, drop_last)
         if rank == -1:
@@ -125,7 +129,7 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
     def data_iterator(self, _iter, wrap_around=False):
         """iterates through data and handles wrap around"""
         for i, idx in enumerate(_iter):
-            if i < self.wrap_around%self.batch_size:
+            if i < self.wrap_around % self.batch_size:
                 continue
             if wrap_around:
                 self.wrap_around += 1
@@ -134,6 +138,6 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
 
     def _batch(self, batch):
         """extracts samples only pertaining to this worker's batch"""
-        start = self.rank*self.batch_size//self.world_size
-        end = (self.rank+1)*self.batch_size//self.world_size
+        start = self.rank * self.batch_size // self.world_size
+        end = (self.rank + 1) * self.batch_size // self.world_size
         return batch[start:end]

@@ -46,6 +46,7 @@ from megatron.module import MegatronModule
                                      unmaksed-attention-scores, attention-mask)
 """
 
+
 class ParallelMLP(MegatronModule):
     """MLP.
 
@@ -63,7 +64,7 @@ class ParallelMLP(MegatronModule):
         # Project to 4h.
         self.dense_h_to_4h = mpu.ColumnParallelLinear(
             args.hidden_size,
-            4*args.hidden_size,
+            4 * args.hidden_size,
             gather_output=False,
             init_method=init_method)
 
@@ -71,13 +72,12 @@ class ParallelMLP(MegatronModule):
 
         # Project back to h.
         self.dense_4h_to_h = mpu.RowParallelLinear(
-            4*args.hidden_size,
+            4 * args.hidden_size,
             args.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method)
 
         self.dropout = torch.nn.Dropout(args.hidden_dropout)
-
 
     def forward(self, hidden_states):
 
@@ -91,13 +91,13 @@ class ParallelMLP(MegatronModule):
         return output
 
 
-
 class ParallelSelfAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
     Self-attention layer takes input with size [b, s, h]
     and returns output of the same size.
     """
+
     def __init__(self, attention_mask_func, init_method,
                  output_layer_init_method, layer_number):
         super(ParallelSelfAttention, self).__init__()
@@ -123,7 +123,7 @@ class ParallelSelfAttention(MegatronModule):
         # Strided linear layer.
         self.query_key_value = mpu.ColumnParallelLinear(
             args.hidden_size,
-            3*args.hidden_size,
+            3 * args.hidden_size,
             stride=3,
             gather_output=False,
             init_method=init_method)
@@ -141,17 +141,15 @@ class ParallelSelfAttention(MegatronModule):
             init_method=output_layer_init_method)
         self.output_dropout = torch.nn.Dropout(args.hidden_dropout)
 
-
     def _transpose_for_scores(self, tensor):
         """Transpose a 3D tensor [b, s, np*hn] into a 4D tensor with
         size [b, np, s, hn].
         """
         new_tensor_shape = tensor.size()[:-1] + \
-                           (self.num_attention_heads_per_partition,
-                            self.hidden_size_per_attention_head)
+            (self.num_attention_heads_per_partition,
+             self.hidden_size_per_attention_head)
         tensor = tensor.view(*new_tensor_shape)
         return tensor.permute(0, 2, 1, 3)
-
 
     def _get_query_key_value(self, hidden_states):
         """Get query, key, and value and transpose to
@@ -170,7 +168,6 @@ class ParallelSelfAttention(MegatronModule):
 
         return query_layer, key_layer, value_layer
 
-
     def _get_unmasked_attention_scores(self, query_layer, key_layer):
         """Unmasked attention scores with size [b, np, s, s]."""
         coeff = 1
@@ -179,9 +176,8 @@ class ParallelSelfAttention(MegatronModule):
         norm_factor = math.sqrt(coeff *
                                 math.sqrt(self.hidden_size_per_attention_head))
         # Raw attention scores. [b, np, s, s]
-        return torch.matmul(query_layer/norm_factor,
-                            key_layer.transpose(-1, -2)/norm_factor)
-
+        return torch.matmul(query_layer / norm_factor,
+                            key_layer.transpose(-1, -2) / norm_factor)
 
     def _get_attention_probs(self, attention_scores):
         """Attention probabilies with dropout. The output has
@@ -198,7 +194,6 @@ class ParallelSelfAttention(MegatronModule):
 
         return attention_probs
 
-
     def _get_attended_context(self, attention_probs, value_layer):
         """Final attended tesnor and transposed back to [b, s, hp]."""
         # Context layer.
@@ -207,12 +202,11 @@ class ParallelSelfAttention(MegatronModule):
         # [b, s, np, hn]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + \
-                                  (self.hidden_size_per_partition,)
+            (self.hidden_size_per_partition,)
         # [b, s, hp]
         context_layer = context_layer.view(*new_context_layer_shape)
 
         return context_layer
-
 
     def _get_output(self, context_layer):
         """Output layer with dropout."""
@@ -221,7 +215,6 @@ class ParallelSelfAttention(MegatronModule):
         output = self.output_dropout(output)
 
         return output
-
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
@@ -254,7 +247,7 @@ class ParallelSelfAttention(MegatronModule):
                 if layer_past is not None:
                     attention_mask = attention_mask[
                         ...,
-                        attention_scores.size(3)-1,
+                        attention_scores.size(3) - 1,
                         :attention_scores.size(3)].unsqueeze(2)
                 else:
                     attention_mask = attention_mask[
@@ -283,13 +276,13 @@ class ParallelSelfAttention(MegatronModule):
         return output
 
 
-
 class ParallelTransformerLayer(MegatronModule):
     """A single transformer layer.
 
     Transformore layer takes input with size [b, s, h] and returns an
     output of the same size.
     """
+
     def __init__(self, attention_mask_func, mlp_activation_func,
                  init_method, output_layer_init_method, layer_number):
         args = get_args()
@@ -318,7 +311,6 @@ class ParallelTransformerLayer(MegatronModule):
         # MLP
         self.mlp = ParallelMLP(mlp_activation_func, init_method,
                                output_layer_init_method)
-
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
@@ -375,13 +367,12 @@ class ParallelTransformer(MegatronModule):
 
         # Transformer layers.
         self.layers = torch.nn.ModuleList(
-            [get_layer(i+1) for i in range(args.num_layers)])
+            [get_layer(i + 1) for i in range(args.num_layers)])
 
         # Final layer norm before output.
         self.final_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon)
-
 
     def _checkpointed_forward(self, hidden_states, attention_mask):
         """Forward method with activation checkpointing."""
@@ -398,12 +389,11 @@ class ParallelTransformer(MegatronModule):
         num_layers = len(self.layers)
         while l < num_layers:
             hidden_states = mpu.checkpoint(
-                custom(l, l+self.checkpoint_num_layers),
+                custom(l, l + self.checkpoint_num_layers),
                 hidden_states, attention_mask)
             l += self.checkpoint_num_layers
 
         return hidden_states
-
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):

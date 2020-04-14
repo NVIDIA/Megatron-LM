@@ -26,6 +26,7 @@ class IdentityLayer(torch.nn.Module):
     def __init__(self, size, scale=1.0):
         super(IdentityLayer, self).__init__()
         self.weight = torch.nn.Parameter(scale * torch.randn(size))
+
     def forward(self):
         return self.weight
 

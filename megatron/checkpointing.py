@@ -67,7 +67,7 @@ def get_checkpoint_name(checkpoints_path, iteration,
         directory = 'iter_{:07d}'.format(iteration)
     return os.path.join(checkpoints_path, directory,
                         'mp_rank_{:02d}'.format(
-                            mpu.get_model_parallel_rank() if mp_rank is None \
+                            mpu.get_model_parallel_rank() if mp_rank is None
                             else mp_rank),
                         'model_optim_rng.pt')
 
@@ -179,7 +179,7 @@ def load_checkpoint(model, optimizer, lr_scheduler):
             'megatron.fp16.loss_scaler']
         state_dict = torch.load(checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
-    except:
+    except BaseException:
         print_rank_0('could not load the checkpoint')
         sys.exit()
 
@@ -190,7 +190,7 @@ def load_checkpoint(model, optimizer, lr_scheduler):
         try:
             iteration = state_dict['iteration']
         except KeyError:
-            try: # Backward compatible with older checkpoints
+            try:  # Backward compatible with older checkpoints
                 iteration = state_dict['total_iters']
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '

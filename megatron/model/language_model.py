@@ -62,7 +62,6 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     return language_model, language_model_key
 
 
-
 class Pooler(MegatronModule):
     """Pooler layer.
 
@@ -74,10 +73,10 @@ class Pooler(MegatronModule):
         init_method: weight initialization method for the linear layer.
             bias is set to zero.
     """
+
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-
 
     def forward(self, hidden_states, sequence_index=0):
         # hidden_states: [b, s, h]
@@ -101,6 +100,7 @@ class Embedding(MegatronModule):
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
     """
+
     def __init__(self,
                  hidden_size,
                  vocab_size,
@@ -142,7 +142,6 @@ class Embedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
-
     def add_tokentype_embeddings(self, num_tokentypes):
         """Add token-type embedding. This function is provided so we can add
         token-type embeddings in case the pretrained model does not have it.
@@ -158,7 +157,6 @@ class Embedding(MegatronModule):
                                                        self.hidden_size)
         # Initialize the token-type embeddings.
         self.init_method(self.tokentype_embeddings.weight)
-
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
@@ -176,7 +174,6 @@ class Embedding(MegatronModule):
 
         return embeddings
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load."""
@@ -193,7 +190,6 @@ class Embedding(MegatronModule):
                     destination, prefix, keep_vars)
 
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
@@ -223,7 +219,7 @@ class Embedding(MegatronModule):
         self.position_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Tokentype embedding.
-        if  self.num_tokentypes > 0:
+        if self.num_tokentypes > 0:
             state_dict_ = {}
             if self._tokentype_embeddings_key in state_dict:
                 state_dict_ = state_dict[self._tokentype_embeddings_key]
@@ -239,7 +235,6 @@ class Embedding(MegatronModule):
             else:
                 print('***WARNING*** expected tokentype embeddings in the '
                       'checkpoint but could not find it', flush=True)
-
 
 
 class TransformerLanguageModel(MegatronModule):
@@ -260,6 +255,7 @@ class TransformerLanguageModel(MegatronModule):
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
     """
+
     def __init__(self,
                  attention_mask_func,
                  mlp_activation_func,
@@ -295,7 +291,6 @@ class TransformerLanguageModel(MegatronModule):
             self.pooler = Pooler(self.hidden_size, self.init_method)
             self._pooler_key = 'pooler'
 
-
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 pooling_sequence_index=0):
@@ -317,7 +312,6 @@ class TransformerLanguageModel(MegatronModule):
 
         return transformer_output
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load."""
@@ -335,7 +329,6 @@ class TransformerLanguageModel(MegatronModule):
                     destination, prefix, keep_vars)
 
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

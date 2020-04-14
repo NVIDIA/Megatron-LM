@@ -48,7 +48,6 @@ class AnnealingLR(object):
 
         print_rank_0('> learning rate decay style: {}'.format(self.decay_style))
 
-
     def get_lr(self):
         """Learning rate decay functions from:
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
@@ -71,7 +70,6 @@ class AnnealingLR(object):
             lr = self.start_lr
         return max(lr, self.min_lr)
 
-
     def step(self, step_num=None):
         """Set lr for all parameters groups."""
         if step_num is None:
@@ -80,7 +78,6 @@ class AnnealingLR(object):
         new_lr = self.get_lr()
         for group in self.optimizer.param_groups:
             group['lr'] = new_lr
-
 
     def state_dict(self):
         state_dict = {
@@ -92,7 +89,6 @@ class AnnealingLR(object):
             'min_lr': self.min_lr
         }
         return state_dict
-
 
     def _check_and_set(self, cls_value, sd_value, name):
         """Auxiliary function for checking the values in the checkpoint and
@@ -107,7 +103,6 @@ class AnnealingLR(object):
         print_rank_0(' > using checkpoint value {} for {}'.format(sd_value,
                                                                   name))
         return sd_value
-
 
     def load_state_dict(self, sd):
 

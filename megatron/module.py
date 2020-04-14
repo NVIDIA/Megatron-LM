@@ -21,10 +21,8 @@ import torch
 class MegatronModule(torch.nn.Module):
     """Megatron specific extentions of torch Module."""
 
-
     def __init__(self):
         super(MegatronModule, self).__init__()
-
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

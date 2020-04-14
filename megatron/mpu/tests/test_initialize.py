@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from commons import print_separator
+from commons import initialize_distributed
+import mpu
+import torch
 import sys
 sys.path.append("../..")
-
-import torch
-import mpu
-
-from commons import initialize_distributed
-from commons import print_separator
 
 
 def test_initialize_model_parallel(model_parallel_size):
@@ -45,7 +43,6 @@ def test_initialize_model_parallel(model_parallel_size):
     assert world_size == mpu.get_model_parallel_world_size()
     assert rank == mpu.get_model_parallel_rank()
     check(mpu.get_model_parallel_group(), world_size, rank)
-
 
     # Data parallel.
     world_size = torch.distributed.get_world_size() // model_parallel_size_

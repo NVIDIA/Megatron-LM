@@ -42,6 +42,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     # Print stats about the splits.
     print_rank_0(' > dataset split:')
+
     def print_split_stats(name, index):
         print_rank_0('    {}:'.format(name))
         print_rank_0('     document indices in [{}, {}) total of {} '
@@ -54,7 +55,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     def build_dataset(index, name):
         dataset = None
         if splits[index + 1] > splits[index]:
-            documents = np.arange(start=splits[index], stop=splits[index+1],
+            documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
             dataset = GPT2Dataset(name, data_prefix,
                                   documents, indexed_dataset,
@@ -102,21 +103,19 @@ class GPT2Dataset(torch.utils.data.Dataset):
             self.name, data_prefix, documents, self.indexed_dataset.sizes,
             num_samples, seq_length, seed)
 
-
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
         #    sample i --> [sample_idx[i], sample_idx[i+1])
         return self.sample_idx.shape[0] - 1
-
 
     def __getitem__(self, idx):
         # Get the shuffled index.
         idx = self.shuffle_idx[idx]
         # Start and end documents and offsets.
         doc_index_f = self.sample_idx[idx][0]
-        doc_index_l = self.sample_idx[idx+1][0]
+        doc_index_l = self.sample_idx[idx + 1][0]
         offset_f = self.sample_idx[idx][1]
-        offset_l = self.sample_idx[idx+1][1]
+        offset_l = self.sample_idx[idx + 1][1]
         # If we are within the same document, just extract the chunk.
         if doc_index_f == doc_index_l:
             sample = self.indexed_dataset.get(self.doc_idx[doc_index_f],
@@ -127,16 +126,15 @@ class GPT2Dataset(torch.utils.data.Dataset):
             sample_list = [self.indexed_dataset.get(self.doc_idx[doc_index_f],
                                                     offset=offset_f)]
             # Loop over all in between documents and add the entire document.
-            for i in range(doc_index_f+1, doc_index_l):
+            for i in range(doc_index_f + 1, doc_index_l):
                 sample_list.append(self.indexed_dataset.get(self.doc_idx[i]))
             # And finally add the relevant portion of last document.
             sample_list.append(self.indexed_dataset.get(
                 self.doc_idx[doc_index_l],
-                length=offset_l+1))
+                length=offset_l + 1))
             sample = np.concatenate(sample_list)
 
         return {'text': np.array(sample, dtype=np.int64)}
-
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
@@ -185,7 +183,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             assert sizes.dtype == np.int32
             sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
                                                   num_epochs, tokens_per_epoch)
-            #sample_idx = _build_sample_idx(sizes, doc_idx, seq_length,
+            # sample_idx = _build_sample_idx(sizes, doc_idx, seq_length,
             #                               num_epochs, tokens_per_epoch)
             np.save(sample_idx_filename, sample_idx, allow_pickle=True)
             print_rank_0(' > elasped time to build and save sample-idx mapping '
@@ -194,7 +192,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             start_time = time.time()
             # -1 is due to data structure used to retieve the index:
             #    sample i --> [sample_idx[i], sample_idx[i+1])
-            shuffle_idx = _build_shuffle_idx(sample_idx.shape[0]-1, np_rng)
+            shuffle_idx = _build_shuffle_idx(sample_idx.shape[0] - 1, np_rng)
             np.save(shuffle_idx_filename, shuffle_idx, allow_pickle=True)
             print_rank_0(' > elasped time to build and save shuffle-idx mapping'
                          ' (seconds): {:4f}'.format(time.time() - start_time))

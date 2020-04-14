@@ -53,7 +53,6 @@ class Classification(MegatronModule):
                                                     init_method)
         self._classification_head_key = 'classification_head'
 
-
     def forward(self, input_ids, attention_mask, tokentype_ids):
 
         extended_attention_mask = bert_extended_attention_mask(
@@ -74,7 +73,6 @@ class Classification(MegatronModule):
 
         return classification_logits
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load when model is combined with other heads,
@@ -88,7 +86,6 @@ class Classification(MegatronModule):
             = self.classification_head.state_dict(
                 destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
