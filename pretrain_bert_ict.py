@@ -102,7 +102,7 @@ def get_train_val_test_data():
     """Load the data on rank zero and boradcast number of tokens to all GPUS."""
     args = get_args()
 
-    (train_data, val_data, test_data) = (None, None, None)
+    (train_data, valid_data, test_data) = (None, None, None)
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
@@ -115,7 +115,7 @@ def get_train_val_test_data():
 
         # Number of train/valid/test samples.
         train_iters = args.train_iters
-        eval_iters = args.eval_iters
+        eval_iters = (train_iters // args.eval_iters + 1) * args.eval_iters
         test_iters = args.eval_iters
         train_val_test_num_samples = [train_iters * global_batch_size,
                                       eval_iters * global_batch_size,

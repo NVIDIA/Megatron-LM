@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import multiprocessing
 import nltk
@@ -43,18 +44,28 @@ class Encoder(object):
 
     def encode(self, json_line):
         text = json.loads(json_line)[self.args.json_key]
+        if not text:
+            text = "no text"
         doc_ids = []
         for sentence in Encoder.splitter.tokenize(text):
             tokens = Encoder.tokenizer.tokenize(sentence)
             ids = Encoder.tokenizer.convert_tokens_to_ids(tokens)
             if len(ids) > 0:
                 doc_ids.append(ids)
+            else:
+                print("no ids!", flush=True)
+                tokens = Encoder.tokenizer.tokenize("no text")
+                ids = Encoder.tokenizer.convert_tokens_to_ids(tokens)
+                doc_ids.append(ids)
+        if self.args.flatten and len(doc_ids) > 1:
+            doc_ids = [list(itertools.chain(*doc_ids))]
         return doc_ids, len(json_line)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', type=str, help='Path to input JSON')
     parser.add_argument('--vocab', type=str, help='Path to vocab.txt')
+    parser.add_argument('--flatten', action='store_true', help='Path to input JSON')
     parser.add_argument('--json-key', type=str, default='text',
                         help='Key to extract from json')
     parser.add_argument('--output-prefix', type=str, help='Path to binary output file without suffix')
