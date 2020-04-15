@@ -53,10 +53,10 @@ def parse_args(extra_args_provider=None, defaults={}):
         setattr(args, key, defaults[key])
 
     # Check required arguments.
-    _check_arg_is_not_none(args, 'num_layers')
-    _check_arg_is_not_none(args, 'hidden_size')
-    _check_arg_is_not_none(args, 'num_attention_heads')
-    _check_arg_is_not_none(args, 'max_position_embeddings')
+    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+                     'max_position_embeddings']
+    for req_arg in required_args: 
+        _check_arg_is_not_none(args, req_arg)
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
