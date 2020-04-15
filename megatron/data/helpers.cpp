@@ -363,6 +363,7 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
 
         // Current map index.
         uint64_t map_index = 0;
+        int32_t block_id = 0;
 
         // For each epoch:
         for (int32_t epoch=0; epoch<num_epochs; ++epoch) {
@@ -425,14 +426,16 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
 
                             // Populate the map.
                             if (second) {
-                                const auto map_index_0 = 3 * map_index;
+                                const auto map_index_0 = 4 * map_index;
                                 maps[map_index_0] = static_cast<DocIdx>(prev_start_index);
                                 maps[map_index_0 + 1] = static_cast<DocIdx>(sent_index + 1);
                                 maps[map_index_0 + 2] = static_cast<DocIdx>(doc);
+                                maps[map_index_0 + 3] = static_cast<DocIdx>(block_id);
                             }
 
                             // Update indices / counters.
                             ++map_index;
+                            ++block_id;
                             prev_start_index = sent_index + 1;
                             seq_len = 0;
                             num_sent = 0;
@@ -440,6 +443,7 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
                     } // for (auto sent_index=sent_index_first; ...
                 } // if (num_remain_sent > 1) {
             } // for (int doc=0; doc < num_docs; ++doc) {
+            block_id = 0;
         } // for (int epoch=0; epoch < num_epochs; ++epoch) {
 
         if (!second) {
@@ -449,7 +453,7 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
             }
             assert(maps == NULL);
             assert(num_samples < 0);
-            maps = new DocIdx[3*map_index];
+            maps = new DocIdx[4*map_index];
             num_samples = static_cast<int64_t>(map_index);
         }
 
@@ -461,12 +465,13 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
     std::mt19937_64 rand64_gen(seed + 1);
     for (auto i=(num_samples - 1); i > 0; --i) {
         const auto j = static_cast<int64_t>(rand64_gen() % (i + 1));
-        const auto i0 = 3 * i;
-        const auto j0 = 3 * j;
+        const auto i0 = 4 * i;
+        const auto j0 = 4 * j;
         // Swap values.
         swap(maps[i0], maps[j0]);
         swap(maps[i0 + 1], maps[j0 + 1]);
         swap(maps[i0 + 2], maps[j0 + 2]);
+        swap(maps[i0 + 3], maps[j0 + 3]);
     }
 
     // Method to deallocate memory.
@@ -477,8 +482,8 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
 
     // Return the numpy array.
     const auto byte_size = sizeof(DocIdx);
-    return py::array(std::vector<int64_t>{num_samples, 3}, // shape
-                     {3*byte_size, byte_size}, // C-style contiguous strides
+    return py::array(std::vector<int64_t>{num_samples, 4}, // shape
+                     {4*byte_size, byte_size}, // C-style contiguous strides
                      maps, // the data pointer
                      free_when_done); // numpy array references
 

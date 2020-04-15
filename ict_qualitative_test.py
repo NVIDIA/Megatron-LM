@@ -1,3 +1,6 @@
+from collections import defaultdict
+import pickle
+
 import numpy as np
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -22,20 +25,33 @@ def main():
     dataset = get_dataset()
     data_iter = iter(get_dataloader(dataset))
 
+    hash_data = defaultdict(list)
+    hash_matrix = np.random.rand(128, 1024)
+
     all_input_tokens = []
     all_input_logits = []
     all_block_tokens = []
     all_block_logits = []
 
-    for i in range(100):
-        input_tokens, input_types, input_pad_mask, block_tokens, block_token_types, block_pad_mask = get_batch(data_iter)
-        input_logits, doc_logits, _ = model.module.module.forward(
+    while True:
+        try:
+            input_tokens, input_types, input_pad_mask, \
+            block_tokens, block_token_types, block_pad_mask, block_indices = get_batch(data_iter)
+        except StopIteration:
+            break
+        input_logits, block_logits, _ = model.module.module.forward(
             input_tokens, input_types, input_pad_mask, block_tokens, block_pad_mask, block_token_types, return_logits=True)
+
+        block_hash_pos = torch.matmul(block_logits, hash_matrix)
+        block_hash_full = torch.concat((block_hash_pos, -block_hash_pos), axis=1)
+        block_hashes = torch.argmax(block_hash_full, axis=1)
+        for hash, idx in zip(block_hashes, block_indices):
+            hash_data[int(hash)].append(int(idx))
 
         all_input_tokens.append(input_tokens.detach().cpu().numpy())
         all_input_logits.append(input_logits.detach().cpu().numpy())
         all_block_tokens.append(block_tokens.detach().cpu().numpy())
-        all_block_logits.append(doc_logits.detach().cpu().numpy())
+        all_block_logits.append(block_logits.detach().cpu().numpy())
 
     all_input_tokens = np.array(all_input_tokens).reshape(-1, args.seq_length)
     all_input_logits = np.array(all_input_logits).reshape(-1, 128)
@@ -44,7 +60,14 @@ def main():
     np.save('input_tokens.npy', all_input_tokens)
     np.save('input_logits.npy', all_input_logits)
     np.save('block_tokens.npy', all_block_tokens)
-    np.save('doc_logits.npy', all_block_logits)
+    np.save('block_logits.npy', all_block_logits)
+
+    for hash, block_indices in hash_data.items():
+        hash_data[hash] = np.array(block_indices)
+
+    hash_data['matrix'] = hash_matrix
+    with open('hash_data.pkl', 'wb') as hash_file:
+        pickle.dump(hash_data, hash_file)
 
 
 def load_checkpoint():
@@ -78,16 +101,13 @@ def get_dataset():
     block_dataset = get_indexed_dataset_(args.data_path, 'mmap', True)
     titles_dataset = get_indexed_dataset_(args.data_path + '-titles', 'mmap', True)
 
-    doc_idx_ptr = block_dataset.get_doc_idx()
-    total_num_documents = block_dataset.doc_idx.shape[0] - 1
-    block_dataset.set_doc_idx(doc_idx_ptr[0:total_num_documents])
     kwargs = dict(
         name='full',
         context_dataset=block_dataset,
         titles_dataset=titles_dataset,
         data_prefix=args.data_path,
-        num_epochs=None,
-        max_num_samples=total_num_documents * 3,
+        num_epochs=1,
+        max_num_samples=None,
         max_seq_length=288,  # doesn't matter
         short_seq_prob=0.0001,  # doesn't matter
         seed=1

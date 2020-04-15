@@ -64,9 +64,10 @@ def get_batch(data_iterator):
     context_tokens = data_b['context_text'].long()
     context_types = data_b['context_types'].long()
     context_pad_mask = data_b['context_pad_mask'].long()
+    context_indices = data_b['context_indices'].long()
 
     return input_tokens, input_types, input_pad_mask,\
-           context_tokens, context_types, context_pad_mask
+           context_tokens, context_types, context_pad_mask, context_indices
 
 
 def forward_step(data_iterator, model):

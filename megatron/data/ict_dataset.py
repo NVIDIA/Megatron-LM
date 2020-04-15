@@ -47,7 +47,7 @@ class InverseClozeDataset(Dataset):
         return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
-        start_idx, end_idx, doc_idx = self.samples_mapping[idx]
+        start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
         title = list(self.titles_dataset[int(doc_idx)])
         context = [list(self.context_dataset[i]) for i in range(start_idx, end_idx)]
         assert len(context) > 1
@@ -78,7 +78,8 @@ class InverseClozeDataset(Dataset):
             'input_pad_mask': np.array(input_pad_mask),
             'context_text': np.array(context_tokens),
             'context_types': np.array(context_token_types),
-            'context_pad_mask': np.array(context_pad_mask)
+            'context_pad_mask': np.array(context_pad_mask),
+            'context_indices': np.array([block_idx])
         }
 
         return sample
