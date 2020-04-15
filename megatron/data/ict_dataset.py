@@ -79,7 +79,7 @@ class InverseClozeDataset(Dataset):
             'context_text': np.array(context_tokens),
             'context_types': np.array(context_token_types),
             'context_pad_mask': np.array(context_pad_mask),
-            'context_indices': np.array([block_idx])
+            'context_indices': np.array([block_idx]).astype(np.int64)
         }
 
         return sample

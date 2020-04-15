@@ -26,13 +26,14 @@ def main():
     data_iter = iter(get_dataloader(dataset))
 
     hash_data = defaultdict(list)
-    hash_matrix = np.random.rand(128, 1024)
+    hash_matrix = torch.cuda.HalfTensor(np.random.rand(128, 1024))
 
     all_input_tokens = []
     all_input_logits = []
     all_block_tokens = []
     all_block_logits = []
 
+    i = 0
     while True:
         try:
             input_tokens, input_types, input_pad_mask, \
@@ -43,8 +44,8 @@ def main():
             input_tokens, input_types, input_pad_mask, block_tokens, block_pad_mask, block_token_types, return_logits=True)
 
         block_hash_pos = torch.matmul(block_logits, hash_matrix)
-        block_hash_full = torch.concat((block_hash_pos, -block_hash_pos), axis=1)
-        block_hashes = torch.argmax(block_hash_full, axis=1)
+        block_hash_full = torch.cat((block_hash_pos, -block_hash_pos), axis=1)
+        block_hashes = torch.argmax(block_hash_full, axis=1).detach().cpu().numpy()
         for hash, idx in zip(block_hashes, block_indices):
             hash_data[int(hash)].append(int(idx))
 
@@ -52,6 +53,15 @@ def main():
         all_input_logits.append(input_logits.detach().cpu().numpy())
         all_block_tokens.append(block_tokens.detach().cpu().numpy())
         all_block_logits.append(block_logits.detach().cpu().numpy())
+
+        if i % 100 == 0:
+            print(i, flush=True)
+            print(len(all_block_tokens), flush=True)
+            print(block_tokens.shape, flush=True)
+        i += 1
+
+        if i == 10:
+            break
 
     all_input_tokens = np.array(all_input_tokens).reshape(-1, args.seq_length)
     all_input_logits = np.array(all_input_logits).reshape(-1, 128)

@@ -47,7 +47,7 @@ def get_batch(data_iterator):
 
     # Items and their type.
     keys = ['input_text', 'input_types', 'input_pad_mask',
-            'context_text', 'context_types', 'context_pad_mask']
+            'context_text', 'context_types', 'context_pad_mask', 'context_indices']
     datatype = torch.int64
 
     # Broadcast data.
