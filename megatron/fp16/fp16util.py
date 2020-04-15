@@ -169,7 +169,6 @@ def model_grads_to_master_grads(model_params, master_params, flat_master=False):
             if model.grad is not None:
                 if master.grad is None:
                     master.grad = Variable(master.data.new(*master.data.size()))
-                master.grad.data.copy_(model.grad.data)
             else:
                 master.grad = None
         model_grads = [p.grad for p in model_params if p.grad is not None]
