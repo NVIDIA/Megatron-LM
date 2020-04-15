@@ -18,6 +18,9 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from megatron import mpu
 
 
@@ -169,6 +172,13 @@ def model_grads_to_master_grads(model_params, master_params, flat_master=False):
                 master.grad.data.copy_(model.grad.data)
             else:
                 master.grad = None
+        model_grads = [p.grad for p in model_params if p.grad is not None]
+        master_grads = [p.grad for p in master_params if p.grad is not None]
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [model_grads, master_grads],
+                             1.0)
 
 
 def master_params_to_model_params(model_params, master_params, flat_master=False):
