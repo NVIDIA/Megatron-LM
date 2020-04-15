@@ -65,8 +65,7 @@ def get_batch(data_iterator):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss,
-        args.fp16)
+        args.eod_mask_loss)
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
