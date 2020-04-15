@@ -428,7 +428,7 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
                                 const auto map_index_0 = 3 * map_index;
                                 maps[map_index_0] = static_cast<DocIdx>(prev_start_index);
                                 maps[map_index_0 + 1] = static_cast<DocIdx>(sent_index + 1);
-                                maps[map_index_0 + 2] = static_cast<DocIdx>(target_seq_len);
+                                maps[map_index_0 + 2] = static_cast<DocIdx>(doc);
                             }
 
                             // Update indices / counters.

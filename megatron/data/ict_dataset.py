@@ -1,5 +1,7 @@
+import itertools
 import random
 import os
+import sys
 import time
 
 import numpy as np
@@ -45,18 +47,25 @@ class InverseClozeDataset(Dataset):
         return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
-        start_index, end_index, _ = self.samples_mapping[idx]
-        context = [self.indexed_dataset[i] for i in range(start_index, end_index)]
+        start_index, end_index, doc_index = self.samples_mapping[idx]
+        context = [list(self.context_dataset[i]) for i in range(start_index, end_index)]
         assert len(context) > 1
 
-        title = self.titles_dataset[idx]
-        assert sum(len(c) for c in context) + len(title) <= self.max_seq_length - 3
+        title = list(self.titles_dataset[int(doc_index)])
+        full_sum = sum(len(c) for c in context) + len(title)
 
-        rand_sent_idx = self.rng.randint(0, len(context) - 1)
+        if len(context) == 2:
+            rand_sent_idx = int(self.rng.random() > 0.5)
+        else:
+            rand_sent_idx = self.rng.randint(1, len(context) - 2)
+
         if self.rng.random() < 0.1:
             input = list(context[rand_sent_idx])
         else:
             input = context.pop(rand_sent_idx)
+
+        input = input[:self.max_seq_length - 2]
+        context = list(itertools.chain(*context))[:self.max_seq_length - (3 + len(title))]
 
         input_tokens, input_token_types, input_pad_mask = self.concat_and_pad_tokens(input)
         context_tokens, context_token_types, context_pad_mask = self.concat_and_pad_tokens(context, title)
@@ -77,7 +86,7 @@ class InverseClozeDataset(Dataset):
         tokens = [self.cls_id] + tokens + [self.sep_id]
         if title is not None:
             tokens += title + [self.sep_id]
-        assert len(tokens) <= self.max_seq_length
+        assert len(tokens) <= self.max_seq_length, len(tokens)
 
         num_pad = self.max_seq_length - len(tokens)
         pad_mask = [0] * len(tokens) + [1] * num_pad
