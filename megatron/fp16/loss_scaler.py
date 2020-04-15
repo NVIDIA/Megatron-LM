@@ -14,6 +14,10 @@
 # limitations under the License.
 
 import torch
+
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from megatron import mpu
 
 # item() is a recent addition, so this helps with backward compatibility.
