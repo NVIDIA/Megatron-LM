@@ -21,8 +21,45 @@
 import torch
 from torch._six import inf
 
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from .initialize import get_model_parallel_group
 from .initialize import get_model_parallel_rank
+
+
+def l2_grad_clipper(parameters, max_norm):
+    """Efficient L2 norm gradient clipping."""
+
+    overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    mp_rank_is_zero = (get_model_parallel_rank() == 0)
+    parameters = list(filter(lambda p: (p.grad is not None) and
+                             (p.model_parallel or mp_rank_is_zero),
+                             parameters))
+    norm, _ = multi_tensor_applier(
+        amp_C.multi_tensor_l2norm,
+        overflow_buf,
+        [parameters],
+        False # no per-parameter norm
+    )
+    # Sum across all model parallel GPUs.
+    norm_2 = norm * norm
+    torch.distributed.all_reduce(norm_2,
+                                 op=torch.distributed.ReduceOp.SUM,
+                                 group=get_model_parallel_group())
+    total_norm = norm_2.item() ** 0.5
+
+    clip_coef = max_norm / (total_norm + 1e-6)
+    grads = [p.grad for p in parameters]
+    if clip_coef < 1:
+        multi_tensor_applier(
+            amp_C.multi_tensor_scale,
+            overflow_buf,
+            [grads, grads],
+            clip_coef)
+    return total_norm
 
 
 def clip_grad_norm(parameters, max_norm, norm_type=2):
@@ -55,6 +92,13 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item()
+        clip_coef = max_norm / (total_norm + 1e-6)
+        if clip_coef < 1:
+            for p in parameters:
+                p.grad.data.mul_(clip_coef)
+    elif norm_type == 2:
+        total_norm = l2_grad_clipper(parameters, max_norm)
+
     else:
         total_norm = 0
         for p in parameters:
@@ -67,8 +111,8 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item() ** (1. / norm_type)
-    clip_coef = max_norm / (total_norm + 1e-6)
-    if clip_coef < 1:
-        for p in parameters:
-            p.grad.data.mul_(clip_coef)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        if clip_coef < 1:
+            for p in parameters:
+                p.grad.data.mul_(clip_coef)
     return total_norm
