@@ -323,7 +323,7 @@ We include example scripts for GPT-2 evaluation on WikiText perplexity evaluatio
 ### WikiText Perplexity Evaluation
 For even comparison with prior works, we evaluate perplexity on the word-level [WikiText-103 test dataset](https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip), and appropriately compute perplexity given the change in tokens when using our subword tokenizer.
 
-We use the following command to run WikiText-103 evaluation on a 345M parameter model. Make that `wikitext` is part of the file path.
+We use the following command to run WikiText-103 evaluation on a 345M parameter model.
 <pre>
 TASK="WIKITEXT103"
 
