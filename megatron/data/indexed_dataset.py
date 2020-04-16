@@ -42,6 +42,7 @@ def infer_dataset_impl(path):
             else:
                 return None
     else:
+        print(f"Dataset path does not exist: {path}")
         return None
 
 
@@ -61,6 +62,7 @@ def make_dataset(path, impl, skip_warmup=False):
         return IndexedCachedDataset(path)
     elif impl == 'mmap' and MMapIndexedDataset.exists(path):
         return MMapIndexedDataset(path, skip_warmup)
+    print(f"Unknown dataset implementation: {impl}")
     return None
 
 
@@ -466,9 +468,8 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if isinstance(idx, int):
             ptr, size = self._index[idx]
-            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype, count=size, offset=ptr)
-            if self._index.dtype != np.int64:
-                np_array = np_array.astype(np.int64)
+            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
+                                     count=size, offset=ptr)
             return np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
@@ -478,9 +479,24 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             sizes = self._index._sizes[idx]
             offsets = list(accumulate(sizes))
             total_size = sum(sizes)
-            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype, count=total_size, offset=ptr)
+            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
+                                     count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
             return sents
+
+    def get(self, idx, offset=0, length=None):
+        """ Retrieves a single item from the dataset with the option to only
+        return a portion of the item.
+
+        get(idx) is the same as [idx] but get() does not support slicing.
+        """
+        ptr, size = self._index[idx]
+        if length is None:
+            length = size - offset
+        ptr += offset * np.dtype(self._index.dtype).itemsize
+        np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
+                                 count=length, offset=ptr)
+        return np_array
 
     @property
     def sizes(self):

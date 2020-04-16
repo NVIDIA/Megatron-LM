@@ -25,13 +25,11 @@ from megatron import print_rank_0
 from megatron.data.bert_dataset import build_train_valid_test_datasets
 from megatron.model import BertModel
 from megatron.training import pretrain
-from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
 
 
 def model_provider():
     """Build the model."""
-    args = get_args()
 
     print_rank_0('building BERT model ...')
 
@@ -44,6 +42,7 @@ def model_provider():
 
 
 def get_batch(data_iterator):
+    """Build the batch."""
 
     # Items and their type.
     keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
@@ -96,70 +95,28 @@ def forward_step(data_iterator, model):
     return loss, {'lm loss': reduced_losses[0], 'sop loss': reduced_losses[1]}
 
 
-def get_train_val_test_data():
-    """Load the data on rank zero and boradcast number of tokens to all GPUS."""
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build train, valid, and test datasets."""
     args = get_args()
 
-    (train_data, valid_data, test_data) = (None, None, None)
+    print_rank_0('> building train, validation, and test datasets '
+                 'for BERT ...')
+    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        train_valid_test_num_samples=train_val_test_num_samples,
+        max_seq_length=args.seq_length,
+        masked_lm_prob=args.mask_prob,
+        short_seq_prob=args.short_seq_prob,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup))
+    print_rank_0("> finished creating BERT datasets ...")
 
-    # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_model_parallel_rank() == 0:
-        print_rank_0('> building train, validation, and test datasets '
-                     'for BERT ...')
-
-        data_parallel_size = mpu.get_data_parallel_world_size()
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        global_batch_size = args.batch_size * data_parallel_size
-
-        # Number of train/valid/test samples.
-        train_iters = args.train_iters
-        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
-        test_iters = args.eval_iters
-        train_val_test_num_samples = [train_iters * global_batch_size,
-                                      eval_iters * global_batch_size,
-                                      test_iters * global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
-
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-            data_prefix=args.data_path,
-            data_impl=args.data_impl,
-            splits_string=args.split,
-            train_valid_test_num_samples=train_val_test_num_samples,
-            max_seq_length=args.seq_length,
-            masked_lm_prob=args.mask_prob,
-            short_seq_prob=args.short_seq_prob,
-            seed=args.seed,
-            skip_warmup=(not args.mmap_warmup))
-        print_rank_0("> finished creating BERT datasets ...")
-
-        train_data = make_data_loader(train_ds)
-        valid_data = make_data_loader(valid_ds)
-        test_data = make_data_loader(test_ds)
-
-        do_train = train_data is not None and args.train_iters > 0
-        do_valid = valid_data is not None and args.eval_iters > 0
-        do_test = test_data is not None and args.eval_iters > 0
-        # Need to broadcast num_tokens and num_type_tokens.
-        flags = torch.cuda.LongTensor(
-            [int(do_train), int(do_valid), int(do_test)])
-    else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
-
-    # Broadcast num tokens.
-    torch.distributed.broadcast(flags,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
-    args.do_train = flags[0].item()
-    args.do_valid = flags[1].item()
-    args.do_test = flags[2].item()
-
-    return train_data, valid_data, test_data
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
 
-    pretrain(get_train_val_test_data, model_provider, forward_step,
+    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
              args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

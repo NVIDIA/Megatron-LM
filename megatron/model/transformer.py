@@ -102,6 +102,7 @@ class ParallelSelfAttention(MegatronModule):
                  output_layer_init_method, layer_number):
         super(ParallelSelfAttention, self).__init__()
         args = get_args()
+        self.fp16 = args.fp16
 
         self.attention_mask_func = attention_mask_func
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
@@ -244,7 +245,7 @@ class ParallelSelfAttention(MegatronModule):
             query_layer, key_layer)
 
         # fp32 conversion.
-        if self.attention_softmax_in_fp32:
+        if self.fp16 and self.attention_softmax_in_fp32:
             attention_scores = attention_scores.float()
 
         # Apply attention mask. [b, np, s, s]
@@ -267,7 +268,7 @@ class ParallelSelfAttention(MegatronModule):
         attention_probs = self._get_attention_probs(attention_scores)
 
         # fp16 conversion
-        if self.attention_softmax_in_fp32:
+        if self.fp16 and self.attention_softmax_in_fp32:
             attention_probs = attention_probs.half()
 
         # Context layer. [b, s, hp]

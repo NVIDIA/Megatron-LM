@@ -15,8 +15,6 @@
 
 """Pretrain GPT2"""
 
-import os
-
 import torch
 
 from megatron import get_args
@@ -24,17 +22,15 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron import print_rank_0
-from megatron.data.gpt2_dataset import GPT2Dataset
+from megatron.data.gpt2_dataset import build_train_valid_test_datasets
 from megatron.model import GPT2Model
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import make_data_loader
 from megatron.utils import reduce_losses
 
 
 def model_provider():
     """Build the model."""
-    args = get_args()
 
     print_rank_0('building GPT2 model ...')
     model = GPT2Model(num_tokentypes=0, parallel_output=True)
@@ -98,71 +94,26 @@ def forward_step(data_iterator, model):
     return loss, {'lm loss': reduced_loss[0]}
 
 
-def make_gpt2_dataloaders():
-    """Build gpt2 dataloders."""
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build train, valid, and test datasets."""
     args = get_args()
 
-    # Input parameters.
-    input_data_sizes_file = args.input_data_sizes_file
-    seq_length = args.seq_length
-    initial_seed = args.seed
+    print_rank_0('> building train, validation, and test datasets '
+                 'for GPT2 ...')
+    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        train_valid_test_num_samples=train_val_test_num_samples,
+        seq_length=args.seq_length,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup))
+    print_rank_0("> finished creating GPT2 datasets ...")
 
-    # Build the datasets.
-    def _build_dataset(name):
-        return GPT2Dataset(os.path.join(args.data_path, name),
-                           args.input_data_sizes_file,
-                           args.seq_length, args.seed)
-    train_ds = _build_dataset('train')
-    valid_ds = _build_dataset('valid')
-    test_ds = _build_dataset('test')
-
-    # Dataloaders
-    train = make_data_loader(train_ds)
-    valid = make_data_loader(valid_ds)
-    test = make_data_loader(test_ds)
-
-    args.do_train = False
-    args.do_valid = False
-    args.do_test = False
-
-    if train is not None:
-        args.do_train = True
-    if valid is not None:
-        args.do_valid = True
-    if test is not None:
-        args.do_test = True
-
-    return (train, valid, test)
-
-
-def get_train_val_test_data():
-    """Load the data on rank zero and boradcast number of tokens to all GPUS."""
-    args = get_args()
-
-    (train_data, val_data, test_data) = (None, None, None)
-
-    # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_model_parallel_rank() == 0:
-
-        (train_data, val_data, test_data) = make_gpt2_dataloaders()
-        flags = torch.cuda.LongTensor([int(args.do_train),
-                                       int(args.do_valid),
-                                       int(args.do_test)])
-    else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
-
-    # Broadcast num tokens.
-    torch.distributed.broadcast(flags,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
-    args.do_train = flags[0].item()
-    args.do_valid = flags[1].item()
-    args.do_test = flags[2].item()
-
-    return train_data, val_data, test_data
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
 
-    pretrain(get_train_val_test_data, model_provider, forward_step,
+    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
