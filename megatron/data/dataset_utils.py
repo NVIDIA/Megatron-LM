@@ -14,6 +14,10 @@
 # limitations under the License.
 
 
+# Most of the code here has been copied from:
+#   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
+# with some modifications.
+
 import collections
 import numpy as np
 
