@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,81 +18,69 @@
 import torch
 import torch.nn.functional as F
 
-from configure_data import configure_data
+from megatron import get_args
+from megatron import get_timers
 from megatron import mpu
+from megatron import print_rank_0
+from megatron.data.bert_dataset import build_train_valid_test_datasets
 from megatron.model import BertModel
-from megatron.utils import print_rank_0
+from megatron.training import pretrain
 from megatron.utils import reduce_losses
-from megatron.utils import vocab_size_with_padding
-from megatron.training import run
 
 
-def model_provider(args):
+def model_provider():
     """Build the model."""
 
     print_rank_0('building BERT model ...')
 
     model = BertModel(
-        num_layers=args.num_layers,
-        vocab_size=args.vocab_size,
-        hidden_size=args.hidden_size,
-        num_attention_heads=args.num_attention_heads,
-        embedding_dropout_prob=args.hidden_dropout,
-        attention_dropout_prob=args.attention_dropout,
-        output_dropout_prob=args.hidden_dropout,
-        max_sequence_length=args.max_position_embeddings,
-        checkpoint_activations=args.checkpoint_activations,
-        checkpoint_num_layers=args.checkpoint_num_layers,
+        num_tokentypes=2,
         add_binary_head=True,
-        layernorm_epsilon=args.layernorm_epsilon,
-        num_tokentypes=args.tokentype_size,
-        parallel_output=True,
-        apply_query_key_layer_scaling=args.apply_query_key_layer_scaling,
-        attention_softmax_in_fp32=args.attention_softmax_in_fp32)
+        parallel_output=True)
 
     return model
 
 
-def get_batch(data_iterator, timers):
+def get_batch(data_iterator):
+    """Build the batch."""
 
     # Items and their type.
-    keys = ['text', 'types', 'is_random', 'mask', 'mask_labels', 'pad_mask']
+    keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
     datatype = torch.int64
 
     # Broadcast data.
-    timers('data loader').start()
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    timers('data loader').stop()
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
     tokens = data_b['text'].long()
     types = data_b['types'].long()
-    next_sentence = data_b['is_random'].long()
-    loss_mask = data_b['mask'].float()
-    lm_labels = data_b['mask_labels'].long()
-    padding_mask = data_b['pad_mask'].long()
+    sentence_order = data_b['is_random'].long()
+    loss_mask = data_b['loss_mask'].float()
+    lm_labels = data_b['labels'].long()
+    padding_mask = data_b['padding_mask'].long()
 
-    return tokens, types, next_sentence, loss_mask, lm_labels, padding_mask
+    return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
 
-def forward_step(data_iterator, model, args, timers):
+def forward_step(data_iterator, model):
     """Forward step."""
+    timers = get_timers()
 
     # Get the batch.
     timers('batch generator').start()
-    tokens, types, next_sentence, loss_mask, lm_labels, padding_mask \
-        = get_batch(data_iterator, timers)
+    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask \
+        = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
-    lm_logits, nsp_logits = model(tokens, 1-padding_mask, tokentype_ids=types)
+    lm_logits, sop_logits = model(tokens, padding_mask, tokentype_ids=types)
 
-    nsp_loss = F.cross_entropy(nsp_logits.view(-1, 2).contiguous().float(),
-                               next_sentence.view(-1).contiguous(),
+    sop_loss = F.cross_entropy(sop_logits.view(-1, 2).contiguous().float(),
+                               sentence_order.view(-1).contiguous(),
                                ignore_index=-1)
 
     lm_loss_ = mpu.vocab_parallel_cross_entropy(lm_logits.contiguous().float(),
@@ -100,57 +88,35 @@ def forward_step(data_iterator, model, args, timers):
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
-    loss = lm_loss + nsp_loss
+    loss = lm_loss + sop_loss
 
-    reduced_losses = reduce_losses([lm_loss, nsp_loss])
+    reduced_losses = reduce_losses([lm_loss, sop_loss])
 
-    return loss, {'lm loss': reduced_losses[0], 'nsp loss': reduced_losses[1]}
+    return loss, {'lm loss': reduced_losses[0], 'sop loss': reduced_losses[1]}
 
 
-def get_train_val_test_data(args):
-    """Load the data on rank zero and boradcast number of tokens to all GPUS."""
+def train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build train, valid, and test datasets."""
+    args = get_args()
 
-    (train_data, val_data, test_data) = (None, None, None)
+    print_rank_0('> building train, validation, and test datasets '
+                 'for BERT ...')
+    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+        data_prefix=args.data_path,
+        data_impl=args.data_impl,
+        splits_string=args.split,
+        train_valid_test_num_samples=train_val_test_num_samples,
+        max_seq_length=args.seq_length,
+        masked_lm_prob=args.mask_prob,
+        short_seq_prob=args.short_seq_prob,
+        seed=args.seed,
+        skip_warmup=(not args.mmap_warmup))
+    print_rank_0("> finished creating BERT datasets ...")
 
-    # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_model_parallel_rank() == 0:
-        if (args.data_loader == 'raw'
-            or args.data_loader == 'lazy'
-            or args.data_loader == 'tfrecords'):
-            data_config = configure_data()
-            ds_type = 'BERT'
-            data_config.set_defaults(data_set_type=ds_type, transpose=False)
-            (train_data, val_data, test_data), tokenizer = data_config.apply(args)
-            num_tokens = vocab_size_with_padding(tokenizer.num_tokens, args)
-            # Need to broadcast num_tokens and num_type_tokens.
-            token_counts = torch.cuda.LongTensor([num_tokens,
-                                                  tokenizer.num_type_tokens,
-                                                  int(args.do_train),
-                                                  int(args.do_valid),
-                                                  int(args.do_test)])
-        else:
-            print("Unsupported data loader for BERT.")
-            exit(1)
-    else:
-        token_counts = torch.cuda.LongTensor([0, 0, 0, 0, 0])
-
-    # Broadcast num tokens.
-    torch.distributed.broadcast(token_counts,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
-    num_tokens = token_counts[0].item()
-    num_type_tokens = token_counts[1].item()
-    args.do_train = token_counts[2].item()
-    args.do_valid = token_counts[3].item()
-    args.do_test = token_counts[4].item()
-
-    args.vocab_size = num_tokens
-    args.tokentype_size = num_type_tokens
-
-    return train_data, val_data, test_data
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
 
-    run('Pretrain BERT model', get_train_val_test_data,
-        model_provider, forward_step)
+    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
+             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

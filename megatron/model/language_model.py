@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,13 +18,12 @@
 import torch
 import torch.nn.functional as F
 
+from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
-
-from .transformer import ParallelTransformer
-from .transformer import TransformerHyperparameters
-from .utils import gelu
-from .utils import get_linear_layer
+from megatron.model.transformer import ParallelTransformer
+from megatron.model.utils import openai_gelu
+from megatron.model.utils import get_linear_layer
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
@@ -40,59 +39,32 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     # Gather if needed.
     if parallel_output:
         return logits_parallel
-    else:
-        return mpu.gather_from_model_parallel_region(logits_parallel)
+
+    return mpu.gather_from_model_parallel_region(logits_parallel)
 
 
-def get_language_model(num_layers,
-                       vocab_size,
-                       hidden_size,
-                       num_attention_heads,
-                       embedding_dropout_prob,
-                       attention_dropout_prob,
-                       output_dropout_prob,
-                       max_sequence_length,
-                       num_tokentypes,
-                       attention_mask_func,
-                       add_pooler,
-                       checkpoint_activations,
-                       checkpoint_num_layers,
-                       layernorm_epsilon,
-                       init_method,
-                       scaled_init_method,
-                       residual_connection_post_layernorm,
-                       apply_query_key_layer_scaling,
-                       attention_softmax_in_fp32):
-    # Transformer hyperparameters.
-    transformer_hparams = TransformerHyperparameters(
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        num_attention_heads=num_attention_heads,
-        attention_dropout_prob=attention_dropout_prob,
-        output_dropout_prob=output_dropout_prob,
-        mlp_activation_func=gelu,
-        layernorm_epsilon=layernorm_epsilon,
-        init_method=init_method,
-        output_layer_init_method=scaled_init_method,
-        checkpoint_activations=checkpoint_activations,
-        checkpoint_num_layers=checkpoint_num_layers,
-        apply_residual_connection_post_layernorm=residual_connection_post_layernorm,
-        apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-        attention_softmax_in_fp32=attention_softmax_in_fp32)
+def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
+                       init_method, scaled_init_method):
+    """Build language model and return along with the key to save."""
+    args = get_args()
+
+    # Use torch gelu unless otherwise forced.
+    gelu = F.gelu
+    if args.openai_gelu:
+        gelu = openai_gelu
+    
     # Language model.
     language_model = TransformerLanguageModel(
-        transformer_hparams=transformer_hparams,
         attention_mask_func=attention_mask_func,
-        vocab_size=vocab_size,
-        max_sequence_length=max_sequence_length,
-        embedding_dropout_prob=embedding_dropout_prob,
+        mlp_activation_func=gelu,
+        init_method=init_method,
+        output_layer_init_method=scaled_init_method,
         num_tokentypes=num_tokentypes,
         add_pooler=add_pooler)
     # key used for checkpoints.
     language_model_key = 'language_model'
 
     return language_model, language_model_key
-
 
 
 class Pooler(MegatronModule):
@@ -106,10 +78,10 @@ class Pooler(MegatronModule):
         init_method: weight initialization method for the linear layer.
             bias is set to zero.
     """
+
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-
 
     def forward(self, hidden_states, sequence_index=0):
         # hidden_states: [b, s, h]
@@ -133,6 +105,7 @@ class Embedding(MegatronModule):
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
     """
+
     def __init__(self,
                  hidden_size,
                  vocab_size,
@@ -174,7 +147,6 @@ class Embedding(MegatronModule):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
-
     def add_tokentype_embeddings(self, num_tokentypes):
         """Add token-type embedding. This function is provided so we can add
         token-type embeddings in case the pretrained model does not have it.
@@ -190,7 +162,6 @@ class Embedding(MegatronModule):
                                                        self.hidden_size)
         # Initialize the token-type embeddings.
         self.init_method(self.tokentype_embeddings.weight)
-
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
@@ -208,7 +179,6 @@ class Embedding(MegatronModule):
 
         return embeddings
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load."""
@@ -225,7 +195,6 @@ class Embedding(MegatronModule):
                     destination, prefix, keep_vars)
 
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
@@ -255,7 +224,7 @@ class Embedding(MegatronModule):
         self.position_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Tokentype embedding.
-        if  self.num_tokentypes > 0:
+        if self.num_tokentypes > 0:
             state_dict_ = {}
             if self._tokentype_embeddings_key in state_dict:
                 state_dict_ = state_dict[self._tokentype_embeddings_key]
@@ -271,7 +240,6 @@ class Embedding(MegatronModule):
             else:
                 print('***WARNING*** expected tokentype embeddings in the '
                       'checkpoint but could not find it', flush=True)
-
 
 
 class TransformerLanguageModel(MegatronModule):
@@ -292,41 +260,41 @@ class TransformerLanguageModel(MegatronModule):
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
     """
+
     def __init__(self,
-                 transformer_hparams,
                  attention_mask_func,
-                 vocab_size,
-                 max_sequence_length,
-                 embedding_dropout_prob,
+                 mlp_activation_func,
+                 init_method,
+                 output_layer_init_method,
                  num_tokentypes=0,
                  add_pooler=False):
         super(TransformerLanguageModel, self).__init__()
+        args = get_args()
 
-        self.hidden_size = transformer_hparams['hidden_size']
+        self.hidden_size = args.hidden_size
         self.num_tokentypes = num_tokentypes
-        self.init_method = transformer_hparams['init_method']
+        self.init_method = init_method
         self.add_pooler = add_pooler
 
         # Embeddings
         self.embedding = Embedding(self.hidden_size,
-                                   vocab_size,
-                                   max_sequence_length,
-                                   embedding_dropout_prob,
+                                   args.padded_vocab_size,
+                                   args.max_position_embeddings,
+                                   args.hidden_dropout,
                                    self.init_method,
                                    self.num_tokentypes)
         self._embedding_key = 'embedding'
 
         # Transformer
         self.transformer = ParallelTransformer(
-            transformer_hparams,
-            attention_mask_func)
+            attention_mask_func, mlp_activation_func,
+            self.init_method, output_layer_init_method)
         self._transformer_key = 'transformer'
 
         # Pooler
         if self.add_pooler:
             self.pooler = Pooler(self.hidden_size, self.init_method)
             self._pooler_key = 'pooler'
-
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
@@ -349,7 +317,6 @@ class TransformerLanguageModel(MegatronModule):
 
         return transformer_output
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load."""
@@ -367,7 +334,6 @@ class TransformerLanguageModel(MegatronModule):
                     destination, prefix, keep_vars)
 
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

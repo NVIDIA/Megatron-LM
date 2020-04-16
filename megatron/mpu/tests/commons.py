@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ class IdentityLayer(torch.nn.Module):
     def __init__(self, size, scale=1.0):
         super(IdentityLayer, self).__init__()
         self.weight = torch.nn.Parameter(scale * torch.randn(size))
+
     def forward(self):
         return self.weight
 

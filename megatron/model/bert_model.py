@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,15 +17,15 @@
 
 import torch
 
+from megatron import get_args
+from megatron.model.language_model import parallel_lm_logits
+from megatron.model.language_model import get_language_model
+from megatron.model.transformer import LayerNorm
+from megatron.model.utils import openai_gelu
+from megatron.model.utils import get_linear_layer
+from megatron.model.utils import init_method_normal
+from megatron.model.utils import scaled_init_method_normal
 from megatron.module import MegatronModule
-
-from .language_model import parallel_lm_logits
-from .language_model import get_language_model
-from .transformer import LayerNorm
-from .utils import gelu
-from .utils import get_linear_layer
-from .utils import init_method_normal
-from .utils import scaled_init_method_normal
 
 
 def bert_attention_mask_func(attention_scores, attention_mask):
@@ -65,7 +65,6 @@ def bert_position_ids(token_ids):
     return position_ids
 
 
-
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
@@ -76,11 +75,14 @@ class BertLMHead(MegatronModule):
         layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: wether output logits being distributed or not.
     """
+
     def __init__(self, mpu_vocab_size, hidden_size, init_method,
                  layernorm_epsilon, parallel_output):
 
         super(BertLMHead, self).__init__()
 
+        args = get_args()
+        
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -89,11 +91,13 @@ class BertLMHead(MegatronModule):
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
-
+        self.gelu = torch.nn.functional.gelu
+        if args.openai_gelu:
+            self.gelu = openai_gelu
 
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
-        hidden_states = gelu(hidden_states)
+        hidden_states = self.gelu(hidden_states)
         hidden_states = self.layernorm(hidden_states)
         output = parallel_lm_logits(hidden_states,
                                     word_embeddings_weight,
@@ -102,69 +106,39 @@ class BertLMHead(MegatronModule):
         return output
 
 
-
 class BertModel(MegatronModule):
     """Bert Language model."""
 
-    def __init__(self,
-                 num_layers,
-                 vocab_size,
-                 hidden_size,
-                 num_attention_heads,
-                 embedding_dropout_prob,
-                 attention_dropout_prob,
-                 output_dropout_prob,
-                 max_sequence_length,
-                 checkpoint_activations,
-                 checkpoint_num_layers=1,
-                 add_binary_head=False,
-                 layernorm_epsilon=1.0e-5,
-                 init_method_std=0.02,
-                 num_tokentypes=0,
-                 parallel_output=True,
-                 apply_query_key_layer_scaling=False,
-                 attention_softmax_in_fp32=False):
-
+    def __init__(self, num_tokentypes=2, add_binary_head=True,
+                 parallel_output=True):
         super(BertModel, self).__init__()
+        args = get_args()
 
         self.add_binary_head = add_binary_head
         self.parallel_output = parallel_output
-        init_method = init_method_normal(init_method_std)
+        init_method = init_method_normal(args.init_method_std)
+        scaled_init_method = scaled_init_method_normal(args.init_method_std,
+                                                       args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
-            num_layers=num_layers,
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            embedding_dropout_prob=embedding_dropout_prob,
-            attention_dropout_prob=attention_dropout_prob,
-            output_dropout_prob=output_dropout_prob,
-            max_sequence_length=max_sequence_length,
+            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=self.add_binary_head,
-            attention_mask_func=bert_attention_mask_func,
-            checkpoint_activations=checkpoint_activations,
-            checkpoint_num_layers=checkpoint_num_layers,
-            layernorm_epsilon=layernorm_epsilon,
             init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(init_method_std,
-                                                         num_layers),
-            residual_connection_post_layernorm=False,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            attention_softmax_in_fp32=attention_softmax_in_fp32)
+            scaled_init_method=scaled_init_method)
 
         self.lm_head = BertLMHead(
             self.language_model.embedding.word_embeddings.weight.size(0),
-            hidden_size, init_method, layernorm_epsilon, parallel_output)
+            args.hidden_size, init_method, args.layernorm_epsilon,
+            parallel_output)
         self._lm_head_key = 'lm_head'
 
         if self.add_binary_head:
-            self.binary_head = get_linear_layer(hidden_size, 2, init_method)
+            self.binary_head = get_linear_layer(args.hidden_size, 2,
+                                                init_method)
             self._binary_head_key = 'binary_head'
 
-
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
+    def forward(self, input_ids, attention_mask, tokentype_ids=None):
 
         extended_attention_mask = bert_extended_attention_mask(
             attention_mask, next(self.language_model.parameters()).dtype)
@@ -193,7 +167,6 @@ class BertModel(MegatronModule):
 
         return lm_logits, None
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load when model is combined with other heads,
@@ -210,7 +183,6 @@ class BertModel(MegatronModule):
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

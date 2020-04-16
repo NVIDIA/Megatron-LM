@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 """Megatron Module"""
 
 import torch
@@ -22,10 +21,8 @@ import torch
 class MegatronModule(torch.nn.Module):
     """Megatron specific extentions of torch Module."""
 
-
     def __init__(self):
         super(MegatronModule, self).__init__()
-
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

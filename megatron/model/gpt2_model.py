@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 
 import torch
 
+from megatron import get_args
 from megatron.module import MegatronModule
 
 from .language_model import parallel_lm_logits
@@ -26,61 +27,30 @@ from .utils import scaled_init_method_normal
 
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
-    attention_scores = torch.mul(attention_scores, ltor_mask) - \
-                       10000.0 * (1.0 - ltor_mask)
+    attention_scores.masked_fill_(ltor_mask, -10000.0)
     return attention_scores
 
 
 class GPT2Model(MegatronModule):
     """GPT-2 Language model."""
 
-    def __init__(self,
-                 num_layers,
-                 vocab_size,
-                 hidden_size,
-                 num_attention_heads,
-                 embedding_dropout_prob,
-                 attention_dropout_prob,
-                 output_dropout_prob,
-                 max_sequence_length,
-                 checkpoint_activations,
-                 checkpoint_num_layers=1,
-                 layernorm_epsilon=1.0e-5,
-                 init_method_std=0.02,
-                 num_tokentypes=0,
-                 parallel_output=True,
-                 apply_query_key_layer_scaling=False,
-                 attention_softmax_in_fp32=False):
-
+    def __init__(self, num_tokentypes=0, parallel_output=True):
         super(GPT2Model, self).__init__()
+        args = get_args()
 
         self.parallel_output = parallel_output
 
         self.language_model, self._language_model_key = get_language_model(
-            num_layers=num_layers,
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            embedding_dropout_prob=embedding_dropout_prob,
-            attention_dropout_prob=attention_dropout_prob,
-            output_dropout_prob=output_dropout_prob,
-            max_sequence_length=max_sequence_length,
+            attention_mask_func=gpt2_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            attention_mask_func=gpt2_attention_mask_func,
-            checkpoint_activations=checkpoint_activations,
-            checkpoint_num_layers=checkpoint_num_layers,
-            layernorm_epsilon=layernorm_epsilon,
-            init_method=init_method_normal(init_method_std),
-            scaled_init_method=scaled_init_method_normal(init_method_std,
-                                                         num_layers),
-            residual_connection_post_layernorm=False,
-            apply_query_key_layer_scaling=apply_query_key_layer_scaling,
-            attention_softmax_in_fp32=attention_softmax_in_fp32)
-
+            init_method=init_method_normal(args.init_method_std),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std,
+                                                         args.num_layers))
 
     def forward(self, input_ids, position_ids, attention_mask,
-                tokentype_ids=None, layer_past=None, get_key_value=False):
+                tokentype_ids=None, layer_past=None, get_key_value=False,
+                forward_method_parallel_output=None):
 
         # Language model.
         lm_output = self.language_model(input_ids,
@@ -94,16 +64,18 @@ class GPT2Model(MegatronModule):
             lm_output, presents = lm_output
 
         # Output.
+        parallel_output = self.parallel_output
+        if forward_method_parallel_output is not None:
+            parallel_output = forward_method_parallel_output
         output = parallel_lm_logits(
             lm_output,
             self.language_model.embedding.word_embeddings.weight,
-            self.parallel_output)
+            parallel_output)
 
         if get_key_value:
             output = [output, presents]
 
         return output
-
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
@@ -113,7 +85,6 @@ class GPT2Model(MegatronModule):
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@ import torch
 import torch.nn as nn
 from torch.autograd import Variable
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 
 from megatron import mpu
 
@@ -102,6 +105,7 @@ class FP16Model(nn.Module):
 def backwards_debug_hook(grad):
     raise RuntimeError("master_params recieved a gradient in the backward pass!")
 
+
 def prep_param_lists(model, flat_master=False):
     """
     Creates a list of FP32 master parameters for a given model, as in
@@ -131,9 +135,9 @@ def prep_param_lists(model, flat_master=False):
             # flatten_dense_tensors returns a contiguous flat array.
             # http://pytorch.org/docs/master/_modules/torch/_utils.html
             master_params = _flatten_dense_tensors([param.data for param in model_params]).float()
-        except:
+        except BaseException:
             print("Error in prep_param_lists:  model may contain a mixture of parameters "
-                      "of different types.  Use flat_master=False, or use F16_Optimizer.")
+                  "of different types.  Use flat_master=False, or use F16_Optimizer.")
             raise
         master_params = torch.nn.Parameter(master_params)
         master_params.requires_grad = True
@@ -150,7 +154,7 @@ def prep_param_lists(model, flat_master=False):
 
 def model_grads_to_master_grads(model_params, master_params, flat_master=False):
     """
-    Copy model gradients to master gradients.  
+    Copy model gradients to master gradients.
 
     Args:
         model_params:  List of model parameters created by :func:`prep_param_lists`.
@@ -165,9 +169,15 @@ def model_grads_to_master_grads(model_params, master_params, flat_master=False):
             if model.grad is not None:
                 if master.grad is None:
                     master.grad = Variable(master.data.new(*master.data.size()))
-                master.grad.data.copy_(model.grad.data)
             else:
                 master.grad = None
+        model_grads = [p.grad for p in model_params if p.grad is not None]
+        master_grads = [p.grad for p in master_params if p.grad is not None]
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [model_grads, master_grads],
+                             1.0)
 
 
 def master_params_to_model_params(model_params, master_params, flat_master=False):
@@ -179,7 +189,7 @@ def master_params_to_model_params(model_params, master_params, flat_master=False
         master_params:  List of FP32 master parameters created by :func:`prep_param_lists`.  If ``master_params`` was created with ``flat_master=True``, ``flat_master=True`` should also be supplied to :func:`master_params_to_model_params`.
     """
     if flat_master:
-        for model, master in zip(model_params, 
+        for model, master in zip(model_params,
                                  _unflatten_dense_tensors(master_params[0].data, model_params)):
             model.data.copy_(master)
     else:
@@ -188,17 +198,19 @@ def master_params_to_model_params(model_params, master_params, flat_master=False
 
 # Backward compatibility fixes
 
+
 def to_python_float(t):
     if hasattr(t, 'item'):
         return t.item()
     else:
         return t[0]
 
+
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
 
 clip_grad_norm = mpu.clip_grad_norm
-#elif TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
+# elif TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
 #    clip_grad_norm = torch.nn.utils.clip_grad_norm
-#else:
+# else:
 #    clip_grad_norm = torch.nn.utils.clip_grad_norm_

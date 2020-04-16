@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,21 +14,28 @@
 # limitations under the License.
 
 import torch
+
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from megatron import mpu
 
 # item() is a recent addition, so this helps with backward compatibility.
+
+
 def to_python_float(t):
     if hasattr(t, 'item'):
         return t.item()
     else:
         return t[0]
 
+
 class LossScaler:
     """
     Class that manages a static loss scale.  This class is intended to interact with
     :class:`FP16_Optimizer`, and should not be directly manipulated by the user.
 
-    Use of :class:`LossScaler` is enabled via the ``static_loss_scale`` argument to 
+    Use of :class:`LossScaler` is enabled via the ``static_loss_scale`` argument to
     :class:`FP16_Optimizer`'s constructor.
 
     Args:
@@ -54,16 +61,22 @@ class LossScaler:
         return self.cur_scale
 
     def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [grad_in, grad_in],
+                             self.loss_scale)
+        return grad_in
 
     def backward(self, loss, retain_graph=False):
-        scaled_loss = loss*self.loss_scale
+        scaled_loss = loss * self.loss_scale
         scaled_loss.backward(retain_graph=retain_graph)
+
 
 class DynamicLossScaler:
     """
     Class that manages dynamic loss scaling.  It is recommended to use :class:`DynamicLossScaler`
-    indirectly, by supplying ``dynamic_loss_scale=True`` to the constructor of 
+    indirectly, by supplying ``dynamic_loss_scale=True`` to the constructor of
     :class:`FP16_Optimizer`.  However, it's important to understand how :class:`DynamicLossScaler`
     operates, because the default options can be changed using the
     the ``dynamic_loss_args`` argument to :class:`FP16_Optimizer`'s constructor.
@@ -71,18 +84,18 @@ class DynamicLossScaler:
     Loss scaling is designed to combat the problem of underflowing gradients encountered at long
     times when training fp16 networks.  Dynamic loss scaling begins by attempting a very high loss
     scale.  Ironically, this may result in OVERflowing gradients.  If overflowing gradients are
-    encountered, :class:`DynamicLossScaler` informs :class:`FP16_Optimizer` that an overflow has 
+    encountered, :class:`DynamicLossScaler` informs :class:`FP16_Optimizer` that an overflow has
     occurred.
     :class:`FP16_Optimizer` then skips the update step for this particular iteration/minibatch,
-    and :class:`DynamicLossScaler` adjusts the loss scale to a lower value.  
+    and :class:`DynamicLossScaler` adjusts the loss scale to a lower value.
     If a certain number of iterations occur without overflowing gradients detected,
     :class:`DynamicLossScaler` increases the loss scale once more.
-    In this way :class:`DynamicLossScaler` attempts to "ride the edge" of 
+    In this way :class:`DynamicLossScaler` attempts to "ride the edge" of
     always using the highest loss scale possible without incurring overflow.
 
     Args:
         init_scale (float, optional, default=2**32):  Initial loss scale attempted by :class:`DynamicLossScaler.`
-        scale_factor (float, optional, default=2.0):  Factor used when adjusting the loss scale. If an overflow is encountered, the loss scale is readjusted to loss scale/``scale_factor``.  If ``scale_window`` consecutive iterations take place without an overflow, the loss scale is readjusted to loss_scale*``scale_factor``. 
+        scale_factor (float, optional, default=2.0):  Factor used when adjusting the loss scale. If an overflow is encountered, the loss scale is readjusted to loss scale/``scale_factor``.  If ``scale_window`` consecutive iterations take place without an overflow, the loss scale is readjusted to loss_scale*``scale_factor``.
         scale_window (int, optional, default=1000):  Number of consecutive iterations without an overflow to wait before increasing the loss scale.
     """
 
@@ -122,12 +135,12 @@ class DynamicLossScaler:
         overflow = overflow_gpu[0].item()
         return bool(overflow)
 
-
     # `x` is a torch.Tensor
+
     def _has_inf_or_nan(x):
         try:
-            # if x is half, the .float() incurs an additional deep copy, but it's necessary if 
-            # Pytorch's .sum() creates a one-element tensor of the same type as x 
+            # if x is half, the .float() incurs an additional deep copy, but it's necessary if
+            # Pytorch's .sum() creates a one-element tensor of the same type as x
             # (which is true for some recent version of pytorch).
             cpu_sum = float(x.float().sum())
             # More efficient version that can be used if .sum() returns a Python scalar
@@ -158,7 +171,7 @@ class DynamicLossScaler:
         if overflow:
             # self.cur_scale /= self.scale_factor
             if self.delayed_shift == 1 or self.cur_hysteresis == 1:
-                self.cur_scale = max(self.cur_scale/self.scale_factor, self.min_scale)
+                self.cur_scale = max(self.cur_scale / self.scale_factor, self.min_scale)
             else:
                 self.cur_hysteresis -= 1
             self.last_overflow_iter = self.cur_iter
@@ -176,13 +189,19 @@ class DynamicLossScaler:
         return self.cur_scale
 
     def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [grad_in, grad_in],
+                             self.loss_scale)
+        return grad_in
 
     def backward(self, loss, retain_graph=False):
-        scaled_loss = loss*self.loss_scale
+        scaled_loss = loss * self.loss_scale
         scaled_loss.backward(retain_graph=retain_graph)
-        
-##############################################################        
+
+
+##############################################################
 # Example usage below here -- assuming it's in a separate file
 ##############################################################
 """
@@ -218,10 +237,10 @@ if __name__ == "__main__":
         # Run backprop
         optimizer.zero_grad()
         loss.backward()
-        
+
         # Check for overflow
         has_overflow = DynamicLossScaler.has_overflow(parameters)
-        
+
         # If no overflow, unscale grad and update as usual
         if not has_overflow:
             for param in parameters:
