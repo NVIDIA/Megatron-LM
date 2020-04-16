@@ -32,6 +32,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --distributed-backend nccl \
        --lr 0.0001 \
        --lr-decay-style linear \
+       --min-lr 1.0e-5 \
        --lr-decay-iters 990000 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \

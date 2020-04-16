@@ -36,6 +36,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --distributed-backend nccl \
        --lr 0.00015 \
        --lr-decay-style cosine \
+       --min-lr 1.0e-5 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --warmup .01 \
