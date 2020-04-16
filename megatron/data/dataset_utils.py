@@ -24,7 +24,11 @@ def compile_helper():
     import os
     import subprocess
     path = os.path.abspath(os.path.dirname(__file__))
-    subprocess.run(['make', '-C', path]) 
+    ret = subprocess.run(['make', '-C', path])
+    if ret.returncode != 0:
+        print("Making C++ dataset helpers module failed, exiting.")
+        import sys
+        sys.exit(1)
 
 
 def build_training_sample(sample,
