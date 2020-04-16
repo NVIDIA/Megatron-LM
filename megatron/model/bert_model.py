@@ -214,10 +214,14 @@ class BertModel(MegatronModule):
                 state_dict[self._ict_head_key], strict=strict)
 
 
+# REALMBertModel is just BertModel without binary head.
+# needs a different kind of dataset though
+
+
 class ICTBertModel(MegatronModule):
     def __init__(self,
                  ict_head_size,
-                 num_tokentypes=0,
+                 num_tokentypes=2,
                  parallel_output=True):
         super(ICTBertModel, self).__init__()
         bert_args = dict(

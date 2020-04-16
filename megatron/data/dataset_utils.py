@@ -15,6 +15,8 @@
 
 
 import collections
+import itertools
+
 import numpy as np
 
 
@@ -80,6 +82,33 @@ def build_training_sample(sample,
     return train_sample
 
 
+def build_simple_training_sample(sample, target_seq_length, max_seq_length,
+                                 vocab_id_list, vocab_id_to_token_dict,
+                                 cls_id, sep_id, mask_id, pad_id,
+                                 masked_lm_prob, np_rng):
+
+    tokens = list(itertools.chain(*sample))[:max_seq_length - 2]
+    tokens, tokentypes = create_single_tokens_and_tokentypes(tokens)
+
+    max_predictions_per_seq = masked_lm_prob * max_seq_length
+    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
+        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
+        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
+
+    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
+        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+                                   masked_labels, pad_id, max_seq_length)
+
+
+    train_sample = {
+        'text': tokens_np,
+        'types': tokentypes_np,
+        'labels': labels_np,
+        'loss_mask': loss_mask_np,
+        'padding_mask': padding_mask_np}
+    return train_sample
+
+
 def get_a_and_b_segments(sample, np_rng):
     """Divide sample into a and b segments."""
 
@@ -132,6 +161,7 @@ def truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, np_rng):
             tokens.pop()
     return True
 
+
 def create_tokens_and_tokentypes(tokens_a, tokens_b, cls_id, sep_id):
     """Merge segments A and B, add [CLS] and [SEP] and build tokentypes."""
 
@@ -155,6 +185,15 @@ def create_tokens_and_tokentypes(tokens_a, tokens_b, cls_id, sep_id):
     tokens.append(sep_id)
     tokentypes.append(1)
 
+    return tokens, tokentypes
+
+
+def create_single_tokens_and_tokentypes(_tokens, cls_id, sep_id):
+    tokens = []
+    tokens.append(cls_id)
+    tokens.extend(list(_tokens))
+    tokens.append(sep_id)
+    tokentypes = [0] * len(tokens)
     return tokens, tokentypes
 
 
