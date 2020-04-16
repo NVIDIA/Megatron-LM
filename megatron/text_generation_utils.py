@@ -42,8 +42,7 @@ def get_batch(context_tokens):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss,
-        args.fp16)
+        args.eod_mask_loss)
 
     return tokens, attention_mask, position_ids
 

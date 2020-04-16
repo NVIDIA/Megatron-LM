@@ -14,6 +14,10 @@
 # limitations under the License.
 
 import torch
+
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from megatron import mpu
 
 # item() is a recent addition, so this helps with backward compatibility.
@@ -57,7 +61,12 @@ class LossScaler:
         return self.cur_scale
 
     def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [grad_in, grad_in],
+                             self.loss_scale)
+        return grad_in
 
     def backward(self, loss, retain_graph=False):
         scaled_loss = loss * self.loss_scale
@@ -180,7 +189,12 @@ class DynamicLossScaler:
         return self.cur_scale
 
     def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
+        _overflow_buf = torch.cuda.IntTensor([0])
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             _overflow_buf,
+                             [grad_in, grad_in],
+                             self.loss_scale)
+        return grad_in
 
     def backward(self, loss, retain_graph=False):
         scaled_loss = loss * self.loss_scale

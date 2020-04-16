@@ -119,8 +119,7 @@ def get_ltor_masks_and_position_ids(data,
                                     eod_token,
                                     reset_position_ids,
                                     reset_attention_mask,
-                                    eod_mask_loss,
-                                    fp16):
+                                    eod_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -170,8 +169,7 @@ def get_ltor_masks_and_position_ids(data,
                     position_ids[b, (i + 1):] -= (i + 1 - prev_index)
                     prev_index = i + 1
 
-    # Convert
-    if fp16:
-        attention_mask = attention_mask.half()
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
 
     return attention_mask, loss_mask, position_ids

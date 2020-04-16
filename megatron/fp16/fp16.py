@@ -22,6 +22,8 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .loss_scaler import DynamicLossScaler, LossScaler
 from .fp16util import model_grads_to_master_grads, master_params_to_model_params, clip_grad_norm
 
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 
 from megatron.module import MegatronModule
 
@@ -320,10 +322,13 @@ class FP16_Optimizer(object):
     def _downscale_master(self):
         if self.loss_scale != 1.0:
             for group in self.optimizer.param_groups:
-                for param in group['params']:
-                    if param.grad is not None:
-                        param.grad.data.mul_(1. / self.loss_scale)
-
+                grads = [p.grad for p in group['params'] if p.grad is not None]
+                _overflow_buf = torch.cuda.IntTensor([0])
+                multi_tensor_applier(amp_C.multi_tensor_scale,
+                                     _overflow_buf,
+                                     [grads, grads],
+                                     1./self.loss_scale)
+      
     def clip_master_grads(self, max_norm, norm_type=2):
         """
         Clips fp32 master gradients via ``torch.nn.utils.clip_grad_norm``.
