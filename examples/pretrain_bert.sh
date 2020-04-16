@@ -2,6 +2,8 @@
 
 RANK=0
 WORLD_SIZE=1
+DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH=<Specify path>
 
 python pretrain_bert.py \
        --num-layers 24 \
@@ -9,26 +11,25 @@ python pretrain_bert.py \
        --num-attention-heads 16 \
        --batch-size 4 \
        --seq-length 512 \
-       --max-preds-per-seq 80 \
        --max-position-embeddings 512 \
-       --train-iters 1000000 \
-       --save checkpoints/bert_345m \
-       --load checkpoints/bert_345m \
-       --resume-dataloader \
-       --train-data wikipedia \
-       --lazy-loader \
-       --tokenizer-type BertWordPieceTokenizer \
-       --tokenizer-model-type bert-large-uncased \
-       --presplit-sentences \
-       --cache-dir cache \
+       --train-iters 2000000 \
+       --save $CHECKPOINT_PATH \
+       --load $CHECKPOINT_PATH \
+       --data-path $DATA_PATH \
+       --vocab-file bert-vocab.txt \
+       --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
+       --min-lr 0.00001 \
        --lr-decay-style linear \
        --lr-decay-iters 990000 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --warmup .01 \
-       --fp16 \
-       --fp32-layernorm \
-       --fp32-embedding
+       --log-interval 100 \
+       --save-interval 10000 \
+       --eval-interval 1000 \
+       --eval-iters 10 \
+       --fp16
+
