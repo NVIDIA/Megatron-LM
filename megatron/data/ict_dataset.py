@@ -59,7 +59,7 @@ class InverseClozeDataset(Dataset):
             rand_sent_idx = self.rng.randint(1, len(context) - 2)
 
         # keep the query in the context 10% of the time.
-        if self.rng.random() < 0.1:
+        if self.rng.random() < 1:
             input = context[rand_sent_idx].copy()
         else:
             input = context.pop(rand_sent_idx)
