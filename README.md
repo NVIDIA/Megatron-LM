@@ -63,7 +63,7 @@ After installation, there are several possible workflows. The most comprehensive
 
 However, steps 1 and 2 can be replaced by using one of the pretrained models mentioned above.
 
-We've provided several scripts for pretraining both BERT and GPT-2 in [`examples`](./examples) directory, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText, and LAMBADA evaluation. There is also a script for GPT-2 interactive text generation.
+We've provided several scripts for pretraining both BERT and GPT-2 in [`examples`](./examples) directory, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText103, and LAMBADA evaluation. There is also a script for GPT-2 interactive text generation.
 
 <a id="training"></a>
 # Training
@@ -110,7 +110,7 @@ Further command line arguments are described in the source file [`preprocess_dat
 ## BERT Pretraining
 `bash examples/pretrain_bert.sh`
 
-This script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--warmup`. While this is single GPU training, the batch size specified by `--batch-size` is per GPU used for data parallelism. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (true by default, or specified manually with `--seed`).
+This script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--warmup`. While this is single GPU training, the batch size specified by `--batch-size` is per GPU used for data parallelism. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`).
 
 The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
