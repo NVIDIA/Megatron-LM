@@ -35,6 +35,7 @@ def main():
     all_block_logits = []
     all_block_indices = []
     my_rank = args.rank
+    block_file = open(f'block_data{my_rank}.pkl', 'wb')
     i = 0
     while True:
         try:
@@ -51,29 +52,35 @@ def main():
         block_hash_full = torch.cat((block_hash_pos, -block_hash_pos), axis=1)
         block_hashes = torch.argmax(block_hash_full, axis=1).detach().cpu().numpy()
         for hash, indices_array in zip(block_hashes, block_indices):
-            hash_data[int(hash)].append(indicecs_array)
+            hash_data[int(hash)].append(indices_array)
 
         #all_input_tokens.append(input_tokens.detach().cpu().numpy())
         #all_input_logits.append(input_logits.detach().cpu().numpy())
         #all_block_tokens.append(block_tokens.detach().cpu().numpy())
 
-        all_block_logits.append(block_logits.detach().cpu().numpy())
-        all_block_indices.append(block_indices.detach().cpu().numpy()[:, 3])
-        if i == 1000:
+        #all_block_logits.append(block_logits.detach().cpu().numpy())
+        #all_block_indices.append(block_indices.detach().cpu().numpy()[:, 3])
+        block_logits = block_logits.detach().cpu().numpy()
+        block_indices = block_indices.detach().cpu().numpy()[:, 3]
+        for logits, idx in zip(block_logits, block_indices):
+            pickle.dump({idx: logits}, block_file)
+
+        if i == 100:
             print(i)
 
         i += 1
 
+    block_file.close()
     #all_input_tokens = np.array(all_input_tokens).reshape(-1, args.seq_length)
     #all_input_logits = np.array(all_input_logits).reshape(-1, 128)
     #all_block_tokens = np.array(all_block_tokens).reshape(-1, args.seq_length)
-    all_block_logits = np.array(all_block_logits).reshape(-1, 128)
-    all_block_indices = np.array(all_block_indices).reshape(all_block_logits.shape[0])
-    for logits, idx in zip(all_block_logits, all_block_indices):
-        block_data[idx] = logits
+    #all_block_logits = np.array(all_block_logits).reshape(-1, 128)
+    #all_block_indices = np.array(all_block_indices).reshape(all_block_logits.shape[0])
+    #for logits, idx in zip(all_block_logits, all_block_indices):
+    #    block_data[idx] = logits
 
-    with open(f'block_data{my_rank}.pkl', 'wb') as block_file:
-        pickle.dump(block_data, block_file)
+    #with  as block_file:
+    #    pickle.dump(block_data, block_file)
 
     #np.save(f'input_tokens{my_rank}.npy', all_input_tokens)
     #np.save(f'input_logits{my_rank}.npy', all_input_logits)
