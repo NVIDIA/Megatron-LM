@@ -38,7 +38,7 @@ To use this repo please install the latest supported versions of PyTorch with GP
 
 <a id="downloading-checkpoints"></a>
 ## Downloading Checkpoints
-We've provided several pretrained checkpoints for use to evaluate or finetuning downstream tasks. To access these checkpoints, first please [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI.
+We've provided two pretrained checkpoints for use to evaluate or finetuning downstream tasks. To access these checkpoints, first please [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI.
 
 The checkpoints can be downloaded with:
 <pre>
@@ -63,7 +63,7 @@ After installation, there are several possible workflows. The most comprehensive
 
 However, steps 1 and 2 can be replaced by using one of the pretrained models mentioned above.
 
-We've provided several scripts for pretraining both BERT and GPT-2, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText, and LAMBADA evaluation. There is also a script for GPT-2 interactive text generation.
+We've provided several scripts for pretraining both BERT and GPT-2 in [`examples`](./examples) directory, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText, and LAMBADA evaluation. There is also a script for GPT-2 interactive text generation.
 
 <a id="training"></a>
 # Training
