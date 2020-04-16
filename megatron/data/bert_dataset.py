@@ -246,6 +246,9 @@ def get_samples_mapping_(indexed_dataset,
         start_time = time.time()
         print_rank_0(' > building sapmles index mapping for {} ...'.format(
             name))
+        # First compile and then import.
+        from megatron.data.dataset_utils import compile_helper
+        compile_helper()
         from megatron.data import helpers
         samples_mapping = helpers.build_mapping(
             indexed_dataset.doc_idx,

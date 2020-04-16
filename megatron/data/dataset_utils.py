@@ -18,6 +18,15 @@ import collections
 import numpy as np
 
 
+def compile_helper():
+    """Compile helper function ar runtime. Make sure this
+    is invoked on a single process."""
+    import os
+    import subprocess
+    path = os.path.abspath(os.path.dirname(__file__))
+    subprocess.run(['make', '-C', path]) 
+
+
 def build_training_sample(sample,
                           target_seq_length, max_seq_length,
                           vocab_id_list, vocab_id_to_token_dict,
