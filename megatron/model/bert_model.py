@@ -18,15 +18,14 @@
 import torch
 
 from megatron import get_args
+from megatron.model.language_model import parallel_lm_logits
+from megatron.model.language_model import get_language_model
+from megatron.model.transformer import LayerNorm
+from megatron.model.utils import openai_gelu
+from megatron.model.utils import get_linear_layer
+from megatron.model.utils import init_method_normal
+from megatron.model.utils import scaled_init_method_normal
 from megatron.module import MegatronModule
-
-from .language_model import parallel_lm_logits
-from .language_model import get_language_model
-from .transformer import LayerNorm
-from .utils import gelu
-from .utils import get_linear_layer
-from .utils import init_method_normal
-from .utils import scaled_init_method_normal
 
 
 def bert_attention_mask_func(attention_scores, attention_mask):
@@ -82,6 +81,8 @@ class BertLMHead(MegatronModule):
 
         super(BertLMHead, self).__init__()
 
+        args = get_args()
+        
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -90,10 +91,13 @@ class BertLMHead(MegatronModule):
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        self.gelu = torch.nn.functional.gelu
+        if args.openai_gelu:
+            self.gelu = openai_gelu
 
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
-        hidden_states = gelu(hidden_states)
+        hidden_states = self.gelu(hidden_states)
         hidden_states = self.layernorm(hidden_states)
         output = parallel_lm_logits(hidden_states,
                                     word_embeddings_weight,

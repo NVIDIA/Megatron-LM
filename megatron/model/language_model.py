@@ -21,9 +21,8 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
-
 from megatron.model.transformer import ParallelTransformer
-from megatron.model.utils import gelu
+from megatron.model.utils import openai_gelu
 from megatron.model.utils import get_linear_layer
 
 
@@ -47,7 +46,13 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
                        init_method, scaled_init_method):
     """Build language model and return along with the key to save."""
+    args = get_args()
 
+    # Use torch gelu unless otherwise forced.
+    gelu = F.gelu
+    if args.openai_gelu:
+        gelu = openai_gelu
+    
     # Language model.
     language_model = TransformerLanguageModel(
         attention_mask_func=attention_mask_func,
