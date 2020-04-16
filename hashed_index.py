@@ -39,7 +39,7 @@ def main():
         try:
             input_tokens, input_types, input_pad_mask, \
             block_tokens, block_token_types, block_pad_mask, block_indices = get_batch(data_iter)
-        except StopIteration:
+        except:
             break
 
         # TODO: make sure input is still in block
@@ -49,20 +49,16 @@ def main():
         block_hash_pos = torch.matmul(block_logits, hash_matrix)
         block_hash_full = torch.cat((block_hash_pos, -block_hash_pos), axis=1)
         block_hashes = torch.argmax(block_hash_full, axis=1).detach().cpu().numpy()
-        for hash, idx in zip(block_hashes, block_indices):
-            hash_data[int(hash)].append(int(idx))
+        for hash, indices_array in zip(block_hashes, block_indices):
+            hash_data[int(hash)].append(indicecs_array)
 
         all_input_tokens.append(input_tokens.detach().cpu().numpy())
         all_input_logits.append(input_logits.detach().cpu().numpy())
         all_block_tokens.append(block_tokens.detach().cpu().numpy())
         all_block_logits.append(block_logits.detach().cpu().numpy())
 
-        if i % 10 == 0:
-            print(i, flush=True)
-            print(block_tokens[0])
-
-        if i == 100:
-            break
+        if i == 1000:
+            print(i)
 
         i += 1
 
