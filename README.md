@@ -391,7 +391,7 @@ Further command line arguments are described in the source file [`main.py`](./ta
 ## BERT Task Evaluation
 <a id="race-evaluation"></a>
 ### RACE Evaluation
-The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/).
+The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/). The `TRAIN_DATA` and `VALID_DATA` directory contain the RACE dataset as separate `.txt` files.
 
 <pre>
 TRAIN_DATA="data/RACE/train/middle"
