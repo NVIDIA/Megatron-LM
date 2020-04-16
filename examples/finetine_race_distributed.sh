@@ -12,7 +12,7 @@ TRAIN_DATA="data/RACE/train/middle"
 VALID_DATA="data/RACE/dev/middle \
             data/RACE/dev/high"
 VOCAB_FILE=bert-vocab.txt
-PRETRIANED_CHECKPOINT=checkpoints/bert_345m
+PRETRAINED_CHECKPOINT=checkpoints/bert_345m
 CHECKPOINT_PATH=checkpoints/bert_345m_race
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
@@ -23,7 +23,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --tokenizer-type BertWordPieceLowerCase \
                --vocab-file $VOCAB_FILE \
                --epochs 3 \
-               --pretrained-checkpoint $PRETRIANED_CHECKPOINT \
+               --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
                --model-parallel-size 1 \
                --num-layers 24 \
                --hidden-size 1024 \
@@ -35,7 +35,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --warmup 0.06 \
                --seq-length 512 \
                --max-position-embeddings 512 \
-               --save-interval 500000 \
+               --save-interval 100000 \
                --save $CHECKPOINT_PATH \
                --log-interval 10 \
                --eval-interval 100 \
