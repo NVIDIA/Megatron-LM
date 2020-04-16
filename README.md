@@ -400,7 +400,7 @@ VALID_DATA="data/RACE/dev/middle \
 VOCAB_FILE=bert-vocab.txt
 PRETRAINED_CHECKPOINT=checkpoints/bert_345m
 CHECKPOINT_PATH=checkpoints/bert_345m_race
-COMMON_TASK_ARGS=COMMON_TASK_ARGS="--num-layers 24 \
+COMMON_TASK_ARGS="--num-layers 24 \
                   --hidden-size 1024 \
                   --num-attention-heads 16 \
                   --seq-length 512 \
