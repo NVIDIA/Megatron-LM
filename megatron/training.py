@@ -262,19 +262,16 @@ def train_step(forward_step_func, data_iterator,
     timers('forward').start()
     loss, loss_reduced = forward_step_func(data_iterator, model)
     timers('forward').stop()
-    torch.cuda.synchronize()
 
     # Calculate gradients, reduce across processes, and clip.
     timers('backward').start()
     backward_step(optimizer, model, loss)
     timers('backward').stop()
-    torch.cuda.synchronize()
 
     # Update parameters.
     timers('optimizer').start()
     optimizer.step()
     timers('optimizer').stop()
-    torch.cuda.synchronize()
 
     # Update learning rate.
     skipped_iter = 0

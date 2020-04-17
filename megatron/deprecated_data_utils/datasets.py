@@ -918,10 +918,10 @@ class InverseClozeDataset(data.Dataset):
 
         sample = {
             'input_text': np.array(input_tokens),
-            'input_types': np.array(input_token_types),
+            'query_types': np.array(input_token_types),
             'input_pad_mask': np.array(input_pad_mask),
             'context_text': np.array(context_tokens),
-            'context_types': np.array(context_token_types),
+            'block_types': np.array(context_token_types),
             'context_pad_mask': np.array(context_pad_mask)
         }
 

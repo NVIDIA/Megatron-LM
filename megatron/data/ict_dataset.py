@@ -1,7 +1,6 @@
 import itertools
 import random
 import os
-import sys
 import time
 
 import numpy as np
@@ -16,19 +15,19 @@ from megatron.data import helpers
 
 class InverseClozeDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
-    def __init__(self, name, context_dataset, titles_dataset, data_prefix,
+    def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length,
                  short_seq_prob, seed):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
-        self.context_dataset = context_dataset
-        self.titles_dataset = titles_dataset
+        self.block_dataset = block_dataset
+        self.title_dataset = title_dataset
         self.short_seq_prob = short_seq_prob
         self.rng = random.Random(self.seed)
 
-        self.samples_mapping = get_samples_mapping(self.context_dataset,
-                                                   self.titles_dataset,
+        self.samples_mapping = get_samples_mapping(self.block_dataset,
+                                                   self.title_dataset,
                                                    data_prefix,
                                                    num_epochs,
                                                    max_num_samples,
@@ -47,38 +46,38 @@ class InverseClozeDataset(Dataset):
         return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
-        start_idx, end_idx, doc_idx = self.samples_mapping[idx]
-        title = list(self.titles_dataset[int(doc_idx)])
-        context = [list(self.context_dataset[i]) for i in range(start_idx, end_idx)]
-        assert len(context) > 1
+        start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
+        title = list(self.title_dataset[int(doc_idx)])
+        block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
+        assert len(block) > 1
 
         # avoid selecting the first or last sentence to be the query.
-        if len(context) == 2:
+        if len(block) == 2:
             rand_sent_idx = int(self.rng.random() > 0.5)
         else:
-            rand_sent_idx = self.rng.randint(1, len(context) - 2)
+            rand_sent_idx = self.rng.randint(1, len(block) - 2)
 
-        # keep the query in the context 10% of the time.
+        # keep the query in the block 10% of the time.
         if self.rng.random() < 0.1:
-            input = context[rand_sent_idx].copy()
+            query = block[rand_sent_idx].copy()
         else:
-            input = context.pop(rand_sent_idx)
+            query = block.pop(rand_sent_idx)
 
-        # may still need to truncate because blocks are concluded when
+        # still need to truncate because blocks are concluded when
         # the sentence lengths have exceeded max_seq_length.
-        input = input[:self.max_seq_length - 2]
-        context = list(itertools.chain(*context))[:self.max_seq_length - (3 + len(title))]
+        query = query[:self.max_seq_length - 2]
+        block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
 
-        input_tokens, input_token_types, input_pad_mask = self.concat_and_pad_tokens(input)
-        context_tokens, context_token_types, context_pad_mask = self.concat_and_pad_tokens(context, title)
+        query_tokens, query_token_types, query_pad_mask = self.concat_and_pad_tokens(query)
+        block_tokens, block_token_types, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
         sample = {
-            'input_text': np.array(input_tokens),
-            'input_types': np.array(input_token_types),
-            'input_pad_mask': np.array(input_pad_mask),
-            'context_text': np.array(context_tokens),
-            'context_types': np.array(context_token_types),
-            'context_pad_mask': np.array(context_pad_mask)
+            'query_tokens': np.array(query_tokens),
+            'query_types': np.array(query_token_types),
+            'query_pad_mask': np.array(query_pad_mask),
+            'block_tokens': np.array(block_tokens),
+            'block_types': np.array(block_token_types),
+            'block_pad_mask': np.array(block_pad_mask)
         }
 
         return sample
@@ -97,7 +96,7 @@ class InverseClozeDataset(Dataset):
         return tokens, token_types, pad_mask
 
 
-def get_samples_mapping(context_dataset,
+def get_samples_mapping(block_dataset,
                         titles_dataset,
                         data_prefix,
                         num_epochs,
@@ -131,8 +130,8 @@ def get_samples_mapping(context_dataset,
               'the indices on rank 0 ...'.format(indexmap_filename))
 
         # Make sure the types match the helpers input types.
-        assert context_dataset.doc_idx.dtype == np.int64
-        assert context_dataset.sizes.dtype == np.int32
+        assert block_dataset.doc_idx.dtype == np.int64
+        assert block_dataset.sizes.dtype == np.int32
 
         # Build samples mapping
         verbose = torch.distributed.get_rank() == 0
@@ -140,8 +139,8 @@ def get_samples_mapping(context_dataset,
         print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
         samples_mapping = helpers.build_blocks_mapping(
-            context_dataset.doc_idx,
-            context_dataset.sizes,
+            block_dataset.doc_idx,
+            block_dataset.sizes,
             titles_dataset.sizes,
             num_epochs,
             max_num_samples,
