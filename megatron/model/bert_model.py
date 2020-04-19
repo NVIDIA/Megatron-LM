@@ -219,6 +219,7 @@ class BertModel(MegatronModule):
 
 
 class ICTBertModel(MegatronModule):
+    """Bert-based module for Inverse Cloze task."""
     def __init__(self,
                  ict_head_size,
                  num_tokentypes=2,
@@ -231,41 +232,38 @@ class ICTBertModel(MegatronModule):
             parallel_output=parallel_output
         )
 
-        self.question_model = BertModel(**bert_args)
-        self._question_key = 'question_model'
-        self.context_model = BertModel(**bert_args)
-        self._context_key = 'context_model'
+        # this model embeds (pseudo-)queries - Embed_input in the paper
+        self.query_model = BertModel(**bert_args)
+        self._query_key = 'question_model'
 
-    def forward(self, input_tokens, input_attention_mask, input_types,
-                context_tokens, context_attention_mask, context_types, return_logits=False):
+        # this model embeds evidence blocks - Embed_doc in the paper
+        self.block_model = BertModel(**bert_args)
+        self._block_key = 'context_model'
 
-        question_ict_logits, _ = self.question_model.forward(input_tokens, 1 - input_attention_mask, input_types)
-        context_ict_logits, _ = self.context_model.forward(context_tokens, 1 - context_attention_mask, context_types)
+    def forward(self, query_tokens, query_attention_mask, query_types,
+                block_tokens, block_attention_mask, block_types):
+        """Run a forward pass for each of the models and compute the similarity scores."""
 
-        # [batch x h] * [h x batch]
-        retrieval_scores = question_ict_logits.matmul(torch.transpose(context_ict_logits, 0, 1))
+        query_logits, _ = self.query_model.forward(query_tokens, 1 - query_attention_mask, query_types)
+        block_logits, _ = self.block_model.forward(block_tokens, 1 - block_attention_mask, block_types)
 
-        if return_logits:
-            return question_ict_logits, context_ict_logits, retrieval_scores
-
-        return retrieval_scores
-
+        return query_logits, block_logits
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
+        """Save dict with state dicts of each of the models."""
         state_dict_ = {}
-        state_dict_[self._question_key] \
-            = self.question_model.state_dict_for_save_checkpoint(
+        state_dict_[self._query_key] \
+            = self.query_model.state_dict_for_save_checkpoint(
             destination, prefix, keep_vars)
-        state_dict_[self._context_key] \
-            = self.context_model.state_dict_for_save_checkpoint(
+        state_dict_[self._block_key] \
+            = self.block_model.state_dict_for_save_checkpoint(
             destination, prefix, keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
-        """Customized load."""
-
-        self.question_model.load_state_dict(
-            state_dict[self._question_key], strict=strict)
-        self.context_model.load_state_dict(
-            state_dict[self._context_key], strict=strict)
+        """Load the state dicts of each of the models"""
+        self.query_model.load_state_dict(
+            state_dict[self._query_key], strict=strict)
+        self.block_model.load_state_dict(
+            state_dict[self._block_key], strict=strict)

@@ -65,7 +65,7 @@ def set_global_variables(extra_args_provider=None, args_defaults={}):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
     args = _parse_args(extra_args_provider=extra_args_provider,
                        defaults=args_defaults)
-    _build_tokenizer(args)
+    _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers()
@@ -85,6 +85,13 @@ def _build_tokenizer(args):
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     _GLOBAL_TOKENIZER = build_tokenizer(args)
+    return _GLOBAL_TOKENIZER
+
+
+def rebuild_tokenizer(args):
+    global _GLOBAL_TOKENIZER
+    _GLOBAL_TOKENIZER = None
+    return _build_tokenizer(args)
 
 
 def _set_tensorboard_writer(args):
