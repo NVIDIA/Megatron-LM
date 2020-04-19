@@ -59,6 +59,7 @@ def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
     args = get_args()
 
+    device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -66,23 +67,25 @@ def _initialize_distributed():
                   'skipping initialization ...', flush=True)
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
-        device = torch.cuda.current_device()
-        local_rank = args.rank % torch.cuda.device_count()
-        assert local_rank == device, \
-            'expected local-rank to be the same as rank % device-count.'
+        if device_count > 0:
+            device = torch.cuda.current_device()
+            local_rank = args.rank % device_count
+            assert local_rank == device, \
+                'expected local-rank to be the same as rank % device-count.'
 
     else:
 
         if args.rank == 0:
             print('> initializing torch distributed ...', flush=True)
         # Manually set the device ids.
-        device = args.rank % torch.cuda.device_count()
-        if args.local_rank is not None:
-            assert args.local_rank == device, \
-                'expected local-rank to be the same as rank % device-count.'
-        else:
-            args.local_rank = device
-        torch.cuda.set_device(device)
+        if device_count > 0:
+            device = args.rank % device_count
+            if args.local_rank is not None:
+                assert args.local_rank == device, \
+                    'expected local-rank to be the same as rank % device-count.'
+            else:
+                args.local_rank = device
+            torch.cuda.set_device(device)
         # Call the init process
         init_method = 'tcp://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
@@ -94,7 +97,8 @@ def _initialize_distributed():
             init_method=init_method)
 
     # Set the model-parallel / data-parallel communicators.
-    mpu.initialize_model_parallel(args.model_parallel_size)
+    if device_count > 0:
+        mpu.initialize_model_parallel(args.model_parallel_size)
 
 
 def _init_autoresume():
@@ -112,7 +116,8 @@ def _set_random_seed(seed):
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
-        mpu.model_parallel_cuda_manual_seed(seed)
+        if torch.cuda.device_count() > 0:
+            mpu.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 
