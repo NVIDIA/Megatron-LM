@@ -214,8 +214,49 @@ class BertModel(MegatronModule):
                 state_dict[self._ict_head_key], strict=strict)
 
 
-# REALMBertModel is just BertModel without binary head.
-# needs a different kind of dataset though
+class REALMBertModel(MegatronModule):
+    def __init__(self, ict_model_path, block_hash_data_path):
+        super(REALMBertModel, self).__init__()
+        bert_args = dict(
+            num_tokentypes=2,
+            add_binary_head=False,
+            parallel_output=True
+        )
+        self.lm_model = BertModel(**bert_args)
+        self._lm_key = 'realm_lm'
+
+        self.ict_model = ict_model
+        self.ict_dataset = ict_dataset
+
+        self.block_hash_data = block_hash_data
+
+    def forward(self, tokens, attention_mask, token_types):
+        # [batch_size x embed_size]
+        query_logits = self.ict_model.embed_query(tokens, attention_mask, token_types)
+        hash_matrix_pos = self.hash_data['matrix']
+
+        # [batch_size, num_buckets / 2]
+        query_hash_pos = torch.matmul(query_logits, hash_matrix_pos)
+        query_hash_full = torch.cat((query_hash_pos, -query_hash_pos), axis=1)
+
+        # [batch_size]
+        query_hashes = torch.argmax(query_hash_full, axis=1)
+
+        batch_block_embeds = []
+        for hash in query_hashes:
+            # TODO: this should be made into a single np.array in preprocessing
+            bucket_blocks = self.hash_data[hash]
+            block_indices = bucket_blocks[:, 3]
+            # [bucket_pop, embed_size]
+            block_embeds = [self.block_data[idx] for idx in block_indices]
+            # will become [batch_size, bucket_pop, embed_size]
+            # will require padding to do tensor multiplication
+            batch_block_embeds.append(block_embeds)
+
+        batch_block_embeds = np.array(batch_block_embeds)
+        retrieval_scores = query_logits.matmul(torch.transpose(batch_block_embeds, 0, 1))
+
+
 
 
 class ICTBertModel(MegatronModule):
@@ -248,6 +289,11 @@ class ICTBertModel(MegatronModule):
         block_logits, _ = self.block_model.forward(block_tokens, 1 - block_attention_mask, block_types)
 
         return query_logits, block_logits
+
+    def embed_query(self, query_tokens, query_attention_mask, query_types):
+        query_ict_logits, _ = self.question_model.forward(query_tokens, 1 - query_attention_mask, query_types)
+        return query_ict_logits
+
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

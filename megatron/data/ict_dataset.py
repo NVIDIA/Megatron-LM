@@ -89,6 +89,12 @@ class InverseClozeDataset(Dataset):
         token_types = [0] * self.max_seq_length
         return tokens, token_types, pad_mask
 
+    def get_block(self, start_idx, end_idx, doc_idx, block_idx):
+        block = [self.context_dataset[i] for i in range(start_idx, end_idx)]
+        title = list(self.titles_dataset[int(doc_idx)])
+
+        block = list(itertools.chain(*block))[self.max_seq_length - (3 + len(title))]
+
     def get_samples_mapping(self, data_prefix, num_epochs, max_num_samples):
         if not num_epochs:
             if not max_num_samples:

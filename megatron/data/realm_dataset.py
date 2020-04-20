@@ -1,13 +1,23 @@
 import numpy as np
+import spacy
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
 from megatron.data.bert_dataset import get_samples_mapping_
 from megatron.data.dataset_utils import build_simple_training_sample
 
+qa_nlp = spacy.load('en_core_web_lg')
 
 class RealmDataset(Dataset):
-    """Dataset containing sentences and their blocks for an inverse cloze task."""
+    """Dataset containing simple masked sentences for masked language modeling.
+
+    The dataset should yield sentences just like the regular BertDataset
+    However, this dataset also needs to be able to return a set of blocks
+    given their start and end indices.
+
+    Presumably
+
+    """
     def __init__(self, name, indexed_dataset, data_prefix,
                  num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, short_seq_prob, seed):
@@ -58,3 +68,14 @@ class RealmDataset(Dataset):
                                             self.mask_id, self.pad_id,
                                             self.masked_lm_prob, np_rng)
 
+
+def spacy_ner(block_text):
+    candidates = {}
+    block = qa_nlp(block_text)
+    starts = []
+    answers = []
+    for ent in block.ents:
+        starts.append(int(ent.start_char))
+        answers.append(str(ent.text))
+    candidates['starts'] = starts
+    candidates['answers'] = answers
