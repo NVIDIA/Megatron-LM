@@ -104,6 +104,8 @@ python tools/preprocess_data.py \
 
 Here the output files are named `my-gpt2_text_document.bin` and `my-gpt2_text_document.idx`. As before, in GPT-2 training, use the longer name without the extension as `--data-path`.
 
+The BERT uncased vocabulary file can be extracted from Google's [pretrained BERT models](https://storage.googleapis.com/bert_models/2018_10_18/uncased_L-12_H-768_A-12.zip). The GPT-2 [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
+
 Further command line arguments are described in the source file [`preprocess_data.py`](./tools/preprocess_data.py).
 
 <a id="bert-pretraining"></a>
