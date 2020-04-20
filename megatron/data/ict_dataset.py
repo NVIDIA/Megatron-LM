@@ -41,6 +41,7 @@ class InverseClozeDataset(Dataset):
 
     def __getitem__(self, idx):
         start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
+        title = list(self.title_dataset[int(doc_idx)])
         block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
         assert len(block) > 1
 
@@ -50,8 +51,8 @@ class InverseClozeDataset(Dataset):
         else:
             rand_sent_idx = self.rng.randint(1, len(block) - 2)
 
-        # keep the query in the block 10% of the time.
-        if self.rng.random() < 0.1:
+        # keep the query in the context 10% of the time.
+        if self.rng.random() < 1:
             query = block[rand_sent_idx].copy()
         else:
             query = block.pop(rand_sent_idx)
@@ -71,7 +72,7 @@ class InverseClozeDataset(Dataset):
             'block_tokens': np.array(block_tokens),
             'block_types': np.array(block_token_types),
             'block_pad_mask': np.array(block_pad_mask),
-            'block_indices': np.array([start_idx, end_idx, doc_idx, block_idx])
+            'block_indices': np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
         }
 
         return sample

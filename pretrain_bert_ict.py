@@ -46,7 +46,7 @@ def get_batch(data_iterator):
 
     # Items and their type.
     keys = ['query_tokens', 'query_types', 'query_pad_mask',
-            'block_tokens', 'block_types', 'block_pad_mask']
+            'block_tokens', 'block_types', 'block_pad_mask', 'block_indices']
     datatype = torch.int64
 
     # Broadcast data.
@@ -63,9 +63,10 @@ def get_batch(data_iterator):
     block_tokens = data_b['block_tokens'].long()
     block_types = data_b['block_types'].long()
     block_pad_mask = data_b['block_pad_mask'].long()
+    block_indices = data_b['block_indices'].long()
 
     return query_tokens, query_types, query_pad_mask,\
-           block_tokens, block_types, block_pad_mask
+           block_tokens, block_types, block_pad_mask, block_indices
 
 
 def forward_step(data_iterator, model):
@@ -75,7 +76,7 @@ def forward_step(data_iterator, model):
     # Get the batch.
     timers('batch generator').start()
     query_tokens, query_types, query_pad_mask,\
-    block_tokens, block_types, block_pad_mask = get_batch(data_iterator)
+    block_tokens, block_types, block_pad_mask, block_indices = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
