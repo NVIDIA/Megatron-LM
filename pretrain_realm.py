@@ -17,24 +17,49 @@
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
+from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.bert_dataset import build_train_valid_test_datasets
 from megatron.model import ICTBertModel, REALMBertModel
-from megatron.training import pretrain
+from megatron.training import get_model, pretrain
 from megatron.utils import reduce_losses
+from pretrain_bert_ict import model_provider as ict_model_provider
 
 num_batches = 0
+
 
 def model_provider():
     """Build the model."""
     args = get_args()
     print_rank_0('building BERT models ...')
 
-    realm_model = REALMBertModel(args.ict_model_path,
+    ict_model = get_model(ict_model_provider)
+
+    if isinstance(ict_model, torchDDP):
+        model = ict_model.module
+    tracker_filename = get_checkpoint_tracker_filename(args.load)
+    with open(tracker_filename, 'r') as f:
+        iteration = int(f.read().strip())
+
+    assert iteration > 0
+    checkpoint_name = get_checkpoint_name(args.load, iteration, False)
+    if mpu.get_data_parallel_rank() == 0:
+        print('global rank {} is loading checkpoint {}'.format(
+            torch.distributed.get_rank(), checkpoint_name))
+
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
+    ict_model.load_state_dict(state_dict['model'])
+    torch.distributed.barrier()
+
+    if mpu.get_data_parallel_rank() == 0:
+        print(' successfully loaded {}'.format(checkpoint_name))
+
+    realm_model = REALMBertModel(ict_model,
                                  args.block_hash_data_path)
 
     return ict_model
@@ -107,8 +132,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        ict_dataset=True)
+        skip_warmup=(not args.mmap_warmup))
     print_rank_0("> finished creating BERT ICT datasets ...")
 
     return train_ds, valid_ds, test_ds

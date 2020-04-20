@@ -17,6 +17,10 @@ from megatron.training import get_model
 from pretrain_bert_ict import get_batch, model_provider
 
 
+def detach(tensor):
+    return tensor.detach().cpu().numpy()
+
+
 def embed_docs():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
@@ -45,12 +49,13 @@ def embed_docs():
 
         block_hash_pos = torch.matmul(block_logits, hash_matrix)
         block_hash_full = torch.cat((block_hash_pos, -block_hash_pos), axis=1)
-        block_hashes = torch.argmax(block_hash_full, axis=1).detach().cpu().numpy()
+        block_hashes = detach(torch.argmax(block_hash_full, axis=1))
         for hash, indices_array in zip(block_hashes, block_indices):
-            hash_data[int(hash)].append(indices_array.detach().cpu().numpy())
+            hash_data[int(hash)].append(detach(indices_array))
 
-        block_logits = block_logits.detach().cpu().numpy()
-        block_indices = block_indices.detach().cpu().numpy()[:, 3]
+        block_logits = detach(block_logits)
+        # originally this has [start_idx, end_idx, doc_idx, block_idx]
+        block_indices = detach(block_indices)[:, 3]
         for logits, idx in zip(block_logits, block_indices):
             block_data[int(idx)] = logits
 
@@ -68,6 +73,10 @@ def embed_docs():
 
     torch.distributed.barrier()
 
+    all_data.clear()
+    del all_data
+    del model
+
     if mpu.get_data_parallel_rank() == 0:
         all_block_data = defaultdict(dict)
         dir_name = 'block_hash_data'
@@ -80,9 +89,7 @@ def embed_docs():
 
         with open('block_hash_data.pkl', 'wb') as final_file:
             pickle.dump(all_block_data, final_file)
-
         os.rmdir(dir_name)
-    return
 
 
 def load_checkpoint():

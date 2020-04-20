@@ -15,6 +15,8 @@
 
 """BERT model."""
 
+import pickle
+
 import numpy as np
 import torch
 
@@ -215,7 +217,7 @@ class BertModel(MegatronModule):
 
 
 class REALMBertModel(MegatronModule):
-    def __init__(self, ict_model_path, block_hash_data_path):
+    def __init__(self, ict_model, block_hash_data_path):
         super(REALMBertModel, self).__init__()
         bert_args = dict(
             num_tokentypes=2,
@@ -226,17 +228,21 @@ class REALMBertModel(MegatronModule):
         self._lm_key = 'realm_lm'
 
         self.ict_model = ict_model
-        self.ict_dataset = ict_dataset
-
-        self.block_hash_data = block_hash_data
+        with open(block_hash_data_path, 'rb') as data_file:
+            data = pickle.load(data_file)
+            # {block_idx: block_embed} - the main index
+            self.block_data = data['block_data']
+            # {hash_num: [start, end, doc, block]} - the hash table
+            self.hash_data = data['hash_data']
+            # [embed_size x num_buckets / 2] - the projection matrix used for hashing
+            self.hash_matrix = self.hash_data['matrix']
 
     def forward(self, tokens, attention_mask, token_types):
         # [batch_size x embed_size]
         query_logits = self.ict_model.embed_query(tokens, attention_mask, token_types)
-        hash_matrix_pos = self.hash_data['matrix']
 
-        # [batch_size, num_buckets / 2]
-        query_hash_pos = torch.matmul(query_logits, hash_matrix_pos)
+        # [batch_size x num_buckets / 2]
+        query_hash_pos = torch.matmul(query_logits, self.hash_matrix)
         query_hash_full = torch.cat((query_hash_pos, -query_hash_pos), axis=1)
 
         # [batch_size]
@@ -247,15 +253,19 @@ class REALMBertModel(MegatronModule):
             # TODO: this should be made into a single np.array in preprocessing
             bucket_blocks = self.hash_data[hash]
             block_indices = bucket_blocks[:, 3]
-            # [bucket_pop, embed_size]
+            # [bucket_pop x embed_size]
             block_embeds = [self.block_data[idx] for idx in block_indices]
-            # will become [batch_size, bucket_pop, embed_size]
+            # will become [batch_size x bucket_pop x embed_size]
             # will require padding to do tensor multiplication
             batch_block_embeds.append(block_embeds)
 
+        # [batch_size x max bucket_pop x embed_size]
         batch_block_embeds = np.array(batch_block_embeds)
-        retrieval_scores = query_logits.matmul(torch.transpose(batch_block_embeds, 0, 1))
-
+        # [batch_size x 1 x max bucket_pop]
+        retrieval_scores = query_logits.matmul(torch.transpose(batch_block_embeds, 1, 2))
+        # [batch_size x max bucket_pop]
+        retrieval_scores = retrieval_scores.squeeze()
+        top5_vals, top5_indices = torch.topk(retrieval_scores, k=5)
 
 
 
