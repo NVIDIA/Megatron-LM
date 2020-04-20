@@ -49,6 +49,7 @@ The available models along with `<model_name>:<version>` are below:
 * [BERT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_bert_345m): megatron\_bert\_345m:v0.0
 * [GPT-2-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_lm_345m): megatron\_lm\_345m:v0.0 
 
+The models require vocabulary files to run. The BERT uncased WordPiece vocab file can be extracted from Google's [pretrained BERT models](https://storage.googleapis.com/bert_models/2018_10_18/uncased_L-12_H-768_A-12.zip). The GPT-2 [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
 
 Further documentation for downloading models can be found in the [NGC documentation](https://docs.nvidia.com/dgx/ngc-registry-cli-user-guide/index.html#topic_6_4_1)
 
