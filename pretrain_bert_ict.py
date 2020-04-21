@@ -43,10 +43,9 @@ def model_provider():
 
 
 def get_batch(data_iterator):
-
     # Items and their type.
-    keys = ['query_tokens', 'query_types', 'query_pad_mask',
-            'block_tokens', 'block_types', 'block_pad_mask', 'block_indices']
+    keys = ['query_tokens', 'query_pad_mask',
+            'block_tokens', 'block_pad_mask', 'block_data']
     datatype = torch.int64
 
     # Broadcast data.
@@ -58,15 +57,13 @@ def get_batch(data_iterator):
 
     # Unpack.
     query_tokens = data_b['query_tokens'].long()
-    query_types = data_b['query_types'].long()
     query_pad_mask = data_b['query_pad_mask'].long()
     block_tokens = data_b['block_tokens'].long()
-    block_types = data_b['block_types'].long()
     block_pad_mask = data_b['block_pad_mask'].long()
-    block_indices = data_b['block_indices'].long()
+    block_indices = data_b['block_data'].long()
 
-    return query_tokens, query_types, query_pad_mask,\
-           block_tokens, block_types, block_pad_mask, block_indices
+    return query_tokens, query_pad_mask,\
+           block_tokens, block_pad_mask, block_indices
 
 
 def forward_step(data_iterator, model):
@@ -75,16 +72,12 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers('batch generator').start()
-    query_tokens, query_types, query_pad_mask,\
-    block_tokens, block_types, block_pad_mask, block_indices = get_batch(data_iterator)
+    query_tokens, query_pad_mask, \
+    block_tokens, block_pad_mask, block_indices = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
-    query_logits, block_logits = model(query_tokens, query_pad_mask, query_types,
-                                       block_tokens, block_pad_mask, block_types).float()
-
-    # [batch x h] * [h x batch]
-    retrieval_scores = query_logits.matmul(torch.transpose(block_logits, 0, 1))
+    retrieval_scores = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask).float()
     softmaxed = F.softmax(retrieval_scores, dim=1)
 
     top5_vals, top5_indices = torch.topk(softmaxed, k=5, sorted=True)
@@ -95,10 +88,13 @@ def forward_step(data_iterator, model):
 
     retrieval_loss = F.cross_entropy(softmaxed, torch.arange(batch_size).cuda())
     reduced_losses = reduce_losses([retrieval_loss, top1_acc, top5_acc])
+    stats_dict = {
+        'retrieval loss': reduced_losses[0],
+        'top1_acc': reduced_losses[1],
+        'top5_acc': reduced_losses[2]
+    }
 
-    return retrieval_loss, {'retrieval loss': reduced_losses[0],
-                            'top1_acc': reduced_losses[1],
-                            'top5_acc': reduced_losses[2]}
+    return retrieval_loss, stats_dict
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

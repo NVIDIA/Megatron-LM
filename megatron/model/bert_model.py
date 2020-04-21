@@ -273,8 +273,10 @@ class ICTBertModel(MegatronModule):
     """Bert-based module for Inverse Cloze task."""
     def __init__(self,
                  ict_head_size,
-                 num_tokentypes=2,
-                 parallel_output=True):
+                 num_tokentypes=1,
+                 parallel_output=True,
+                 only_query_model=False,
+                 only_block_model=False):
         super(ICTBertModel, self).__init__()
         bert_args = dict(
             num_tokentypes=num_tokentypes,
@@ -282,44 +284,68 @@ class ICTBertModel(MegatronModule):
             ict_head_size=ict_head_size,
             parallel_output=parallel_output
         )
+        assert not only_block_model and only_query_model
+        self.use_block_model = not only_query_model
+        self.use_query_model = not only_block_model
 
-        # this model embeds (pseudo-)queries - Embed_input in the paper
-        self.query_model = BertModel(**bert_args)
-        self._query_key = 'question_model'
+        if self.use_query_model:
+            # this model embeds (pseudo-)queries - Embed_input in the paper
+            self.query_model = BertModel(**bert_args)
+            self._query_key = 'question_model'
 
-        # this model embeds evidence blocks - Embed_doc in the paper
-        self.block_model = BertModel(**bert_args)
-        self._block_key = 'context_model'
+        if self.use_block_model:
+            # this model embeds evidence blocks - Embed_doc in the paper
+            self.block_model = BertModel(**bert_args)
+            self._block_key = 'context_model'
 
-    def forward(self, query_tokens, query_attention_mask, query_types,
-                block_tokens, block_attention_mask, block_types):
+    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask):
         """Run a forward pass for each of the models and compute the similarity scores."""
+        query_logits = self.embed_query(query_tokens, query_attention_mask)
+        block_logits = self.embed_block(block_tokens, block_attention_mask)
 
-        query_logits, _ = self.query_model.forward(query_tokens, 1 - query_attention_mask, query_types)
-        block_logits, _ = self.block_model.forward(block_tokens, 1 - block_attention_mask, block_types)
+        # [batch x embed] * [embed x batch]
+        retrieval_scores = query_logits.matmul(torch.transpose(block_logits, 0, 1))
+        return retrieval_scores
 
-        return query_logits, block_logits
+    def embed_query(self, query_tokens, query_attention_mask):
+        """Embed a batch of tokens using the query model"""
+        if self.use_query_model:
+            query_types = torch.zeros(query_tokens.shape).type(torch.float16).cuda()
+            query_ict_logits, _ = self.query_model.forward(query_tokens, query_attention_mask, query_types)
+            return query_ict_logits
+        else:
+            raise ValueError("Cannot embed query without query model.")
 
-    def embed_query(self, query_tokens, query_attention_mask, query_types):
-        query_ict_logits, _ = self.question_model.forward(query_tokens, 1 - query_attention_mask, query_types)
-        return query_ict_logits
+    def embed_block(self, block_tokens, block_attention_mask):
+        """Embed a batch of tokens using the block model"""
+        if self.use_block_model:
+            block_types = torch.zeros(block_tokens.shape).type(torch.float16).cuda()
+            block_ict_logits, _ = self.block_model.forward(block_tokens, block_attention_mask, block_types)
+            return block_ict_logits
+        else:
+            raise ValueError("Cannot embed block without block model.")
 
-
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
-        state_dict_[self._query_key] \
-            = self.query_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
-        state_dict_[self._block_key] \
-            = self.block_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+        if self.use_query_model:
+            state_dict_[self._query_key] \
+                = self.query_model.state_dict_for_save_checkpoint(
+                destination, prefix, keep_vars)
+
+        if self.use_block_model:
+            state_dict_[self._block_key] \
+                = self.block_model.state_dict_for_save_checkpoint(
+                destination, prefix, keep_vars)
+
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
         """Load the state dicts of each of the models"""
-        self.query_model.load_state_dict(
-            state_dict[self._query_key], strict=strict)
-        self.block_model.load_state_dict(
-            state_dict[self._block_key], strict=strict)
+        if self.use_query_model:
+            self.query_model.load_state_dict(
+                state_dict[self._query_key], strict=strict)
+
+        if self.use_block_model:
+            self.block_model.load_state_dict(
+                state_dict[self._block_key], strict=strict)

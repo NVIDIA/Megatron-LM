@@ -28,13 +28,13 @@ class InverseClozeDataset(Dataset):
 
         self.samples_mapping = self.get_samples_mapping(
             data_prefix, num_epochs, max_num_samples)
-        tokenizer = get_tokenizer()
-        self.vocab_id_list = list(tokenizer.inv_vocab.keys())
-        self.vocab_id_to_token_list = tokenizer.inv_vocab
-        self.cls_id = tokenizer.cls
-        self.sep_id = tokenizer.sep
-        self.mask_id = tokenizer.mask
-        self.pad_id = tokenizer.pad
+        self.tokenizer = get_tokenizer()
+        self.vocab_id_list = list(self.tokenizer.inv_vocab.keys())
+        self.vocab_id_to_token_list = self.tokenizer.inv_vocab
+        self.cls_id = self.tokenizer.cls
+        self.sep_id = self.tokenizer.sep
+        self.mask_id = self.tokenizer.mask
+        self.pad_id = self.tokenizer.pad
 
     def __len__(self):
         return self.samples_mapping.shape[0]
@@ -62,20 +62,35 @@ class InverseClozeDataset(Dataset):
         query = query[:self.max_seq_length - 2]
         block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
 
-        query_tokens, query_token_types, query_pad_mask = self.concat_and_pad_tokens(query)
-        block_tokens, block_token_types, block_pad_mask = self.concat_and_pad_tokens(block, title)
+        query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
+        block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
         sample = {
             'query_tokens': np.array(query_tokens),
-            'query_types': np.array(query_token_types),
             'query_pad_mask': np.array(query_pad_mask),
             'block_tokens': np.array(block_tokens),
-            'block_types': np.array(block_token_types),
             'block_pad_mask': np.array(block_pad_mask),
-            'block_indices': np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
+            'block_data': np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
         }
 
         return sample
+
+    def encode_text(self, text):
+        return self.tokenizer.tokenize(text)
+
+    def decode_tokens(self, token_ids):
+        tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
+        return ' '.join(tokens)
+
+    def get_block(self, start_idx, end_idx, doc_idx):
+        """Get the IDs for an evidence block plus the title of the corresponding document"""
+        block = [self.context_dataset[i] for i in range(start_idx, end_idx)]
+        title = list(self.titles_dataset[int(doc_idx)])
+
+        block = list(itertools.chain(*block))[self.max_seq_length - (3 + len(title))]
+        block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
+
+        return block_tokens, block_pad_mask
 
     def concat_and_pad_tokens(self, tokens, title=None):
         """concat with special tokens and pad sequence to self.max_seq_length"""
@@ -85,16 +100,9 @@ class InverseClozeDataset(Dataset):
         assert len(tokens) <= self.max_seq_length, len(tokens)
 
         num_pad = self.max_seq_length - len(tokens)
-        pad_mask = [0] * len(tokens) + [1] * num_pad
+        pad_mask = [1] * len(tokens) + [0] * num_pad
         tokens += [self.pad_id] * num_pad
-        token_types = [0] * self.max_seq_length
-        return tokens, token_types, pad_mask
-
-    def get_block(self, start_idx, end_idx, doc_idx, block_idx):
-        block = [self.context_dataset[i] for i in range(start_idx, end_idx)]
-        title = list(self.titles_dataset[int(doc_idx)])
-
-        block = list(itertools.chain(*block))[self.max_seq_length - (3 + len(title))]
+        return tokens, pad_mask
 
     def get_samples_mapping(self, data_prefix, num_epochs, max_num_samples):
         if not num_epochs:
