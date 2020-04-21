@@ -329,7 +329,7 @@ class ICTBertModel(MegatronModule):
             ict_head_size=ict_head_size,
             parallel_output=parallel_output
         )
-        assert not only_block_model and only_query_model
+        assert not (only_block_model and only_query_model)
         self.use_block_model = not only_query_model
         self.use_query_model = not only_block_model
 
@@ -355,7 +355,7 @@ class ICTBertModel(MegatronModule):
     def embed_query(self, query_tokens, query_attention_mask):
         """Embed a batch of tokens using the query model"""
         if self.use_query_model:
-            query_types = torch.zeros(query_tokens.shape).type(torch.float16).cuda()
+            query_types = torch.zeros(query_tokens.shape).type(torch.int64).cuda()
             query_ict_logits, _ = self.query_model.forward(query_tokens, query_attention_mask, query_types)
             return query_ict_logits
         else:
@@ -364,7 +364,7 @@ class ICTBertModel(MegatronModule):
     def embed_block(self, block_tokens, block_attention_mask):
         """Embed a batch of tokens using the block model"""
         if self.use_block_model:
-            block_types = torch.zeros(block_tokens.shape).type(torch.float16).cuda()
+            block_types = torch.zeros(block_tokens.shape).type(torch.int64).cuda()
             block_ict_logits, _ = self.block_model.forward(block_tokens, block_attention_mask, block_types)
             return block_ict_logits
         else:

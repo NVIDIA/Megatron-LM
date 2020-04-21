@@ -28,7 +28,7 @@ class HashedIndex(object):
         np.random.seed(seed)
         self.block_data = defaultdict(list)
         self.hash_data = defaultdict(list)
-        self.hash_matrix = np.random.rand(embed_size, num_buckets / 2)
+        self.hash_matrix = np.random.rand(embed_size, int(num_buckets / 2))
 
     def state(self):
         state = {
@@ -72,19 +72,21 @@ class HashedIndex(object):
         with open('{}/{}.pkl'.format(dir_name, rank), 'wb') as data_file:
             pickle.dump(self.state(), data_file)
 
-    def consolidate_shards_and_save(self):
+    def consolidate_shards_and_save(self, ignore_shard=0):
         """Combine all the shards made using self.save_shard()"""
         dir_name = 'block_hash_data'
         fnames = os.listdir(dir_name)
         for fname in fnames:
+            if str(ignore_shard) in fname:
+                continue
             with open('{}/{}'.format(dir_name, fname), 'rb') as f:
                 data = pickle.load(f)
-                assert data['hash_matrix'] == self.hash_matrix
+                assert np.array_equal(data['hash_matrix'], self.hash_matrix)
 
                 old_size = len(self.block_data)
                 shard_size = len(data['block_data'])
                 self.block_data.update(data['block_data'])
-                assert len(self.block_data) == old_size + shard_size
+                assert len(self.block_data) == old_size + shard_size, (old_size, shard_size, len(self.block_data))
 
                 for bucket, items in data['hash_data'].items():
                     self.hash_data[bucket].extend(items)
@@ -137,7 +139,7 @@ def main():
 
         block_logits = actual_model.embed_block(block_tokens, block_pad_mask)
         hashed_index.hash_embeds(block_logits, block_indices)
-        hashed_index.assign_block_embeds(block_indices, detach(block_logits))
+        hashed_index.assign_block_embeds(block_indices[:,3], detach(block_logits))
 
         if i % 100 == 0:
             print(i, flush=True)
