@@ -178,14 +178,6 @@ class FullTokenizer(object):
     return convert_by_vocab(self.vocab, tokens)
 
   def convert_ids_to_tokens(self, ids):
-    train_sample = {
-      'text': tokens_np,
-      'types': tokentypes_np,
-      'labels': labels_np,
-      'is_random': int(is_next_random),
-      'loss_mask': loss_mask_np,
-      'padding_mask': padding_mask_np,
-      'truncated': int(truncated)}
     return convert_by_vocab(self.inv_vocab, ids)
 
   def vocab_size(self):
