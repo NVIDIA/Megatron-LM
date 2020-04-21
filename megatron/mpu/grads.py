@@ -39,6 +39,7 @@ def l2_grad_clipper(parameters, max_norm):
     parameters_with_grads = list(filter(
         lambda p: p.grad is not None, parameters))
     # Filter parameters for norm calculations.
+    mp_rank_is_zero = (get_model_parallel_rank() == 0)
     parameters_for_norm = list(filter(
         lambda p: p.model_parallel or mp_rank_is_zero, parameters_with_grads))
     # Calculate L2 norm.
