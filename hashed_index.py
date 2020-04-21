@@ -14,6 +14,7 @@ from megatron.data.bert_dataset import get_indexed_dataset_
 from megatron.data.ict_dataset import InverseClozeDataset
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
+from megatron.model import REALMRetriever
 from megatron.training import get_model
 from pretrain_bert_ict import get_batch, model_provider
 
@@ -99,6 +100,17 @@ class HashedIndex(object):
         """Clear the data structures to save memory"""
         self.block_data = defaultdict(list)
         self.hash_data = defaultdict(list)
+
+
+def test_retriever():
+    initialize_megatron(extra_args_provider=None,
+                        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    model = load_checkpoint()
+    model.eval()
+    dataset = get_dataset()
+    hashed_index = HashedIndex(embed_size=128, num_buckets=2048)
+    retriever = REALMRetriever(model, dataset, hashed_index)
+    retriever.retrieve_evidence_blocks_text("The last monarch from the house of windsor")
 
 
 def main():
