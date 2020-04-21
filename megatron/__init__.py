@@ -13,14 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+from .package_info import (
+    __contact_emails__,
+    __contact_names__,
+    __description__,
+    __url__,
+    __download_url__,
+    __keywords__,
+    __license__,
+    __package_name__,
+    __version__,
+)
+
+if "MEGATRON_PACKAGE_BUILDING" not in os.environ:
+    from .global_vars import get_args
+    from .global_vars import get_tokenizer
+    from .global_vars import get_tensorboard_writer
+    from .global_vars import get_adlr_autoresume
+    from .global_vars import get_timers
+
 import torch
-
-from .global_vars import get_args
-from .global_vars import get_tokenizer
-from .global_vars import get_tensorboard_writer
-from .global_vars import get_adlr_autoresume
-from .global_vars import get_timers
-
 
 def print_rank_0(message):
     """If distributed is initialized print only on rank 0."""
