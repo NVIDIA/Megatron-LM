@@ -28,7 +28,8 @@ from megatron import mpu
 from megatron.global_vars import set_global_variables
 
 
-def initialize_megatron(extra_args_provider=None, args_defaults={}):
+def initialize_megatron(extra_args_provider=None, args_defaults={},
+                        ignore_unknown_args=False):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds."""
     # Make sure cuda is available.
@@ -37,7 +38,8 @@ def initialize_megatron(extra_args_provider=None, args_defaults={}):
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(extra_args_provider=extra_args_provider,
-                         args_defaults=args_defaults)
+                         args_defaults=args_defaults,
+                         ignore_unknown_args=ignore_unknown_args)
 
     # Pytorch distributed.
     _initialize_distributed()
