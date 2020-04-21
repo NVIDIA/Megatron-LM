@@ -101,8 +101,8 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
         if clip_coef < 1:
             for p in parameters:
                 p.grad.data.mul_(clip_coef)
-    elif norm_type == 2:
-        total_norm = l2_grad_clipper(parameters, max_norm)
+    #elif norm_type == 2:
+    #    total_norm = l2_grad_clipper(parameters, max_norm)
 
     else:
         total_norm = 0
