@@ -22,10 +22,10 @@ PATCH = 1
 # Use the following formatting: (major, minor, patch)
 VERSION = (MAJOR, MINOR, PATCH)
 
-__version__ = '.'.join(map(str, VERSION[:3]))
+__version__ = '.'.join(map(str, VERSION))
 __package_name__ = 'megatron_lm'
 __contact_names__ = 'NVIDIA'
-__contact_emails__ = 'ekmb.new@gmail.com'
+__contact_emails__ = '??????@nvidia.com'
 __url__ = 'https://github.com/NVIDIA/Megatron-LM'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = 'Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.'
