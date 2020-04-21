@@ -19,7 +19,8 @@ import argparse
 import os
 
 
-def parse_args(extra_args_provider=None, defaults={}):
+def parse_args(extra_args_provider=None, defaults={},
+               ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments')
 
@@ -41,7 +42,10 @@ def parse_args(extra_args_provider=None, defaults={}):
         parser = extra_args_provider(parser)
 
     # Parse.
-    args = parser.parse_args()
+    if ignore_unknown_args:
+        args, _ = parser.parse_known_args()
+    else:
+        args = parser.parse_args()
 
     # Set input defaults.
     for key in defaults:
