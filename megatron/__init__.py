@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 from .package_info import (
     __contact_emails__,
     __contact_names__,
@@ -27,12 +25,11 @@ from .package_info import (
     __version__,
 )
 
-if "MEGATRON_PACKAGE_BUILDING" not in os.environ:
-    from .global_vars import get_args
-    from .global_vars import get_tokenizer
-    from .global_vars import get_tensorboard_writer
-    from .global_vars import get_adlr_autoresume
-    from .global_vars import get_timers
+from .global_vars import get_args
+from .global_vars import get_tokenizer
+from .global_vars import get_tensorboard_writer
+from .global_vars import get_adlr_autoresume
+from .global_vars import get_timers
 
 import torch
 

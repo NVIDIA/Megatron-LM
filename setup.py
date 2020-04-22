@@ -18,17 +18,10 @@
 
 """Setup for pip package."""
 
-import codecs
 import os
-import subprocess
 import sys
-from distutils import cmd as distutils_cmd
-from distutils import log as distutils_log
-from itertools import chain
-
 import setuptools
 
-import sys
 if sys.version_info < (3,):
     raise Exception("Python 2 is not supported by Megatron.")
 
@@ -43,9 +36,6 @@ def is_build_action():
     else:
         return False
 
-
-if is_build_action():
-    os.environ['MEGATRON_PACKAGE_BUILDING'] = 'True'
 
 from megatron.package_info import (
     __contact_emails__,
@@ -75,7 +65,7 @@ def req_file(filename):
 install_requires = req_file("requirements.txt")
 
 setuptools.setup(
-    name=__package_name__ + '_test',
+    name=__package_name__,
     # Versions should comply with PEP440.  For a discussion on single-sourcing
     # the version across setup.py and the project code, see
     # https://packaging.python.org/en/latest/single_source_version.html
@@ -130,5 +120,5 @@ setuptools.setup(
     include_package_data=True,
     zip_safe=False,
     # PyPI package information.
-    keywords=__keywords__,
+    keywords=__keywords__
 )

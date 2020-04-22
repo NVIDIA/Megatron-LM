@@ -16,8 +16,8 @@
 # limitations under the License.
 
 MAJOR = 0
-MINOR = 0
-PATCH = 1
+MINOR = 1
+PATCH = 0
 
 # Use the following formatting: (major, minor, patch)
 VERSION = (MAJOR, MINOR, PATCH)
