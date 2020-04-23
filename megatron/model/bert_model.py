@@ -293,20 +293,20 @@ class REALMRetriever(MegatronModule):
         query_tokens = self.ict_dataset.encode_text(query_text)[:padless_max_len]
 
         query_tokens, query_pad_mask = self.ict_dataset.concat_and_pad_tokens(query_tokens)
-        query_tokens = torch.cuda.IntTensor(np.array(query_tokens).reshape(1, -1))
-        query_pad_mask = torch.cuda.IntTensor(np.array(query_pad_mask).reshape(1, -1))
+        query_tokens = torch.cuda.LongTensor(np.array(query_tokens).reshape(1, -1))
+        query_pad_mask = torch.cuda.LongTensor(np.array(query_pad_mask).reshape(1, -1))
 
-        query_embed = self.ict_model.embed_query(query_tokens, query_pad_mask)
+        query_embed = self.ict_model.module.module.embed_query(query_tokens, query_pad_mask)
         query_hash = self.hashed_index.hash_embeds(query_embed)
         assert query_hash.size == 1
 
         block_bucket = self.hashed_index.get_block_bucket(query_hash[0])
-        block_embeds = [self.hashed_index.get_block_embed[idx] for idx in block_bucket[:, 3]]
+        block_embeds = [self.hashed_index.get_block_embed(arr[3]) for arr in block_bucket]
         block_embed_tensor = torch.cuda.HalfTensor(np.array(block_embeds))
 
         retrieval_scores = query_embed.matmul(torch.transpose(block_embed_tensor, 0, 1))
         top5_vals, top5_indices = torch.topk(retrieval_scores, k=5, sorted=True)
-        top5_start_end_doc = [block_bucket[idx][:3] for idx in top5_indices]
+        top5_start_end_doc = [block_bucket[idx][:3] for idx in top5_indices.squeeze()]
 
         top5_blocks = [(self.ict_dataset.get_block(*indices)) for indices in top5_start_end_doc]
         for i, (block, _) in enumerate(top5_blocks):

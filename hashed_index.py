@@ -103,7 +103,9 @@ class HashedIndex(object):
 
     @classmethod
     def load_from_file(cls, fname):
+        print(" > Unpickling block hash data")
         state_dict = pickle.load(open(fname, 'rb'))
+        print(" > Finished unpickling")
         hash_matrix = state_dict['hash_matrix']
 
         new_index = HashedIndex(hash_matrix.shape[0], hash_matrix.shape[1] * 2)
@@ -121,7 +123,16 @@ def test_retriever():
     dataset = get_dataset()
     hashed_index = HashedIndex.load_from_file('block_hash_data.pkl')
     retriever = REALMRetriever(model, dataset, hashed_index)
-    retriever.retrieve_evidence_blocks_text("The last monarch from the house of windsor")
+
+    strs = [
+        "The last monarch from the house of windsor",
+        "married to Elvis Presley",
+        "tallest building in the world today",
+        "who makes graphics cards"
+    ]
+
+    for s in strs:
+        retriever.retrieve_evidence_blocks_text(s)
 
 
 def main():
@@ -246,4 +257,4 @@ def get_dataloader(dataset):
 
 
 if __name__ == "__main__":
-    main()
+    test_retriever()

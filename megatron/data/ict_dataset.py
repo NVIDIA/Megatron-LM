@@ -84,10 +84,10 @@ class InverseClozeDataset(Dataset):
 
     def get_block(self, start_idx, end_idx, doc_idx):
         """Get the IDs for an evidence block plus the title of the corresponding document"""
-        block = [self.context_dataset[i] for i in range(start_idx, end_idx)]
-        title = list(self.titles_dataset[int(doc_idx)])
+        block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
+        title = list(self.title_dataset[int(doc_idx)])
 
-        block = list(itertools.chain(*block))[self.max_seq_length - (3 + len(title))]
+        block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
         return block_tokens, block_pad_mask
