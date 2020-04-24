@@ -219,6 +219,8 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--ict-load', type=str, default=None,
+                       help='Directory containing an ICTBertModel checkpoint')
     group.add_argument('--no-load-optim', action='store_true',
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true',
@@ -294,6 +296,8 @@ def _add_data_args(parser):
 
     group.add_argument('--data-path', type=str, default=None,
                        help='Path to combined dataset to split.')
+    group.add_argument('--titles-data-path', type=str, default=None,
+                       help='Path to titles dataset used for ICT')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

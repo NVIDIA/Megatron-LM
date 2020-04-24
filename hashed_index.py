@@ -203,7 +203,7 @@ def load_ict_checkpoint():
         iteration = int(f.read().strip())
 
     assert iteration > 0
-    checkpoint_name = get_checkpoint_name(args.load, iteration, False)
+    checkpoint_name = get_checkpoint_name(args.ict_load, iteration, False)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
@@ -221,7 +221,7 @@ def load_ict_checkpoint():
 def get_ict_dataset():
     args = get_args()
     block_dataset = get_indexed_dataset_(args.data_path, 'mmap', True)
-    titles_dataset = get_indexed_dataset_(args.data_path + '-titles', 'mmap', True)
+    titles_dataset = get_indexed_dataset_(args.titles_data_path, 'mmap', True)
 
     kwargs = dict(
         name='full',
