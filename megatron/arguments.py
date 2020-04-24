@@ -47,6 +47,19 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    # Distributed args.
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
+    if args.rank == 0:
+        print('using world size: {} and model-parallel size: {} '.format(
+            args.world_size, args.model_parallel_size))
+
+    # Fp16 loss scaling.
+    args.dynamic_loss_scale = False
+    if args.loss_scale is None:
+        args.dynamic_loss_scale = True
+
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
@@ -66,19 +79,6 @@ def parse_args(extra_args_provider=None, defaults={},
                      'max_position_embeddings']
     for req_arg in required_args: 
         _check_arg_is_not_none(args, req_arg)
-
-    # Distributed args.
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
-    if args.rank == 0:
-        print('using world size: {} and model-parallel size: {} '.format(
-            args.world_size, args.model_parallel_size))
-
-    # Fp16 loss scaling.
-    args.dynamic_loss_scale = False
-    if args.loss_scale is None:
-        args.dynamic_loss_scale = True
 
     # Checks.
     assert args.hidden_size % args.num_attention_heads == 0
