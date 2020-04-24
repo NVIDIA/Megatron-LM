@@ -52,9 +52,14 @@ def parse_args(extra_args_provider=None, defaults={},
         # For default to be valid, it should not be provided in the
         # arguments that are passed to the program. We check this by
         # ensuring the arg is set to None.
-        assert getattr(args, key) is None, \
-            'defaults can only be overwritten for args with None values.'
-        setattr(args, key, defaults[key])
+        if getattr(args, key) is not None:
+            if args.rank == 0:
+                print('WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(key=key, v=defaults[key],
+                                               v2=getattr(args, key)),
+                                               flush=True)
+        else:
+            setattr(args, key, defaults[key])
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -332,6 +337,7 @@ def _add_data_args(parser):
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
+                                'BertWordPieceCase',
                                 'GPT2BPETokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--data-impl', type=str, default='infer',

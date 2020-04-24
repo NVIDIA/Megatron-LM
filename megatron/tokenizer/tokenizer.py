@@ -33,6 +33,9 @@ def build_tokenizer(args):
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True)
+    elif args.tokenizer_type == 'BertWordPieceCase':
+        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                            lower_case=False)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
