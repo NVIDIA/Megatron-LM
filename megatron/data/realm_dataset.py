@@ -1,14 +1,16 @@
+import itertools
+
 import numpy as np
 import spacy
-from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
-from megatron.data.bert_dataset import get_samples_mapping_
-from megatron.data.dataset_utils import build_simple_training_sample
+from megatron.data.bert_dataset import BertDataset, get_samples_mapping_
+from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 
 qa_nlp = spacy.load('en_core_web_lg')
 
-class RealmDataset(Dataset):
+
+class RealmDataset(BertDataset):
     """Dataset containing simple masked sentences for masked language modeling.
 
     The dataset should yield sentences just like the regular BertDataset
@@ -21,52 +23,48 @@ class RealmDataset(Dataset):
     def __init__(self, name, indexed_dataset, data_prefix,
                  num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, short_seq_prob, seed):
-
-        # Params to store.
-        self.name = name
-        self.seed = seed
-        self.masked_lm_prob = masked_lm_prob
-        self.max_seq_length = max_seq_length
-
-        # Dataset.
-        self.indexed_dataset = indexed_dataset
+        super(RealmDataset, self).__init__(name, indexed_dataset, data_prefix,
+                                           num_epochs, max_num_samples, masked_lm_prob,
+                                           max_seq_length, short_seq_prob, seed)
+        self.build_sample_fn = build_simple_training_sample
 
 
-        # Build the samples mapping.
-        self.samples_mapping = get_samples_mapping_(self.indexed_dataset,
-                                                    data_prefix,
-                                                    num_epochs,
-                                                    max_num_samples,
-                                                    self.max_seq_length,
-                                                    short_seq_prob,
-                                                    self.seed,
-                                                    self.name)
+def build_simple_training_sample(sample, target_seq_length, max_seq_length,
+                                 vocab_id_list, vocab_id_to_token_dict,
+                                 cls_id, sep_id, mask_id, pad_id,
+                                 masked_lm_prob, np_rng):
 
-        # Vocab stuff.
-        tokenizer = get_tokenizer()
-        self.vocab_id_list = list(tokenizer.inv_vocab.keys())
-        self.vocab_id_to_token_dict = tokenizer.inv_vocab
-        self.cls_id = tokenizer.cls
-        self.sep_id = tokenizer.sep
-        self.mask_id = tokenizer.mask
-        self.pad_id = tokenizer.pad
+    tokens = list(itertools.chain(*sample))[:max_seq_length - 2]
+    tokens, tokentypes = create_single_tokens_and_tokentypes(tokens, cls_id, sep_id)
 
-    def __len__(self):
-        return self.samples_mapping.shape[0]
+    max_predictions_per_seq = masked_lm_prob * max_seq_length
+    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
+        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
+        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
 
-    def __getitem__(self, idx):
-        start_idx, end_idx, seq_length = self.samples_mapping[idx]
-        sample = [self.indexed_dataset[i] for i in range(start_idx, end_idx)]
-        # Note that this rng state should be numpy and not python since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        np_rng = np.random.RandomState(seed=(self.seed + idx))
-        return build_simple_training_sample(sample, seq_length,
-                                            self.max_seq_length,  # needed for padding
-                                            self.vocab_id_list,
-                                            self.vocab_id_to_token_dict,
-                                            self.cls_id, self.sep_id,
-                                            self.mask_id, self.pad_id,
-                                            self.masked_lm_prob, np_rng)
+    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
+        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+                                   masked_labels, pad_id, max_seq_length)
+
+    # REALM true sequence length is twice as long but none of that is to be predicted with LM
+    loss_mask_np = np.concatenate((loss_mask_np, np.ones(loss_mask_np.shape)), -1)
+
+    train_sample = {
+        'tokens': tokens_np,
+        'labels': labels_np,
+        'loss_mask': loss_mask_np,
+        'pad_mask': padding_mask_np
+    }
+    return train_sample
+
+
+def create_single_tokens_and_tokentypes(_tokens, cls_id, sep_id):
+    tokens = []
+    tokens.append(cls_id)
+    tokens.extend(list(_tokens))
+    tokens.append(sep_id)
+    tokentypes = [0] * len(tokens)
+    return tokens, tokentypes
 
 
 def spacy_ner(block_text):
