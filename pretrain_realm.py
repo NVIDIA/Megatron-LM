@@ -132,7 +132,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup))
+        skip_warmup=(not args.mmap_warmup),
+        dataset_type='realm')
     print_rank_0("> finished creating BERT ICT datasets ...")
 
     return train_ds, valid_ds, test_ds
