@@ -198,7 +198,7 @@ def load_ict_checkpoint():
 
     if isinstance(model, torchDDP):
         model = model.module
-    tracker_filename = get_checkpoint_tracker_filename(args.load)
+    tracker_filename = get_checkpoint_tracker_filename(args.ict_load)
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 

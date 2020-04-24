@@ -7,8 +7,8 @@ from megatron import get_tokenizer
 from megatron.data.bert_dataset import BertDataset, get_samples_mapping_
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 
-qa_nlp = spacy.load('en_core_web_lg')
-
+#qa_nlp = spacy.load('en_core_web_lg')
+qa_nlp = None
 
 class RealmDataset(BertDataset):
     """Dataset containing simple masked sentences for masked language modeling.
@@ -47,7 +47,7 @@ def build_simple_training_sample(sample, target_seq_length, max_seq_length,
                                    masked_labels, pad_id, max_seq_length)
 
     # REALM true sequence length is twice as long but none of that is to be predicted with LM
-    loss_mask_np = np.concatenate((loss_mask_np, np.ones(loss_mask_np.shape)), -1)
+    loss_mask_np = np.concatenate((loss_mask_np, np.ones(loss_mask_np.shape)), -1).astype(np.int64)
 
     train_sample = {
         'tokens': tokens_np,

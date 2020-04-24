@@ -27,7 +27,6 @@ from megatron import mpu
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron.data.ict_dataset import InverseClozeDataset
-from megatron.data.realm_dataset import RealmDataset
 from megatron import print_rank_0
 
 DATASET_TYPES = ['standard_bert', 'ict', 'realm']
@@ -76,6 +75,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     print_split_stats('test', 2)
 
     def build_dataset(index, name):
+        from megatron.data.realm_dataset import RealmDataset
         dataset = None
         if splits[index + 1] > splits[index]:
             # Get the pointer to the original doc-idx so we can set it later.

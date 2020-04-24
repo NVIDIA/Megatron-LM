@@ -234,22 +234,35 @@ class REALMBertModel(MegatronModule):
     def forward(self, tokens, attention_mask):
         # [batch_size x 5 x seq_length]
         top5_block_tokens, top5_block_attention_mask = self.retriever.retrieve_evidence_blocks(tokens, attention_mask)
+        batch_size = tokens.shape[0]
+
+        seq_length = top5_block_tokens.shape[2]
+        top5_block_tokens = torch.cuda.LongTensor(top5_block_tokens).reshape(-1, seq_length)
+        top5_block_attention_mask = torch.cuda.LongTensor(top5_block_attention_mask).reshape(-1, seq_length)
+
+        # [batch_size x 5 x embed_size]
+        fresh_block_logits = self.retriever.ict_model.module.module.embed_block(top5_block_tokens, top5_block_attention_mask).reshape(batch_size, 5, -1)
+
+        # [batch_size x embed_size x 1]
+        query_logits = self.retriever.ict_model.module.module.embed_query(tokens, attention_mask).unsqueeze(2)
+
 
         # [batch_size x 5]
-        fresh_block_logits = self.retriever.ict_model.embed_block(top5_block_tokens, top5_block_attention_mask)
-        block_probs = F.softmax(fresh_block_logits, axis=1)
+        fresh_block_scores = torch.matmul(fresh_block_logits, query_logits).squeeze()
+        block_probs = F.softmax(fresh_block_scores, dim=1)
 
-        # [batch_size x 5 x seq_length]
-        tokens = torch.stack([tokens.unsqueeze(1)] * 5, dim=1)
-        attention_mask = torch.stack([attention_mask.unsqueeze(1)] * 5, dim=1)
+        # [batch_size * 5 x seq_length]
+        tokens = torch.stack([tokens.unsqueeze(1)] * 5, dim=1).reshape(-1, seq_length)
+        attention_mask = torch.stack([attention_mask.unsqueeze(1)] * 5, dim=1).reshape(-1, seq_length)
 
-        # [batch_size x 5 x 2 * seq_length]
-        all_tokens = torch.cat((tokens, top5_block_tokens), axis=2)
-        all_attention_mask = torch.cat((attention_mask, top5_block_attention_mask), axis=2)
+        # [batch_size * 5 x 2 * seq_length]
+        all_tokens = torch.cat((tokens, top5_block_tokens), axis=1)
+        all_attention_mask = torch.cat((attention_mask, top5_block_attention_mask), axis=1)
         all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
 
         # [batch_size x 5 x 2 * seq_length x vocab_size]
         lm_logits, _ = self.lm_model.forward(all_tokens, all_attention_mask, all_token_types)
+        lm_logits = lm_logits.reshape(batch_size, 5, 2 * seq_length, -1)
         return lm_logits, block_probs
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
@@ -263,7 +276,7 @@ class REALMBertModel(MegatronModule):
 
 
 class REALMRetriever(MegatronModule):
-    """Retriever which uses a pretrained ICTBertModel and a hashed_index"""
+    """Retriever which uses a pretrained ICTBertModel and a HashedIndex"""
     def __init__(self, ict_model, ict_dataset, hashed_index, top_k=5):
         super(REALMRetriever, self).__init__()
         self.ict_model = ict_model
@@ -301,13 +314,14 @@ class REALMRetriever(MegatronModule):
 
             top5_start_end_doc = [bucket[idx][:3] for idx in top5_indices.squeeze()]
             # top_k tuples of (block_tokens, block_pad_mask)
-            top5_block_data = [(self.ict_dataset.get_block(*indices)) for indices in top5_start_end_doc]
-            top5_tokens, top5_pad_masks = zip(top5_block_data)
+            top5_block_data = [self.ict_dataset.get_block(*indices) for indices in top5_start_end_doc]
+
+            top5_tokens, top5_pad_masks = zip(*top5_block_data)
 
             all_top5_tokens.append(np.array(top5_tokens))
             all_top5_pad_masks.append(np.array(top5_pad_masks))
 
-        return all_top5_tokens, all_top5_pad_masks
+        return np.array(all_top5_tokens), np.array(all_top5_pad_masks)
 
 
 class ICTBertModel(MegatronModule):

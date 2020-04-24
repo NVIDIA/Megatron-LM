@@ -90,7 +90,7 @@ class InverseClozeDataset(Dataset):
         block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
-        return block_tokens, block_pad_mask
+        return (block_tokens, block_pad_mask)
 
     def concat_and_pad_tokens(self, tokens, title=None):
         """concat with special tokens and pad sequence to self.max_seq_length"""

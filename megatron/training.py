@@ -225,6 +225,7 @@ def backward_step(optimizer, model, loss):
     """Backward step."""
     args = get_args()
     timers = get_timers()
+    print("start backward", flush=True)
 
     # Backward pass.
     optimizer.zero_grad()
@@ -239,11 +240,9 @@ def backward_step(optimizer, model, loss):
         model.allreduce_params(reduce_after=False,
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
-
     # Update master gradients.
     if args.fp16:
         optimizer.update_master_grads()
-
     # Clipping gradients helps prevent the exploding gradient.
     if args.clip_grad > 0:
         if not args.fp16:

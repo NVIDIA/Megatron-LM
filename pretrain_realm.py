@@ -74,6 +74,7 @@ def forward_step(data_iterator, model):
     # Get the batch.
     timers('batch generator').start()
     tokens, labels, loss_mask, pad_mask = get_batch(data_iterator)
+    labels = torch.cat((labels, labels), axis=-1)
     timers('batch generator').stop()
 
     # Forward model.
@@ -81,6 +82,7 @@ def forward_step(data_iterator, model):
     lm_logits, block_probs = model(tokens, pad_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
+    block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
     lm_logits = torch.sum(lm_logits * block_probs, dim=1)
     lm_loss_ = mpu.vocab_parallel_cross_entropy(lm_logits.contiguous().float(),
                                                 labels.contiguous())
@@ -88,6 +90,7 @@ def forward_step(data_iterator, model):
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
     reduced_loss = reduce_losses([lm_loss])
+    print(reduced_loss, flush=True)
     return lm_loss, {'lm_loss': reduced_loss[0]}
 
 
