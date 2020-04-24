@@ -295,9 +295,9 @@ class REALMRetriever(MegatronModule):
         query_pad_mask = torch.cuda.LongTensor(np.array(query_pad_mask).reshape(1, -1))
 
         top5_block_tokens, _ = self.retrieve_evidence_blocks(query_tokens, query_pad_mask)
-        for i, block in enumerate(top5_block_tokens):
+        for i, block in enumerate(top5_block_tokens[0]):
             block_text = self.ict_dataset.decode_tokens(block)
-            print('    > Block {}: {}'.format(i, block_text))
+            print('\n    > Block {}: {}'.format(i, block_text))
 
     def retrieve_evidence_blocks(self, query_tokens, query_pad_mask):
         query_embeds = self.ict_model.module.module.embed_query(query_tokens, query_pad_mask)
@@ -321,6 +321,7 @@ class REALMRetriever(MegatronModule):
             all_top5_tokens.append(np.array(top5_tokens))
             all_top5_pad_masks.append(np.array(top5_pad_masks))
 
+        # [batch_size x 5 x seq_length]
         return np.array(all_top5_tokens), np.array(all_top5_pad_masks)
 
 

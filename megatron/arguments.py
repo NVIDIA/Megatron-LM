@@ -298,6 +298,8 @@ def _add_data_args(parser):
                        help='Path to combined dataset to split.')
     group.add_argument('--titles-data-path', type=str, default=None,
                        help='Path to titles dataset used for ICT')
+    group.add_argument('--hash-data-path', type=str, default=None,
+                       help='Path to pickled HashedIndex data structure')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

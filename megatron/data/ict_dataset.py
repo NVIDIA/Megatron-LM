@@ -80,7 +80,7 @@ class InverseClozeDataset(Dataset):
 
     def decode_tokens(self, token_ids):
         tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
-        return ' '.join(tokens)
+        return ' '.join(token for token in tokens if token != '[PAD]')
 
     def get_block(self, start_idx, end_idx, doc_idx):
         """Get the IDs for an evidence block plus the title of the corresponding document"""

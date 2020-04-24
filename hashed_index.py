@@ -118,10 +118,11 @@ class HashedIndex(object):
 def test_retriever():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    args = get_args()
     model = load_ict_checkpoint()
     model.eval()
     dataset = get_ict_dataset()
-    hashed_index = HashedIndex.load_from_file('block_hash_data.pkl')
+    hashed_index = HashedIndex.load_from_file(args.hash_data_path)
     retriever = REALMRetriever(model, dataset, hashed_index)
 
     strs = [
