@@ -20,7 +20,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --task $TASK \
                --valid-data $VALID_DATA \
                --tokenizer-type GPT2BPETokenizer \
-               --strict-lambada
+               --strict-lambada \
                --vocab-file $VOCAB_FILE \
                --merge-file $MERGE_FILE \
                --load $CHECKPOINT \
