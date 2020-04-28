@@ -1,7 +1,6 @@
 # ! /usr/bin/python
-# -*- coding: utf-8 -*-
-
-# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
+# coding=utf-8
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,17 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-MAJOR = 0
-MINOR = 1
-PATCH = 0
+MAJOR = 1
+MINOR = 0
 
 # Use the following formatting: (major, minor, patch)
-VERSION = (MAJOR, MINOR, PATCH)
+VERSION = (MAJOR, MINOR)
 
 __version__ = '.'.join(map(str, VERSION))
-__package_name__ = 'megatron_lm'
-__contact_names__ = 'NVIDIA'
-__contact_emails__ = '??????@nvidia.com'
+__package_name__ = 'megatron-lm'
 __url__ = 'https://github.com/NVIDIA/Megatron-LM'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = 'Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.'
