@@ -131,8 +131,8 @@ class InverseClozeDataset(Dataset):
                   'the indices on rank 0 ...'.format(indexmap_filename))
 
             # Make sure the types match the helpers input types.
-            assert self.context_dataset.doc_idx.dtype == np.int64
-            assert self.context_dataset.sizes.dtype == np.int32
+            assert self.block_dataset.doc_idx.dtype == np.int64
+            assert self.block_dataset.sizes.dtype == np.int32
 
             # Build samples mapping
             verbose = torch.distributed.get_rank() == 0
@@ -140,9 +140,9 @@ class InverseClozeDataset(Dataset):
             print_rank_0(' > building samples index mapping for {} ...'.format(
                 self.name))
             samples_mapping = helpers.build_blocks_mapping(
-                self.context_dataset.doc_idx,
-                self.context_dataset.sizes,
-                self.titles_dataset.sizes,
+                self.block_dataset.doc_idx,
+                self.block_dataset.sizes,
+                self.title_dataset.sizes,
                 num_epochs,
                 max_num_samples,
                 self.max_seq_length-3,  # account for added tokens

@@ -29,7 +29,7 @@ from megatron.utils import reduce_losses
 
 num_batches = 0
 
-def model_provider():
+def model_provider(only_query_model=False, only_block_model=False):
     """Build the model."""
     args = get_args()
     print_rank_0('building BERT models ...')
@@ -37,7 +37,9 @@ def model_provider():
     model = ICTBertModel(
         ict_head_size=128,
         num_tokentypes=2,
-        parallel_output=True)
+        parallel_output=True,
+        only_query_model=only_query_model,
+        only_block_model=only_block_model)
 
     return model
 

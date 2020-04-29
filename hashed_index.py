@@ -29,7 +29,8 @@ class HashedIndex(object):
         np.random.seed(seed)
         self.block_data = defaultdict(list)
         self.hash_data = defaultdict(list)
-        self.hash_matrix = np.random.rand(embed_size, int(num_buckets / 2))
+        hash_matrix = np.random.rand(embed_size, int(num_buckets / 2))
+        self.hash_matrix = hash_matrix / np.linalg.norm(hash_matrix, axis=0).reshape(1, -1)
 
     def state(self):
         state = {
@@ -47,7 +48,7 @@ class HashedIndex(object):
 
     def hash_embeds(self, embeds, block_data=None):
         """Hash a tensor of embeddings using a random projection matrix"""
-        embed_scores_pos = torch.matmul(embeds, torch.cuda.HalfTensor(self.hash_matrix))
+        embed_scores_pos = torch.matmul(embeds, torch.cuda.FloatTensor(self.hash_matrix))
         embed_scores = torch.cat((embed_scores_pos, -embed_scores_pos), axis=1)
         embed_hashes = detach(torch.argmax(embed_scores, axis=1))
 
@@ -62,7 +63,7 @@ class HashedIndex(object):
         for idx, embed in zip(block_indices, block_embeds):
             if not allow_overwrite and int(idx) in self.block_data:
                 raise ValueError("Attempted to overwrite a read-only HashedIndex")
-            self.block_data[int(idx)] = embed
+            self.block_data[int(idx)] = np.float16(embed)
 
     def save_shard(self, rank):
         dir_name = 'block_hash_data'
@@ -92,7 +93,8 @@ class HashedIndex(object):
                 for bucket, items in data['hash_data'].items():
                     self.hash_data[bucket].extend(items)
 
-        with open('block_hash_data.pkl', 'wb') as final_file:
+        args = get_args()
+        with open(args.hash_data_path, 'wb') as final_file:
             pickle.dump(self.state(), final_file)
         shutil.rmtree(dir_name, ignore_errors=True)
 
@@ -119,7 +121,7 @@ def test_retriever():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
-    model = load_ict_checkpoint()
+    model = load_ict_checkpoint(only_block_model=True)
     model.eval()
     dataset = get_ict_dataset()
     hashed_index = HashedIndex.load_from_file(args.hash_data_path)
@@ -158,11 +160,11 @@ def main():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
-    model = load_ict_checkpoint()
+    model = load_ict_checkpoint(only_block_model=True, no_grad=True)
     model.eval()
     dataset = get_ict_dataset()
     data_iter = iter(get_dataloader(dataset))
-    hashed_index = HashedIndex(embed_size=128, num_buckets=2048)
+    hashed_index = HashedIndex(embed_size=128, num_buckets=4096)
 
     i = 0
     while True:
@@ -172,10 +174,8 @@ def main():
         except:
             break
 
-        actual_model = model.module.module
         block_indices = detach(block_indices)
-
-        block_logits = actual_model.embed_block(block_tokens, block_pad_mask)
+        block_logits = model(None, None, block_tokens, block_pad_mask, only_block=True)
         hashed_index.hash_embeds(block_logits, block_indices)
         hashed_index.assign_block_embeds(block_indices[:,3], detach(block_logits))
 
@@ -193,9 +193,9 @@ def main():
         hashed_index.clear()
 
 
-def load_ict_checkpoint():
+def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False):
     args = get_args()
-    model = get_model(model_provider)
+    model = get_model(lambda: model_provider(only_query_model, only_block_model))
 
     if isinstance(model, torchDDP):
         model = model.module
@@ -210,7 +210,15 @@ def load_ict_checkpoint():
             torch.distributed.get_rank(), checkpoint_name))
 
     state_dict = torch.load(checkpoint_name, map_location='cpu')
-    model.load_state_dict(state_dict['model'])
+    if only_query_model:
+        state_dict['model'].pop('context_model')
+    if only_block_model:
+        state_dict['model'].pop('question_model')
+    if no_grad:
+        with torch.no_grad():
+            model.load_state_dict(state_dict['model'])
+    else:
+        model.load_state_dict(state_dict['model'])
     torch.distributed.barrier()
 
     if mpu.get_data_parallel_rank() == 0:
@@ -261,4 +269,4 @@ def get_dataloader(dataset):
 
 
 if __name__ == "__main__":
-    test_retriever()
+    main()

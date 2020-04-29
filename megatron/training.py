@@ -225,7 +225,7 @@ def backward_step(optimizer, model, loss):
     """Backward step."""
     args = get_args()
     timers = get_timers()
-    print("start backward", flush=True)
+    torch.cuda.synchronize()
 
     # Backward pass.
     optimizer.zero_grad()
@@ -250,6 +250,7 @@ def backward_step(optimizer, model, loss):
         else:
             optimizer.clip_master_grads(args.clip_grad)
 
+ran_backward_once = False
 
 def train_step(forward_step_func, data_iterator,
                model, optimizer, lr_scheduler):
@@ -262,10 +263,11 @@ def train_step(forward_step_func, data_iterator,
     loss, loss_reduced = forward_step_func(data_iterator, model)
     timers('forward').stop()
 
-    # Calculate gradients, reduce across processes, and clip.
     timers('backward').start()
     backward_step(optimizer, model, loss)
     timers('backward').stop()
+
+    # Calculate gradients, reduce across processes, and clip.
 
     # Update parameters.
     timers('optimizer').start()

@@ -126,12 +126,18 @@ class BertModel(MegatronModule):
         add_pooler = self.add_binary_head or self.add_ict_head
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
                                                        args.num_layers)
+
+        max_pos_embeds = None
+        if not add_binary_head and ict_head_size is None:
+            max_pos_embeds = 2 * args.seq_length
+
         self.language_model, self._language_model_key = get_language_model(
             attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=add_pooler,
             init_method=init_method,
-            scaled_init_method=scaled_init_method)
+            scaled_init_method=scaled_init_method,
+            max_pos_embeds=max_pos_embeds)
 
         if not self.add_ict_head:
             self.lm_head = BertLMHead(
@@ -218,6 +224,8 @@ class BertModel(MegatronModule):
 
 
 class REALMBertModel(MegatronModule):
+
+    # TODO: load BertModel checkpoint
     def __init__(self, retriever):
         super(REALMBertModel, self).__init__()
         bert_args = dict(
@@ -241,10 +249,11 @@ class REALMBertModel(MegatronModule):
         top5_block_attention_mask = torch.cuda.LongTensor(top5_block_attention_mask).reshape(-1, seq_length)
 
         # [batch_size x 5 x embed_size]
-        fresh_block_logits = self.retriever.ict_model.module.module.embed_block(top5_block_tokens, top5_block_attention_mask).reshape(batch_size, 5, -1)
+        fresh_block_logits = self.retriever.ict_model(None, None, top5_block_tokens, top5_block_attention_mask, only_block=True).reshape(batch_size, 5, -1)
+        # fresh_block_logits.register_hook(lambda x: print("fresh block: ", x.shape, flush=True))
 
         # [batch_size x embed_size x 1]
-        query_logits = self.retriever.ict_model.module.module.embed_query(tokens, attention_mask).unsqueeze(2)
+        query_logits = self.retriever.ict_model(tokens, attention_mask, None, None, only_query=True).unsqueeze(2)
 
 
         # [batch_size x 5]
@@ -282,6 +291,7 @@ class REALMRetriever(MegatronModule):
         self.ict_model = ict_model
         self.ict_dataset = ict_dataset
         self.hashed_index = hashed_index
+        self.top_k = top_k
 
     def retrieve_evidence_blocks_text(self, query_text):
         """Get the top k evidence blocks for query_text in text form"""
@@ -300,16 +310,25 @@ class REALMRetriever(MegatronModule):
             print('\n    > Block {}: {}'.format(i, block_text))
 
     def retrieve_evidence_blocks(self, query_tokens, query_pad_mask):
-        query_embeds = self.ict_model.module.module.embed_query(query_tokens, query_pad_mask)
+        """Embed blocks to be used in a forward pass"""
+        query_embeds = self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True)
         query_hashes = self.hashed_index.hash_embeds(query_embeds)
 
         block_buckets = [self.hashed_index.get_block_bucket(hash) for hash in query_hashes]
-        block_embeds = [torch.cuda.HalfTensor(np.array([self.hashed_index.get_block_embed(arr[3])
+        for j, bucket in enumerate(block_buckets):
+            if len(bucket) < 5:
+                for i in range(len(block_buckets)):
+                    if len(block_buckets[i]) > 5:
+                        block_buckets[j] = block_buckets[i].copy()
+
+        # [batch_size x max_bucket_population x embed_size]
+        block_embeds = [torch.cuda.FloatTensor(np.array([self.hashed_index.get_block_embed(arr[3])
                                                         for arr in bucket])) for bucket in block_buckets]
 
         all_top5_tokens, all_top5_pad_masks = [], []
         for query_embed, embed_tensor, bucket in zip(query_embeds, block_embeds, block_buckets):
-            retrieval_scores = query_embed.matmul(torch.transpose(embed_tensor, 0, 1))
+            retrieval_scores = query_embed.matmul(torch.transpose(embed_tensor.reshape(-1, query_embed.size()[0]), 0, 1))
+            print(retrieval_scores.shape, flush=True)
             top5_vals, top5_indices = torch.topk(retrieval_scores, k=5, sorted=True)
 
             top5_start_end_doc = [bucket[idx][:3] for idx in top5_indices.squeeze()]
@@ -354,8 +373,16 @@ class ICTBertModel(MegatronModule):
             self.block_model = BertModel(**bert_args)
             self._block_key = 'context_model'
 
-    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask):
+    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask, only_query=False, only_block=False):
         """Run a forward pass for each of the models and compute the similarity scores."""
+
+        if only_query:
+            return self.embed_query(query_tokens, query_attention_mask)
+
+        if only_block:
+            return self.embed_block(block_tokens, block_attention_mask)
+
+
         query_logits = self.embed_query(query_tokens, query_attention_mask)
         block_logits = self.embed_block(block_tokens, block_attention_mask)
 
@@ -399,9 +426,11 @@ class ICTBertModel(MegatronModule):
     def load_state_dict(self, state_dict, strict=True):
         """Load the state dicts of each of the models"""
         if self.use_query_model:
+            print("Loading ICT query model", flush=True)
             self.query_model.load_state_dict(
                 state_dict[self._query_key], strict=strict)
 
         if self.use_block_model:
+            print("Loading ICT block model", flush=True)
             self.block_model.load_state_dict(
                 state_dict[self._block_key], strict=strict)
