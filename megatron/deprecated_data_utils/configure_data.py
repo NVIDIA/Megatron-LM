@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import torch
 
 from megatron import data_utils
 from megatron import mpu
+
 
 class DataConfig:
 
@@ -46,7 +47,8 @@ class DataConfig:
 
 def make_data_loader(dataset, batch_size, args):
     if args.shuffle:
-        sampler = data_utils.samplers.RandomSampler(dataset, replacement=True, num_samples=batch_size*args.train_iters)
+        sampler = data_utils.samplers.RandomSampler(
+            dataset, replacement=True, num_samples=batch_size*args.train_iters)
     else:
         sampler = torch.utils.data.SequentialSampler(dataset)
     world_size = torch.distributed.get_world_size(
@@ -202,6 +204,7 @@ def make_loaders(args):
 
     return (train, valid, test), tokenizer
 
+
 def get_split(args):
     """
     Get dataset splits from comma separated string list
@@ -215,7 +218,7 @@ def get_split(args):
         splits = [float(args.split)]
     split_total = sum(splits)
     if split_total < 1.:
-        splits.append(1-split_total)
+        splits.append(1 - split_total)
     while len(splits) < 3:
         splits.append(0.)
     splits = splits[:3]
@@ -224,10 +227,10 @@ def get_split(args):
     if args.test_data is not None:
         splits[2] = 0.
     final_sum = sum(splits)
-    return [s/final_sum for s in splits]
+    return [s / final_sum for s in splits]
+
 
 def configure_data():
-
     """add cmdline flags for configuring datasets"""
     # These are options that are used by data_utils, but are either
     # deprecated or not meant to be exposed to the command line user.

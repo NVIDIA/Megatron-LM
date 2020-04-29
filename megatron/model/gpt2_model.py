@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,8 +27,7 @@ from .utils import scaled_init_method_normal
 
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
-    attention_scores = torch.mul(attention_scores, ltor_mask) - \
-                       10000.0 * (1.0 - ltor_mask)
+    attention_scores.masked_fill_(ltor_mask, -10000.0)
     return attention_scores
 
 
@@ -48,7 +47,6 @@ class GPT2Model(MegatronModule):
             init_method=init_method_normal(args.init_method_std),
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
-
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
@@ -79,7 +77,6 @@ class GPT2Model(MegatronModule):
 
         return output
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
 
@@ -88,7 +85,6 @@ class GPT2Model(MegatronModule):
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -141,7 +141,6 @@ class BertDataset(Dataset):
         # Dataset.
         self.indexed_dataset = indexed_dataset
 
-
         # Build the samples mapping.
         self.samples_mapping = get_samples_mapping_(self.indexed_dataset,
                                                     data_prefix,
@@ -162,10 +161,8 @@ class BertDataset(Dataset):
         self.pad_id = tokenizer.pad
         self.build_sample_fn = build_training_sample
 
-
     def __len__(self):
         return self.samples_mapping.shape[0]
-
 
     def __getitem__(self, idx):
         start_idx, end_idx, seq_length = self.samples_mapping[idx]
@@ -218,7 +215,7 @@ def get_train_valid_test_split_(splits_string, size):
     splits = splits[:3]
     splits_sum = sum(splits)
     assert splits_sum > 0.0
-    splits = [split/splits_sum for split in splits]
+    splits = [split / splits_sum for split in splits]
     splits_index = [0]
     for index, split in enumerate(splits):
         splits_index.append(splits_index[index] +
@@ -274,13 +271,16 @@ def get_samples_mapping_(indexed_dataset,
         start_time = time.time()
         print_rank_0(' > building sapmles index mapping for {} ...'.format(
             name))
+        # First compile and then import.
+        from megatron.data.dataset_utils import compile_helper
+        compile_helper()
         from megatron.data import helpers
         samples_mapping = helpers.build_mapping(
             indexed_dataset.doc_idx,
             indexed_dataset.sizes,
             num_epochs,
             max_num_samples,
-            max_seq_length-3, # account for added tokens
+            max_seq_length - 3,  # account for added tokens
             short_seq_prob,
             seed,
             verbose)

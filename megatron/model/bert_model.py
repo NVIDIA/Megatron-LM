@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,15 +22,14 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
+from megatron.model.language_model import parallel_lm_logits
+from megatron.model.language_model import get_language_model
+from megatron.model.transformer import LayerNorm
+from megatron.model.utils import openai_gelu
+from megatron.model.utils import get_linear_layer
+from megatron.model.utils import init_method_normal
+from megatron.model.utils import scaled_init_method_normal
 from megatron.module import MegatronModule
-
-from .language_model import parallel_lm_logits
-from .language_model import get_language_model
-from .transformer import LayerNorm
-from .utils import gelu
-from .utils import get_linear_layer
-from .utils import init_method_normal
-from .utils import scaled_init_method_normal
 
 
 def bert_attention_mask_func(attention_scores, attention_mask):
@@ -70,7 +69,6 @@ def bert_position_ids(token_ids):
     return position_ids
 
 
-
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
@@ -81,11 +79,14 @@ class BertLMHead(MegatronModule):
         layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: whether output logits being distributed or not.
     """
+
     def __init__(self, mpu_vocab_size, hidden_size, init_method,
                  layernorm_epsilon, parallel_output):
 
         super(BertLMHead, self).__init__()
 
+        args = get_args()
+        
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -94,18 +95,19 @@ class BertLMHead(MegatronModule):
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
-
+        self.gelu = torch.nn.functional.gelu
+        if args.openai_gelu:
+            self.gelu = openai_gelu
 
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
-        hidden_states = gelu(hidden_states)
+        hidden_states = self.gelu(hidden_states)
         hidden_states = self.layernorm(hidden_states)
         output = parallel_lm_logits(hidden_states,
                                     word_embeddings_weight,
                                     self.parallel_output,
                                     bias=self.bias)
         return output
-
 
 
 class BertModel(MegatronModule):
@@ -184,7 +186,6 @@ class BertModel(MegatronModule):
 
         return lm_logits, None
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load when model is combined with other heads,
@@ -206,7 +207,6 @@ class BertModel(MegatronModule):
                 = self.ict_head.state_dict(destination, prefix, keep_vars)
         return state_dict_
 
-
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
 
@@ -224,8 +224,6 @@ class BertModel(MegatronModule):
 
 
 class REALMBertModel(MegatronModule):
-
-    # TODO: load BertModel checkpoint
     def __init__(self, retriever):
         super(REALMBertModel, self).__init__()
         bert_args = dict(

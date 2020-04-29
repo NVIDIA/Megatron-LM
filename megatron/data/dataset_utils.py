@@ -14,10 +14,27 @@
 # limitations under the License.
 
 
+# Most of the code here has been copied from:
+#   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
+# with some modifications.
+
 import collections
 import itertools
 
 import numpy as np
+
+
+def compile_helper():
+    """Compile helper function ar runtime. Make sure this
+    is invoked on a single process."""
+    import os
+    import subprocess
+    path = os.path.abspath(os.path.dirname(__file__))
+    ret = subprocess.run(['make', '-C', path])
+    if ret.returncode != 0:
+        print("Making C++ dataset helpers module failed, exiting.")
+        import sys
+        sys.exit(1)
 
 
 def build_training_sample(sample,

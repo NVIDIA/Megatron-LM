@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,10 +31,6 @@ class DistributedDataParallel(MegatronModule):
 
         self.module = module
         self.data_parallel_group = mpu.get_data_parallel_group()
-        src_rank = mpu.get_model_parallel_rank()
-        for p in self.module.parameters():
-            if torch.is_tensor(p):
-                dist.broadcast(p, src_rank, group=self.data_parallel_group)
 
         def allreduce_params(reduce_after=True, no_scale=False, fp32_allreduce=False):
             if(self.needs_reduction):
@@ -71,8 +67,8 @@ class DistributedDataParallel(MegatronModule):
             def allreduce_hook(*unused):
                 Variable._execution_engine.queue_callback(allreduce_params)
         #    handle = param.register_hook(allreduce_hook)
-            #self.hooks.append(allreduce_hook)
-            #self.hook_handles.append(handle)
+            # self.hooks.append(allreduce_hook)
+            # self.hook_handles.append(handle)
         self.allreduce_params = allreduce_params
 
     def forward(self, *inputs, **kwargs):
@@ -114,4 +110,3 @@ class DistributedDataParallel(MegatronModule):
         super(DistributedDataParallel, self).train(mode)
         self.module.train(mode)
     '''
-

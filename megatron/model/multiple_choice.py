@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -51,7 +51,6 @@ class MultipleChoice(MegatronModule):
                                                  init_method)
         self._multichoice_head_key = 'multichoice_head'
 
-
     def forward(self, input_ids, attention_mask, tokentype_ids):
 
         # [batch, choices, sequence] --> [batch * choices, sequence] -->
@@ -86,7 +85,6 @@ class MultipleChoice(MegatronModule):
 
         return multichoice_logits
 
-
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load when model is combined with other heads,
@@ -100,7 +98,6 @@ class MultipleChoice(MegatronModule):
             = self.multichoice_head.state_dict(
                 destination, prefix, keep_vars)
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""

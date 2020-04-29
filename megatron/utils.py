@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,7 +48,7 @@ def report_memory(name):
         torch.cuda.max_memory_allocated() / mega_bytes)
     string += ' | cached: {}'.format(torch.cuda.memory_cached() / mega_bytes)
     string += ' | max cached: {}'.format(
-        torch.cuda.max_memory_cached()/ mega_bytes)
+        torch.cuda.max_memory_cached() / mega_bytes)
     print_rank_0(string)
 
 
@@ -119,8 +119,7 @@ def get_ltor_masks_and_position_ids(data,
                                     eod_token,
                                     reset_position_ids,
                                     reset_attention_mask,
-                                    eod_mask_loss,
-                                    fp16):
+                                    eod_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -164,14 +163,13 @@ def get_ltor_masks_and_position_ids(data,
                 i = eod_index[j]
                 # Mask attention loss.
                 if reset_attention_mask:
-                    attention_mask[b, 0, (i+1):, :(i+1)] = 0
+                    attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
                 # Reset positions.
                 if reset_position_ids:
-                    position_ids[b, (i+1):] -= (i + 1 - prev_index)
+                    position_ids[b, (i + 1):] -= (i + 1 - prev_index)
                     prev_index = i + 1
 
-    # Convert
-    if fp16:
-        attention_mask = attention_mask.half()
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
 
     return attention_mask, loss_mask, position_ids

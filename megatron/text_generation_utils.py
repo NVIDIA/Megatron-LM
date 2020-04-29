@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,8 +42,7 @@ def get_batch(context_tokens):
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss,
-        args.fp16)
+        args.eod_mask_loss)
 
     return tokens, attention_mask, position_ids
 
@@ -120,8 +119,8 @@ def generate_samples_input_from_file(model):
                     context_length = len(context_tokens)
 
                     if context_length >= (args.seq_length // 2):
-                        print("\nContext length", context_length, \
-                            "\nPlease give smaller context (half of the "
+                        print("\nContext length", context_length,
+                              "\nPlease give smaller context (half of the "
                               "sequence length)!", flush=True)
                         continue
             else:
@@ -187,8 +186,8 @@ def generate_samples_interactive(model, print_frequency=24):
                     context_length = len(context_tokens)
 
                     if context_length >= (args.seq_length // 2):
-                        print("\nContext length", context_length, \
-                            "\nPlease give smaller context (half of the "
+                        print("\nContext length", context_length,
+                              "\nPlease give smaller context (half of the "
                               "sequence length)!", flush=True)
                         continue
             else:
@@ -246,7 +245,7 @@ def generate_samples_unconditional(model):
         for token_stream in get_token_stream(model,
                                              copy.deepcopy(context_tokens)):
             pass
-        if ctr%args.log_interval == 0:
+        if ctr % args.log_interval == 0:
             print('Avg s/batch:',
                   (time.time() - start_time) / min(args.log_interval, ctr + 1))
             start_time = time.time()
@@ -254,10 +253,10 @@ def generate_samples_unconditional(model):
         token_batch = token_stream[0].cpu().numpy().tolist()
         length_batch = token_stream[1].cpu().numpy().tolist()
         for tokens, length in zip(token_batch, length_batch):
-            tokens = tokens[1:length-1]
+            tokens = tokens[1:length - 1]
             text = tokenizer.detokenize(tokens)
             is_finished = length < args.seq_length - 1
-            datum = {'text': text, 'length': length-1, 'finished': is_finished}
+            datum = {'text': text, 'length': length - 1, 'finished': is_finished}
             yield datum
             ctr += 1
             if ctr >= num_samples:
@@ -272,7 +271,7 @@ def generate_and_write_samples_unconditional(model):
     assert args.genfile is not None
     with open(args.genfile, 'w') as f:
         for datum in generate_samples_unconditional(model):
-            f.write(json.dumps(datum)+'\n')
+            f.write(json.dumps(datum) + '\n')
 
 
 def pad_batch(batch, pad_id, args):
@@ -281,7 +280,7 @@ def pad_batch(batch, pad_id, args):
     for tokens in batch:
         context_length = len(tokens)
         if context_length < args.seq_length:
-            tokens.extend([pad_id]*(args.seq_length - context_length))
+            tokens.extend([pad_id] * (args.seq_length - context_length))
         context_lengths.append(context_length)
     return batch, context_lengths
 
@@ -345,7 +344,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
             if maxlen > (org_context_length + args.out_seq_length):
                 maxlen = org_context_length + args.out_seq_length
 
-        lengths = torch.ones([batch_size]).long().cuda()*maxlen
+        lengths = torch.ones([batch_size]).long().cuda() * maxlen
 
         while context_length <= (maxlen):
 

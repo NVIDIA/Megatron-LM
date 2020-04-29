@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,8 +75,8 @@ def build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids, max_seq_length,
     # A.
     len_text_a = len(text_a_ids)
     ids.extend(text_a_ids)
-    types.extend([0]*len_text_a)
-    paddings.extend([1]*len_text_a)
+    types.extend([0] * len_text_a)
+    paddings.extend([1] * len_text_a)
 
     # [SEP].
     ids.append(sep_id)
@@ -87,8 +87,8 @@ def build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids, max_seq_length,
     if text_b_ids is not None:
         len_text_b = len(text_b_ids)
         ids.extend(text_b_ids)
-        types.extend([1]*len_text_b)
-        paddings.extend([1]*len_text_b)
+        types.extend([1] * len_text_b)
+        paddings.extend([1] * len_text_b)
 
     # Cap the size.
     trimmed = False
@@ -111,8 +111,8 @@ def build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids, max_seq_length,
     # Padding.
     padding_length = max_seq_length - len(ids)
     if padding_length > 0:
-        ids.extend([pad_id]*padding_length)
-        types.extend([pad_id]*padding_length)
-        paddings.extend([0]*padding_length)
+        ids.extend([pad_id] * padding_length)
+        types.extend([pad_id] * padding_length)
+        paddings.extend([0] * padding_length)
 
     return ids, types, paddings

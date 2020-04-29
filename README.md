@@ -1,214 +1,472 @@
-Megatron is a large, powerful transformer. This repo is for ongoing research on training large, powerful transformer language models at scale. Currently, we support model-parallel, multinode training of [GPT2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) in mixed precision. 
+[Megatron](https://arxiv.org/pdf/1909.08053.pdf) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel, and multinode training of [GPT-2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
 
-Our codebase is capable of efficiently training a 72-layer, 8.3 Billion Parameter GPT2 Language model with 8-way model and 64-way data parallelism across 512 GPUs. We find that bigger language models are able to surpass current GPT2-1.5B wikitext perplexities in as little as 5 epochs of training.
+Our codebase is capable of efficiently training a 72-layer, 8.3 billion parameter GPT-2 language model with 8-way model and 64-way data parallelism across 512 GPUs. We sustain 15.1 PetaFLOPs across the entire application with 76% scaling efficiency when compared to a strong single GPU baseline that sustains 39 TeraFLOPs, which is 30% of peak theoritical FLOPs. Using our GPT-2 model we achieve SOTA results on the WikiText-103 (10.8 compared to SOTA perplexity of 15.8) and LAMBADA (66.5% compared to SOTA accuracy of 63.2%) datasets. 
 
-For BERT training our repository trains BERT Large on 64 V100 GPUs in 3 days. We achieved a final language modeling perplexity of 3.15 and SQuAD F1-score of 90.7.
-<!--
-do we want to make any claims about GPT2 speed, convergence, or model release
--->
+For BERT training, we swapped the position of the layer normalization and the residual connection in the model architecture (similar to GPT-2 architucture), which allowed the models to continue to improve as they were scaled up. Our BERT models with 3.9 billion parameters reaches a loss of 1.16, SQuAD 2.0 F1-score of 91.7, and RACE accuracy of 90.9%.
 
+<a id="contents"></a>
+# Contents
+<!-- MarkdownTOC -->
+
+- [Setup](#setup)
+  - [Downloading Checkpoints](#downloading-checkpoints)
+- [Usage](#usage)
+- [Training](#training)
+  - [Data Preprocessing](#data-preprocessing)
+  - [BERT Pretraining](#bert-pretraining)
+  - [GPT-2 Pretraining](#gpt-2-pretraining)
+  - [Distributed BERT or GPT-2 Pretraining](#distributed-bert-or-gpt-2-pretraining)
+- [Evaluation and Tasks](#evaluation-and-tasks)
+  - [GPT-2 Text Generation](#gpt-2-text-generation)
+  - [GPT-2 Evaluation](#gpt-2-evaluation)
+    - [WikiText Perplexity Evaluation](#wikitext-perplexity-evaluation)
+    - [LAMBADA Cloze Accuracy](#lambada-cloze-accuracy)
+  - [BERT Task Evaluation](#bert-task-evaluation)
+    - [RACE Evaluation](#race-evaluation)
+    - [MNLI Evaluation](#mnli-evaluation)
+- [Datasets](#datasets)
+  - [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
+  - [Collecting GPT-2 Webtext Data](#collecting-gpt-2-webtext-data)
+
+<!-- /MarkdownTOC -->
+
+<a id="setup"></a>
 # Setup
-We officially support only python3.6.
+We officially support only python 3.6, pytorch 1.5, cuda 10, and nccl 2.6 versions and above.
 
-To use this repo please install the latest supported versions of PyTorch with GPU support. 
+To use this repo please install the latest supported versions of PyTorch with GPU support. We strongly recommend using one of [NGC's recent PyTorch containers](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) (the latest compatible version at time of publication can be pulled with `docker pull nvcr.io/nvidia/pytorch:20.03-py3`). Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation or downstream tasks.
 
-Additionally, part of this codebase leverages tensorflow-cpu to (optionally) perform dataloading of TFRecords for BERT training. We recommend either utilizing the provided Dockerfile in [`./docker/`](./docker) or creating a virtual environment (to avoid breaking existing tf installations) and install our `requirements.txt`. 
+<a id="downloading-checkpoints"></a>
+## Downloading Checkpoints
+We've provided two pretrained checkpoints for use to evaluate or finetuning downstream tasks. To access these checkpoints, first please [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI.
 
-```
-python -m pip install virtualenv
-virtualenv bert_env
-source bert_env/bin/activate
-pip install -r requirements.txt
-```
+The checkpoints can be downloaded with:
+<pre>
+ngc registry model download-version --dest &#60;output_base_directory&#62; nvidia/&#60;model_name&#62;:&#60;version&#62;
+</pre>
 
+The available models along with `<model_name>:<version>` are below:
+* [BERT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_bert_345m): megatron\_bert\_345m:v0.0
+* [GPT-2-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_lm_345m): megatron\_lm\_345m:v0.0 
 
+The models require vocabulary files to run. The BERT uncased WordPiece vocab file can be extracted from Google's [pretrained BERT models](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt). The GPT-2 [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
+
+Further documentation for downloading models can be found in the [NGC documentation](https://docs.nvidia.com/dgx/ngc-registry-cli-user-guide/index.html#topic_6_4_1)
+
+<a id="usage"></a>
 # Usage
-We've provided 5 scripts that pretrain BERT and 3 scripts that pretrain GPT2. Save and load model checkpoints with `--save` and `--load`. Additionally we provide GPT2 scripts for interactive text generation and zero shot evaluation of GPT2 on wikitext and LAMBADA.
 
-## BERT Pretraining
-`bash scripts/pretrain_bert.sh`
+After installation, there are several possible workflows. The most comprehensive is:
+1. Data preprocessing
+2. Pretraining
+3. Finetuning (Optional for zero-shot tasks)
+4. Downstream task evaluation or text generation
 
-This script runs single gpu BERT pretraining and is mainly for debugging purposes. The optimization arguments are set with 64-way distributed training in mind.
+However, steps 1 and 2 can be replaced by using one of the pretrained models mentioned above.
 
-To use this script place your `--train-data` in loose json format with one json per line. The text field of your json dictionaries should correspond to `--text-key`. 
+We've provided several scripts for pretraining both BERT and GPT-2 in [`examples`](./examples) directory, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText103, and LAMBADA evaluation. There is also a script for GPT-2 interactive text generation.
 
-```
-python pretrain_bert.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
-       --batch-size 4 \
-       --seq-length 512 \
-       --max-preds-per-seq 80 \
-       --max-position-embeddings 512 \
-       --train-iters 1000000 \
-       --save checkpoints/bert_345m \
-       --load checkpoints/bert_345m \
-       --resume-dataloader \
-       --train-data wikipedia \
-       --lazy-loader \
-       --tokenizer-type BertWordPieceTokenizer \
-       --tokenizer-model-type bert-large-uncased \
-       --presplit-sentences \
-       --cache-dir cache \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.0001 \
-       --lr-decay-style linear \
-       --lr-decay-iters 990000 \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --warmup .01 \
-       --fp16 \
-       --fp32-embedding
-```
+<a id="training"></a>
+# Training
+<a id="data-preprocessing"></a>
+## Data Preprocessing
+We support three file formats for training, but all require preprocessing. First, place your training data in a loose json format, with one json containing a text sample per line. For example:
+<pre>
+{"src": "www.nvidia.com", "text": "The quick brown fox", "type": "Eng", "id": "0", "title": "First Part"}
+{"src": "The Internet", "text": "jumps over the lazy dog", "type": "Eng", "id": "42", "title": "Second Part"}
+</pre>
 
-## GPT2 Pretraining
-`bash scripts/pretrain_gpt2.sh`
+The name of the `text` field of the json can be changed by using the `--json-key` flag in [`preprocess_data.py`](./tools/preprocess_data.py) The other metadata are optional and are not used in training.
 
-This script runs single gpu gpt2 pretraining and is mainly for debugging purposes. The optimization arguments are set with 64-way distributed training in mind. 
+The loose json is then processed into a binary format for training. To convert the json into mmap, cached index file, or the lazy loader format use `preprocess_data.py`. Set the `--dataset-impl` flag to `mmap`, `cached`, or `lazy`, respectively (default is `mmap`). An example script to prepare data for BERT training is:
+<pre>
+python tools/preprocess_data.py \
+       --input my-corpus.json \
+       --output-prefix my-bert \
+       --vocab bert-vocab.txt \
+       --dataset-impl mmap \
+       --tokenizer-type BertWordPieceLowerCase \
+       --split-sentences
+</pre>
 
-It follows largely the same format as the previous script with a few notable differences: the `--tokenizer-type` has been switched to a `GPT2BPETokenizer`, the `--lr-decay-style` has been switched to cosine decay, and activation checkpointing has been turned on with `--checkpoint-activations` and `--checkpoint-num-layers` set to checkpoint every `1` layers.
+The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
 
-Additionally GPT2 uses a different parameter initialization from BERT designed for training deep residual networks. To train BERT with this initialization use `--deep-init`.
-
-```
-python pretrain_gpt2.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
-       --batch-size 8 \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
-       --train-iters 320000 \
-       --save checkpoints/gpt2_345m \
-       --load checkpoints/gpt2_345m \
-       --resume-dataloader \
-       --train-data wikipedia \
-       --lazy-loader \
+Some minor modifications are required for GPT-2 data preprocessing, namely, the addition of a merge table, an end-of-document token, removal of sentence splitting, and a change to the tokenizer type:
+<pre>
+python tools/preprocess_data.py \
+       --input my-corpus.json \
+       --output-prefix my-gpt2 \
+       --vocab gpt2-vocab.json \
+       --dataset-impl mmap \
        --tokenizer-type GPT2BPETokenizer \
-       --cache-dir cache \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.00015 \
-       --lr-decay-style cosine \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --warmup .01 \
+       --merge-file gpt2-merges.txt \
+       --append-eod
+</pre>
+
+Here the output files are named `my-gpt2_text_document.bin` and `my-gpt2_text_document.idx`. As before, in GPT-2 training, use the longer name without the extension as `--data-path`.
+
+Further command line arguments are described in the source file [`preprocess_data.py`](./tools/preprocess_data.py).
+
+<a id="bert-pretraining"></a>
+## BERT Pretraining
+`bash examples/pretrain_bert.sh`
+
+This script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--warmup`. While this is single GPU training, the batch size specified by `--batch-size` is per GPU used for data parallelism. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`).
+
+The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
+
+<pre>
+CHECKPOINT_PATH=checkpoints/bert_345m
+VOCAB_FILE=bert-vocab.txt
+DATA_PATH=my-bert_text_sentence
+
+BERT_ARGS="--num-layers 24 \
+           --hidden-size 1024 \
+           --num-attention-heads 16 \
+           --seq-length 512 \
+           --max-position-embeddings 512 \
+           --lr 0.0001 \
+           --train-iters 2000000 \
+           --min-lr 0.00001 \
+           --lr-decay-iters 990000 \
+           --warmup 0.01 \
+           --batch-size 8 \
+           --vocab-file $VOCAB_FILE \
+           --split 949,50,1 \
+           --fp16"
+
+OUTPUT_ARGS="--log-interval 10 \
+             --save-interval 500 \
+             --eval-interval 100 \
+             --eval-iters 10 \
+             --checkpoint-activations"
+
+python pretrain_bert.py \
+       $BERT_ARGS \
+       $OUTPUT_ARGS \
+       --save $CHECKPOINT_PATH \
+       --load $CHECKPOINT_PATH \
+       --data-path $DATA_PATH
+</pre>
+
+Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+
+<a id="gpt-2-pretraining"></a>
+## GPT-2 Pretraining
+`bash examples/pretrain_gpt2.sh`
+
+This script runs single GPU 345M parameter GPT-2 pretraining. As mentioned above, single GPU training is primarily intended for debugging purposes, as the code is optimized for distributed training. 
+
+It follows largely the same format as the previous BERT script with a few notable differences: the tokenization scheme used is BPE (which requires a merge table and a `json` vocabulary file) instead of WordPiece, the model architecture allows for longer sequences (note that the max position embedding must be greater than or equal to the maximum sequence length), and the `--lr-decay-style` has been set to cosine decay.  Note that the `--data-path` now includes the additional `_text_document` suffix added in preprocessing, but does not include the file extensions.
+
+<pre>
+CHECKPOINT_PATH=checkpoints/gpt2_345m
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+DATA_PATH=my-gpt2_text_document
+
+GPT2_ARGS="--num-layers 24 \
+           --hidden-size 1024 \
+           --num-attention-heads 16 \
+           --seq-length 1024 \
+           --max-position-embeddings 1024 \
+           --batch-size 4 \
+           --lr 0.00015 \
+           --train-iters 500000 \
+           --lr-decay-iters 320000 \
+           --lr-decay-style cosine \
+           --vocab-file $VOCAB_FILE \
+           --merge-file $MERGE_FILE \
+           --warmup .01 \
+           --fp16"
+
+OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+
+python pretrain_gpt2.py \
+       $GPT2_ARGS \
+       $OUTPUT_ARGS \
+       --save $CHECKPOINT_PATH \
+       --load $CHECKPOINT_PATH \
+       --data-path $DATA_PATH \
+</pre>
+
+Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+
+<a id="distributed-bert-or-gpt-2-pretraining"></a>
+## Distributed BERT or GPT-2 Pretraining
+`bash examples/pretrain_bert_distributed.sh`
+
+`bash examples/pretrain_gpt2_distributed.sh`
+
+These scripts use the PyTorch distributed launcher for distributed training. As such, multinode training can be achieved by properly setting environment variables and using `init_method='env://'` in the launcher. See the official PyTorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default, multinode training uses the [nccl](https://developer.nvidia.com/nccl) distributed backend. A simple set of additional arguments and the use of the PyTorch distributed module with the Python flag `-m torch.distributed.launch`, detailed below, are the only additional requirements to adopt distributed training.
+
+The two tiers of parallelism are data and model parallelism. First, we facilitate two distributed data parallel implementations: a simple one of our own that performs gradient all-reduce at the end of back propagation step, and Torch's distributed data parallel wrapper that overlaps gradient reduction with back propagation computation. To switch between these two options use `--DDP-impl local` or `--DDP-impl torch`, respectively. As expected, Torch distributed data parallelism is more efficient at larger model parallel sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 76% when Torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
+
+Second, we developed a simple and efficient intra-layer model parallel approach. To use model parallelism, add the `--model-parallel-size` flag to specify the number of GPUs among which to split the model, along with the arguments passed to the distributed launcher as mentioned above. With `WORLD_SIZE` GPUs and `MP_SIZE` model parallel size, `WORLD_SIZE`/`MP_SIZE` GPUs will be used for data parallelism. The default value for `--model-parallel-size` is 1, which will not implement model parallelism.
+
+Other than these minor changes, the distributed training is identical to the training on a single GPU.
+
+Distributed BERT training:
+<pre>
+WORLD_SIZE=8
+MP_SIZE=2
+
+DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
+                  --nnodes 1 \
+                  --node_rank 0 \
+                  --master_addr localhost \
+                  --master_port 6000"
+
+CHECKPOINT_PATH=checkpoints/bert_345m
+VOCAB_FILE=bert-vocab.txt
+DATA_PATH=my-bert_text_sentence
+BERT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+
+python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_bert.py \
+                $BERT_ARGS \
+                $OUTPUT_ARGS \
+                --save $CHECKPOINT_PATH \
+                --load $CHECKPOINT_PATH \
+                --data-path $DATA_PATH \
+                --model-parallel-size $MP_SIZE \
+                --DDP-impl torch
+</pre>
+
+Distributed GPT-2 training:
+<pre>
+WORLD_SIZE=8
+MP_SIZE=2
+
+DISTRIBUTED_ARGS=&#60;same as those directly above&#62;
+
+CHECKPOINT_PATH=checkpoints/gpt2_345m
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+DATA_PATH=my-gpt2_text_document
+GPT2_ARGS=&#60;same as those in <a href="#gpt-2-pretraining">GPT-2 pretraining</a> above&#62;
+OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+
+python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_gpt2.py \
+                $GPT2_ARGS \
+                $OUTPUT_ARGS \
+                --save $CHECKPOINT_PATH \
+                --load $CHECKPOINT_PATH \
+                --data-path $DATA_PATH \
+                --model-parallel-size $MP_SIZE \
+                --DDP-impl torch
+
+</pre>
+
+<a id="evaluation-and-tasks"></a>
+# Evaluation and Tasks
+
+We provide several command line arguments, detailed in the scripts listed below, to handle various zero-shot and fine-tuned downstream tasks. However, you can also finetune your model from a pretrained checkpoint on other corpora as desired. To do so, simply add the `--finetune` flag and adjust the input files and training parameters within the original training script. The iteration count will be reset to zero, and the optimizer and internal state will be reinitialized. If the fine-tuning is interrupted for any reason, be sure to remove the `--finetune` flag before continuing, otherwise the training will start again from the beginning.
+
+Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this.
+
+<pre>
+MODEL_PARALLEL_SIZE=2
+
+VOCAB_FILE=bert-vocab.txt
+CHECKPOINT_PATH=checkpoints/bert_345m
+
+WORLD_SIZE=$MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
+        --model-type BERT \
+        --model-parallel-size $MODEL_PARALLEL_SIZE \
+        --tokenizer-type BertWordPieceLowerCase \
+        --vocab-file $VOCAB_FILE \
+        --num-layers 24 \
+        --hidden-size 1024 \
+        --num-attention-heads 16 \
+        --seq-length 512 \
+        --max-position-embeddings 512 \
+        --load $CHECKPOINT_PATH
+
+</pre>
+
+Several downstream tasks are described for both GPT-2 and BERT models below. They can be run in distributed and model parallel modes with the same changes used in the training scripts.
+
+<a id="gpt-2-text-generation"></a>
+## GPT-2 Text Generation
+`bash examples/generate_text.sh`
+
+We generate text samples using largely the GPT-2 pretraining script. Few changes need to make, such as we need to provide the path to the pretrained checkpoint, the length of the output samples, whether to generate texts unconditionally (`--num-samples` to denote how many samples to generate) or conditional (need to pass `--sample-input-file <filename>` where each line of the file will be used as the conditional texts). There are few optional parameters to play, e.g. `top-k`, `top-p`, or `greedy` (set top-k and top-p to 0) sampling..
+
+<pre>
+CHECKPOINT_PATH=checkpoints/gpt2_345m
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+GPT2_ARGS=&#60;same as those in <a href="#gpt-2-pretraining">GPT-2 pretraining</a> above&#62;
+
+MAX_OUTPUT_SEQUENCE_LENGTH=1024
+TEMPERATURE=1.0
+TOP_P=0.9
+NUMBER_OF_SAMPLES=2
+OUTPUT_FILE=samples.json
+
+python tools/generate_samples_gpt2.py \
+       $GPT2_ARGS \
+       --load $CHECKPOINT_PATH \
+       --out-seq-length $MAX_OUTPUT_SEQUENCE_LENGTH \
+       --temperature $TEMPERATURE \
+       --genfile $OUTPUT_FILE \
+       --num-samples $NUMBER_OF_SAMPLES \
+       --top_p $TOP_P \
+       --recompute
+</pre>
+
+<a id="gpt-2-evaluation"></a>
+## GPT-2 Evaluation
+We include example scripts for GPT-2 evaluation on WikiText perplexity evaluation and LAMBADA Cloze accuracy.
+
+<a id="wikitext-perplexity-evaluation"></a>
+### WikiText Perplexity Evaluation
+For even comparison with prior works, we evaluate perplexity on the word-level [WikiText-103 test dataset](https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip), and appropriately compute perplexity given the change in tokens when using our subword tokenizer.
+
+We use the following command to run WikiText-103 evaluation on a 345M parameter model.
+<pre>
+TASK="WIKITEXT103"
+
+VALID_DATA=&#60;wikitext path&#62;.txt
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+CHECKPOINT_PATH=checkpoints/gpt2_345m
+
+COMMON_TASK_ARGS="--num-layers 24 \
+                  --hidden-size 1024 \
+                  --num-attention-heads 16 \
+                  --seq-length 1024 \
+                  --max-position-embeddings 1024 \
+                  --fp16 \
+                  --vocab-file $VOCAB_FILE"
+
+python tasks/main.py \
+       --task $TASK \
+       $COMMON_TASK_ARGS \
+       --valid-data $VALID_DATA \
+       --tokenizer-type GPT2BPETokenizer \
+       --merge-file $MERGE_FILE \
+       --load $CHECKPOINT_PATH \
+       --batch-size 8 \
        --checkpoint-activations \
-       --fp16
-```
-
-## GPT2 Text Generation
-`bash scripts/generate_text.sh`
-
-Starts an interactive terminal session that generates text either conditionally or unconditionally depending on what the user enters into the prompt. Specify the model in the script by setting the `CHECKPOINT_PATH` variable and the appropriate model configuration. 
-
-The script is capable of greedy sampling, top-k, or top-p sampling as specified by the appropriate variables within the script.
-
-## GPT2 Evaluation
-We support 3 modes of GPT2 evaluation with [`./scripts/run_gpt2_eval.py`](./scripts/run_gpt2_eval.py): wikitext ppl evaluation, lambada cloze accuracy, large corpora ppl evaluation.
-
-### Wikitext PPL evaluation
-For even comparison with prior works we evaluate wikitext perplexity on the word-level wikitext test dataset, which can be downloaded [here](https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip), and appropriately compute perplexity given the change in tokens when using our subword tokenizer.
-
-We use the following command to run wikitext evaluation:
-
-```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <wikitext_tokens_test_path> \
-  --batch-size 16 \
-  --cache-dir cache
-```
-
-### Lambada Cloze Accuracy
-To compute Lambada cloze accuracy (the accuracy of predicting the last token given the preceding tokens) we utilize a detokenized, processed version of the Lambada dataset we sourced from [here](https://github.com/cybertronai/bflm/blob/master/lambada_test.jsonl).
-
-We use the following command to run lambada evaluation:
-
-```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <lambada_test_path> \
-  --batch-size 16 \
-  --cloze-eval \
-  --cache-dir cache
-```
-
-### Large Corpora PPL evaluation
-This functionality allows one to evaluate the gpt2 model on a loose json file. With the following command we evaluate the gpt2 model for 5000 iterations at a batch size of 16 on a webtext test data split. We recommend that the user presplit their dataset before training a model according to the procedure outlined [below](#partitioning-datasets-into-train-val-test).
-
-```
-python scripts/run_gpt2_eval.py \
-  --model-parallel-size 1 \
-  --num-layers 24 \
-  --hidden-size 1024 \
-  --num-attention-heads 16 \
-  --model-path <gpt2_345_path> \
-  --data-path <webtext_test_path> \
-  --batch-size 16 \
-  --eval-iters 5000 \
-  --webtext-eval \
-  --cache-dir cache
-```
-
-## Distributed BERT or GPT2 Pretraining
-`bash scripts/pretrain_bert_distributed.sh` or `bash scripts/pretrain_gpt2_distributed.sh`
-
-To use these scripts, follow the same data preparation procedure as in earlier sections. This script uses the pytorch distributed launcher to launch distributed training. As such, multinode training can be achieved by properly setting environment variables for the `env://` init method. See the official pytorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default multinode training uses the nccl distributed backend.
-
-## Model Parallel BERT or GPT2 Pretraining
-`bash scripts/pretrain_bert_model_parallel.sh` or `bash scripts/pretrain_gpt2_model_parallel.sh`
-
-These scripts build upon the distributed training scripts and are identical in setup. They differ in use of the `--model-parallel-size` flag. For model parallelism of 2 and a world size of 8, the scripts will launch training with 4-way distributed data parallelism and 2-way model parallelism.
-
-We note that we have experimented with multiple distributed data parallel implementations: a simple one of our own which performs gradient all-reduce at the end of back propagation step, and torch's distributed data parallel wrapper which overlaps gradient reduction with back propagation computation. To switch between these two options toggle the `USE_TORCH_DDP` flag (the default is set to `False` and uses our DDP implementation) at the top of `pretrain_bert.py` and `pretrain_gpt2.py`. We find that torch distributed data parallelism is more efficient at larger model parallel sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 74% when torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
-
-## Distributed BERT Pretraining with TFRecords
-`bash scripts/pretrain_bert_tfrecords_distributed.sh`
-
-This script takes advantage of TensorFlow BERT's [`create_pretraining.py`](https://github.com/NVIDIA/DeepLearningExamples/blob/master/TensorFlow/LanguageModeling/BERT/create_pretraining_data.py) script to pre-cache the dataset in the TFRecord format. To convert the data to pytorch tensors we use a `TFRecordDataset` and tensorflow eager mode to turn the TFRecords into numpy matrices before loading them into pytorch gpu tensors. This greatly reduces the overhead of dataprocessing and speeds up training. Pass a whitespace-separated list of TFRecord paths to `--train-data` and enable the `--use-tfrecords` flag. Multinode training can be achieved as described in the [previous section](#distributed-bert-pretraining).
-
-## Train Custom Sentence Piece Tokenizer and Pretrain BERT
-`bash scripts/pretrain_bert_sentencepiece.sh`
-
-This script runs BERT pretraining with a `sentencepiece` tokenizer. If no sentencepiece tokenizer exists at `--tokenizer-path` one will be trained automatically. The sentencepiece tokenizer can be used with the previous scripts (NOTE: sentencepiece training can only happen during single gpu pretraining). `<--tokenizer-path>.vocab` can be used with [`create_pretraining_data.py`](https://github.com/NVIDIA/DeepLearningExamples/blob/master/TensorFlow/LanguageModeling/BERT/create_pretraining_data.py) to make a TFRecord dataset with the given tokenization.
+       --log-interval 10 \
+       --no-load-optim \
+       --no-load-rng
+</pre>
 
 
-# Data sets
-We do not host any datasets for GPT2 or BERT training, however, we detail their collection so that our results may be reproduced.
+<a id="lambada-cloze-accuracy"></a>
+### LAMBADA Cloze Accuracy
+To compute LAMBADA cloze accuracy (the accuracy of predicting the last token given the preceeding tokens) we utilize a detokenized, processed version of the [LAMBADA dataset](https://github.com/cybertronai/bflm/blob/master/lambada_test.jsonl).
 
+We use the following command to run LAMBADA evaluation on a 345M parameter model. Note that the `--strict-lambada` flag should be used to require whole word matching. Make that `lambada` is part of the file path.
+
+<pre>
+TASK="LAMBADA"
+
+VALID_DATA=&#60;lambada path&#62;.json
+VOCAB_FILE=gpt2-vocab.json
+MERGE_FILE=gpt2-merges.txt
+CHECKPOINT_PATH=checkpoints/gpt2_345m
+COMMON_TASK_ARGS=&#60;same as those in <a href="#wikitext-perplexity-evaluation">WikiText Perplexity Evaluation</a> above&#62;
+
+python tasks/main.py \
+       --task $TASK \
+       $COMMON_TASK_ARGS \
+       --valid-data $VALID_DATA \
+       --tokenizer-type GPT2BPETokenizer \
+       --strict-lambada \
+       --merge-file $MERGE_FILE \
+       --load $CHECKPOINT_PATH \
+       --batch-size 8 \
+       --checkpoint-activations \
+       --log-interval 10 \
+       --no-load-optim \
+       --no-load-rng
+</pre>
+
+Further command line arguments are described in the source file [`main.py`](./tasks/main.py)
+
+<a id="bert-task-evaluation"></a>
+## BERT Task Evaluation
+<a id="race-evaluation"></a>
+### RACE Evaluation
+The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/). The `TRAIN_DATA` and `VALID_DATA` directory contain the RACE dataset as separate `.txt` files.
+
+<pre>
+TRAIN_DATA="data/RACE/train/middle"
+VALID_DATA="data/RACE/dev/middle \
+            data/RACE/dev/high"
+VOCAB_FILE=bert-vocab.txt
+PRETRAINED_CHECKPOINT=checkpoints/bert_345m
+CHECKPOINT_PATH=checkpoints/bert_345m_race
+COMMON_TASK_ARGS="--num-layers 24 \
+                  --hidden-size 1024 \
+                  --num-attention-heads 16 \
+                  --seq-length 512 \
+                  --max-position-embeddings 512 \
+                  --fp16 \
+                  --vocab-file $VOCAB_FILE"
+
+COMMON_TASK_ARGS_EXT="--train-data $TRAIN_DATA \
+                      --valid-data $VALID_DATA \
+                      --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
+                      --checkpoint-activations \
+                      --save-interval 10000 \
+                      --save $CHECKPOINT_PATH \
+                      --log-interval 100 \
+                      --eval-interval 1000 \
+                      --eval-iters 10 \
+                      --weight-decay 1.0e-1"
+
+python tasks/main.py \
+       --task RACE \
+       $COMMON_TASK_ARGS \
+       $COMMON_TASK_ARGS_EXT \
+       --tokenizer-type BertWordPieceLowerCase \
+       --epochs 3 \
+       --batch-size 4 \
+       --lr 1.0e-5 \
+       --warmup 0.06
+</pre>
+
+<a id="mnli-evaluation"></a>
+### MNLI Evaluation
+The following script finetunes the BERT model for evaluation with the [MultiNLI sentence pair corpus](https://www.nyu.edu/projects/bowman/multinli/). Because the matching tasks are quite similar, the script can be quickly tweaked to work with the [Quora Question Pairs](https://www.kaggle.com/quora/question-pairs-dataset) (QQP) dataset as well.
+
+<pre>
+
+TRAIN_DATA="data/glue_data/MNLI/train.tsv"
+VALID_DATA="data/glue_data/MNLI/dev_matched.tsv \
+            data/glue_data/MNLI/dev_mismatched.tsv"
+PRETRAINED_CHECKPOINT=checkpoints/bert_345m
+VOCAB_FILE=bert-vocab.txt
+CHECKPOINT_PATH=checkpoints/bert_345m_mnli
+COMMON_TASK_ARGS=&#60;same as those in <a href="#race-evaluation">RACE Evaluation</a> above&#62;
+COMMON_TASK_ARGS_EXT=&#60;same as those in <a href="#race-evaluation">RACE Evaluation</a> above&#62;
+
+python tasks/main.py \
+       --task MNLI \
+       $COMMON_TASK_ARGS \
+       $COMMON_TASK_ARGS_EXT \
+       --tokenizer-type BertWordPieceLowerCase \
+       --epochs 5 \
+       --batch-size 8 \
+       --lr 5.0e-5 \
+       --warmup 0.065
+</pre>
+
+<a id="datasets"></a>
+# Datasets
+We do not host any datasets for GPT-2 or BERT training, however, we detail their collection so that our results may be reproduced.
+
+<a id="collecting-wikipedia-training-data"></a>
 ## Collecting Wikipedia Training Data
-We recommend following the wikipedia data extraction process specified by google research: "the recommended pre-processing is to download [the latest dump](https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2), extract the text with [WikiExtractor.py](https://github.com/attardi/wikiextractor), and then apply any necessary cleanup to convert it into plain text." 
+We recommend following the Wikipedia data extraction process specified by Google research: "the recommended pre-processing is to download [the latest dump](https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2), extract the text with [WikiExtractor.py](https://github.com/attardi/wikiextractor), and then apply any necessary cleanup to convert it into plain text." 
 
-We recommend using the `--json` argument when using WikiExtractor, which will dump the wikipedia data into loose json format (one json per line), making it more manageable and readily consumable by our codebase. We recommend further preprocessing this json dataset by preprocessing the dataset with nltk punctuation standardization, and presplitting each document into newline separated sentences. This can be done with the provided script `./scripts/presplit_sentences_json.py` and will allow for faster data processing during training time. Pretraining with presplit data should be run with the `--presplit-sentences` flag as shown above. (Note that if you'd like to use wikipedia data for GPT2 training you should still clean it with nltk/spacy/ftfy, but do not split it into newline seperated sentences)
+We recommend using the `--json` argument when using WikiExtractor, which will dump the Wikipedia data into loose json format (one json per line), making it more manageable on the file system and also readily consumable by our codebase. We recommend further preprocessing this json dataset by nltk punctuation standardization. For BERT training, add newlines between sentences during data preprocessing. This is done with the `--split-sentences` flag in `preprocess_data.py` as described [above](#data-preprocessing). (Note that if you'd like to use Wikipedia data for GPT-2 training you should still clean it with nltk/spacy/ftfy, but do not split it into newline separated sentences.)
 
-Once the json dataset is ready make sure to set the path in line 27 of `data_utils/corpora.py`.
-
-If your system is memory limited we also recommend running pretraining with the `--lazy-loader` argument as we've done. After preprocessing the dataset once, this will allow the dataset to be lazily loaded from disk, as opposed to storing it in memory. Make sure to run the code once on a 
-
-## Collecting GPT2 Webtext Data
-We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filtered, cleaned, and deduplicated all downloaded content according to the procedure described in our [openwebtext](./openwebtext) directory. For reddit URLS corresponding to content upto october 2018 we arrived at approximately 37GB of content.
-
-We recommend creating an alias for this dataset as described below.
-
-## Aliasing datasets with corpora.py
-As mentioned in the previous Wikipedia data section we recommend aliasing datasets with human readable names (eg. `--train-data wikipedia`). This helps avoid forgetting arguments when submitting jobs, and allows one to combine datasets that would otherwise require different commandline options/data structures.
-
-Examples of how to create these dataset objects can be found in [`./data_utils/corpora.py`](./data_utils/corpora.py). We recommend that the objects inherit from or adhere to the interface laid out by `torch.utils.data.Dataset` objects.
-
-Any created datasets should be then added to the `NAMED_CORPORA` dictionary object in [`./data_utils/corpora.py`](./data_utils/corpora.py). At runtime one can specify one or more corpora from the commandline with `--train-data corpus1 corpus2 corpus3`, `--valid-data corpus1 corpus2 corpus3`, or `--test-data ...`.
-
-## Partitioning datasets into Train/Val/Test
-We support multiple ways to partition corpora into train/val/test splits. By specifying a `--split 95,5` commandline argument, the corpora specified by `--train-data` will have it's documents split proportionally into a 95%, 5% train/val split. The split is performed lazily on the fly and is efficient and deterministic from run to run given the same `--seed`. Note that if `--valid-data` or `--test-data` is specified then the train data will still be split accordingly, but `--valid-data`/`--test-data` will still be used as the validation/test source.
-
-We do realize that this method, while effective, introduces noise into the development process, since different seeds will change the dataset and outcome. To have fixed training/validation/test sets across all your runs please utilize our script [`./scripts/split_json.py`](./scripts/split_json.py)
+<a id="collecting-gpt-2-webtext-data"></a>
+## Collecting GPT-2 Webtext Data
+We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filtered, cleaned, and deduplicated all downloaded content according to the procedure described in our [openwebtext](./tools/openwebtext) directory. For reddit URLs corresponding to content up to October 2018 we arrived at approximately 37GB of content.

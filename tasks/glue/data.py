@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -48,10 +48,8 @@ class GLUEAbstractDataset(ABC, Dataset):
         print_rank_0('  >> total number of samples: {}'.format(
             len(self.samples)))
 
-
     def __len__(self):
         return len(self.samples)
-
 
     def __getitem__(self, idx):
         raw_sample = self.samples[idx]
@@ -61,7 +59,6 @@ class GLUEAbstractDataset(ABC, Dataset):
         sample = build_sample(ids, types, paddings,
                               raw_sample['label'], raw_sample['uid'])
         return sample
-
 
     @abstractmethod
     def process_samples_from_single_path(self, datapath):

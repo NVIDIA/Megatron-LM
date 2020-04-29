@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@ import argparse
 import os
 
 
-def parse_args(extra_args_provider=None, defaults={}):
+def parse_args(extra_args_provider=None, defaults={},
+               ignore_unknown_args=False):
     """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments')
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
+                                     allow_abbrev=False)
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -35,24 +37,16 @@ def parse_args(extra_args_provider=None, defaults={}):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
-    # TODO: Refactor
-    parser = _add_gpt2_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
 
     # Parse.
-    args = parser.parse_args()
-
-    # Set input defaults.
-    for key in defaults:
-        # For default to be valid, it should not be provided in the
-        # arguments that are passed to the program. We check this by
-        # ensuring the arg is set to None.
-        assert getattr(args, key) is None, \
-            'defaults can only be overwritten for args with None values.'
-        setattr(args, key, defaults[key])
+    if ignore_unknown_args:
+        args, _ = parser.parse_known_args()
+    else:
+        args = parser.parse_args()
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
@@ -66,6 +60,26 @@ def parse_args(extra_args_provider=None, defaults={}):
     args.dynamic_loss_scale = False
     if args.loss_scale is None:
         args.dynamic_loss_scale = True
+
+    # Set input defaults.
+    for key in defaults:
+        # For default to be valid, it should not be provided in the
+        # arguments that are passed to the program. We check this by
+        # ensuring the arg is set to None.
+        if getattr(args, key) is not None:
+            if args.rank == 0:
+                print('WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(key=key, v=defaults[key],
+                                               v2=getattr(args, key)),
+                                               flush=True)
+        else:
+            setattr(args, key, defaults[key])
+
+    # Check required arguments.
+    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+                     'max_position_embeddings']
+    for req_arg in required_args: 
+        _check_arg_is_not_none(args, req_arg)
 
     # Checks.
     assert args.hidden_size % args.num_attention_heads == 0
@@ -93,16 +107,20 @@ def _print_args(args):
         print('---------------- end of arguments ----------------', flush=True)
 
 
+def _check_arg_is_not_none(args, arg):
+    assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
+
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
-    group.add_argument('--num-layers', type=int, required=True,
+    group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
-    group.add_argument('--hidden-size', type=int, required=True,
+    group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
-    group.add_argument('--num-attention-heads', type=int, required=True,
+    group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
-    group.add_argument('--max-position-embeddings', type=int, required=True,
+    group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
@@ -114,6 +132,10 @@ def _add_network_size_args(parser):
                        action='store_true',
                        help='If set, use original BERT residula connection '
                        'ordering.')
+    group.add_argument('--openai-gelu', action='store_true',
+                       help='Use OpenAIs GeLU implementation. This option'
+                       'should not be used unless for backward compatibility'
+                       'reasons.')
 
     return parser
 
@@ -322,6 +344,7 @@ def _add_data_args(parser):
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',
+                                'BertWordPieceCase',
                                 'GPT2BPETokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--data-impl', type=str, default='infer',
@@ -348,31 +371,3 @@ def _add_autoresume_args(parser):
                        'termination signal')
 
     return parser
-
-
-########################################################################
-
-
-def _add_gpt2_args(parser):
-    group = parser.add_argument_group(title='gpt2')
-
-    group.add_argument('--input-data-sizes-file', type=str, default='sizes.txt',
-                       help='The filename containing all the shards '
-                       'sizes for numpy data loader')
-
-    return parser
-
-
-
-def add_data_args_(parser):
-    """Train/valid/test data arguments."""
-
-    group = parser.add_argument_group('data', 'data configurations')
-
-    group.add_argument('--data-loader', type=str, default=None,
-                       choices=['raw', 'lazy', 'tfrecords', 'numpy', 'binary'],
-                       help='Which data loader to use. Default varies by model.')
-
-
-    return parser
-

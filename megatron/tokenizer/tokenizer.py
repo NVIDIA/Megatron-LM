@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,9 @@ def build_tokenizer(args):
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True)
+    elif args.tokenizer_type == 'BertWordPieceCase':
+        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                            lower_case=False)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
@@ -53,7 +56,7 @@ def _vocab_size_with_padding(orig_vocab_size, args):
 
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
-               args.model_parallel_size
+        args.model_parallel_size
     while (after % multiple) != 0:
         after += 1
     if args.rank == 0:
@@ -134,7 +137,7 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         self.cls_id = self.tokenizer.vocab['[CLS]']
         self.sep_id = self.tokenizer.vocab['[SEP]']
         self.pad_id = self.tokenizer.vocab['[PAD]']
-        self.mask_id = self.tokenizer.vocab['[MASK]']  
+        self.mask_id = self.tokenizer.vocab['[MASK]']
 
     @property
     def vocab_size(self):
@@ -167,6 +170,7 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     @property
     def mask(self):
         return self.mask_id
+
 
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""

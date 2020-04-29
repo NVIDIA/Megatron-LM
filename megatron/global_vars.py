@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,22 +61,26 @@ def get_timers():
     return _GLOBAL_TIMERS
 
 
-def set_global_variables(extra_args_provider=None, args_defaults={}):
+def set_global_variables(extra_args_provider=None, args_defaults={},
+                         ignore_unknown_args=False):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
     args = _parse_args(extra_args_provider=extra_args_provider,
-                       defaults=args_defaults)
+                       defaults=args_defaults,
+                       ignore_unknown_args=ignore_unknown_args)
     _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers()
 
 
-def _parse_args(extra_args_provider=None, defaults={}):
+def _parse_args(extra_args_provider=None, defaults={},
+                ignore_unknown_args=False):
     """Parse entire arguments."""
     global _GLOBAL_ARGS
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
-                              defaults=defaults)
+                              defaults=defaults,
+                              ignore_unknown_args=ignore_unknown_args)
     return _GLOBAL_ARGS
 
 
@@ -124,7 +128,7 @@ def _set_adlr_autoresume(args):
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
             from userlib.auto_resume import AutoResume
-        except:
+        except BaseException:
             print('ADLR autoresume is not available, exiting ...')
             sys.exit()
 

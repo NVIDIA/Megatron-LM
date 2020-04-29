@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
-from megatron.checkpointing  import load_checkpoint
+from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
@@ -53,7 +53,7 @@ def _cross_entropy_forward_step(batch, model):
     timers('batch generator').start()
     try:
         batch_ = next(batch)
-    except:
+    except BaseException:
         batch_ = batch
     tokens, types, labels, attention_mask = process_batch(batch_)
     timers('batch generator').stop()
@@ -146,7 +146,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
     # For each remaining epoch
     timers('interval time').start()
     for epoch in range(start_epoch, args.epochs):
-        print_rank_0('working on epoch {} ...'.format(epoch+1))
+        print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
         train_dataloader.sampler.set_epoch(args.seed + epoch)
@@ -172,7 +172,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                                               report_memory_flag)
 
             # Autoresume
-            if args.adlr_autoresume  and \
+            if args.adlr_autoresume and \
                (iteration % args.adlr_autoresume_interval == 0):
                 check_adlr_autoresume_termination(iteration, model,
                                                   optimizer, lr_scheduler)

@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -131,11 +131,14 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 def copy_to_model_parallel_region(input_):
     return _CopyToModelParallelRegion.apply(input_)
 
+
 def reduce_from_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
+
 def scatter_to_model_parallel_region(input_):
     return _ScatterToModelParallelRegion.apply(input_)
+
 
 def gather_from_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)
