@@ -46,9 +46,6 @@ def build_simple_training_sample(sample, target_seq_length, max_seq_length,
         = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
                                    masked_labels, pad_id, max_seq_length)
 
-    # REALM true sequence length is twice as long but none of that is to be predicted with LM
-    # loss_mask_np = np.concatenate((loss_mask_np, np.ones(loss_mask_np.shape)), -1).astype(np.int64)
-
     train_sample = {
         'tokens': tokens_np,
         'labels': labels_np,

@@ -184,6 +184,8 @@ def _add_training_args(parser):
 def _add_initialization_args(parser):
     group = parser.add_argument_group(title='initialization')
 
+    group.add_argument('--debug', action='store_true',
+                       help='Run things in debug mode')
     group.add_argument('--seed', type=int, default=1234,
                        help='Random seed used for python, numpy, '
                        'pytorch, and cuda.')

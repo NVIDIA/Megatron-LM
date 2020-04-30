@@ -29,6 +29,7 @@ from megatron.utils import reduce_losses
 
 num_batches = 0
 
+
 def model_provider(only_query_model=False, only_block_model=False):
     """Build the model."""
     args = get_args()
@@ -103,7 +104,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid and test datasets."""
     args = get_args()
     print_rank_0('> building train, validation, and test datasets '
-                 'for BERT ...')
+                 'for BERT ICT...')
 
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
