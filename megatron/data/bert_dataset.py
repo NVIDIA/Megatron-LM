@@ -26,7 +26,7 @@ from megatron import get_tokenizer
 from megatron import mpu
 from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
-from megatron.data.ict_dataset import InverseClozeDataset
+from megatron.data.realm_dataset import InverseClozeDataset
 from megatron import print_rank_0
 
 DATASET_TYPES = ['standard_bert', 'ict', 'realm']
