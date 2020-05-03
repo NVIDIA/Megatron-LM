@@ -18,7 +18,8 @@
 import torch
 import torch.nn.functional as F
 
-from hashed_index import HashedIndex, load_ict_checkpoint, get_ict_dataset
+from hashed_index import load_ict_checkpoint, get_ict_dataset
+from megatron.data.realm_dataset import HashedIndex
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
