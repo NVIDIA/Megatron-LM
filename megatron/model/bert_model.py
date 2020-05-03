@@ -284,10 +284,11 @@ class REALMBertModel(MegatronModule):
 
 class REALMRetriever(MegatronModule):
     """Retriever which uses a pretrained ICTBertModel and a HashedIndex"""
-    def __init__(self, ict_model, ict_dataset, hashed_index, top_k=5):
+    def __init__(self, ict_model, ict_dataset, block_data, hashed_index, top_k=5):
         super(REALMRetriever, self).__init__()
         self.ict_model = ict_model
         self.ict_dataset = ict_dataset
+        self.block_data = block_data
         self.hashed_index = hashed_index
         self.top_k = top_k
 
@@ -320,8 +321,8 @@ class REALMRetriever(MegatronModule):
                         block_buckets[j] = block_buckets[i].copy()
 
         # [batch_size x max_bucket_population x embed_size]
-        block_embeds = [torch.cuda.FloatTensor(np.array([self.hashed_index.get_block_embed(arr[3])
-                                                        for arr in bucket])) for bucket in block_buckets]
+        block_embeds = [torch.cuda.FloatTensor(np.array([self.block_data.embed_data[idx]
+                                                         for idx in bucket])) for bucket in block_buckets]
 
         all_top5_tokens, all_top5_pad_masks = [], []
         for query_embed, embed_tensor, bucket in zip(query_embeds, block_embeds, block_buckets):
