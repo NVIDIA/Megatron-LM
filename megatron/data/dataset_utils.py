@@ -23,9 +23,9 @@ import itertools
 
 import numpy as np
 from megatron import print_rank_0
-from megatron.data.bert_dataset import DATASET_TYPES, get_indexed_dataset_, get_train_valid_test_split_, BertDataset
-from megatron.data.realm_dataset import InverseClozeDataset
+from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_, BertDataset
 
+DATASET_TYPES = ['standard_bert', 'ict', 'realm']
 
 def compile_helper():
     """Compile helper function ar runtime. Make sure this
@@ -454,6 +454,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     print_split_stats('test', 2)
 
     def build_dataset(index, name):
+        from megatron.data.realm_dataset import InverseClozeDataset
         from megatron.data.realm_dataset import RealmDataset
         dataset = None
         if splits[index + 1] > splits[index]:

@@ -24,11 +24,9 @@ from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.data.dataset_utils import build_training_sample
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron import print_rank_0
 
-DATASET_TYPES = ['standard_bert', 'ict', 'realm']
 
 
 class BertDataset(Dataset):
@@ -64,6 +62,7 @@ class BertDataset(Dataset):
         self.sep_id = tokenizer.sep
         self.mask_id = tokenizer.mask
         self.pad_id = tokenizer.pad
+        from megatron.data.dataset_utils import build_training_sample
         self.build_sample_fn = build_training_sample
 
     def __len__(self):

@@ -3,11 +3,14 @@ import os
 import pickle
 import shutil
 
-from hashed_index import detach
 import numpy as np
 import torch
 
 from megatron import get_args
+
+
+def detach(tensor):
+    return tensor.detach().cpu().numpy()
 
 
 class BlockData(object):
@@ -43,7 +46,7 @@ class BlockData(object):
             if not allow_overwrite and idx in self.embed_data:
                 raise ValueError("Unexpectedly tried to overwrite block data")
 
-            self.embed_data[idx] = embed
+            self.embed_data[idx] = np.float16(embed)
             self.meta_data[idx] = meta
 
     def save_shard(self, rank):
@@ -213,7 +216,7 @@ class RandProjectionLSHIndex(object):
 
     def hash_embeds(self, embeds, write_block_data=None):
         """Hash a tensor of embeddings using a random projection matrix"""
-        embed_scores_pos = torch.matmul(embeds, torch.cuda.FloatTensor(self.hash_matrix))
+        embed_scores_pos = torch.matmul(embeds, torch.cuda.HalfTensor(self.hash_matrix))
         embed_scores = torch.cat((embed_scores_pos, -embed_scores_pos), axis=1)
         embed_hashes = detach(torch.argmax(embed_scores, axis=1))
 
@@ -226,7 +229,7 @@ class RandProjectionLSHIndex(object):
     def hash_whitened_block_embeds(self, block_data):
         """Transform all block embeds to have zero mean and unit covariance
         when treated as samples from a distribution"""
-        block_idx, all_embeds = zip(block_data.embed_data.items())
+        block_idx, all_embeds = zip(*block_data.embed_data.items())
         arr_embeds = np.transpose(np.array(all_embeds))
 
         mean = np.mean(arr_embeds, axis=1).reshape(-1, 1)

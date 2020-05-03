@@ -12,7 +12,7 @@ from megatron import get_tokenizer, print_rank_0, mpu
 from megatron.data.bert_dataset import BertDataset
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 
-qa_nlp = spacy.load('en_core_web_lg')
+#qa_nlp = spacy.load('en_core_web_lg')
 
 
 class RealmDataset(BertDataset):

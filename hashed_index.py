@@ -6,16 +6,12 @@ from megatron import mpu
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.bert_dataset import get_indexed_dataset_
 from megatron.data.realm_dataset import InverseClozeDataset
-from megatron.data.realm_index import BlockData, RandProjectionLSHIndex
+from megatron.data.realm_index import detach, BlockData, RandProjectionLSHIndex
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
 from megatron.training import get_model
 from pretrain_bert_ict import get_batch, model_provider
-
-
-def detach(tensor):
-    return tensor.detach().cpu().numpy()
 
 
 def test_retriever():
@@ -71,25 +67,26 @@ def main():
     i = 1
     total = 0
     while True:
-        try:
-            query_tokens, query_pad_mask, \
-            block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
-        except:
-            break
-
-        block_index_data = detach(block_index_data)
-        block_indices = block_index_data[:, 3]
-        block_meta = block_index_data[:, :3]
-
-        block_logits = model(None, None, block_tokens, block_pad_mask, only_block=True)
-        all_block_data.add_block_data(block_indices, block_logits, block_meta)
-
-        total += block_indices.size
-        i += 1
-        if i % 20 == 0:
-            print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
-            if args.debug:
+        with torch.no_grad():
+            try:
+                query_tokens, query_pad_mask, \
+                block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
+            except:
                 break
+
+            block_index_data = detach(block_index_data)
+            block_indices = block_index_data[:, 3]
+            block_meta = block_index_data[:, :3]
+
+            block_logits = detach(model(None, None, block_tokens, block_pad_mask, only_block=True))
+            all_block_data.add_block_data(block_indices, block_logits, block_meta)
+
+            total += block_indices.size
+            i += 1
+            if i % 20 == 0:
+                print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
+                if args.debug:
+                    break
 
     all_block_data.save_shard(args.rank)
     torch.distributed.barrier()
