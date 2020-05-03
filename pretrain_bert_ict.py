@@ -22,7 +22,7 @@ from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
-from megatron.data.bert_dataset import build_train_valid_test_datasets
+from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import ICTBertModel
 from megatron.training import pretrain
 from megatron.utils import reduce_losses
