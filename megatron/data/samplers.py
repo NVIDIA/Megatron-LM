@@ -82,7 +82,10 @@ class DistributedBatchSampler(data.sampler.BatchSampler):
     (sequential, random, WeightedRandomSampler, etc.) with this batch
     sampler.
     
-    The `interleave` argument specifies how to distribute a batch.
+    The `interleave` argument specifies how to distribute a batch. A value
+    of True combined with the above random sampler is equivalent to pytorch's
+    torch.utils.data.distributed.DistributedSampler.
+
     For the following batch [0,1,2,3,4,5,6,7] and data parallelism of 2 
     specifying True will result in the following samples for each gpu:
         GPU0: [0,2,4,6] GPU1: [1,3,5,7]
