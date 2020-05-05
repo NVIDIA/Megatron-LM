@@ -21,40 +21,43 @@ class REALMBertModel(MegatronModule):
         self._lm_key = 'realm_lm'
 
         self.retriever = retriever
+        self.top_k = self.retriever.top_k
         self._retriever_key = 'retriever'
 
-    def forward(self, tokens, attention_mask):
-        # [batch_size x 5 x seq_length]
-        top5_block_tokens, top5_block_attention_mask = self.retriever.retrieve_evidence_blocks(tokens, attention_mask)
+    def forward(self, tokens, attention_mask, query_block_indices):
+        # [batch_size x k x seq_length]
+        topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
+            tokens, attention_mask, query_block_indices=query_block_indices, include_null_doc=True)
         batch_size = tokens.shape[0]
 
-        seq_length = top5_block_tokens.shape[2]
-        top5_block_tokens = torch.cuda.LongTensor(top5_block_tokens).reshape(-1, seq_length)
-        top5_block_attention_mask = torch.cuda.LongTensor(top5_block_attention_mask).reshape(-1, seq_length)
+        seq_length = topk_block_tokens.shape[2]
+        topk_block_tokens = torch.cuda.LongTensor(topk_block_tokens).reshape(-1, seq_length)
+        topk_block_attention_mask = torch.cuda.LongTensor(topk_block_attention_mask).reshape(-1, seq_length)
 
-        # [batch_size x 5 x embed_size]
+        # [batch_size x k x embed_size]
         true_model = self.retriever.ict_model.module.module
-        fresh_block_logits = true_model.embed_block(top5_block_tokens, top5_block_attention_mask).reshape(batch_size, 5, -1)
+        fresh_block_logits = true_model.embed_block(topk_block_tokens, topk_block_attention_mask)
+        fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1)
 
         # [batch_size x embed_size x 1]
         query_logits = true_model.embed_query(tokens, attention_mask).unsqueeze(2)
 
-        # [batch_size x 5]
+        # [batch_size x k]
         fresh_block_scores = torch.matmul(fresh_block_logits, query_logits).squeeze()
         block_probs = F.softmax(fresh_block_scores, dim=1)
 
-        # [batch_size * 5 x seq_length]
-        tokens = torch.stack([tokens.unsqueeze(1)] * 5, dim=1).reshape(-1, seq_length)
-        attention_mask = torch.stack([attention_mask.unsqueeze(1)] * 5, dim=1).reshape(-1, seq_length)
+        # [batch_size * k x seq_length]
+        tokens = torch.stack([tokens.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
+        attention_mask = torch.stack([attention_mask.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
 
-        # [batch_size * 5 x 2 * seq_length]
-        all_tokens = torch.cat((tokens, top5_block_tokens), axis=1)
-        all_attention_mask = torch.cat((attention_mask, top5_block_attention_mask), axis=1)
+        # [batch_size * k x 2 * seq_length]
+        all_tokens = torch.cat((tokens, topk_block_tokens), axis=1)
+        all_attention_mask = torch.cat((attention_mask, topk_block_attention_mask), axis=1)
         all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
 
-        # [batch_size x 5 x 2 * seq_length x vocab_size]
+        # [batch_size x k x 2 * seq_length x vocab_size]
         lm_logits, _ = self.lm_model.forward(all_tokens, all_attention_mask, all_token_types)
-        lm_logits = lm_logits.reshape(batch_size, 5, 2 * seq_length, -1)
+        lm_logits = lm_logits.reshape(batch_size, self.top_k, 2 * seq_length, -1)
         return lm_logits, block_probs
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
@@ -101,24 +104,27 @@ class REALMRetriever(MegatronModule):
             block_text = self.ict_dataset.decode_tokens(block)
             print('\n    > Block {}: {}'.format(i, block_text))
 
-    def retrieve_evidence_blocks(self, query_tokens, query_pad_mask):
+    def retrieve_evidence_blocks(self, query_tokens, query_pad_mask, query_block_indices=None, include_null_doc=False):
         """Embed blocks to be used in a forward pass"""
         with torch.no_grad():
             true_model = self.ict_model.module.module
             query_embeds = detach(true_model.embed_query(query_tokens, query_pad_mask))
         _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
-        all_top5_tokens, all_top5_pad_masks = [], []
-        for indices in block_indices:
+        all_topk_tokens, all_topk_pad_masks = [], []
+        for query_idx, indices in enumerate(block_indices):
             # [k x meta_dim]
-            top5_metas = np.array([self.block_data.meta_data[idx] for idx in indices])
-            top5_block_data = [self.ict_dataset.get_block(*block_meta) for block_meta in top5_metas]
-            top5_tokens, top5_pad_masks = zip(*top5_block_data)
+            # exclude trivial candidate if it appears, else just trim the weakest in the top-k
+            topk_metas = [self.block_data.meta_data[idx] for idx in indices if idx != query_block_indices[query_idx]]
+            topk_block_data = [self.ict_dataset.get_block(*block_meta) for block_meta in topk_metas[:self.top_k - 1]]
+            if include_null_doc:
+                topk_block_data.append(self.ict_dataset.get_null_block())
+            topk_tokens, topk_pad_masks = zip(*topk_block_data)
 
-            all_top5_tokens.append(np.array(top5_tokens))
-            all_top5_pad_masks.append(np.array(top5_pad_masks))
+            all_topk_tokens.append(np.array(topk_tokens))
+            all_topk_pad_masks.append(np.array(topk_pad_masks))
 
         # [batch_size x k x seq_length]
-        return np.array(all_top5_tokens), np.array(all_top5_pad_masks)
+        return np.array(all_topk_tokens), np.array(all_topk_pad_masks)
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

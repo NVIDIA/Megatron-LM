@@ -44,8 +44,8 @@ def model_provider():
     hashed_index = FaissMIPSIndex(index_type='flat_l2', embed_size=128)
     hashed_index.add_block_embed_data(all_block_data)
 
-    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index, args.block_top_k)
-    # TODO: REALMBertModel should accept a path to a pretrained bert-base
+    # top_k + 1 because we may need to exclude trivial candidate
+    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index, args.block_top_k + 1)
     model = REALMBertModel(retriever)
 
     return model
@@ -53,7 +53,7 @@ def model_provider():
 
 def get_batch(data_iterator):
     # Items and their type.
-    keys = ['tokens', 'labels', 'loss_mask', 'pad_mask']
+    keys = ['tokens', 'labels', 'loss_mask', 'pad_mask', 'query_block_indices']
     datatype = torch.int64
 
     # Broadcast data.
@@ -68,8 +68,9 @@ def get_batch(data_iterator):
     labels = data_b['labels'].long()
     loss_mask = data_b['loss_mask'].long()
     pad_mask = data_b['pad_mask'].long()
+    query_block_indices = data_b['query_block_indices'].long()
 
-    return tokens, labels, loss_mask, pad_mask
+    return tokens, labels, loss_mask, pad_mask, query_block_indices
 
 
 def forward_step(data_iterator, model):
@@ -78,23 +79,21 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers('batch generator').start()
-    tokens, labels, loss_mask, pad_mask = get_batch(data_iterator)
+    tokens, labels, loss_mask, pad_mask, query_block_indices = get_batch(data_iterator)
     timers('batch generator').stop()
 
     # Forward model.
     # TODO: MAKE SURE PAD IS NOT 1 - PAD
-    lm_logits, block_probs = model(tokens, pad_mask)
+    lm_logits, block_probs = model(tokens, pad_mask, query_block_indices)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
-    #block_probs.register_hook(lambda x: print("block_probs: ", x.shape, flush=True))
     lm_logits = torch.sum(lm_logits * block_probs, dim=1)[:, :labels.shape[1]]
 
     lm_loss_ = mpu.vocab_parallel_cross_entropy(lm_logits.contiguous().float(),
                                                 labels.contiguous())
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
-
 
     reduced_loss = reduce_losses([lm_loss])
     torch.cuda.synchronize()

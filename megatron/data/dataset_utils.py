@@ -483,9 +483,15 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     title_dataset=title_dataset,
                     **kwargs
                 )
+            elif dataset_type == 'realm':
+                dataset = REALMDataset(
+                    block_dataset=indexed_dataset,
+                    title_dataset=title_dataset,
+                    masked_lm_prob=masked_lm_prob,
+                    **kwargs
+                )
             else:
-                dataset_cls = BertDataset if dataset_type == 'standard_bert' else REALMDataset
-                dataset = dataset_cls(
+                dataset = BertDataset(
                     indexed_dataset=indexed_dataset,
                     masked_lm_prob=masked_lm_prob,
                     **kwargs
