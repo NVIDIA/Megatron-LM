@@ -12,7 +12,7 @@ class REALMBertModel(MegatronModule):
     def __init__(self, retriever):
         super(REALMBertModel, self).__init__()
         bert_args = dict(
-            num_tokentypes=1,
+            num_tokentypes=2,
             add_binary_head=False,
             parallel_output=True
         )

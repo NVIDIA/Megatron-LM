@@ -425,7 +425,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                            data_impl,
                                            skip_warmup)
 
-    if dataset_type == 'ict':
+    if dataset_type in ['ict', 'realm']:
         title_dataset = get_indexed_dataset_(data_prefix + '-titles',
                                              data_impl,
                                              skip_warmup)

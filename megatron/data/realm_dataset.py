@@ -92,7 +92,7 @@ class REALMDataset(Dataset):
                                               self.pad_id,
                                               self.masked_lm_prob,
                                               np_rng)
-        sample.update({'query_block_indices': np.array([block_idx])})
+        sample.update({'query_block_indices': np.array([block_idx]).astype(np.int64)})
         return sample
 
     def get_samples_mapping(self, data_prefix, num_epochs, max_num_samples):
