@@ -44,7 +44,7 @@ def model_provider():
     hashed_index = FaissMIPSIndex(index_type='flat_l2', embed_size=128)
     hashed_index.add_block_embed_data(all_block_data)
 
-    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index)
+    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index, args.block_top_k)
     # TODO: REALMBertModel should accept a path to a pretrained bert-base
     model = REALMBertModel(retriever)
 

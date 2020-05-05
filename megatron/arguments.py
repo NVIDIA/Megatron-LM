@@ -245,6 +245,8 @@ def _add_checkpointing_args(parser):
                        help='Directory containing a model checkpoint.')
     group.add_argument('--ict-load', type=str, default=None,
                        help='Directory containing an ICTBertModel checkpoint')
+    group.add_argument('--bert-load', type=str, default=None,
+                       help='Directory containing an BertModel checkpoint (needed to start REALM)')
     group.add_argument('--no-load-optim', action='store_true',
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true',
@@ -326,6 +328,8 @@ def _add_data_args(parser):
                        help='Path to pickled BlockData data structure')
     group.add_argument('--block-index-path', type=str, default=None,
                        help='Path to pickled data structure for efficient block indexing')
+    group.add_argument('--block-top-k', type=int, default=5,
+                       help='Number of blocks to use as top-k during retrieval')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

@@ -15,7 +15,7 @@ from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_co
 #qa_nlp = spacy.load('en_core_web_lg')
 
 
-class RealmDataset(BertDataset):
+class REALMDataset(BertDataset):
     """Dataset containing simple masked sentences for masked language modeling.
 
     The dataset should yield sentences just like the regular BertDataset
@@ -28,7 +28,7 @@ class RealmDataset(BertDataset):
     def __init__(self, name, indexed_dataset, data_prefix,
                  num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, short_seq_prob, seed):
-        super(RealmDataset, self).__init__(name, indexed_dataset, data_prefix,
+        super(REALMDataset, self).__init__(name, indexed_dataset, data_prefix,
                                            num_epochs, max_num_samples, masked_lm_prob,
                                            max_seq_length, short_seq_prob, seed)
         self.build_sample_fn = build_simple_training_sample
@@ -81,7 +81,7 @@ def spacy_ner(block_text):
     candidates['answers'] = answers
 
 
-class InverseClozeDataset(Dataset):
+class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length,

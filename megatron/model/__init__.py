@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from .distributed import *
-from .bert_model import BertModel, ICTBertModel, REALMBertModel, REALMRetriever
+from .bert_model import BertModel
+from megatron.model.realm_model import ICTBertModel, REALMRetriever, REALMBertModel
 from .gpt2_model import GPT2Model
 from .utils import get_params_for_weight_decay_optimization

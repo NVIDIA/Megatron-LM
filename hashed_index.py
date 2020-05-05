@@ -5,7 +5,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.bert_dataset import get_indexed_dataset_
-from megatron.data.realm_dataset import InverseClozeDataset
+from megatron.data.realm_dataset import ICTDataset
 from megatron.data.realm_index import detach, BlockData, RandProjectionLSHIndex
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
@@ -150,7 +150,7 @@ def get_ict_dataset():
         short_seq_prob=0.0001,  # doesn't matter
         seed=1
     )
-    dataset = InverseClozeDataset(**kwargs)
+    dataset = ICTDataset(**kwargs)
     return dataset
 
 

@@ -454,8 +454,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     print_split_stats('test', 2)
 
     def build_dataset(index, name):
-        from megatron.data.realm_dataset import InverseClozeDataset
-        from megatron.data.realm_dataset import RealmDataset
+        from megatron.data.realm_dataset import ICTDataset
+        from megatron.data.realm_dataset import REALMDataset
         dataset = None
         if splits[index + 1] > splits[index]:
             # Get the pointer to the original doc-idx so we can set it later.
@@ -478,13 +478,13 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             )
 
             if dataset_type == 'ict':
-                dataset = InverseClozeDataset(
+                dataset = ICTDataset(
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
                     **kwargs
                 )
             else:
-                dataset_cls = BertDataset if dataset_type == 'standard_bert' else RealmDataset
+                dataset_cls = BertDataset if dataset_type == 'standard_bert' else REALMDataset
                 dataset = dataset_cls(
                     indexed_dataset=indexed_dataset,
                     masked_lm_prob=masked_lm_prob,
