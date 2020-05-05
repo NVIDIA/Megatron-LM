@@ -3,6 +3,7 @@ import os
 import pickle
 import shutil
 
+import faiss
 import numpy as np
 import torch
 
@@ -121,7 +122,7 @@ class FaissMIPSIndex(object):
 
         if self.index_type == 'flat_l2':
             block_embeds = self.alsh_block_preprocess_fn(block_embeds)
-        self.block_mips_index.add_with_ids(block_embeds, block_indices)
+        self.block_mips_index.add_with_ids(np.array(block_embeds), np.array(block_indices))
 
     def search_mips_index(self, query_embeds, top_k, reconstruct=True):
         """Get the top-k blocks by the index distance metric.
@@ -216,7 +217,7 @@ class RandProjectionLSHIndex(object):
 
     def hash_embeds(self, embeds, write_block_data=None):
         """Hash a tensor of embeddings using a random projection matrix"""
-        embed_scores_pos = torch.matmul(embeds, torch.cuda.HalfTensor(self.hash_matrix))
+        embed_scores_pos = torch.matmul(embeds, torch.cuda.FloatTensor(self.hash_matrix).type(embeds.dtype))
         embed_scores = torch.cat((embed_scores_pos, -embed_scores_pos), axis=1)
         embed_hashes = detach(torch.argmax(embed_scores, axis=1))
 

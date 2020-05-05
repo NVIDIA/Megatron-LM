@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
+from megatron.data.realm_index import detach
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
 from megatron.model.transformer import LayerNorm
@@ -86,7 +87,7 @@ class BertLMHead(MegatronModule):
         super(BertLMHead, self).__init__()
 
         args = get_args()
-        
+
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -247,11 +248,11 @@ class REALMBertModel(MegatronModule):
         top5_block_attention_mask = torch.cuda.LongTensor(top5_block_attention_mask).reshape(-1, seq_length)
 
         # [batch_size x 5 x embed_size]
-        fresh_block_logits = self.retriever.ict_model(None, None, top5_block_tokens, top5_block_attention_mask, only_block=True).reshape(batch_size, 5, -1)
-        # fresh_block_logits.register_hook(lambda x: print("fresh block: ", x.shape, flush=True))
+        true_model = self.retriever.ict_model.module.module
+        fresh_block_logits = true_model.embed_block(top5_block_tokens, top5_block_attention_mask).reshape(batch_size, 5, -1)
 
         # [batch_size x embed_size x 1]
-        query_logits = self.retriever.ict_model(tokens, attention_mask, None, None, only_query=True).unsqueeze(2)
+        query_logits = true_model.embed_query(tokens, attention_mask).unsqueeze(2)
 
 
         # [batch_size x 5]
@@ -310,36 +311,21 @@ class REALMRetriever(MegatronModule):
 
     def retrieve_evidence_blocks(self, query_tokens, query_pad_mask):
         """Embed blocks to be used in a forward pass"""
-        query_embeds = self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True)
-        query_hashes = self.hashed_index.hash_embeds(query_embeds)
-
-        block_buckets = [self.hashed_index.get_block_bucket(hash) for hash in query_hashes]
-        for j, bucket in enumerate(block_buckets):
-            if len(bucket) < 5:
-                for i in range(len(block_buckets)):
-                    if len(block_buckets[i]) > 5:
-                        block_buckets[j] = block_buckets[i].copy()
-
-        # [batch_size x max_bucket_population x embed_size]
-        block_embeds = [torch.cuda.FloatTensor(np.array([self.block_data.embed_data[idx]
-                                                         for idx in bucket])) for bucket in block_buckets]
-
+        with torch.no_grad():
+            true_model = self.ict_model.module.module
+            query_embeds = detach(true_model.embed_query(query_tokens, query_pad_mask))
+        _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
         all_top5_tokens, all_top5_pad_masks = [], []
-        for query_embed, embed_tensor, bucket in zip(query_embeds, block_embeds, block_buckets):
-            retrieval_scores = query_embed.matmul(torch.transpose(embed_tensor.reshape(-1, query_embed.size()[0]), 0, 1))
-            print(retrieval_scores.shape, flush=True)
-            top5_vals, top5_indices = torch.topk(retrieval_scores, k=5, sorted=True)
-
-            top5_start_end_doc = [bucket[idx][:3] for idx in top5_indices.squeeze()]
-            # top_k tuples of (block_tokens, block_pad_mask)
-            top5_block_data = [self.ict_dataset.get_block(*indices) for indices in top5_start_end_doc]
-
+        for indices in block_indices:
+            # [k x meta_dim]
+            top5_metas = np.array([self.block_data.meta_data[idx] for idx in indices])
+            top5_block_data = [self.ict_dataset.get_block(*block_meta) for block_meta in top5_metas]
             top5_tokens, top5_pad_masks = zip(*top5_block_data)
 
             all_top5_tokens.append(np.array(top5_tokens))
             all_top5_pad_masks.append(np.array(top5_pad_masks))
 
-        # [batch_size x 5 x seq_length]
+        # [batch_size x k x seq_length]
         return np.array(all_top5_tokens), np.array(all_top5_pad_masks)
 
 

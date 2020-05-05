@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from hashed_index import load_ict_checkpoint, get_ict_dataset
-from megatron.data.realm_index import BlockData, RandProjectionLSHIndex
+from megatron.data.realm_index import BlockData, RandProjectionLSHIndex, FaissMIPSIndex
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
@@ -40,7 +40,9 @@ def model_provider():
     ict_model = load_ict_checkpoint()
     ict_dataset = get_ict_dataset()
     all_block_data = BlockData.load_from_file(args.block_data_path)
-    hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
+    # hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
+    hashed_index = FaissMIPSIndex(index_type='flat_l2', embed_size=128)
+    hashed_index.add_block_embed_data(all_block_data)
 
     retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index)
     # TODO: REALMBertModel should accept a path to a pretrained bert-base
