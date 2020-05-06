@@ -368,7 +368,6 @@ class ParallelTransformer(MegatronModule):
         assert self.num_layers % self.num_unique_layers == 0, \
             'number of layers should be divisible by number of unique layers'
         self.param_sharing_style = args.param_sharing_style
-        assert self.param_sharing_style in ['grouped', 'spaced']
 
         # Transformer layers.
         def build_layer(layer_number):
