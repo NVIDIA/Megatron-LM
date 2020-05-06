@@ -89,6 +89,14 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.min_lr <= args.lr
     if args.save is not None:
         assert args.save_interval is not None
+    # Parameters sharing does not work with torch DDP.
+    if (args.num_unique_layers is not None) and (args.num_layers is not None):
+        assert args.num_unique_layers <= args.num_layers
+        assert args.num_layers % args.num_unique_layers == 0, \
+            'num-layers should be divisible by num-unique-layers.'
+        if args.num_unique_layers < args.num_layers:
+            assert args.DDP_impl == 'local', \
+                'torch-DDP does not work with parameters sharing.'
 
     _print_args(args)
     return args
@@ -120,7 +128,7 @@ def _add_network_size_args(parser):
                        help='Number of unique transformer layers. '
                        '`num-layers` should be divisible by this value.')
     group.add_argument('--param-sharing-style', default='grouped',
-                       choices=['grouped', 'space'],
+                       choices=['grouped', 'spaced'],
                        help='Ordering of the shared parameters. For example, '
                        'for a `num-layers`=4 and `--num-unique-layers`=2, '
                        'we will have the following ordering for two unique '

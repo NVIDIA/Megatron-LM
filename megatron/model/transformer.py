@@ -383,8 +383,9 @@ class ParallelTransformer(MegatronModule):
             if torch.distributed.get_rank() == 0:
                 print('> will be using the following layer ordering:')
                 for i in range(self.num_layers):
-                    print('   layer: {:3d} --> unique layer: {:3d}'.format(
-                        i, self._get_layer_index(i)), flush=True)
+                    print('   layer id: {:3d} --> unique layer id: '
+                          '{:3d}'.format(i, self._get_layer_index(i)),
+                          flush=True)
 
         # Final layer norm before output.
         self.final_layernorm = LayerNorm(
