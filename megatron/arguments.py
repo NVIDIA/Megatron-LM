@@ -116,6 +116,16 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--num-unique-layers', type=int, default=None,
+                       help='Number of unique transformer layers. '
+                       '`num-layers` should be divisible by this value.')
+    group.add_argument('--param-sharing-style', default='grouped',
+                       choices=['grouped', 'space'],
+                       help='Ordering of the shared parameters. For example, '
+                       'for a `num-layers`=4 and `--num-unique-layers`=2, '
+                       'we will have the following ordering for two unique '
+                       'layers 1 and 2: '
+                       '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--num-attention-heads', type=int, default=None,
