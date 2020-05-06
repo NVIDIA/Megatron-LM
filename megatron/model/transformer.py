@@ -405,7 +405,6 @@ class ParallelTransformer(MegatronModule):
         """Forward method with activation checkpointing."""
         def custom(start, end):
             def custom_forward(*inputs):
-                layers_ = self.layers[start:end]
                 x_ = inputs[0]
                 for index in range(start, end):
                     layer = self._get_layer(index)
