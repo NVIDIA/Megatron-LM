@@ -86,7 +86,8 @@ class FaissMIPSIndex(object):
         self.m = 5
         self.u = 0.99
         self.max_norm = None
-        self.block_mips_index = self.get_block_index()
+        self.block_mips_index = None
+        self._set_block_index()
 
     @classmethod
     def load_from_file(cls, fname):
@@ -101,7 +102,7 @@ class FaissMIPSIndex(object):
 
         return new_index
 
-    def get_block_index(self):
+    def _set_block_index(self):
         import faiss
         INDEX_TYPES = ['flat_l2', 'flat_ip']
         if self.index_type not in INDEX_TYPES:
@@ -109,10 +110,13 @@ class FaissMIPSIndex(object):
 
         if self.index_type == 'flat_l2':
             index = faiss.IndexFlatL2(self.embed_size + 2 * self.m)
-            return faiss.IndexIDMap(index)
+            self.block_mips_index = faiss.IndexIDMap(index)
         elif self.index_type == 'flat_ip':
             index = faiss.IndexFlatIP(self.embed_size)
-            return faiss.IndexIDMap(index)
+            self.block_mips_index = faiss.IndexIDMap(index)
+
+    def reset_index(self):
+        self._set_block_index()
 
     def add_block_embed_data(self, all_block_data, clear_block_data=False):
         """Add the embedding of each block to the underlying FAISS index"""

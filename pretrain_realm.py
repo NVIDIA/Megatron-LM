@@ -18,7 +18,7 @@
 import torch
 import torch.nn.functional as F
 
-from hashed_index import load_ict_checkpoint, get_ict_dataset
+from indexer import load_ict_checkpoint, get_ict_dataset
 from megatron.data.realm_index import BlockData, RandProjectionLSHIndex, FaissMIPSIndex
 from megatron import get_args
 from megatron import get_timers
@@ -41,7 +41,7 @@ def model_provider():
     ict_dataset = get_ict_dataset(use_titles=False)
     all_block_data = BlockData.load_from_file(args.block_data_path)
     # hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
-    hashed_index = FaissMIPSIndex(index_type='flat_l2', embed_size=128)
+    hashed_index = FaissMIPSIndex(index_type='flat_ip', embed_size=128)
     hashed_index.add_block_embed_data(all_block_data)
 
     # top_k + 1 because we may need to exclude trivial candidate
@@ -102,7 +102,6 @@ def forward_step(data_iterator, model):
 
     reduced_loss = reduce_losses([lm_loss])
     torch.cuda.synchronize()
-    print(reduced_loss, flush=True)
     return lm_loss, {'lm_loss': reduced_loss[0]}
 
 

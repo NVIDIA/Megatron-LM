@@ -1,3 +1,6 @@
+import os
+import time
+
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
@@ -15,6 +18,7 @@ from pretrain_bert_ict import get_batch, model_provider
 
 
 def test_retriever():
+    # TODO: Update this because it's outdated and definitely won't run.
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
@@ -57,75 +61,139 @@ def main():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
-    model = load_ict_checkpoint(only_block_model=True, no_grad=True)
-    model.eval()
-    dataset = get_ict_dataset()
-    data_iter = iter(get_one_epoch_dataloader(dataset))
-    all_block_data = BlockData()
-    hashed_index = RandProjectionLSHIndex(embed_size=128, num_buckets=32, whiten=True)
-
-    i = 1
-    total = 0
+    ran_once = False
     while True:
-        with torch.no_grad():
-            try:
-                query_tokens, query_pad_mask, \
-                block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
-            except:
-                break
+        model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=ran_once)
+        model.eval()
+        dataset = get_ict_dataset()
+        data_iter = iter(get_one_epoch_dataloader(dataset))
+        all_block_data = BlockData()
+        hashed_index = RandProjectionLSHIndex(embed_size=128, num_buckets=32, whiten=True)
 
-            block_index_data = detach(block_index_data)
-            block_indices = block_index_data[:, 3]
-            block_meta = block_index_data[:, :3]
-
-            block_logits = detach(model(None, None, block_tokens, block_pad_mask, only_block=True))
-            all_block_data.add_block_data(block_indices, block_logits, block_meta)
-
-            total += block_indices.size
-            i += 1
-            if i % 20 == 0:
-                print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
-                if args.debug:
+        i = 1
+        total = 0
+        while True:
+            with torch.no_grad():
+                try:
+                    query_tokens, query_pad_mask, \
+                    block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
+                except:
                     break
 
-    all_block_data.save_shard(args.rank)
-    torch.distributed.barrier()
-    del model
+                block_index_data = detach(block_index_data)
+                block_indices = block_index_data[:, 3]
+                block_meta = block_index_data[:, :3]
 
-    if args.rank == 0:
-        all_block_data.consolidate_shards_and_save()
-        hashed_index.hash_whitened_block_embeds(all_block_data)
-        hashed_index.save_to_file()
-    else:
-        all_block_data.clear()
+                block_logits = detach(model(None, None, block_tokens, block_pad_mask, only_block=True))
+                all_block_data.add_block_data(block_indices, block_logits, block_meta)
+
+                total += block_indices.size
+                i += 1
+                if i % 20 == 0:
+                    print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
+                    if args.debug:
+                        break
+
+        all_block_data.save_shard(args.rank)
+        torch.distributed.barrier()
+        del model
+
+        if args.rank == 0:
+            all_block_data.consolidate_shards_and_save()
+            hashed_index.hash_whitened_block_embeds(all_block_data)
+            hashed_index.save_to_file()
+        else:
+            all_block_data.clear()
+
+        ran_once = True
+        set_index_com_file_ready()
+        torch.distributed.barrier()
+        while not check_model_com_file_ready():
+            time.sleep(5)
+
+        set_model_com_file_not_ready()
 
 
-def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False):
+INDEX_COM_FILE = 'ready.index'
+MODEL_COM_FILE = 'ready.model'
+
+
+def setup_index_com_file():
+    set_index_com_file_not_ready()
+
+
+def set_index_com_file_not_ready():
+    with open(INDEX_COM_FILE, 'w') as com_file:
+        com_file.write('0')
+
+
+def set_index_com_file_ready():
+    with open(INDEX_COM_FILE, 'w') as com_file:
+        com_file.write('1')
+
+
+def check_index_com_file_ready():
+    if os.path.exists(INDEX_COM_FILE):
+        with open(INDEX_COM_FILE, 'r') as com_file:
+            return bool(com_file.readline())
+
+    return False
+
+
+def setup_model_com_file():
+    set_model_com_file_not_ready()
+
+
+def set_model_com_file_not_ready():
+    with open(MODEL_COM_FILE, 'w') as com_file:
+        com_file.write('0')
+
+
+def set_model_com_file_ready():
+    with open(MODEL_COM_FILE, 'w') as com_file:
+        com_file.write('1')
+
+
+def check_model_com_file_ready():
+    if os.path.exists(MODEL_COM_FILE):
+        with open(MODEL_COM_FILE, 'r') as com_file:
+            return bool(com_file.readline())
+
+    return False
+
+
+def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):
     args = get_args()
     model = get_model(lambda: model_provider(only_query_model, only_block_model))
 
+    load_path = args.load if from_realm_chkpt else args.ict_load
+
     if isinstance(model, torchDDP):
         model = model.module
-    tracker_filename = get_checkpoint_tracker_filename(args.ict_load)
+    tracker_filename = get_checkpoint_tracker_filename(load_path)
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
     assert iteration > 0
-    checkpoint_name = get_checkpoint_name(args.ict_load, iteration, False)
+    checkpoint_name = get_checkpoint_name(load_path, iteration, False)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
     state_dict = torch.load(checkpoint_name, map_location='cpu')
+    ict_state_dict = state_dict['model']
+    if from_realm_chkpt:
+        ict_state_dict = ict_state_dict['retriever']['ict_model']
+
     if only_query_model:
-        state_dict['model'].pop('context_model')
+        ict_state_dict.pop('context_model')
     if only_block_model:
-        state_dict['model'].pop('question_model')
+        ict_state_dict.pop('question_model')
     if no_grad:
         with torch.no_grad():
-            model.load_state_dict(state_dict['model'])
+            model.load_state_dict(ict_state_dict)
     else:
-        model.load_state_dict(state_dict['model'])
+        model.load_state_dict(ict_state_dict)
     torch.distributed.barrier()
 
     if mpu.get_data_parallel_rank() == 0:

@@ -67,7 +67,6 @@ def print_accuracy_stats(name, gold_indices, estimated_indices):
     print('{:20s} First missing: {:4d}  |  All equal: {:4d}  |  Mixed: {:4d}'.format(name, *[results[s] for s in result_strs]))
 
 
-
 def create_and_test_gold(d, k, embeds, queries):
     times = [time.time()]
     gold_idx = index_factory(d, 'Flat')

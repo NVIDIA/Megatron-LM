@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from megatron import get_args
 from megatron.checkpointing import load_checkpoint
-from megatron.data.realm_index import detach
+from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
 from megatron.model import BertModel
 from megatron.model.utils import get_linear_layer, init_method_normal
 from megatron.module import MegatronModule
@@ -161,6 +161,12 @@ class REALMRetriever(MegatronModule):
         self.top_k = top_k
         self._ict_key = 'ict_model'
 
+    def reload_index(self):
+        args = get_args()
+        self.block_data = BlockData.load_from_file(args.block_data_path)
+        self.hashed_index.reset_index()
+        self.hashed_index.add_block_embed_data(self.block_data)
+
     def retrieve_evidence_blocks_text(self, query_text):
         """Get the top k evidence blocks for query_text in text form"""
         print("-" * 100)
@@ -255,7 +261,6 @@ class ICTBertModel(MegatronModule):
 
         if only_block:
             return self.embed_block(block_tokens, block_attention_mask)
-
 
         query_logits = self.embed_query(query_tokens, query_attention_mask)
         block_logits = self.embed_block(block_tokens, block_attention_mask)
