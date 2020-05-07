@@ -22,7 +22,7 @@ import collections
 import itertools
 
 import numpy as np
-from megatron import print_rank_0
+from megatron import print_rank_0, get_args
 from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_, BertDataset
 
 DATASET_TYPES = ['standard_bert', 'ict', 'realm']
@@ -478,9 +478,11 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             )
 
             if dataset_type == 'ict':
+                args = get_args()
                 dataset = ICTDataset(
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
+                    query_in_block_prob=args.query_in_block_prob,
                     **kwargs
                 )
             elif dataset_type == 'realm':

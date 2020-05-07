@@ -365,6 +365,8 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--query-in-block-prob', type=float, default=0.1,
+                       help='Probability of keeping query in block for ICT dataset')
 
     return parser
 

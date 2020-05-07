@@ -3,7 +3,6 @@ import os
 import pickle
 import shutil
 
-import faiss
 import numpy as np
 import torch
 
@@ -103,6 +102,7 @@ class FaissMIPSIndex(object):
         return new_index
 
     def get_block_index(self):
+        import faiss
         INDEX_TYPES = ['flat_l2', 'flat_ip']
         if self.index_type not in INDEX_TYPES:
             raise ValueError("Invalid index type specified")

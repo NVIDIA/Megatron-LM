@@ -4,7 +4,7 @@ import random
 import time
 
 import numpy as np
-import spacy
+# import spacy
 import torch
 from torch.utils.data import Dataset
 
@@ -38,7 +38,7 @@ def build_simple_training_sample(sample, target_seq_length, max_seq_length,
     return train_sample
 
 
-qa_nlp = spacy.load('en_core_web_lg')
+# qa_nlp = spacy.load('en_core_web_lg')
 
 
 def salient_span_mask(tokens, vocab_id_list, vocab_id_to_token_dict,
@@ -357,10 +357,11 @@ class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length,
-                 short_seq_prob, seed, use_titles=True):
+                 query_in_block_prob, short_seq_prob, seed, use_titles=True):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
+        self.query_in_block_prob = query_in_block_prob
         self.block_dataset = block_dataset
         self.title_dataset = title_dataset
         self.short_seq_prob = short_seq_prob
@@ -394,7 +395,7 @@ class ICTDataset(Dataset):
         rand_sent_idx = self.rng.randint(0, len(block) - 1)
 
         # keep the query in the context 10% of the time.
-        if self.rng.random() < 1:
+        if self.rng.random() < self.query_in_block_prob:
             query = block[rand_sent_idx].copy()
         else:
             query = block.pop(rand_sent_idx)

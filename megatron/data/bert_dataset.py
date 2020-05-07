@@ -22,11 +22,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from megatron import get_tokenizer
+from megatron import get_tokenizer, get_args
 from megatron import mpu
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 from megatron import print_rank_0
-
 
 
 class BertDataset(Dataset):
