@@ -38,7 +38,7 @@ def model_provider():
     print_rank_0('building REALM models ...')
 
     ict_model = load_ict_checkpoint()
-    ict_dataset = get_ict_dataset()
+    ict_dataset = get_ict_dataset(use_titles=False)
     all_block_data = BlockData.load_from_file(args.block_data_path)
     # hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
     hashed_index = FaissMIPSIndex(index_type='flat_l2', embed_size=128)
@@ -73,6 +73,11 @@ def get_batch(data_iterator):
     return tokens, labels, loss_mask, pad_mask, query_block_indices
 
 
+def get_qa_batch(data_iterator):
+    question_tokens, question_attention_mask, answer_tokens, answer_token_lengths = next(data_iterator)
+    return question_tokens, question_attention_mask, answer_tokens, answer_token_lengths
+
+
 def forward_step(data_iterator, model):
     """Forward step."""
     timers = get_timers()
@@ -99,6 +104,26 @@ def forward_step(data_iterator, model):
     torch.cuda.synchronize()
     print(reduced_loss, flush=True)
     return lm_loss, {'lm_loss': reduced_loss[0]}
+
+
+def qa_forward_step(data_iterator, model):
+    timers = get_timers()
+
+    # this dataset interface needs to be implemented
+    timers('batch generator').start()
+    question_tokens, question_attention_mask, answer_tokens, answer_token_lengths = get_qa_batch(data_iterator)
+    timers('batch generator').stop()
+
+    batch_span_logits, batch_loss_masks, block_probs = model(question_tokens, question_attention_mask,
+                                                             answer_tokens, answer_token_lengths)
+    # [batch_size x k x num_spans]
+    block_probs = block_probs.unsqueeze(2).expand_as(batch_span_logits)
+    batch_span_probs = F.softmax(batch_span_logits, dim=2)
+    reduced_block_span_probs = torch.sum(batch_span_probs * block_probs, dim=1)
+    qa_span_loss_ = -torch.log(reduced_block_span_probs)
+    qa_span_loss = torch.sum(
+        qa_span_loss_.view(-1) * batch_loss_masks
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

@@ -2,10 +2,77 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from megatron import get_args
 from megatron.checkpointing import load_checkpoint
 from megatron.data.realm_index import detach
 from megatron.model import BertModel
+from megatron.model.utils import get_linear_layer, init_method_normal
 from megatron.module import MegatronModule
+
+
+class REALMAnswerSpanModel(MegatronModule):
+    def __init__(self, realm_model, mlp_hidden_size=64):
+        super(REALMAnswerSpanModel, self).__init__()
+        self.realm_model = realm_model
+        self.mlp_hidden_size = mlp_hidden_size
+
+        args = get_args()
+        init_method = init_method_normal(args.init_method_std)
+        self.fc1 = get_linear_layer(2 * args.hidden_size, self.mlp_hidden_size, init_method)
+        self._fc1_key = 'fc1'
+        self.fc2 = get_linear_layer(self.mlp_hidden_size, 1, init_method)
+        self._fc2_key = 'fc2'
+
+        max_length = 10
+        self.start_ends = []
+        for length in range(max_length):
+            self.start_ends.extend([(i, i + length) for i in range(288 - length)])
+
+    def forward(self, question_tokens, question_attention_mask, answer_tokens, answer_token_lengths):
+        lm_logits, block_probs, topk_block_tokens = self.realm_model(
+            question_tokens, question_attention_mask, query_block_indices=None, return_topk_block_tokens=True)
+
+        batch_span_reps, batch_loss_masks = [], []
+        # go through batch one-by-one
+        for i in range(len(answer_token_lengths)):
+            answer_length = answer_token_lengths[i]
+            answer_span_tokens = answer_tokens[i][:answer_length]
+            span_reps, loss_masks = [], []
+            # go through the top k for the batch item
+            for logits, block_tokens in zip(lm_logits[i], topk_block_tokens[i]):
+                block_logits = logits[len(logits) / 2:]
+                span_starts = range(len(block_tokens) - (answer_length - 1))
+
+                # record the start, end indices of spans which match the answer
+                matching_indices = set([
+                    (idx, idx + answer_length - 1) for idx in span_starts
+                    if np.array_equal(block_tokens[idx:idx + answer_length], answer_span_tokens)
+                ])
+                # create a mask for computing the loss on P(y | z, x)
+                # [num_spans]
+                loss_masks.append(torch.LongTensor([int(idx_pair in matching_indices) for idx_pair in self.start_ends]))
+
+                # get all of the candidate spans that need to be fed to MLP
+                # [num_spans x 2 * embed_size]
+                span_reps.append([torch.cat((block_logits[s], block_logits[e])) for (s, e) in self.start_ends])
+
+            # data for all k blocks for a single batch item
+            # [k x num_spans]
+            batch_loss_masks.append(torch.stack(loss_masks))
+            # [k x num_spans x 2 * embed_size]
+            batch_span_reps.append(torch.stack(span_reps))
+
+        # data for all batch items
+        # [batch_size x k x num_spans]
+        batch_loss_masks = torch.stack(batch_loss_masks)
+        batch_span_reps = torch.stack(batch_span_reps)
+        # [batch_size x k x num_spans]
+        batch_span_logits = self.fc2(self.fc1(batch_span_reps)).squeeze()
+
+        return batch_span_logits, batch_loss_masks, block_probs
+
+        # block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
+        # lm_logits = torch.sum(lm_logits * block_probs, dim=1)
 
 
 class REALMBertModel(MegatronModule):
@@ -24,11 +91,13 @@ class REALMBertModel(MegatronModule):
         self.top_k = self.retriever.top_k
         self._retriever_key = 'retriever'
 
-    def forward(self, tokens, attention_mask, query_block_indices):
+    def forward(self, tokens, attention_mask, query_block_indices, return_topk_block_tokens=False):
         # [batch_size x k x seq_length]
         topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
             tokens, attention_mask, query_block_indices=query_block_indices, include_null_doc=True)
         batch_size = tokens.shape[0]
+        # create a copy in case it needs to be returned
+        ret_topk_block_tokens = np.array(topk_block_tokens)
 
         seq_length = topk_block_tokens.shape[2]
         topk_block_tokens = torch.cuda.LongTensor(topk_block_tokens).reshape(-1, seq_length)
@@ -58,6 +127,10 @@ class REALMBertModel(MegatronModule):
         # [batch_size x k x 2 * seq_length x vocab_size]
         lm_logits, _ = self.lm_model.forward(all_tokens, all_attention_mask, all_token_types)
         lm_logits = lm_logits.reshape(batch_size, self.top_k, 2 * seq_length, -1)
+
+        if return_topk_block_tokens:
+            return lm_logits, block_probs, ret_topk_block_tokens
+
         return lm_logits, block_probs
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
@@ -111,6 +184,11 @@ class REALMRetriever(MegatronModule):
             query_embeds = detach(true_model.embed_query(query_tokens, query_pad_mask))
         _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
         all_topk_tokens, all_topk_pad_masks = [], []
+
+        # this will result in no candidate exclusion
+        if query_block_indices is None:
+            query_block_indices = [-1] * len(block_indices)
+
         for query_idx, indices in enumerate(block_indices):
             # [k x meta_dim]
             # exclude trivial candidate if it appears, else just trim the weakest in the top-k

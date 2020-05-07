@@ -10,9 +10,7 @@ from torch.utils.data import Dataset
 
 from megatron import get_tokenizer, print_rank_0, mpu
 from megatron.data.bert_dataset import BertDataset
-from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
-
-#qa_nlp = spacy.load('en_core_web_lg')
+from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy, is_start_piece
 
 
 def build_simple_training_sample(sample, target_seq_length, max_seq_length,
@@ -38,6 +36,169 @@ def build_simple_training_sample(sample, target_seq_length, max_seq_length,
         'pad_mask': padding_mask_np
     }
     return train_sample
+
+
+qa_nlp = spacy.load('en_core_web_lg')
+
+
+def salient_span_mask(tokens, vocab_id_list, vocab_id_to_token_dict,
+                      cls_id, sep_id, mask_id, np_rng,
+                      do_permutation=False):
+    """Creates the predictions for the masked LM objective.
+    Note: Tokens here are vocab ids and not text tokens."""
+
+    cand_indexes = []
+    # Note(mingdachen): We create a list for recording if the piece is
+    # the starting piece of current token, where 1 means true, so that
+    # on-the-fly whole word masking is possible.
+    token_boundary = [0] * len(tokens)
+
+    for (i, token) in enumerate(tokens):
+        if token == cls_id or token == sep_id:
+            token_boundary[i] = 1
+            continue
+        # Whole Word Masking means that if we mask all of the wordpieces
+        # corresponding to an original word.
+        #
+        # Note that Whole Word Masking does *not* change the training code
+        # at all -- we still predict each WordPiece independently, softmaxed
+        # over the entire vocabulary.
+        if len(cand_indexes) >= 1 and not is_start_piece(vocab_id_to_token_dict[token]):
+            cand_indexes[-1].append(i)
+        else:
+            cand_indexes.append([i])
+            if is_start_piece(vocab_id_to_token_dict[token]):
+                token_boundary[i] = 1
+
+    output_tokens = list(tokens)
+
+    masked_lm_positions = []
+    masked_lm_labels = []
+
+    ngram_indexes = []
+    for idx in range(len(cand_indexes)):
+        ngram_index = []
+        for n in ngrams:
+            ngram_index.append(cand_indexes[idx:idx + n])
+        ngram_indexes.append(ngram_index)
+
+    np_rng.shuffle(ngram_indexes)
+
+    masked_lms = []
+    covered_indexes = set()
+    for cand_index_set in ngram_indexes:
+        if len(masked_lms) >= num_to_predict:
+            break
+        if not cand_index_set:
+            continue
+        # Note(mingdachen):
+        # Skip current piece if they are covered in lm masking or previous ngrams.
+        for index_set in cand_index_set[0]:
+            for index in index_set:
+                if index in covered_indexes:
+                    continue
+
+        n = np_rng.choice(ngrams[:len(cand_index_set)],
+                          p=pvals[:len(cand_index_set)] /
+                            pvals[:len(cand_index_set)].sum(keepdims=True))
+        index_set = sum(cand_index_set[n - 1], [])
+        n -= 1
+        # Note(mingdachen):
+        # Repeatedly looking for a candidate that does not exceed the
+        # maximum number of predictions by trying shorter ngrams.
+        while len(masked_lms) + len(index_set) > num_to_predict:
+            if n == 0:
+                break
+            index_set = sum(cand_index_set[n - 1], [])
+            n -= 1
+        # If adding a whole-word mask would exceed the maximum number of
+        # predictions, then just skip this candidate.
+        if len(masked_lms) + len(index_set) > num_to_predict:
+            continue
+        is_any_index_covered = False
+        for index in index_set:
+            if index in covered_indexes:
+                is_any_index_covered = True
+                break
+        if is_any_index_covered:
+            continue
+        for index in index_set:
+            covered_indexes.add(index)
+
+            masked_token = None
+            # 80% of the time, replace with [MASK]
+            if np_rng.random() < 0.8:
+                masked_token = mask_id
+            else:
+                # 10% of the time, keep original
+                if np_rng.random() < 0.5:
+                    masked_token = tokens[index]
+                # 10% of the time, replace with random word
+                else:
+                    masked_token = vocab_id_list[np_rng.randint(0, len(vocab_id_list))]
+
+            output_tokens[index] = masked_token
+
+            masked_lms.append(MaskedLmInstance(index=index, label=tokens[index]))
+    assert len(masked_lms) <= num_to_predict
+
+    np_rng.shuffle(ngram_indexes)
+
+    select_indexes = set()
+    if do_permutation:
+        for cand_index_set in ngram_indexes:
+            if len(select_indexes) >= num_to_predict:
+                break
+            if not cand_index_set:
+                continue
+            # Note(mingdachen):
+            # Skip current piece if they are covered in lm masking or previous ngrams.
+            for index_set in cand_index_set[0]:
+                for index in index_set:
+                    if index in covered_indexes or index in select_indexes:
+                        continue
+
+            n = np.random.choice(ngrams[:len(cand_index_set)],
+                                 p=pvals[:len(cand_index_set)] /
+                                   pvals[:len(cand_index_set)].sum(keepdims=True))
+            index_set = sum(cand_index_set[n - 1], [])
+            n -= 1
+
+            while len(select_indexes) + len(index_set) > num_to_predict:
+                if n == 0:
+                    break
+                index_set = sum(cand_index_set[n - 1], [])
+                n -= 1
+            # If adding a whole-word mask would exceed the maximum number of
+            # predictions, then just skip this candidate.
+            if len(select_indexes) + len(index_set) > num_to_predict:
+                continue
+            is_any_index_covered = False
+            for index in index_set:
+                if index in covered_indexes or index in select_indexes:
+                    is_any_index_covered = True
+                    break
+            if is_any_index_covered:
+                continue
+            for index in index_set:
+                select_indexes.add(index)
+        assert len(select_indexes) <= num_to_predict
+
+        select_indexes = sorted(select_indexes)
+        permute_indexes = list(select_indexes)
+        np_rng.shuffle(permute_indexes)
+        orig_token = list(output_tokens)
+
+        for src_i, tgt_i in zip(select_indexes, permute_indexes):
+            output_tokens[src_i] = orig_token[tgt_i]
+            masked_lms.append(MaskedLmInstance(index=src_i, label=orig_token[src_i]))
+
+    masked_lms = sorted(masked_lms, key=lambda x: x.index)
+
+    for p in masked_lms:
+        masked_lm_positions.append(p.index)
+        masked_lm_labels.append(p.label)
+    return (output_tokens, masked_lm_positions, masked_lm_labels, token_boundary)
 
 
 class REALMDataset(Dataset):
@@ -196,7 +357,7 @@ class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length,
-                 short_seq_prob, seed):
+                 short_seq_prob, seed, use_titles=True):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
@@ -204,6 +365,7 @@ class ICTDataset(Dataset):
         self.title_dataset = title_dataset
         self.short_seq_prob = short_seq_prob
         self.rng = random.Random(self.seed)
+        self.use_titles = use_titles
 
         self.samples_mapping = self.get_samples_mapping(
             data_prefix, num_epochs, max_num_samples)
@@ -220,15 +382,16 @@ class ICTDataset(Dataset):
 
     def __getitem__(self, idx):
         start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
-        title = list(self.title_dataset[int(doc_idx)])
+        if self.use_titles:
+            title = list(self.title_dataset[int(doc_idx)])
+            title_pad_offset = 3 + len(title)
+        else:
+            title = None
+            title_pad_offset = 2
         block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
         assert len(block) > 1
 
-        # avoid selecting the first or last sentence to be the query.
-        if len(block) == 2:
-            rand_sent_idx = int(self.rng.random() > 0.5)
-        else:
-            rand_sent_idx = self.rng.randint(1, len(block) - 2)
+        rand_sent_idx = self.rng.randint(0, len(block) - 1)
 
         # keep the query in the context 10% of the time.
         if self.rng.random() < 1:
@@ -239,7 +402,7 @@ class ICTDataset(Dataset):
         # still need to truncate because blocks are concluded when
         # the sentence lengths have exceeded max_seq_length.
         query = query[:self.max_seq_length - 2]
-        block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
+        block = list(itertools.chain(*block))[:self.max_seq_length - title_pad_offset]
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
@@ -279,9 +442,10 @@ class ICTDataset(Dataset):
 
     def concat_and_pad_tokens(self, tokens, title=None):
         """concat with special tokens and pad sequence to self.max_seq_length"""
-        tokens = [self.cls_id] + tokens + [self.sep_id]
-        if title is not None:
-            tokens += title + [self.sep_id]
+        if title is None:
+            tokens = [self.cls_id] + tokens + [self.sep_id]
+        else:
+            tokens = [self.cls_id] + title + [self.sep_id] + tokens + [self.sep_id]
         assert len(tokens) <= self.max_seq_length, len(tokens)
 
         num_pad = self.max_seq_length - len(tokens)

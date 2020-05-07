@@ -83,11 +83,11 @@ def forward_step(data_iterator, model):
     retrieval_scores = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask).float()
     softmaxed = F.softmax(retrieval_scores, dim=1)
 
-    top5_vals, top5_indices = torch.topk(softmaxed, k=5, sorted=True)
+    sorted_vals, sorted_indices = torch.topk(softmaxed, k=softmaxed.shape[1], sorted=True)
     batch_size = softmaxed.shape[0]
 
-    top1_acc = torch.cuda.FloatTensor([sum([int(top5_indices[i, 0] == i) for i in range(batch_size)]) / batch_size])
-    top5_acc = torch.cuda.FloatTensor([sum([int(i in top5_indices[i]) for i in range(batch_size)]) / batch_size])
+    top1_acc = torch.cuda.FloatTensor([sum([int(sorted_indices[i, 0] == i) for i in range(batch_size)]) / batch_size])
+    top5_acc = torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :5]) for i in range(batch_size)]) / batch_size])
 
     retrieval_loss = F.cross_entropy(softmaxed, torch.arange(batch_size).cuda())
     reduced_losses = reduce_losses([retrieval_loss, top1_acc, top5_acc])
