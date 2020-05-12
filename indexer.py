@@ -43,8 +43,11 @@ def test_retriever():
     model = load_ict_checkpoint(only_block_model=True)
     model.eval()
     dataset = get_ict_dataset()
-    hashed_index = HashedIndex.load_from_file(args.hash_data_path)
-    retriever = REALMRetriever(model, dataset, hashed_index)
+
+    block_data = BlockData.load_from_file(args.block_data_path)
+    mips_index = FaissMIPSIndex('flat_ip', 128)
+    mips_index.add_block_embed_data(block_data)
+    retriever = REALMRetriever(model, dataset, mips_index, top_k=5)
 
     strs = [
         "The last monarch from the house of windsor",
@@ -58,8 +61,6 @@ def test_retriever():
 
 
 def main():
-
-
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
@@ -114,7 +115,6 @@ def main():
             time.sleep(5)
 
         set_model_com_file_not_ready()
-
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):

@@ -3,10 +3,11 @@ import os
 import pickle
 import shutil
 
+import faiss
 import numpy as np
 import torch
 
-from megatron import get_args
+from megatron import get_args, mpu
 
 
 def detach(tensor):
@@ -77,10 +78,10 @@ class BlockData(object):
 
 
 class FaissMIPSIndex(object):
-    def __init__(self, index_type, embed_size, **index_kwargs):
+    def __init__(self, index_type, embed_size, use_gpu=False):
         self.index_type = index_type
         self.embed_size = embed_size
-        self.index_kwargs = dict(index_kwargs)
+        self.use_gpu = use_gpu
 
         # alsh
         self.m = 5
@@ -89,27 +90,17 @@ class FaissMIPSIndex(object):
         self.block_mips_index = None
         self._set_block_index()
 
-    @classmethod
-    def load_from_file(cls, fname):
-        print(" > Unpickling block index data")
-        state_dict = pickle.load(open(fname, 'rb'))
-        print(" > Finished unpickling")
-        index_type = state_dict['index_type']
-        index_kwargs = state_dict['index_kwargs']
-        embed_size = state_dict['embed_size']
-
-        new_index = cls(index_type, embed_size, **index_kwargs)
-
-        return new_index
-
     def _set_block_index(self):
-        import faiss
         INDEX_TYPES = ['flat_l2', 'flat_ip']
         if self.index_type not in INDEX_TYPES:
             raise ValueError("Invalid index type specified")
 
         index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
         self.block_mips_index = faiss.IndexIDMap(index)
+        if self.use_gpu:
+            res = faiss.StandardGpuResources()
+            device = mpu.get_data_parallel_rank()
+            self.block_mips_index = faiss.index_cpu_to_gpu(res, device, self.block_mips_index)
 
     def reset_index(self):
         self._set_block_index()

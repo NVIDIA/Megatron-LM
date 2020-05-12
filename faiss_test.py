@@ -45,8 +45,6 @@ ENCODINGS = [
 # LSH is inaccurate - pretty much always missing the top-1 result (1e6 embeds)
 
 
-
-
 def latest(times):
     return times[-1] - times[-2]
 
@@ -183,8 +181,6 @@ def run_all_tests():
     test_pca(d, k, embeds, queries, 96)
     test_quantizers(d, k, embeds, queries)
     test_encodings(d, k, embeds, queries)
-
-
 
 
 if __name__ == "__main__":
