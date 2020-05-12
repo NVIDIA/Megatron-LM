@@ -14,7 +14,6 @@
 # limitations under the License.
 
 """Pretrain BERT for Inverse Cloze Task"""
-
 import torch
 import torch.nn.functional as F
 

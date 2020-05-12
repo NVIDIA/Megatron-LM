@@ -25,14 +25,13 @@ def build_realm_training_sample(sample, max_seq_length,
     except TypeError:
         # this means the above returned None, and None isn't iterable.
         # TODO: consider coding style.
-        print("No salient span found.", flush=True)
         max_predictions_per_seq = masked_lm_prob * max_seq_length
         masked_tokens, masked_positions, masked_labels, _ = create_masked_lm_predictions(
             tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
             cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
 
     tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
-        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+        = pad_and_convert_to_numpy(masked_tokens, tokentypes, masked_positions,
                                    masked_labels, pad_id, max_seq_length)
 
     train_sample = {
@@ -84,7 +83,7 @@ def id_to_str_pos_map(token_ids, tokenizer):
     # make sure total size is correct
     offset = -2 if token_strs[-1].startswith("##") else 0
     total_len = pos_map[-1] + len(token_strs[-1]) + offset
-    assert total_len == len(join_str_list(token_strs))
+    assert total_len == len(join_str_list(token_strs)) - 1, (total_len, len(join_str_list(token_strs)))
 
     return pos_map
 
@@ -93,25 +92,34 @@ def salient_span_mask(tokens, mask_id):
     """Creates the predictions for the masked LM objective.
     Note: Tokens here are vocab ids and not text tokens."""
     tokenizer = get_tokenizer()
-    tokens_str = join_str_list(tokenizer.tokenize(tokens))
+    tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
 
     # need to get all named entities
     entities = SPACY_NER(tokens_str).ents
+    entities = [e for e in entities if e.text != "CLS"]
     if len(entities) == 0:
         return None
+    entity_idx = np.random.randint(0, len(entities))
+    selected_entity = entities[entity_idx]
 
-    selected_entity = np.random.choice(entities)
     token_pos_map = id_to_str_pos_map(tokens, tokenizer)
-    mask_start = mask_end = token_pos_map.index(selected_entity.start_char)
+    mask_start = mask_end = 0
+    set_mask_start = False
     while mask_end < len(token_pos_map) and token_pos_map[mask_end] < selected_entity.end_char:
+        if token_pos_map[mask_start] > selected_entity.start_char:
+            set_mask_start = True
+        if not set_mask_start:
+            mask_start += 1
         mask_end += 1
+    masked_positions = list(range(mask_start, mask_end + 1))
 
-    labels = tokens.copy()
+    labels = []
     output_tokens = tokens.copy()
-    for id_idx in range(mask_start, mask_end):
+    for id_idx in masked_positions:
+        labels.append(tokens[id_idx])
         output_tokens[id_idx] = mask_id
 
-    return output_tokens, list(range(mask_start, mask_end)), labels
+    return output_tokens, masked_positions, labels
 
 
 def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epochs,

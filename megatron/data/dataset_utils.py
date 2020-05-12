@@ -375,6 +375,7 @@ def create_masked_lm_predictions(tokens,
     for p in masked_lms:
         masked_lm_positions.append(p.index)
         masked_lm_labels.append(p.label)
+
     return (output_tokens, masked_lm_positions, masked_lm_labels, token_boundary)
 
 
@@ -387,7 +388,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     padding_length = max_seq_length - num_tokens
     assert padding_length >= 0
     assert len(tokentypes) == num_tokens
-    assert len(masked_positions) == len(masked_labels)
+    assert len(masked_positions) == len(masked_labels), (len(masked_positions), len(masked_labels))
 
     # Tokens and token types.
     filler = [pad_id] * padding_length

@@ -15,6 +15,7 @@ from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
 from megatron.training import get_model
 from pretrain_bert_ict import get_batch, model_provider
+from indexer_utils import set_index_com_file_ready, set_model_com_file_not_ready, check_model_com_file_ready
 
 
 # TODO re: main()
@@ -115,45 +116,6 @@ def main():
         set_model_com_file_not_ready()
 
 
-INDEX_COM_FILE = 'ready.index'
-MODEL_COM_FILE = 'ready.model'
-
-
-def set_index_com_file_not_ready():
-    with open(INDEX_COM_FILE, 'w') as com_file:
-        com_file.write('0')
-
-
-def set_index_com_file_ready():
-    with open(INDEX_COM_FILE, 'w') as com_file:
-        com_file.write('1')
-
-
-def check_index_com_file_ready():
-    if not os.path.exists(INDEX_COM_FILE):
-        set_index_com_file_not_ready()
-
-    with open(INDEX_COM_FILE, 'r') as com_file:
-        return bool(com_file.readline())
-
-
-def set_model_com_file_not_ready():
-    with open(MODEL_COM_FILE, 'w') as com_file:
-        com_file.write('0')
-
-
-def set_model_com_file_ready():
-    with open(MODEL_COM_FILE, 'w') as com_file:
-        com_file.write('1')
-
-
-def check_model_com_file_ready():
-    if not os.path.exists(MODEL_COM_FILE):
-        set_index_com_file_not_ready()
-
-    with open(MODEL_COM_FILE, 'r') as com_file:
-        return bool(com_file.readline())
-
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):
     args = get_args()
@@ -210,6 +172,7 @@ def get_ict_dataset(use_titles=True):
         max_seq_length=288,  # doesn't matter
         short_seq_prob=0.0001,  # doesn't matter
         seed=1,
+        query_in_block_prob=1,
         use_titles=use_titles
     )
     dataset = ICTDataset(**kwargs)

@@ -108,12 +108,8 @@ class FaissMIPSIndex(object):
         if self.index_type not in INDEX_TYPES:
             raise ValueError("Invalid index type specified")
 
-        if self.index_type == 'flat_l2':
-            index = faiss.IndexFlatL2(self.embed_size + 2 * self.m)
-            self.block_mips_index = faiss.IndexIDMap(index)
-        elif self.index_type == 'flat_ip':
-            index = faiss.IndexFlatIP(self.embed_size)
-            self.block_mips_index = faiss.IndexIDMap(index)
+        index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
+        self.block_mips_index = faiss.IndexIDMap(index)
 
     def reset_index(self):
         self._set_block_index()
@@ -126,7 +122,7 @@ class FaissMIPSIndex(object):
 
         if self.index_type == 'flat_l2':
             block_embeds = self.alsh_block_preprocess_fn(block_embeds)
-        self.block_mips_index.add_with_ids(np.array(block_embeds), np.array(block_indices))
+        self.block_mips_index.add_with_ids(np.float32(np.array(block_embeds)), np.array(block_indices))
 
     def search_mips_index(self, query_embeds, top_k, reconstruct=True):
         """Get the top-k blocks by the index distance metric.
@@ -138,10 +134,10 @@ class FaissMIPSIndex(object):
             query_embeds = self.alsh_query_preprocess_fn(query_embeds)
 
         if reconstruct:
-            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
+            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds.astype('float32'), top_k)
             return top_k_block_embeds
         else:
-            distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
+            distances, block_indices = self.block_mips_index.search(query_embeds.astype('float32'), top_k)
             return distances, block_indices
 
     def get_norm_powers_and_halves_array(self, embeds):
@@ -175,6 +171,8 @@ class FaissMIPSIndex(object):
         # Q'(S(x)) for all x in query_embeds
         return np.float32(np.concatenate((query_embeds, halves_array, norm_powers), axis=1))
 
+
+# This was the original hashing scheme, not used anymore
 
 class RandProjectionLSHIndex(object):
     """Class for holding hashed data"""

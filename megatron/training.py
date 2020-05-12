@@ -39,7 +39,7 @@ from megatron.model import get_params_for_weight_decay_optimization
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
-from indexer import check_index_com_file_ready, set_index_com_file_not_ready, set_model_com_file_ready
+from indexer_utils import check_index_com_file_ready, set_index_com_file_not_ready, set_model_com_file_ready
 
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
