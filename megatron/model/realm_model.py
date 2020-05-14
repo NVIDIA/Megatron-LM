@@ -192,6 +192,8 @@ class REALMRetriever(MegatronModule):
         with torch.no_grad():
             if hasattr(self.ict_model, 'module'):
                 true_model = self.ict_model.module
+                if hasattr(true_model, 'module'):
+                    true_model = true_model.module
             else:
                 true_model = self.ict_model
             query_embeds = detach(true_model.embed_query(query_tokens, query_pad_mask))

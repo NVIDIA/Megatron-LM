@@ -348,6 +348,8 @@ def _add_data_args(parser):
                        help='Path to pickled data structure for efficient block indexing')
     group.add_argument('--block-top-k', type=int, default=5,
                        help='Number of blocks to use as top-k during retrieval')
+    group.add_argument('--async-indexer', action='store_true',
+                       help='Whether the indexer job is running asynchronously with a trainer job')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

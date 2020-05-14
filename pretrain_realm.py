@@ -87,8 +87,9 @@ def forward_step(data_iterator, model):
     timers('batch generator').stop()
 
     # Forward model.
-    # TODO: MAKE SURE PAD IS NOT 1 - PAD
     lm_logits, block_probs = model(tokens, pad_mask, query_block_indices)
+    with torch.no_grad():
+        retrieval_utility = get_retrieval_utility(lm_logits, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
@@ -99,9 +100,32 @@ def forward_step(data_iterator, model):
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
-    reduced_loss = reduce_losses([lm_loss])
+    reduced_loss = reduce_losses([lm_loss, retrieval_utility])
     torch.cuda.synchronize()
-    return lm_loss, {'lm_loss': reduced_loss[0]}
+    return lm_loss, {'lm_loss': reduced_loss[0], 'retrieval_utility': reduced_loss[1]}
+
+
+def get_retrieval_utility(lm_logits, labels, loss_mask):
+    """log P(y | z, x) - log P(y | null, x)"""
+    # [batch x seq_len x vocab_size]
+    null_block_lm_logits = lm_logits[:, -1, :, :]
+    null_block_loss_ = mpu.vocab_parallel_cross_entropy(null_block_lm_logits.contiguous().float(),
+                                                       labels.contiguous())
+    null_block_loss = torch.sum(
+        null_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+    retrieved_block_losses = []
+    for block_num in range(lm_logits.shape[1] - 1):
+        retrieved_block_lm_logits = lm_logits[:, block_num, :, :]
+        retrieved_block_loss_ = mpu.vocab_parallel_cross_entropy(retrieved_block_lm_logits.contiguous().float(),
+                                                                 labels.contiguous())
+        retrieved_block_loss = torch.sum(
+            retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+        retrieved_block_losses.append(retrieved_block_loss)
+    avg_retrieved_block_loss = torch.sum(retrieved_block_losses) / (lm_logits.shape[1] - 1)
+
+    retrieval_utility = null_block_loss - avg_retrieved_block_loss
+    return retrieval_utility
 
 
 def qa_forward_step(data_iterator, model):

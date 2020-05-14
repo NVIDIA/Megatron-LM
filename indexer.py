@@ -1,19 +1,21 @@
 import os
+import sys
 import time
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from megatron import get_args
+from megatron import get_args, get_adlr_autoresume, print_rank_0
 from megatron import mpu
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.bert_dataset import get_indexed_dataset_
 from megatron.data.realm_dataset import ICTDataset
-from megatron.data.realm_index import detach, BlockData, RandProjectionLSHIndex
+from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
 from megatron.training import get_model
+from megatron.utils import check_adlr_autoresume_termination
 from pretrain_bert_ict import get_batch, model_provider
 from indexer_utils import set_index_com_file_ready, set_model_com_file_not_ready, check_model_com_file_ready
 
@@ -40,14 +42,14 @@ def test_retriever():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
-    model = load_ict_checkpoint(only_block_model=True)
+    model = load_ict_checkpoint()
     model.eval()
     dataset = get_ict_dataset()
 
     block_data = BlockData.load_from_file(args.block_data_path)
     mips_index = FaissMIPSIndex('flat_ip', 128)
     mips_index.add_block_embed_data(block_data)
-    retriever = REALMRetriever(model, dataset, mips_index, top_k=5)
+    retriever = REALMRetriever(model, dataset, block_data, mips_index, top_k=5)
 
     strs = [
         "The last monarch from the house of windsor",
@@ -71,7 +73,6 @@ def main():
         dataset = get_ict_dataset()
         data_iter = iter(get_one_epoch_dataloader(dataset))
         all_block_data = BlockData()
-        hashed_index = RandProjectionLSHIndex(embed_size=128, num_buckets=32, whiten=True)
 
         i = 1
         total = 0
@@ -103,18 +104,24 @@ def main():
 
         if args.rank == 0:
             all_block_data.consolidate_shards_and_save()
-            hashed_index.hash_whitened_block_embeds(all_block_data)
-            hashed_index.save_to_file()
         else:
             all_block_data.clear()
 
         ran_once = True
         set_index_com_file_ready()
         torch.distributed.barrier()
-        while not check_model_com_file_ready():
-            time.sleep(5)
+        if args.async_indexer:
+            while not check_model_com_file_ready():
+                time.sleep(5)
+                autoresume = get_adlr_autoresume()
+                if autoresume.termination_requested():
+                    print_rank_0(">>> autoresume termination request found!")
+                    if torch.distributed.get_rank() == 0:
+                        autoresume.request_resume()
+                    print_rank_0(">>> training terminated. Returning")
+                    sys.exit(0)
 
-        set_model_com_file_not_ready()
+            set_model_com_file_not_ready()
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):
