@@ -26,6 +26,6 @@ __contact_names__ = 'NVIDIA INC'
 __url__ = 'https://github.com/NVIDIA/Megatron-LM'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = 'Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism.'
-__license__ = 'Apache2'
+__license__ = 'https://github.com/NVIDIA/Megatron-LM/blob/master/LICENSE'
 __keywords__ = 'deep learning, Megatron, gpu, NLP, nvidia, pytorch, torch, language'
 
