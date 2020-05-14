@@ -1,7 +1,5 @@
 pybind11
 torch
-torchvision
 six
 regex
 numpy
-
