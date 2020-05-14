@@ -38,7 +38,7 @@ To use this repo please install the latest supported versions of PyTorch with GP
 
 To use megatron you can either clone the repo or install it via pip:
 <pre>
-pip install megatron
+pip install megatron-lm
 </pre>
 
 <a id="downloading-checkpoints"></a>
