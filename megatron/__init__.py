@@ -15,6 +15,7 @@
 
 from .package_info import (
     __description__,
+    __contact_names__,
     __url__,
     __download_url__,
     __keywords__,

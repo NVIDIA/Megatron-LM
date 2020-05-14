@@ -3,3 +3,5 @@ torch
 torchvision
 six
 regex
+numpy
+

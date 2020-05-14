@@ -24,6 +24,7 @@ if sys.version_info < (3,):
 
 from megatron.package_info import (
     __description__,
+    __contact_names__,
     __url__,
     __download_url__,
     __keywords__,
@@ -61,6 +62,8 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     # The project's main homepage.
     url=__url__,
+    author=__contact_names__,
+    maintainer=__contact_names__,
     # The licence under which the project is released
     license=__license__,
     classifiers=[
