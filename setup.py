@@ -44,8 +44,6 @@ with open("README.md", "r") as fh:
 def req_file(filename):
     with open(filename) as f:
         content = f.readlines()
-    # you may also want to remove whitespace characters
-    # Example: `\n` at the end of each line
     return [x.strip() for x in content]
 
 
@@ -67,8 +65,6 @@ setuptools.setup(
     # The licence under which the project is released
     license=__license__,
     classifiers=[
-        'Development Status :: 4 - Beta',
-        # Indicate who your project is intended for
         'Intended Audience :: Developers',
         'Intended Audience :: Science/Research',
         'Intended Audience :: Information Technology',
