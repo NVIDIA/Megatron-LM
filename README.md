@@ -34,7 +34,7 @@ For BERT training, we swapped the position of the layer normalization and the re
 # Setup
 We officially support only python 3.6, pytorch 1.5, cuda 10, and nccl 2.6 versions and above.
 
-To use this repo please install the latest supported versions of PyTorch with GPU support. We strongly recommend using one of [NGC's recent PyTorch containers](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) (the latest compatible version at time of publication can be pulled with `docker pull nvcr.io/nvidia/pytorch:20.03-py3`). Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation or downstream tasks.
+To use this repo please install the latest supported versions of PyTorch with GPU support (see [requirements.txt](https://github.com/NVIDIA/Megatron-LM/blob/master/requirements.txt)) and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start). We strongly recommend using one of [NGC's recent PyTorch containers](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) (the latest compatible version at time of publication can be pulled with `docker pull nvcr.io/nvidia/pytorch:20.03-py3`). Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation or downstream tasks.
 
 <a id="downloading-checkpoints"></a>
 ## Downloading Checkpoints
