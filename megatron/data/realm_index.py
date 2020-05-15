@@ -91,7 +91,7 @@ class FaissMIPSIndex(object):
         self._set_block_index()
 
     def _set_block_index(self):
-        INDEX_TYPES = ['flat_l2', 'flat_ip']
+        INDEX_TYPES = ['flat_ip']
         if self.index_type not in INDEX_TYPES:
             raise ValueError("Invalid index type specified")
 
@@ -123,13 +123,16 @@ class FaissMIPSIndex(object):
         """
         if self.index_type == 'flat_l2':
             query_embeds = self.alsh_query_preprocess_fn(query_embeds)
+        query_embeds = np.float32(query_embeds)
 
         if reconstruct:
-            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds.astype('float32'), top_k)
+            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
             return top_k_block_embeds
         else:
-            distances, block_indices = self.block_mips_index.search(query_embeds.astype('float32'), top_k)
+            distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
             return distances, block_indices
+
+    # functions below are for ALSH, which currently isn't being used
 
     def get_norm_powers_and_halves_array(self, embeds):
         norm = np.linalg.norm(embeds, axis=1)

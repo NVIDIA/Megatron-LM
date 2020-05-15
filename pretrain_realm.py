@@ -89,7 +89,7 @@ def forward_step(data_iterator, model):
     # Forward model.
     lm_logits, block_probs = model(tokens, pad_mask, query_block_indices)
     with torch.no_grad():
-        retrieval_utility = get_retrieval_utility(lm_logits, labels, loss_mask)
+        retrieval_utility = get_retrieval_utility(lm_logits, block_probs, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
@@ -105,9 +105,13 @@ def forward_step(data_iterator, model):
     return lm_loss, {'lm_loss': reduced_loss[0], 'retrieval_utility': reduced_loss[1]}
 
 
-def get_retrieval_utility(lm_logits, labels, loss_mask):
+def get_retrieval_utility(lm_logits, block_probs, labels, loss_mask):
     """log P(y | z, x) - log P(y | null, x)"""
     # [batch x seq_len x vocab_size]
+    lm_logits = lm_logits[:, :, :labels.shape[1], :]
+    #non_null_block_probs = block_probs[:, :-1]
+    #non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
+    # non_null_block_probs = non_null_block_probsexpand_as(lm_logits[:, :-1, :, :])
     null_block_lm_logits = lm_logits[:, -1, :, :]
     null_block_loss_ = mpu.vocab_parallel_cross_entropy(null_block_lm_logits.contiguous().float(),
                                                        labels.contiguous())
@@ -119,10 +123,11 @@ def get_retrieval_utility(lm_logits, labels, loss_mask):
         retrieved_block_lm_logits = lm_logits[:, block_num, :, :]
         retrieved_block_loss_ = mpu.vocab_parallel_cross_entropy(retrieved_block_lm_logits.contiguous().float(),
                                                                  labels.contiguous())
+        #retrieved_block_loss_ *= non_null_block_probs[:, block_num].reshape(-1, 1)
         retrieved_block_loss = torch.sum(
             retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
         retrieved_block_losses.append(retrieved_block_loss)
-    avg_retrieved_block_loss = torch.sum(retrieved_block_losses) / (lm_logits.shape[1] - 1)
+    avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (lm_logits.shape[1] - 1)
 
     retrieval_utility = null_block_loss - avg_retrieved_block_loss
     return retrieval_utility
@@ -171,6 +176,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
              args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

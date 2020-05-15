@@ -93,8 +93,6 @@ def salient_span_mask(tokens, mask_id):
     Note: Tokens here are vocab ids and not text tokens."""
     tokenizer = get_tokenizer()
     tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
-    print("-" * 100)
-    print("TOKEN STR\n", tokens_str)
 
     # need to get all named entities
     entities = SPACY_NER(tokens_str).ents
@@ -103,7 +101,6 @@ def salient_span_mask(tokens, mask_id):
         return None
     entity_idx = np.random.randint(0, len(entities))
     selected_entity = entities[entity_idx]
-    print("SELECTED ENTITY\n", selected_entity.text)
 
     token_pos_map = id_to_str_pos_map(tokens, tokenizer)
     mask_start = mask_end = 0
@@ -114,14 +111,17 @@ def salient_span_mask(tokens, mask_id):
         if not set_mask_start:
             mask_start += 1
         mask_end += 1
-    masked_positions = list(range(mask_start, mask_end + 1))
+    masked_positions = list(range(mask_start - 1, mask_end))
 
     labels = []
     output_tokens = tokens.copy()
     for id_idx in masked_positions:
         labels.append(tokens[id_idx])
         output_tokens[id_idx] = mask_id
-    print("OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)))
+    #print("-" * 100 + '\n',
+    #      "TOKEN STR\n", tokens_str + '\n',
+    #      "SELECTED ENTITY\n", selected_entity.text + '\n',
+    #      "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
 
     return output_tokens, masked_positions, labels
 
