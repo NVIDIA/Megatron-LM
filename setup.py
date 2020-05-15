@@ -71,8 +71,6 @@ setuptools.setup(
         # Indicate what your project relates to
         'Topic :: Scientific/Engineering :: Artificial Intelligence',
         'Topic :: Software Development :: Libraries :: Python Modules',
-        # Pick your license as you wish (should match "license" above)
-        'License :: OSI Approved :: Apache Software License',
         # Supported python versions
         'Programming Language :: Python :: 3.6',
         'Programming Language :: Python :: 3.7',
