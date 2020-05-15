@@ -1,0 +1,5 @@
+pybind11
+torch
+six
+regex
+numpy
