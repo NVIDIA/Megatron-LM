@@ -36,14 +36,18 @@ from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
+from megatron.mpu.initialize import get_index_ready, get_train_group
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
-from indexer_utils import check_index_com_file_ready, set_index_com_file_not_ready, set_model_com_file_ready
+
+
+INDEX_READY = None
 
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
-             forward_step_func, extra_args_provider=None, args_defaults={}):
+             forward_step_func, extra_args_provider=None, args_defaults={},
+             initializer_func=None):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -69,8 +73,15 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+    if initializer_func is None:
+        initialize_megatron(extra_args_provider=extra_args_provider,
+                            args_defaults=args_defaults)
+    else:
+        initializer_func(extra_args_provider=extra_args_provider,
+                         args_defaults=args_defaults)
+        global INDEX_READY
+        INDEX_READY = get_index_ready()
+
     args = get_args()
     timers = get_timers()
 
@@ -250,7 +261,6 @@ def backward_step(optimizer, model, loss):
         else:
             optimizer.clip_master_grads(args.clip_grad)
 
-ran_backward_once = False
 
 def train_step(forward_step_func, data_iterator,
                model, optimizer, lr_scheduler):
@@ -363,15 +373,20 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
     timers('interval time').start()
     report_memory_flag = True
+
+    global INDEX_READY
+    recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
     while iteration < args.train_iters:
-        if hasattr(model, 'retriever'):
-            new_index_ready = check_index_com_file_ready()
-            if new_index_ready:
-                torch.distributed.barrier()
-                model.retriever.reload_index()
-                set_index_com_file_not_ready()
-                save_checkpoint(iteration, model, optimizer, lr_scheduler)
-                set_model_com_file_ready()
+        if hasattr(model, 'retriever') and INDEX_READY == 1:
+            model.retriever.reload_index()
+            save_checkpoint(iteration, model, optimizer, lr_scheduler)
+
+            if args.rank == 0:
+                INDEX_READY = 1 - INDEX_READY
+                print("Switched index ready", flush=True)
+            send_handle = torch.distributed.broadcast(INDEX_READY, 0, async_op=True)
+            torch.distributed.barrier(get_train_group())
+            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
 
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,

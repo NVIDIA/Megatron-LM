@@ -26,6 +26,10 @@ _MODEL_PARALLEL_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
+_TRAIN_GROUP = None
+_INDEX_GROUP = None
+_INDEX_READY = None
+
 # These values enable us to change the mpu sizes on the fly.
 _MPU_WORLD_SIZE = None
 _MPU_RANK = None
@@ -105,8 +109,10 @@ def set_model_parallel_group(group):
 
 def get_data_parallel_group():
     """Get the data parallel group the caller rank belongs to."""
+    #print(">>> yeah this function works.")
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
+    #print(_DATA_PARALLEL_GROUP)
     return _DATA_PARALLEL_GROUP
 
 
@@ -114,6 +120,7 @@ def set_data_parallel_group(group):
     global _DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, \
         'data parallel group has already been initialized'
+    print(">>> setting data parallel group: ", group, flush=True)
     _DATA_PARALLEL_GROUP = group
 
 
@@ -169,3 +176,30 @@ def destroy_model_parallel():
     _MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+
+
+def init_realm_groups(max_training_rank, world_size):
+    global _TRAIN_GROUP
+    _TRAIN_GROUP = torch.distributed.new_group(list(range(max_training_rank)))
+    global _INDEX_GROUP
+    _INDEX_GROUP = torch.distributed.new_group(list(range(max_training_rank, world_size)))
+    global _INDEX_READY
+    _INDEX_READY = torch.zeros(1).cuda()
+
+
+def get_train_group():
+    global _TRAIN_GROUP
+    assert _TRAIN_GROUP is not None
+    return _TRAIN_GROUP
+
+
+def get_index_group():
+    global _INDEX_GROUP
+    assert _INDEX_GROUP is not None
+    return _INDEX_GROUP
+
+
+def get_index_ready():
+    global _INDEX_READY
+    assert _INDEX_READY is not None
+    return _INDEX_READY

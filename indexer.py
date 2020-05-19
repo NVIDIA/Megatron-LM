@@ -3,6 +3,7 @@ import sys
 import time
 
 import torch
+import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args, get_adlr_autoresume, print_rank_0
@@ -14,58 +15,128 @@ from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
+from megatron.global_vars import set_global_variables
+from megatron.mpu.initialize import get_index_ready, get_index_group, get_train_group
+from megatron.mpu.initialize import set_data_parallel_group, set_model_parallel_group, init_realm_groups
+from megatron.initialize import init_distributed, _init_autoresume, _set_random_seed, _write_args_to_tensorboard
 from megatron.training import get_model
 from megatron.utils import check_adlr_autoresume_termination
 from pretrain_bert_ict import get_batch, model_provider
-from indexer_utils import set_index_com_file_ready, set_model_com_file_not_ready, check_model_com_file_ready
 
 
-def test_retriever():
-    # TODO: Update this because it's outdated and definitely won't run.
-    initialize_megatron(extra_args_provider=None,
-                        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+INDEX_READY = None
+
+
+def pprint(*args):
+    print(*args, flush=True)
+
+
+def initialize_and_run_async_megatron(extra_args_provider=None, args_defaults={},
+                                      ignore_unknown_args=False, allow_no_cuda=False):
+    if not allow_no_cuda:
+        # Make sure cuda is available.
+        assert torch.cuda.is_available(), 'Megatron requires CUDA.'
+
+    # Parse args, build tokenizer, and set adlr-autoresume,
+    # tensorboard-writer, and timers.
+    set_global_variables(extra_args_provider=extra_args_provider,
+                         args_defaults=args_defaults,
+                         ignore_unknown_args=ignore_unknown_args)
+
+    # instead of _initialize_distributed()
+    init_distributed()
+    setup_realm_groups_and_vars()
+    global INDEX_READY
+    INDEX_READY = get_index_ready()
+    pprint('finished setting up groups')
+
+    # Autoresume
+    _init_autoresume()
+    pprint('finished setting up autoresume')
+
+    # Random seeds for reproducibility.
     args = get_args()
-    model = load_ict_checkpoint()
-    model.eval()
-    dataset = get_ict_dataset()
+    if args.rank == 0:
+        pprint('> setting random seeds to {} ...'.format(args.seed))
+    _set_random_seed(args.seed)
 
-    block_data = BlockData.load_from_file(args.block_data_path)
-    mips_index = FaissMIPSIndex('flat_ip', 128)
-    mips_index.add_block_embed_data(block_data)
-    retriever = REALMRetriever(model, dataset, block_data, mips_index, top_k=5)
+    # Write arguments to tensorboard.
+    _write_args_to_tensorboard()
+    pprint('finished writing args to tensorboard')
 
-    strs = [
-        "The last monarch from the house of windsor",
-        "married to Elvis Presley",
-        "tallest building in the world today",
-        "who makes graphics cards"
-    ]
+    torch.distributed.barrier()
 
-    for s in strs:
-        retriever.retrieve_evidence_blocks_text(s)
+    if args.rank < args.max_training_rank:
+        torch.distributed.barrier(get_train_group())
+        pprint("All trainers ready.")
+        return
+    else:
+        runner = AsyncIndexBuilder(args.rank)
+        torch.distributed.barrier(get_index_group())
+        pprint("All indexers ready.")
+        runner.run_async()
 
 
-def main():
-    initialize_megatron(extra_args_provider=None,
-                        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+def setup_realm_groups_and_vars():
     args = get_args()
-    while True:
+    world_size = dist.get_world_size()
+    max_training_rank = args.max_training_rank
+
+    # assuming no model parallelism right now
+    set_model_parallel_group(dist.new_group([args.rank]))
+    init_realm_groups(max_training_rank, world_size)
+
+    if args.rank < max_training_rank:
+        set_data_parallel_group(get_train_group())
+    else:
+        set_data_parallel_group(get_index_group())
+
+
+class AsyncIndexBuilder(object):
+    def __init__(self, rank):
+        self.rank = rank
+        args = get_args()
+        self.is_main_builder = self.rank == args.max_training_rank
+        self.main_builder_idx = args.max_training_rank
+        self.debug = args.debug
+
+        self.model = None
+        self.dataloader = None
+        self.block_data = None
+        self.load_attributes()
+
+        global INDEX_READY
+        INDEX_READY = get_index_ready()
+
+    def run_async(self):
+        while True:
+            print("Starting (again!)")
+            self.build_index()
+            self.save_index()
+            self.send_index_ready_signal()
+            while INDEX_READY == 1:
+                print("Waiting for new model checkpoint.")
+                time.sleep(1)
+
+            self.load_model()
+
+    def load_attributes(self):
         try:
-            model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=True)
+            self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=True)
         except:
-            model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
-        model.eval()
-        dataset = get_ict_dataset()
-        data_iter = iter(get_one_epoch_dataloader(dataset))
-        all_block_data = BlockData()
+            self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
+        self.model.eval()
+        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
+        self.block_data = BlockData()
 
+    def build_index(self):
         i = 1
         total = 0
         while True:
             with torch.no_grad():
                 try:
                     query_tokens, query_pad_mask, \
-                    block_tokens, block_pad_mask, block_index_data = get_batch(data_iter)
+                    block_tokens, block_pad_mask, block_index_data = get_batch(self.dataloader)
                 except:
                     break
 
@@ -73,30 +144,16 @@ def main():
                 block_indices = block_index_data[:, 3]
                 block_meta = block_index_data[:, :3]
 
-                block_logits = detach(model(None, None, block_tokens, block_pad_mask, only_block=True))
-                all_block_data.add_block_data(block_indices, block_logits, block_meta)
+                block_logits = detach(self.model(None, None, block_tokens, block_pad_mask, only_block=True))
+                self.block_data.add_block_data(block_indices, block_logits, block_meta)
 
                 total += block_indices.size
                 i += 1
                 if i % 2000 == 0:
                     print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
-                    if args.debug:
+                    if self.debug:
                         break
 
-        all_block_data.save_shard(args.rank)
-        torch.distributed.barrier()
-        del model
-
-        if args.rank == 0:
-            all_block_data.consolidate_shards_and_save()
-        else:
-            all_block_data.clear()
-
-        set_index_com_file_ready()
-        torch.distributed.barrier()
-        if args.async_indexer:
-            while not check_model_com_file_ready():
-                time.sleep(5)
                 autoresume = get_adlr_autoresume()
                 if autoresume.termination_requested():
                     print_rank_0(">>> autoresume termination request found!")
@@ -105,17 +162,36 @@ def main():
                     print_rank_0(">>> training terminated. Returning")
                     sys.exit(0)
 
-            set_model_com_file_not_ready()
+    def save_index(self):
+        self.block_data.save_shard(self.rank)
+        torch.distributed.barrier()
+        del self.model
+
+        if self.is_main_builder:
+            self.block_data.consolidate_shards_and_save(ignore_shard=self.rank)
+        else:
+            self.block_data.clear()
+
+    def send_index_ready_signal(self):
+        global INDEX_READY
+        if self.is_main_builder:
+            INDEX_READY = 1 - INDEX_READY
+            print("Switched INDEX_READY", flush=True)
+        send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, async_op=True)
+
+        torch.distributed.barrier(get_index_group())
+        recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):
     args = get_args()
     model = get_model(lambda: model_provider(only_query_model, only_block_model))
 
-    load_path = args.load if from_realm_chkpt else args.ict_load
-
     if isinstance(model, torchDDP):
         model = model.module
+
+    load_path = args.load if from_realm_chkpt else args.ict_load
+
     tracker_filename = get_checkpoint_tracker_filename(load_path)
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
@@ -174,7 +250,9 @@ def get_one_epoch_dataloader(dataset):
     args = get_args()
 
     world_size = mpu.get_data_parallel_world_size()
+    print(world_size, flush=True)
     rank = mpu.get_data_parallel_rank()
+    print(rank, flush=True)
     global_batch_size = args.batch_size * world_size
     num_workers = args.num_workers
 

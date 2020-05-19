@@ -27,6 +27,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import REALMBertModel, REALMRetriever
 from megatron.training import pretrain
 from megatron.utils import reduce_losses
+from indexer import initialize_and_run_async_megatron
 
 num_batches = 0
 
@@ -177,4 +178,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
-             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'},
+             initializer_func=initialize_and_run_async_megatron)
