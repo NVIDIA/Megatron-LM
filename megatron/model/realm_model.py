@@ -163,8 +163,11 @@ class REALMRetriever(MegatronModule):
 
     def reload_index(self):
         args = get_args()
+        print("loading from file", flush=True)
         self.block_data = BlockData.load_from_file(args.block_data_path)
+        print("resetting index", flush=True)
         self.hashed_index.reset_index()
+        print("adding block data", flush=True)
         self.hashed_index.add_block_embed_data(self.block_data)
 
     def prep_query_text_for_retrieval(self, query_text):

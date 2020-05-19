@@ -373,13 +373,29 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
     timers('interval time').start()
     report_memory_flag = True
+    import time
+    print(">>> going to sleep", flush=True)
+    time.sleep(10)
+    print(">>> woke from sleep", flush=True)
+    print(time.ctime(time.time()), flush=True)
 
     global INDEX_READY
     recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
+    print(">>>>>>>> Created recv handle", flush=True)
     while iteration < args.train_iters:
-        if hasattr(model, 'retriever') and INDEX_READY == 1:
-            model.retriever.reload_index()
+        print("INDEX READY: ", INDEX_READY)
+        if args.max_training_rank is not None and INDEX_READY == 1:
+            print(">>>>>>> entering the good stuff", flush=True)
+            true_model = model
+            if hasattr(true_model, 'module'):
+                true_model = true_model.module
+                if hasattr(true_model, 'module'):
+                    true_model = true_model.module
+            print(">>>>>>> starting to reload index", flush=True)
+            true_model.retriever.reload_index()
+            print(">>>>>>> starting to save checkpoint", flush=True)
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            print(">>>>>>> saved checkpoint", flush=True)
 
             if args.rank == 0:
                 INDEX_READY = 1 - INDEX_READY
@@ -387,6 +403,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             send_handle = torch.distributed.broadcast(INDEX_READY, 0, async_op=True)
             torch.distributed.barrier(get_train_group())
             recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
+        else:
+            print(">>>>>>> moving right along", flush=True)
 
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,

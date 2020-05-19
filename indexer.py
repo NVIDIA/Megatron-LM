@@ -110,15 +110,14 @@ class AsyncIndexBuilder(object):
 
     def run_async(self):
         while True:
-            print("Starting (again!)")
-            self.build_index()
-            self.save_index()
+            print("Starting (again!)", flush=True)
+            self.build_and_save_index()
             self.send_index_ready_signal()
             while INDEX_READY == 1:
-                print("Waiting for new model checkpoint.")
-                time.sleep(1)
+                print("Waiting for new model checkpoint.", flush=True)
+                time.sleep(5)
 
-            self.load_model()
+            self.load_attributes()
 
     def load_attributes(self):
         try:
@@ -129,7 +128,70 @@ class AsyncIndexBuilder(object):
         self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
         self.block_data = BlockData()
 
-    def build_index(self):
+    def build_and_save_index(self):
+        i = 1
+        total = 0
+        while True:
+            with torch.no_grad():
+                try:
+                    query_tokens, query_pad_mask, \
+                    block_tokens, block_pad_mask, block_index_data = get_batch(self.dataloader)
+                except:
+                    break
+
+                block_index_data = detach(block_index_data)
+                block_indices = block_index_data[:, 3]
+                block_meta = block_index_data[:, :3]
+
+                block_logits = detach(self.model(None, None, block_tokens, block_pad_mask, only_block=True))
+                self.block_data.add_block_data(block_indices, block_logits, block_meta)
+
+                total += block_indices.size
+                i += 1
+                if i % 10 == 0:
+                    print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
+                    if self.debug:
+                        break
+
+                autoresume = get_adlr_autoresume()
+                if autoresume.termination_requested():
+                    print_rank_0(">>> autoresume termination request found!")
+                    if torch.distributed.get_rank() == 0:
+                        autoresume.request_resume()
+                    print_rank_0(">>> training terminated. Returning")
+                    sys.exit(0)
+
+        self.block_data.save_shard(self.rank)
+        torch.distributed.barrier()
+        del self.model
+
+        if self.is_main_builder:
+            self.block_data.consolidate_shards_and_save(ignore_shard=self.rank)
+        self.block_data.clear()
+
+    def send_index_ready_signal(self):
+        global INDEX_READY
+        if self.is_main_builder:
+            INDEX_READY = 1 - INDEX_READY
+            print("Switched INDEX_READY", flush=True)
+        import time
+        print(time.ctime(time.time()), flush=True)
+        send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, async_op=True)
+
+        torch.distributed.barrier(get_index_group())
+        recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
+
+
+class BasicIndexBuilder(object):
+    def __init__(self):
+        args = get_args()
+        self.rank = args.rank
+        self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
+        self.model.eval()
+        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
+        self.block_data = BlockData()
+
+    def build_and_save_index(self):
         i = 1
         total = 0
         while True:
@@ -151,36 +213,14 @@ class AsyncIndexBuilder(object):
                 i += 1
                 if i % 2000 == 0:
                     print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
-                    if self.debug:
-                        break
 
-                autoresume = get_adlr_autoresume()
-                if autoresume.termination_requested():
-                    print_rank_0(">>> autoresume termination request found!")
-                    if torch.distributed.get_rank() == 0:
-                        autoresume.request_resume()
-                    print_rank_0(">>> training terminated. Returning")
-                    sys.exit(0)
-
-    def save_index(self):
         self.block_data.save_shard(self.rank)
         torch.distributed.barrier()
         del self.model
 
-        if self.is_main_builder:
+        if self.rank == 0:
             self.block_data.consolidate_shards_and_save(ignore_shard=self.rank)
-        else:
-            self.block_data.clear()
-
-    def send_index_ready_signal(self):
-        global INDEX_READY
-        if self.is_main_builder:
-            INDEX_READY = 1 - INDEX_READY
-            print("Switched INDEX_READY", flush=True)
-        send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, async_op=True)
-
-        torch.distributed.barrier(get_index_group())
-        recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
+        self.block_data.clear()
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):
@@ -270,4 +310,8 @@ def get_one_epoch_dataloader(dataset):
 
 
 if __name__ == "__main__":
-    main()
+    initialize_megatron(extra_args_provider=None,
+                        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    index_builder = BasicIndexBuilder()
+    index_builder.build_and_save_index()
+
