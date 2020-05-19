@@ -20,23 +20,6 @@ from pretrain_bert_ict import get_batch, model_provider
 from indexer_utils import set_index_com_file_ready, set_model_com_file_not_ready, check_model_com_file_ready
 
 
-# TODO re: main()
-# consider broadcasting/all-reducing all in memory rather than using the filesystem
-# create a different process group in the same nccl world - don't have to use chkpts on disc or transfer things on disc
-# torch distributed new group, constains a list of rank, gives back a group which I can hand to the collective operations
-# create a training process group, indexing process group
-# pass the training group to the distributed DDP, instead of the large world process group
-# use indexing process group for the shard-combining
-# communication group between process "8" and process "0" which tells training group that there's a new index
-# also, process 0 sends process 8 the new model
-
-# if i want to launch a separate process for indexing, may have to work with environment variables to
-# allocate the resources well. Have to subsequently assign the correct gpus to the indexing job
-# consider initializing everything in a single group and break off processes based on the ranks
-
-# for debugging purposes, make it so that the training process group checks every some number of intervals
-# and if it isn't ready, then wait so that it's consistent. Start with using the filesystem
-
 def test_retriever():
     # TODO: Update this because it's outdated and definitely won't run.
     initialize_megatron(extra_args_provider=None,
@@ -66,9 +49,11 @@ def main():
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     args = get_args()
-    ran_once = False
     while True:
-        model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=ran_once)
+        try:
+            model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=True)
+        except:
+            model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
         model.eval()
         dataset = get_ict_dataset()
         data_iter = iter(get_one_epoch_dataloader(dataset))
@@ -93,7 +78,7 @@ def main():
 
                 total += block_indices.size
                 i += 1
-                if i % 20 == 0:
+                if i % 2000 == 0:
                     print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
                     if args.debug:
                         break
@@ -107,7 +92,6 @@ def main():
         else:
             all_block_data.clear()
 
-        ran_once = True
         set_index_com_file_ready()
         torch.distributed.barrier()
         if args.async_indexer:

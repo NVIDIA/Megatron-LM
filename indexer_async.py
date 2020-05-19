@@ -111,7 +111,7 @@ class AsyncIndexBuilder(object):
         pprint("-" * 100)
         for i in range(5):
             # simulating building the index which takes 20 seconds
-            time.sleep(20)
+            time.sleep(10)
             pprint('built the index. Time: {}'.format(time.ctime(time.time())))
             args = get_args()
 
@@ -121,8 +121,11 @@ class AsyncIndexBuilder(object):
                 INDEX_READY = 1 - INDEX_READY
                 send_handle = dist.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
                 pprint("Broadcasted index ready = ", INDEX_READY)
+            else:
+                send_recv_handle = dist.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
 
             torch.distributed.barrier(INDEX_GROUP)
+            pprint("Synced after broadcasting")
 
             recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
             while INDEX_READY == 1:
@@ -154,12 +157,14 @@ class AsyncREALMTrainer(object):
             # INDEX_READY is 1
             if self.rank == 0:
                 INDEX_READY = 1 - INDEX_READY
-                send_handle = dist.broadcast(INDEX_READY, self.rank, async_op=True)
+                send_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
                 pprint("Broadcasted index ready = ", INDEX_READY)
+            else:
+                send_recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
 
             torch.distributed.barrier(TRAIN_GROUP)
+            pprint("Synced after broadcasting")
 
 
 if __name__ == "__main__":
     initialize_and_run_async_megatron(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-

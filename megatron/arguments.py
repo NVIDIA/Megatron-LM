@@ -195,6 +195,7 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
+    group.add_argument('--max-training-rank', type=int, default=None)
 
     return parser
 
