@@ -36,7 +36,7 @@ from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
-from megatron.mpu.initialize import get_index_ready, get_train_group
+from megatron.mpu.initialize import get_index_ready, get_train_group, get_data_parallel_group
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
@@ -236,7 +236,7 @@ def backward_step(optimizer, model, loss):
     """Backward step."""
     args = get_args()
     timers = get_timers()
-    torch.cuda.synchronize()
+    # torch.cuda.synchronize()
 
     # Backward pass.
     optimizer.zero_grad(set_grads_to_None=True)
@@ -373,19 +373,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
     timers('interval time').start()
     report_memory_flag = True
-    import time
-    print(">>> going to sleep", flush=True)
-    time.sleep(10)
-    print(">>> woke from sleep", flush=True)
-    print(time.ctime(time.time()), flush=True)
-
     global INDEX_READY
     recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
-    print(">>>>>>>> Created recv handle", flush=True)
     while iteration < args.train_iters:
-        print("INDEX READY: ", INDEX_READY)
         if args.max_training_rank is not None and INDEX_READY == 1:
-            print(">>>>>>> entering the good stuff", flush=True)
             true_model = model
             if hasattr(true_model, 'module'):
                 true_model = true_model.module
@@ -393,24 +384,24 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                     true_model = true_model.module
             print(">>>>>>> starting to reload index", flush=True)
             true_model.retriever.reload_index()
-            print(">>>>>>> starting to save checkpoint", flush=True)
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
-            print(">>>>>>> saved checkpoint", flush=True)
 
             if args.rank == 0:
                 INDEX_READY = 1 - INDEX_READY
-                print("Switched index ready", flush=True)
-            send_handle = torch.distributed.broadcast(INDEX_READY, 0, async_op=True)
-            torch.distributed.barrier(get_train_group())
+                print(">>> Switched index ready", flush=True)
+            torch.cuda.synchronize()
+            send_handle = torch.distributed.broadcast(INDEX_READY, 0)
+            torch.distributed.barrier(get_data_parallel_group())
             recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
         else:
-            print(">>>>>>> moving right along", flush=True)
+            print("moving right along", flush=True)
 
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,
                                              optimizer,
                                              lr_scheduler)
+
         skipped_iters += skipped_iter
         iteration += 1
 
@@ -443,7 +434,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        iteration, False)
 
         if args.exit_interval and iteration % args.exit_interval == 0:
-            torch.distributed.barrier()
+            torch.distributed.barrier(get_data_parallel_group())
             time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rank = torch.distributed.get_rank()
             print_rank_0('rank: {} | time: {} | exiting the program at '

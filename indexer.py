@@ -16,7 +16,7 @@ from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
 from megatron.global_vars import set_global_variables
-from megatron.mpu.initialize import get_index_ready, get_index_group, get_train_group
+from megatron.mpu.initialize import get_index_ready, get_index_group, get_train_group, get_data_parallel_group
 from megatron.mpu.initialize import set_data_parallel_group, set_model_parallel_group, init_realm_groups
 from megatron.initialize import init_distributed, _init_autoresume, _set_random_seed, _write_args_to_tensorboard
 from megatron.training import get_model
@@ -67,12 +67,12 @@ def initialize_and_run_async_megatron(extra_args_provider=None, args_defaults={}
     torch.distributed.barrier()
 
     if args.rank < args.max_training_rank:
-        torch.distributed.barrier(get_train_group())
+        torch.distributed.barrier(get_data_parallel_group())
         pprint("All trainers ready.")
         return
     else:
         runner = AsyncIndexBuilder(args.rank)
-        torch.distributed.barrier(get_index_group())
+        torch.distributed.barrier(get_data_parallel_group())
         pprint("All indexers ready.")
         runner.run_async()
 
@@ -123,6 +123,7 @@ class AsyncIndexBuilder(object):
         try:
             self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=True)
         except:
+            print(">>>>> No realm chkpt available", flush=True)
             self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
         self.model.eval()
         self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
@@ -148,7 +149,7 @@ class AsyncIndexBuilder(object):
 
                 total += block_indices.size
                 i += 1
-                if i % 10 == 0:
+                if i % 500 == 0:
                     print('Batch {:10d} | Total {:10d}'.format(i, total), flush=True)
                     if self.debug:
                         break
@@ -162,7 +163,7 @@ class AsyncIndexBuilder(object):
                     sys.exit(0)
 
         self.block_data.save_shard(self.rank)
-        torch.distributed.barrier()
+        torch.distributed.barrier(get_data_parallel_group())
         del self.model
 
         if self.is_main_builder:
@@ -174,12 +175,11 @@ class AsyncIndexBuilder(object):
         if self.is_main_builder:
             INDEX_READY = 1 - INDEX_READY
             print("Switched INDEX_READY", flush=True)
-        import time
-        print(time.ctime(time.time()), flush=True)
+        torch.cuda.synchronize()
         send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, async_op=True)
 
-        torch.distributed.barrier(get_index_group())
-        recv_handle = dist.broadcast(INDEX_READY, 0, async_op=True)
+        torch.distributed.barrier(get_data_parallel_group())
+        recv_handle = dist.broadcast(INDEX_READY, 0)
 
 
 class BasicIndexBuilder(object):
@@ -236,7 +236,7 @@ def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
-    assert iteration > 0
+    # assert iteration > 0
     checkpoint_name = get_checkpoint_name(load_path, iteration, False)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
@@ -245,6 +245,7 @@ def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=
     state_dict = torch.load(checkpoint_name, map_location='cpu')
     ict_state_dict = state_dict['model']
     if from_realm_chkpt:
+        print(">>>> Attempting to get ict state dict from realm", flush=True)
         ict_state_dict = ict_state_dict['retriever']['ict_model']
 
     if only_query_model:
@@ -256,7 +257,7 @@ def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=
             model.load_state_dict(ict_state_dict)
     else:
         model.load_state_dict(ict_state_dict)
-    torch.distributed.barrier()
+    torch.distributed.barrier(get_data_parallel_group())
 
     if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))
@@ -290,9 +291,7 @@ def get_one_epoch_dataloader(dataset):
     args = get_args()
 
     world_size = mpu.get_data_parallel_world_size()
-    print(world_size, flush=True)
     rank = mpu.get_data_parallel_rank()
-    print(rank, flush=True)
     global_batch_size = args.batch_size * world_size
     num_workers = args.num_workers
 

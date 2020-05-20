@@ -199,7 +199,9 @@ class REALMRetriever(MegatronModule):
                     true_model = true_model.module
             else:
                 true_model = self.ict_model
-            query_embeds = detach(true_model.embed_query(query_tokens, query_pad_mask))
+            # print("true model: ", true_model, flush=True)
+
+            query_embeds = detach(self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True))
         _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
         all_topk_tokens, all_topk_pad_masks = [], []
 
@@ -268,7 +270,6 @@ class ICTBertModel(MegatronModule):
 
     def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask, only_query=False, only_block=False):
         """Run a forward pass for each of the models and compute the similarity scores."""
-
         if only_query:
             return self.embed_query(query_tokens, query_attention_mask)
 

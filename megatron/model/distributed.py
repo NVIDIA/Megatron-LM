@@ -56,7 +56,7 @@ class DistributedDataParallel(MegatronModule):
                     if not no_scale and not reduce_after:
                         coalesced /= dist.get_world_size(group=self.data_parallel_group)
                     dist.all_reduce(coalesced, group=self.data_parallel_group)
-                    torch.cuda.synchronize()
+                    # torch.cuda.synchronize()
                     if not no_scale and reduce_after:
                         coalesced /= dist.get_world_size(group=self.data_parallel_group)
                     for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):

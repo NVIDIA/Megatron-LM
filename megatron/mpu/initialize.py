@@ -109,10 +109,8 @@ def set_model_parallel_group(group):
 
 def get_data_parallel_group():
     """Get the data parallel group the caller rank belongs to."""
-    #print(">>> yeah this function works.")
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
-    #print(_DATA_PARALLEL_GROUP)
     return _DATA_PARALLEL_GROUP
 
 
