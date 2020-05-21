@@ -154,14 +154,6 @@ class AsyncIndexBuilder(object):
                     if self.debug:
                         break
 
-                autoresume = get_adlr_autoresume()
-                if autoresume.termination_requested():
-                    print_rank_0(">>> autoresume termination request found!")
-                    if torch.distributed.get_rank() == 0:
-                        autoresume.request_resume()
-                    print_rank_0(">>> training terminated. Returning")
-                    sys.exit(0)
-
         self.block_data.save_shard(self.rank)
         torch.distributed.barrier(get_data_parallel_group())
         del self.model
