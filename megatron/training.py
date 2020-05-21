@@ -36,7 +36,7 @@ from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
-from megatron.mpu.initialize import get_index_ready, get_train_group, get_data_parallel_group
+from megatron.mpu.initialize import get_index_ready, get_train_group, get_data_parallel_group, get_gloo_comm_group
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
@@ -374,14 +374,20 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers('interval time').start()
     report_memory_flag = True
     global INDEX_READY
-    recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
+    # start off by posting a receive call which will be answered.
+    recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
     while iteration < args.train_iters:
-        if args.max_training_rank is not None and INDEX_READY == 1:
+
+        # this only applies for realm right here
+        if args.max_training_rank is not None and recv_handle.is_completed():
+            # should add check that INDEX_READY == 1 but what else could be happening
             true_model = model
             if hasattr(true_model, 'module'):
                 true_model = true_model.module
                 if hasattr(true_model, 'module'):
                     true_model = true_model.module
+
+
             print(">>>>>>> starting to reload index", flush=True)
             true_model.retriever.reload_index()
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
@@ -390,10 +396,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                 INDEX_READY = 1 - INDEX_READY
                 print(">>> Switched index ready", flush=True)
             torch.cuda.synchronize()
-            send_handle = torch.distributed.broadcast(INDEX_READY, 0)
+            send_handle = torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
             torch.distributed.barrier(get_data_parallel_group())
-            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, async_op=True)
-        else:
+            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
+        elif iteration < 100:
             print("moving right along", flush=True)
 
         loss_dict, skipped_iter = train_step(forward_step_func,

@@ -16,6 +16,7 @@
 
 """Model and data parallel groups."""
 
+import datetime
 import torch
 
 from .utils import ensure_divisibility
@@ -26,6 +27,7 @@ _MODEL_PARALLEL_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
+_GLOO_COMM_GROUP = None
 _TRAIN_GROUP = None
 _INDEX_GROUP = None
 _INDEX_READY = None
@@ -177,12 +179,22 @@ def destroy_model_parallel():
 
 
 def init_realm_groups(max_training_rank, world_size):
+    global _GLOO_COMM_GROUP
+    _GLOO_COMM_GROUP = torch.distributed.new_group(list(range(world_size)),
+                                                   backend="gloo",
+                                                   timeout=datetime.timedelta(0, 7200))
     global _TRAIN_GROUP
     _TRAIN_GROUP = torch.distributed.new_group(list(range(max_training_rank)))
     global _INDEX_GROUP
     _INDEX_GROUP = torch.distributed.new_group(list(range(max_training_rank, world_size)))
     global _INDEX_READY
-    _INDEX_READY = torch.zeros(1).cuda()
+    _INDEX_READY = torch.zeros(1)
+
+
+def get_gloo_comm_group():
+    global _GLOO_COMM_GROUP
+    assert _GLOO_COMM_GROUP is not None
+    return _GLOO_COMM_GROUP
 
 
 def get_train_group():

@@ -15,6 +15,7 @@
 
 """Megatron initialization."""
 
+import datetime
 import random
 import os
 

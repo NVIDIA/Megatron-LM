@@ -16,7 +16,7 @@ from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.model import REALMRetriever
 from megatron.global_vars import set_global_variables
-from megatron.mpu.initialize import get_index_ready, get_index_group, get_train_group, get_data_parallel_group
+from megatron.mpu.initialize import get_index_ready, get_index_group, get_train_group, get_data_parallel_group, get_gloo_comm_group
 from megatron.mpu.initialize import set_data_parallel_group, set_model_parallel_group, init_realm_groups
 from megatron.initialize import init_distributed, _init_autoresume, _set_random_seed, _write_args_to_tensorboard
 from megatron.training import get_model
@@ -176,10 +176,10 @@ class AsyncIndexBuilder(object):
             INDEX_READY = 1 - INDEX_READY
             print("Switched INDEX_READY", flush=True)
         torch.cuda.synchronize()
-        send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, async_op=True)
+        send_handle = dist.broadcast(INDEX_READY, self.main_builder_idx, group=get_gloo_comm_group(), async_op=True)
 
         torch.distributed.barrier(get_data_parallel_group())
-        recv_handle = dist.broadcast(INDEX_READY, 0)
+        dist.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
 
 
 class BasicIndexBuilder(object):
@@ -287,12 +287,14 @@ def get_ict_dataset(use_titles=True):
     return dataset
 
 
-def get_one_epoch_dataloader(dataset):
+def get_one_epoch_dataloader(dataset, batch_size=None):
     args = get_args()
 
     world_size = mpu.get_data_parallel_world_size()
     rank = mpu.get_data_parallel_rank()
-    global_batch_size = args.batch_size * world_size
+    if batch_size is None:
+        batch_size = args.batch_size
+    global_batch_size = batch_size * world_size
     num_workers = args.num_workers
 
     sampler = torch.utils.data.SequentialSampler(dataset)
