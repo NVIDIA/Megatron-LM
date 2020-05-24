@@ -34,7 +34,12 @@ def reduce_losses(losses):
     reduced_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(reduced_losses, group=get_data_parallel_group())
-    reduced_losses = reduced_losses / torch.distributed.get_world_size()
+    args = get_args()
+    if args.max_training_rank is not None:
+        num_trainers = args.max_training_rank
+    else:
+        num_trainers = torch.distributed.get_world_size()
+    reduced_losses = reduced_losses / num_trainers
 
     return reduced_losses
 

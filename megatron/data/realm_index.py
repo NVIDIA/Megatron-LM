@@ -33,9 +33,9 @@ class BlockData(object):
 
     @classmethod
     def load_from_file(cls, fname):
-        print(" > Unpickling block data")
+        print("\n> Unpickling block data", flush=True)
         state_dict = pickle.load(open(fname, 'rb'))
-        print(" > Finished unpickling")
+        print(">> Finished unpickling block data\n", flush=True)
 
         new_index = cls()
         new_index.embed_data = state_dict['embed_data']
@@ -69,7 +69,7 @@ class BlockData(object):
                 shard_size = len(data['embed_data'])
                 self.embed_data.update(data['embed_data'])
                 self.meta_data.update(data['meta_data'])
-                assert (len(self.embed_data) == old_size + shard_size) or (str(ignore_shard) in fname)
+                # assert (len(self.embed_data) == old_size + shard_size) or (str(ignore_shard) in fname)
 
         args = get_args()
         with open(args.block_data_path, 'wb') as final_file:
@@ -82,6 +82,7 @@ class FaissMIPSIndex(object):
         self.index_type = index_type
         self.embed_size = embed_size
         self.use_gpu = use_gpu
+        self.id_map = dict()
 
         # alsh
         self.m = 5
@@ -95,12 +96,20 @@ class FaissMIPSIndex(object):
         if self.index_type not in INDEX_TYPES:
             raise ValueError("Invalid index type specified")
 
-        index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
-        self.block_mips_index = faiss.IndexIDMap(index)
+        print("\n> Building index", flush=True)
+        self.block_mips_index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
+        if not self.use_gpu:
+            self.block_mips_index = faiss.IndexIDMap(self.block_mips_index)
+        print(">> Finished building index", flush=True)
+
         if self.use_gpu:
             res = faiss.StandardGpuResources()
-            device = mpu.get_data_parallel_rank()
-            self.block_mips_index = faiss.index_cpu_to_gpu(res, device, self.block_mips_index)
+            # self.block_mips_index = faiss.index_cpu_to_gpu(res, device, self.block_mips_index)
+            config = faiss.GpuIndexFlatConfig()
+            config.device = torch.cuda.current_device()
+            config.useFloat16 = True
+            self.block_mips_index = faiss.GpuIndexFlat(res, self.block_mips_index, config)
+            print(">>> Loaded Faiss index on GPU {}\n".format(self.block_mips_index.getDevice()), flush=True)
 
     def reset_index(self):
         self._set_block_index()
@@ -108,12 +117,16 @@ class FaissMIPSIndex(object):
     def add_block_embed_data(self, all_block_data, clear_block_data=False):
         """Add the embedding of each block to the underlying FAISS index"""
         block_indices, block_embeds = zip(*all_block_data.embed_data.items())
+        if self.use_gpu:
+            for i, idx in enumerate(block_indices):
+                self.id_map[i] = idx
         if clear_block_data:
             all_block_data.clear()
 
-        if self.index_type == 'flat_l2':
-            block_embeds = self.alsh_block_preprocess_fn(block_embeds)
-        self.block_mips_index.add_with_ids(np.float32(np.array(block_embeds)), np.array(block_indices))
+        if self.use_gpu:
+            self.block_mips_index.add(np.float32(np.array(block_embeds)))
+        else:
+            self.block_mips_index.add_with_ids(np.float32(np.array(block_embeds)), np.array(block_indices))
 
     def search_mips_index(self, query_embeds, top_k, reconstruct=True):
         """Get the top-k blocks by the index distance metric.
@@ -123,14 +136,22 @@ class FaissMIPSIndex(object):
         """
         if self.index_type == 'flat_l2':
             query_embeds = self.alsh_query_preprocess_fn(query_embeds)
-        query_embeds = np.float32(query_embeds)
+        query_embeds = np.float32(detach(query_embeds))
+        # query_embeds = query_embeds.float()
 
-        if reconstruct:
-            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
-            return top_k_block_embeds
-        else:
-            distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
-            return distances, block_indices
+        with torch.no_grad():
+            if reconstruct:
+                top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
+                return top_k_block_embeds
+            else:
+                distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
+                if self.use_gpu:
+                    fresh_indices = np.zeros(block_indices.shape)
+                    for i in range(block_indices.shape[0]):
+                        for j in range(block_indices.shape[1]):
+                            fresh_indices[i, j] = self.id_map[block_indices[i, j]]
+                    block_indices = fresh_indices
+                return distances, block_indices
 
     # functions below are for ALSH, which currently isn't being used
 

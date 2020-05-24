@@ -26,7 +26,8 @@ from megatron import print_rank_0
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import REALMBertModel, REALMRetriever
 from megatron.training import pretrain
-from megatron.utils import reduce_losses
+from megatron.utils import reduce_losses, report_memory
+from megatron import mpu
 from indexer import initialize_and_run_async_megatron
 
 num_batches = 0
@@ -37,11 +38,14 @@ def model_provider():
     args = get_args()
     print_rank_0('building REALM models ...')
 
-    ict_model = load_ict_checkpoint()
+    try:
+        ict_model = load_ict_checkpoint(from_realm_chkpt=True)
+    except:
+        ict_model = load_ict_checkpoint(from_realm_chkpt=False)
     ict_dataset = get_ict_dataset(use_titles=False)
     all_block_data = BlockData.load_from_file(args.block_data_path)
     # hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
-    hashed_index = FaissMIPSIndex(index_type='flat_ip', embed_size=128)
+    hashed_index = FaissMIPSIndex(index_type='flat_ip', embed_size=128, use_gpu=args.faiss_use_gpu)
     hashed_index.add_block_embed_data(all_block_data)
 
     # top_k + 1 because we may need to exclude trivial candidate
@@ -61,6 +65,9 @@ def get_batch(data_iterator):
         data = None
     else:
         data = next(data_iterator)
+
+
+
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
@@ -90,9 +97,11 @@ def forward_step(data_iterator, model):
     # Forward model.
     lm_logits, block_probs = model(tokens, pad_mask, query_block_indices)
     with torch.no_grad():
-        retrieval_utility = get_retrieval_utility(lm_logits, block_probs, labels, loss_mask)
+        max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility = mpu.checkpoint(
+            get_retrieval_utility, lm_logits, block_probs, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
+    null_block_probs = torch.mean(block_probs[:, block_probs.shape[1] - 1])
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
     lm_logits = torch.sum(lm_logits * block_probs, dim=1)[:, :labels.shape[1]]
 
@@ -101,9 +110,13 @@ def forward_step(data_iterator, model):
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
-    reduced_loss = reduce_losses([lm_loss, retrieval_utility])
+    reduced_loss = reduce_losses([lm_loss, max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, null_block_probs])
     # torch.cuda.synchronize()
-    return lm_loss, {'lm_loss': reduced_loss[0], 'retrieval_utility': reduced_loss[1]}
+    return lm_loss, {'lm_loss': reduced_loss[0],
+                     'max_ru': reduced_loss[1],
+                     'top_ru': reduced_loss[2],
+                     'avg_ru': reduced_loss[3],
+                     'null_prob': reduced_loss[4]}
 
 
 def get_retrieval_utility(lm_logits, block_probs, labels, loss_mask):
@@ -129,9 +142,10 @@ def get_retrieval_utility(lm_logits, block_probs, labels, loss_mask):
             retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
         retrieved_block_losses.append(retrieved_block_loss)
     avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (lm_logits.shape[1] - 1)
-
-    retrieval_utility = null_block_loss - avg_retrieved_block_loss
-    return retrieval_utility
+    max_retrieval_utility = null_block_loss - min(retrieved_block_losses)
+    top_retrieval_utility = null_block_loss - retrieved_block_losses[0]
+    avg_retrieval_utility = null_block_loss - avg_retrieved_block_loss
+    return max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility
 
 
 def qa_forward_step(data_iterator, model):
