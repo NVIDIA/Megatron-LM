@@ -374,12 +374,16 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers('interval time').start()
     report_memory_flag = True
     global INDEX_READY
+    print('>>> Starting train()', flush=True)
     # start off by posting a receive call which will be answered.
+    # synchronize for start
+    torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
     recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
+    last_reload_iteration = iteration
     while iteration < args.train_iters:
-
         # this only applies for realm right here
-        if args.max_training_rank is not None and recv_handle.is_completed():
+        if args.max_training_rank is not None and recv_handle.is_completed() and iteration >= last_reload_iteration + 500:
+
             # should add check that INDEX_READY == 1 but what else could be happening
             true_model = model
             if hasattr(true_model, 'module'):
@@ -388,20 +392,23 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                     true_model = true_model.module
 
 
-            print(">>>>>>> starting to reload index", flush=True)
-            true_model.retriever.reload_index()
+            print("> Saving model and reloading index", flush=True)
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            true_model.retriever.reload_index()
 
             if args.rank == 0:
                 INDEX_READY = 1 - INDEX_READY
-                print(">>> Switched index ready", flush=True)
             torch.cuda.synchronize()
-            send_handle = torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
-            torch.distributed.barrier(get_data_parallel_group())
-            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
-        elif iteration < 100:
-            print("moving right along", flush=True)
 
+            # send handle
+            torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
+            torch.distributed.barrier(get_data_parallel_group())
+
+            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
+            last_reload_iteration = iteration
+        elif iteration < 20:
+            print("moving right along", flush=True)
+            # report_memory("iteration {}".format(iteration))
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,

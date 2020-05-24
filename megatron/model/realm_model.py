@@ -8,6 +8,8 @@ from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
 from megatron.model import BertModel
 from megatron.model.utils import get_linear_layer, init_method_normal
 from megatron.module import MegatronModule
+from megatron.utils import report_memory
+from megatron import mpu
 
 
 class REALMAnswerSpanModel(MegatronModule):
@@ -105,11 +107,11 @@ class REALMBertModel(MegatronModule):
 
         # [batch_size x k x embed_size]
         true_model = self.retriever.ict_model.module.module
-        fresh_block_logits = true_model.embed_block(topk_block_tokens, topk_block_attention_mask)
+        fresh_block_logits = mpu.checkpoint(true_model.embed_block, topk_block_tokens, topk_block_attention_mask)
         fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1)
 
         # [batch_size x embed_size x 1]
-        query_logits = true_model.embed_query(tokens, attention_mask).unsqueeze(2)
+        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(2)
 
         # [batch_size x k]
         fresh_block_scores = torch.matmul(fresh_block_logits, query_logits).squeeze()
@@ -123,6 +125,22 @@ class REALMBertModel(MegatronModule):
         all_tokens = torch.cat((tokens, topk_block_tokens), axis=1)
         all_attention_mask = torch.cat((attention_mask, topk_block_attention_mask), axis=1)
         all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
+
+        # re-align tokens to be contiguous
+        query_lengths = torch.sum(attention_mask, axis=1)
+        block_lengths = torch.sum(topk_block_attention_mask, axis=1)
+        for row_num in range(all_tokens.shape[0]):
+            qlen = query_lengths[row_num]
+            blen = block_lengths[row_num]
+            # disregard the CLS token from the block tokens
+            new_tokens_length = qlen + blen - 1
+
+            all_tokens[row_num, :qlen] = tokens[row_num, :qlen]
+            all_tokens[row_num, qlen:new_tokens_length] = tokens[row_num, 1:blen]
+            all_tokens[row_num, new_tokens_length:] = self.retriever.ict_dataset.pad_id
+
+            all_attention_mask[row_num, :new_tokens_length] = 1
+            all_attention_mask[row_num, new_tokens_length:] = 0
 
         # [batch_size x k x 2 * seq_length x vocab_size]
         lm_logits, _ = self.lm_model.forward(all_tokens, all_attention_mask, all_token_types)
@@ -163,11 +181,9 @@ class REALMRetriever(MegatronModule):
 
     def reload_index(self):
         args = get_args()
-        print("loading from file", flush=True)
         self.block_data = BlockData.load_from_file(args.block_data_path)
         print("resetting index", flush=True)
         self.hashed_index.reset_index()
-        print("adding block data", flush=True)
         self.hashed_index.add_block_embed_data(self.block_data)
 
     def prep_query_text_for_retrieval(self, query_text):
@@ -201,29 +217,29 @@ class REALMRetriever(MegatronModule):
                 true_model = self.ict_model
             # print("true model: ", true_model, flush=True)
 
-            query_embeds = detach(self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True))
-        _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
-        all_topk_tokens, all_topk_pad_masks = [], []
+            query_embeds = self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True)
+            _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
+            all_topk_tokens, all_topk_pad_masks = [], []
 
-        # this will result in no candidate exclusion
-        if query_block_indices is None:
-            query_block_indices = [-1] * len(block_indices)
+            # this will result in no candidate exclusion
+            if query_block_indices is None:
+                query_block_indices = [-1] * len(block_indices)
 
-        top_k_offset = int(include_null_doc)
-        for query_idx, indices in enumerate(block_indices):
-            # [k x meta_dim]
-            # exclude trivial candidate if it appears, else just trim the weakest in the top-k
-            topk_metas = [self.block_data.meta_data[idx] for idx in indices if idx != query_block_indices[query_idx]]
-            topk_block_data = [self.ict_dataset.get_block(*block_meta) for block_meta in topk_metas[:self.top_k - top_k_offset]]
-            if include_null_doc:
-                topk_block_data.append(self.ict_dataset.get_null_block())
-            topk_tokens, topk_pad_masks = zip(*topk_block_data)
+            top_k_offset = int(include_null_doc)
+            for query_idx, indices in enumerate(block_indices):
+                # [k x meta_dim]
+                # exclude trivial candidate if it appears, else just trim the weakest in the top-k
+                topk_metas = [self.block_data.meta_data[idx] for idx in indices if idx != query_block_indices[query_idx]]
+                topk_block_data = [self.ict_dataset.get_block(*block_meta) for block_meta in topk_metas[:self.top_k - top_k_offset]]
+                if include_null_doc:
+                    topk_block_data.append(self.ict_dataset.get_null_block())
+                topk_tokens, topk_pad_masks = zip(*topk_block_data)
 
-            all_topk_tokens.append(np.array(topk_tokens))
-            all_topk_pad_masks.append(np.array(topk_pad_masks))
+                all_topk_tokens.append(np.array(topk_tokens))
+                all_topk_pad_masks.append(np.array(topk_pad_masks))
 
-        # [batch_size x k x seq_length]
-        return np.array(all_topk_tokens), np.array(all_topk_pad_masks)
+            # [batch_size x k x seq_length]
+            return np.array(all_topk_tokens), np.array(all_topk_pad_masks)
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
