@@ -5,7 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
-from megatron.data.realm_dataset_utils import build_realm_training_sample, get_block_samples_mapping
+from megatron.data.realm_dataset_utils import build_realm_training_sample, get_block_samples_mapping, join_str_list
 
 
 class REALMDataset(Dataset):
@@ -136,7 +136,8 @@ class ICTDataset(Dataset):
 
     def decode_tokens(self, token_ids):
         tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
-        return ' '.join(token for token in tokens if token != '[PAD]')
+        non_pads = [t for t in tokens if t != '[PAD]']
+        return join_str_list(non_pads)
 
     def get_block(self, start_idx, end_idx, doc_idx):
         """Get the IDs for an evidence block plus the title of the corresponding document"""

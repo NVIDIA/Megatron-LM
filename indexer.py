@@ -95,6 +95,7 @@ def setup_realm_groups_and_vars():
 class IndexBuilder(object):
     def __init__(self):
         args = get_args()
+        self.debug = args.debug
         self.rank = args.rank
         self.model = None
         self.dataloader = None
@@ -287,6 +288,6 @@ def get_one_epoch_dataloader(dataset, batch_size=None):
 if __name__ == "__main__":
     initialize_megatron(extra_args_provider=None,
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
-    index_builder = BasicIndexBuilder()
+    index_builder = IndexBuilder()
     index_builder.build_and_save_index()
 

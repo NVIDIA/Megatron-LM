@@ -120,7 +120,6 @@ def set_data_parallel_group(group):
     global _DATA_PARALLEL_GROUP
     assert _DATA_PARALLEL_GROUP is None, \
         'data parallel group has already been initialized'
-    print(">>> setting data parallel group: ", group, flush=True)
     _DATA_PARALLEL_GROUP = group
 
 
