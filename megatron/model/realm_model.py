@@ -294,10 +294,11 @@ class ICTBertModel(MegatronModule):
 
         query_logits = self.embed_query(query_tokens, query_attention_mask)
         block_logits = self.embed_block(block_tokens, block_attention_mask)
+        return query_logits, block_logits
 
         # [batch x embed] * [embed x batch]
-        retrieval_scores = query_logits.matmul(torch.transpose(block_logits, 0, 1))
-        return retrieval_scores
+        # retrieval_scores = query_logits.matmul(torch.transpose(block_logits, 0, 1))
+        # return retrieval_scores
 
     def embed_query(self, query_tokens, query_attention_mask):
         """Embed a batch of tokens using the query model"""
@@ -343,3 +344,31 @@ class ICTBertModel(MegatronModule):
             print("Loading ICT block model", flush=True)
             self.block_model.load_state_dict(
                 state_dict[self._block_key], strict=strict)
+
+    def init_state_dict_from_bert(self):
+        args = get_args()
+        import os
+        from megatron import mpu
+        from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
+        tracker_filename = get_checkpoint_tracker_filename(args.bert_load)
+        if not os.path.isfile(tracker_filename):
+            raise FileNotFoundError("Could not find BERT load for ICT")
+        with open(tracker_filename, 'r') as f:
+            iteration = int(f.read().strip())
+            assert iteration > 0
+
+        checkpoint_name = get_checkpoint_name(args.bert_load, iteration, False)
+        if mpu.get_data_parallel_rank() == 0:
+            print('global rank {} is loading checkpoint {}'.format(
+                torch.distributed.get_rank(), checkpoint_name))
+
+        try:
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
+        except BaseException:
+            raise ValueError("Could not load checkpoint")
+
+        model_dict = state_dict['model']['language_model']
+        self.query_model.language_model.load_state_dict(model_dict)
+        self.block_model.language_model.load_state_dict(model_dict)
+        query_ict_head_state_dict = self.state_dict_for_save_checkpoint()[self._query_key]['ict_head']
+        self.block_model.ict_head.load_state_dict(query_ict_head_state_dict)

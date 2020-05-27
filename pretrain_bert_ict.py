@@ -16,6 +16,7 @@
 """Pretrain BERT for Inverse Cloze Task"""
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron import get_args
@@ -71,6 +72,7 @@ def get_batch(data_iterator):
 
 def forward_step(data_iterator, model):
     """Forward step."""
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -80,21 +82,49 @@ def forward_step(data_iterator, model):
     timers('batch generator').stop()
 
     # Forward model.
-    retrieval_scores = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask).float()
+    # retrieval_scores = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask).float()
+    query_logits, block_logits = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask)
+
+    data_parallel_size = dist.get_world_size() / args.model_parallel_size
+    batch_size = query_logits.shape[0]
+    global_batch_size = int(batch_size * data_parallel_size)
+
+    all_logits_shape = (int(global_batch_size), int(query_logits.shape[1]))
+    all_query_logits = torch.zeros(all_logits_shape).type(query_logits.dtype).cuda()
+    all_block_logits = all_query_logits.clone().cuda()
+
+    all_query_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = query_logits
+    all_block_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = block_logits
+    # print(all_query_logits[:, :5], flush=True)
+    # print(all_block_logits[:, :5], flush=True)
+
+    dist.all_reduce(all_query_logits)
+    dist.all_reduce(all_block_logits)
+    # print(all_query_logits[:, :5], flush=True)
+    # print(all_block_logits[:, :5], flush=True)
+
+    retrieval_scores = all_query_logits.float().matmul(torch.transpose(all_block_logits, 0, 1).float())
     softmaxed = F.softmax(retrieval_scores, dim=1)
 
     sorted_vals, sorted_indices = torch.topk(softmaxed, k=softmaxed.shape[1], sorted=True)
-    batch_size = softmaxed.shape[0]
 
-    top1_acc = torch.cuda.FloatTensor([sum([int(sorted_indices[i, 0] == i) for i in range(batch_size)]) / batch_size])
-    top5_acc = torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :5]) for i in range(batch_size)]) / batch_size])
+    def topk_acc(k):
+        return torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :k]) for i in range(global_batch_size)]) / global_batch_size])
+    top_accs = [topk_acc(k) for k in [1, 8, 20, 100]]
 
-    retrieval_loss = F.cross_entropy(softmaxed, torch.arange(batch_size).cuda())
-    reduced_losses = reduce_losses([retrieval_loss, top1_acc, top5_acc])
+    retrieval_loss = torch.nn.CrossEntropyLoss()(retrieval_scores, torch.arange(global_batch_size).long().cuda())
+
+    # correct_probs = torch.gather(softmaxed, 1, torch.arange(global_batch_size).long().cuda().reshape(-1, 1))
+    # assert correct_probs[3] == softmaxed[3, 3]
+    # retrieval_loss = -torch.sum(torch.log(correct_probs)) / global_batch_size
+
+    reduced_losses = reduce_losses([retrieval_loss, *top_accs])
     stats_dict = {
         'retrieval loss': reduced_losses[0],
         'top1_acc': reduced_losses[1],
-        'top5_acc': reduced_losses[2]
+        'top8_acc': reduced_losses[2],
+        'top20_acc': reduced_losses[3],
+        'top100_acc': reduced_losses[4],
     }
 
     return retrieval_loss, stats_dict

@@ -37,6 +37,7 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.mpu.initialize import get_index_ready, get_train_group, get_data_parallel_group, get_gloo_comm_group
+from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
@@ -229,6 +230,12 @@ def setup_model_and_optimizer(model_provider_func):
     else:
         args.iteration = 0
 
+    if args.iteration == 0 and isinstance(model.module.module, ICTBertModel):
+        print("Yes, located ICT model", flush=True)
+        model.module.module.init_state_dict_from_bert()
+    elif args.iteration == 0:
+        print("Ooops", flush=True)
+
     return model, optimizer, lr_scheduler
 
 
@@ -239,10 +246,12 @@ def backward_step(optimizer, model, loss):
     # torch.cuda.synchronize()
 
     # Backward pass.
-    optimizer.zero_grad(set_grads_to_None=True)
+    # optimizer.zero_grad(set_grads_to_None=True)
     if args.fp16:
+        optimizer.zero_grad(set_grads_to_None=True)
         optimizer.backward(loss, update_master_grads=False)
     else:
+        optimizer.zero_grad()
         loss.backward()
 
     # All-reduce if needed.
@@ -377,9 +386,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     print('>>> Starting train()', flush=True)
     # start off by posting a receive call which will be answered.
     # synchronize for start
-    torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
-    recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
-    last_reload_iteration = iteration
+    if args.max_training_rank is not None:
+        torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
+        recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
+        last_reload_iteration = iteration
     while iteration < args.train_iters:
         # this only applies for realm right here
         if args.max_training_rank is not None and recv_handle.is_completed() and iteration >= last_reload_iteration + 500:

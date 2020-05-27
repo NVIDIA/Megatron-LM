@@ -97,7 +97,8 @@ class InverseClozeDataset(Dataset):
         """concat with special tokens and pad sequence to self.max_seq_length"""
         tokens = [self.cls_id] + tokens + [self.sep_id]
         if title is not None:
-            tokens += title + [self.sep_id]
+            # tokens += title + [self.sep_id]
+            tokens = t
         assert len(tokens) <= self.max_seq_length, len(tokens)
 
         num_pad = self.max_seq_length - len(tokens)
