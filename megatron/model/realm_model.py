@@ -94,50 +94,95 @@ class REALMBertModel(MegatronModule):
         self._retriever_key = 'retriever'
 
     def forward(self, tokens, attention_mask, query_block_indices, return_topk_block_tokens=False):
+        # print("\nNEW FORWARD", '-' * 100, flush=True)
+        dset = self.retriever.ict_dataset
+
+        det_tokens = detach(tokens)[0].tolist()
+        det_attention = detach(attention_mask)[0].tolist()
+        # print("\nTokens: ", det_tokens, '\n', flush=True)
+        # print("\nAttention: ", det_attention, '\n', flush=True)
+        # print("pad id: ", dset.pad_id, flush=True)
+
+        assert bool(0 in det_attention) == bool(dset.pad_id in det_tokens)
+        if 0 in det_attention:
+            idx_padid = det_tokens.index(dset.pad_id)
+            idx_attn = det_attention.index(0)
+            assert idx_padid == idx_attn, (idx_padid, idx_attn)
+
+        # text = dset.decode_tokens(det_tokens)
+        # print(text, flush=True)
+
+        # print("Token shape: ", tokens.shape, flush=True)
+
         # [batch_size x k x seq_length]
         topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
             tokens, attention_mask, query_block_indices=query_block_indices, include_null_doc=True)
+        # print("Top k block shape: ", topk_block_tokens.shape, flush=True)
+
         batch_size = tokens.shape[0]
         # create a copy in case it needs to be returned
         ret_topk_block_tokens = np.array(topk_block_tokens)
 
         seq_length = topk_block_tokens.shape[2]
-        topk_block_tokens = torch.cuda.LongTensor(topk_block_tokens).reshape(-1, seq_length)
-        topk_block_attention_mask = torch.cuda.LongTensor(topk_block_attention_mask).reshape(-1, seq_length)
+        long_tensor = torch.cuda.LongTensor
+        topk_block_tokens = long_tensor(topk_block_tokens).reshape(-1, seq_length)
+        topk_block_attention_mask = long_tensor(topk_block_attention_mask).reshape(-1, seq_length)
+        # print('Block token shape: ', topk_block_tokens.shape, flush=True)
 
         # [batch_size x k x embed_size]
         true_model = self.retriever.ict_model.module.module
         fresh_block_logits = mpu.checkpoint(true_model.embed_block, topk_block_tokens, topk_block_attention_mask)
         fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1)
+        # print('Fresh block logits shape: ', fresh_block_logits.shape, flush=True)
 
         # [batch_size x embed_size x 1]
         query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(2)
+        # print('Query logits shape: ', query_logits.shape, flush=True)
 
         # [batch_size x k]
         fresh_block_scores = torch.matmul(fresh_block_logits, query_logits).squeeze()
+        # print('Block score shape: ', fresh_block_scores.shape, flush=True)
         block_probs = F.softmax(fresh_block_scores, dim=1)
 
         # [batch_size * k x seq_length]
         tokens = torch.stack([tokens.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
+        #assert all(tokens[i] == tokens[0] for i in range(self.top_k))
+        #assert all(tokens[i] == tokens[self.top_k] for i in range(self.top_k, 2 * self.top_k))
+        #assert not any(tokens[i] == tokens[0] for i in range(self.top_k, batch_size * self.top_k))
         attention_mask = torch.stack([attention_mask.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
 
         # [batch_size * k x 2 * seq_length]
-        all_tokens = torch.cat((tokens, topk_block_tokens), axis=1)
-        all_attention_mask = torch.cat((attention_mask, topk_block_attention_mask), axis=1)
-        all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
+        lm_input_batch_shape = (batch_size * self.top_k, 2 * seq_length)
+        all_tokens = torch.zeros(lm_input_batch_shape).long().cuda()
+        all_attention_mask = all_tokens.clone()
+        all_token_types = all_tokens.clone()
+        #all_tokens = torch.cat((tokens, topk_block_tokens), axis=1)
+        #all_attention_mask = torch.cat((attention_mask, topk_block_attention_mask), axis=1)
+        #all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
 
-        # re-align tokens to be contiguous
         query_lengths = torch.sum(attention_mask, axis=1)
-        block_lengths = torch.sum(topk_block_attention_mask, axis=1)
-        for row_num in range(all_tokens.shape[0]):
-            qlen = query_lengths[row_num]
-            blen = block_lengths[row_num]
-            # disregard the CLS token from the block tokens
-            new_tokens_length = qlen + blen - 1
+        # all blocks (including null ones) will have two SEP tokens
+        block_sep_indices = (topk_block_tokens == dset.sep_id).nonzero().reshape(batch_size * self.top_k, 2, 2)
 
-            all_tokens[row_num, :qlen] = tokens[row_num, :qlen]
-            all_tokens[row_num, qlen:new_tokens_length] = tokens[row_num, 1:blen]
+        # block body starts after the first SEP
+        block_starts = block_sep_indices[:, 0, 1] + 1
+        # block body ends after the second SEP
+        block_ends = block_sep_indices[:, 1, 1] + 1
+
+        # block_lengths = torch.sum(topk_block_attention_mask, axis=1)
+        for row_num in range(all_tokens.shape[0]):
+            q_len = query_lengths[row_num]
+            b_start = block_starts[row_num]
+            b_end = block_ends[row_num]
+            # new tokens = CLS + query + SEP + block + SEP
+            new_tokens_length = q_len + b_end - b_start
+
+            # splice query and block tokens accordingly
+            all_tokens[row_num, :q_len] = tokens[row_num, :q_len]
+            all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
             all_tokens[row_num, new_tokens_length:] = self.retriever.ict_dataset.pad_id
+
+            # print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
 
             all_attention_mask[row_num, :new_tokens_length] = 1
             all_attention_mask[row_num, new_tokens_length:] = 0

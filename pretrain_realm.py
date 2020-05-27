@@ -49,7 +49,7 @@ def model_provider():
     hashed_index.add_block_embed_data(all_block_data)
 
     # top_k + 1 because we may need to exclude trivial candidate
-    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index, args.block_top_k + 1)
+    retriever = REALMRetriever(ict_model, ict_dataset, all_block_data, hashed_index, args.block_top_k)
     model = REALMBertModel(retriever)
 
     return model

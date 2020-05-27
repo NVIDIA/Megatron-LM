@@ -18,6 +18,7 @@
 from datetime import datetime
 import math
 import sys
+import time
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -391,8 +392,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
         last_reload_iteration = iteration
     while iteration < args.train_iters:
+        if iteration >= last_reload_iteration + 500 and not recv_handle.is_completed():
+            time.sleep(5)
+            continue
+
         # this only applies for realm right here
-        if args.max_training_rank is not None and recv_handle.is_completed() and iteration >= last_reload_iteration + 500:
+        if args.max_training_rank is not None and recv_handle.is_completed():
 
             # should add check that INDEX_READY == 1 but what else could be happening
             true_model = model
@@ -403,7 +408,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
 
             print("> Saving model and reloading index", flush=True)
-            save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            if args.rank == 0:
+                save_checkpoint(iteration, model, optimizer, lr_scheduler)
             true_model.retriever.reload_index()
 
             if args.rank == 0:
