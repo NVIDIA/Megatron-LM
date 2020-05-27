@@ -392,7 +392,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
         last_reload_iteration = iteration
     while iteration < args.train_iters:
-        if iteration >= last_reload_iteration + 500 and not recv_handle.is_completed():
+        if args.max_training_rank is not None and iteration >= last_reload_iteration + 500 and not recv_handle.is_completed():
             time.sleep(5)
             continue
 
