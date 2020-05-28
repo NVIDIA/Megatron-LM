@@ -240,7 +240,7 @@ def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=
     return model
 
 
-def get_ict_dataset(use_titles=True):
+def get_ict_dataset(use_titles=True, query_in_block_prob=1):
     args = get_args()
     block_dataset = get_indexed_dataset_(args.data_path, 'mmap', True)
     titles_dataset = get_indexed_dataset_(args.titles_data_path, 'mmap', True)
@@ -255,7 +255,7 @@ def get_ict_dataset(use_titles=True):
         max_seq_length=args.seq_length,
         short_seq_prob=0.0001,  # doesn't matter
         seed=1,
-        query_in_block_prob=1,
+        query_in_block_prob=query_in_block_prob,
         use_titles=use_titles
     )
     dataset = ICTDataset(**kwargs)
