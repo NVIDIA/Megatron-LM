@@ -103,11 +103,11 @@ class REALMBertModel(MegatronModule):
         # print("\nAttention: ", det_attention, '\n', flush=True)
         # print("pad id: ", dset.pad_id, flush=True)
 
-        assert bool(0 in det_attention) == bool(dset.pad_id in det_tokens)
-        if 0 in det_attention:
-            idx_padid = det_tokens.index(dset.pad_id)
-            idx_attn = det_attention.index(0)
-            assert idx_padid == idx_attn, (idx_padid, idx_attn)
+        # assert bool(0 in det_attention) == bool(dset.pad_id in det_tokens)
+        # if 0 in det_attention:
+        #     idx_padid = det_tokens.index(dset.pad_id)
+        #     idx_attn = det_attention.index(0)
+        #     assert idx_padid == idx_attn, (idx_padid, idx_attn)
 
         # text = dset.decode_tokens(det_tokens)
         # print(text, flush=True)
@@ -135,12 +135,12 @@ class REALMBertModel(MegatronModule):
         fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1)
         # print('Fresh block logits shape: ', fresh_block_logits.shape, flush=True)
 
-        # [batch_size x embed_size x 1]
-        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(2)
+        # [batch_size x 1 x embed_size]
+        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(1)
         # print('Query logits shape: ', query_logits.shape, flush=True)
 
         # [batch_size x k]
-        fresh_block_scores = torch.matmul(fresh_block_logits, query_logits).squeeze()
+        fresh_block_scores = torch.matmul(query_logits, torch.transpose(fresh_block_logits, 1, 2)).squeeze()
         # print('Block score shape: ', fresh_block_scores.shape, flush=True)
         block_probs = F.softmax(fresh_block_scores, dim=1)
 
@@ -175,11 +175,11 @@ class REALMBertModel(MegatronModule):
             b_start = block_starts[row_num]
             b_end = block_ends[row_num]
             # new tokens = CLS + query + SEP + block + SEP
-            new_tokens_length = q_len + b_end - b_start
-
+            # new_tokens_length = q_len + b_end - b_start
+            new_tokens_length = q_len
             # splice query and block tokens accordingly
             all_tokens[row_num, :q_len] = tokens[row_num, :q_len]
-            all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
+            # all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
             all_tokens[row_num, new_tokens_length:] = self.retriever.ict_dataset.pad_id
 
             # print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
@@ -226,9 +226,8 @@ class REALMRetriever(MegatronModule):
 
     def reload_index(self):
         args = get_args()
-        self.block_data = BlockData.load_from_file(args.block_data_path)
-        print("resetting index", flush=True)
         self.hashed_index.reset_index()
+        self.block_data = BlockData.load_from_file(args.block_data_path)
         self.hashed_index.add_block_embed_data(self.block_data)
 
     def prep_query_text_for_retrieval(self, query_text):

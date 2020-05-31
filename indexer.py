@@ -167,10 +167,6 @@ class AsyncIndexBuilder(IndexBuilder):
             print("Starting (again!)", flush=True)
             self.build_and_save_index()
             self.send_index_ready_signal()
-            while INDEX_READY == 1:
-                print("Waiting for new model checkpoint.", flush=True)
-                time.sleep(5)
-
             self.load_attributes()
 
     def load_attributes(self):
@@ -195,7 +191,6 @@ class AsyncIndexBuilder(IndexBuilder):
 
         # recv handle
         dist.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
-        torch.distributed.barrier(get_data_parallel_group())
 
 
 def load_ict_checkpoint(only_query_model=False, only_block_model=False, no_grad=False, from_realm_chkpt=False):

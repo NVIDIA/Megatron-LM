@@ -96,7 +96,8 @@ def salient_span_mask(tokens, mask_id):
 
     # need to get all named entities
     entities = SPACY_NER(tokens_str).ents
-    entities = [e for e in entities if e.text != "CLS"]
+    undesired_types = ['CARDINAL', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL']
+    entities = [e for e in entities if e.text != "CLS" and e.label_ not in undesired_types]
     if len(entities) == 0:
         return None
     entity_idx = np.random.randint(0, len(entities))

@@ -29,7 +29,7 @@ class BlockData(object):
     def clear(self):
         """Clear the data structures to save memory"""
         self.embed_data = dict()
-        self.meta_data = dict()
+        # self.meta_data = dict()
 
     @classmethod
     def load_from_file(cls, fname):
@@ -100,7 +100,7 @@ class FaissMIPSIndex(object):
         self.block_mips_index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
         if not self.use_gpu:
             self.block_mips_index = faiss.IndexIDMap(self.block_mips_index)
-        print(">> Finished building index", flush=True)
+            print(">> Finished building index\n", flush=True)
 
         if self.use_gpu:
             res = faiss.StandardGpuResources()
@@ -109,9 +109,10 @@ class FaissMIPSIndex(object):
             config.device = torch.cuda.current_device()
             config.useFloat16 = True
             self.block_mips_index = faiss.GpuIndexFlat(res, self.block_mips_index, config)
-            print(">>> Loaded Faiss index on GPU {}\n".format(self.block_mips_index.getDevice()), flush=True)
+            print(">>> Finished building index on GPU {}\n".format(self.block_mips_index.getDevice()), flush=True)
 
     def reset_index(self):
+        del self.block_mips_index
         self._set_block_index()
 
     def add_block_embed_data(self, all_block_data, clear_block_data=False):
@@ -120,7 +121,7 @@ class FaissMIPSIndex(object):
         if self.use_gpu:
             for i, idx in enumerate(block_indices):
                 self.id_map[i] = idx
-        if clear_block_data:
+        if True:
             all_block_data.clear()
 
         if self.use_gpu:
@@ -134,8 +135,6 @@ class FaissMIPSIndex(object):
         :param reconstruct: if True: return a [num_queries x k x embed_dim] array of blocks
                             if False: return [num_queries x k] array of distances, and another for indices
         """
-        if self.index_type == 'flat_l2':
-            query_embeds = self.alsh_query_preprocess_fn(query_embeds)
         query_embeds = np.float32(detach(query_embeds))
         # query_embeds = query_embeds.float()
 
