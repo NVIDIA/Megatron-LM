@@ -307,8 +307,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('batch generator')
 
     # Tensorboard values.
-    if writer and torch.distributed.get_rank() == 0:
-        writer.add_scalar('learning_rate', learning_rate, iteration)
+    if iteration % args.log_interval == 0:
+        elapsed_time = timers('interval time').elapsed()
+        if writer and torch.distributed.get_rank() == 0:
+            writer.add_scalar('learning_rate', learning_rate, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
         if args.fp16:
@@ -318,10 +320,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             normalizer = args.log_interval
         timers.write(timers_to_log, writer, iteration,
                      normalizer=normalizer)
-
-    if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval time').elapsed()
-        if writer and torch.distributed.get_rank() == 0:
             writer.add_scalar('iteration_time',
                               elapsed_time / args.log_interval, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
