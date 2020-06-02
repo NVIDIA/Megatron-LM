@@ -311,17 +311,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         elapsed_time = timers('interval time').elapsed()
         if writer and torch.distributed.get_rank() == 0:
             writer.add_scalar('learning_rate', learning_rate, iteration)
-        for key in loss_dict:
-            writer.add_scalar(key, loss_dict[key], iteration)
-        if args.fp16:
-            writer.add_scalar('loss_scale', loss_scale, iteration)
+            for key in loss_dict:
+                writer.add_scalar(key, loss_dict[key], iteration)
+            if args.fp16:
+                writer.add_scalar('loss_scale', loss_scale, iteration)
+            writer.add_scalar('iteration_time',
+                              elapsed_time / args.log_interval, iteration)
         normalizer = iteration % args.log_interval
         if normalizer == 0:
             normalizer = args.log_interval
         timers.write(timers_to_log, writer, iteration,
                      normalizer=normalizer)
-            writer.add_scalar('iteration_time',
-                              elapsed_time / args.log_interval, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
                                                        args.train_iters)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
