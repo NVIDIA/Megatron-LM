@@ -16,7 +16,6 @@
 
 """Model and data parallel groups."""
 
-import datetime
 import torch
 
 from .utils import ensure_divisibility
@@ -26,11 +25,6 @@ from .utils import ensure_divisibility
 _MODEL_PARALLEL_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
-
-_GLOO_COMM_GROUP = None
-_TRAIN_GROUP = None
-_INDEX_GROUP = None
-_INDEX_READY = None
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_WORLD_SIZE = None
@@ -102,25 +96,11 @@ def get_model_parallel_group():
     return _MODEL_PARALLEL_GROUP
 
 
-def set_model_parallel_group(group):
-    global _MODEL_PARALLEL_GROUP
-    assert _MODEL_PARALLEL_GROUP is None, \
-        'model parallel group has already been initialized'
-    _MODEL_PARALLEL_GROUP = group
-
-
 def get_data_parallel_group():
     """Get the data parallel group the caller rank belongs to."""
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
     return _DATA_PARALLEL_GROUP
-
-
-def set_data_parallel_group(group):
-    global _DATA_PARALLEL_GROUP
-    assert _DATA_PARALLEL_GROUP is None, \
-        'data parallel group has already been initialized'
-    _DATA_PARALLEL_GROUP = group
 
 
 def set_model_parallel_world_size(world_size):
@@ -175,40 +155,3 @@ def destroy_model_parallel():
     _MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
-
-
-def init_realm_groups(max_training_rank, world_size):
-    global _GLOO_COMM_GROUP
-    _GLOO_COMM_GROUP = torch.distributed.new_group(list(range(world_size)),
-                                                   backend="gloo",
-                                                   timeout=datetime.timedelta(0, 7200))
-    global _TRAIN_GROUP
-    _TRAIN_GROUP = torch.distributed.new_group(list(range(max_training_rank)))
-    global _INDEX_GROUP
-    _INDEX_GROUP = torch.distributed.new_group(list(range(max_training_rank, world_size)))
-    global _INDEX_READY
-    _INDEX_READY = torch.zeros(1)
-
-
-def get_gloo_comm_group():
-    global _GLOO_COMM_GROUP
-    assert _GLOO_COMM_GROUP is not None
-    return _GLOO_COMM_GROUP
-
-
-def get_train_group():
-    global _TRAIN_GROUP
-    assert _TRAIN_GROUP is not None
-    return _TRAIN_GROUP
-
-
-def get_index_group():
-    global _INDEX_GROUP
-    assert _INDEX_GROUP is not None
-    return _INDEX_GROUP
-
-
-def get_index_ready():
-    global _INDEX_READY
-    assert _INDEX_READY is not None
-    return _INDEX_READY

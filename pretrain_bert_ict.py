@@ -36,6 +36,7 @@ def model_provider(only_query_model=False, only_block_model=False):
     args = get_args()
     print_rank_0('building BERT models ...')
 
+    # simpler to just keep using 2 tokentypes since the LM we initialize with has 2 tokentypes
     model = ICTBertModel(
         ict_head_size=128,
         num_tokentypes=2,
@@ -93,19 +94,16 @@ def forward_step(data_iterator, model):
     all_query_logits = torch.zeros(all_logits_shape).type(query_logits.dtype).cuda()
     all_block_logits = all_query_logits.clone().cuda()
 
+    # record this processes' data and then merge with other processes below
     all_query_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = query_logits
     all_block_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = block_logits
-    # print(all_query_logits[:, :5], flush=True)
-    # print(all_block_logits[:, :5], flush=True)
 
     dist.all_reduce(all_query_logits)
     dist.all_reduce(all_block_logits)
-    # print(all_query_logits[:, :5], flush=True)
-    # print(all_block_logits[:, :5], flush=True)
 
+    # scores are inner products between query and block embeddings
     retrieval_scores = all_query_logits.float().matmul(torch.transpose(all_block_logits, 0, 1).float())
     softmaxed = F.softmax(retrieval_scores, dim=1)
-
     sorted_vals, sorted_indices = torch.topk(softmaxed, k=softmaxed.shape[1], sorted=True)
 
     def topk_acc(k):
@@ -113,11 +111,6 @@ def forward_step(data_iterator, model):
     top_accs = [topk_acc(k) for k in [1, 8, 20, 100]]
 
     retrieval_loss = torch.nn.CrossEntropyLoss()(retrieval_scores, torch.arange(global_batch_size).long().cuda())
-
-    # correct_probs = torch.gather(softmaxed, 1, torch.arange(global_batch_size).long().cuda().reshape(-1, 1))
-    # assert correct_probs[3] == softmaxed[3, 3]
-    # retrieval_loss = -torch.sum(torch.log(correct_probs)) / global_batch_size
-
     reduced_losses = reduce_losses([retrieval_loss, *top_accs])
     stats_dict = {
         'retrieval loss': reduced_losses[0],

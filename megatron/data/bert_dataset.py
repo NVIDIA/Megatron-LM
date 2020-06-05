@@ -25,6 +25,7 @@ from torch.utils.data import Dataset
 from megatron import get_tokenizer, get_args
 from megatron import mpu
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.data.dataset_utils import build_training_sample
 from megatron import print_rank_0
 
 
@@ -61,8 +62,6 @@ class BertDataset(Dataset):
         self.sep_id = tokenizer.sep
         self.mask_id = tokenizer.mask
         self.pad_id = tokenizer.pad
-        from megatron.data.dataset_utils import build_training_sample
-        self.build_sample_fn = build_training_sample
 
     def __len__(self):
         return self.samples_mapping.shape[0]
@@ -73,13 +72,13 @@ class BertDataset(Dataset):
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
         np_rng = np.random.RandomState(seed=(self.seed + idx))
-        return self.build_sample_fn(sample, seq_length,
-                                    self.max_seq_length,  # needed for padding
-                                    self.vocab_id_list,
-                                    self.vocab_id_to_token_dict,
-                                    self.cls_id, self.sep_id,
-                                    self.mask_id, self.pad_id,
-                                    self.masked_lm_prob, np_rng)
+        return build_training_sample(sample, seq_length,
+                                     self.max_seq_length,  # needed for padding
+                                     self.vocab_id_list,
+                                     self.vocab_id_to_token_dict,
+                                     self.cls_id, self.sep_id,
+                                     self.mask_id, self.pad_id,
+                                     self.masked_lm_prob, np_rng)
 
 
 def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):

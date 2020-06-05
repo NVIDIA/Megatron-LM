@@ -44,7 +44,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 
 
 def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
-                       init_method, scaled_init_method, max_pos_embeds=None):
+                       init_method, scaled_init_method):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -60,8 +60,7 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
         init_method=init_method,
         output_layer_init_method=scaled_init_method,
         num_tokentypes=num_tokentypes,
-        add_pooler=add_pooler,
-        max_pos_embeds=max_pos_embeds)
+        add_pooler=add_pooler)
     # key used for checkpoints.
     language_model_key = 'language_model'
 
@@ -268,8 +267,7 @@ class TransformerLanguageModel(MegatronModule):
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
-                 add_pooler=False,
-                 max_pos_embeds=None):
+                 add_pooler=False):
         super(TransformerLanguageModel, self).__init__()
         args = get_args()
 
@@ -278,11 +276,10 @@ class TransformerLanguageModel(MegatronModule):
         self.init_method = init_method
         self.add_pooler = add_pooler
 
-        max_pos_embeds = args.max_position_embeddings if max_pos_embeds is None else max_pos_embeds
         # Embeddings
         self.embedding = Embedding(self.hidden_size,
                                    args.padded_vocab_size,
-                                   max_pos_embeds,
+                                   args.max_position_embeddings,
                                    args.hidden_dropout,
                                    self.init_method,
                                    self.num_tokentypes)

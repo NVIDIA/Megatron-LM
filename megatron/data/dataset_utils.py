@@ -25,7 +25,7 @@ import numpy as np
 from megatron import print_rank_0, get_args
 from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_, BertDataset
 
-DATASET_TYPES = ['standard_bert', 'ict', 'realm']
+DATASET_TYPES = ['standard_bert', 'ict']
 
 def compile_helper():
     """Compile helper function ar runtime. Make sure this
@@ -388,7 +388,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     padding_length = max_seq_length - num_tokens
     assert padding_length >= 0
     assert len(tokentypes) == num_tokens
-    assert len(masked_positions) == len(masked_labels), (len(masked_positions), len(masked_labels))
+    assert len(masked_positions) == len(masked_labels)
 
     # Tokens and token types.
     filler = [pad_id] * padding_length
@@ -456,7 +456,6 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     def build_dataset(index, name):
         from megatron.data.realm_dataset import ICTDataset
-        from megatron.data.realm_dataset import REALMDataset
         dataset = None
         if splits[index + 1] > splits[index]:
             # Get the pointer to the original doc-idx so we can set it later.
@@ -484,13 +483,6 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
                     query_in_block_prob=args.query_in_block_prob,
-                    **kwargs
-                )
-            elif dataset_type == 'realm':
-                dataset = REALMDataset(
-                    block_dataset=indexed_dataset,
-                    title_dataset=title_dataset,
-                    masked_lm_prob=masked_lm_prob,
                     **kwargs
                 )
             else:

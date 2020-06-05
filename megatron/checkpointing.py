@@ -24,7 +24,6 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import mpu
-from megatron.mpu.initialize import get_train_group, get_data_parallel_group
 from megatron import get_args
 from megatron import print_rank_0
 
@@ -45,7 +44,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-  # _compare('max_position_embeddings')
+    _compare('max_position_embeddings')
     _compare('make_vocab_size_divisible_by')
     _compare('padded_vocab_size')
     _compare('tokenizer_type')
@@ -119,14 +118,14 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         print('  successfully saved {}'.format(checkpoint_name))
 
     # Wait so everyone is done (necessary)
-    torch.distributed.barrier(get_data_parallel_group())
+    torch.distributed.barrier()
     # And update the latest iteration
     if torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
     # Wait so everyone is done (not necessary)
-    torch.distributed.barrier(get_data_parallel_group())
+    torch.distributed.barrier()
 
 
 def load_checkpoint(model, optimizer, lr_scheduler):
@@ -243,7 +242,7 @@ def load_checkpoint(model, optimizer, lr_scheduler):
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
-    # torch.distributed.barrier()
+    torch.distributed.barrier()
     if mpu.get_data_parallel_rank() == 0:
         print('  successfully loaded {}'.format(checkpoint_name))
 

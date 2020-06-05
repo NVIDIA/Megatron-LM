@@ -125,17 +125,12 @@ class BertModel(MegatronModule):
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
                                                        args.num_layers)
 
-        max_pos_embeds = None
-        if not add_binary_head and ict_head_size is None:
-            max_pos_embeds = 2 * args.seq_length
-
         self.language_model, self._language_model_key = get_language_model(
             attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=add_pooler,
             init_method=init_method,
-            scaled_init_method=scaled_init_method,
-            max_pos_embeds=max_pos_embeds)
+            scaled_init_method=scaled_init_method)
 
         if not self.add_ict_head:
             self.lm_head = BertLMHead(

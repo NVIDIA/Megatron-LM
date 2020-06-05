@@ -25,7 +25,6 @@ from megatron import mpu
 from megatron import print_rank_0
 from megatron.checkpointing import save_checkpoint
 from megatron.data.samplers import DistributedBatchSampler
-from megatron.mpu.initialize import get_data_parallel_group
 from megatron.fp16 import FP16_Optimizer
 
 
@@ -33,13 +32,8 @@ def reduce_losses(losses):
     """Reduce a tensor of losses across all GPUs."""
     reduced_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(reduced_losses, group=get_data_parallel_group())
-    args = get_args()
-    if args.max_training_rank is not None:
-        num_trainers = args.max_training_rank
-    else:
-        num_trainers = torch.distributed.get_world_size()
-    reduced_losses = reduced_losses / num_trainers
+    torch.distributed.all_reduce(reduced_losses)
+    reduced_losses = reduced_losses / torch.distributed.get_world_size()
 
     return reduced_losses
 
@@ -84,7 +78,7 @@ def check_adlr_autoresume_termination(iteration, model,
     args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
-    torch.distributed.barrier(get_data_parallel_group())
+    torch.distributed.barrier()
     if autoresume.termination_requested():
         if args.save:
             save_checkpoint(iteration, model, optimizer, lr_scheduler)

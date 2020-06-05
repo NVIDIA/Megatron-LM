@@ -18,8 +18,6 @@
 from datetime import datetime
 import math
 import sys
-import time
-
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
@@ -37,19 +35,14 @@ from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
-from megatron.mpu.initialize import get_index_ready, get_train_group, get_data_parallel_group, get_gloo_comm_group
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
 
 
-INDEX_READY = None
-
-
 def pretrain(train_valid_test_dataset_provider, model_provider,
-             forward_step_func, extra_args_provider=None, args_defaults={},
-             initializer_func=None):
+             forward_step_func, extra_args_provider=None, args_defaults={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -75,14 +68,8 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    if initializer_func is None:
-        initialize_megatron(extra_args_provider=extra_args_provider,
-                            args_defaults=args_defaults)
-    else:
-        initializer_func(extra_args_provider=extra_args_provider,
-                         args_defaults=args_defaults)
-        global INDEX_READY
-        INDEX_READY = get_index_ready()
+    initialize_megatron(extra_args_provider=extra_args_provider,
+                        args_defaults=args_defaults)
 
     args = get_args()
     timers = get_timers()
@@ -232,10 +219,8 @@ def setup_model_and_optimizer(model_provider_func):
         args.iteration = 0
 
     if args.iteration == 0 and isinstance(model.module.module, ICTBertModel):
-        print("Yes, located ICT model", flush=True)
+        print("Initializing ICT from pretrained BERT model", flush=True)
         model.module.module.init_state_dict_from_bert()
-    elif args.iteration == 0:
-        print("Ooops", flush=True)
 
     return model, optimizer, lr_scheduler
 
@@ -244,15 +229,12 @@ def backward_step(optimizer, model, loss):
     """Backward step."""
     args = get_args()
     timers = get_timers()
-    # torch.cuda.synchronize()
 
     # Backward pass.
-    # optimizer.zero_grad(set_grads_to_None=True)
+    optimizer.zero_grad(set_grads_to_None=True)
     if args.fp16:
-        optimizer.zero_grad(set_grads_to_None=True)
         optimizer.backward(loss, update_master_grads=False)
     else:
-        optimizer.zero_grad()
         loss.backward()
 
     # All-reduce if needed.
@@ -261,9 +243,11 @@ def backward_step(optimizer, model, loss):
         model.allreduce_params(reduce_after=False,
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
+
     # Update master gradients.
     if args.fp16:
         optimizer.update_master_grads()
+
     # Clipping gradients helps prevent the exploding gradient.
     if args.clip_grad > 0:
         if not args.fp16:
@@ -283,11 +267,10 @@ def train_step(forward_step_func, data_iterator,
     loss, loss_reduced = forward_step_func(data_iterator, model)
     timers('forward').stop()
 
+    # Calculate gradients, reduce across processes, and clip.
     timers('backward').start()
     backward_step(optimizer, model, loss)
     timers('backward').stop()
-
-    # Calculate gradients, reduce across processes, and clip.
 
     # Update parameters.
     timers('optimizer').start()
@@ -383,54 +366,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
     timers('interval time').start()
     report_memory_flag = True
-    global INDEX_READY
-    print('>>> Starting train()', flush=True)
-    # start off by posting a receive call which will be answered.
-    # synchronize for start
-    if args.max_training_rank is not None:
-        torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
-        recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
-        last_reload_iteration = iteration
     while iteration < args.train_iters:
-        if args.max_training_rank is not None and iteration >= last_reload_iteration + 500 and not recv_handle.is_completed():
-            time.sleep(5)
-            continue
-
-        # this only applies for realm right here
-        if args.max_training_rank is not None and recv_handle.is_completed():
-
-            # should add check that INDEX_READY == 1 but what else could be happening
-            true_model = model
-            if hasattr(true_model, 'module'):
-                true_model = true_model.module
-                if hasattr(true_model, 'module'):
-                    true_model = true_model.module
-
-
-            print("> Saving model and reloading index", flush=True)
-            if args.rank == 0:
-                save_checkpoint(iteration, model, optimizer, lr_scheduler)
-            true_model.retriever.reload_index()
-
-            if args.rank == 0:
-                INDEX_READY = 1 - INDEX_READY
-            torch.cuda.synchronize()
-
-            # send handle
-            torch.distributed.broadcast(INDEX_READY, 0, group=get_gloo_comm_group())
-            torch.distributed.barrier(get_data_parallel_group())
-
-            recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
-            last_reload_iteration = iteration
-        elif iteration < 20:
-            print("moving right along", flush=True)
-            # report_memory("iteration {}".format(iteration))
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,
                                              optimizer,
                                              lr_scheduler)
-
         skipped_iters += skipped_iter
         iteration += 1
 
@@ -463,7 +404,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        iteration, False)
 
         if args.exit_interval and iteration % args.exit_interval == 0:
-            torch.distributed.barrier(get_data_parallel_group())
+            torch.distributed.barrier()
             time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rank = torch.distributed.get_rank()
             print_rank_0('rank: {} | time: {} | exiting the program at '

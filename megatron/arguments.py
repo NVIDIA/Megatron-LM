@@ -195,7 +195,6 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
-    group.add_argument('--max-training-rank', type=int, default=None)
 
     return parser
 
@@ -343,14 +342,6 @@ def _add_data_args(parser):
                        help='Path to combined dataset to split.')
     group.add_argument('--titles-data-path', type=str, default=None,
                        help='Path to titles dataset used for ICT')
-    group.add_argument('--block-data-path', type=str, default=None,
-                       help='Path to pickled BlockData data structure')
-    group.add_argument('--block-index-path', type=str, default=None,
-                       help='Path to pickled data structure for efficient block indexing')
-    group.add_argument('--block-top-k', type=int, default=5,
-                       help='Number of blocks to use as top-k during retrieval')
-    group.add_argument('--async-indexer', action='store_true',
-                       help='Whether the indexer job is running asynchronously with a trainer job')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -388,7 +379,6 @@ def _add_data_args(parser):
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
                        help='Probability of keeping query in block for ICT dataset')
-    group.add_argument('--faiss-use-gpu', action='store_true')
 
     return parser
 

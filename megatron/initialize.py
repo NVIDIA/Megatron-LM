@@ -15,7 +15,6 @@
 
 """Megatron initialization."""
 
-import datetime
 import random
 import os
 
@@ -62,7 +61,8 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     _write_args_to_tensorboard()
 
 
-def init_distributed():
+def _initialize_distributed():
+    """Initialize torch.distributed and mpu."""
     args = get_args()
 
     device_count = torch.cuda.device_count()
@@ -101,13 +101,6 @@ def init_distributed():
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
             init_method=init_method)
-
-
-def _initialize_distributed():
-    """Initialize torch.distributed and mpu."""
-    init_distributed()
-    args = get_args()
-    device_count = torch.cuda.device_count()
 
     # Set the model-parallel / data-parallel communicators.
     if device_count > 0:
