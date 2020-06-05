@@ -82,13 +82,8 @@ def forward_step(data_iterator, model):
     timers('batch generator').stop()
 
     # Forward model.
-    if args.fp16_lm_cross_entropy:
-        losses = model(tokens, position_ids, attention_mask, labels=labels)
-    else:
-        output = model(tokens, position_ids, attention_mask)
-        losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
-                                                  labels)
-
+    losses = model(tokens, position_ids, attention_mask, labels=labels)
+    
     loss_mask = loss_mask.view(-1)
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 

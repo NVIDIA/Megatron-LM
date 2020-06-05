@@ -97,6 +97,9 @@ def parse_args(extra_args_provider=None, defaults={},
         if args.num_unique_layers < args.num_layers:
             assert args.DDP_impl == 'local', \
                 'torch-DDP does not work with parameters sharing.'
+    # Mixed precision checks.
+    if args.fp16_lm_cross_entropy:
+        assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
 
     _print_args(args)
     return args

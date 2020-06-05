@@ -40,6 +40,7 @@ class GPT2Model(MegatronModule):
         args = get_args()
 
         self.parallel_output = parallel_output
+        self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
 
         self.language_model, self._language_model_key = get_language_model(
             attention_mask_func=gpt2_attention_mask_func,
@@ -79,7 +80,11 @@ class GPT2Model(MegatronModule):
         if labels is None:
             return output
         else:
-            loss = mpu.vocab_parallel_cross_entropy(output, labels)
+            if self.fp16_lm_cross_entropy:
+                assert output.dtype == torch.half
+                loss = mpu.vocab_parallel_cross_entropy(output, labels)
+            else:
+                loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
             return loss
 
 

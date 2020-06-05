@@ -115,6 +115,7 @@ class BertModel(MegatronModule):
         super(BertModel, self).__init__()
         args = get_args()
 
+        self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.add_binary_head = add_binary_head
         self.parallel_output = parallel_output
         init_method = init_method_normal(args.init_method_std)
@@ -170,7 +171,12 @@ class BertModel(MegatronModule):
         if lm_labels is None:
             return lm_logits, binary_logits
         else:
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            if self.fp16_lm_cross_entropy:
+                assert lm_logits.dtype == torch.half
+                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            else:
+                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                           lm_labels)
             return lm_loss, binary_logits
 
 
