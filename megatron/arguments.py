@@ -294,6 +294,10 @@ def _add_mixed_precision_args(parser):
                        help='Window over which to raise/lower dynamic scale.')
     group.add_argument('--min-scale', type=float, default=1,
                        help='Minimum loss scale for dynamic loss scale.')
+    group.add_argument('--fp16-lm-cross-entropy', action='store_true',
+                       help='Move the cross entropy unreduced loss calculation'
+                       'for lm head to fp16.')
+
 
     return parser
 
