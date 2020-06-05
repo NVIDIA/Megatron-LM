@@ -42,14 +42,8 @@ class ICTBertModel(MegatronModule):
             self.block_model = BertModel(**bert_args)
             self._block_key = 'context_model'
 
-    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask, only_query=False, only_block=False):
-        """Run a forward pass for each of the models and compute the similarity scores."""
-        if only_query:
-            return self.embed_query(query_tokens, query_attention_mask)
-
-        if only_block:
-            return self.embed_block(block_tokens, block_attention_mask)
-
+    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask):
+        """Run a forward pass for each of the models and return the respective embeddings."""
         query_logits = self.embed_query(query_tokens, query_attention_mask)
         block_logits = self.embed_block(block_tokens, block_attention_mask)
         return query_logits, block_logits
