@@ -76,7 +76,7 @@ class GPT2Model(MegatronModule):
         if get_key_value:
             output = [output, presents]
 
-        if labels is not None:
+        if labels is None:
             return output
         else:
             loss = mpu.vocab_parallel_cross_entropy(output, labels)
