@@ -134,10 +134,30 @@ class ICTDataset(Dataset):
     def encode_text(self, text):
         return self.tokenizer.tokenize(text)
 
-    def decode_tokens(self, token_ids):
+    def decode_tokens(self, token_ids, hardcore=False):
         tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
-        non_pads = [t for t in tokens if t != '[PAD]']
-        return join_str_list(non_pads)
+        exclude_list = ['[PAD]', '[CLS]']
+        if hardcore:
+            extra_exclude = ['[SEP]']
+            exclude_list.extend(extra_exclude)
+        non_pads = [t for t in tokens if t not in exclude_list]
+        joined_strs = join_str_list(non_pads)
+        if hardcore:
+            escape_chars = ['+', '-', '&', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '/']
+            skip_me = False
+            joined_strs = list(joined_strs)
+            joined_strs = [s for s in joined_strs if s != '\\']
+            for i, c in enumerate(joined_strs):
+                if skip_me:
+                    skip_me = False
+                    continue
+                if c in escape_chars:
+                    joined_strs.insert(i, '\\')
+                    skip_me = True
+            joined_strs = ''.join(joined_strs)
+            if len(joined_strs) < 3:
+                joined_strs += 'text here'
+        return joined_strs
 
     def get_block(self, start_idx, end_idx, doc_idx):
         """Get the IDs for an evidence block plus the title of the corresponding document"""
