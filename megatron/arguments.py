@@ -97,6 +97,9 @@ def parse_args(extra_args_provider=None, defaults={},
         if args.num_unique_layers < args.num_layers:
             assert args.DDP_impl == 'local', \
                 'torch-DDP does not work with parameters sharing.'
+    # Mixed precision checks.
+    if args.fp16_lm_cross_entropy:
+        assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
 
     _print_args(args)
     return args
@@ -294,6 +297,10 @@ def _add_mixed_precision_args(parser):
                        help='Window over which to raise/lower dynamic scale.')
     group.add_argument('--min-scale', type=float, default=1,
                        help='Minimum loss scale for dynamic loss scale.')
+    group.add_argument('--fp16-lm-cross-entropy', action='store_true',
+                       help='Move the cross entropy unreduced loss calculation'
+                       'for lm head to fp16.')
+
 
     return parser
 

@@ -18,6 +18,7 @@
 import torch
 
 from megatron import get_args
+from megatron import mpu
 from megatron.module import MegatronModule
 
 from .language_model import parallel_lm_logits
@@ -39,6 +40,7 @@ class GPT2Model(MegatronModule):
         args = get_args()
 
         self.parallel_output = parallel_output
+        self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
 
         self.language_model, self._language_model_key = get_language_model(
             attention_mask_func=gpt2_attention_mask_func,
@@ -48,7 +50,7 @@ class GPT2Model(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
 
-    def forward(self, input_ids, position_ids, attention_mask,
+    def forward(self, input_ids, position_ids, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
 
@@ -75,7 +77,16 @@ class GPT2Model(MegatronModule):
         if get_key_value:
             output = [output, presents]
 
-        return output
+        if labels is None:
+            return output
+        else:
+            if self.fp16_lm_cross_entropy:
+                assert output.dtype == torch.half
+                loss = mpu.vocab_parallel_cross_entropy(output, labels)
+            else:
+                loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
+            return loss
+
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

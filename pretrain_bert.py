@@ -68,6 +68,7 @@ def get_batch(data_iterator):
 
 def forward_step(data_iterator, model):
     """Forward step."""
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -76,15 +77,15 @@ def forward_step(data_iterator, model):
         = get_batch(data_iterator)
     timers('batch generator').stop()
 
-    # Forward model.
-    lm_logits, sop_logits = model(tokens, padding_mask, tokentype_ids=types)
+    # Forward model. lm_labels
+    lm_loss_, sop_logits = model(tokens, padding_mask,
+                                 tokentype_ids=types,
+                                 lm_labels=lm_labels)
 
-    sop_loss = F.cross_entropy(sop_logits.view(-1, 2).contiguous().float(),
-                               sentence_order.view(-1).contiguous(),
+    sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
+                               sentence_order.view(-1),
                                ignore_index=-1)
 
-    lm_loss_ = mpu.vocab_parallel_cross_entropy(lm_logits.contiguous().float(),
-                                                lm_labels.contiguous())
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 

@@ -18,6 +18,7 @@
 import torch
 
 from megatron import get_args
+from megatron import mpu
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
 from megatron.model.transformer import LayerNorm
@@ -114,6 +115,7 @@ class BertModel(MegatronModule):
         super(BertModel, self).__init__()
         args = get_args()
 
+        self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.add_binary_head = add_binary_head
         self.parallel_output = parallel_output
         init_method = init_method_normal(args.init_method_std)
@@ -138,7 +140,8 @@ class BertModel(MegatronModule):
                                                 init_method)
             self._binary_head_key = 'binary_head'
 
-    def forward(self, input_ids, attention_mask, tokentype_ids=None):
+    def forward(self, input_ids, attention_mask,
+                tokentype_ids=None, lm_labels=None):
 
         extended_attention_mask = bert_extended_attention_mask(
             attention_mask, next(self.language_model.parameters()).dtype)
@@ -161,11 +164,21 @@ class BertModel(MegatronModule):
         lm_logits = self.lm_head(
             lm_output, self.language_model.embedding.word_embeddings.weight)
 
+        binary_logits = None
         if self.add_binary_head:
             binary_logits = self.binary_head(pooled_output)
-            return lm_logits, binary_logits
 
-        return lm_logits, None
+        if lm_labels is None:
+            return lm_logits, binary_logits
+        else:
+            if self.fp16_lm_cross_entropy:
+                assert lm_logits.dtype == torch.half
+                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            else:
+                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                           lm_labels)
+            return lm_loss, binary_logits
+
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
