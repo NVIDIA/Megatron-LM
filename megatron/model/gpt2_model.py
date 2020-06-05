@@ -25,6 +25,9 @@ from .language_model import get_language_model
 from .utils import init_method_normal
 from .utils import scaled_init_method_normal
 
+from megatron.utils import report_memory
+from megatron import mpu
+
 
 def gpt2_attention_mask_func(attention_scores, ltor_mask):
     attention_scores.masked_fill_(ltor_mask, -10000.0)
@@ -48,7 +51,7 @@ class GPT2Model(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
 
-    def forward(self, input_ids, position_ids, attention_mask,
+    def forward(self, input_ids, position_ids, attention_mask, labels,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
 
@@ -75,7 +78,14 @@ class GPT2Model(MegatronModule):
         if get_key_value:
             output = [output, presents]
 
-        return output
+        #report_memory('AAA')
+
+        losses = mpu.vocab_parallel_cross_entropy(output, labels)
+
+        #report_memory('BBB')
+
+        #return output
+        return losses
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

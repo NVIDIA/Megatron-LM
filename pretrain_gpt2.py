@@ -27,7 +27,7 @@ from megatron.model import GPT2Model
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import reduce_losses
-
+from megatron.utils import report_memory
 
 def model_provider():
     """Build the model."""
@@ -81,9 +81,12 @@ def forward_step(data_iterator, model):
     timers('batch generator').stop()
 
     # Forward model.
-    output = model(tokens, position_ids, attention_mask)
-    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
-                                              labels)
+    losses = model(tokens, position_ids, attention_mask, labels)
+    #report_memory('CCC')
+    #exit()
+    #losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
+    #                                          labels)
+    #report_memory('DDD')
     loss_mask = loss_mask.view(-1)
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 

@@ -379,6 +379,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag)
+        #report_memory_flag = True
 
         # Autoresume
         if args.adlr_autoresume and \
