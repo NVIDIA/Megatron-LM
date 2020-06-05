@@ -176,7 +176,7 @@ class AsyncIndexBuilder(IndexBuilder):
             print(">>>>> No realm chkpt available", flush=True)
             self.model = load_ict_checkpoint(only_block_model=True, no_grad=True, from_realm_chkpt=False)
         self.model.eval()
-        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
+        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset(), batch_size=128))
         self.block_data = BlockData()
 
     def send_index_ready_signal(self):

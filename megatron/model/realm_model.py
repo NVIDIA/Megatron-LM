@@ -92,9 +92,9 @@ class REALMBertModel(MegatronModule):
         self.retriever = retriever
         self.top_k = self.retriever.top_k
         self._retriever_key = 'retriever'
+        # self.eval()
 
     def forward(self, tokens, attention_mask, query_block_indices, return_topk_block_tokens=False):
-        # print("\nNEW FORWARD", '-' * 100, flush=True)
         dset = self.retriever.ict_dataset
 
         det_tokens = detach(tokens)[0].tolist()
@@ -112,7 +112,6 @@ class REALMBertModel(MegatronModule):
         # text = dset.decode_tokens(det_tokens)
         # print(text, flush=True)
 
-        # print("Token shape: ", tokens.shape, flush=True)
 
         # [batch_size x k x seq_length]
         topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
@@ -132,23 +131,21 @@ class REALMBertModel(MegatronModule):
         # [batch_size x k x embed_size]
         true_model = self.retriever.ict_model.module.module
         fresh_block_logits = mpu.checkpoint(true_model.embed_block, topk_block_tokens, topk_block_attention_mask)
-        fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1)
+        fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1).float()
         # print('Fresh block logits shape: ', fresh_block_logits.shape, flush=True)
 
         # [batch_size x 1 x embed_size]
-        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(1)
-        # print('Query logits shape: ', query_logits.shape, flush=True)
+        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(1).float()
 
         # [batch_size x k]
         fresh_block_scores = torch.matmul(query_logits, torch.transpose(fresh_block_logits, 1, 2)).squeeze()
-        # print('Block score shape: ', fresh_block_scores.shape, flush=True)
         block_probs = F.softmax(fresh_block_scores, dim=1)
 
         # [batch_size * k x seq_length]
         tokens = torch.stack([tokens.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
-        #assert all(tokens[i] == tokens[0] for i in range(self.top_k))
-        #assert all(tokens[i] == tokens[self.top_k] for i in range(self.top_k, 2 * self.top_k))
-        #assert not any(tokens[i] == tokens[0] for i in range(self.top_k, batch_size * self.top_k))
+        # assert all(torch.equal(tokens[i], tokens[0]) for i in range(self.top_k))
+        # assert all(torch.equal(tokens[i], tokens[self.top_k]) for i in range(self.top_k, 2 * self.top_k))
+        # assert not any(torch.equal(tokens[i], tokens[0]) for i in range(self.top_k, batch_size * self.top_k))
         attention_mask = torch.stack([attention_mask.unsqueeze(1)] * self.top_k, dim=1).reshape(-1, seq_length)
 
         # [batch_size * k x 2 * seq_length]
@@ -156,9 +153,6 @@ class REALMBertModel(MegatronModule):
         all_tokens = torch.zeros(lm_input_batch_shape).long().cuda()
         all_attention_mask = all_tokens.clone()
         all_token_types = all_tokens.clone()
-        #all_tokens = torch.cat((tokens, topk_block_tokens), axis=1)
-        #all_attention_mask = torch.cat((attention_mask, topk_block_attention_mask), axis=1)
-        #all_token_types = torch.zeros(all_tokens.shape).type(torch.int64).cuda()
 
         query_lengths = torch.sum(attention_mask, axis=1)
         # all blocks (including null ones) will have two SEP tokens
@@ -169,23 +163,40 @@ class REALMBertModel(MegatronModule):
         # block body ends after the second SEP
         block_ends = block_sep_indices[:, 1, 1] + 1
 
-        # block_lengths = torch.sum(topk_block_attention_mask, axis=1)
+        print('-' * 100)
         for row_num in range(all_tokens.shape[0]):
             q_len = query_lengths[row_num]
             b_start = block_starts[row_num]
             b_end = block_ends[row_num]
             # new tokens = CLS + query + SEP + block + SEP
-            # new_tokens_length = q_len + b_end - b_start
-            new_tokens_length = q_len
+            new_tokens_length = q_len + b_end - b_start
+
             # splice query and block tokens accordingly
             all_tokens[row_num, :q_len] = tokens[row_num, :q_len]
-            # all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
+            all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
             all_tokens[row_num, new_tokens_length:] = self.retriever.ict_dataset.pad_id
 
-            # print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
+            print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
 
             all_attention_mask[row_num, :new_tokens_length] = 1
             all_attention_mask[row_num, new_tokens_length:] = 0
+        print('-' * 100)
+
+        args = get_args()
+        if args.rank == 0:
+            torch.save({'lm_tokens': all_tokens,
+                        'lm_attn_mask': all_attention_mask,
+                        'query_tokens': tokens,
+                        'query_attn_mask': attention_mask,
+                        'query_logits': query_logits,
+                        'block_tokens': topk_block_tokens,
+                        'block_attn_mask': topk_block_attention_mask,
+                        'block_logits': fresh_block_logits,
+                        'block_probs': block_probs,
+                        }, 'final_lm_inputs.data')
+
+        # assert all(torch.equal(all_tokens[i], all_tokens[0]) for i in range(self.top_k))
+        # assert all(torch.equal(all_attention_mask[i], all_attention_mask[0]) for i in range(self.top_k))
 
         # [batch_size x k x 2 * seq_length x vocab_size]
         lm_logits, _ = self.lm_model.forward(all_tokens, all_attention_mask, all_token_types)
@@ -261,7 +272,7 @@ class REALMRetriever(MegatronModule):
                 true_model = self.ict_model
             # print("true model: ", true_model, flush=True)
 
-            query_embeds = self.ict_model(query_tokens, query_pad_mask, None, None, only_query=True)
+            query_embeds = true_model.embed_query(query_tokens, query_pad_mask)
             _, block_indices = self.hashed_index.search_mips_index(query_embeds, top_k=self.top_k, reconstruct=False)
             all_topk_tokens, all_topk_pad_masks = [], []
 

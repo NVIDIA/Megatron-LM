@@ -14,6 +14,9 @@
 # limitations under the License.
 
 """Pretrain BERT for Inverse Cloze Task"""
+import sys
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -29,6 +32,7 @@ from megatron.training import pretrain
 from megatron.utils import reduce_losses, report_memory
 from megatron import mpu
 from indexer import initialize_and_run_async_megatron
+from megatron.mpu.initialize import get_data_parallel_group
 
 num_batches = 0
 
@@ -44,7 +48,6 @@ def model_provider():
         ict_model = load_ict_checkpoint(from_realm_chkpt=False)
     ict_dataset = get_ict_dataset(use_titles=False)
     all_block_data = BlockData.load_from_file(args.block_data_path)
-    # hashed_index = RandProjectionLSHIndex.load_from_file(args.block_index_path)
     hashed_index = FaissMIPSIndex(index_type='flat_ip', embed_size=128, use_gpu=args.faiss_use_gpu)
     hashed_index.add_block_embed_data(all_block_data)
 
@@ -65,8 +68,6 @@ def get_batch(data_iterator):
         data = None
     else:
         data = next(data_iterator)
-
-
 
     data_b = mpu.broadcast_data(keys, data, datatype)
 
@@ -96,21 +97,57 @@ def forward_step(data_iterator, model):
 
     # Forward model.
     lm_logits, block_probs = model(tokens, pad_mask, query_block_indices)
+    # print('logits shape: ', lm_logits.shape, flush=True)
+    # print('labels shape: ', labels.shape, flush=True)
+
     with torch.no_grad():
         max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility = mpu.checkpoint(
             get_retrieval_utility, lm_logits, block_probs, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
     null_block_probs = torch.mean(block_probs[:, block_probs.shape[1] - 1])
-    block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(lm_logits)
-    lm_logits = torch.sum(lm_logits * block_probs, dim=1)[:, :labels.shape[1]]
 
-    lm_loss_ = mpu.vocab_parallel_cross_entropy(lm_logits.contiguous().float(),
-                                                labels.contiguous())
-    lm_loss = torch.sum(
-        lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+    # logits: [batch x top_k x 2 * seq_length x vocab_size]
+    # labels: [batch x seq_length]
+    relevant_logits = lm_logits[:, :, :labels.shape[1]].float()
+    # if get_args().rank == 0:
+    #     torch.save({'logits': relevant_logits.cpu(),
+    #                 'block_probs': block_probs.cpu(),
+    #                 'labels': labels.cpu(),
+    #                 'loss_mask': loss_mask.cpu(),
+    #                 'tokens': tokens.cpu(),
+    #                 'pad_mask': pad_mask.cpu(),
+    #                 }, 'tensors.data')
+        # torch.load('gagaga')
+    block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(relevant_logits)
+    # print(torch.sum(block_probs, dim=1), flush=True)
+
+    def get_log_probs(logits, b_probs):
+        max_logits = torch.max(logits, dim=-1, keepdim=True)[0].expand_as(logits)
+        logits = logits - max_logits
+
+        softmaxed_logits = F.softmax(logits, dim=-1)
+        marginalized_probs = torch.sum(softmaxed_logits * b_probs, dim=1)
+        l_probs = torch.log(marginalized_probs)
+        return l_probs
+
+    log_probs = mpu.checkpoint(get_log_probs, relevant_logits, block_probs)
+
+    def get_loss(l_probs, labs):
+        vocab_size = l_probs.shape[2]
+        loss = torch.nn.NLLLoss(ignore_index=-1)(l_probs.reshape(-1, vocab_size), labs.reshape(-1))
+        # loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+        return loss.float()
+
+    lm_loss = mpu.checkpoint(get_loss, log_probs, labels)
+
+    # marginalized_logits = torch.sum(relevant_logits * block_probs, dim=1)
+    # vocab_size = marginalized_logits.shape[2]
+    # lm_loss_ = torch.nn.CrossEntropyLoss()(marginalized_logits.reshape(-1, vocab_size), labels.reshape(-1))
+    # lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
     reduced_loss = reduce_losses([lm_loss, max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, null_block_probs])
+    # reduced_loss = reduce_losses([lm_loss])
     # torch.cuda.synchronize()
     return lm_loss, {'lm_loss': reduced_loss[0],
                      'max_ru': reduced_loss[1],
@@ -119,10 +156,10 @@ def forward_step(data_iterator, model):
                      'null_prob': reduced_loss[4]}
 
 
-def get_retrieval_utility(lm_logits, block_probs, labels, loss_mask):
+def get_retrieval_utility(lm_logits_, block_probs, labels, loss_mask):
     """log P(y | z, x) - log P(y | null, x)"""
     # [batch x seq_len x vocab_size]
-    lm_logits = lm_logits[:, :, :labels.shape[1], :]
+    lm_logits = lm_logits_[:, :, :labels.shape[1], :]
     #non_null_block_probs = block_probs[:, :-1]
     #non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
     # non_null_block_probs = non_null_block_probsexpand_as(lm_logits[:, :-1, :, :])
