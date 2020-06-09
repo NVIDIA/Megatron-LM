@@ -389,6 +389,10 @@ def _add_data_args(parser):
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
                        help='Probability of keeping query in block for ICT dataset')
     group.add_argument('--faiss-use-gpu', action='store_true')
+    group.add_argument('--index-reload-interval', type=int, default=500)
+    group.add_argument('--use-regular-masking', action='store_true')
+    group.add_argument('--allow-trivial-doc', action='store_true')
+    group.add_argument('--ner-data-path', type=str, default=None)
 
     return parser
 

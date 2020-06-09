@@ -417,7 +417,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     max_seq_length, masked_lm_prob,
                                     short_seq_prob, seed, skip_warmup,
                                     dataset_type='standard_bert'):
-
+    args = get_args()
     if dataset_type not in DATASET_TYPES:
         raise ValueError("Invalid dataset_type: ", dataset_type)
 
@@ -427,7 +427,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                            skip_warmup)
 
     if dataset_type in ['ict', 'realm']:
-        title_dataset = get_indexed_dataset_(data_prefix + '-titles',
+        title_dataset = get_indexed_dataset_(args.titles_data_path,
                                              data_impl,
                                              skip_warmup)
 
@@ -479,7 +479,6 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             )
 
             if dataset_type == 'ict':
-                args = get_args()
                 dataset = ICTDataset(
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
@@ -487,6 +486,11 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     **kwargs
                 )
             elif dataset_type == 'realm':
+                if args.ner_data_path is not None:
+                    ner_dataset = get_indexed_dataset_(args.ner_data_path,
+                                                       data_impl,
+                                                       skip_warmup)
+                    kwargs.update({'ner_dataset': ner_dataset})
                 dataset = REALMDataset(
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,

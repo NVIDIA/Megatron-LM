@@ -394,7 +394,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         recv_handle = torch.distributed.broadcast(INDEX_READY, args.max_training_rank, group=get_gloo_comm_group(), async_op=True)
         last_reload_iteration = iteration
     while iteration < args.train_iters:
-        if args.max_training_rank is not None and iteration >= last_reload_iteration + 100:
+        if args.max_training_rank is not None and iteration >= last_reload_iteration + args.index_reload_interval:
             if recv_handle.is_completed():
                 # should add check that INDEX_READY == 1 but what else could be happening
                 true_model = model

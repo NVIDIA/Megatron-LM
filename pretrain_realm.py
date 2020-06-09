@@ -101,7 +101,7 @@ def forward_step(data_iterator, model):
     # print('labels shape: ', labels.shape, flush=True)
 
     with torch.no_grad():
-        max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility = mpu.checkpoint(
+        max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, tokens_over_batch = mpu.checkpoint(
             get_retrieval_utility, lm_logits, block_probs, labels, loss_mask)
 
     # P(y|x) = sum_z(P(y|z, x) * P(z|x))
@@ -118,7 +118,7 @@ def forward_step(data_iterator, model):
     #                 'tokens': tokens.cpu(),
     #                 'pad_mask': pad_mask.cpu(),
     #                 }, 'tensors.data')
-        # torch.load('gagaga')
+
     block_probs = block_probs.unsqueeze(2).unsqueeze(3).expand_as(relevant_logits)
     # print(torch.sum(block_probs, dim=1), flush=True)
 
@@ -131,58 +131,59 @@ def forward_step(data_iterator, model):
         l_probs = torch.log(marginalized_probs)
         return l_probs
 
-    log_probs = mpu.checkpoint(get_log_probs, relevant_logits, block_probs)
-
     def get_loss(l_probs, labs):
         vocab_size = l_probs.shape[2]
         loss = torch.nn.NLLLoss(ignore_index=-1)(l_probs.reshape(-1, vocab_size), labs.reshape(-1))
         # loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
         return loss.float()
 
-    lm_loss = mpu.checkpoint(get_loss, log_probs, labels)
-
-    # marginalized_logits = torch.sum(relevant_logits * block_probs, dim=1)
-    # vocab_size = marginalized_logits.shape[2]
-    # lm_loss_ = torch.nn.CrossEntropyLoss()(marginalized_logits.reshape(-1, vocab_size), labels.reshape(-1))
-    # lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
-
-    reduced_loss = reduce_losses([lm_loss, max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, null_block_probs])
+    lm_loss = get_loss(get_log_probs(relevant_logits, block_probs), labels)
+    reduced_loss = reduce_losses([lm_loss, max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, null_block_probs, tokens_over_batch])
     # reduced_loss = reduce_losses([lm_loss])
     # torch.cuda.synchronize()
     return lm_loss, {'lm_loss': reduced_loss[0],
                      'max_ru': reduced_loss[1],
                      'top_ru': reduced_loss[2],
                      'avg_ru': reduced_loss[3],
-                     'null_prob': reduced_loss[4]}
+                     'null_prob': reduced_loss[4],
+                     'mask/batch': reduced_loss[5]}
 
 
 def get_retrieval_utility(lm_logits_, block_probs, labels, loss_mask):
     """log P(y | z, x) - log P(y | null, x)"""
-    # [batch x seq_len x vocab_size]
+
+    # [batch x top_k x seq_len x vocab_size]
     lm_logits = lm_logits_[:, :, :labels.shape[1], :]
-    #non_null_block_probs = block_probs[:, :-1]
-    #non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
-    # non_null_block_probs = non_null_block_probsexpand_as(lm_logits[:, :-1, :, :])
+    batch_size, top_k = lm_logits.shape[0], lm_logits.shape[1]
+
+    # non_null_block_probs = block_probs[:, :-1]
+    # non_null_block_probs /= torch.sum(non_null_block_probs, axis=1, keepdim=True)
+    # non_null_block_probs = non_null_block_probs.expand_as(lm_logits[:, :-1, :, :])
+
     null_block_lm_logits = lm_logits[:, -1, :, :]
     null_block_loss_ = mpu.vocab_parallel_cross_entropy(null_block_lm_logits.contiguous().float(),
                                                        labels.contiguous())
-    null_block_loss = torch.sum(
-        null_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+    null_block_loss = torch.sum(null_block_loss_.view(-1) * loss_mask.reshape(-1)) / batch_size
 
     retrieved_block_losses = []
-    for block_num in range(lm_logits.shape[1] - 1):
+
+    for block_num in range(top_k - 1):
         retrieved_block_lm_logits = lm_logits[:, block_num, :, :]
         retrieved_block_loss_ = mpu.vocab_parallel_cross_entropy(retrieved_block_lm_logits.contiguous().float(),
                                                                  labels.contiguous())
-        #retrieved_block_loss_ *= non_null_block_probs[:, block_num].reshape(-1, 1)
-        retrieved_block_loss = torch.sum(
-            retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+        # retrieved_block_loss_ *= non_null_block_probs[:, block_num].reshape(-1, 1)
+        retrieved_block_loss = torch.sum(retrieved_block_loss_.view(-1) * loss_mask.reshape(-1)) / batch_size
         retrieved_block_losses.append(retrieved_block_loss)
-    avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (lm_logits.shape[1] - 1)
+    avg_retrieved_block_loss = torch.sum(torch.cuda.FloatTensor(retrieved_block_losses)) / (top_k - 1)
+
     max_retrieval_utility = null_block_loss - min(retrieved_block_losses)
     top_retrieval_utility = null_block_loss - retrieved_block_losses[0]
     avg_retrieval_utility = null_block_loss - avg_retrieved_block_loss
-    return max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility
+
+    tokens_over_batch = loss_mask.sum().float() / batch_size
+
+    return max_retrieval_utility, top_retrieval_utility, avg_retrieval_utility, tokens_over_batch
 
 
 def qa_forward_step(data_iterator, model):

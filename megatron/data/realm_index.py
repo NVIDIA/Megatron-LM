@@ -16,9 +16,11 @@ def detach(tensor):
 
 class BlockData(object):
     def __init__(self):
+        args = get_args()
         self.embed_data = dict()
         self.meta_data = dict()
-        self.temp_dir_name = 'temp_block_data'
+        block_data_path = os.path.splitext(args.block_data_path)[0]
+        self.temp_dir_name = block_data_path + '_tmp'
 
     def state(self):
         return {
@@ -150,12 +152,12 @@ class FaissMIPSIndex(object):
                         for j in range(block_indices.shape[1]):
                             fresh_indices[i, j] = self.id_map[block_indices[i, j]]
                     block_indices = fresh_indices
-                    args = get_args()
-                    if args.rank == 0:
-                        torch.save({'query_embeds': query_embeds,
-                                    'id_map': self.id_map,
-                                    'block_indices': block_indices,
-                                    'distances': distances}, 'search.data')
+                    # args = get_args()
+                    # if args.rank == 0:
+                    #     torch.save({'query_embeds': query_embeds,
+                    #                 'id_map': self.id_map,
+                    #                 'block_indices': block_indices,
+                    #                 'distances': distances}, 'search.data')
                 return distances, block_indices
 
     # functions below are for ALSH, which currently isn't being used

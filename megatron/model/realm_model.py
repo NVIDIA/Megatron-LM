@@ -114,8 +114,15 @@ class REALMBertModel(MegatronModule):
 
 
         # [batch_size x k x seq_length]
-        topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
-            tokens, attention_mask, query_block_indices=query_block_indices, include_null_doc=True)
+
+        args = get_args()
+        if args.allow_trivial_doc:
+            topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
+                tokens, attention_mask, query_block_indices=None, include_null_doc=True)
+        else:
+            topk_block_tokens, topk_block_attention_mask = self.retriever.retrieve_evidence_blocks(
+                tokens, attention_mask, query_block_indices=query_block_indices, include_null_doc=True)
+
         # print("Top k block shape: ", topk_block_tokens.shape, flush=True)
 
         batch_size = tokens.shape[0]
@@ -130,15 +137,16 @@ class REALMBertModel(MegatronModule):
 
         # [batch_size x k x embed_size]
         true_model = self.retriever.ict_model.module.module
-        fresh_block_logits = mpu.checkpoint(true_model.embed_block, topk_block_tokens, topk_block_attention_mask)
+        fresh_block_logits = true_model.embed_block(topk_block_tokens, topk_block_attention_mask)
         fresh_block_logits = fresh_block_logits.reshape(batch_size, self.top_k, -1).float()
         # print('Fresh block logits shape: ', fresh_block_logits.shape, flush=True)
 
         # [batch_size x 1 x embed_size]
-        query_logits = mpu.checkpoint(true_model.embed_query, tokens, attention_mask).unsqueeze(1).float()
+        query_logits = true_model.embed_query(tokens, attention_mask).unsqueeze(1).float()
 
         # [batch_size x k]
         fresh_block_scores = torch.matmul(query_logits, torch.transpose(fresh_block_logits, 1, 2)).squeeze()
+        # fresh_block_scores = fresh_block_scores / np.sqrt(query_logits.shape[2])
         block_probs = F.softmax(fresh_block_scores, dim=1)
 
         # [batch_size * k x seq_length]
@@ -163,7 +171,7 @@ class REALMBertModel(MegatronModule):
         # block body ends after the second SEP
         block_ends = block_sep_indices[:, 1, 1] + 1
 
-        print('-' * 100)
+        # print('-' * 100)
         for row_num in range(all_tokens.shape[0]):
             q_len = query_lengths[row_num]
             b_start = block_starts[row_num]
@@ -176,24 +184,24 @@ class REALMBertModel(MegatronModule):
             all_tokens[row_num, q_len:new_tokens_length] = topk_block_tokens[row_num, b_start:b_end]
             all_tokens[row_num, new_tokens_length:] = self.retriever.ict_dataset.pad_id
 
-            print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
+            # print(dset.decode_tokens(detach(all_tokens[row_num]).tolist()), '\n', flush=True)
 
             all_attention_mask[row_num, :new_tokens_length] = 1
             all_attention_mask[row_num, new_tokens_length:] = 0
-        print('-' * 100)
+        # print('-' * 100)
 
-        args = get_args()
-        if args.rank == 0:
-            torch.save({'lm_tokens': all_tokens,
-                        'lm_attn_mask': all_attention_mask,
-                        'query_tokens': tokens,
-                        'query_attn_mask': attention_mask,
-                        'query_logits': query_logits,
-                        'block_tokens': topk_block_tokens,
-                        'block_attn_mask': topk_block_attention_mask,
-                        'block_logits': fresh_block_logits,
-                        'block_probs': block_probs,
-                        }, 'final_lm_inputs.data')
+        # args = get_args()
+        # if args.rank == 0:
+        #     torch.save({'lm_tokens': all_tokens,
+        #                 'lm_attn_mask': all_attention_mask,
+        #                 'query_tokens': tokens,
+        #                 'query_attn_mask': attention_mask,
+        #                 'query_logits': query_logits,
+        #                 'block_tokens': topk_block_tokens,
+        #                 'block_attn_mask': topk_block_attention_mask,
+        #                 'block_logits': fresh_block_logits,
+        #                 'block_probs': block_probs,
+        #                 }, 'final_lm_inputs.data')
 
         # assert all(torch.equal(all_tokens[i], all_tokens[0]) for i in range(self.top_k))
         # assert all(torch.equal(all_attention_mask[i], all_attention_mask[0]) for i in range(self.top_k))

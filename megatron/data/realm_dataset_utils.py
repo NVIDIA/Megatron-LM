@@ -8,7 +8,7 @@ import spacy
 import torch
 
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
-from megatron import get_tokenizer, print_rank_0, mpu
+from megatron import get_args, get_tokenizer, print_rank_0, mpu
 
 SPACY_NER = spacy.load('en_core_web_lg')
 
@@ -16,19 +16,30 @@ SPACY_NER = spacy.load('en_core_web_lg')
 def build_realm_training_sample(sample, max_seq_length,
                                 vocab_id_list, vocab_id_to_token_dict,
                                 cls_id, sep_id, mask_id, pad_id,
-                                masked_lm_prob, np_rng):
+                                masked_lm_prob, block_ner_mask, np_rng):
     tokens = list(itertools.chain(*sample))[:max_seq_length - 2]
     tokens, tokentypes = create_single_tokens_and_tokentypes(tokens, cls_id, sep_id)
 
-    try:
-        masked_tokens, masked_positions, masked_labels = salient_span_mask(tokens, mask_id)
-    except TypeError:
-        # this means the above returned None, and None isn't iterable.
-        # TODO: consider coding style.
+    args = get_args()
+    if args.use_regular_masking:
         max_predictions_per_seq = masked_lm_prob * max_seq_length
         masked_tokens, masked_positions, masked_labels, _ = create_masked_lm_predictions(
             tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
             cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
+    elif block_ner_mask is not None:
+        block_ner_mask = list(itertools.chain(*block_ner_mask))[:max_seq_length - 2]
+        block_ner_mask = [0] + block_ner_mask + [0]
+        masked_tokens, masked_positions, masked_labels = get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id)
+    else:
+        try:
+            masked_tokens, masked_positions, masked_labels = salient_span_mask(tokens, mask_id)
+        except TypeError:
+            # this means the above returned None, and None isn't iterable.
+            # TODO: consider coding style.
+            max_predictions_per_seq = masked_lm_prob * max_seq_length
+            masked_tokens, masked_positions, masked_labels, _ = create_masked_lm_predictions(
+                tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
+                cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
 
     tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
         = pad_and_convert_to_numpy(masked_tokens, tokentypes, masked_positions,
@@ -41,6 +52,28 @@ def build_realm_training_sample(sample, max_seq_length,
         'pad_mask': padding_mask_np
     }
     return train_sample
+
+
+def get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id):
+    tokenizer = get_tokenizer()
+    tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
+
+    masked_tokens = tokens.copy()
+    masked_positions = []
+    masked_labels = []
+
+
+    for i in range(len(tokens)):
+        if block_ner_mask[i] == 1:
+            masked_positions.append(i)
+            masked_labels.append(tokens[i])
+            masked_tokens[i] = mask_id
+
+    # print("-" * 100 + '\n',
+    #       "TOKEN STR\n", tokens_str + '\n',
+    #       "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(masked_tokens)), flush=True)
+
+    return masked_tokens, masked_positions, masked_labels
 
 
 def create_single_tokens_and_tokentypes(_tokens, cls_id, sep_id):
@@ -119,10 +152,10 @@ def salient_span_mask(tokens, mask_id):
     for id_idx in masked_positions:
         labels.append(tokens[id_idx])
         output_tokens[id_idx] = mask_id
-    #print("-" * 100 + '\n',
-    #      "TOKEN STR\n", tokens_str + '\n',
-    #      "SELECTED ENTITY\n", selected_entity.text + '\n',
-    #      "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
+    # print("-" * 100 + '\n',
+    #       "TOKEN STR\n", tokens_str + '\n',
+    #       "SELECTED ENTITY\n", selected_entity.text + '\n',
+    #       "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(output_tokens)), flush=True)
 
     return output_tokens, masked_positions, labels
 
