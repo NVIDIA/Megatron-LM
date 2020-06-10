@@ -5,6 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
+from megatron.data.realm_dataset_utils import get_block_samples_mapping, join_str_list
 
 
 class ICTDataset(Dataset):

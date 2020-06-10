@@ -23,7 +23,7 @@ import itertools
 
 import numpy as np
 from megatron import print_rank_0, get_args
-from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_, BertDataset
+from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_
 
 DATASET_TYPES = ['standard_bert', 'ict']
 
@@ -426,8 +426,9 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                            data_impl,
                                            skip_warmup)
 
-    if dataset_type in ['ict', 'realm']:
-        title_dataset = get_indexed_dataset_(data_prefix + '-titles',
+    if dataset_type in ['ict']:
+        args = get_args()
+        title_dataset = get_indexed_dataset_(args.titles_data_path,
                                              data_impl,
                                              skip_warmup)
 
@@ -455,6 +456,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     print_split_stats('test', 2)
 
     def build_dataset(index, name):
+        from megatron.data.bert_dataset import BertDataset
         from megatron.data.realm_dataset import ICTDataset
         dataset = None
         if splits[index + 1] > splits[index]:

@@ -1,15 +1,10 @@
 import os
-import numpy as np
 import torch
-import torch.nn.functional as F
 
 from megatron import get_args
-from megatron.checkpointing import load_checkpoint, get_checkpoint_tracker_filename, get_checkpoint_name
-from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
+from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.model import BertModel
-from megatron.model.utils import get_linear_layer, init_method_normal
 from megatron.module import MegatronModule
-from megatron.utils import report_memory
 from megatron import mpu
 
 

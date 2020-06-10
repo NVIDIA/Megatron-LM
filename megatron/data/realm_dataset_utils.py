@@ -79,8 +79,8 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     # parallel case
     counts = torch.cuda.LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    #assert counts[0].item() == torch.distributed.get_world_size(
-    #    group=mpu.get_data_parallel_group())
+    assert counts[0].item() == torch.distributed.get_world_size(
+        group=mpu.get_data_parallel_group())
 
     # Load indexed dataset.
     print_rank_0(' > loading indexed mapping from {}'.format(
