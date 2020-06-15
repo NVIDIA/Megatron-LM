@@ -422,8 +422,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
 
         elif iteration < 20:
-            print("moving right along", flush=True)
-            report_memory("iteration {}".format(iteration))
+            #print("moving right along", flush=True)
+            #report_memory("iteration {}".format(iteration))
+            pass
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,

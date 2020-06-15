@@ -15,12 +15,16 @@ def detach(tensor):
 
 
 class BlockData(object):
-    def __init__(self):
-        args = get_args()
+    def __init__(self, block_data_path=None):
         self.embed_data = dict()
         self.meta_data = dict()
-        block_data_path = os.path.splitext(args.block_data_path)[0]
-        self.temp_dir_name = block_data_path + '_tmp'
+        if block_data_path is None:
+            args = get_args()
+            block_data_path = args.block_data_path
+        self.block_data_path = block_data_path
+
+        block_data_name = os.path.splitext(self.block_data_path)[0]
+        self.temp_dir_name = block_data_name + '_tmp'
 
     def state(self):
         return {
@@ -54,7 +58,7 @@ class BlockData(object):
 
     def save_shard(self, rank):
         if not os.path.isdir(self.temp_dir_name):
-            os.mkdir(self.temp_dir_name)
+            os.makedirs(self.temp_dir_name, exist_ok=True)
 
         # save the data for each shard
         with open('{}/{}.pkl'.format(self.temp_dir_name, rank), 'wb') as data_file:
@@ -73,8 +77,7 @@ class BlockData(object):
                 self.meta_data.update(data['meta_data'])
                 # assert (len(self.embed_data) == old_size + shard_size) or (str(ignore_shard) in fname)
 
-        args = get_args()
-        with open(args.block_data_path, 'wb') as final_file:
+        with open(self.block_data_path, 'wb') as final_file:
             pickle.dump(self.state(), final_file)
         shutil.rmtree(self.temp_dir_name, ignore_errors=True)
 

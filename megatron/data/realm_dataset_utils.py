@@ -28,6 +28,9 @@ def build_realm_training_sample(sample, max_seq_length,
             cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
     elif block_ner_mask is not None:
         block_ner_mask = list(itertools.chain(*block_ner_mask))[:max_seq_length - 2]
+        if args.use_random_spans:
+            rand_idx = np.random.randint(len(block_ner_mask))
+            block_ner_mask = block_ner_mask[rand_idx:] + block_ner_mask[:rand_idx]
         block_ner_mask = [0] + block_ner_mask + [0]
         masked_tokens, masked_positions, masked_labels = get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id)
     else:
@@ -182,7 +185,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     indexmap_filename += '.npy'
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0 and \
+    if mpu.get_data_parallel_rank() == 0 and \
             not os.path.isfile(indexmap_filename):
         print(' > WARNING: could not find index map file {}, building '
               'the indices on rank 0 ...'.format(indexmap_filename))
