@@ -6,6 +6,13 @@ from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoi
 from megatron.model import BertModel
 from megatron.module import MegatronModule
 from megatron import mpu
+from megatron.model.utils import get_linear_layer
+from megatron.model.utils import init_method_normal
+from megatron.model.language_model import get_language_model
+from megatron.model.utils import scaled_init_method_normal
+from megatron.model.utils import bert_attention_mask_func
+from megatron.model.utils import bert_extended_attention_mask
+from megatron.model.utils import bert_position_ids
 
 
 class ICTBertModel(MegatronModule):
@@ -17,10 +24,9 @@ class ICTBertModel(MegatronModule):
                  only_query_model=False,
                  only_block_model=False):
         super(ICTBertModel, self).__init__()
-        bert_args = dict(
-            num_tokentypes=num_tokentypes,
-            add_binary_head=False,
+        bert_kwargs = dict(
             ict_head_size=ict_head_size,
+            num_tokentypes=num_tokentypes,
             parallel_output=parallel_output
         )
         assert not (only_block_model and only_query_model)
@@ -29,12 +35,12 @@ class ICTBertModel(MegatronModule):
 
         if self.use_query_model:
             # this model embeds (pseudo-)queries - Embed_input in the paper
-            self.query_model = BertModel(**bert_args)
+            self.query_model = IREncoderBertModel(**bert_kwargs)
             self._query_key = 'question_model'
 
         if self.use_block_model:
             # this model embeds evidence blocks - Embed_doc in the paper
-            self.block_model = BertModel(**bert_args)
+            self.block_model = IREncoderBertModel(**bert_kwargs)
             self._block_key = 'context_model'
 
     def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask):
@@ -116,3 +122,64 @@ class ICTBertModel(MegatronModule):
         # give each model the same ict_head to begin with as well
         query_ict_head_state_dict = self.state_dict_for_save_checkpoint()[self._query_key]['ict_head']
         self.block_model.ict_head.load_state_dict(query_ict_head_state_dict)
+
+
+class IREncoderBertModel(MegatronModule):
+    """Bert Language model."""
+    def __init__(self, ict_head_size, num_tokentypes=2, parallel_output=True):
+        super(IREncoderBertModel, self).__init__()
+        args = get_args()
+
+        self.ict_head_size = ict_head_size
+        self.parallel_output = parallel_output
+        init_method = init_method_normal(args.init_method_std)
+        scaled_init_method = scaled_init_method_normal(args.init_method_std,
+                                                       args.num_layers)
+
+        self.language_model, self._language_model_key = get_language_model(
+            attention_mask_func=bert_attention_mask_func,
+            num_tokentypes=num_tokentypes,
+            add_pooler=True,
+            init_method=init_method,
+            scaled_init_method=scaled_init_method)
+
+        self.ict_head = get_linear_layer(args.hidden_size, ict_head_size, init_method)
+        self._ict_head_key = 'ict_head'
+
+    def forward(self, input_ids, attention_mask, tokentype_ids=None):
+        extended_attention_mask = bert_extended_attention_mask(
+            attention_mask, next(self.language_model.parameters()).dtype)
+        position_ids = bert_position_ids(input_ids)
+
+        lm_output, pooled_output = self.language_model(
+            input_ids,
+            position_ids,
+            extended_attention_mask,
+            tokentype_ids=tokentype_ids)
+
+        # Output.
+        if self.add_ict_head:
+            ict_logits = self.ict_head(pooled_output)
+            return ict_logits, None
+
+    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
+                                       keep_vars=False):
+        """For easy load when model is combined with other heads,
+        add an extra key."""
+
+        state_dict_ = {}
+        state_dict_[self._language_model_key] \
+            = self.language_model.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
+        state_dict_[self._ict_head_key] \
+            = self.ict_head.state_dict(destination, prefix, keep_vars)
+        return state_dict_
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customized load."""
+        self.language_model.load_state_dict(
+            state_dict[self._language_model_key], strict=strict)
+        self.ict_head.load_state_dict(
+            state_dict[self._ict_head_key], strict=strict)
+
+

@@ -20,6 +20,8 @@ def join_str_list(str_list):
 
 def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epochs,
                               max_num_samples, max_seq_length, seed, name):
+    """Get samples mapping for a dataset over fixed size blocks. This function also requires
+    a dataset of the titles for the source documents since their lengths must be taken into account."""
     if not num_epochs:
         if not max_num_samples:
             raise ValueError("Need to specify either max_num_samples "
@@ -40,7 +42,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     indexmap_filename += '.npy'
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0 and \
+    if mpu.get_data_parallel_rank() == 0 and \
             not os.path.isfile(indexmap_filename):
         print(' > WARNING: could not find index map file {}, building '
               'the indices on rank 0 ...'.format(indexmap_filename))

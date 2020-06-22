@@ -136,6 +136,8 @@ def _add_network_size_args(parser):
                        '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
+    group.add_argument('--ict-head-size', type=int, default=None,
+                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
@@ -202,8 +204,6 @@ def _add_training_args(parser):
 def _add_initialization_args(parser):
     group = parser.add_argument_group(title='initialization')
 
-    group.add_argument('--debug', action='store_true',
-                       help='Run things in debug mode')
     group.add_argument('--seed', type=int, default=1234,
                        help='Random seed used for python, numpy, '
                        'pytorch, and cuda.')

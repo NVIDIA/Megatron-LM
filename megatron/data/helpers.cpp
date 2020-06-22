@@ -452,10 +452,12 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
 
         // Current map index.
         uint64_t map_index = 0;
-        int32_t block_id = 0;
 
         // For each epoch:
         for (int32_t epoch=0; epoch<num_epochs; ++epoch) {
+            // assign every block a unique id
+            int32_t block_id = 0;
+
             if (map_index >= max_num_samples) {
                 if (verbose && (!second)) {
                 cout << "    reached " << max_num_samples << " samples after "
@@ -516,6 +518,10 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
                             // Populate the map.
                             if (second) {
                                 const auto map_index_0 = 4 * map_index;
+                                // Each sample has 4 items: the starting sentence index, ending sentence index,
+                                // the index of the document from which the block comes (used for fetching titles)
+                                // and the unique id of the block (used for creating block indexes)
+
                                 maps[map_index_0] = static_cast<DocIdx>(prev_start_index);
                                 maps[map_index_0 + 1] = static_cast<DocIdx>(sent_index + 1);
                                 maps[map_index_0 + 2] = static_cast<DocIdx>(doc);

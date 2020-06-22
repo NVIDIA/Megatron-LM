@@ -41,14 +41,15 @@ class ICTDataset(Dataset):
         """Get an ICT example of a pseudo-query and the block of text from which it was extracted"""
         start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
         if self.use_titles:
-            title = list(self.title_dataset[int(doc_idx)])
+            title = self.title_dataset[int(doc_idx)]
             title_pad_offset = 3 + len(title)
         else:
             title = None
             title_pad_offset = 2
-        block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
+        block = [self.block_dataset[i] for i in range(start_idx, end_idx)]
         assert len(block) > 1
 
+        # randint() is inclusive for Python rng
         rand_sent_idx = self.rng.randint(0, len(block) - 1)
 
         # keep the query in the context query_in_block_prob fraction of the time.
@@ -64,53 +65,47 @@ class ICTDataset(Dataset):
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
+        block_data = np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
 
         sample = {
-            'query_tokens': np.array(query_tokens),
-            'query_pad_mask': np.array(query_pad_mask),
-            'block_tokens': np.array(block_tokens),
-            'block_pad_mask': np.array(block_pad_mask),
-            'block_data': np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
+            'query_tokens': query_tokens,
+            'query_pad_mask': query_pad_mask,
+            'block_tokens': block_tokens,
+            'block_pad_mask': block_pad_mask,
+            'block_data': block_data,
         }
 
         return sample
 
-    def encode_text(self, text):
-        return self.tokenizer.tokenize(text)
-
-    def decode_tokens(self, token_ids):
-        """Utility function to help with debugging mostly"""
-        tokens = self.tokenizer.tokenizer.convert_ids_to_tokens(token_ids)
-        exclude_list = ['[PAD]', '[CLS]']
-        non_pads = [t for t in tokens if t not in exclude_list]
-        joined_strs = join_str_list(non_pads)
-
     def get_block(self, start_idx, end_idx, doc_idx):
         """Get the IDs for an evidence block plus the title of the corresponding document"""
-        block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
-        title = list(self.title_dataset[int(doc_idx)])
+        block = [self.block_dataset[i] for i in range(start_idx, end_idx)]
+        title = self.title_dataset[int(doc_idx)]
 
         block = list(itertools.chain(*block))[:self.max_seq_length - (3 + len(title))]
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
-        return (block_tokens, block_pad_mask)
+        return block_tokens, block_pad_mask
 
     def get_null_block(self):
         """Get empty block and title - used in REALM pretraining"""
         block, title = [], []
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
 
-        return (block_tokens, block_pad_mask)
+        return block_tokens, block_pad_mask
 
     def concat_and_pad_tokens(self, tokens, title=None):
         """Concat with special tokens and pad sequence to self.max_seq_length"""
+        tokens = list(tokens)
         if title is None:
             tokens = [self.cls_id] + tokens + [self.sep_id]
         else:
+            title = list(title)
             tokens = [self.cls_id] + title + [self.sep_id] + tokens + [self.sep_id]
-        assert len(tokens) <= self.max_seq_length, len(tokens)
+        assert len(tokens) <= self.max_seq_length
 
         num_pad = self.max_seq_length - len(tokens)
         pad_mask = [1] * len(tokens) + [0] * num_pad
         tokens += [self.pad_id] * num_pad
-        return tokens, pad_mask
+
+        return np.array(tokens), np.array(pad_mask)

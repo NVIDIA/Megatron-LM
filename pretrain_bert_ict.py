@@ -31,20 +31,27 @@ from megatron.utils import reduce_losses
 num_batches = 0
 
 
-def model_provider(only_query_model=False, only_block_model=False):
+def general_model_provider(only_query_model=False, only_block_model=False):
     """Build the model."""
     args = get_args()
-    print_rank_0('building BERT models ...')
+    if args.ict_head_size is None:
+        raise ValueError("Need to specify --ict-head-size to provide an ICTBertModel")
+
+    print_rank_0('building ICTBertModel...')
 
     # simpler to just keep using 2 tokentypes since the LM we initialize with has 2 tokentypes
     model = ICTBertModel(
-        ict_head_size=128,
+        ict_head_size=args.ict_head_size,
         num_tokentypes=2,
         parallel_output=True,
         only_query_model=only_query_model,
         only_block_model=only_block_model)
 
     return model
+
+
+def model_provider():
+    return general_model_provider(False, False)
 
 
 def get_batch(data_iterator):
@@ -98,6 +105,7 @@ def forward_step(data_iterator, model):
     all_query_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = query_logits
     all_block_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = block_logits
 
+    # currently this assumes model parallel size == 1.
     dist.all_reduce(all_query_logits)
     dist.all_reduce(all_block_logits)
 

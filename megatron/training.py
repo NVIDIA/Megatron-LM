@@ -218,9 +218,10 @@ def setup_model_and_optimizer(model_provider_func):
     else:
         args.iteration = 0
 
-    if args.iteration == 0 and isinstance(model.module.module, ICTBertModel):
+    unwrapped_model = model.module.module
+    if args.iteration == 0 and hasattr(unwrapped_model, 'init_state_dict_from_bert'):
         print("Initializing ICT from pretrained BERT model", flush=True)
-        model.module.module.init_state_dict_from_bert()
+        unwrapped_model.init_state_dict_from_bert()
 
     return model, optimizer, lr_scheduler
 

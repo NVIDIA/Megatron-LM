@@ -23,9 +23,11 @@ import itertools
 
 import numpy as np
 from megatron import print_rank_0, get_args
-from megatron.data.bert_dataset import get_indexed_dataset_, get_train_valid_test_split_
 
-DATASET_TYPES = ['standard_bert', 'ict']
+DSET_TYPE_STD = 'standard_bert'
+DSET_TYPE_ICT = 'ict'
+
+DSET_TYPES = [DSET_TYPE_ICT, DSET_TYPE_STD]
 
 def compile_helper():
     """Compile helper function ar runtime. Make sure this
@@ -38,68 +40,6 @@ def compile_helper():
         print("Making C++ dataset helpers module failed, exiting.")
         import sys
         sys.exit(1)
-
-
-def build_training_sample(sample,
-                          target_seq_length, max_seq_length,
-                          vocab_id_list, vocab_id_to_token_dict,
-                          cls_id, sep_id, mask_id, pad_id,
-                          masked_lm_prob, np_rng):
-    """Biuld training sample.
-
-    Arguments:
-        sample: A list of sentences in which each sentence is a list token ids.
-        target_seq_length: Desired sequence length.
-        max_seq_length: Maximum length of the sequence. All values are padded to
-            this length.
-        vocab_id_list: List of vocabulary ids. Used to pick a random id.
-        vocab_id_to_token_dict: A dictionary from vocab ids to text tokens.
-        cls_id: Start of example id.
-        sep_id: Separator id.
-        mask_id: Mask token id.
-        pad_id: Padding token id.
-        masked_lm_prob: Probability to mask tokens.
-        np_rng: Random number genenrator. Note that this rng state should be
-              numpy and not python since python randint is inclusive for
-              the opper bound whereas the numpy one is exclusive.
-    """
-
-    # We assume that we have at least two sentences in the sample
-    assert len(sample) > 1
-    assert target_seq_length <= max_seq_length
-
-    # Divide sample into two segments (A and B).
-    tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, np_rng)
-
-    # Truncate to `target_sequence_length`.
-    max_num_tokens = target_seq_length
-    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a),
-                                  len(tokens_b), max_num_tokens, np_rng)
-
-    # Build tokens and toketypes.
-    tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b,
-                                                      cls_id, sep_id)
-
-    # Masking.
-    max_predictions_per_seq = masked_lm_prob * max_num_tokens
-    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
-        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
-        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
-
-    # Padding.
-    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
-        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
-                                   masked_labels, pad_id, max_seq_length)
-
-    train_sample = {
-        'text': tokens_np,
-        'types': tokentypes_np,
-        'labels': labels_np,
-        'is_random': int(is_next_random),
-        'loss_mask': loss_mask_np,
-        'padding_mask': padding_mask_np,
-        'truncated': int(truncated)}
-    return train_sample
 
 
 def get_a_and_b_segments(sample, np_rng):
@@ -418,7 +358,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     short_seq_prob, seed, skip_warmup,
                                     dataset_type='standard_bert'):
 
-    if dataset_type not in DATASET_TYPES:
+    if dataset_type not in DSET_TYPES:
         raise ValueError("Invalid dataset_type: ", dataset_type)
 
     # Indexed dataset.
@@ -426,7 +366,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                            data_impl,
                                            skip_warmup)
 
-    if dataset_type in ['ict']:
+    if dataset_type == DSET_TYPE_ICT:
         args = get_args()
         title_dataset = get_indexed_dataset_(args.titles_data_path,
                                              data_impl,
@@ -479,7 +419,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                 seed=seed
             )
 
-            if dataset_type == 'ict':
+            if dataset_type == DSET_TYPE_ICT:
                 args = get_args()
                 dataset = ICTDataset(
                     block_dataset=indexed_dataset,

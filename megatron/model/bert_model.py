@@ -25,44 +25,10 @@ from megatron.model.utils import openai_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
+from megatron.model.utils import bert_attention_mask_func
+from megatron.model.utils import bert_extended_attention_mask
+from megatron.model.utils import bert_position_ids
 from megatron.module import MegatronModule
-
-
-def bert_attention_mask_func(attention_scores, attention_mask):
-    attention_scores = attention_scores + attention_mask
-    return attention_scores
-
-
-def bert_extended_attention_mask(attention_mask, dtype):
-    # We create a 3D attention mask from a 2D tensor mask.
-    # [b, 1, s]
-    attention_mask_b1s = attention_mask.unsqueeze(1)
-    # [b, s, 1]
-    attention_mask_bs1 = attention_mask.unsqueeze(2)
-    # [b, s, s]
-    attention_mask_bss = attention_mask_b1s * attention_mask_bs1
-    # [b, 1, s, s]
-    extended_attention_mask = attention_mask_bss.unsqueeze(1)
-    # Since attention_mask is 1.0 for positions we want to attend and 0.0
-    # for masked positions, this operation will create a tensor which is
-    # 0.0 for positions we want to attend and -10000.0 for masked positions.
-    # Since we are adding it to the raw scores before the softmax, this is
-    # effectively the same as removing these entirely.
-    # fp16 compatibility
-    extended_attention_mask = extended_attention_mask.to(dtype=dtype)
-    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-
-    return extended_attention_mask
-
-
-def bert_position_ids(token_ids):
-    # Create position ids
-    seq_length = token_ids.size(1)
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=token_ids.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
-
-    return position_ids
 
 
 class BertLMHead(MegatronModule):
@@ -110,40 +76,31 @@ class BertModel(MegatronModule):
     """Bert Language model."""
 
     def __init__(self, num_tokentypes=2, add_binary_head=True,
-                 ict_head_size=None, parallel_output=True):
+                 parallel_output=True):
         super(BertModel, self).__init__()
         args = get_args()
 
         self.add_binary_head = add_binary_head
-        self.ict_head_size = ict_head_size
-        self.add_ict_head = ict_head_size is not None
-        assert not (self.add_binary_head and self.add_ict_head)
-
         self.parallel_output = parallel_output
         init_method = init_method_normal(args.init_method_std)
-        add_pooler = self.add_binary_head or self.add_ict_head
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
                                                        args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
             attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
-            add_pooler=add_pooler,
+            add_pooler=self.add_binary_head,
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
-        if not self.add_ict_head:
-            self.lm_head = BertLMHead(
-                self.language_model.embedding.word_embeddings.weight.size(0),
-                args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
-            self._lm_head_key = 'lm_head'
+        self.lm_head = BertLMHead(
+            self.language_model.embedding.word_embeddings.weight.size(0),
+            args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
+        self._lm_head_key = 'lm_head'
         if self.add_binary_head:
             self.binary_head = get_linear_layer(args.hidden_size, 2,
                                                 init_method)
             self._binary_head_key = 'binary_head'
-        elif self.add_ict_head:
-            self.ict_head = get_linear_layer(args.hidden_size, ict_head_size, init_method)
-            self._ict_head_key = 'ict_head'
 
     def forward(self, input_ids, attention_mask, tokentype_ids=None):
 
@@ -151,7 +108,7 @@ class BertModel(MegatronModule):
             attention_mask, next(self.language_model.parameters()).dtype)
         position_ids = bert_position_ids(input_ids)
 
-        if self.add_binary_head or self.add_ict_head:
+        if self.add_binary_head:
             lm_output, pooled_output = self.language_model(
                 input_ids,
                 position_ids,
@@ -165,12 +122,9 @@ class BertModel(MegatronModule):
                 tokentype_ids=tokentype_ids)
 
         # Output.
-        if self.add_ict_head:
-            ict_logits = self.ict_head(pooled_output)
-            return ict_logits, None
-
         lm_logits = self.lm_head(
             lm_output, self.language_model.embedding.word_embeddings.weight)
+
         if self.add_binary_head:
             binary_logits = self.binary_head(pooled_output)
             return lm_logits, binary_logits
@@ -185,17 +139,13 @@ class BertModel(MegatronModule):
         state_dict_ = {}
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
-        if not self.add_ict_head:
-            state_dict_[self._lm_head_key] \
-                = self.lm_head.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+            destination, prefix, keep_vars)
+        state_dict_[self._lm_head_key] \
+            = self.lm_head.state_dict_for_save_checkpoint(
+            destination, prefix, keep_vars)
         if self.add_binary_head:
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
-        elif self.add_ict_head:
-            state_dict_[self._ict_head_key] \
-                = self.ict_head.state_dict(destination, prefix, keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
@@ -203,14 +153,10 @@ class BertModel(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        if not self.add_ict_head:
-            self.lm_head.load_state_dict(
-                state_dict[self._lm_head_key], strict=strict)
+        self.lm_head.load_state_dict(
+            state_dict[self._lm_head_key], strict=strict)
         if self.add_binary_head:
             self.binary_head.load_state_dict(
                 state_dict[self._binary_head_key], strict=strict)
-        elif self.add_ict_head:
-            self.ict_head.load_state_dict(
-                state_dict[self._ict_head_key], strict=strict)
 
 

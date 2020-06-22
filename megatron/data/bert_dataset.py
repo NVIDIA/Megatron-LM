@@ -25,6 +25,11 @@ from torch.utils.data import Dataset
 from megatron import get_tokenizer, get_args
 from megatron import mpu
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.data.dataset_utils import get_a_and_b_segments
+from megatron.data.dataset_utils import truncate_segments
+from megatron.data.dataset_utils import create_tokens_and_tokentypes
+from megatron.data.dataset_utils import pad_and_convert_to_numpy
+from megatron.data.dataset_utils import create_masked_lm_predictions
 from megatron import print_rank_0
 
 
@@ -61,8 +66,6 @@ class BertDataset(Dataset):
         self.sep_id = tokenizer.sep
         self.mask_id = tokenizer.mask
         self.pad_id = tokenizer.pad
-        from megatron.data.dataset_utils import build_training_sample
-        self.build_sample_fn = build_training_sample
 
     def __len__(self):
         return self.samples_mapping.shape[0]
@@ -73,13 +76,13 @@ class BertDataset(Dataset):
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
         np_rng = np.random.RandomState(seed=(self.seed + idx))
-        return self.build_sample_fn(sample, seq_length,
-                                    self.max_seq_length,  # needed for padding
-                                    self.vocab_id_list,
-                                    self.vocab_id_to_token_dict,
-                                    self.cls_id, self.sep_id,
-                                    self.mask_id, self.pad_id,
-                                    self.masked_lm_prob, np_rng)
+        return build_training_sample(sample, seq_length,
+                                     self.max_seq_length,  # needed for padding
+                                     self.vocab_id_list,
+                                     self.vocab_id_to_token_dict,
+                                     self.cls_id, self.sep_id,
+                                     self.mask_id, self.pad_id,
+                                     self.masked_lm_prob, np_rng)
 
 
 def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
@@ -214,3 +217,66 @@ def get_samples_mapping_(indexed_dataset,
         samples_mapping.shape[0]))
 
     return samples_mapping
+
+
+def build_training_sample(sample,
+                          target_seq_length, max_seq_length,
+                          vocab_id_list, vocab_id_to_token_dict,
+                          cls_id, sep_id, mask_id, pad_id,
+                          masked_lm_prob, np_rng):
+    """Biuld training sample.
+
+    Arguments:
+        sample: A list of sentences in which each sentence is a list token ids.
+        target_seq_length: Desired sequence length.
+        max_seq_length: Maximum length of the sequence. All values are padded to
+            this length.
+        vocab_id_list: List of vocabulary ids. Used to pick a random id.
+        vocab_id_to_token_dict: A dictionary from vocab ids to text tokens.
+        cls_id: Start of example id.
+        sep_id: Separator id.
+        mask_id: Mask token id.
+        pad_id: Padding token id.
+        masked_lm_prob: Probability to mask tokens.
+        np_rng: Random number genenrator. Note that this rng state should be
+              numpy and not python since python randint is inclusive for
+              the opper bound whereas the numpy one is exclusive.
+    """
+
+    # We assume that we have at least two sentences in the sample
+    assert len(sample) > 1
+    assert target_seq_length <= max_seq_length
+
+    # Divide sample into two segments (A and B).
+    tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, np_rng)
+
+    # Truncate to `target_sequence_length`.
+    max_num_tokens = target_seq_length
+    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a),
+                                  len(tokens_b), max_num_tokens, np_rng)
+
+    # Build tokens and toketypes.
+    tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b,
+                                                      cls_id, sep_id)
+
+    # Masking.
+    max_predictions_per_seq = masked_lm_prob * max_num_tokens
+    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
+        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
+        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
+
+    # Padding.
+    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
+        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
+                                   masked_labels, pad_id, max_seq_length)
+
+    train_sample = {
+        'text': tokens_np,
+        'types': tokentypes_np,
+        'labels': labels_np,
+        'is_random': int(is_next_random),
+        'loss_mask': loss_mask_np,
+        'padding_mask': padding_mask_np,
+        'truncated': int(truncated)}
+    return train_sample
+

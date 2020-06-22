@@ -128,13 +128,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     torch.distributed.barrier()
 
 
-def load_checkpoint(model, optimizer, lr_scheduler):
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
-    load_dir = args.load
-    from megatron.model.bert_model import BertModel
-    if isinstance(model, BertModel) and args.bert_load is not None:
-        load_dir = args.bert_load
+    load_dir = getattr(args, load_arg)
 
     if isinstance(model, torchDDP):
         model = model.module
