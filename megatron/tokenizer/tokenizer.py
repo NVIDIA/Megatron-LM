@@ -20,7 +20,6 @@ from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
-from megatron.data.realm_dataset_utils import join_str_list
 
 
 def build_tokenizer(args):
@@ -160,8 +159,15 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
         exclude_list = ['[PAD]', '[CLS]']
         non_pads = [t for t in tokens if t not in exclude_list]
-        joined_strs = join_str_list(non_pads)
-        return joined_strs
+
+        result = ""
+        for s in non_pads:
+            if s.startswith("##"):
+                result += s[2:]
+            else:
+                result += " " + s
+
+        return result
 
     @property
     def cls(self):

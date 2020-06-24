@@ -125,7 +125,7 @@ class ICTBertModel(MegatronModule):
 
 
 class IREncoderBertModel(MegatronModule):
-    """Bert Language model."""
+    """BERT-based encoder for queries or blocks used for learned information retrieval."""
     def __init__(self, ict_head_size, num_tokentypes=2, parallel_output=True):
         super(IREncoderBertModel, self).__init__()
         args = get_args()
@@ -158,9 +158,8 @@ class IREncoderBertModel(MegatronModule):
             tokentype_ids=tokentype_ids)
 
         # Output.
-        if self.add_ict_head:
-            ict_logits = self.ict_head(pooled_output)
-            return ict_logits, None
+        ict_logits = self.ict_head(pooled_output)
+        return ict_logits, None
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

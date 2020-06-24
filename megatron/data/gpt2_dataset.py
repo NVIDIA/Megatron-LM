@@ -21,8 +21,7 @@ import time
 import numpy as np
 import torch
 
-from megatron import print_rank_0
-from megatron import mpu
+from megatron import mpu, print_rank_0
 from megatron.data.bert_dataset import get_train_valid_test_split_
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 

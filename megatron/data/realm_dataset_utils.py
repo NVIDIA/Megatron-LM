@@ -4,7 +4,7 @@ import time
 import numpy as np
 import torch
 
-from megatron import print_rank_0, mpu
+from megatron import mpu, print_rank_0
 
 
 def join_str_list(str_list):
@@ -19,7 +19,7 @@ def join_str_list(str_list):
 
 
 def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epochs,
-                              max_num_samples, max_seq_length, seed, name):
+                              max_num_samples, max_seq_length, seed, name, use_one_sent_docs=False):
     """Get samples mapping for a dataset over fixed size blocks. This function also requires
     a dataset of the titles for the source documents since their lengths must be taken into account."""
     if not num_epochs:
@@ -39,6 +39,8 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         indexmap_filename += '_{}mns'.format(max_num_samples)
     indexmap_filename += '_{}msl'.format(max_seq_length)
     indexmap_filename += '_{}s'.format(seed)
+    if use_one_sent_docs:
+        indexmap_filename += '_1sentok'
     indexmap_filename += '.npy'
 
     # Build the indexed mapping if not exist.
@@ -67,7 +69,8 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
             max_num_samples,
             max_seq_length-3,  # account for added tokens
             seed,
-            verbose)
+            verbose,
+            use_one_sent_docs)
         print_rank_0(' > done building samples index mapping')
         np.save(indexmap_filename, samples_mapping, allow_pickle=True)
         print_rank_0(' > saved the index mapping in {}'.format(

@@ -22,11 +22,10 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
-from megatron import get_args
+from megatron import get_args, print_rank_0
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import mpu
-from megatron import print_rank_0
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module

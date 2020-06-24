@@ -18,16 +18,18 @@
 #   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
 # with some modifications.
 
+import time
 import collections
-import itertools
 
 import numpy as np
-from megatron import print_rank_0, get_args
+from megatron import get_args, print_rank_0
+from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 
 DSET_TYPE_STD = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
 
 DSET_TYPES = [DSET_TYPE_ICT, DSET_TYPE_STD]
+
 
 def compile_helper():
     """Compile helper function ar runtime. Make sure this
@@ -447,3 +449,54 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     test_dataset = build_dataset(2, 'test')
 
     return (train_dataset, valid_dataset, test_dataset)
+
+
+def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
+
+    print_rank_0(' > building dataset index ...')
+
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset(data_prefix,
+                                           data_impl,
+                                           skip_warmup)
+    assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
+    print_rank_0(' > finished creating indexed dataset in {:4f} '
+                 'seconds'.format(time.time() - start_time))
+
+    print_rank_0(' > indexed dataset stats:')
+    print_rank_0('    number of documents: {}'.format(
+        indexed_dataset.doc_idx.shape[0] - 1))
+    print_rank_0('    number of sentences: {}'.format(
+        indexed_dataset.sizes.shape[0]))
+
+    return indexed_dataset
+
+
+def get_train_valid_test_split_(splits_string, size):
+    """ Get dataset splits from comma or '/' separated string list."""
+
+    splits = []
+    if splits_string.find(',') != -1:
+        splits = [float(s) for s in splits_string.split(',')]
+    elif splits_string.find('/') != -1:
+        splits = [float(s) for s in splits_string.split('/')]
+    else:
+        splits = [float(splits_string)]
+    while len(splits) < 3:
+        splits.append(0.)
+    splits = splits[:3]
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits = [split / splits_sum for split in splits]
+    splits_index = [0]
+    for index, split in enumerate(splits):
+        splits_index.append(splits_index[index] +
+                            int(round(split * float(size))))
+    diff = splits_index[-1] - size
+    for index in range(1, len(splits_index)):
+        splits_index[index] -= diff
+    assert len(splits_index) == 4
+    assert splits_index[-1] == size
+    return splits_index
+
+

@@ -19,10 +19,9 @@ import sys
 
 import torch
 
-from megatron import get_args
+from megatron import get_args, print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
-from megatron import print_rank_0
 from megatron.checkpointing import save_checkpoint
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.fp16 import FP16_Optimizer
@@ -173,3 +172,5 @@ def get_ltor_masks_and_position_ids(data,
     attention_mask = (attention_mask < 0.5)
 
     return attention_mask, loss_mask, position_ids
+
+
