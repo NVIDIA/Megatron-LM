@@ -581,9 +581,9 @@ py::array build_blocks_mapping_impl(const py::array_t<int64_t>& docs_,
 
     } // for (int iteration=0; iteration < 2; ++iteration) {
 
-    Shuffle.
-    We need a 64 bit random number generator as we might have more
-    than 2 billion samples.
+    // Shuffle.
+    // We need a 64 bit random number generator as we might have more
+    // than 2 billion samples.
     std::mt19937_64 rand64_gen(seed + 1);
     for (auto i=(num_samples - 1); i > 0; --i) {
         const auto j = static_cast<int64_t>(rand64_gen() % (i + 1));
