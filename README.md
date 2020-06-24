@@ -265,10 +265,9 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_gpt2.py \
 </pre>
 
 <a id="realm"></a>
-# REALM Pipeline
-This branch is up-to-date with the current progress on building REALM, the open domain information retrieval QA system. (We should ensure that this is on a stable branch, ready to use.)
-
-The following sections reflect the three stages of training a REALM system. Loosely, they are pretraining the retriever modules, then jointly training the language model and the retriever, and then finetuning a question answering head on the language model with fixed retriever.
+## REALM Pipeline
+The following sections (will) reflect the three stages of training a REALM system. For now it's just the ICT code.
+Loosely, they are pretraining the retriever modules, then jointly training the language model and the retriever, and then finetuning a question answering head on the language model with fixed retriever.
 
 ### Inverse Cloze Task (ICT) Pretraining
 1. Have a corpus in loose JSON format with the intention of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document. 
