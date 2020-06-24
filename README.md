@@ -16,6 +16,7 @@ For BERT training, we swapped the position of the layer normalization and the re
   - [BERT Pretraining](#bert-pretraining)
   - [GPT-2 Pretraining](#gpt-2-pretraining)
   - [Distributed BERT or GPT-2 Pretraining](#distributed-bert-or-gpt-2-pretraining)
+- [REALM Pipeline](#realm)
 - [Evaluation and Tasks](#evaluation-and-tasks)
   - [GPT-2 Text Generation](#gpt-2-text-generation)
   - [GPT-2 Evaluation](#gpt-2-evaluation)
@@ -261,6 +262,69 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_gpt2.py \
                 --model-parallel-size $MP_SIZE \
                 --DDP-impl torch
 
+</pre>
+
+<a id="realm"></a>
+# REALM Pipeline
+This branch is up-to-date with the current progress on building REALM, the open domain information retrieval QA system. (We should ensure that this is on a stable branch, ready to use.)
+
+The following sections reflect the three stages of training a REALM system. Loosely, they are pretraining the retriever modules, then jointly training the language model and the retriever, and then finetuning a question answering head on the language model with fixed retriever.
+
+### Inverse Cloze Task (ICT) Pretraining
+1. Have a corpus in loose JSON format with the intention of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document. 
+Run `tools/preprocess_data.py` to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. For the original REALM system, we construct two datasets, one with the title of every document, and another with the body. 
+Refer to the following script meant to be run in an interactive session on draco: 
+<pre>
+python preprocess_data.py \
+    --input /home/universal-lm-data.cosmos549/datasets/wikipedia/wikidump_lines.json \
+    --json-keys text title \
+    --split-sentences \
+    --tokenizer-type BertWordPieceLowerCase \
+    --vocab-file /home/universal-lm-data.cosmos549/scratch/mshoeybi/data/albert/vocab.txt \
+    --output-prefix wiki_indexed \
+    --workers 5  # works well for 10 CPU cores. Scale up accordingly.
+</pre>
+
+2. Use a custom samples mapping function in place of `megatron/data/realm_dataset_utils.get_block_samples_mapping` if required. To do this, you will need to implement a new function in C++ inside of `megatron/data/helpers.cpp`. The samples mapping data structure is used to select the data that will constitute every training sample in advance of the training loop.
+ The samples mapping is responsible for holding all of the required metadata needed to construct the sample from one or more indexed datasets. In REALM, the samples mapping contains the start and end sentence indices, as well as the document index (to find the correct title for a body) and a unique ID for every block. 
+3. Pretrain a BERT language model using `pretrain_bert.py`, with the sequence length equal to the block size in token ids. This model should be trained on the same indexed dataset that is used to supply the blocks for the information retrieval task.
+In REALM, this is an uncased bert base model trained with the standard hyperparameters.
+4. Use `pretrain_bert_ict.py` to train an `ICTBertModel` which uses two BERT-based encoders to encode queries and blocks to perform retrieval with. 
+The script below trains the ICT model from REALM on draco. It refrences a pretrained BERT model (step 3) in the `--bert-load` argument.
+<pre>
+EXPNAME="ict_wikipedia"
+CHKPT="chkpts/${EXPNAME}"
+LOGDIR="logs/${EXPNAME}"
+COMMAND="/home/scratch.gcf/adlr-utils/release/cluster-interface/latest/mp_launch python pretrain_bert_ict.py \
+    --num-layers 12 \
+    --num-attention-heads 12 \
+    --hidden-size 768 \
+    --batch-size 128 \
+    --seq-length 256 \
+    --max-position-embeddings 256 \
+    --ict-head-size 128 \
+    --train-iters 100000 \
+    --checkpoint-activations \
+    --bert-load /home/dcg-adlr-nkant-output.cosmos1203/chkpts/base_bert_seq256 \
+    --load CHKPT \
+    --save CHKPT \
+    --data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines \
+    --titles-data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines-titles \
+    --vocab-file /home/universal-lm-data.cosmos549/scratch/mshoeybi/data/albert/vocab.txt \
+    --distributed-backend nccl \
+    --lr 0.0001 \
+    --num-workers 2 \
+    --lr-decay-style linear \
+    --weight-decay 1e-2 \
+    --clip-grad 1.0 \
+    --warmup .01 \
+    --save-interval 3000 \
+    --query-in-block-prob 0.1 \
+    --fp16 \
+    --adlr-autoresume \
+    --adlr-autoresume-interval 100"
+    
+submit_job --image 'http://gitlab-master.nvidia.com/adlr/megatron-lm/megatron:20.03_faiss' --mounts /home/universal-lm-data.cosmos549,/home/dcg-adlr-nkant-data.cosmos1202,/home/dcg-adlr-nkant-output.cosmos1203,/home/nkant --name "${EXPNAME}" --partition batch_32GB --gpu 8 --nodes 4 --autoresume_timer 420 -c "${COMMAND}" --logdir "${LOGDIR}"
 </pre>
 
 <a id="evaluation-and-tasks"></a>
