@@ -394,6 +394,10 @@ def _add_data_args(parser):
     group.add_argument('--use-random-spans', action='store_true')
     group.add_argument('--allow-trivial-doc', action='store_true')
     group.add_argument('--ner-data-path', type=str, default=None)
+    group.add_argument('--cased-data-path', type=str, default=None,
+                       help='path to cased data to use for NER salient span masking')
+    group.add_argument('--cased-vocab', type=str, default=None,
+                       help='path to cased vocab file to use for NER salient span masking')
 
     return parser
 

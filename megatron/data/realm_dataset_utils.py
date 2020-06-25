@@ -6,6 +6,12 @@ import time
 import numpy as np
 import spacy
 import torch
+try:
+    import stanza
+    processors_dict = {'tokenize': 'default', 'mwt': 'default', 'ner': 'conll03'}
+    stanza_pipeline = stanza.Pipeline('en', processors=processors_dict, use_gpu=True)
+except:
+    pass
 
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 from megatron import get_args, get_tokenizer, print_rank_0, mpu
@@ -16,7 +22,8 @@ SPACY_NER = spacy.load('en_core_web_lg')
 def build_realm_training_sample(sample, max_seq_length,
                                 vocab_id_list, vocab_id_to_token_dict,
                                 cls_id, sep_id, mask_id, pad_id,
-                                masked_lm_prob, block_ner_mask, np_rng):
+                                masked_lm_prob, block_ner_mask, cased_tokens,
+                                cased_tokenizer, np_rng):
     tokens = list(itertools.chain(*sample))[:max_seq_length - 2]
     tokens, tokentypes = create_single_tokens_and_tokentypes(tokens, cls_id, sep_id)
 
@@ -35,8 +42,20 @@ def build_realm_training_sample(sample, max_seq_length,
         masked_tokens, masked_positions, masked_labels = get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id)
     else:
         try:
-            masked_tokens, masked_positions, masked_labels = salient_span_mask(tokens, mask_id)
-        except TypeError:
+            if args.cased_data_path is not None:
+                total_len = sum(len(l) for l in sample)
+                # truncate the last sentence to make it so that the whole thing has length max_seq_length - 2
+                if total_len > max_seq_length - 2:
+                    offset = -(total_len - (max_seq_length - 2))
+                    sample[-1] = sample[-1][:offset]
+                masked_tokens, masked_positions, masked_labels = get_stanza_ner_mask(sample, cased_tokens, cased_tokenizer,
+                                                                                     cls_id, sep_id, mask_id)
+            else:
+                masked_tokens, masked_positions, masked_labels = salient_span_mask(tokens, mask_id)
+        except:
+            # print("+" * 100, flush=True)
+            # print('could not create salient span', flush=True)
+            # print("+" * 100, flush=True)
             # this means the above returned None, and None isn't iterable.
             # TODO: consider coding style.
             max_predictions_per_seq = masked_lm_prob * max_seq_length
@@ -57,6 +76,67 @@ def build_realm_training_sample(sample, max_seq_length,
     return train_sample
 
 
+def get_stanza_ner_mask(tokens, cased_tokens, cased_tokenizer, cls_id, sep_id, mask_id):
+    """Use stanza to generate NER salient span masks in the loop"""
+    # assuming that the default tokenizer is uncased.
+    uncased_tokenizer = get_tokenizer()
+    block_ner_mask = []
+
+    for cased_sent_ids, uncased_sent_ids in zip(cased_tokens, tokens):
+        # print('>')
+        token_pos_map = id_to_str_pos_map(uncased_sent_ids, uncased_tokenizer)
+
+        # get the cased string and do NER with both toolkits
+        cased_sent_str = join_str_list(cased_tokenizer.tokenizer.convert_ids_to_tokens(cased_sent_ids))
+        entities = stanza_pipeline(cased_sent_str).ents
+        spacy_entities = SPACY_NER(cased_sent_str).ents
+
+        # CoNLL doesn't do dates, so we scan with spacy to get the dates.
+        entities = [e for e in entities if e.text != 'CLS']
+        entities.extend([e for e in spacy_entities if (e.text != 'CLS' and e.label_ == 'DATE')])
+
+        # randomize which entities to look at, and set a target of 12% of tokens being masked
+        entity_indices = np.arange(len(entities))
+        np.random.shuffle(entity_indices)
+        target_num_masks = int(len(cased_sent_ids) * 0.12)
+
+        masked_positions = []
+        for entity_idx in entity_indices[:3]:
+
+            # if we have enough masks then break.
+            if len(masked_positions) > target_num_masks:
+                break
+
+            selected_entity = entities[entity_idx]
+            # print(">> selected entity: {}".format(selected_entity.text), flush=True)
+
+            mask_start = mask_end = 0
+            set_mask_start = False
+            # loop for checking where mask should start and end.
+            while mask_end < len(token_pos_map) and token_pos_map[mask_end] < selected_entity.end_char:
+                if token_pos_map[mask_start] > selected_entity.start_char:
+                    set_mask_start = True
+                if not set_mask_start:
+                    mask_start += 1
+                mask_end += 1
+
+            # add offset to indices since our input was list of sentences
+            masked_positions.extend(range(mask_start - 1, mask_end))
+
+        ner_mask = [0] * len(uncased_sent_ids)
+        for pos in masked_positions:
+            ner_mask[pos] = 1
+        block_ner_mask.extend(ner_mask)
+
+    # len_tokens = [len(l) for l in tokens]
+    # print(len_tokens, flush=True)
+    # print([sum(len_tokens[:i + 1]) for i in range(len(tokens))], flush=True)
+    tokens = list(itertools.chain(*tokens))
+    tokens = [cls_id] + tokens + [sep_id]
+    block_ner_mask = [0] + block_ner_mask + [0]
+    return get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id)
+
+
 def get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id):
     tokenizer = get_tokenizer()
     tokens_str = join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(tokens))
@@ -65,16 +145,17 @@ def get_arrays_using_ner_mask(tokens, block_ner_mask, mask_id):
     masked_positions = []
     masked_labels = []
 
-
     for i in range(len(tokens)):
         if block_ner_mask[i] == 1:
             masked_positions.append(i)
             masked_labels.append(tokens[i])
             masked_tokens[i] = mask_id
 
-    # print("-" * 100 + '\n',
-    #       "TOKEN STR\n", tokens_str + '\n',
-    #       "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(masked_tokens)), flush=True)
+    # print("\nTOKEN STR\n", tokens_str + '\n',
+    #     "OUTPUT\n", join_str_list(tokenizer.tokenizer.convert_ids_to_tokens(masked_tokens)) + '\n',
+    #     "FRAC_MASKED: {}\n".format(len(masked_labels) / len(tokens)),
+    #     "-" * 100 + '\n',
+    #     flush=True)
 
     return masked_tokens, masked_positions, masked_labels
 

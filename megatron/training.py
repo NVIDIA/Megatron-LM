@@ -87,6 +87,11 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     args = get_args()
     timers = get_timers()
 
+    if args.rank == 0 and args.cased_data_path is not None:
+        import stanza
+        stanza.download('en', processors={'ner': 'conll03'}, dir='stanza')
+
+
     # Model, optimizer, and learning rate.
     timers('model and optimizer').start()
     model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)

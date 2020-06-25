@@ -20,7 +20,7 @@ class REALMDataset(Dataset):
     """
     def __init__(self, name, block_dataset, title_dataset,
                  data_prefix, num_epochs, max_num_samples, masked_lm_prob,
-                 max_seq_length, short_seq_prob, seed, ner_dataset=None):
+                 max_seq_length, short_seq_prob, seed, ner_dataset=None, cased_block_dataset=None, cased_vocab=None):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
@@ -29,7 +29,13 @@ class REALMDataset(Dataset):
         self.title_dataset = title_dataset
         self.short_seq_prob = short_seq_prob
         self.rng = random.Random(self.seed)
+
         self.ner_dataset = ner_dataset
+        self.cased_block_dataset = cased_block_dataset
+        self.cased_tokenizer = None
+        if self.cased_block_dataset is not None:
+            from megatron.tokenizer.tokenizer import BertWordPieceTokenizer
+            self.cased_tokenizer = BertWordPieceTokenizer(vocab_file=cased_vocab, lower_case=False)
 
         self.samples_mapping = get_block_samples_mapping(
             block_dataset, title_dataset, data_prefix, num_epochs,
@@ -49,13 +55,16 @@ class REALMDataset(Dataset):
     def __getitem__(self, idx):
         start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
         block = [list(self.block_dataset[i]) for i in range(start_idx, end_idx)]
-        # print([len(list(self.block_dataset[i])) for i in range(start_idx, end_idx)], flush=True)
         assert len(block) > 1
 
         block_ner_mask = None
         if self.ner_dataset is not None:
             block_ner_mask = [list(self.ner_dataset[i]) for i in range(start_idx, end_idx)]
             # print([len(list(self.ner_dataset[i])) for i in range(start_idx, end_idx)], flush=True)
+
+        cased_tokens = None
+        if self.cased_block_dataset is not None:
+            cased_tokens = [list(self.cased_block_dataset[i]) for i in range(start_idx, end_idx)]
 
         np_rng = np.random.RandomState(seed=(self.seed + idx))
 
@@ -69,6 +78,8 @@ class REALMDataset(Dataset):
                                              self.pad_id,
                                              self.masked_lm_prob,
                                              block_ner_mask,
+                                             cased_tokens,
+                                             self.cased_tokenizer,
                                              np_rng)
         sample.update({'query_block_indices': np.array([block_idx]).astype(np.int64)})
         return sample

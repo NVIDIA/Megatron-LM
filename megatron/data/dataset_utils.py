@@ -387,7 +387,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     num_tokens = len(tokens)
     padding_length = max_seq_length - num_tokens
     assert padding_length >= 0
-    assert len(tokentypes) == num_tokens
+    assert len(tokentypes) == num_tokens, (len(tokentypes), num_tokens)
     assert len(masked_positions) == len(masked_labels), (len(masked_positions), len(masked_labels))
 
     # Tokens and token types.
@@ -491,6 +491,12 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                                        data_impl,
                                                        skip_warmup)
                     kwargs.update({'ner_dataset': ner_dataset})
+                elif args.cased_data_path is not None:
+                    cased_dataset = get_indexed_dataset_(args.cased_data_path,
+                                                         data_impl,
+                                                         skip_warmup)
+                    kwargs.update({'cased_block_dataset': cased_dataset,
+                                   'cased_vocab': args.cased_vocab})
                 dataset = REALMDataset(
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
