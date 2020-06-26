@@ -211,13 +211,13 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     start_time = time.time()
     print_rank_0(' > loading doc-idx mapping from {}'.format(
         doc_idx_filename))
-    doc_idx = np.load(doc_idx_filename, allow_pickle=True)
+    doc_idx = np.load(doc_idx_filename, allow_pickle=True, mmap_mode='r')
     print_rank_0(' > loading sample-idx mapping from {}'.format(
         sample_idx_filename))
-    sample_idx = np.load(sample_idx_filename, allow_pickle=True)
+    sample_idx = np.load(sample_idx_filename, allow_pickle=True, mmap_mode='r')
     print_rank_0(' > loading shuffle-idx mapping from {}'.format(
         shuffle_idx_filename))
-    shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True)
+    shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True, mmap_mode='r')
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(

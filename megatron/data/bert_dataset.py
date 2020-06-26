@@ -159,7 +159,7 @@ def get_samples_mapping_(indexed_dataset,
     print_rank_0(' > loading indexed mapping from {}'.format(
         indexmap_filename))
     start_time = time.time()
-    samples_mapping = np.load(indexmap_filename, allow_pickle=True)
+    samples_mapping = np.load(indexmap_filename, allow_pickle=True, mmap_mode='r')
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(
