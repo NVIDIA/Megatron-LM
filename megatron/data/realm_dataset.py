@@ -65,7 +65,6 @@ class ICTDataset(Dataset):
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
-        print(self.tokenizer.decode_token_ids(block_tokens), '\n')
         block_data = np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
 
         sample = {
