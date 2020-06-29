@@ -5,6 +5,8 @@ import numpy as np
 import torch
 
 from megatron import mpu, print_rank_0
+from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
+from megatron import get_args, get_tokenizer, print_rank_0, mpu
 
 
 def join_str_list(str_list):
@@ -18,10 +20,47 @@ def join_str_list(str_list):
     return result
 
 
+class BlockSampleData(object):
+    """A struct for fully describing a fixed-size block of data as used in REALM
+
+    :param start_idx: for first sentence of the block
+    :param end_idx: for last sentence of the block (may be partially truncated in sample construction)
+    :param doc_idx: the index of the document from which the block comes in the original indexed dataset
+    :param block_idx: a unique integer identifier given to every block.
+    """
+    def __init__(self, start_idx, end_idx, doc_idx, block_idx):
+        self.start_idx = start_idx
+        self.end_idx = end_idx
+        self.doc_idx = doc_idx
+        self.block_idx = block_idx
+
+    def as_array(self):
+        return np.array([self.start_idx, self.end_idx, self.doc_idx, self.block_idx]).astype(np.int64)
+
+    def as_tuple(self):
+        return self.start_idx, self.end_idx, self.doc_idx, self.block_idx
+
+
+class BlockSamplesMapping(object):
+    def __init__(self, mapping_array):
+        # make sure that the array is compatible with BlockSampleData
+        assert mapping_array.shape[1] == 4
+        self.mapping_array = mapping_array
+
+    def __getitem__(self, idx):
+        """Get the data associated with a particular sample."""
+        sample_data = BlockSamplesData(*self.mapping_array[idx])
+        return sample_data
+
+
 def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epochs,
                               max_num_samples, max_seq_length, seed, name, use_one_sent_docs=False):
     """Get samples mapping for a dataset over fixed size blocks. This function also requires
-    a dataset of the titles for the source documents since their lengths must be taken into account."""
+    a dataset of the titles for the source documents since their lengths must be taken into account.
+
+    :return: samples_mapping (BlockSamplesMapping)
+    """
+
     if not num_epochs:
         if not max_num_samples:
             raise ValueError("Need to specify either max_num_samples "
@@ -58,19 +97,24 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         start_time = time.time()
         print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
+
+        # compile/bind the C++ helper code
         from megatron.data.dataset_utils import compile_helper
         compile_helper()
+
         from megatron.data import helpers
-        samples_mapping = helpers.build_blocks_mapping(
+        mapping_array = helpers.build_blocks_mapping(
             block_dataset.doc_idx,
             block_dataset.sizes,
             title_dataset.sizes,
             num_epochs,
             max_num_samples,
-            max_seq_length-3,  # account for added tokens
+            max_seq_length - 3,  # account for added tokens
             seed,
             verbose,
             use_one_sent_docs)
+        samples_mapping = BlockSamplesMapping(mapping_array)
+
         print_rank_0(' > done building samples index mapping')
         np.save(indexmap_filename, samples_mapping, allow_pickle=True)
         print_rank_0(' > saved the index mapping in {}'.format(
@@ -79,6 +123,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         print_rank_0(' > elapsed time to build and save samples mapping '
                      '(seconds): {:4f}'.format(
             time.time() - start_time))
+
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case

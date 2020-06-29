@@ -1,3 +1,4 @@
+import collections
 import itertools
 import random
 
@@ -39,7 +40,9 @@ class ICTDataset(Dataset):
 
     def __getitem__(self, idx):
         """Get an ICT example of a pseudo-query and the block of text from which it was extracted"""
-        start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
+        sample_data = self.samples_mapping[idx]
+        start_idx, end_idx, doc_idx, block_idx = sample_data.as_tuple()
+
         if self.use_titles:
             title = self.title_dataset[int(doc_idx)]
             title_pad_offset = 3 + len(title)
@@ -65,7 +68,7 @@ class ICTDataset(Dataset):
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
-        block_data = np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
+        block_data = sample_data.as_array()
 
         sample = {
             'query_tokens': query_tokens,

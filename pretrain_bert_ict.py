@@ -30,7 +30,7 @@ from megatron.utils import reduce_losses
 num_batches = 0
 
 
-def general_model_provider(only_query_model=False, only_block_model=False):
+def general_ict_model_provider(only_query_model=False, only_block_model=False):
     """Build the model."""
     args = get_args()
     assert args.ict_head_size is not None, \
@@ -53,7 +53,7 @@ def general_model_provider(only_query_model=False, only_block_model=False):
 
 
 def model_provider():
-    return general_model_provider(False, False)
+    return general_ict_model_provider(False, False)
 
 
 def get_batch(data_iterator):
