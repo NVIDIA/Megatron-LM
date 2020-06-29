@@ -46,10 +46,11 @@ class BlockSamplesMapping(object):
         # make sure that the array is compatible with BlockSampleData
         assert mapping_array.shape[1] == 4
         self.mapping_array = mapping_array
+        self.shape = self.mapping_array.shape
 
     def __getitem__(self, idx):
         """Get the data associated with a particular sample."""
-        sample_data = BlockSamplesData(*self.mapping_array[idx])
+        sample_data = BlockSampleData(*self.mapping_array[idx])
         return sample_data
 
 
@@ -113,10 +114,10 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
             seed,
             verbose,
             use_one_sent_docs)
-        samples_mapping = BlockSamplesMapping(mapping_array)
+
 
         print_rank_0(' > done building samples index mapping')
-        np.save(indexmap_filename, samples_mapping, allow_pickle=True)
+        np.save(indexmap_filename, mapping_array, allow_pickle=True)
         print_rank_0(' > saved the index mapping in {}'.format(
             indexmap_filename))
         # Make sure all the ranks have built the mapping
@@ -136,7 +137,10 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     print_rank_0(' > loading indexed mapping from {}'.format(
         indexmap_filename))
     start_time = time.time()
-    samples_mapping = np.load(indexmap_filename, allow_pickle=True)
+
+    mapping_array = np.load(indexmap_filename, allow_pickle=True)
+    samples_mapping = BlockSamplesMapping(mapping_array)
+
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(
