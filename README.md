@@ -305,8 +305,8 @@ COMMAND="/home/scratch.gcf/adlr-utils/release/cluster-interface/latest/mp_launch
     --train-iters 100000 \
     --checkpoint-activations \
     --bert-load /home/dcg-adlr-nkant-output.cosmos1203/chkpts/base_bert_seq256 \
-    --load CHKPT \
-    --save CHKPT \
+    --load $CHKPT \
+    --save $CHKPT \
     --data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines \
     --titles-data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines-titles \
     --vocab-file /home/universal-lm-data.cosmos549/scratch/mshoeybi/data/albert/vocab.txt \
@@ -324,6 +324,31 @@ COMMAND="/home/scratch.gcf/adlr-utils/release/cluster-interface/latest/mp_launch
     --adlr-autoresume-interval 100"
     
 submit_job --image 'http://gitlab-master.nvidia.com/adlr/megatron-lm/megatron:20.03_faiss' --mounts /home/universal-lm-data.cosmos549,/home/dcg-adlr-nkant-data.cosmos1202,/home/dcg-adlr-nkant-output.cosmos1203,/home/nkant --name "${EXPNAME}" --partition batch_32GB --gpu 8 --nodes 4 --autoresume_timer 420 -c "${COMMAND}" --logdir "${LOGDIR}"
+</pre>
+
+### Building an Index of Block Embeddings
+After having trained an ICT model, you can now embed an entire dataset of blocks by creating a `BlockData` structure. After that has been saved, you can load it 
+and wrap it with a `FaissMIPSIndex` to do fast similarity search which is key in the learned information retrieval pipeline. The initial index can be built with the following script, meant to be run in an interactive session. It can leverage multiple GPUs on multiple nodes to index large datasets much more quickly. 
+
+<pre>
+ICT_LOAD="chkpts/ict_wikipedia"
+BLOCK_DATA="block_data/wikipedia"
+/home/scratch.gcf/adlr-utils/release/cluster-interface/latest/mp_launch python indexer.py \
+    --num-layers 12 \
+    --hidden-size 768 \
+    --ict-head-size 128 \
+    --num-attention-heads 12 \
+    --batch-size 128 \
+    --checkpoint-activations \
+    --seq-length 256 \
+    --max-position-embeddings 256 \
+    --ict-load $ICT_LOAD \
+    --data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines \
+    --titles-data-path /home/dcg-adlr-nkant-data.cosmos1202/wiki/wikipedia_lines \
+    --block-data-path $BLOCK_DATA \
+    --vocab-file /home/universal-lm-data.cosmos549/scratch/mshoeybi/data/albert/vocab.txt \
+    --num-workers 2 \
+    --fp16
 </pre>
 
 <a id="evaluation-and-tasks"></a>
