@@ -99,8 +99,8 @@ def forward_step(data_iterator, model):
     global_batch_size = int(batch_size * data_parallel_size)
 
     all_logits_shape = (int(global_batch_size), int(query_logits.shape[1]))
-    all_query_logits = torch.zeros(all_logits_shape).type(query_logits.dtype).cuda()
-    all_block_logits = all_query_logits.clone().cuda()
+    all_query_logits = torch.cuda.FloatTensor(*all_logits_shape).type(query_logits.dtype).fill_(0.0)
+    all_block_logits = all_query_logits.clone()
 
     # record this processes' data
     all_query_logits[args.rank * batch_size:(args.rank + 1) * batch_size] = query_logits
