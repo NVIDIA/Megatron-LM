@@ -5,14 +5,14 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
-from megatron.data.realm_dataset_utils import get_block_samples_mapping, join_str_list
+from megatron.data.realm_dataset_utils import get_block_samples_mapping
 
 
 class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length,
-                 query_in_block_prob, short_seq_prob, seed, use_titles=True):
+                 query_in_block_prob, short_seq_prob, seed, use_titles=True, use_one_sent_docs=False):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
@@ -22,10 +22,11 @@ class ICTDataset(Dataset):
         self.short_seq_prob = short_seq_prob
         self.rng = random.Random(self.seed)
         self.use_titles = use_titles
+        self.use_one_sent_docs = use_one_sent_docs
 
         self.samples_mapping = get_block_samples_mapping(
             block_dataset, title_dataset, data_prefix, num_epochs,
-            max_num_samples, max_seq_length, seed, name)
+            max_num_samples, max_seq_length, seed, name, use_one_sent_docs)
         self.tokenizer = get_tokenizer()
         self.vocab_id_list = list(self.tokenizer.inv_vocab.keys())
         self.vocab_id_to_token_list = self.tokenizer.inv_vocab
@@ -47,7 +48,7 @@ class ICTDataset(Dataset):
             title = None
             title_pad_offset = 2
         block = [self.block_dataset[i] for i in range(start_idx, end_idx)]
-        assert len(block) > 1
+        assert len(block) > 1 or self.use_one_sent_docs
 
         # randint() is inclusive for Python rng
         rand_sent_idx = self.rng.randint(0, len(block) - 1)

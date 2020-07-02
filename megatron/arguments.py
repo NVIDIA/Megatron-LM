@@ -386,6 +386,8 @@ def _add_data_args(parser):
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
                        help='Probability of keeping query in block for ICT dataset')
+    group.add_argument('--ict-one-sent', action='store_true',
+                       help='Whether to use one sentence documents in ICT')
 
     return parser
 
