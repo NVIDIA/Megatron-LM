@@ -414,5 +414,9 @@ def _add_realm_args(parser):
     group.add_argument('--ict-one-sent', action='store_true',
                        help='Whether to use one sentence documents in ICT')
 
+    # training
+    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
+                       help="Which top-k accuracies to report (e.g. '1 5 20')")
+
     return parser
 
