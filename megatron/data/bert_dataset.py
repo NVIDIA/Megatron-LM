@@ -22,7 +22,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from megatron import get_tokenizer, get_args, print_rank_0
+from megatron import get_tokenizer, get_args
+from megatron import print_rank_0
 from megatron import mpu
 from megatron.data.dataset_utils import get_a_and_b_segments
 from megatron.data.dataset_utils import truncate_segments

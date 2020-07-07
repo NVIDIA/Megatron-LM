@@ -18,9 +18,7 @@
 import torch
 
 from megatron import get_args, print_rank_0
-from megatron.model.bert_model import bert_attention_mask_func
-from megatron.model.bert_model import bert_extended_attention_mask
-from megatron.model.bert_model import bert_position_ids
+from megatron.model.bert_model import bert_attention_mask_func, bert_extended_attention_mask, bert_position_ids
 from megatron.model.language_model import get_language_model
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal

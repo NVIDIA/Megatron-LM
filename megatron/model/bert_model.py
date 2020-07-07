@@ -26,10 +26,44 @@ from megatron.model.utils import openai_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
-from megatron.model.utils import bert_attention_mask_func
-from megatron.model.utils import bert_extended_attention_mask
-from megatron.model.utils import bert_position_ids
 from megatron.module import MegatronModule
+
+
+def bert_attention_mask_func(attention_scores, attention_mask):
+    attention_scores = attention_scores + attention_mask
+    return attention_scores
+
+
+def bert_extended_attention_mask(attention_mask, dtype):
+    # We create a 3D attention mask from a 2D tensor mask.
+    # [b, 1, s]
+    attention_mask_b1s = attention_mask.unsqueeze(1)
+    # [b, s, 1]
+    attention_mask_bs1 = attention_mask.unsqueeze(2)
+    # [b, s, s]
+    attention_mask_bss = attention_mask_b1s * attention_mask_bs1
+    # [b, 1, s, s]
+    extended_attention_mask = attention_mask_bss.unsqueeze(1)
+    # Since attention_mask is 1.0 for positions we want to attend and 0.0
+    # for masked positions, this operation will create a tensor which is
+    # 0.0 for positions we want to attend and -10000.0 for masked positions.
+    # Since we are adding it to the raw scores before the softmax, this is
+    # effectively the same as removing these entirely.
+    # fp16 compatibility
+    extended_attention_mask = extended_attention_mask.to(dtype=dtype)
+    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+    return extended_attention_mask
+
+
+def bert_position_ids(token_ids):
+    # Create position ids
+    seq_length = token_ids.size(1)
+    position_ids = torch.arange(seq_length, dtype=torch.long,
+                                device=token_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
+
+    return position_ids
 
 
 class BertLMHead(MegatronModule):
@@ -171,5 +205,3 @@ class BertModel(MegatronModule):
         if self.add_binary_head:
             self.binary_head.load_state_dict(
                 state_dict[self._binary_head_key], strict=strict)
-
-

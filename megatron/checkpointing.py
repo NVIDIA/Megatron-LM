@@ -23,8 +23,9 @@ import numpy as np
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from megatron import mpu, print_rank_0
+from megatron import mpu
 from megatron import get_args
+from megatron import print_rank_0
 
 
 def check_checkpoint_args(checkpoint_args):
