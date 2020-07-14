@@ -18,7 +18,6 @@
 from datetime import datetime
 import math
 import sys
-
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
@@ -36,6 +35,7 @@ from megatron.initialize import initialize_megatron
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
+from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
@@ -70,6 +70,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
+
     args = get_args()
     timers = get_timers()
 
@@ -92,10 +93,9 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
 
     iteration = 0
     if args.do_train and args.train_iters > 0:
-        if args.do_train:
-            iteration, _ = train(forward_step_func,
-                                 model, optimizer, lr_scheduler,
-                                 train_data_iterator, valid_data_iterator)
+        iteration, _ = train(forward_step_func,
+                             model, optimizer, lr_scheduler,
+                             train_data_iterator, valid_data_iterator)
 
     if args.do_valid:
         prefix = 'the end of training for val data'
@@ -217,6 +217,15 @@ def setup_model_and_optimizer(model_provider_func):
         args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
         args.iteration = 0
+
+    # get model without FP16 and/or TorchDDP wrappers
+    unwrapped_model = model
+    while hasattr(unwrapped_model, 'module'):
+        unwrapped_model = unwrapped_model.module
+
+    if args.iteration == 0 and hasattr(unwrapped_model, 'init_state_dict_from_bert'):
+        print("Initializing ICT from pretrained BERT model", flush=True)
+        unwrapped_model.init_state_dict_from_bert()
 
     return model, optimizer, lr_scheduler
 

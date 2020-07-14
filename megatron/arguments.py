@@ -37,6 +37,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
+    parser = _add_realm_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -390,3 +391,32 @@ def _add_autoresume_args(parser):
                        'termination signal')
 
     return parser
+
+
+def _add_realm_args(parser):
+    group = parser.add_argument_group(title='realm')
+
+    # network size
+    group.add_argument('--ict-head-size', type=int, default=None,
+                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
+
+    # checkpointing
+    group.add_argument('--ict-load', type=str, default=None,
+                       help='Directory containing an ICTBertModel checkpoint')
+    group.add_argument('--bert-load', type=str, default=None,
+                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
+
+    # data
+    group.add_argument('--titles-data-path', type=str, default=None,
+                       help='Path to titles dataset used for ICT')
+    group.add_argument('--query-in-block-prob', type=float, default=0.1,
+                       help='Probability of keeping query in block for ICT dataset')
+    group.add_argument('--ict-one-sent', action='store_true',
+                       help='Whether to use one sentence documents in ICT')
+
+    # training
+    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
+                       help="Which top-k accuracies to report (e.g. '1 5 20')")
+
+    return parser
+

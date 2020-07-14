@@ -20,9 +20,9 @@ import math
 import torch
 
 from megatron import get_args
+from megatron import print_rank_0
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron import print_rank_0
 from megatron.checkpointing import load_checkpoint
 from megatron.model import GPT2Model
 from megatron.training import get_model

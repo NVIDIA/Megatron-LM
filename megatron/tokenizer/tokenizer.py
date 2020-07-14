@@ -155,6 +155,20 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         text_tokens = self.tokenizer.tokenize(text)
         return self.tokenizer.convert_tokens_to_ids(text_tokens)
 
+    def decode_token_ids(self, token_ids):
+        tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
+        exclude_list = ['[PAD]', '[CLS]']
+        non_pads = [t for t in tokens if t not in exclude_list]
+
+        result = ""
+        for s in non_pads:
+            if s.startswith("##"):
+                result += s[2:]
+            else:
+                result += " " + s
+
+        return result
+
     @property
     def cls(self):
         return self.cls_id

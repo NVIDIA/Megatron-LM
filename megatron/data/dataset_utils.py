@@ -18,8 +18,17 @@
 #   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
 # with some modifications.
 
+import time
 import collections
+
 import numpy as np
+from megatron import get_args, print_rank_0
+from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+
+DSET_TYPE_STD = 'standard_bert'
+DSET_TYPE_ICT = 'ict'
+
+DSET_TYPES = [DSET_TYPE_ICT, DSET_TYPE_STD]
 
 
 def compile_helper():
@@ -33,68 +42,6 @@ def compile_helper():
         print("Making C++ dataset helpers module failed, exiting.")
         import sys
         sys.exit(1)
-
-
-def build_training_sample(sample,
-                          target_seq_length, max_seq_length,
-                          vocab_id_list, vocab_id_to_token_dict,
-                          cls_id, sep_id, mask_id, pad_id,
-                          masked_lm_prob, np_rng):
-    """Biuld training sample.
-
-    Arguments:
-        sample: A list of sentences in which each sentence is a list token ids.
-        target_seq_length: Desired sequence length.
-        max_seq_length: Maximum length of the sequence. All values are padded to
-            this length.
-        vocab_id_list: List of vocabulary ids. Used to pick a random id.
-        vocab_id_to_token_dict: A dictionary from vocab ids to text tokens.
-        cls_id: Start of example id.
-        sep_id: Separator id.
-        mask_id: Mask token id.
-        pad_id: Padding token id.
-        masked_lm_prob: Probability to mask tokens.
-        np_rng: Random number genenrator. Note that this rng state should be
-              numpy and not python since python randint is inclusive for
-              the opper bound whereas the numpy one is exclusive.
-    """
-
-    # We assume that we have at least two sentences in the sample
-    assert len(sample) > 1
-    assert target_seq_length <= max_seq_length
-
-    # Divide sample into two segments (A and B).
-    tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, np_rng)
-
-    # Truncate to `target_sequence_length`.
-    max_num_tokens = target_seq_length
-    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a),
-                                  len(tokens_b), max_num_tokens, np_rng)
-
-    # Build tokens and toketypes.
-    tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b,
-                                                      cls_id, sep_id)
-
-    # Masking.
-    max_predictions_per_seq = masked_lm_prob * max_num_tokens
-    (tokens, masked_positions, masked_labels, _) = create_masked_lm_predictions(
-        tokens, vocab_id_list, vocab_id_to_token_dict, masked_lm_prob,
-        cls_id, sep_id, mask_id, max_predictions_per_seq, np_rng)
-
-    # Padding.
-    tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np \
-        = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
-                                   masked_labels, pad_id, max_seq_length)
-
-    train_sample = {
-        'text': tokens_np,
-        'types': tokentypes_np,
-        'labels': labels_np,
-        'is_random': int(is_next_random),
-        'loss_mask': loss_mask_np,
-        'padding_mask': padding_mask_np,
-        'truncated': int(truncated)}
-    return train_sample
 
 
 def get_a_and_b_segments(sample, np_rng):
@@ -370,6 +317,7 @@ def create_masked_lm_predictions(tokens,
     for p in masked_lms:
         masked_lm_positions.append(p.index)
         masked_lm_labels.append(p.label)
+
     return (output_tokens, masked_lm_positions, masked_lm_labels, token_boundary)
 
 
@@ -404,3 +352,152 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     loss_mask_np = np.array(loss_mask, dtype=np.int64)
 
     return tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np
+
+
+def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+                                    train_valid_test_num_samples,
+                                    max_seq_length, masked_lm_prob,
+                                    short_seq_prob, seed, skip_warmup,
+                                    dataset_type='standard_bert'):
+
+    if dataset_type not in DSET_TYPES:
+        raise ValueError("Invalid dataset_type: ", dataset_type)
+
+    # Indexed dataset.
+    indexed_dataset = get_indexed_dataset_(data_prefix,
+                                           data_impl,
+                                           skip_warmup)
+
+    if dataset_type == DSET_TYPE_ICT:
+        args = get_args()
+        title_dataset = get_indexed_dataset_(args.titles_data_path,
+                                             data_impl,
+                                             skip_warmup)
+
+    # Get start and end indices of train/valid/train into doc-idx
+    # Note that doc-idx is desinged to be num-docs + 1 so we can
+    # easily iterate over it.
+    total_num_of_documents = indexed_dataset.doc_idx.shape[0] - 1
+    splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
+
+    # Print stats about the splits.
+    print_rank_0(' > dataset split:')
+
+    def print_split_stats(name, index):
+        print_rank_0('    {}:'.format(name))
+        print_rank_0('     document indices in [{}, {}) total of {} '
+                     'documents'.format(splits[index], splits[index + 1],
+                                        splits[index + 1] - splits[index]))
+        start_index = indexed_dataset.doc_idx[splits[index]]
+        end_index = indexed_dataset.doc_idx[splits[index + 1]]
+        print_rank_0('     sentence indices in [{}, {}) total of {} '
+                     'sentences'.format(start_index, end_index,
+                                        end_index - start_index))
+    print_split_stats('train', 0)
+    print_split_stats('validation', 1)
+    print_split_stats('test', 2)
+
+    def build_dataset(index, name):
+        from megatron.data.bert_dataset import BertDataset
+        from megatron.data.ict_dataset import ICTDataset
+        dataset = None
+        if splits[index + 1] > splits[index]:
+            # Get the pointer to the original doc-idx so we can set it later.
+            doc_idx_ptr = indexed_dataset.get_doc_idx()
+            # Slice the doc-idx
+            start_index = splits[index]
+            # Add +1 so we can index into the dataset to get the upper bound.
+            end_index = splits[index + 1] + 1
+            # New doc_idx view.
+            indexed_dataset.set_doc_idx(doc_idx_ptr[start_index:end_index])
+            # Build the dataset accordingly.
+            kwargs = dict(
+                name=name,
+                data_prefix=data_prefix,
+                num_epochs=None,
+                max_num_samples=train_valid_test_num_samples[index],
+                max_seq_length=max_seq_length,
+                short_seq_prob=short_seq_prob,
+                seed=seed
+            )
+
+            if dataset_type == DSET_TYPE_ICT:
+                args = get_args()
+                dataset = ICTDataset(
+                    block_dataset=indexed_dataset,
+                    title_dataset=title_dataset,
+                    query_in_block_prob=args.query_in_block_prob,
+                    use_one_sent_docs=args.ict_one_sent,
+                    **kwargs
+                )
+            else:
+                dataset = BertDataset(
+                    indexed_dataset=indexed_dataset,
+                    masked_lm_prob=masked_lm_prob,
+                    **kwargs
+                )
+
+            # Set the original pointer so dataset remains the main dataset.
+            indexed_dataset.set_doc_idx(doc_idx_ptr)
+            # Checks.
+            assert indexed_dataset.doc_idx[0] == 0
+            assert indexed_dataset.doc_idx.shape[0] == \
+                (total_num_of_documents + 1)
+        return dataset
+
+    train_dataset = build_dataset(0, 'train')
+    valid_dataset = build_dataset(1, 'valid')
+    test_dataset = build_dataset(2, 'test')
+
+    return (train_dataset, valid_dataset, test_dataset)
+
+
+def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
+
+    print_rank_0(' > building dataset index ...')
+
+    start_time = time.time()
+    indexed_dataset = make_indexed_dataset(data_prefix,
+                                           data_impl,
+                                           skip_warmup)
+    assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
+    print_rank_0(' > finished creating indexed dataset in {:4f} '
+                 'seconds'.format(time.time() - start_time))
+
+    print_rank_0(' > indexed dataset stats:')
+    print_rank_0('    number of documents: {}'.format(
+        indexed_dataset.doc_idx.shape[0] - 1))
+    print_rank_0('    number of sentences: {}'.format(
+        indexed_dataset.sizes.shape[0]))
+
+    return indexed_dataset
+
+
+def get_train_valid_test_split_(splits_string, size):
+    """ Get dataset splits from comma or '/' separated string list."""
+
+    splits = []
+    if splits_string.find(',') != -1:
+        splits = [float(s) for s in splits_string.split(',')]
+    elif splits_string.find('/') != -1:
+        splits = [float(s) for s in splits_string.split('/')]
+    else:
+        splits = [float(splits_string)]
+    while len(splits) < 3:
+        splits.append(0.)
+    splits = splits[:3]
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits = [split / splits_sum for split in splits]
+    splits_index = [0]
+    for index, split in enumerate(splits):
+        splits_index.append(splits_index[index] +
+                            int(round(split * float(size))))
+    diff = splits_index[-1] - size
+    for index in range(1, len(splits_index)):
+        splits_index[index] -= diff
+    assert len(splits_index) == 4
+    assert splits_index[-1] == size
+    return splits_index
+
+

@@ -128,14 +128,15 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     torch.distributed.barrier()
 
 
-def load_checkpoint(model, optimizer, lr_scheduler):
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
+    load_dir = getattr(args, load_arg)
 
     if isinstance(model, torchDDP):
         model = model.module
     # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(args.load)
+    tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
     # If no tracker file, return iretation zero.
     if not os.path.isfile(tracker_filename):
@@ -164,7 +165,7 @@ def load_checkpoint(model, optimizer, lr_scheduler):
         tracker_filename)
 
     # Checkpoint.
-    checkpoint_name = get_checkpoint_name(args.load, iteration, release)
+    checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))

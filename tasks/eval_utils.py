@@ -21,8 +21,8 @@ import time
 import torch
 
 from megatron import get_args
-from megatron import mpu
 from megatron import print_rank_0
+from megatron import mpu
 from tasks.finetune_utils import build_data_loader
 from tasks.finetune_utils import process_batch
 

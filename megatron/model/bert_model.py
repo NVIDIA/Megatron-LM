@@ -74,7 +74,7 @@ class BertLMHead(MegatronModule):
         hidden_size: hidden size
         init_method: init method for weight initialization
         layernorm_epsilon: tolerance for layer norm divisions
-        parallel_output: wether output logits being distributed or not.
+        parallel_output: whether output logits being distributed or not.
     """
 
     def __init__(self, mpu_vocab_size, hidden_size, init_method,
@@ -83,7 +83,7 @@ class BertLMHead(MegatronModule):
         super(BertLMHead, self).__init__()
 
         args = get_args()
-        
+
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias.model_parallel = True
         self.bias.partition_dim = 0
@@ -131,10 +131,8 @@ class BertModel(MegatronModule):
 
         self.lm_head = BertLMHead(
             self.language_model.embedding.word_embeddings.weight.size(0),
-            args.hidden_size, init_method, args.layernorm_epsilon,
-            parallel_output)
+            args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
         self._lm_head_key = 'lm_head'
-
         if self.add_binary_head:
             self.binary_head = get_linear_layer(args.hidden_size, 2,
                                                 init_method)
@@ -188,10 +186,10 @@ class BertModel(MegatronModule):
         state_dict_ = {}
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+            destination, prefix, keep_vars)
         state_dict_[self._lm_head_key] \
             = self.lm_head.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+            destination, prefix, keep_vars)
         if self.add_binary_head:
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
@@ -202,8 +200,8 @@ class BertModel(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        self.lm_head.load_state_dict(state_dict[self._lm_head_key],
-                                     strict=strict)
+        self.lm_head.load_state_dict(
+            state_dict[self._lm_head_key], strict=strict)
         if self.add_binary_head:
-            self.binary_head.load_state_dict(state_dict[self._binary_head_key],
-                                             strict=strict)
+            self.binary_head.load_state_dict(
+                state_dict[self._binary_head_key], strict=strict)

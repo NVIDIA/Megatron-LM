@@ -18,10 +18,10 @@
 import torch
 
 from megatron import get_args
+from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron import print_rank_0
 from megatron.data.gpt2_dataset import build_train_valid_test_datasets
 from megatron.model import GPT2Model
 from megatron.training import pretrain
