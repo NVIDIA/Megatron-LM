@@ -1,22 +1,17 @@
-import os
-import sys
-import time
-
 import torch
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from megatron import get_args, get_adlr_autoresume, print_rank_0
+from megatron import get_args
 from megatron import mpu
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.data.dataset_utils import get_indexed_dataset_
-from megatron.data.realm_dataset import ICTDataset
-from megatron.data.realm_dataset_utils import BlockSampleData
-from megatron.data.realm_index import detach, BlockData, FaissMIPSIndex
+from megatron.data.ict_dataset import ICTDataset
+from megatron.data.realm_index import detach, BlockData
 from megatron.data.samplers import DistributedBatchSampler
 from megatron.initialize import initialize_megatron
 from megatron.training import get_model
-from pretrain_bert_ict import get_batch, general_ict_model_provider
+from pretrain_ict import get_batch, general_ict_model_provider
 
 
 def pprint(*args):
@@ -30,17 +25,21 @@ class IndexBuilder(object):
         self.model = None
         self.dataloader = None
         self.block_data = None
+
+        # need to know whether we're using a REALM checkpoint (args.load) or ICT checkpoint
+        assert not (args.load and args.ict_load)
+        self.using_realm_chkpt = args.ict_load is None
+
         self.load_attributes()
         self.is_main_builder = args.rank == 0
         self.iteration = self.total_processed = 0
 
     def load_attributes(self):
         """Load the necessary attributes: model, dataloader and empty BlockData"""
-        # TODO: handle from_realm_chkpt correctly
-        self.model = load_ict_checkpoint(only_block_model=True, from_realm_chkpt=False)
+        self.model = load_ict_checkpoint(only_block_model=True, from_realm_chkpt=self.using_realm_chkpt)
         self.model.eval()
         self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset()))
-        self.block_data = BlockData()
+        self.block_data = BlockData(load_from_path=False)
 
     def track_and_report_progress(self, batch_size):
         """Utility function for tracking progress"""
@@ -141,7 +140,6 @@ def get_ict_dataset(use_titles=True, query_in_block_prob=1):
         num_epochs=1,
         max_num_samples=None,
         max_seq_length=args.seq_length,
-        short_seq_prob=0.0001,  # doesn't matter
         seed=1,
         query_in_block_prob=query_in_block_prob,
         use_titles=use_titles,

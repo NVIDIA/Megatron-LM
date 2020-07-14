@@ -31,11 +31,11 @@ def build_tokenizer(args):
     # Select and instantiate the tokenizer.
     assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
-        tokenizer = BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                           lower_case=True)
+        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                            lower_case=True)
     elif args.tokenizer_type == 'BertWordPieceCase':
-        tokenizer = BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                           lower_case=False)
+        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+                                            lower_case=False)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
@@ -124,7 +124,7 @@ class AbstractTokenizer(ABC):
                                   'tokenizer'.format(self.name))
 
 
-class BertWordPieceTokenizer(AbstractTokenizer):
+class _BertWordPieceTokenizer(AbstractTokenizer):
     """Original BERT wordpiece tokenizer."""
 
     def __init__(self, vocab_file, lower_case=True):

@@ -1,4 +1,3 @@
-from collections import defaultdict
 import itertools
 import os
 import pickle
@@ -8,7 +7,7 @@ import faiss
 import numpy as np
 import torch
 
-from megatron import get_args, mpu
+from megatron import get_args
 
 
 def detach(tensor):
@@ -17,7 +16,7 @@ def detach(tensor):
 
 class BlockData(object):
     """Serializable data structure for holding data for blocks -- embeddings and necessary metadata for REALM"""
-    def __init__(self, block_data_path=None, rank=None):
+    def __init__(self, block_data_path=None, load_from_path=True, rank=None):
         self.embed_data = dict()
         self.meta_data = dict()
         if block_data_path is None:
@@ -26,6 +25,9 @@ class BlockData(object):
             rank = args.rank
         self.block_data_path = block_data_path
         self.rank = rank
+
+        if load_from_path:
+            self.load_from_file()
 
         block_data_name = os.path.splitext(self.block_data_path)[0]
         self.temp_dir_name = block_data_name + '_tmp'
@@ -43,18 +45,23 @@ class BlockData(object):
         """
         self.embed_data = dict()
 
-    @classmethod
-    def load_from_file(cls, fname):
+    def load_from_file(self):
+        """Populate members from instance saved to file"""
+
         print("\n> Unpickling BlockData", flush=True)
-        state_dict = pickle.load(open(fname, 'rb'))
+        state_dict = pickle.load(open(self.block_data_path, 'rb'))
         print(">> Finished unpickling BlockData\n", flush=True)
 
-        new_index = cls()
-        new_index.embed_data = state_dict['embed_data']
-        new_index.meta_data = state_dict['meta_data']
-        return new_index
+        self.embed_data = state_dict['embed_data']
+        self.meta_data = state_dict['meta_data']
 
     def add_block_data(self, block_indices, block_embeds, block_metas, allow_overwrite=False):
+        """Add data for set of blocks
+        :param block_indices: 1D array of unique int ids for the blocks
+        :param block_embeds: 2D array of embeddings of the blocks
+        :param block_metas: 2D array of metadata for the blocks.
+            In the case of REALM this will be [start_idx, end_idx, doc_idx]
+        """
         for idx, embed, meta in zip(block_indices, block_embeds, block_metas):
             if not allow_overwrite and idx in self.embed_data:
                 raise ValueError("Unexpectedly tried to overwrite block data")
@@ -63,6 +70,7 @@ class BlockData(object):
             self.meta_data[idx] = meta
 
     def save_shard(self):
+        """Save the block data that was created this in this process"""
         if not os.path.isdir(self.temp_dir_name):
             os.makedirs(self.temp_dir_name, exist_ok=True)
 
@@ -104,9 +112,9 @@ class BlockData(object):
 
 class FaissMIPSIndex(object):
     """Wrapper object for a BlockData which similarity search via FAISS under the hood"""
-    def __init__(self, index_type, embed_size, use_gpu=False):
-        self.index_type = index_type
+    def __init__(self, embed_size, block_data=None, use_gpu=False):
         self.embed_size = embed_size
+        self.block_data = block_data
         self.use_gpu = use_gpu
         self.id_map = dict()
 
@@ -114,10 +122,7 @@ class FaissMIPSIndex(object):
         self._set_block_index()
 
     def _set_block_index(self):
-        INDEX_TYPES = ['flat_ip']
-        if self.index_type not in INDEX_TYPES:
-            raise ValueError("Invalid index type specified")
-
+        """Create a Faiss Flat index with inner product as the metric to search against"""
         print("\n> Building index", flush=True)
         self.block_mips_index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
 
@@ -129,29 +134,52 @@ class FaissMIPSIndex(object):
             config.useFloat16 = True
 
             self.block_mips_index = faiss.GpuIndexFlat(res, self.block_mips_index, config)
-            print(">>> Finished building index on GPU {}\n".format(self.block_mips_index.getDevice()), flush=True)
+            print(">> Initialized index on GPU {}".format(self.block_mips_index.getDevice()), flush=True)
         else:
             # CPU index supports IDs so wrap with IDMap
             self.block_mips_index = faiss.IndexIDMap(self.block_mips_index)
-            print(">> Finished building index\n", flush=True)
+            print(">> Initialized index on CPU", flush=True)
+
+        # if we were constructed with a BlockData, then automatically load it when the FAISS structure is built
+        if self.block_data is not None:
+            self.add_block_embed_data(self.block_data)
 
     def reset_index(self):
         """Delete existing index and create anew"""
         del self.block_mips_index
+
+        # reset the block data so that _set_block_index will reload it as well
+        if self.block_data is not None:
+            block_data_path = self.block_data.block_data_path
+            del self.block_data
+            self.block_data = BlockData.load_from_file(block_data_path)
+
         self._set_block_index()
 
     def add_block_embed_data(self, all_block_data):
         """Add the embedding of each block to the underlying FAISS index"""
+
+        # this assumes the embed_data is a dict : {int: np.array<float>}
         block_indices, block_embeds = zip(*all_block_data.embed_data.items())
+
+        # the embeddings have to be entered in as float32 even though the math internally is done with float16.
+        block_embeds_arr = np.float32(np.array(block_embeds))
+        block_indices_arr = np.array(block_indices)
+
+        # faiss GpuIndex doesn't work with IDMap wrapper so store ids to map back with
         if self.use_gpu:
             for i, idx in enumerate(block_indices):
                 self.id_map[i] = idx
 
+        # we no longer need the embedding data since it's in the index now
         all_block_data.clear()
+
         if self.use_gpu:
-            self.block_mips_index.add(np.float32(np.array(block_embeds)))
+            self.block_mips_index.add(block_embeds_arr)
         else:
-            self.block_mips_index.add_with_ids(np.float32(np.array(block_embeds)), np.array(block_indices))
+            self.block_mips_index.add_with_ids(block_embeds_arr, block_indices_arr)
+
+        print(">>> Finished adding block data to index", flush=True)
 
     def search_mips_index(self, query_embeds, top_k, reconstruct=True):
         """Get the top-k blocks by the index distance metric.
@@ -160,12 +188,15 @@ class FaissMIPSIndex(object):
                             if False: return [num_queries x k] array of distances, and another for indices
         """
         query_embeds = np.float32(detach(query_embeds))
-
         with torch.no_grad():
+
             if reconstruct:
+                # get the vectors themselves
                 top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
                 return top_k_block_embeds
+
             else:
+                # get distances and indices of closest vectors
                 distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
                 if self.use_gpu:
                     fresh_indices = np.zeros(block_indices.shape)
