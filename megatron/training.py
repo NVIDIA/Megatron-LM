@@ -22,10 +22,11 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
-from megatron import get_args, print_rank_0
+from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import mpu
+from megatron import print_rank_0
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
@@ -222,7 +223,11 @@ def setup_model_and_optimizer(model_provider_func):
     else:
         args.iteration = 0
 
-    unwrapped_model = model.module.module
+    # get model without FP16 and/or TorchDDP wrappers
+    unwrapped_model = model
+    while hasattr(unwrapped_model, 'module'):
+        unwrapped_model = unwrapped_model.module
+
     if args.iteration == 0 and hasattr(unwrapped_model, 'init_state_dict_from_bert'):
         print("Initializing ICT from pretrained BERT model", flush=True)
         unwrapped_model.init_state_dict_from_bert()

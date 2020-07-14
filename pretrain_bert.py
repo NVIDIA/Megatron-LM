@@ -18,7 +18,8 @@
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, print_rank_0
+from megatron import get_args
+from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets

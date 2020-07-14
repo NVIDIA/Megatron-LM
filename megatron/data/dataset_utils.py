@@ -399,7 +399,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     def build_dataset(index, name):
         from megatron.data.bert_dataset import BertDataset
-        from megatron.data.realm_dataset import ICTDataset
+        from megatron.data.ict_dataset import ICTDataset
         dataset = None
         if splits[index + 1] > splits[index]:
             # Get the pointer to the original doc-idx so we can set it later.
@@ -427,6 +427,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
                     query_in_block_prob=args.query_in_block_prob,
+                    use_one_sent_docs=args.ict_one_sent,
                     **kwargs
                 )
             else:

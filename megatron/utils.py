@@ -19,7 +19,8 @@ import sys
 
 import torch
 
-from megatron import get_args, print_rank_0
+from megatron import get_args
+from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.checkpointing import save_checkpoint

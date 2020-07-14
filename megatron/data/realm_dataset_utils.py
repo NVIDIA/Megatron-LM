@@ -138,7 +138,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         indexmap_filename))
     start_time = time.time()
 
-    mapping_array = np.load(indexmap_filename, allow_pickle=True)
+    mapping_array = np.load(indexmap_filename, allow_pickle=True, mmap_mode='r')
     samples_mapping = BlockSamplesMapping(mapping_array)
 
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(

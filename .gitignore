@@ -4,13 +4,3 @@ __pycache__
 build/
 dist/
 *.egg-info/
-
-# added by neel
-*.npy
-*.bin
-*.idx
-*.pkl
-raw_*
-run_*
-realm_*
-

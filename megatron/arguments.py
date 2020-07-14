@@ -37,6 +37,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
+    parser = _add_realm_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -139,8 +140,6 @@ def _add_network_size_args(parser):
                        '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
-    group.add_argument('--ict-head-size', type=int, default=None,
-                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
@@ -264,10 +263,6 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
-    group.add_argument('--ict-load', type=str, default=None,
-                       help='Directory containing an ICTBertModel checkpoint')
-    group.add_argument('--bert-load', type=str, default=None,
-                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
     group.add_argument('--no-load-optim', action='store_true',
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true',
@@ -347,10 +342,6 @@ def _add_data_args(parser):
 
     group.add_argument('--data-path', type=str, default=None,
                        help='Path to combined dataset to split.')
-    group.add_argument('--titles-data-path', type=str, default=None,
-                       help='Path to titles dataset used for ICT')
-    group.add_argument('--block-data-path', type=str, default=None,
-                       help='Path for loading and saving block data')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -386,10 +377,6 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
-    group.add_argument('--query-in-block-prob', type=float, default=0.1,
-                       help='Probability of keeping query in block for ICT dataset')
-    group.add_argument('--faiss-use-gpu', action='store_true',
-                       help='Whether create the FaissMIPSIndex on GPU')
 
     return parser
 
@@ -404,3 +391,37 @@ def _add_autoresume_args(parser):
                        'termination signal')
 
     return parser
+
+
+def _add_realm_args(parser):
+    group = parser.add_argument_group(title='realm')
+
+    # network size
+    group.add_argument('--ict-head-size', type=int, default=None,
+                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
+
+    # checkpointing
+    group.add_argument('--ict-load', type=str, default=None,
+                       help='Directory containing an ICTBertModel checkpoint')
+    group.add_argument('--bert-load', type=str, default=None,
+                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
+
+    # data
+    group.add_argument('--titles-data-path', type=str, default=None,
+                       help='Path to titles dataset used for ICT')
+    group.add_argument('--query-in-block-prob', type=float, default=0.1,
+                       help='Probability of keeping query in block for ICT dataset')
+    group.add_argument('--ict-one-sent', action='store_true',
+                       help='Whether to use one sentence documents in ICT')
+
+    # training
+    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
+                       help="Which top-k accuracies to report (e.g. '1 5 20')")
+
+    # faiss index
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--block-data-path', type=str,
+                       help='Where to save/load BlockData to/from')
+    return parser
+
