@@ -18,7 +18,13 @@
 import math
 
 import torch
-from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+try:
+    from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+    # Try to use FusedLayerNorm from Apex - this will trigger an error.
+    _ = FusedLayerNorm(8, eps=1e-5)
+
+except Exception as e:
+    from torch.nn import LayerNorm
 
 from megatron import get_args
 from megatron import mpu
