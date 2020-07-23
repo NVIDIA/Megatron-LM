@@ -426,7 +426,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
                     query_in_block_prob=args.query_in_block_prob,
-                    use_one_sent_docs=args.ict_one_sent,
+                    use_one_sent_docs=args.use_one_sent_docs,
                     **kwargs
                 )
             else:

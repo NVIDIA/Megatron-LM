@@ -21,9 +21,10 @@ import sys
 import numpy as np
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as torchDDP
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
-from megatron import mpu
+from megatron import mpu, get_args
 from megatron import get_args
 from megatron import print_rank_0
 
@@ -244,3 +245,43 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         print('  successfully loaded {}'.format(checkpoint_name))
 
     return iteration
+
+
+def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, from_realm_chkpt=False):
+    """selectively load ICT models for indexing/retrieving from ICT or REALM checkpoints"""
+
+    args = get_args()
+
+    if isinstance(model, torchDDP):
+        model = model.module
+
+    load_path = args.load if from_realm_chkpt else args.ict_load
+
+    tracker_filename = get_checkpoint_tracker_filename(load_path)
+    with open(tracker_filename, 'r') as f:
+        iteration = int(f.read().strip())
+
+    # assert iteration > 0
+    checkpoint_name = get_checkpoint_name(load_path, iteration, False)
+    if mpu.get_data_parallel_rank() == 0:
+        print('global rank {} is loading checkpoint {}'.format(
+            torch.distributed.get_rank(), checkpoint_name))
+
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
+    ict_state_dict = state_dict['model']
+    if from_realm_chkpt and mpu.get_data_parallel_rank() == 0:
+        print(" loading ICT state dict from REALM", flush=True)
+        ict_state_dict = ict_state_dict['retriever']['ict_model']
+
+    if only_query_model:
+        ict_state_dict.pop('context_model')
+    if only_block_model:
+        ict_state_dict.pop('question_model')
+
+    model.load_state_dict(ict_state_dict)
+    torch.distributed.barrier()
+
+    if mpu.get_data_parallel_rank() == 0:
+        print(' successfully loaded {}'.format(checkpoint_name))
+
+    return model

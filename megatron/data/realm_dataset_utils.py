@@ -6,7 +6,57 @@ import torch
 
 from megatron import mpu, print_rank_0
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
+from megatron.data.samplers import DistributedBatchSampler
 from megatron import get_args, get_tokenizer, print_rank_0, mpu
+
+
+def get_one_epoch_dataloader(dataset, batch_size=None):
+    """Specifically one epoch to be used in an indexing job."""
+    args = get_args()
+
+    world_size = mpu.get_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    if batch_size is None:
+        batch_size = args.batch_size
+    global_batch_size = batch_size * world_size
+    num_workers = args.num_workers
+
+    sampler = torch.utils.data.SequentialSampler(dataset)
+    # importantly, drop_last must be False to get all the data.
+    batch_sampler = DistributedBatchSampler(sampler,
+                                            batch_size=global_batch_size,
+                                            drop_last=False,
+                                            rank=rank,
+                                            world_size=world_size)
+
+    return torch.utils.data.DataLoader(dataset,
+                                       batch_sampler=batch_sampler,
+                                       num_workers=num_workers,
+                                       pin_memory=True)
+
+
+def get_ict_batch(data_iterator):
+    # Items and their type.
+    keys = ['query_tokens', 'query_pad_mask',
+            'block_tokens', 'block_pad_mask', 'block_data']
+    datatype = torch.int64
+
+    # Broadcast data.
+    if data_iterator is None:
+        data = None
+    else:
+        data = next(data_iterator)
+    data_b = mpu.broadcast_data(keys, data, datatype)
+
+    # Unpack.
+    query_tokens = data_b['query_tokens'].long()
+    query_pad_mask = data_b['query_pad_mask'].long()
+    block_tokens = data_b['block_tokens'].long()
+    block_pad_mask = data_b['block_pad_mask'].long()
+    block_indices = data_b['block_data'].long()
+
+    return query_tokens, query_pad_mask,\
+           block_tokens, block_pad_mask, block_indices
 
 
 def join_str_list(str_list):
@@ -46,10 +96,12 @@ class BlockSamplesMapping(object):
         # make sure that the array is compatible with BlockSampleData
         assert mapping_array.shape[1] == 4
         self.mapping_array = mapping_array
-        self.shape = self.mapping_array.shape
+
+    def __len__(self):
+        return self.mapping_array.shape[0]
 
     def __getitem__(self, idx):
-        """Get the data associated with a particular sample."""
+        """Get the data associated with an indexed sample."""
         sample_data = BlockSampleData(*self.mapping_array[idx])
         return sample_data
 
@@ -144,6 +196,6 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(
-        samples_mapping.shape[0]))
+        mapping_array.shape[0]))
 
     return samples_mapping

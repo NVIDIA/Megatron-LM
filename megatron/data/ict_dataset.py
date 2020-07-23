@@ -5,7 +5,34 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
+from megatron import get_args
+from megatron.data.dataset_utils import get_indexed_dataset_
 from megatron.data.realm_dataset_utils import get_block_samples_mapping
+
+
+def get_ict_dataset(use_titles=True, query_in_block_prob=1):
+    """Get a dataset which uses block samples mappings to get ICT/block indexing data (via get_block())
+    rather than for training, since it is only built with a single epoch sample mapping.
+    """
+    args = get_args()
+    block_dataset = get_indexed_dataset_(args.data_path, 'mmap', True)
+    titles_dataset = get_indexed_dataset_(args.titles_data_path, 'mmap', True)
+
+    kwargs = dict(
+        name='full',
+        block_dataset=block_dataset,
+        title_dataset=titles_dataset,
+        data_prefix=args.data_path,
+        num_epochs=1,
+        max_num_samples=None,
+        max_seq_length=args.seq_length,
+        seed=1,
+        query_in_block_prob=query_in_block_prob,
+        use_titles=use_titles,
+        use_one_sent_docs=args.use_one_sent_docs
+    )
+    dataset = ICTDataset(**kwargs)
+    return dataset
 
 
 class ICTDataset(Dataset):
@@ -35,7 +62,7 @@ class ICTDataset(Dataset):
         self.pad_id = self.tokenizer.pad
 
     def __len__(self):
-        return self.samples_mapping.shape[0]
+        return len(self.samples_mapping)
 
     def __getitem__(self, idx):
         """Get an ICT example of a pseudo-query and the block of text from which it was extracted"""

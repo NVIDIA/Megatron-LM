@@ -3,7 +3,6 @@ import os
 import pickle
 import shutil
 
-import faiss
 import numpy as np
 import torch
 
@@ -123,6 +122,11 @@ class FaissMIPSIndex(object):
 
     def _set_block_index(self):
         """Create a Faiss Flat index with inner product as the metric to search against"""
+        try:
+            import faiss
+        except ImportError:
+            raise Exception("Error: Please install faiss to use FaissMIPSIndex")
+
         print("\n> Building index", flush=True)
         self.block_mips_index = faiss.index_factory(self.embed_size, 'Flat', faiss.METRIC_INNER_PRODUCT)
 
@@ -188,19 +192,18 @@ class FaissMIPSIndex(object):
                             if False: return [num_queries x k] array of distances, and another for indices
         """
         query_embeds = np.float32(detach(query_embeds))
-        with torch.no_grad():
 
-            if reconstruct:
-                # get the vectors themselves
-                top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
-                return top_k_block_embeds
+        if reconstruct:
+            # get the vectors themselves
+            top_k_block_embeds = self.block_mips_index.search_and_reconstruct(query_embeds, top_k)
+            return top_k_block_embeds
 
-            else:
-                # get distances and indices of closest vectors
-                distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
-                if self.use_gpu:
-                    fresh_indices = np.zeros(block_indices.shape)
-                    for i, j in itertools.product(block_indices.shape):
-                        fresh_indices[i, j] = self.id_map[block_indices[i, j]]
-                    block_indices = fresh_indices
-                return distances, block_indices
+        else:
+            # get distances and indices of closest vectors
+            distances, block_indices = self.block_mips_index.search(query_embeds, top_k)
+            if self.use_gpu:
+                fresh_indices = np.zeros(block_indices.shape)
+                for i, j in itertools.product(block_indices.shape):
+                    fresh_indices[i, j] = self.id_map[block_indices[i, j]]
+                block_indices = fresh_indices
+            return distances, block_indices
