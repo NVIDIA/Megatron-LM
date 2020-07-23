@@ -13,6 +13,8 @@ def main():
         --block-data-path: path to write to
         --ict-load or --realm-load: path to checkpoint with which to embed
         --data-path and --titles-data-path: paths for dataset
+        --indexer-log-interval: reporting interval
+        --indexer-batch-size: size specific for indexer jobs
 
     Check README.md for example script
     """
