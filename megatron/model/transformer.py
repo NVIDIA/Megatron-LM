@@ -24,6 +24,7 @@ try:
     _ = FusedLayerNorm(8, eps=1e-5)
 
 except Exception as e:
+    print('WARNING: APEX is not available, using torch.nn.LayerNorm instead of apex.normalization.FusedLayerNorm!')
     from torch.nn import LayerNorm
 
 from megatron import get_args
