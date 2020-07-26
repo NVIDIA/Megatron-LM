@@ -37,7 +37,8 @@ class IndexBuilder(object):
         model = get_model(lambda: general_ict_model_provider(only_block_model=True))
         self.model = load_ict_checkpoint(model, only_block_model=True, from_realm_chkpt=self.using_realm_chkpt)
         self.model.eval()
-        self.dataloader = iter(get_one_epoch_dataloader(get_ict_dataset(), self.batch_size))
+        self.dataset = get_ict_dataset()
+        self.dataloader = iter(get_one_epoch_dataloader(self.dataset, self.batch_size))
         self.block_data = BlockData(load_from_path=False)
 
     def track_and_report_progress(self, batch_size):
@@ -58,7 +59,7 @@ class IndexBuilder(object):
             try:
                 # batch also has query_tokens and query_pad_data
                 _, _, block_tokens, block_pad_mask, block_sample_data = get_ict_batch(self.dataloader)
-            except StopIteration:
+            except (StopIteration, IndexError):
                 break
 
             unwrapped_model = self.model
@@ -85,6 +86,6 @@ class IndexBuilder(object):
         # rank 0 process builds the final copy
         if self.is_main_builder:
             self.block_data.merge_shards_and_save()
+            # make sure that every single piece of data was embedded
+            assert len(self.block_data.embed_data) == len(self.dataset)
         self.block_data.clear()
-
-
