@@ -97,7 +97,7 @@ class BertLMHead(MegatronModule):
             self.gelu = openai_gelu
         # make it override 
         if args.erf_gelu:
-            self.gelu = openai_gelu
+            self.gelu = erf_gelu
 
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
