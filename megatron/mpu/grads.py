@@ -21,8 +21,12 @@
 import torch
 from torch._six import inf
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier
+    import amp_C
+
+except Exception as e:
+    print('WARNING: APEX is not installed, multi_tensor_applier will not be available.')
 
 from .initialize import get_model_parallel_group
 from .initialize import get_model_parallel_rank
