@@ -95,8 +95,7 @@ class BertLMHead(MegatronModule):
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
-        # make it override 
-        if args.erf_gelu:
+        elif args.onnx_safe:
             self.gelu = erf_gelu
 
     def forward(self, hidden_states, word_embeddings_weight):

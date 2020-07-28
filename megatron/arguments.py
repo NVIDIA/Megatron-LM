@@ -158,9 +158,8 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
-    group.add_argument('--erf-gelu', action='store_true',
-                       help='Python GeLU implementation equivalent to one in Torch. This option'
-                       'should only be used to work around Torch bug exporting gelu() to ONNX in FP16')
+    group.add_argument('--onnx-safe', action='store_true',
+                       help='Use workarounds for known problems with Torch ONNX exporter')
 
     return parser
 

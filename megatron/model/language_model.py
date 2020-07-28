@@ -52,7 +52,7 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     gelu = F.gelu
     if args.openai_gelu:
         gelu = openai_gelu
-    if args.erf_gelu:
+    elif args.onnx_safe:
         gelu = erf_gelu
     
     # Language model.
