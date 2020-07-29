@@ -48,6 +48,7 @@ def get_linear_layer(rows, columns, init_method):
         layer.bias.zero_()
     return layer
 
+@torch.jit.script
 def gelu_impl(x):
     """OpenAI's gelu implementation."""
     return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x *
