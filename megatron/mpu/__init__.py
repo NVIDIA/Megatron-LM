@@ -32,6 +32,7 @@ from .initialize import get_model_parallel_world_size
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
 
+from .layers import LayerNorm
 from .layers import ColumnParallelLinear
 from .layers import ParallelEmbedding
 from .layers import RowParallelLinear
