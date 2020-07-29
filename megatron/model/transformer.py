@@ -16,12 +16,11 @@
 """Transformer."""
 
 import math
-
 import torch
-from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
 from megatron import get_args
 from megatron import mpu
+from megatron.mpu import LayerNorm
 from megatron.module import MegatronModule
 
 
