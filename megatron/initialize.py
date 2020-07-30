@@ -39,12 +39,6 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Make sure cuda is available.
         assert torch.cuda.is_available(), 'Megatron requires CUDA.'
 
-    # This is temporary WAR to make simple case like pytest calling with same args twice
-    # Need to implement clean factory init.
-    if mpu.model_parallel_is_initialized():
-        return
-    
-    
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(extra_args_provider=extra_args_provider,

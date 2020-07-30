@@ -127,19 +127,23 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings_per_partition, 0, init_method)
 
     def forward(self, input_):
-        # Build the mask.
-        input_mask = (input_ < self.vocab_start_index) | \
-                     (input_ >= self.vocab_end_index)
-        # Mask the input.
-        masked_input = input_.clone() - self.vocab_start_index
-        masked_input[input_mask] = 0
-        # Get the embeddings.
+        if self.num_embeddings_per_partition < self.num_embeddings:
+            # Build the mask.
+            input_mask = (input_ < self.vocab_start_index) | \
+                         (input_ >= self.vocab_end_index)
+            # Mask the input.
+            masked_input = input_.clone() - self.vocab_start_index
+            masked_input[input_mask] = 0
+        else:
+            masked_input = input_
+            # Get the embeddings.
         output_parallel = F.embedding(masked_input, self.weight,
                                       self.padding_idx, self.max_norm,
                                       self.norm_type, self.scale_grad_by_freq,
                                       self.sparse)
         # Mask the output embedding.
-        output_parallel[input_mask, :] = 0.0
+        if self.num_embeddings_per_partition < self.num_embeddings:
+            output_parallel[input_mask, :] = 0.0
         # Reduce across all the model parallel GPUs.
         output = reduce_from_model_parallel_region(output_parallel)
         return output
