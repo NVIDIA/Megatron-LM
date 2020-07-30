@@ -24,7 +24,6 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import ICTBertModel
 from megatron.training import pretrain
 from megatron.utils import reduce_losses
 from megatron.model.realm_model import general_ict_model_provider

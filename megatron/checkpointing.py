@@ -22,7 +22,6 @@ import numpy as np
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import mpu, get_args
 from megatron import get_args
