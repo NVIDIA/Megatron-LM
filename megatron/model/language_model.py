@@ -22,7 +22,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
 from megatron.model.transformer import ParallelTransformer
-from megatron.model.utils import openai_gelu
+from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 
 
@@ -52,6 +52,8 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     gelu = F.gelu
     if args.openai_gelu:
         gelu = openai_gelu
+    elif args.onnx_safe:
+        gelu = erf_gelu
     
     # Language model.
     language_model = TransformerLanguageModel(

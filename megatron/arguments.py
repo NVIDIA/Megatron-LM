@@ -158,6 +158,8 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
+    group.add_argument('--onnx-safe', action='store_true',
+                       help='Use workarounds for known problems with Torch ONNX exporter')
 
     return parser
 
@@ -411,12 +413,23 @@ def _add_realm_args(parser):
                        help='Path to titles dataset used for ICT')
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
                        help='Probability of keeping query in block for ICT dataset')
-    group.add_argument('--ict-one-sent', action='store_true',
+    group.add_argument('--use-one-sent-docs', action='store_true',
                        help='Whether to use one sentence documents in ICT')
 
     # training
     group.add_argument('--report-topk-accuracies', nargs='+', default=[],
                        help="Which top-k accuracies to report (e.g. '1 5 20')")
 
+    # faiss index
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--block-data-path', type=str, default=None,
+                       help='Where to save/load BlockData to/from')
+
+    # indexer
+    group.add_argument('--indexer-batch-size', type=int, default=128,
+                       help='How large of batches to use when doing indexing jobs')
+    group.add_argument('--indexer-log-interval', type=int, default=1000,
+                       help='After how many batches should the indexer report progress')
     return parser
 

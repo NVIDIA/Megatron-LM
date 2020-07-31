@@ -48,7 +48,6 @@ def get_linear_layer(rows, columns, init_method):
         layer.bias.zero_()
     return layer
 
-
 @torch.jit.script
 def gelu_impl(x):
     """OpenAI's gelu implementation."""
@@ -57,6 +56,10 @@ def gelu_impl(x):
 def openai_gelu(x):
     return gelu_impl(x)
 
+#This is actually Python equivalent of torch.nn.functional.gelu(), also with type hints for ONNX exporter
+@torch.jit.script
+def erf_gelu(x):
+    return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
 
 def get_params_for_weight_decay_optimization(module):
     """Divide params into with-weight-decay and without-weight-decay groups.

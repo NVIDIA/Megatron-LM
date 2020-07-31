@@ -1,7 +1,7 @@
 import os
 import torch
 
-from megatron import get_args
+from megatron import get_args, print_rank_0
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.model import BertModel
 from megatron.module import MegatronModule
@@ -11,6 +11,28 @@ from megatron.model.utils import init_method_normal
 from megatron.model.language_model import get_language_model
 from megatron.model.utils import scaled_init_method_normal
 from megatron.model.bert_model import bert_attention_mask_func, bert_extended_attention_mask, bert_position_ids
+
+
+def general_ict_model_provider(only_query_model=False, only_block_model=False):
+    """Build the model."""
+    args = get_args()
+    assert args.ict_head_size is not None, \
+        "Need to specify --ict-head-size to provide an ICTBertModel"
+
+    assert args.model_parallel_size == 1, \
+        "Model parallel size > 1 not supported for ICT"
+
+    print_rank_0('building ICTBertModel...')
+
+    # simpler to just keep using 2 tokentypes since the LM we initialize with has 2 tokentypes
+    model = ICTBertModel(
+        ict_head_size=args.ict_head_size,
+        num_tokentypes=2,
+        parallel_output=True,
+        only_query_model=only_query_model,
+        only_block_model=only_block_model)
+
+    return model
 
 
 class ICTBertModel(MegatronModule):

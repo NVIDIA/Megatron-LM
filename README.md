@@ -319,6 +319,31 @@ python pretrain_ict.py \
     
 </pre>
 
+### Building an Index of Block Embeddings
+After having trained an ICT model, you can now embed an entire dataset of blocks by creating a `BlockData` structure. After that has been saved, you can load it 
+and wrap it with a `FaissMIPSIndex` to do fast similarity search which is key in the learned information retrieval pipeline. The initial index can be built with the following script, meant to be run in an interactive session. It can leverage multiple GPUs on multiple nodes to index large datasets much more quickly. 
+
+<pre>
+python tools/create_doc_index.py \
+    --num-layers 12 \
+    --hidden-size 768 \
+    --ict-head-size 128 \
+    --num-attention-heads 12 \
+    --batch-size 128 \
+    --checkpoint-activations \
+    --seq-length 256 \
+    --max-position-embeddings 256 \
+    --ict-load /path/to/pretrained_ict \
+    --data-path /path/to/indexed_dataset \
+    --titles-data-path /path/to/titles_indexed_dataset \
+    --block-data-path embedded_blocks.pkl \
+    --indexer-log-interval 1000 \
+    --indexer-batch-size 128 \
+    --vocab-file /path/to/vocab.txt \
+    --num-workers 2 \
+    --fp16
+</pre>
+
 <a id="evaluation-and-tasks"></a>
 # Evaluation and Tasks
 

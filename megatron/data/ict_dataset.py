@@ -5,21 +5,47 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from megatron import get_tokenizer
+from megatron import get_args
+from megatron.data.dataset_utils import get_indexed_dataset_
 from megatron.data.realm_dataset_utils import get_block_samples_mapping
+
+
+def get_ict_dataset(use_titles=True, query_in_block_prob=1):
+    """Get a dataset which uses block samples mappings to get ICT/block indexing data (via get_block())
+    rather than for training, since it is only built with a single epoch sample mapping.
+    """
+    args = get_args()
+    block_dataset = get_indexed_dataset_(args.data_path, 'mmap', True)
+    titles_dataset = get_indexed_dataset_(args.titles_data_path, 'mmap', True)
+
+    kwargs = dict(
+        name='full',
+        block_dataset=block_dataset,
+        title_dataset=titles_dataset,
+        data_prefix=args.data_path,
+        num_epochs=1,
+        max_num_samples=None,
+        max_seq_length=args.seq_length,
+        seed=1,
+        query_in_block_prob=query_in_block_prob,
+        use_titles=use_titles,
+        use_one_sent_docs=args.use_one_sent_docs
+    )
+    dataset = ICTDataset(**kwargs)
+    return dataset
 
 
 class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
-                 num_epochs, max_num_samples, max_seq_length,
-                 query_in_block_prob, short_seq_prob, seed, use_titles=True, use_one_sent_docs=False):
+                 num_epochs, max_num_samples, max_seq_length, query_in_block_prob,
+                 seed, use_titles=True, use_one_sent_docs=False):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
         self.query_in_block_prob = query_in_block_prob
         self.block_dataset = block_dataset
         self.title_dataset = title_dataset
-        self.short_seq_prob = short_seq_prob
         self.rng = random.Random(self.seed)
         self.use_titles = use_titles
         self.use_one_sent_docs = use_one_sent_docs
@@ -36,11 +62,13 @@ class ICTDataset(Dataset):
         self.pad_id = self.tokenizer.pad
 
     def __len__(self):
-        return self.samples_mapping.shape[0]
+        return len(self.samples_mapping)
 
     def __getitem__(self, idx):
         """Get an ICT example of a pseudo-query and the block of text from which it was extracted"""
-        start_idx, end_idx, doc_idx, block_idx = self.samples_mapping[idx]
+        sample_data = self.samples_mapping[idx]
+        start_idx, end_idx, doc_idx, block_idx = sample_data.as_tuple()
+
         if self.use_titles:
             title = self.title_dataset[int(doc_idx)]
             title_pad_offset = 3 + len(title)
@@ -48,7 +76,7 @@ class ICTDataset(Dataset):
             title = None
             title_pad_offset = 2
         block = [self.block_dataset[i] for i in range(start_idx, end_idx)]
-        assert len(block) > 1 or self.use_one_sent_docs
+        assert len(block) > 1 or self.use_one_sent_docs or self.query_in_block_prob == 1
 
         # randint() is inclusive for Python rng
         rand_sent_idx = self.rng.randint(0, len(block) - 1)
@@ -66,7 +94,7 @@ class ICTDataset(Dataset):
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
         block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
-        block_data = np.array([start_idx, end_idx, doc_idx, block_idx]).astype(np.int64)
+        block_data = sample_data.as_array()
 
         sample = {
             'query_tokens': query_tokens,

@@ -31,6 +31,11 @@ _MPU_WORLD_SIZE = None
 _MPU_RANK = None
 
 
+def is_unitialized():
+    """Useful for code segments that may be accessed with or without mpu initialization"""
+    return _DATA_PARALLEL_GROUP is None
+
+
 def initialize_model_parallel(model_parallel_size_):
     """
     Initialize model data parallel groups.
