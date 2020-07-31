@@ -80,6 +80,10 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
 
     @staticmethod
+    def symbolic(graph, input_):
+        return input_
+    
+    @staticmethod
     def forward(ctx, input_):
         return input_
 
@@ -91,6 +95,10 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
     """All-redcue the input from the model parallel region."""
 
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce(input_)
+    
     @staticmethod
     def forward(ctx, input_):
         return _reduce(input_)
@@ -104,6 +112,10 @@ class _ScatterToModelParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
+    def symbolic(graph, input_):
+        return _split(input_)
+
+    @staticmethod
     def forward(ctx, input_):
         return _split(input_)
 
@@ -115,6 +127,10 @@ class _ScatterToModelParallelRegion(torch.autograd.Function):
 class _GatherFromModelParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatinate."""
 
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather(input_)
+    
     @staticmethod
     def forward(ctx, input_):
         return _gather(input_)
