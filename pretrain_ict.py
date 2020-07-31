@@ -24,37 +24,14 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import ICTBertModel
 from megatron.training import pretrain
 from megatron.utils import reduce_losses
-
-num_batches = 0
-
-
-def general_model_provider(only_query_model=False, only_block_model=False):
-    """Build the model."""
-    args = get_args()
-    assert args.ict_head_size is not None, \
-        "Need to specify --ict-head-size to provide an ICTBertModel"
-
-    assert args.model_parallel_size == 1, \
-        "Model parallel size > 1 not supported for ICT"
-
-    print_rank_0('building ICTBertModel...')
-
-    # simpler to just keep using 2 tokentypes since the LM we initialize with has 2 tokentypes
-    model = ICTBertModel(
-        ict_head_size=args.ict_head_size,
-        num_tokentypes=2,
-        parallel_output=True,
-        only_query_model=only_query_model,
-        only_block_model=only_block_model)
-
-    return model
+from megatron.model.realm_model import general_ict_model_provider
+from megatron.data.realm_dataset_utils import get_ict_batch
 
 
-def model_provider():
-    return general_model_provider(False, False)
+def pretrain_ict_model_provider():
+    return general_ict_model_provider(False, False)
 
 
 def get_group_world_size_rank():
@@ -95,30 +72,6 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
         return output
 
 
-def get_batch(data_iterator):
-    # Items and their type.
-    keys = ['query_tokens', 'query_pad_mask',
-            'block_tokens', 'block_pad_mask', 'block_data']
-    datatype = torch.int64
-
-    # Broadcast data.
-    if data_iterator is None:
-        data = None
-    else:
-        data = next(data_iterator)
-    data_b = mpu.broadcast_data(keys, data, datatype)
-
-    # Unpack.
-    query_tokens = data_b['query_tokens'].long()
-    query_pad_mask = data_b['query_pad_mask'].long()
-    block_tokens = data_b['block_tokens'].long()
-    block_pad_mask = data_b['block_pad_mask'].long()
-    block_indices = data_b['block_data'].long()
-
-    return query_tokens, query_pad_mask,\
-           block_tokens, block_pad_mask, block_indices
-
-
 def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
@@ -127,7 +80,7 @@ def forward_step(data_iterator, model):
     # Get the batch.
     timers('batch generator').start()
     query_tokens, query_pad_mask, \
-    block_tokens, block_pad_mask, block_indices = get_batch(data_iterator)
+    block_tokens, block_pad_mask, block_indices = get_ict_batch(data_iterator)
     timers('batch generator').stop()
 
 
@@ -181,5 +134,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
+    pretrain(train_valid_test_datasets_provider, pretrain_ict_model_provider, forward_step,
              args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

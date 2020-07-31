@@ -417,7 +417,6 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                 num_epochs=None,
                 max_num_samples=train_valid_test_num_samples[index],
                 max_seq_length=max_seq_length,
-                short_seq_prob=short_seq_prob,
                 seed=seed
             )
 
@@ -427,13 +426,14 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                     block_dataset=indexed_dataset,
                     title_dataset=title_dataset,
                     query_in_block_prob=args.query_in_block_prob,
-                    use_one_sent_docs=args.ict_one_sent,
+                    use_one_sent_docs=args.use_one_sent_docs,
                     **kwargs
                 )
             else:
                 dataset = BertDataset(
                     indexed_dataset=indexed_dataset,
                     masked_lm_prob=masked_lm_prob,
+                    short_seq_prob=short_seq_prob,
                     **kwargs
                 )
 
