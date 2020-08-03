@@ -18,6 +18,8 @@
 import argparse
 import os
 
+import torch
+
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -61,6 +63,15 @@ def parse_args(extra_args_provider=None, defaults={},
     args.dynamic_loss_scale = False
     if args.loss_scale is None:
         args.dynamic_loss_scale = True
+
+    # Parameters dtype.
+    args.params_dtype = torch.float
+    if args.fp16:
+        args.params_dtype = torch.half
+    if args.rank == 0:
+        print('using {} for parameters ...'.format(args.params_dtype),
+              flush=True)
+
 
     # Set input defaults.
     for key in defaults:
