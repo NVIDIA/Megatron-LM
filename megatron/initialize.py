@@ -93,11 +93,6 @@ def _initialize_distributed():
                   'skipping initialization ...', flush=True)
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
-        if device_count > 0:
-            device = torch.cuda.current_device()
-            local_rank = args.rank % device_count
-            assert local_rank == device, \
-                'expected local-rank to be the same as rank % device-count.'
 
     else:
 
