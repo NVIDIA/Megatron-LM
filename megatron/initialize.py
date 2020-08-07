@@ -65,7 +65,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals    
         set_model_parallel_world_size(args.model_parallel_size)
-        # and refurn function for external DDP manager to call when it has DDP initialized
+        # and return function for external DDP manager to call when it has DDP initialized
         set_model_parallel_rank(args.rank)    
         return finish_mpu_init
     else:
