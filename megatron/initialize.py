@@ -36,7 +36,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     data processing. In general this arg should not be set unless you know 
     what you are doing.
     Returns a function to finalize distributed env initialization 
-    (optionally, only for args.distributed_backend == "external_ddp")
+    (optionally, only when args.lazy_mpu_init == True)
 
 """
     if not allow_no_cuda:
