@@ -35,7 +35,6 @@ from .initialize import model_parallel_is_initialized
 
 from .layers import LayerNorm
 from .layers import ColumnParallelLinear
-from .layers import ParallelEmbedding
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding
 
