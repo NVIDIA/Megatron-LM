@@ -15,20 +15,19 @@
 
 import torch
 
-from .initialize import get_model_parallel_group
+from .initialize import get_model_parallel_group, get_model_parallel_world_size, get_model_parallel_rank
 from .utils import split_tensor_along_last_dim
 
 
 def _reduce(input_):
     """All-reduce the the input tensor across model parallel group."""
-    group = get_model_parallel_group()
 
     # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group) == 1:
+    if get_model_parallel_world_size()==1:
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_, group=group)
+    torch.distributed.all_reduce(input_, group=get_model_parallel_group())
 
     return input_
 
@@ -36,18 +35,17 @@ def _reduce(input_):
 def _split(input_):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
-    group = get_model_parallel_group()
 
+    world_size = get_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group) == 1:
+    if world_size==1:
         return input_
 
     # Split along last dimension.
-    world_size = torch.distributed.get_world_size(group=group)
     input_list = split_tensor_along_last_dim(input_, world_size)
 
     # Note: torch.split does not create contiguous tensors by default.
-    rank = torch.distributed.get_rank(group=group)
+    rank = get_model_parallel_rank()
     output = input_list[rank].contiguous()
 
     return output
@@ -55,16 +53,15 @@ def _split(input_):
 
 def _gather(input_):
     """Gather tensors and concatinate along the last dimension."""
-    group = get_model_parallel_group()
 
+    world_size = get_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if torch.distributed.get_world_size(group=group) == 1:
+    if world_size==1:
         return input_
 
     # Size and dimension.
     last_dim = input_.dim() - 1
-    rank = torch.distributed.get_rank(group=group)
-    world_size = torch.distributed.get_world_size(group=group)
+    rank = get_model_parallel_rank()
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_

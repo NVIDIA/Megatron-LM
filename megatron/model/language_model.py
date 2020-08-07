@@ -24,7 +24,7 @@ from megatron.module import MegatronModule
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
-
+from megatron.model.utils import init_method_normal, scaled_init_method_normal
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
@@ -44,7 +44,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 
 
 def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
-                       init_method, scaled_init_method):
+                       init_method=None, scaled_init_method=None):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -55,6 +55,12 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     elif args.onnx_safe:
         gelu = erf_gelu
     
+    if init_method is None:
+        init_method = init_method_normal(args.init_method_std)
+
+    if scaled_init_method is None:
+        scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
+
     # Language model.
     language_model = TransformerLanguageModel(
         attention_mask_func=attention_mask_func,

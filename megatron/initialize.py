@@ -26,7 +26,7 @@ from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron.global_vars import set_global_variables
-
+from megatron.mpu import set_model_parallel_rank, set_model_parallel_world_size
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -34,38 +34,52 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only 
     data processing. In general this arg should not be set unless you know 
-    what you are doing."""
+    what you are doing.
+    Returns a function to finalize distributed env initialization 
+    (optionally, only when args.lazy_mpu_init == True)
+
+"""
     if not allow_no_cuda:
         # Make sure cuda is available.
         assert torch.cuda.is_available(), 'Megatron requires CUDA.'
 
-    # This is temporary WAR to make simple case like pytest calling with same args twice
-    # Need to implement clean factory init.
-    if mpu.model_parallel_is_initialized():
-        return
-    
-    
     # Parse args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(extra_args_provider=extra_args_provider,
                          args_defaults=args_defaults,
                          ignore_unknown_args=ignore_unknown_args)
 
-    # Pytorch distributed.
-    _initialize_distributed()
+    # torch.distributed initialization
+    def finish_mpu_init():
+        args = get_args()
+        # Pytorch distributed.
+        _initialize_distributed()
+        
+        # Random seeds for reproducibility.
+        if args.rank == 0:
+            print('> setting random seeds to {} ...'.format(args.seed))
+        _set_random_seed(args.seed)
 
-    # Autoresume.
-    _init_autoresume()
-
-    # Random seeds for reproducibility.
     args = get_args()
-    if args.rank == 0:
-        print('> setting random seeds to {} ...'.format(args.seed))
-    _set_random_seed(args.seed)
-
-    # Write arguments to tensorboard.
-    _write_args_to_tensorboard()
-
+    if  args.lazy_mpu_init:
+        # delayed initialization of DDP-related stuff
+        # We only set basic DDP globals    
+        set_model_parallel_world_size(args.model_parallel_size)
+        # and return function for external DDP manager to call when it has DDP initialized
+        set_model_parallel_rank(args.rank)    
+        return finish_mpu_init
+    else:
+        # Megatron's MPU is the master. Complete initialization right away.
+        finish_mpu_init()
+        
+        # Autoresume.
+        _init_autoresume()
+        
+        # Write arguments to tensorboard.
+        _write_args_to_tensorboard()
+        # No continuation function
+        return None
+        
 
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
@@ -79,11 +93,6 @@ def _initialize_distributed():
                   'skipping initialization ...', flush=True)
         args.rank = torch.distributed.get_rank()
         args.world_size = torch.distributed.get_world_size()
-        if device_count > 0:
-            device = torch.cuda.current_device()
-            local_rank = args.rank % device_count
-            assert local_rank == device, \
-                'expected local-rank to be the same as rank % device-count.'
 
     else:
 
