@@ -89,7 +89,7 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
-    """All-redcue the input from the model parallel region."""
+    """All-reduce the input from the model parallel region."""
 
     @staticmethod
     def forward(ctx, input_):
