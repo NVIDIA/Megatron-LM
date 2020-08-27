@@ -337,6 +337,8 @@ def _add_distributed_args(parser):
                        help='If set to True, initialize_megatron() skips DDP initialization'
                        ' and returns function to complete it instead'
                        'This is for external DDP manager.' )
+    group.add_argument('--use-cpu-initialization', action='store_true',
+                       help='If set, affine parallel weights initialization uses CPU' )
     return parser
 
 
