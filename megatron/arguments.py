@@ -335,7 +335,8 @@ def _add_distributed_args(parser):
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() skips DDP initialization'
-                       ' and returns function to complete it instead'
+                       ' and returns function to complete it instead.'
+                       'Also turns on --use-cpu-initialization flag.'
                        'This is for external DDP manager.' )
     group.add_argument('--use-cpu-initialization', action='store_true',
                        help='If set, affine parallel weights initialization uses CPU' )
