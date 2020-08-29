@@ -27,6 +27,7 @@ from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron import print_rank_0
+from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
@@ -123,8 +124,10 @@ def get_model(model_provider_func):
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
-        print(' > number of parameters on model parallel rank {}: {}'.format(
-            mpu.get_model_parallel_rank(),
+        print(' > number of parameters on (intra-layer, inter-layer) '
+              'model parallel rank ({}, {}): {}'.format(
+            mpu.get_intra_layer_model_parallel_rank(),
+            mpu.get_inter_layer_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
 
     # GPU allocation.
@@ -135,6 +138,9 @@ def get_model(model_provider_func):
         model = FP16_Module(model)
 
     # Wrap model for distributed training."""
+    if args.use_pipelining:
+        assert args.DDP_impl == 'local'
+
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
         model = torchDDP(model, device_ids=[i], output_device=i,
@@ -160,8 +166,8 @@ def get_optimizer(model):
     # Add model parallel attribute if it is not set.
     for param_group in param_groups:
         for param in param_group['params']:
-            if not hasattr(param, 'model_parallel'):
-                param.model_parallel = False
+            if not hasattr(param, 'intra_layer_model_parallel'):
+                param.intra_layer_model_parallel = False
 
     # Use Adam.
     optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
@@ -231,42 +237,58 @@ def setup_model_and_optimizer(model_provider_func):
     return model, optimizer, lr_scheduler
 
 
-def backward_step(optimizer, model, loss):
+def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward):
+    """Communicate tensors between stages using torch.distributed.ring_exchange(.) API."""
+    args = get_args()
+
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
+    tensor_recv_prev = None
+    tensor_recv_next = None
+    tensor_shape = (args.batch_size, args.seq_length, args.hidden_size)
+    if recv_forward:
+        tensor_recv_prev = torch.empty(tensor_shape,
+                                       requires_grad=True,
+                                       dtype=args.params_dtype).cuda()
+    if recv_backward:
+        tensor_recv_next = torch.empty(tensor_shape,
+                                       requires_grad=True,
+                                       dtype=args.params_dtype).cuda()
+
+    # Send tensors in both the forward and backward directions as appropriate.
+    torch.distributed.ring_exchange(tensor_send_prev=tensor_send_prev,
+                                    tensor_recv_prev=tensor_recv_prev,
+                                    tensor_send_next=tensor_send_next,
+                                    tensor_recv_next=tensor_recv_next,
+                                    group=mpu.get_inter_layer_model_parallel_group())
+
+    return tensor_recv_prev, tensor_recv_next
+
+
+def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_grad):
     """Backward step."""
     args = get_args()
     timers = get_timers()
 
+    # Retain the grad on the input_tensor.
+    if input_tensor is not None:
+        input_tensor.retain_grad()
+
     # Backward pass.
     timers('backward-backward').start()
     if args.fp16:
-        optimizer.zero_grad(set_grads_to_None=True)
-        optimizer.backward(loss, update_master_grads=False)
+        optimizer.backward(output_tensor, update_master_grads=False,
+                           output_tensor_grad=output_tensor_grad)
     else:
-        optimizer.zero_grad()
-        loss.backward()
+        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
     timers('backward-backward').stop()
 
-    # All-reduce if needed.
-    if args.DDP_impl == 'local':
-        timers('backward-allreduce').start()
-        model.allreduce_params(reduce_after=False,
-                               fp32_allreduce=args.fp32_allreduce)
-        timers('backward-allreduce').stop()
+    # Collect the grad of the input_tensor.
+    input_tensor_grad = None
+    if input_tensor is not None:
+        input_tensor_grad = input_tensor.grad
 
-    # Update master gradients.
-    timers('backward-master-grad').start()
-    if args.fp16:
-        optimizer.update_master_grads()
-    timers('backward-master-grad').stop()
-
-    # Clipping gradients helps prevent the exploding gradient.
-    timers('backward-clip-grad').start()
-    if args.clip_grad > 0:
-        if not args.fp16:
-            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-        else:
-            optimizer.clip_master_grads(args.clip_grad)
-    timers('backward-clip-grad').stop()
+    return input_tensor_grad
 
 
 def train_step(forward_step_func, data_iterator,
@@ -275,15 +297,117 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
-    # Forward model for one step.
-    timers('forward').start()
-    loss, loss_reduced = forward_step_func(data_iterator, model)
-    timers('forward').stop()
+    # Set grad to zero.
+    if args.fp16:
+        optimizer.zero_grad(set_grads_to_None=True)
+    else:
+        optimizer.zero_grad()
 
-    # Calculate gradients, reduce across processes, and clip.
-    timers('backward').start()
-    backward_step(optimizer, model, loss)
-    timers('backward').stop()
+    # Compute number of microbatches in a minibatch.
+    num_microbatches_to_pipeline = args.inter_layer_model_parallel_size \
+            if args.use_pipelining else 1
+
+    input_tensors = []
+    output_tensors = []
+    losses_reduced = []
+
+    # Run forward pass for all microbatches in minibatch.
+    for i in range(num_microbatches_to_pipeline):
+        if not mpu.is_inter_layer_first_stage():
+            input_tensor, _ = communicate(
+                tensor_send_next=None,
+                tensor_send_prev=None,
+                recv_forward=True,
+                recv_backward=False)
+        else:
+            input_tensor = None
+
+        # Forward model for one step.
+        timers('forward').start()
+        output_tensor = forward_step_func(data_iterator, model, input_tensor)
+        timers('forward').stop()
+
+        if mpu.is_inter_layer_last_stage():
+            loss, loss_reduced = output_tensor
+            output_tensor = loss
+            losses_reduced.append(loss_reduced)
+        else:
+            communicate(
+                tensor_send_next=output_tensor,
+                tensor_send_prev=None,
+                recv_forward=False,
+                recv_backward=False)
+
+        input_tensors.append(input_tensor)
+        output_tensors.append(output_tensor)
+
+    # Run backward pass for all microbatches in minibatch.
+    for i in range(num_microbatches_to_pipeline):
+        input_tensor = input_tensors.pop(0)
+        output_tensor = output_tensors.pop(0)
+
+        if mpu.is_inter_layer_last_stage():
+            output_grad_tensor = None
+        else:
+            _, output_grad_tensor = communicate(
+                tensor_send_next=None,
+                tensor_send_prev=None,
+                recv_forward=False,
+                recv_backward=True)
+
+        # Backward pass for one step.
+        # TODO: This timer is a bit redundant now with backward-backward.
+        timers('backward').start()
+        input_grad_tensor = \
+            backward_step(optimizer, model, input_tensor, output_tensor, output_grad_tensor)
+        timers('backward').stop()
+
+        if not mpu.is_inter_layer_first_stage():
+            communicate(
+                tensor_send_next=None,
+                tensor_send_prev=input_grad_tensor,
+                recv_forward=False,
+                recv_backward=False)
+
+    # All-reduce if needed.
+    if args.DDP_impl == 'local':
+        timers('allreduce').start()
+        model.allreduce_params(reduce_after=False,
+                               fp32_allreduce=args.fp32_allreduce)
+        timers('allreduce').stop()
+
+    # Update master gradients.
+    timers('backward-master-grad').start()
+    if args.fp16:
+        optimizer.update_master_grads()
+    timers('backward-master-grad').stop()
+
+    # All-reduce across first and last stages.
+    if (mpu.is_inter_layer_first_stage() or mpu.is_inter_layer_last_stage()) and \
+            args.inter_layer_model_parallel_size > 1:
+        unwrapped_model = model
+        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
+            unwrapped_model = unwrapped_model.module
+
+        word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+        torch.distributed.all_reduce(word_embeddings_weight.grad,
+                                     group=mpu.get_embedding_group())
+
+    # Clipping gradients helps prevent the exploding gradient.
+    timers('backward-clip-grad').start()
+    if args.clip_grad > 0.:
+        if not args.fp16:
+            named_parameters = model.named_parameters()
+            parameters = []
+            parameter_names = []
+            for parameter_name, parameter in model.named_parameters():
+                parameters.append(parameter)
+                parameter_names.append(parameter_name)
+            mpu.clip_grad_norm(parameters, args.clip_grad,
+                               parameter_names=parameter_names)
+        else:
+            optimizer.clip_master_grads(args.clip_grad)
+    timers('backward-clip-grad').stop()
 
     # Update parameters.
     timers('optimizer').start()
@@ -297,7 +421,15 @@ def train_step(forward_step_func, data_iterator,
     else:
         skipped_iter = 1
 
-    return loss_reduced, skipped_iter
+    if mpu.is_inter_layer_last_stage():
+        # Average loss across microbatches.
+        loss_reduced = {}
+        for key in losses_reduced[0]:
+            losses_reduced_for_key = [x[key] for x in losses_reduced]
+            loss_reduced[key] = sum(losses_reduced_for_key) / \
+                    len(losses_reduced_for_key)
+        return loss_reduced, skipped_iter
+    return {}, skipped_iter
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
@@ -382,7 +514,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[got_nan_key])
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[got_nan_key] = 0
-        print_rank_0(log_string)
+        print_rank_last(log_string)
         if report_memory_flag:
             report_memory('after {} iterations'.format(iteration))
             report_memory_flag = False
@@ -471,12 +603,32 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             if verbose and iteration % args.log_interval == 0:
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
+
+            if not mpu.is_inter_layer_first_stage():
+                input_tensor, _ = communicate(
+                    tensor_send_next=None,
+                    tensor_send_prev=None,
+                    recv_forward=True,
+                    recv_backward=False)
+            else:
+                input_tensor = None
+
             # Forward evaluation.
-            _, loss_dict = forward_step_func(data_iterator, model)
-            # Reduce across processes.
-            for key in loss_dict:
-                total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
-                    loss_dict[key]
+            output_tensor = forward_step_func(data_iterator, model, input_tensor)
+
+            if mpu.is_inter_layer_last_stage():
+                _, loss_dict = output_tensor
+                # Reduce across processes.
+                for key in loss_dict:
+                    total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
+                        loss_dict[key]
+            else:
+                communicate(
+                    tensor_send_next=output_tensor,
+                    tensor_send_prev=None,
+                    recv_forward=False,
+                    recv_backward=False)
+
     # Move model back to the train mode.
     model.train()
 
@@ -505,9 +657,9 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} ppl'.format(key), ppl, iteration)
 
     length = len(string) + 1
-    print_rank_0('-' * length)
-    print_rank_0(string)
-    print_rank_0('-' * length)
+    print_rank_last('-' * length)
+    print_rank_last(string)
+    print_rank_last('-' * length)
 
 
 def build_train_valid_test_data_iterators(
@@ -519,7 +671,7 @@ def build_train_valid_test_data_iterators(
 
     print_rank_0('> building train, validation, and test datasets ...')
     # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_model_parallel_rank() == 0:
+    if mpu.get_intra_layer_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
         data_parallel_size = mpu.get_data_parallel_world_size()
         global_batch_size = args.batch_size * data_parallel_size
@@ -557,8 +709,8 @@ def build_train_valid_test_data_iterators(
 
     # Broadcast num tokens.
     torch.distributed.broadcast(flags,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+                                mpu.get_intra_layer_model_parallel_src_rank(),
+                                group=mpu.get_intra_layer_model_parallel_group())
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()

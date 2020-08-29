@@ -54,10 +54,14 @@ def parse_args(extra_args_provider=None, defaults={},
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
+    args.intra_layer_model_parallel_size = min(
+        args.intra_layer_model_parallel_size, args.world_size)
+    args.inter_layer_model_parallel_size = min(
+        args.inter_layer_model_parallel_size,
+        (args.world_size // args.intra_layer_model_parallel_size))
     if args.rank == 0:
-        print('using world size: {} and model-parallel size: {} '.format(
-            args.world_size, args.model_parallel_size))
+        print('using world size: {} and intra-layer-model-parallel size: {} '.format(
+            args.world_size, args.intra_layer_model_parallel_size))
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -192,7 +196,7 @@ def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
     group.add_argument('--attention-dropout', type=float, default=0.1,
-                       help='Post attention dropout ptobability.')
+                       help='Post attention dropout probability.')
     group.add_argument('--hidden-dropout', type=float, default=0.1,
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
@@ -358,10 +362,14 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='mixed precision')
+    group = parser.add_argument_group(title='distributed')
 
-    group.add_argument('--model-parallel-size', type=int, default=1,
-                       help='Size of the model parallel.')
+    group.add_argument('--intra-layer-model-parallel-size', type=int, default=1,
+                       help='Degree of intra-layer model parallelism.')
+    group.add_argument('--inter-layer-model-parallel-size', type=int, default=1,
+                       help='Degree of inter-layer model parallelism.')
+    group.add_argument('--use-pipelining', action='store_true',
+                       help='Use pipelining to increase throughput of inter-layer model parallelism')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

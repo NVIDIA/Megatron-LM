@@ -68,9 +68,13 @@ class LossScaler:
                              self.loss_scale)
         return grad_in
 
-    def backward(self, loss, retain_graph=False):
-        scaled_loss = loss * self.loss_scale
-        scaled_loss.backward(retain_graph=retain_graph)
+    def backward(self, output_tensor, retain_graph=False, output_tensor_grad=None):
+        if output_tensor_grad is None:
+            scaled_output_tensor = output_tensor * self.loss_scale
+        else:
+            scaled_output_tensor = output_tensor
+        torch.autograd.backward(scaled_output_tensor, grad_tensors=output_tensor_grad,
+                                retain_graph=retain_graph)
 
 
 class DynamicLossScaler:
@@ -196,9 +200,13 @@ class DynamicLossScaler:
                              self.loss_scale)
         return grad_in
 
-    def backward(self, loss, retain_graph=False):
-        scaled_loss = loss * self.loss_scale
-        scaled_loss.backward(retain_graph=retain_graph)
+    def backward(self, output_tensor, retain_graph=False, output_tensor_grad=None):
+        if output_tensor_grad is None:
+            scaled_output_tensor = output_tensor * self.loss_scale
+        else:
+            scaled_output_tensor = output_tensor
+        torch.autograd.backward(scaled_output_tensor, grad_tensors=output_tensor_grad,
+                                retain_graph=retain_graph)
 
 
 ##############################################################

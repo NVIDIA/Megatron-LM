@@ -28,14 +28,16 @@ from megatron.data.samplers import DistributedBatchSampler
 from megatron.fp16 import FP16_Optimizer
 
 
-def reduce_losses(losses):
+def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
-    reduced_losses = torch.cat(
+    averaged_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(reduced_losses)
-    reduced_losses = reduced_losses / torch.distributed.get_world_size()
+    torch.distributed.all_reduce(averaged_losses,
+                                 group=mpu.get_data_parallel_group())
+    averaged_losses = averaged_losses / \
+        torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
-    return reduced_losses
+    return averaged_losses
 
 
 def report_memory(name):
@@ -56,7 +58,7 @@ def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
     index = 0
     rank = torch.distributed.get_rank()
-    string = 'iteration, rank, index, model-parallel,min, max, norm\n'
+    string = 'iteration, rank, index, intra-layer-model-parallel, min, max, norm\n'
     optimizer_ = optimizer
     if isinstance(optimizer, FP16_Optimizer):
         optimizer_ = optimizer.optimizer
@@ -67,7 +69,7 @@ def print_params_min_max_norm(optimizer, iteration):
             max_ = param.data.max()
             norm = param.data.norm()
             string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
-                iteration, rank, index, int(param.model_parallel))
+                iteration, rank, index, int(param.intra_layer_model_parallel))
             string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
     print(string, flush=True)
 

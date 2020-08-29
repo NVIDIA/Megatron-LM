@@ -28,7 +28,7 @@ from megatron.training import setup_model_and_optimizer
 from megatron.training import train_step
 from megatron.training import training_log
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import reduce_losses
+from megatron.utils import average_losses_across_data_parallel_group
 
 
 def process_batch(batch):
@@ -66,9 +66,9 @@ def _cross_entropy_forward_step(batch, model):
     loss = loss_func(logits.contiguous().float(), labels)
 
     # Reduce loss for logging.
-    reduced_loss = reduce_losses([loss])
+    averaged_loss = average_losses_across_data_parallel_group([loss])
 
-    return loss, {'lm loss': reduced_loss[0]}
+    return loss, {'lm loss': averaged_loss[0]}
 
 
 def build_data_loader(dataset, batch_size, num_workers, drop_last):

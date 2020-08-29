@@ -19,7 +19,7 @@ def general_ict_model_provider(only_query_model=False, only_block_model=False):
     assert args.ict_head_size is not None, \
         "Need to specify --ict-head-size to provide an ICTBertModel"
 
-    assert args.model_parallel_size == 1, \
+    assert args.intra_layer_model_parallel_size == 1, \
         "Model parallel size > 1 not supported for ICT"
 
     print_rank_0('building ICTBertModel...')
@@ -172,8 +172,7 @@ class IREncoderBertModel(MegatronModule):
         position_ids = bert_position_ids(input_ids)
 
         lm_output, pooled_output = self.language_model(
-            input_ids,
-            position_ids,
+            input_ids, position_ids,
             extended_attention_mask,
             tokentype_ids=tokentype_ids)
 

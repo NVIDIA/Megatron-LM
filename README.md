@@ -1,4 +1,4 @@
-[Megatron](https://arxiv.org/pdf/1909.08053.pdf) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel, and multinode training of [GPT-2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
+[Megatron](https://arxiv.org/pdf/1909.08053.pdf) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, intra-layer-model-parallel, and multinode training of [GPT-2](https://d4mucfpksywv.cloudfront.net/better-language-models/language_models_are_unsupervised_multitask_learners.pdf) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
 
 Using our GPT-2 model we achieve a perplexity of 10.8 on the WikiText-103 dataset (improving SOTA from 15.8) and an accuracy of 66.5% on the LAMBADA datasets. For BERT training, we swapped the position of the layer normalization and the residual connection in the model architecture (similar to GPT-2 architucture), which allowed the models to continue to improve as they were scaled up. Our BERT models with 3.9 billion parameters reaches a loss of 1.16, SQuAD 2.0 F1-score of 91.7, and RACE accuracy of 90.9%.
 
@@ -218,7 +218,7 @@ These scripts use the PyTorch distributed launcher for distributed training. As 
 
 The two tiers of parallelism are data and model parallelism. First, we facilitate two distributed data parallel implementations: a simple one of our own that performs gradient all-reduce at the end of back propagation step, and Torch's distributed data parallel wrapper that overlaps gradient reduction with back propagation computation. To switch between these two options use `--DDP-impl local` or `--DDP-impl torch`, respectively. As expected, Torch distributed data parallelism is more efficient at larger model parallel sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 76% when Torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
 
-Second, we developed a simple and efficient intra-layer model parallel approach. To use model parallelism, add the `--model-parallel-size` flag to specify the number of GPUs among which to split the model, along with the arguments passed to the distributed launcher as mentioned above. With `WORLD_SIZE` GPUs and `MP_SIZE` model parallel size, `WORLD_SIZE`/`MP_SIZE` GPUs will be used for data parallelism. The default value for `--model-parallel-size` is 1, which will not implement model parallelism.
+Second, we developed a simple and efficient intra-layer model parallel approach. To use model parallelism, add the `--intra-layer-model-parallel-size` flag to specify the number of GPUs among which to split the model, along with the arguments passed to the distributed launcher as mentioned above. With `WORLD_SIZE` GPUs and `MP_SIZE` model parallel size, `WORLD_SIZE`/`MP_SIZE` GPUs will be used for data parallelism. The default value for `--intra-layer-model-parallel-size` is 1, which will not implement model parallelism.
 
 Other than these minor changes, the distributed training is identical to the training on a single GPU.
 
@@ -245,7 +245,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_bert.py \
                 --save $CHECKPOINT_PATH \
                 --load $CHECKPOINT_PATH \
                 --data-path $DATA_PATH \
-                --model-parallel-size $MP_SIZE \
+                --intra-layer-model-parallel-size $MP_SIZE \
                 --DDP-impl torch
 </pre>
 
@@ -269,7 +269,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_gpt2.py \
                 --save $CHECKPOINT_PATH \
                 --load $CHECKPOINT_PATH \
                 --data-path $DATA_PATH \
-                --model-parallel-size $MP_SIZE \
+                --intra-layer-model-parallel-size $MP_SIZE \
                 --DDP-impl torch
 
 </pre>
@@ -362,14 +362,14 @@ We provide several command line arguments, detailed in the scripts listed below,
 Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this.
 
 <pre>
-MODEL_PARALLEL_SIZE=2
+INTRA_LAYER_MODEL_PARALLEL_SIZE=2
 
 VOCAB_FILE=bert-vocab.txt
 CHECKPOINT_PATH=checkpoints/bert_345m
 
-WORLD_SIZE=$MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
+WORLD_SIZE=$INTRA_LAYER_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
         --model-type BERT \
-        --model-parallel-size $MODEL_PARALLEL_SIZE \
+        --intra-layer-model-parallel-size $INTRA_LAYER_MODEL_PARALLEL_SIZE \
         --tokenizer-type BertWordPieceLowerCase \
         --vocab-file $VOCAB_FILE \
         --num-layers 24 \

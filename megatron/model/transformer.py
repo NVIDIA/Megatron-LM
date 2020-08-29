@@ -130,7 +130,7 @@ class ParallelSelfAttention(MegatronModule):
         self.layer_number = max(1, layer_number)
 
         # Per attention head and per partition values.
-        world_size = mpu.get_model_parallel_world_size()
+        world_size = mpu.get_intra_layer_model_parallel_world_size()
         self.hidden_size_per_partition = mpu.divide(args.hidden_size,
                                                     world_size)
         self.hidden_size_per_attention_head = mpu.divide(
@@ -504,13 +504,15 @@ class ParallelTransformer(MegatronModule):
         self.checkpoint_activations = args.checkpoint_activations
         self.checkpoint_num_layers = args.checkpoint_num_layers
 
-        # Number of layers:
-        self.num_layers = args.num_layers
-        self.num_unique_layers = args.num_unique_layers
-        if self.num_unique_layers is None:
+        # Number of layers.
+        self.num_layers = args.num_layers // args.inter_layer_model_parallel_size
+        # TODO: Need to do something different in case self.num_layers != self.num_unique_layers?
+        if args.num_unique_layers is None:
             self.num_unique_layers = self.num_layers
-        assert self.num_layers % self.num_unique_layers == 0, \
-            'number of layers should be divisible by number of unique layers'
+        else:
+            self.num_unique_layers = args.num_unique_layers // args.inter_layer_model_parallel_size
+        assert self.num_layers == self.num_unique_layers, \
+            'number of layers should be equal to the number of unique layers'
         self.param_sharing_style = args.param_sharing_style
 
         # Transformer layers.
@@ -518,8 +520,9 @@ class ParallelTransformer(MegatronModule):
             return ParallelTransformerLayer(
                 attention_mask_func, init_method,
                 output_layer_init_method, layer_number)
+        offset = mpu.get_inter_layer_model_parallel_rank() * self.num_layers
         self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1) for i in range(self.num_unique_layers)])
+            [build_layer(i + 1 + offset) for i in range(self.num_unique_layers)])
 
         # Print layer ordering.
         if self.num_layers != self.num_unique_layers:
@@ -530,10 +533,11 @@ class ParallelTransformer(MegatronModule):
                           '{:3d}'.format(i, self._get_layer_index(i)),
                           flush=True)
 
-        # Final layer norm before output.
-        self.final_layernorm = LayerNorm(
-            args.hidden_size,
-            eps=args.layernorm_epsilon)
+        if mpu.is_inter_layer_last_stage():
+            # Final layer norm before output.
+            self.final_layernorm = LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon)
 
     def _get_layer_index(self, layer_number):
         if self.param_sharing_style == 'grouped':
@@ -606,7 +610,10 @@ class ParallelTransformer(MegatronModule):
         hidden_states = hidden_states.transpose(0, 1).contiguous()
 
         # Final layer norm.
-        output = self.final_layernorm(hidden_states)
+        if mpu.is_inter_layer_last_stage():
+            output = self.final_layernorm(hidden_states)
+        else:
+            output = hidden_states
         if get_key_value:
             output = [output, presents]
 

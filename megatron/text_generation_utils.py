@@ -88,7 +88,7 @@ def generate_samples_input_from_file(model):
     # Read the sample file and open the output file.
     assert args.sample_input_file is not None, \
         'sample input file is not provided.'
-    if mpu.get_model_parallel_rank() == 0:
+    if mpu.get_intra_layer_model_parallel_rank() == 0:
         fname = open(args.sample_input_file, "r")
         all_raw_text = fname.readlines()
         input_count = len(all_raw_text)
@@ -105,10 +105,10 @@ def generate_samples_input_from_file(model):
     model.eval()
     with torch.no_grad():
         while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
+            torch.distributed.barrier(group=mpu.get_intra_layer_model_parallel_group())
             terminate_runs = 0
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.get_intra_layer_model_parallel_rank() == 0:
                 raw_text = all_raw_text[input_pos]
                 input_pos += 1
                 if input_pos == input_count:
@@ -131,8 +131,8 @@ def generate_samples_input_from_file(model):
 
             terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
             torch.distributed.broadcast(terminate_runs_tensor,
-                                        mpu.get_model_parallel_src_rank(),
-                                        group=mpu.get_model_parallel_group())
+                                        mpu.get_intra_layer_model_parallel_src_rank(),
+                                        group=mpu.get_intra_layer_model_parallel_group())
             terminate_runs = terminate_runs_tensor[0].item()
 
             if terminate_runs == 1:
@@ -143,7 +143,7 @@ def generate_samples_input_from_file(model):
                 decode_tokens, _ = decode_tokens
                 decode_tokens = decode_tokens[0].cpu().numpy().tolist()
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.get_intra_layer_model_parallel_rank() == 0:
                 os.system('clear')
                 print("\nContext:", raw_text, flush=True)
                 trim_decode_tokens = tokenizer.detokenize(
@@ -158,7 +158,7 @@ def generate_samples_input_from_file(model):
 
             raw_text = None
 
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
+            torch.distributed.barrier(group=mpu.get_intra_layer_model_parallel_group())
             context_count += 1
 
 
@@ -171,10 +171,10 @@ def generate_samples_interactive(model, print_frequency=24):
     model.eval()
     with torch.no_grad():
         while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
+            torch.distributed.barrier(group=mpu.get_intra_layer_model_parallel_group())
             terminate_runs = 0
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.get_intra_layer_model_parallel_rank() == 0:
                 os.system('clear')
                 raw_text = input("\nContext prompt (stop to exit) >>> ")
                 while not raw_text:
@@ -198,8 +198,8 @@ def generate_samples_interactive(model, print_frequency=24):
 
             terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
             torch.distributed.broadcast(terminate_runs_tensor,
-                                        mpu.get_model_parallel_src_rank(),
-                                        group=mpu.get_model_parallel_group())
+                                        mpu.get_intra_layer_model_parallel_src_rank(),
+                                        group=mpu.get_intra_layer_model_parallel_group())
             terminate_runs = terminate_runs_tensor[0].item()
 
             if terminate_runs == 1:
@@ -210,7 +210,7 @@ def generate_samples_interactive(model, print_frequency=24):
                 decode_tokens, _ = decode_tokens
                 decode_tokens = decode_tokens[0].cpu().numpy().tolist()
 
-                if mpu.get_model_parallel_rank() == 0 and \
+                if mpu.get_intra_layer_model_parallel_rank() == 0 and \
                    counter % print_frequency == 0:
                     os.system('clear')
                     print("\nContext:", raw_text, flush=True)
@@ -218,7 +218,7 @@ def generate_samples_interactive(model, print_frequency=24):
                         decode_tokens)[len(raw_text):]
                     print("\nMegatron-LM:", trim_decode_tokens, flush=True)
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.get_intra_layer_model_parallel_rank() == 0:
                 os.system('clear')
                 print("\nContext:", raw_text, flush=True)
                 trim_decode_tokens = tokenizer.detokenize(
@@ -226,10 +226,10 @@ def generate_samples_interactive(model, print_frequency=24):
                 print("\nMegatron-LM:", trim_decode_tokens, flush=True)
 
             raw_text = None
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
+            torch.distributed.barrier(group=mpu.get_intra_layer_model_parallel_group())
             context_count += 1
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.get_intra_layer_model_parallel_rank() == 0:
                 input("\nPress any key to continue >>>")
 
 
@@ -299,11 +299,11 @@ def get_token_stream(model, context_tokens):
     context_length_tensor = torch.cuda.LongTensor(context_lengths)
 
     torch.distributed.broadcast(context_length_tensor,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+                                mpu.get_intra_layer_model_parallel_src_rank(),
+                                group=mpu.get_intra_layer_model_parallel_group())
     torch.distributed.broadcast(context_tokens_tensor,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+                                mpu.get_intra_layer_model_parallel_src_rank(),
+                                group=mpu.get_intra_layer_model_parallel_group())
 
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)

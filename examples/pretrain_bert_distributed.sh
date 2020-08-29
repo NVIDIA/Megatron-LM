@@ -15,7 +15,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_bert.py \
-       --model-parallel-size 1 \
+       --intra-layer-model-parallel-size 1 \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \

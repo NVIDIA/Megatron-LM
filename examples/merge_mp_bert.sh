@@ -1,13 +1,13 @@
 #!/bin/bash
 
-MODEL_PARALLEL_SIZE=2
+INTRA_LAYER_MODEL_PARALLEL_SIZE=2
 
 VOCAB_FILE=bert-vocab.txt
 CHECKPOINT_PATH=checkpoints/bert_345m
 
-WORLD_SIZE=$MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
+WORLD_SIZE=$INTRA_LAYER_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
                                 --model-type BERT \
-                                --model-parallel-size $MODEL_PARALLEL_SIZE \
+                                --intra-layer-model-parallel-size $INTRA_LAYER_MODEL_PARALLEL_SIZE \
                                 --tokenizer-type BertWordPieceLowerCase \
                                 --vocab-file $VOCAB_FILE \
                                 --num-layers 24 \
