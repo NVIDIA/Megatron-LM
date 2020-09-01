@@ -62,6 +62,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     args = get_args()
     if  args.lazy_mpu_init:
+        args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals    
         set_model_parallel_world_size(args.model_parallel_size)

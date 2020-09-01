@@ -169,7 +169,7 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
-    group.add_argument('--onnx-safe', action='store_true',
+    group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with Torch ONNX exporter')
 
     return parser
@@ -335,8 +335,11 @@ def _add_distributed_args(parser):
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() skips DDP initialization'
-                       ' and returns function to complete it instead'
+                       ' and returns function to complete it instead.'
+                       'Also turns on --use-cpu-initialization flag.'
                        'This is for external DDP manager.' )
+    group.add_argument('--use-cpu-initialization', action='store_true',
+                       help='If set, affine parallel weights initialization uses CPU' )
     return parser
 
 
