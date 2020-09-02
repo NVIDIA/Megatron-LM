@@ -112,6 +112,11 @@ def parse_args(extra_args_provider=None, defaults={},
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
+    # Activation checkpointing.
+    if args.distribute_checkpointed_activations:
+        assert args.checkpoint_activations, \
+            'for distribute-checkpointed-activations to work you '\
+            'need to enable checkpoint-activations'
 
     _print_args(args)
     return args

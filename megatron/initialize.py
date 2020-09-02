@@ -162,13 +162,4 @@ def _initialize_mem_buffs():
 
     # Initialize memory for checkpointed activations.
     if args.distribute_checkpointed_activations:
-        per_layer = args.batch_size * args.max_position_embeddings * \
-                    args.hidden_size // args.model_parallel_size
-        assert args.num_layers % args.checkpoint_num_layers == 0, \
-            'number of layers is not divisible by checkpoint-num-layers'
-        num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
-        numel = per_layer * num_checkpointer_layers
-        dtype = torch.half
-        if not args.fp16:
-            dtype = torch.float
-        mpu.init_checkpointed_activations_memory_buffer(numel, dtype)
+        mpu.init_checkpointed_activations_memory_buffer()
