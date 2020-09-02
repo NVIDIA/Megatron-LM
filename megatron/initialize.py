@@ -72,6 +72,9 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     else:
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
+
+        # Initialize memory buffers.
+        _initialize_mem_buffs()
         
         # Autoresume.
         _init_autoresume()
@@ -151,3 +154,21 @@ def _write_args_to_tensorboard():
     if writer:
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)))
+
+
+def _initialize_mem_buffs():
+    """Initialize manually allocated static memory."""
+    args = get_args()
+
+    # Initialize memory for checkpointed activations.
+    if args.distribute_checkpointed_activations:
+        per_layer = args.batch_size * args.max_position_embeddings * \
+                    args.hidden_size // args.model_parallel_size
+        assert args.num_layers % args.checkpoint_num_layers == 0, \
+            'number of layers is not divisible by checkpoint-num-layers'
+        num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
+        numel = per_layer * num_checkpointer_layers
+        dtype = torch.half
+        if not args.fp16:
+            dtype = torch.float
+        mpu.init_checkpointed_activations_memory_buffer(numel, dtype)

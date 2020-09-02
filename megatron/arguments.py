@@ -200,6 +200,10 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
+    group.add_argument('--distribute-checkpointed-activations',
+                       action='store_true',
+                       help='If set, distribute checkpointed activations '
+                       'across model parallel group.')
     group.add_argument('--checkpoint-num-layers', type=int, default=1,
                        help='chunk size (number of layers) for checkpointing.')
     group.add_argument('--train-iters', type=int, default=None,
