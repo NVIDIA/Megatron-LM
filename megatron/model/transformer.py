@@ -411,6 +411,8 @@ class ParallelTransformer(MegatronModule):
                 return x_
             return custom_forward
 
+        # Make sure memory is freed.
+        mpu.reset_checkpointed_activations_memory_buffer()
         l = 0
         while l < self.num_layers:
             hidden_states = mpu.checkpoint(

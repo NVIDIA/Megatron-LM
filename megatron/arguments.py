@@ -112,6 +112,11 @@ def parse_args(extra_args_provider=None, defaults={},
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
+    # Activation checkpointing.
+    if args.distribute_checkpointed_activations:
+        assert args.checkpoint_activations, \
+            'for distribute-checkpointed-activations to work you '\
+            'need to enable checkpoint-activations'
 
     _print_args(args)
     return args
@@ -200,6 +205,10 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
+    group.add_argument('--distribute-checkpointed-activations',
+                       action='store_true',
+                       help='If set, distribute checkpointed activations '
+                       'across model parallel group.')
     group.add_argument('--checkpoint-num-layers', type=int, default=1,
                        help='chunk size (number of layers) for checkpointing.')
     group.add_argument('--train-iters', type=int, default=None,
