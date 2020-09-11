@@ -22,7 +22,6 @@ from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
 from megatron.model.transformer import ParallelTransformer
-from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
 
@@ -48,13 +47,6 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     """Build language model and return along with the key to save."""
     args = get_args()
 
-    # Use torch gelu unless otherwise forced.
-    gelu = F.gelu
-    if args.openai_gelu:
-        gelu = openai_gelu
-    elif args.onnx_safe:
-        gelu = erf_gelu
-    
     if init_method is None:
         init_method = init_method_normal(args.init_method_std)
 
@@ -64,7 +56,6 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     # Language model.
     language_model = TransformerLanguageModel(
         attention_mask_func=attention_mask_func,
-        mlp_activation_func=gelu,
         init_method=init_method,
         output_layer_init_method=scaled_init_method,
         num_tokentypes=num_tokentypes,
@@ -271,7 +262,6 @@ class TransformerLanguageModel(MegatronModule):
 
     def __init__(self,
                  attention_mask_func,
-                 mlp_activation_func,
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
@@ -295,8 +285,8 @@ class TransformerLanguageModel(MegatronModule):
 
         # Transformer
         self.transformer = ParallelTransformer(
-            attention_mask_func, mlp_activation_func,
-            self.init_method, output_layer_init_method)
+            attention_mask_func, self.init_method, 
+            output_layer_init_method)
         self._transformer_key = 'transformer'
 
         # Pooler

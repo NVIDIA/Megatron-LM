@@ -28,7 +28,6 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import reduce_losses
 
-
 def model_provider():
     """Build the model."""
 
@@ -80,10 +79,8 @@ def forward_step(data_iterator, model):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch generator').stop()
-
     # Forward model.
     losses = model(tokens, position_ids, attention_mask, labels=labels)
-    
     loss_mask = loss_mask.view(-1)
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
