@@ -1,0 +1,40 @@
+\documentclass[multi,convert]{standalone}
+\usepackage{multirow}
+\standaloneenv{tabular}
+
+\begin{document}
+
+\begin{tabular}{cccccc}
+  Case & Hidden Size & Attention Heads & Layers & Parameters (billions) & Model Parallel Partitions \\
+  \hline
+  1B & 1920 & 15 & 24 & 1.16 & 1 \\
+  2B & 2304 & 18 & 30 & 2.03 & 2 \\
+  4B & 3072 & 24 & 36 & 4.24 & 4 \\
+  8B & 4096 & 32 & 42 & 8.67 & 8 \\
+\end{tabular}
+
+\begin{tabular}{cc|ccc|ccc}
+  & & \multicolumn{3}{c|}{\textbf{DGX-2 (V100) batch size 8}} & \multicolumn{3}{c}{\textbf{DGX-A100 batch size 16}} \\
+  \hline
+  \multirow{2}{*}{Case} & Number of & Iteration & \multirow{2}{*}{Scaling} & TeraFLOPs & Iteration & \multirow{2}{*}{Scaling} & TeraFLOPs \\
+                        & GPUs      & Time (ms) &                          & per GPU   & Time (ms) &                          & per GPU \\
+  \hline
+  1B & 1 & 1121 & 100.0\% & 71.9 & 1076 & 100\%  & 149.8 \\
+  2B & 2 & 1093 & 89.6\%  & 64.2 & 1026 & 91.7\% & 136.8 \\
+  4B & 4 & 1238 & 82.5\%  & 58.5 & 1162 & 84.5\% & 124.7 \\
+  8B & 8 & 1407 & 74.3\%  & 52.2 & 1343 & 74.7\% & 109.3 \\
+\end{tabular}
+
+\begin{tabular}{cc|ccc}
+  & & \multicolumn{3}{c}{\textbf{DGX-A100 batch size 2048}} \\
+  \hline
+  \multirow{2}{*}{Case} & Number of & Iteration & \multirow{2}{*}{Scaling} & TeraFLOPs \\
+                        & GPUs      & Time (ms) &                          & per GPU   \\
+  \hline
+  1B & 128  & 1153 & 93.3\% & 139.8 \\
+  2B & 256  & 1101 & 85.5\% & 127.5 \\
+  4B & 512  & 1242 & 79.0\% & 116.7 \\
+  8B & 1024 & 1380 & 72.7\% & 106.5 \\
+\end{tabular}
+
+\end{document}
