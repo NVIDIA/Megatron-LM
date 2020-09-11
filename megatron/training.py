@@ -236,29 +236,35 @@ def backward_step(optimizer, model, loss):
     timers = get_timers()
 
     # Backward pass.
+    timers('backward-backward').start()
     optimizer.zero_grad(set_grads_to_None=True)
     if args.fp16:
         optimizer.backward(loss, update_master_grads=False)
     else:
         loss.backward()
+    timers('backward-backward').stop()
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':
-        timers('allreduce').start()
+        timers('backward-allreduce').start()
         model.allreduce_params(reduce_after=False,
                                fp32_allreduce=args.fp32_allreduce)
-        timers('allreduce').stop()
+        timers('backward-allreduce').stop()
 
     # Update master gradients.
+    timers('backward-master-grad').start()
     if args.fp16:
         optimizer.update_master_grads()
+    timers('backward-master-grad').stop()
 
     # Clipping gradients helps prevent the exploding gradient.
+    timers('backward-clip-grad').start()
     if args.clip_grad > 0:
         if not args.fp16:
             mpu.clip_grad_norm(model.parameters(), args.clip_grad)
         else:
             optimizer.clip_master_grads(args.clip_grad)
+    timers('backward-clip-grad').stop()
 
 
 def train_step(forward_step_func, data_iterator,
@@ -311,7 +317,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             timers_to_log.append(name)
     add_to_logging('forward')
     add_to_logging('backward')
-    add_to_logging('allreduce')
+    add_to_logging('backward-backward')
+    add_to_logging('backward-allreduce')
+    add_to_logging('backward-master-grad')
+    add_to_logging('backward-clip-grad')
     add_to_logging('optimizer')
     add_to_logging('batch generator')
 

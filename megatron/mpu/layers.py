@@ -54,7 +54,7 @@ def _initialize_affine_weight_gpu(weight, init_method,
     weight.model_parallel = True
     weight.partition_dim = partition_dim
     weight.partition_stride = stride
-
+    
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 
@@ -186,11 +186,15 @@ class ColumnParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: This was added for testing and should be
                                      set to False. It returns the master weights
                                      used for initialization.
+        skip_bias_add: This was added to enable performance optimations where bias
+                       can be fused with other elementwise operations. we skip 
+                       adding bias but instead return it.
     """
 
     def __init__(self, input_size, output_size, bias=True, gather_output=True,
                  init_method=init.xavier_normal_, stride=1,
-                 keep_master_weight_for_test=False):
+                 keep_master_weight_for_test=False,
+                 skip_bias_add=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -200,6 +204,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
+        self.skip_bias_add = skip_bias_add
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -245,13 +250,16 @@ class ColumnParallelLinear(torch.nn.Module):
         # Set up backprop all-reduce.
         input_parallel = copy_to_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight, self.bias)
+
+        bias = self.bias if not self.skip_bias_add else None
+        output_parallel = F.linear(input_parallel, self.weight, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_model_parallel_region(output_parallel)
         else:
-            output = output_parallel
-        return output
+            output = output_parallel 
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
 
 
 class RowParallelLinear(torch.nn.Module):
@@ -279,12 +287,16 @@ class RowParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: This was added for testing and should be
                                      set to False. It returns the master weights
                                      used for initialization.
+        skip_bias_add: This was added to enable performance optimations where bias
+                       can be fused with other elementwise operations. we skip 
+                       adding bias but instead return it.
     """
 
     def __init__(self, input_size, output_size, bias=True,
                  input_is_parallel=False,
                  init_method=init.xavier_normal_, stride=1,
-                 keep_master_weight_for_test=False):
+                 keep_master_weight_for_test=False,
+                 skip_bias_add=False):
         super(RowParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -294,6 +306,7 @@ class RowParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
+        self.skip_bias_add = skip_bias_add
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -340,8 +353,11 @@ class RowParallelLinear(torch.nn.Module):
         output_parallel = F.linear(input_parallel, self.weight)
         # All-reduce across all the partitions.
         output_ = reduce_from_model_parallel_region(output_parallel)
-        if self.bias is not None:
-            output = output_ + self.bias
+        if not self.skip_bias_add:
+            output = output_ + self.bias if self.bias is not None else output_
+            output_bias = None
         else:
             output = output_
-        return output
+            output_bias = self.bias
+        return output, output_bias
+
