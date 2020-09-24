@@ -122,6 +122,10 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.scaled_upper_triang_masked_softmax_fusion:
         fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
 
+    # load scaled_masked_softmax_fusion kernel
+    if args.scaled_masked_softmax_fusion:
+        fused_kernels.load_scaled_masked_softmax_fusion_kernel()
+
     _print_args(args)
     return args
 
@@ -228,7 +232,11 @@ def _add_training_args(parser):
     group.add_argument('--scaled-upper-triang-masked-softmax-fusion',
                        action='store_true',
                        help='Enable fusion of query_key_value_scaling '
-                       'time (upper diagonal) masking, softmax.')
+                       'time (upper diagonal) masking and softmax.')
+    group.add_argument('--scaled-masked-softmax-fusion',
+                       action='store_true',
+                       help='Enable fusion of query_key_value_scaling '
+                       'general masking and softmax.')
     group.add_argument('--bias-gelu-fusion', action='store_true',
                         help='Enable bias and gelu fusion.')
     group.add_argument('--bias-dropout-fusion', action='store_true',
