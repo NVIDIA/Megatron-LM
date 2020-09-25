@@ -17,18 +17,19 @@ import pathlib
 import subprocess
 from torch.utils import cpp_extension
 
+def get_cuda_bare_metal_version(cuda_dir):
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], 
+                                         universal_newlines=True)
+    output = raw_output.split()
+    release_idx = output.index("release") + 1
+    release = output[release_idx].split(".")
+    bare_metal_major = release[0]
+    bare_metal_minor = release[1][0]
+
+    return raw_output, bare_metal_major, bare_metal_minor
+
+
 def load_scaled_upper_triang_masked_softmax_fusion_kernel():
-
-    def get_cuda_bare_metal_version(cuda_dir):
-        raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], 
-                                             universal_newlines=True)
-        output = raw_output.split()
-        release_idx = output.index("release") + 1
-        release = output[release_idx].split(".")
-        bare_metal_major = release[0]
-        bare_metal_minor = release[1][0]
-
-        return raw_output, bare_metal_major, bare_metal_minor
 
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
@@ -42,6 +43,30 @@ def load_scaled_upper_triang_masked_softmax_fusion_kernel():
         name='scaled_upper_triang_masked_softmax_cuda', 
         sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp', 
                  srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'], 
+        extra_cflags=['-O3',],
+        extra_cuda_cflags=['-O3',
+                           '-gencode', 'arch=compute_70,code=sm_70',
+                           '-U__CUDA_NO_HALF_OPERATORS__',
+                           '-U__CUDA_NO_HALF_CONVERSIONS__',
+                           '--expt-relaxed-constexpr',
+                           '--expt-extended-lambda',
+                           '--use_fast_math'] + cc_flag,
+        verbose=True)
+
+def load_scaled_masked_softmax_fusion_kernel():
+
+    # Check, if CUDA11 is installed for compute capability 8.0
+    cc_flag = []
+    _, bare_metal_major, _ = get_cuda_bare_metal_version(cpp_extension.CUDA_HOME)
+    if int(bare_metal_major) >= 11:
+        cc_flag.append('-gencode')
+        cc_flag.append('arch=compute_80,code=sm_80')
+
+    srcpath = pathlib.Path(__file__).parent.absolute()
+    scaled_upper_triang_masked_softmax_cuda = cpp_extension.load(
+        name='scaled_masked_softmax_cuda', 
+        sources=[srcpath / 'scaled_masked_softmax.cpp', 
+                 srcpath / 'scaled_masked_softmax_cuda.cu'], 
         extra_cflags=['-O3',],
         extra_cuda_cflags=['-O3',
                            '-gencode', 'arch=compute_70,code=sm_70',

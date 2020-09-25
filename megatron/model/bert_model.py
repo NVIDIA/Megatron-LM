@@ -28,13 +28,11 @@ from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from megatron.module import MegatronModule
 
-
 def bert_attention_mask_func(attention_scores, attention_mask):
-    attention_scores = attention_scores + attention_mask
+    attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
 
-
-def bert_extended_attention_mask(attention_mask, dtype):
+def bert_extended_attention_mask(attention_mask):
     # We create a 3D attention mask from a 2D tensor mask.
     # [b, 1, s]
     attention_mask_b1s = attention_mask.unsqueeze(1)
@@ -44,17 +42,11 @@ def bert_extended_attention_mask(attention_mask, dtype):
     attention_mask_bss = attention_mask_b1s * attention_mask_bs1
     # [b, 1, s, s]
     extended_attention_mask = attention_mask_bss.unsqueeze(1)
-    # Since attention_mask is 1.0 for positions we want to attend and 0.0
-    # for masked positions, this operation will create a tensor which is
-    # 0.0 for positions we want to attend and -10000.0 for masked positions.
-    # Since we are adding it to the raw scores before the softmax, this is
-    # effectively the same as removing these entirely.
-    # fp16 compatibility
-    extended_attention_mask = extended_attention_mask.to(dtype=dtype)
-    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+
+    # Convert attention mask to binary:
+    extended_attention_mask = (extended_attention_mask < 0.5)
 
     return extended_attention_mask
-
 
 def bert_position_ids(token_ids):
     # Create position ids
@@ -143,8 +135,7 @@ class BertModel(MegatronModule):
     def forward(self, input_ids, attention_mask,
                 tokentype_ids=None, lm_labels=None):
 
-        extended_attention_mask = bert_extended_attention_mask(
-            attention_mask, next(self.language_model.parameters()).dtype)
+        extended_attention_mask = bert_extended_attention_mask(attention_mask)
         position_ids = bert_position_ids(input_ids)
 
         if self.add_binary_head:

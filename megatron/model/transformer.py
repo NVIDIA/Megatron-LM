@@ -153,6 +153,7 @@ class ParallelSelfAttention(MegatronModule):
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             self.fp16,
             args.scaled_upper_triang_masked_softmax_fusion,
+            args.scaled_masked_softmax_fusion,
             self.attention_mask_func,
             self.attention_softmax_in_fp32,
             coeff)
