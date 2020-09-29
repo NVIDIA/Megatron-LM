@@ -97,6 +97,8 @@ def generate_samples_input_from_file(model):
             sample_output_file = args.sample_input_file + ".out"
             print('could not find `sample-output-file`, setting '
                   'it to {}'.format(sample_output_file))
+        else:
+            sample_output_file = args.sample_output_file
         fname_out = open(sample_output_file, "w+")
 
     context_count = 0
