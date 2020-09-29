@@ -87,7 +87,6 @@ def main():
     # Generate samples.
     if args.num_samples == 0:
         args.batch_size = 1
-        print(args.sample_input_file)
         if args.sample_input_file != None:
             generate_samples_input_from_file(model)
         else:
