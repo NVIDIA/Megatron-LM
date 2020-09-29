@@ -313,6 +313,8 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--old-checkpoint-format', action='store_true',
+                       help='load old checkpoint format[Q[]K[]V[]].')
 
     return parser
 
