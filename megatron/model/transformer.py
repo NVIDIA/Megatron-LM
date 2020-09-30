@@ -23,6 +23,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.mpu import LayerNorm
 from megatron.module import MegatronModule
+from megatron.checkpointing import get_checkpoint_version
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import openai_gelu, erf_gelu
@@ -170,7 +171,23 @@ class ParallelSelfAttention(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True)
+ 
+    def _transpose_last_dim(self, mixed_layer):
+        """[s, b, 3 * hp] -->(view) [s, b, 3, hp] -->(tranpose)
+        [s, b, hp, 3] -->(view) [s, b, 3 * hp] """
 
+        input_shape = mixed_layer.size();
+        last_dim = input_shape[-1]
+        assert last_dim % 3 == 0, "expected QKV dimension"
+        last_dim_split = last_dim // 3
+        
+        intermediate_shape = input_shape[:-1] +\
+            (3, last_dim_split)
+        mixed_layer = mixed_layer.view(*intermediate_shape)
+        mixed_layer = mixed_layer.transpose(-1, -2).contiguous()
+        mixed_layer = mixed_layer.view(*input_shape)
+        
+        return mixed_layer
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
@@ -180,20 +197,25 @@ class ParallelSelfAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
 
-        # Attention heads [s, b, hp] --> [s, b, 3 * hp]
+        # Attention heads [s, b, hp] --> [s, b, hp * 3]
         mixed_x_layer, _ = self.query_key_value(hidden_states)
+ 
+        checkpoint_version = get_checkpoint_version()
+        if checkpoint_version is not None and \
+           checkpoint_version == 0:
+            # [s, b, 3 * hp] --> [s, b, hp * 3]
+            mixed_x_layer = self._transpose_last_dim(mixed_x_layer)
 
-        # [s, b, 3 * hp] --> [s, b, np, 3 * hn]  
+        # [s, b, hp * 3] --> [s, b, np, hn, 3]  
         new_tensor_shape = mixed_x_layer.size()[:-1] + \
             (self.num_attention_heads_per_partition,
-             3 * self.hidden_size_per_attention_head)
+             self.hidden_size_per_attention_head, 3)
         mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
-        # [s, b, np, 3 * hn] --> 3 [s, b, np, hn]
-        (query_layer,
-         key_layer,
-         value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
-
+        # [s, b, np, hn, 3] --> 3 [s, b, np, hn]
+        query_layer = mixed_x_layer[:,:,:,:,0]
+        key_layer = mixed_x_layer[:,:,:,:,1]
+        value_layer = mixed_x_layer[:,:,:,:,2]
 
         # ==================================
         # Adjust key and value for inference

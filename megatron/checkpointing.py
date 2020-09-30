@@ -27,6 +27,17 @@ from megatron import mpu, get_args
 from megatron import get_args
 from megatron import print_rank_0
 
+_CHECKPOINT_VERSION = None
+
+def set_checkpoint_version(value):
+    global _CHECKPOINT_VERSION
+    assert _CHECKPOINT_VERSION is None, \
+        "checkpoint version already set"
+    _CHECKPOINT_VERSION = value
+
+def get_checkpoint_version():
+    global _CHECKPOINT_VERSION
+    return _CHECKPOINT_VERSION
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
@@ -90,6 +101,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
+        state_dict['checkpoint_version'] = 1.0
         state_dict['iteration'] = iteration
         state_dict['model'] = model.state_dict_for_save_checkpoint()
 
@@ -184,6 +196,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         print_rank_0('could not load the checkpoint')
         sys.exit()
 
+    # set checkpoint version
+    set_checkpoint_version(state_dict.get('checkpoint_version', 0))
+
     # Set iteration.
     if args.finetune or release:
         iteration = 0
@@ -198,6 +213,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
                              'iteration from checkpoint {}, exiting'.format(
                                  checkpoint_name))
                 sys.exit()
+ 
 
     # Check arguments.
     if 'args' in state_dict:
