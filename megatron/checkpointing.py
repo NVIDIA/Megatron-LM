@@ -31,6 +31,8 @@ _CHECKPOINT_VERSION = None
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
+    assert _CHECKPOINT_VERSION is None, \
+        "checkpoint version already set"
     _CHECKPOINT_VERSION = value
 
 def get_checkpoint_version():
@@ -99,7 +101,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
-        state_dict['checkpoint_version'] = 1
+        state_dict['checkpoint_version'] = 1.0
         state_dict['iteration'] = iteration
         state_dict['model'] = model.state_dict_for_save_checkpoint()
 
