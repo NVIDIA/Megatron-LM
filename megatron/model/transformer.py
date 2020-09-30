@@ -23,6 +23,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.mpu import LayerNorm
 from megatron.module import MegatronModule
+from megatron.checkpointing import get_checkpoint_version
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import openai_gelu, erf_gelu
@@ -120,7 +121,6 @@ class ParallelSelfAttention(MegatronModule):
         super(ParallelSelfAttention, self).__init__()
         args = get_args()
         self.fp16 = args.fp16
-        self.old_checkpoint_format = args.old_checkpoint_format
 
         self.attention_mask_func = attention_mask_func
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
@@ -178,7 +178,7 @@ class ParallelSelfAttention(MegatronModule):
 
         input_shape = mixed_layer.size();
         last_dim = input_shape[-1]
-        assert last_dim % 3 == 0
+        assert last_dim % 3 == 0, "expected QKV dimension"
         last_dim_split = last_dim // 3
         
         intermediate_shape = input_shape[:-1] +\
@@ -200,7 +200,9 @@ class ParallelSelfAttention(MegatronModule):
         # Attention heads [s, b, hp] --> [s, b, hp * 3]
         mixed_x_layer, _ = self.query_key_value(hidden_states)
  
-        if self.old_checkpoint_format:
+        checkpoint_version = get_checkpoint_version()
+        if checkpoint_version is not None and \
+           checkpoint_version == 0:
             # [s, b, 3 * hp] --> [s, b, hp * 3]
             mixed_x_layer = self._transpose_last_dim(mixed_x_layer)
 
