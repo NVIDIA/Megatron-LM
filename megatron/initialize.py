@@ -123,7 +123,10 @@ def _initialize_distributed():
 
     # Set the model-parallel / data-parallel communicators.
     if device_count > 0:
-        mpu.initialize_model_parallel(args.model_parallel_size)
+        if mpu.model_parallel_is_initialized():
+            print('model parallel is already initialized')
+        else:
+            mpu.initialize_model_parallel(args.model_parallel_size)
 
 
 def _init_autoresume():
