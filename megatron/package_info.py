@@ -14,7 +14,7 @@
 # limitations under the License.
 
 MAJOR = 1
-MINOR = 1.4
+MINOR = 1.5
 
 # Use the following formatting: (major, minor)
 VERSION = (MAJOR, MINOR)
