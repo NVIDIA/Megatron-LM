@@ -50,7 +50,8 @@ def load_scaled_upper_triang_masked_softmax_fusion_kernel():
     scaled_upper_triang_masked_softmax_cuda = cpp_extension.load(
         name='scaled_upper_triang_masked_softmax_cuda', 
         sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp', 
-                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'], 
+                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'],
+        build_directory=srcpath,
         extra_cflags=['-O3',],
         extra_cuda_cflags=['-O3',
                            '-gencode', 'arch=compute_70,code=sm_70',
@@ -74,7 +75,8 @@ def load_scaled_masked_softmax_fusion_kernel():
     scaled_upper_triang_masked_softmax_cuda = cpp_extension.load(
         name='scaled_masked_softmax_cuda', 
         sources=[srcpath / 'scaled_masked_softmax.cpp', 
-                 srcpath / 'scaled_masked_softmax_cuda.cu'], 
+                 srcpath / 'scaled_masked_softmax_cuda.cu'],
+        build_directory=srcpath,
         extra_cflags=['-O3',],
         extra_cuda_cflags=['-O3',
                            '-gencode', 'arch=compute_70,code=sm_70',
