@@ -15,7 +15,15 @@
 
 import pathlib
 import subprocess
+import os
 from torch.utils import cpp_extension
+
+# Setting this param to a list has a problem of generating
+# different compilation commands (with diferent order of architectures)
+# and leading to recompilation of fused kernels.
+# set it to empty string to avoid recompilation
+# and assign arch flags explicity in extra_cuda_cflags below
+os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 def get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], 
@@ -42,7 +50,8 @@ def load_scaled_upper_triang_masked_softmax_fusion_kernel():
     scaled_upper_triang_masked_softmax_cuda = cpp_extension.load(
         name='scaled_upper_triang_masked_softmax_cuda', 
         sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp', 
-                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'], 
+                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu'],
+        build_directory=srcpath / 'build',
         extra_cflags=['-O3',],
         extra_cuda_cflags=['-O3',
                            '-gencode', 'arch=compute_70,code=sm_70',
@@ -66,7 +75,8 @@ def load_scaled_masked_softmax_fusion_kernel():
     scaled_upper_triang_masked_softmax_cuda = cpp_extension.load(
         name='scaled_masked_softmax_cuda', 
         sources=[srcpath / 'scaled_masked_softmax.cpp', 
-                 srcpath / 'scaled_masked_softmax_cuda.cu'], 
+                 srcpath / 'scaled_masked_softmax_cuda.cu'],
+        build_directory=srcpath / 'build',
         extra_cflags=['-O3',],
         extra_cuda_cflags=['-O3',
                            '-gencode', 'arch=compute_70,code=sm_70',
