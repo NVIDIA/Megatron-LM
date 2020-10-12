@@ -101,7 +101,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
-        state_dict['checkpoint_version'] = 1.0
+        state_dict['checkpoint_version'] = 2.0
         state_dict['iteration'] = iteration
         state_dict['model'] = model.state_dict_for_save_checkpoint()
 
