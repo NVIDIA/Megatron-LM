@@ -69,8 +69,7 @@ def load_scaled_upper_triang_masked_softmax_fusion_kernel():
                            '-U__CUDA_NO_HALF_CONVERSIONS__',
                            '--expt-relaxed-constexpr',
                            '--expt-extended-lambda',
-                           '--use_fast_math'] + cc_flag,
-        verbose=True)
+                           '--use_fast_math'] + cc_flag)
 
 def load_scaled_masked_softmax_fusion_kernel():
 
@@ -98,5 +97,4 @@ def load_scaled_masked_softmax_fusion_kernel():
                            '-U__CUDA_NO_HALF_CONVERSIONS__',
                            '--expt-relaxed-constexpr',
                            '--expt-extended-lambda',
-                           '--use_fast_math'] + cc_flag,
-        verbose=True)
+                           '--use_fast_math'] + cc_flag)
