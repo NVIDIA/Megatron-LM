@@ -164,7 +164,8 @@ def get_optimizer(model):
                 param.model_parallel = False
 
     # Use Adam.
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
+        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
 
     # Wrap into fp16 optimizer.
     if args.fp16:
