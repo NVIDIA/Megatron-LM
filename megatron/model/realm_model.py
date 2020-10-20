@@ -172,7 +172,8 @@ class IREncoderBertModel(MegatronModule):
         position_ids = bert_position_ids(input_ids)
 
         lm_output, pooled_output = self.language_model(
-            input_ids, position_ids,
+            input_ids,
+            position_ids,
             extended_attention_mask,
             tokentype_ids=tokentype_ids)
 

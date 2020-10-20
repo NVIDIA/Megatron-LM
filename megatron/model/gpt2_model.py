@@ -21,7 +21,6 @@ from megatron import get_args
 from megatron import mpu
 from megatron.module import MegatronModule
 
-from .language_model import Embedding
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
 from .utils import init_method_normal
