@@ -54,14 +54,14 @@ def parse_args(extra_args_provider=None, defaults={},
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.intra_layer_model_parallel_size = min(
-        args.intra_layer_model_parallel_size, args.world_size)
-    args.inter_layer_model_parallel_size = min(
-        args.inter_layer_model_parallel_size,
-        (args.world_size // args.intra_layer_model_parallel_size))
+    args.tensor_model_parallel_size = min(
+        args.tensor_model_parallel_size, args.world_size)
+    args.pipeline_model_parallel_size = min(
+        args.pipeline_model_parallel_size,
+        (args.world_size // args.tensor_model_parallel_size))
     if args.rank == 0:
-        print('using world size: {} and intra-layer-model-parallel size: {} '.format(
-            args.world_size, args.intra_layer_model_parallel_size))
+        print('using world size: {}, tensor-model-parallel size: {}, pipeline-model-parallel size: {} '.format(
+            args.world_size, args.tensor_model_parallel_size, args.pipeline_model_parallel_size))
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -364,12 +364,12 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
 
-    group.add_argument('--intra-layer-model-parallel-size', type=int, default=1,
-                       help='Degree of intra-layer model parallelism.')
-    group.add_argument('--inter-layer-model-parallel-size', type=int, default=1,
-                       help='Degree of inter-layer model parallelism.')
+    group.add_argument('--tensor-model-parallel-size', type=int, default=1,
+                       help='Degree of tensor model parallelism.')
+    group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
+                       help='Degree of pipeline model parallelism.')
     group.add_argument('--use-pipelining', action='store_true',
-                       help='Use pipelining to increase throughput of inter-layer model parallelism')
+                       help='Use pipelining to increase throughput of pipeline model parallelism')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

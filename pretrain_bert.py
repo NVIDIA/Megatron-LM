@@ -34,12 +34,12 @@ def model_provider():
     print_rank_0('building BERT model ...')
 
     args = get_args()
-    if args.inter_layer_model_parallel_size > 1:
+    if args.pipeline_model_parallel_size > 1:
         # Determine model based on position of stage in pipeline.
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             model = BertModelFirstStage(
                 num_tokentypes=2)
-        elif mpu.is_inter_layer_last_stage():
+        elif mpu.is_pipeline_last_stage():
             model = BertModelLastStage(
                 num_tokentypes=2,
                 add_binary_head=True,
@@ -93,21 +93,21 @@ def forward_step(data_iterator, model, input_tensor):
     timers('batch generator').stop()
 
     # Forward pass through the model.
-    if mpu.is_inter_layer_first_stage():
+    if mpu.is_pipeline_first_stage():
         assert input_tensor is None
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             output_tensor = model(tokens, padding_mask, tokentype_ids=types,
                                   lm_labels=lm_labels)
         else:
             output_tensor = model(tokens, padding_mask, tokentype_ids=types)
-    elif mpu.is_inter_layer_last_stage():
+    elif mpu.is_pipeline_last_stage():
         assert input_tensor is not None
         output_tensor = model(input_tensor, padding_mask, lm_labels=lm_labels)
     else:
         assert input_tensor is not None
         output_tensor = model(input_tensor, padding_mask)
 
-    if mpu.is_inter_layer_last_stage():
+    if mpu.is_pipeline_last_stage():
         lm_loss_, sop_logits = output_tensor
 
         sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),

@@ -32,7 +32,7 @@ from megatron.data.realm_dataset_utils import get_ict_batch
 
 def pretrain_ict_model_provider():
     args = get_args()
-    assert args.inter_layer_model_parallel_size == 1, 'inter_layer_model_parallel_size must be 1!'
+    assert args.pipeline_model_parallel_size == 1, 'pipeline_model_parallel_size must be 1!'
     return general_ict_model_provider(False, False)
 
 
@@ -89,7 +89,7 @@ def forward_step(data_iterator, model, input_tensor):
     # Forward model.
     query_logits, block_logits = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask)
     local_batch_size = query_logits.shape[0]
-    global_batch_size = dist.get_world_size() * local_batch_size  # recall we assert that intra_layer_model_parallel_size == 1
+    global_batch_size = dist.get_world_size() * local_batch_size  # recall we assert that tensor_model_parallel_size == 1
 
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
     all_block_logits = AllgatherFromDataParallelRegion.apply(block_logits)

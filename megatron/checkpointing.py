@@ -59,7 +59,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('make_vocab_size_divisible_by')
     _compare('padded_vocab_size')
     _compare('tokenizer_type')
-    _compare('intra_layer_model_parallel_size')
+    _compare('tensor_model_parallel_size')
 
 
 def ensure_directory_exists(filename):
@@ -76,16 +76,16 @@ def get_checkpoint_name(checkpoints_path, iteration,
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
-    # Use both the intra-layer and inter-layer MP rank.
-    if mpu.get_inter_layer_model_parallel_world_size() == 1:
+    # Use both the tensor and pipeline MP rank.
+    if mpu.get_pipeline_model_parallel_world_size() == 1:
         return os.path.join(checkpoints_path, directory,
                             'mp_rank_{:02d}'.format(
-                                mpu.get_intra_layer_model_parallel_rank()),
+                                mpu.get_tensor_model_parallel_rank()),
                             'model_optim_rng.pt')
     return os.path.join(checkpoints_path, directory,
                         'mp_rank_{:02d}_{:03d}'.format(
-                            mpu.get_intra_layer_model_parallel_rank(),
-                            mpu.get_inter_layer_model_parallel_rank()),
+                            mpu.get_tensor_model_parallel_rank(),
+                            mpu.get_pipeline_model_parallel_rank()),
                         'model_optim_rng.pt')
 
 

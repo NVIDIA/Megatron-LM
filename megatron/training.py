@@ -124,10 +124,10 @@ def get_model(model_provider_func):
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
-        print(' > number of parameters on (intra-layer, inter-layer) '
+        print(' > number of parameters on (tensor, pipeline) '
               'model parallel rank ({}, {}): {}'.format(
-            mpu.get_intra_layer_model_parallel_rank(),
-            mpu.get_inter_layer_model_parallel_rank(),
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_pipeline_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
 
     # GPU allocation.
@@ -166,8 +166,8 @@ def get_optimizer(model):
     # Add model parallel attribute if it is not set.
     for param_group in param_groups:
         for param in param_group['params']:
-            if not hasattr(param, 'intra_layer_model_parallel'):
-                param.intra_layer_model_parallel = False
+            if not hasattr(param, 'tensor_model_parallel'):
+                param.tensor_model_parallel = False
 
     # Use Adam.
     optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
@@ -260,7 +260,7 @@ def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward)
                                     tensor_recv_prev=tensor_recv_prev,
                                     tensor_send_next=tensor_send_next,
                                     tensor_recv_next=tensor_recv_next,
-                                    group=mpu.get_inter_layer_model_parallel_group())
+                                    group=mpu.get_pipeline_model_parallel_group())
 
     return tensor_recv_prev, tensor_recv_next
 
@@ -304,7 +304,7 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
     # Compute number of microbatches in a minibatch.
-    num_microbatches_to_pipeline = args.inter_layer_model_parallel_size \
+    num_microbatches_to_pipeline = args.pipeline_model_parallel_size \
             if args.use_pipelining else 1
 
     input_tensors = []
@@ -313,7 +313,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Run forward pass for all microbatches in minibatch.
     for i in range(num_microbatches_to_pipeline):
-        if not mpu.is_inter_layer_first_stage():
+        if not mpu.is_pipeline_first_stage():
             input_tensor, _ = communicate(
                 tensor_send_next=None,
                 tensor_send_prev=None,
@@ -327,7 +327,7 @@ def train_step(forward_step_func, data_iterator,
         output_tensor = forward_step_func(data_iterator, model, input_tensor)
         timers('forward').stop()
 
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             loss, loss_reduced = output_tensor
             output_tensor = loss
             losses_reduced.append(loss_reduced)
@@ -346,7 +346,7 @@ def train_step(forward_step_func, data_iterator,
         input_tensor = input_tensors.pop(0)
         output_tensor = output_tensors.pop(0)
 
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             output_grad_tensor = None
         else:
             _, output_grad_tensor = communicate(
@@ -362,7 +362,7 @@ def train_step(forward_step_func, data_iterator,
             backward_step(optimizer, model, input_tensor, output_tensor, output_grad_tensor)
         timers('backward').stop()
 
-        if not mpu.is_inter_layer_first_stage():
+        if not mpu.is_pipeline_first_stage():
             communicate(
                 tensor_send_next=None,
                 tensor_send_prev=input_grad_tensor,
@@ -383,8 +383,8 @@ def train_step(forward_step_func, data_iterator,
     timers('backward-master-grad').stop()
 
     # All-reduce across first and last stages.
-    if (mpu.is_inter_layer_first_stage() or mpu.is_inter_layer_last_stage()) and \
-            args.inter_layer_model_parallel_size > 1:
+    if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
+            args.pipeline_model_parallel_size > 1:
         unwrapped_model = model
         while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
             unwrapped_model = unwrapped_model.module
@@ -421,7 +421,7 @@ def train_step(forward_step_func, data_iterator,
     else:
         skipped_iter = 1
 
-    if mpu.is_inter_layer_last_stage():
+    if mpu.is_pipeline_last_stage():
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0]:
@@ -604,7 +604,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
 
-            if not mpu.is_inter_layer_first_stage():
+            if not mpu.is_pipeline_first_stage():
                 input_tensor, _ = communicate(
                     tensor_send_next=None,
                     tensor_send_prev=None,
@@ -616,7 +616,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             # Forward evaluation.
             output_tensor = forward_step_func(data_iterator, model, input_tensor)
 
-            if mpu.is_inter_layer_last_stage():
+            if mpu.is_pipeline_last_stage():
                 _, loss_dict = output_tensor
                 # Reduce across processes.
                 for key in loss_dict:
@@ -671,7 +671,7 @@ def build_train_valid_test_data_iterators(
 
     print_rank_0('> building train, validation, and test datasets ...')
     # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_intra_layer_model_parallel_rank() == 0:
+    if mpu.get_tensor_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
         data_parallel_size = mpu.get_data_parallel_world_size()
         global_batch_size = args.batch_size * data_parallel_size
@@ -709,8 +709,8 @@ def build_train_valid_test_data_iterators(
 
     # Broadcast num tokens.
     torch.distributed.broadcast(flags,
-                                mpu.get_intra_layer_model_parallel_src_rank(),
-                                group=mpu.get_intra_layer_model_parallel_group())
+                                mpu.get_tensor_model_parallel_src_rank(),
+                                group=mpu.get_tensor_model_parallel_group())
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()

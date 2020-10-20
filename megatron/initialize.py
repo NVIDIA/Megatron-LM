@@ -26,7 +26,7 @@ from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron.global_vars import set_global_variables
-from megatron.mpu import set_intra_layer_model_parallel_rank, set_intra_layer_model_parallel_world_size
+from megatron.mpu import set_tensor_model_parallel_rank, set_tensor_model_parallel_world_size
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -65,9 +65,9 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals    
-        set_intra_layer_model_parallel_world_size(args.intra_layer_model_parallel_size)
+        set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager to call when it has DDP initialized
-        set_intra_layer_model_parallel_rank(args.rank)    
+        set_tensor_model_parallel_rank(args.rank)    
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -121,14 +121,14 @@ def _initialize_distributed():
             world_size=args.world_size, rank=args.rank,
             init_method=init_method)
 
-    # Set the intra-layer model-parallel, inter-layer model-parallel, and
+    # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
         if mpu.model_parallel_is_initialized():
             print('model parallel is already initialized')
         else:
-            mpu.initialize_model_parallel(args.intra_layer_model_parallel_size,
-                                          args.inter_layer_model_parallel_size)
+            mpu.initialize_model_parallel(args.tensor_model_parallel_size,
+                                          args.pipeline_model_parallel_size)
 
 
 def _init_autoresume():
@@ -143,13 +143,13 @@ def _init_autoresume():
 def _set_random_seed(seed_):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
-        # Ensure that different inter-layer MP stages get different seeds.
-        seed = seed_ + mpu.get_inter_layer_model_parallel_rank()
+        # Ensure that different pipeline MP stages get different seeds.
+        seed = seed_ + mpu.get_pipeline_model_parallel_rank()
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            mpu.intra_layer_model_parallel_cuda_manual_seed(seed)
+            mpu.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 

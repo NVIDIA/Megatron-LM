@@ -74,10 +74,10 @@ class FP16_Module(MegatronModule):
     def forward(self, *inputs, **kwargs):
         convert_inputs = True
         convert_outputs = True
-        if mpu.get_inter_layer_model_parallel_world_size() > 1:
-            if not mpu.is_inter_layer_first_stage():
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            if not mpu.is_pipeline_first_stage():
                 convert_inputs = False
-            if not mpu.is_inter_layer_last_stage():
+            if not mpu.is_pipeline_last_stage():
                 convert_outputs = False
         if convert_inputs:
             inputs = fp32_to_fp16(inputs)
@@ -227,7 +227,7 @@ class FP16_Optimizer(object):
                         master_param = param.detach().clone().float()
                         master_param.requires_grad = True
                         # Copythe model parallel flag.
-                        master_param.intra_layer_model_parallel = param.intra_layer_model_parallel
+                        master_param.tensor_model_parallel = param.tensor_model_parallel
                         param_group['params'][i] = master_param
                         fp32_from_fp16_params_this_group.append(master_param)
                         # Reset existing state dict key to the new master param.

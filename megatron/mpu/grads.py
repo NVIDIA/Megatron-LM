@@ -28,9 +28,9 @@ try:
 except Exception as e:
     print('WARNING: APEX is not installed, multi_tensor_applier will not be available.')
 
-from .initialize import is_inter_layer_first_stage
+from .initialize import is_pipeline_first_stage
 from .initialize import get_model_parallel_group
-from .initialize import get_intra_layer_model_parallel_rank
+from .initialize import get_tensor_model_parallel_rank
 
 
 def l2_grad_clipper(parameters, max_norm):
@@ -44,9 +44,9 @@ def l2_grad_clipper(parameters, max_norm):
     parameters_with_grads = list(filter(
         lambda p: p.grad is not None, parameters))
     # Filter parameters for norm calculations.
-    mp_rank_is_zero = (get_intra_layer_model_parallel_rank() == 0)
+    mp_rank_is_zero = (get_tensor_model_parallel_rank() == 0)
     parameters_for_norm = list(filter(
-        lambda p: p.intra_layer_model_parallel or mp_rank_is_zero, parameters_with_grads))
+        lambda p: p.tensor_model_parallel or mp_rank_is_zero, parameters_with_grads))
     # Calculate L2 norm.
     norm, _ = multi_tensor_applier(
         amp_C.multi_tensor_l2norm,
@@ -101,7 +101,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2, parameter_names=None):
                 # Count embedding layer only once (in first stage).
                 # Don't count the weights a second time in the last stage.
                 if "embedding" not in n or \
-                    is_inter_layer_first_stage():
+                    is_pipeline_first_stage():
                     filtered_parameters.append(p)
         parameters = filtered_parameters
     else:
@@ -123,7 +123,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2, parameter_names=None):
     else:
         total_norm = 0
         for p in parameters:
-            if p.intra_layer_model_parallel or (get_intra_layer_model_parallel_rank() == 0):
+            if p.tensor_model_parallel or (get_tensor_model_parallel_rank() == 0):
                 param_norm = p.grad.data.norm(norm_type)
                 total_norm += param_norm.item() ** norm_type
         # Sum across all model-parallel GPUs.

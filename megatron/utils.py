@@ -58,7 +58,7 @@ def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
     index = 0
     rank = torch.distributed.get_rank()
-    string = 'iteration, rank, index, intra-layer-model-parallel, min, max, norm\n'
+    string = 'iteration, rank, index, tensor-model-parallel, min, max, norm\n'
     optimizer_ = optimizer
     if isinstance(optimizer, FP16_Optimizer):
         optimizer_ = optimizer.optimizer
@@ -69,7 +69,7 @@ def print_params_min_max_norm(optimizer, iteration):
             max_ = param.data.max()
             norm = param.data.norm()
             string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
-                iteration, rank, index, int(param.intra_layer_model_parallel))
+                iteration, rank, index, int(param.tensor_model_parallel))
             string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
     print(string, flush=True)
 

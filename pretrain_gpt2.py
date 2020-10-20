@@ -33,11 +33,11 @@ def model_provider():
 
     print_rank_0('building GPT2 model ...')
     args = get_args()
-    if args.inter_layer_model_parallel_size > 1:
+    if args.pipeline_model_parallel_size > 1:
         # Determine model based on position of stage in pipeline.
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             model = GPT2ModelFirstStage(num_tokentypes=0)
-        elif mpu.is_inter_layer_last_stage():
+        elif mpu.is_pipeline_last_stage():
             model = GPT2ModelLastStage(
                 num_tokentypes=0, parallel_output=True)
         else:
@@ -93,21 +93,21 @@ def forward_step(data_iterator, model, input_tensor):
     timers('batch generator').stop()
 
     # Forward pass through the model.
-    if mpu.is_inter_layer_first_stage():
+    if mpu.is_pipeline_first_stage():
         assert input_tensor is None
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             output_tensor = model(tokens, position_ids, attention_mask,
                                   labels=labels)
         else:
             output_tensor = model(tokens, position_ids, attention_mask)
-    elif mpu.is_inter_layer_last_stage():
+    elif mpu.is_pipeline_last_stage():
         assert input_tensor is not None
         output_tensor = model(input_tensor, attention_mask, labels=labels)
     else:
         assert input_tensor is not None
         output_tensor = model(input_tensor, attention_mask)
 
-    if mpu.is_inter_layer_last_stage():
+    if mpu.is_pipeline_last_stage():
         losses = output_tensor.float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()

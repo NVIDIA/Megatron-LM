@@ -80,8 +80,8 @@ class GPT2ModelBase(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
 
-        if mpu.is_inter_layer_last_stage():
-            if not mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_last_stage():
+            if not mpu.is_pipeline_first_stage():
                 self._word_embeddings_for_head_key = 'word_embeddings_for_head'
                 # If first and last stages are different, set word_embeddings
                 # weights to 0 here, then copy first stage's weights using all_reduce
@@ -92,14 +92,14 @@ class GPT2ModelBase(MegatronModule):
                 self.word_embeddings.weight.data.fill_(0)
 
         # Ensure that first and last stages have the same initial embedding weights.
-        if mpu.is_inter_layer_first_stage() or mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
             torch.distributed.all_reduce(self.word_embeddings_weight().data,
                                          group=mpu.get_embedding_group())
 
     def word_embeddings_weight(self):
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             return self.language_model.embedding.word_embeddings.weight
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             return self.word_embeddings.weight
         raise Exception('word_embeddings_weight() should be '
                         'called for first and last stage only')
@@ -109,7 +109,7 @@ class GPT2ModelBase(MegatronModule):
                 forward_method_parallel_output=None):
 
         kwargs = {'layer_past': layer_past, 'get_key_value': get_key_value}
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             (input_ids, position_ids) = gpt2_model_input
             args = [input_ids, position_ids, attention_mask]
             kwargs['tokentype_ids'] = tokentype_ids
@@ -117,7 +117,7 @@ class GPT2ModelBase(MegatronModule):
             args = [gpt2_model_input, attention_mask]
         lm_output = self.language_model(*args, **kwargs)
 
-        if mpu.is_inter_layer_last_stage():
+        if mpu.is_pipeline_last_stage():
             return post_language_model_processing(
                 lm_output, labels,
                 self.word_embeddings_weight(),
@@ -136,7 +136,7 @@ class GPT2ModelBase(MegatronModule):
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
         # Save word_embeddings.
-        if mpu.is_inter_layer_last_stage() and not mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
             state_dict_[self._word_embeddings_for_head_key] \
                 = self.word_embeddings.state_dict(destination, prefix, keep_vars)
         return state_dict_
@@ -145,7 +145,7 @@ class GPT2ModelBase(MegatronModule):
         """Customized load."""
 
         # Load word_embeddings.
-        if mpu.is_inter_layer_last_stage() and not mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
         if self._language_model_key in state_dict:

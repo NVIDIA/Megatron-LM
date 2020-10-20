@@ -29,7 +29,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
     # Parallel logits.
-    input_parallel = mpu.copy_to_intra_layer_model_parallel_region(input_)
+    input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
     # Matrix multiply.
     if bias is None:
         logits_parallel = F.linear(input_parallel, word_embeddings_weight)
@@ -39,7 +39,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     if parallel_output:
         return logits_parallel
 
-    return mpu.gather_from_intra_layer_model_parallel_region(logits_parallel)
+    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
 def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
@@ -57,14 +57,14 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     args = [attention_mask_func, init_method, scaled_init_method]
     kwargs = {}
     cls = None
-    if mpu.is_inter_layer_first_stage() and mpu.is_inter_layer_last_stage():
+    if mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage():
         cls = TransformerLanguageModel
         kwargs['num_tokentypes'] = num_tokentypes
         kwargs['add_pooler'] = add_pooler
-    elif mpu.is_inter_layer_first_stage() and not mpu.is_inter_layer_last_stage():
+    elif mpu.is_pipeline_first_stage() and not mpu.is_pipeline_last_stage():
         cls = TransformerLanguageModelFirstStage
         kwargs['num_tokentypes'] = num_tokentypes
-    elif not mpu.is_inter_layer_first_stage() and mpu.is_inter_layer_last_stage():
+    elif not mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage():
         cls = TransformerLanguageModelLastStage
         kwargs['add_pooler'] = add_pooler
     else:
@@ -291,7 +291,7 @@ class TransformerLanguageModelBase(MegatronModule):
         self.add_pooler = add_pooler
 
         # Embeddings.
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             self.embedding = Embedding(self.hidden_size,
                                        args.padded_vocab_size,
                                        args.max_position_embeddings,
@@ -307,7 +307,7 @@ class TransformerLanguageModelBase(MegatronModule):
         self._transformer_key = 'transformer'
 
         # Pooler.
-        if mpu.is_inter_layer_last_stage() and self.add_pooler:
+        if mpu.is_pipeline_last_stage() and self.add_pooler:
             self.pooler = Pooler(self.hidden_size, self.init_method)
             self._pooler_key = 'pooler'
 
@@ -316,7 +316,7 @@ class TransformerLanguageModelBase(MegatronModule):
                 pooling_sequence_index=0):
 
         # Embeddings.
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             (input_ids, position_ids) = language_model_input
             embedding_output = self.embedding(input_ids, position_ids,
                                               tokentype_ids=tokentype_ids)
@@ -330,7 +330,7 @@ class TransformerLanguageModelBase(MegatronModule):
                                               layer_past=layer_past,
                                               get_key_value=get_key_value)
 
-        if mpu.is_inter_layer_last_stage() and self.add_pooler:
+        if mpu.is_pipeline_last_stage() and self.add_pooler:
             pooled_output = self.pooler(transformer_output,
                                         pooling_sequence_index)
             return transformer_output, pooled_output
@@ -342,14 +342,14 @@ class TransformerLanguageModelBase(MegatronModule):
         """For easy load."""
 
         state_dict_ = {}
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             state_dict_[self._embedding_key] \
                 = self.embedding.state_dict_for_save_checkpoint(
                     destination, prefix, keep_vars)
         state_dict_[self._transformer_key] \
             = self.transformer.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
-        if mpu.is_inter_layer_last_stage() and self.add_pooler:
+        if mpu.is_pipeline_last_stage() and self.add_pooler:
             state_dict_[self._pooler_key] \
                 = self.pooler.state_dict_for_save_checkpoint(
                     destination, prefix, keep_vars)
@@ -360,7 +360,7 @@ class TransformerLanguageModelBase(MegatronModule):
         """Customized load."""
 
         # Embedding.
-        if mpu.is_inter_layer_first_stage():
+        if mpu.is_pipeline_first_stage():
             if self._embedding_key in state_dict:
                 state_dict_ = state_dict[self._embedding_key]
             else:
@@ -383,7 +383,7 @@ class TransformerLanguageModelBase(MegatronModule):
         self.transformer.load_state_dict(state_dict_, strict=strict)
 
         # Pooler.
-        if mpu.is_inter_layer_last_stage() and self.add_pooler:
+        if mpu.is_pipeline_last_stage() and self.add_pooler:
             assert 'pooler' in state_dict, \
                 'could not find data for pooler in the checkpoint'
             self.pooler.load_state_dict(state_dict[self._pooler_key],
