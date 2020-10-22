@@ -34,7 +34,7 @@ from .initialize import get_tensor_model_parallel_world_size
 
 
 # Default name for the model parallel rng tracker.
-_MODEL_PARALLEL_RNG_TRACKER_NAME = 'tensor-model-parallel-rng'
+_MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
 
 # Whether apply model parallelsim to checkpointed hidden states.
