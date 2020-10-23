@@ -59,6 +59,8 @@ def parse_args(extra_args_provider=None, defaults={},
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
+    if args.num_microbatches_in_minibatch is None:
+        args.num_microbatches_in_minibatch = 1
     if args.rank == 0:
         print('using world size: {}, tensor-model-parallel size: {}, pipeline-model-parallel size: {} '.format(
             args.world_size, args.tensor_model_parallel_size, args.pipeline_model_parallel_size))
@@ -223,6 +225,8 @@ def _add_training_args(parser):
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size.')
+    group.add_argument('--num-microbatches-in-minibatch', type=int, default=None,
+                       help='Number of microbatches in minibatch')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -368,8 +372,6 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
-    group.add_argument('--use-pipelining', action='store_true',
-                       help='Use pipelining to increase throughput of pipeline model parallelism')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

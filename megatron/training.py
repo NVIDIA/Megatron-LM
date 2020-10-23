@@ -138,7 +138,7 @@ def get_model(model_provider_func):
         model = FP16_Module(model)
 
     # Wrap model for distributed training."""
-    if args.use_pipelining:
+    if args.num_microbatches_in_minibatch > 1:
         assert args.DDP_impl == 'local'
 
     if args.DDP_impl == 'torch':
@@ -291,6 +291,67 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
     return input_tensor_grad
 
 
+def forward_step_with_communication(forward_step_func, data_iterator, model,
+                                    input_tensors, output_tensors,
+                                    losses_reduced, timers):
+    if not mpu.is_pipeline_first_stage():
+        input_tensor, _ = communicate(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_forward=True,
+            recv_backward=False)
+    else:
+        input_tensor = None
+
+    # Forward model for one step.
+    timers('forward').start()
+    output_tensor = forward_step_func(data_iterator, model, input_tensor)
+    timers('forward').stop()
+
+    if mpu.is_pipeline_last_stage():
+        loss, loss_reduced = output_tensor
+        output_tensor = loss
+        losses_reduced.append(loss_reduced)
+    else:
+        communicate(
+            tensor_send_next=output_tensor,
+            tensor_send_prev=None,
+            recv_forward=False,
+            recv_backward=False)
+
+    input_tensors.append(input_tensor)
+    output_tensors.append(output_tensor)
+
+
+def backward_step_with_communication(optimizer, model, input_tensors, output_tensors, timers):
+    """Backward step."""
+    input_tensor = input_tensors.pop(0)
+    output_tensor = output_tensors.pop(0)
+
+    if mpu.is_pipeline_last_stage():
+        output_tensor_grad = None
+    else:
+        _, output_tensor_grad = communicate(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_forward=False,
+            recv_backward=True)
+
+    # Backward pass for one step.
+    # TODO: This timer is a bit redundant now with backward-backward.
+    timers('backward').start()
+    input_grad_tensor = \
+        backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_grad)
+    timers('backward').stop()
+
+    if not mpu.is_pipeline_first_stage():
+        communicate(
+            tensor_send_next=None,
+            tensor_send_prev=input_grad_tensor,
+            recv_forward=False,
+            recv_backward=False)
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, lr_scheduler):
     """Single training step."""
@@ -304,70 +365,41 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
     # Compute number of microbatches in a minibatch.
-    num_microbatches_to_pipeline = args.pipeline_model_parallel_size \
-            if args.use_pipelining else 1
+    num_microbatches_in_minibatch = args.num_microbatches_in_minibatch
+    # TODO: Switch to the following schedule when async communication is supported
+    # so that we can facilitate mroe memory-efficient training.
+    # num_warmup_microbatches = \
+    #     (torch.distributed.get_world_size(group=mpu.get_pipeline_model_parallel_group()) -
+    #      torch.distributed.get_rank(group=mpu.get_pipeline_model_parallel_group()) - 1)
+    # num_warmup_microbatches = min(
+    #     num_warmup_microbatches,
+    #     num_microbatches_in_minibatch)
+    num_warmup_microbatches = num_microbatches_in_minibatch
 
     input_tensors = []
     output_tensors = []
     losses_reduced = []
 
-    # Run forward pass for all microbatches in minibatch.
-    for i in range(num_microbatches_to_pipeline):
-        if not mpu.is_pipeline_first_stage():
-            input_tensor, _ = communicate(
-                tensor_send_next=None,
-                tensor_send_prev=None,
-                recv_forward=True,
-                recv_backward=False)
-        else:
-            input_tensor = None
+    # Run warmup forward passes.
+    for i in range(num_warmup_microbatches):
+        forward_step_with_communication(
+            forward_step_func, data_iterator, model,
+            input_tensors, output_tensors,
+            losses_reduced, timers)
 
-        # Forward model for one step.
-        timers('forward').start()
-        output_tensor = forward_step_func(data_iterator, model, input_tensor)
-        timers('forward').stop()
+    # Run 1F1B.
+    for i in range(num_microbatches_in_minibatch - num_warmup_microbatches):
+        forward_step_with_communication(
+            forward_step_func, data_iterator, model,
+            input_tensors, output_tensors,
+            losses_reduced, timers)
+        backward_step_with_communication(
+            optimizer, model, input_tensors, output_tensors, timers)
 
-        if mpu.is_pipeline_last_stage():
-            loss, loss_reduced = output_tensor
-            output_tensor = loss
-            losses_reduced.append(loss_reduced)
-        else:
-            communicate(
-                tensor_send_next=output_tensor,
-                tensor_send_prev=None,
-                recv_forward=False,
-                recv_backward=False)
-
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
-
-    # Run backward pass for all microbatches in minibatch.
-    for i in range(num_microbatches_to_pipeline):
-        input_tensor = input_tensors.pop(0)
-        output_tensor = output_tensors.pop(0)
-
-        if mpu.is_pipeline_last_stage():
-            output_grad_tensor = None
-        else:
-            _, output_grad_tensor = communicate(
-                tensor_send_next=None,
-                tensor_send_prev=None,
-                recv_forward=False,
-                recv_backward=True)
-
-        # Backward pass for one step.
-        # TODO: This timer is a bit redundant now with backward-backward.
-        timers('backward').start()
-        input_grad_tensor = \
-            backward_step(optimizer, model, input_tensor, output_tensor, output_grad_tensor)
-        timers('backward').stop()
-
-        if not mpu.is_pipeline_first_stage():
-            communicate(
-                tensor_send_next=None,
-                tensor_send_prev=input_grad_tensor,
-                recv_forward=False,
-                recv_backward=False)
+    # Run cooldown backward passes.
+    for i in range(num_warmup_microbatches):
+        backward_step_with_communication(
+            optimizer, model, input_tensors, output_tensors, timers)
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':
