@@ -16,12 +16,15 @@
 """Pretrain utilities."""
 
 from datetime import datetime
+import json
 import math
+import os
 import sys
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
 
+from .arguments import HYPERPERAMETERS_FILE, ARGS_TO_SAVE
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
@@ -209,6 +212,14 @@ def get_learning_rate_scheduler(optimizer):
 def setup_model_and_optimizer(model_provider_func):
     """Setup model and optimizer."""
     args = get_args()
+
+    if torch.distributed.get_rank() == 0:
+        # save model configuration to a file
+        hparams_path = os.path.join(args.save, HYPERPERAMETERS_FILE)
+        print(' > saving hyperparameters file to: ' + hparams_path)
+        os.makedirs(args.save, exist_ok=True)
+        with open(hparams_path, "w") as f:
+            json.dump({key: getattr(args, key) for key in ARGS_TO_SAVE}, f)
 
     model = get_model(model_provider_func)
     optimizer = get_optimizer(model)

@@ -16,10 +16,40 @@
 """Megatron arguments."""
 
 import argparse
+import json
 import os
 
 import torch
 from megatron import fused_kernels
+
+HYPERPERAMETERS_FILE = 'hparams.json'
+ARGS_TO_SAVE = ["num_layers", "num_unique_layers", "param_sharing_style", "hidden_size", "num_attention_heads",
+                "max_position_embeddings", "make_vocab_size_divisible_by", "layernorm_epsilon",
+                "apply_residual_connection_post_layernorm", "openai_gelu", "onnx_safe", "attention_dropout",
+                "hidden_dropout", "checkpoint_num_layers", "scaled_upper_triang_masked_softmax_fusion",
+                "scaled_masked_softmax_fusion", "bias_gelu_fusion", "bias_dropout_fusion", "fp16",
+                "apply_query_key_layer_scaling", "attention_softmax_in_fp32", "fp32_allreduce", "hysteresis",
+                "loss_scale", "loss_scale_window", "min_scale", "fp16_lm_cross_entropy", "model_parallel_size",
+                "distributed_backend", "DDP_impl", "lazy_mpu_init", "use_cpu_initialization", "tokenizer_type",
+                "reset_position_ids", "reset_attention_mask", "eod_mask_loss"]
+
+
+def set_args_from_hparams(args):
+    if args.load is not None:
+        hparams_file_path = os.path.join(args.load, HYPERPERAMETERS_FILE)
+        if os.path.exists(hparams_file_path):
+            print(f'Loading existing hyperparameters file at {hparams_file_path}')
+            with open(hparams_file_path) as f:
+                for key, value in json.load(f).items():
+                    if hasattr(args, key) and getattr(args, key) != value:
+                        print(f"WARNING: The value for {key} is {getattr(args, key)} on the command line but "
+                              f"{value} in the hyperparameters file. Using the value from the hyperparameters "
+                              "file.")
+                    setattr(args, key, value)
+        else:
+            print(f'No hyperparameters file found at {hparams_file_path}, using hyperparameters from command line '
+                  'options')
+
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -50,6 +80,8 @@ def parse_args(extra_args_provider=None, defaults={},
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    set_args_from_hparams(args)
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
