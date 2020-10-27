@@ -69,6 +69,10 @@ class LossScaler:
         return grad_in
 
     def backward(self, output_tensor, retain_graph=False, output_tensor_grad=None):
+        # If output_tensor_grad is None, this is the last stage, and
+        # output_tensor is actually the loss and needs to be scaled.
+        # Otherwise, output_tensor does not need to be scaled again since
+        # output_tensor_grad is already scaled.
         if output_tensor_grad is None:
             scaled_output_tensor = output_tensor * self.loss_scale
         else:
