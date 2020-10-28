@@ -361,14 +361,17 @@ def train_step(forward_step_func, data_iterator,
 
     # Compute number of microbatches in a minibatch.
     num_microbatches_in_minibatch = args.num_microbatches_in_minibatch
-    # TODO: Switch to the following schedule when async communication is supported
-    # so that we can facilitate mroe memory-efficient training.
+    # TODO: Switch to the following schedule to facilitate more
+    # memory-efficient training.
     # num_warmup_microbatches = \
     #     (torch.distributed.get_world_size(group=mpu.get_pipeline_model_parallel_group()) -
     #      torch.distributed.get_rank(group=mpu.get_pipeline_model_parallel_group()) - 1)
     # num_warmup_microbatches = min(
     #     num_warmup_microbatches,
     #     num_microbatches_in_minibatch)
+    # For now, perform training without warmup. Perform forward
+    # passes for all microbatches, then backward passes for all
+    # microbatches.
     num_warmup_microbatches = num_microbatches_in_minibatch
 
     input_tensors = []
