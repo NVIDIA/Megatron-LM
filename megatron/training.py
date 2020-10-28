@@ -400,12 +400,6 @@ def train_step(forward_step_func, data_iterator,
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
 
-    # Update master gradients.
-    timers('backward-master-grad').start()
-    if args.fp16:
-        optimizer.update_master_grads()
-    timers('backward-master-grad').stop()
-
     # All-reduce across first and last stages.
     timers('backward-embedding-all-reduce').start()
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
@@ -418,6 +412,12 @@ def train_step(forward_step_func, data_iterator,
         torch.distributed.all_reduce(word_embeddings_weight.grad,
                                      group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
+
+    # Update master gradients.
+    timers('backward-master-grad').start()
+    if args.fp16:
+        optimizer.update_master_grads()
+    timers('backward-master-grad').stop()
 
     # Clipping gradients helps prevent the exploding gradient.
     timers('backward-clip-grad').start()
