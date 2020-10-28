@@ -32,7 +32,6 @@ from megatron.data.realm_dataset_utils import get_ict_batch
 
 def pretrain_ict_model_provider():
     args = get_args()
-    assert args.pipeline_model_parallel_size == 1, 'pipeline_model_parallel_size must be 1!'
     return general_ict_model_provider(False, False)
 
 

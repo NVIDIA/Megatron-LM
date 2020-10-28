@@ -149,6 +149,17 @@ class BertModelBase(MegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
+        # Parameters are shared between the word embeddings layer, and the heads at
+        # the end of the model. In a pipelined setup with more than one stage, the
+        # initial embedding layer and the head are on different workers, so we do
+        # the following:
+        # 1. Create a second copy of word_embeddings on the last stage, with initial
+        #    parameters of 0.0.
+        # 2. Do an all-reduce between the first and last stage to ensure that the
+        #    two copies of word_embeddings start off with the same parameter values.
+        # 3. In the training loop, before an all-reduce between the grads of the two
+        #    word_embeddings layers to ensure that every applied weight update is the
+        #    same on both stages.
         if mpu.is_pipeline_last_stage():
             if not mpu.is_pipeline_first_stage():
                 self._word_embeddings_for_head_key = 'word_embeddings_for_head'
@@ -169,8 +180,7 @@ class BertModelBase(MegatronModule):
                 self.binary_head = get_linear_layer(args.hidden_size, 2,
                                                     init_method)
                 self._binary_head_key = 'binary_head'
-
-        # Ensure that first and last stages have the same initial embedding weights.
+        # Ensure that first and last stages have the same initial parameter values.
         if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
             torch.distributed.all_reduce(self.word_embeddings_weight().data,
                                          group=mpu.get_embedding_group())

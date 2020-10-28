@@ -577,7 +577,6 @@ class FP16_Optimizer(object):
         # a loss scale that works.  After you find a loss scale that works, do a final dummy
         # backward pass with retain_graph=False to tear down the graph.  Doing this would avoid
         # discarding the iteration,  but probably wouldn't improve overall efficiency.
-        # Convert output_tensor to float if it's the loss, otherwise stay in half precision.
         self.loss_scaler.backward(output_tensor, retain_graph=retain_graph,
                                   output_tensor_grad=output_tensor_grad)
         if update_master_grads:

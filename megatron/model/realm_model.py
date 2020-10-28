@@ -18,8 +18,7 @@ def general_ict_model_provider(only_query_model=False, only_block_model=False):
     args = get_args()
     assert args.ict_head_size is not None, \
         "Need to specify --ict-head-size to provide an ICTBertModel"
-
-    assert args.tensor_model_parallel_size == 1, \
+    assert args.tensor_model_parallel_size == 1 and args.pipeline_model_parallel_size == 1, \
         "Model parallel size > 1 not supported for ICT"
 
     print_rank_0('building ICTBertModel...')

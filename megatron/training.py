@@ -361,6 +361,9 @@ def train_step(forward_step_func, data_iterator,
 
     # Compute number of microbatches in a minibatch.
     num_microbatches_in_minibatch = args.num_microbatches_in_minibatch
+    # For now, perform training without warmup. Perform forward
+    # passes for all microbatches, then backward passes for all
+    # microbatches.
     # TODO: Switch to the following schedule to facilitate more
     # memory-efficient training.
     # num_warmup_microbatches = \
@@ -369,9 +372,6 @@ def train_step(forward_step_func, data_iterator,
     # num_warmup_microbatches = min(
     #     num_warmup_microbatches,
     #     num_microbatches_in_minibatch)
-    # For now, perform training without warmup. Perform forward
-    # passes for all microbatches, then backward passes for all
-    # microbatches.
     num_warmup_microbatches = num_microbatches_in_minibatch
 
     input_tensors = []
@@ -381,17 +381,31 @@ def train_step(forward_step_func, data_iterator,
     # Run warmup forward passes.
     timers('forward').start()
     for i in range(num_warmup_microbatches):
-        forward_step_with_communication(
-            forward_step_func, data_iterator, model,
-            input_tensors, output_tensors,
-            losses_reduced, timers)
+        if args.pipeline_model_parallel_size > 1:
+            forward_step_with_communication(
+                forward_step_func, data_iterator, model,
+                input_tensors, output_tensors,
+                losses_reduced, timers)
+        else:
+            input_tensor = None
+            loss, loss_reduced = forward_step_func(data_iterator, model, input_tensor)
+            output_tensor = loss
+            losses_reduced.append(loss_reduced)
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
     timers('forward').stop()
 
     # Run cooldown backward passes.
     timers('backward').start()
     for i in range(num_warmup_microbatches):
-        backward_step_with_communication(
-            optimizer, model, input_tensors, output_tensors, timers)
+        if args.pipeline_model_parallel_size > 1:
+            backward_step_with_communication(
+                optimizer, model, input_tensors, output_tensors, timers)
+        else:
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
+            output_tensor_grad = None
+            backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_grad)
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':
@@ -400,7 +414,10 @@ def train_step(forward_step_func, data_iterator,
                                fp32_allreduce=args.fp32_allreduce)
         timers('allreduce').stop()
 
-    # All-reduce across first and last stages.
+    # All-reduce word_embeddings' grad across first and last stages to ensure
+    # that word_embeddings parameters stay in sync.
+    # This should only run for models that support pipelined model parallelism
+    # (BERT and GPT-2).
     timers('backward-embedding-all-reduce').start()
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
             args.pipeline_model_parallel_size > 1:
