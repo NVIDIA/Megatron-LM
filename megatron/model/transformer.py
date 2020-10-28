@@ -506,14 +506,6 @@ class ParallelTransformer(MegatronModule):
 
         # Number of layers.
         self.num_layers = args.num_layers // args.pipeline_model_parallel_size
-        # TODO: Need to do something different in case self.num_layers != self.num_unique_layers?
-        if args.num_unique_layers is None:
-            self.num_unique_layers = self.num_layers
-        else:
-            self.num_unique_layers = args.num_unique_layers // args.pipeline_model_parallel_size
-        assert self.num_layers == self.num_unique_layers, \
-            'number of layers should be equal to the number of unique layers'
-        self.param_sharing_style = args.param_sharing_style
 
         # Transformer layers.
         def build_layer(layer_number):
@@ -522,16 +514,7 @@ class ParallelTransformer(MegatronModule):
                 output_layer_init_method, layer_number)
         offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
         self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_unique_layers)])
-
-        # Print layer ordering.
-        if self.num_layers != self.num_unique_layers:
-            if torch.distributed.get_rank() == 0:
-                print('> will be using the following layer ordering:')
-                for i in range(self.num_layers):
-                    print('   layer id: {:3d} --> unique layer id: '
-                          '{:3d}'.format(i, self._get_layer_index(i)),
-                          flush=True)
+            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if mpu.is_pipeline_last_stage():
             # Final layer norm before output.
@@ -539,15 +522,8 @@ class ParallelTransformer(MegatronModule):
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
 
-    def _get_layer_index(self, layer_number):
-        if self.param_sharing_style == 'grouped':
-            return layer_number % self.num_unique_layers
-        if self.param_sharing_style == 'spaced':
-            return layer_number // (self.num_layers // self.num_unique_layers) 
-        assert False, 'should not be here'
-
     def _get_layer(self, layer_number):
-        return self.layers[self._get_layer_index(layer_number)]
+        return self.layers[layer_number]
 
     def _checkpointed_forward(self, hidden_states, attention_mask):
         """Forward method with activation checkpointing."""
