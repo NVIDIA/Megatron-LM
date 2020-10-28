@@ -72,17 +72,10 @@ class FP16_Module(MegatronModule):
         self.add_module('module', module.half())
 
     def forward(self, *inputs, **kwargs):
-        convert_inputs = True
-        convert_outputs = True
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
-            if not mpu.is_pipeline_first_stage():
-                convert_inputs = False
-            if not mpu.is_pipeline_last_stage():
-                convert_outputs = False
-        if convert_inputs:
+        if mpu.is_pipeline_first_stage():
             inputs = fp32_to_fp16(inputs)
         outputs = self.module(*inputs, **kwargs)
-        if convert_outputs:
+        if mpu.is_pipeline_last_stage():
             outputs = fp16_to_fp32(outputs)
         return outputs
 
