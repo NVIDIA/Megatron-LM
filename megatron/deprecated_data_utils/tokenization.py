@@ -885,7 +885,7 @@ class GPT2BPETokenizer(Tokenizer):
             processed_text = process_fn(processed_text)
         tokens = []
         for token in re.findall(self.text_tokenizer.pat, processed_text):
-            token = ''.join(self.text_tokenizer.bye_encoder[b] for b in token.encode('utf-8'))
+            token = ''.join(self.text_tokenizer.byte_encoder[b] for b in token.encode('utf-8'))
             tokens.extend(bpe_token for bpe_token in self.text_tokenizer.bpe(token).split(' '))
         tokenization = Tokenization(tokens, processed_text, text, asIds=False)
         tokenization.set_command_tokens(self._command_tokens)
