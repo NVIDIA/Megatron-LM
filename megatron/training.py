@@ -275,13 +275,11 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
         input_tensor.retain_grad()
 
     # Backward pass.
-    timers('backward-backward').start()
     if args.fp16:
         optimizer.backward(output_tensor, update_master_grads=False,
                            output_tensor_grad=output_tensor_grad)
     else:
         torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
-    timers('backward-backward').stop()
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = None
@@ -409,10 +407,10 @@ def train_step(forward_step_func, data_iterator,
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':
-        timers('allreduce').start()
+        timers('backward-params-all-reduce').start()
         model.allreduce_params(reduce_after=False,
                                fp32_allreduce=args.fp32_allreduce)
-        timers('allreduce').stop()
+        timers('backward-params-all-reduce').stop()
 
     # All-reduce word_embeddings' grad across first and last stages to ensure
     # that word_embeddings parameters stay in sync.
@@ -512,9 +510,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             timers_to_log.append(name)
     add_to_logging('forward')
     add_to_logging('backward')
-    add_to_logging('backward-backward')
-    add_to_logging('backward-allreduce')
     add_to_logging('backward-master-grad')
+    add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
     add_to_logging('backward-clip-grad')
     add_to_logging('optimizer')
