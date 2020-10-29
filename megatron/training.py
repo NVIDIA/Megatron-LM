@@ -716,7 +716,7 @@ def build_train_valid_test_data_iterators(
     if mpu.get_tensor_model_parallel_rank() == 0:
         # Rank, size, and global batch size.
         data_parallel_size = mpu.get_data_parallel_world_size()
-        global_batch_size = args.batch_size * data_parallel_size
+        global_batch_size = args.batch_size * data_parallel_size * args.num_microbatches_in_minibatch
 
         # Number of train/valid/test samples.
         train_iters = args.train_iters
