@@ -405,9 +405,11 @@ def _add_data_args(parser):
                        '`90,5,5` will use 90% of data for training, 5% for '
                        'validation and 5% for test.')
     group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file.')
+                       help='Path to the vocab file. Will be copied to the model directory. If omitted and a vocab '
+                            'file already exists in the model directory, that file will be used.')
     group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file.')
+                       help='Path to the BPE merge file. Will be copied to the model directory. If omitted and a merge '
+                            'file already exists in the model directory, that file will be used.')
     group.add_argument('--seq-length', type=int, default=None,
                        help="Maximum sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,

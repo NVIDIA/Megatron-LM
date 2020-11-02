@@ -14,12 +14,29 @@
 # limitations under the License.
 
 """Megatron tokenizers."""
-
+import os
+import shutil
 from abc import ABC
 from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
+
+
+def copy_file_to_model_dir(args, file_from_args, file_name_in_model_dir):
+    """Copy a file to the model directory and return the path to the file that should be used."""
+    if args.save and file_from_args and args.rank == 0:
+        file_in_model_dir = os.path.join(args.save, file_name_in_model_dir)
+        print(f"copying vocab file from {file_from_args} to {file_in_model_dir}")
+        os.makedirs(args.save, exist_ok=True)
+        try:
+            shutil.copyfile(file_from_args, file_in_model_dir)
+        except shutil.SameFileError:
+            pass
+
+    file_to_use = file_from_args if file_from_args else os.path.join(args.load, file_name_in_model_dir)
+    assert os.path.exists(file_to_use)
+    return file_to_use
 
 
 def build_tokenizer(args):
@@ -29,16 +46,17 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None
+    vocab_file = copy_file_to_model_dir(args, args.vocab_file, "vocab.json")
+
     if args.tokenizer_type == 'BertWordPieceLowerCase':
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+        tokenizer = _BertWordPieceTokenizer(vocab_file=vocab_file,
                                             lower_case=True)
     elif args.tokenizer_type == 'BertWordPieceCase':
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
+        tokenizer = _BertWordPieceTokenizer(vocab_file=vocab_file,
                                             lower_case=False)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
-        assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        merge_file = copy_file_to_model_dir(args, args.merge_file, "merges.txt")
+        tokenizer = _GPT2BPETokenizer(vocab_file, merge_file)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
