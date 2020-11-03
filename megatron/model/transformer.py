@@ -505,6 +505,8 @@ class ParallelTransformer(MegatronModule):
         self.checkpoint_num_layers = args.checkpoint_num_layers
 
         # Number of layers.
+        assert args.num_layers % args.pipeline_model_parallel_size == 0, \
+            'num_layers must be divisible by pipeline_model_parallel_size'
         self.num_layers = args.num_layers // args.pipeline_model_parallel_size
 
         # Transformer layers.

@@ -19,7 +19,7 @@ import torch
 
 from megatron import get_args
 from megatron import mpu
-from megatron.module import MegatronModule
+from megatron.module import PipelinedMegatronModule
 
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
@@ -61,7 +61,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         return loss
 
 
-class GPT2ModelBase(MegatronModule):
+class GPT2ModelBase(PipelinedMegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self, num_tokentypes=0, parallel_output=True):
@@ -79,39 +79,7 @@ class GPT2ModelBase(MegatronModule):
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))
 
-        # Parameters are shared between the word embeddings layer, and the heads at
-        # the end of the model. In a pipelined setup with more than one stage, the
-        # initial embedding layer and the head are on different workers, so we do
-        # the following:
-        # 1. Create a second copy of word_embeddings on the last stage, with initial
-        #    parameters of 0.0.
-        # 2. Do an all-reduce between the first and last stage to ensure that the
-        #    two copies of word_embeddings start off with the same parameter values.
-        # 3. In the training loop, before an all-reduce between the grads of the two
-        #    word_embeddings layers to ensure that every applied weight update is the
-        #    same on both stages.
-        if mpu.is_pipeline_last_stage():
-            if not mpu.is_pipeline_first_stage():
-                self._word_embeddings_for_head_key = 'word_embeddings_for_head'
-                # If first and last stages are different, set word_embeddings
-                # weights to 0 here, then copy first stage's weights using all_reduce
-                # below.
-                self.word_embeddings = mpu.VocabParallelEmbedding(
-                    args.padded_vocab_size, args.hidden_size,
-                    init_method=init_method_normal(args.init_method_std))
-                self.word_embeddings.weight.data.fill_(0)
-        # Ensure that first and last stages have the same initial parameter values.
-        if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
-            torch.distributed.all_reduce(self.word_embeddings_weight().data,
-                                         group=mpu.get_embedding_group())
-
-    def word_embeddings_weight(self):
-        if mpu.is_pipeline_first_stage():
-            return self.language_model.embedding.word_embeddings.weight
-        if mpu.is_pipeline_last_stage():
-            return self.word_embeddings.weight
-        raise Exception('word_embeddings_weight() should be '
-                        'called for first and last stage only')
+        self.initialize_word_embeddings(init_method_normal)
 
     def forward(self, gpt2_model_input, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
