@@ -554,8 +554,7 @@ def train_step(forward_step_func, data_iterator,
         loss_reduced = {}
         for key in losses_reduced[0]:
             losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / \
-                    len(losses_reduced_for_key)
+            loss_reduced[key] = sum(losses_reduced_for_key)
         return loss_reduced, skipped_iter
     return {}, skipped_iter
 

@@ -110,7 +110,8 @@ def forward_step(data_iterator, model, input_tensor):
     if mpu.is_pipeline_last_stage():
         losses = output_tensor.float()
         loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+        loss = torch.sum(losses.view(-1) * loss_mask) / (
+            loss_mask.sum() * args.num_microbatches_in_minibatch)
 
         # Reduce loss for logging.
         averaged_loss = average_losses_across_data_parallel_group([loss])
