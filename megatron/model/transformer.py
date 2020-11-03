@@ -552,7 +552,7 @@ class ParallelTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
 
-        # Checks
+        # Checks.
         if layer_past is not None:
             assert get_key_value, \
                 'for not None values in layer_past, ' \
@@ -562,8 +562,9 @@ class ParallelTransformer(MegatronModule):
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
-        # data format change to avoid explicit tranposes : [b s h] --> [s b h]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        if mpu.is_pipeline_first_stage():
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
 
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,
@@ -584,11 +585,10 @@ class ParallelTransformer(MegatronModule):
                     hidden_states, present = hidden_states
                     presents.append(present)
         
-        # reverting data format change [s b h] --> [b s h]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
-
         # Final layer norm.
         if mpu.is_pipeline_last_stage():
+            # Reverting data format change [s b h] --> [b s h].
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)
         else:
             output = hidden_states

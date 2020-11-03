@@ -245,7 +245,7 @@ def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward)
     # if needed.
     tensor_recv_prev = None
     tensor_recv_next = None
-    tensor_shape = (args.batch_size, args.seq_length, args.hidden_size)
+    tensor_shape = (args.seq_length, args.batch_size, args.hidden_size)
     if recv_forward:
         tensor_recv_prev = torch.empty(tensor_shape,
                                        requires_grad=True,
