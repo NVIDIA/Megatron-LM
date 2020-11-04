@@ -381,6 +381,8 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                                            forward_method_parallel_output=False)
                 logits = logits[:, -1].view(batch_size, -1).contiguous()
 
+            # Ignore padding tokens
+            logits = logits[:, :tokenizer.vocab_size]
             if args.greedy:
                 prev = torch.argmax(logits, dim=-1).view(-1)
             else:
