@@ -374,13 +374,13 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
         output_tensor_grad = None
         losses_reduced.append(loss_reduced)
     else:
-        timers('forward-send').start()
+        timers('forward-send-backward-recv').start()
         _, output_tensor_grad = communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
             recv_forward=False,
             recv_backward=True)
-        timers('forward-send').stop()
+        timers('forward-send-backward-recv').stop()
     timers('forward').stop()
 
     input_tensors.append(input_tensor)
@@ -397,13 +397,13 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
     timers('backward-compute').stop()
 
     if not mpu.is_pipeline_first_stage():
-        timers('backward-send').start()
+        timers('backward-send-forward-recv').start()
         input_tensor, _ = communicate(
             tensor_send_next=None,
             tensor_send_prev=input_grad_tensor,
             recv_forward=(not last_microbatch),
             recv_backward=False)
-        timers('backward-send').stop()
+        timers('backward-send-forward-recv').stop()
     else:
         input_tensor = None
     timers('backward').stop()
@@ -597,10 +597,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('forward-compute')
     add_to_logging('forward-recv')
     add_to_logging('forward-send')
+    add_to_logging('forward-send-backward-recv')
     add_to_logging('backward')
     add_to_logging('backward-compute')
     add_to_logging('backward-recv')
     add_to_logging('backward-send')
+    add_to_logging('backward-send-forward-recv')
     add_to_logging('backward-master-grad')
     add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
