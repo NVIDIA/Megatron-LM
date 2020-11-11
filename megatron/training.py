@@ -363,7 +363,6 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
                                                   input_tensors, output_tensors,
                                                   losses_reduced, timers):
     # Forward model for one step.
-    timers('forward').start()
     timers('forward-compute').start()
     output_tensor = forward_step_func(data_iterator, model, input_tensor)
     timers('forward-compute').stop()
@@ -381,7 +380,6 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
             recv_forward=False,
             recv_backward=True)
         timers('forward-send-backward-recv').stop()
-    timers('forward').stop()
 
     input_tensors.append(input_tensor)
     output_tensors.append(output_tensor)
@@ -390,7 +388,6 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
     output_tensor = output_tensors.pop(0)
 
     # Backward pass for one step.
-    timers('backward').start()
     timers('backward-compute').start()
     input_grad_tensor = \
         backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_grad)
@@ -406,7 +403,6 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
         timers('backward-send-forward-recv').stop()
     else:
         input_tensor = None
-    timers('backward').stop()
 
     return input_tensor
 
@@ -437,7 +433,6 @@ def train_step(forward_step_func, data_iterator,
     losses_reduced = []
 
     # Run warmup forward passes.
-    timers('forward').start()
     for i in range(num_warmup_microbatches):
         if args.pipeline_model_parallel_size > 1:
             forward_step_with_communication(
@@ -453,7 +448,6 @@ def train_step(forward_step_func, data_iterator,
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
             timers('forward-compute').stop()
-    timers('forward').stop()
 
     # Before running 1F1B, need to receive first forward tensor.
     if (num_microbatches_in_minibatch - num_warmup_microbatches) > 0:
@@ -478,7 +472,6 @@ def train_step(forward_step_func, data_iterator,
                                                           losses_reduced, timers)
 
     # Run cooldown backward passes.
-    timers('backward').start()
     for i in range(num_warmup_microbatches):
         if args.pipeline_model_parallel_size > 1:
             backward_step_with_communication(
@@ -535,7 +528,6 @@ def train_step(forward_step_func, data_iterator,
         else:
             optimizer.clip_master_grads(args.clip_grad)
     timers('backward-clip-grad').stop()
-    timers('backward').stop()
 
     # Update parameters.
     timers('optimizer').start()
@@ -593,12 +585,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     def add_to_logging(name):
         if name in timers.timers:
             timers_to_log.append(name)
-    add_to_logging('forward')
     add_to_logging('forward-compute')
     add_to_logging('forward-recv')
     add_to_logging('forward-send')
     add_to_logging('forward-send-backward-recv')
-    add_to_logging('backward')
     add_to_logging('backward-compute')
     add_to_logging('backward-recv')
     add_to_logging('backward-send')
