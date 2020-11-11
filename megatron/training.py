@@ -249,11 +249,13 @@ def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward)
     if recv_forward:
         tensor_recv_prev = torch.empty(tensor_shape,
                                        requires_grad=True,
-                                       dtype=args.params_dtype).cuda()
+                                       device=torch.cuda.current_device(),
+                                       dtype=args.params_dtype)
     if recv_backward:
         tensor_recv_next = torch.empty(tensor_shape,
                                        requires_grad=True,
-                                       dtype=args.params_dtype).cuda()
+                                       device=torch.cuda.current_device(),
+                                       dtype=args.params_dtype)
 
     # Send tensors in both the forward and backward directions as appropriate.
     torch.distributed.ring_exchange(tensor_send_prev=tensor_send_prev,
