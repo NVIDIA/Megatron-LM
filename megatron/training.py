@@ -409,6 +409,87 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
     return input_tensor
 
 
+def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
+                                   optimizer, timers):
+    """Run forward and backward passes without inter-stage communication."""
+    args = get_args()
+
+    losses_reduced = []
+    for i in range(args.num_microbatches_in_minibatch):
+        timers('forward-compute').start()
+        loss, loss_reduced = forward_step_func(data_iterator, model, input_tensor=None)
+        output_tensor = loss
+        losses_reduced.append(loss_reduced)
+        timers('forward-compute').stop()
+
+        timers('backward-compute').start()
+        output_tensor_grad = None
+        backward_step(optimizer, model, input_tensor=None,
+                      output_tensor=output_tensor, output_tensor_grad=None)
+        timers('backward-compute').stop()
+
+    return losses_reduced
+
+
+def forward_backward_pipelining(forward_step_func, data_iterator, model,
+                                optimizer, timers):
+    """Run 1F1B schedule, with communication and warmup + cooldown microbatches as needed."""
+    args = get_args()
+
+    # Compute number of warmup microbatches.
+    num_microbatches_in_minibatch = args.num_microbatches_in_minibatch
+    num_warmup_microbatches = \
+        (mpu.get_pipeline_model_parallel_world_size() -
+         mpu.get_pipeline_model_parallel_rank() - 1)
+    num_warmup_microbatches = min(
+        num_warmup_microbatches,
+        num_microbatches_in_minibatch)
+    num_microbatches_in_minibatch_remaining = \
+        num_microbatches_in_minibatch - num_warmup_microbatches
+
+    input_tensors = []
+    output_tensors = []
+    losses_reduced = []
+
+    # Run warmup forward passes.
+    for i in range(num_warmup_microbatches):
+        forward_step_with_communication(
+            forward_step_func, data_iterator, model,
+            input_tensors, output_tensors,
+            losses_reduced, timers)
+
+    # Before running 1F1B, need to receive first forward tensor.
+    # If all microbatches are run in warmup / cooldown phase, then no need to
+    # receive this tensor here.
+    if num_microbatches_in_minibatch_remaining > 0:
+        if mpu.is_pipeline_first_stage():
+            input_tensor = None
+        else:
+            timers('forward-recv').start()
+            input_tensor, _ = communicate(tensor_send_next=None,
+                                          tensor_send_prev=None,
+                                          recv_forward=True,
+                                          recv_backward=False)
+            timers('forward-recv').stop()
+
+    # Run 1F1B.
+    for i in range(num_microbatches_in_minibatch_remaining):
+        last_iteration = (i == (num_microbatches_in_minibatch_remaining - 1))
+        input_tensor = \
+            forward_and_backward_steps_with_communication(forward_step_func, data_iterator, model,
+                                                          optimizer,
+                                                          input_tensor, last_iteration,
+                                                          input_tensors, output_tensors,
+                                                          losses_reduced, timers)
+
+    # Run cooldown backward passes.
+    for i in range(num_warmup_microbatches):
+        backward_step_with_communication(
+            optimizer, model, input_tensors, output_tensors, timers)
+
+    return losses_reduced
+
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, lr_scheduler):
     """Single training step."""
@@ -421,70 +502,12 @@ def train_step(forward_step_func, data_iterator,
     else:
         optimizer.zero_grad()
 
-    # Compute number of microbatches in a minibatch.
-    num_microbatches_in_minibatch = args.num_microbatches_in_minibatch
-    num_warmup_microbatches = \
-        (mpu.get_pipeline_model_parallel_world_size() -
-         mpu.get_pipeline_model_parallel_rank() - 1)
-    num_warmup_microbatches = min(
-        num_warmup_microbatches,
-        num_microbatches_in_minibatch)
-
-    input_tensors = []
-    output_tensors = []
-    losses_reduced = []
-
-    # Run warmup forward passes.
-    for i in range(num_warmup_microbatches):
-        if args.pipeline_model_parallel_size > 1:
-            forward_step_with_communication(
-                forward_step_func, data_iterator, model,
-                input_tensors, output_tensors,
-                losses_reduced, timers)
-        else:
-            timers('forward-compute').start()
-            input_tensor = None
-            loss, loss_reduced = forward_step_func(data_iterator, model, input_tensor)
-            output_tensor = loss
-            losses_reduced.append(loss_reduced)
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
-            timers('forward-compute').stop()
-
-    # Before running 1F1B, need to receive first forward tensor.
-    if (num_microbatches_in_minibatch - num_warmup_microbatches) > 0:
-        if mpu.is_pipeline_first_stage():
-            input_tensor = None
-        else:
-            timers('forward-recv').start()
-            input_tensor, _ = communicate(tensor_send_next=None,
-                                          tensor_send_prev=None,
-                                          recv_forward=True,
-                                          recv_backward=False)
-            timers('forward-recv').stop()
-
-    # Run 1F1B.
-    for i in range(num_microbatches_in_minibatch - num_warmup_microbatches):
-        last_iteration = (i == (num_microbatches_in_minibatch - num_warmup_microbatches - 1))
-        input_tensor = \
-            forward_and_backward_steps_with_communication(forward_step_func, data_iterator, model,
-                                                          optimizer,
-                                                          input_tensor, last_iteration,
-                                                          input_tensors, output_tensors,
-                                                          losses_reduced, timers)
-
-    # Run cooldown backward passes.
-    for i in range(num_warmup_microbatches):
-        if args.pipeline_model_parallel_size > 1:
-            backward_step_with_communication(
-                optimizer, model, input_tensors, output_tensors, timers)
-        else:
-            timers('backward-compute').start()
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
-            output_tensor_grad = None
-            backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_grad)
-            timers('backward-compute').stop()
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        losses_reduced = forward_backward_pipelining(
+            forward_step_func, data_iterator, model, optimizer, timers)
+    else:
+        losses_reduced = forward_backward_no_pipelining(
+            forward_step_func, data_iterator, model, optimizer, timers)
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':
@@ -499,7 +522,7 @@ def train_step(forward_step_func, data_iterator,
     # (BERT and GPT-2).
     timers('backward-embedding-all-reduce').start()
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
-            args.pipeline_model_parallel_size > 1:
+            mpu.get_pipeline_model_parallel_world_size() > 1:
         unwrapped_model = model
         while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
             unwrapped_model = unwrapped_model.module

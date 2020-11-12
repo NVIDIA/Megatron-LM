@@ -33,7 +33,7 @@ def model_provider():
 
     print_rank_0('building GPT2 model ...')
     args = get_args()
-    if args.pipeline_model_parallel_size > 1:
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
         # Determine model based on position of stage in pipeline.
         if mpu.is_pipeline_first_stage():
             model = GPT2ModelFirstStage(num_tokentypes=0)
