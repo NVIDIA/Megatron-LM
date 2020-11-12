@@ -149,6 +149,7 @@ class BertModelBase(PipelinedMegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
+        self.initialize_word_embeddings(init_method_normal)
         if mpu.is_pipeline_last_stage():
             self.lm_head = BertLMHead(
                 self.word_embeddings_weight().size(0),
@@ -159,8 +160,6 @@ class BertModelBase(PipelinedMegatronModule):
                 self.binary_head = get_linear_layer(args.hidden_size, 2,
                                                     init_method)
                 self._binary_head_key = 'binary_head'
-
-        self.initialize_word_embeddings(init_method_normal)
 
     def forward(self, bert_model_input, attention_mask,
                 tokentype_ids=None, lm_labels=None):
