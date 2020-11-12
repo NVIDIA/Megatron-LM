@@ -118,8 +118,7 @@ def forward_step(data_iterator, model, input_tensor):
         lm_loss_ = lm_loss_.float()
         loss_mask = loss_mask.float()
         lm_loss = torch.sum(
-            lm_loss_.view(-1) * loss_mask.reshape(-1)) / (
-                loss_mask.sum() * args.num_microbatches_in_minibatch)
+            lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
         loss = lm_loss + sop_loss
 
