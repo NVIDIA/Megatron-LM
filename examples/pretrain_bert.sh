@@ -32,4 +32,3 @@ python pretrain_bert.py \
        --eval-interval 1000 \
        --eval-iters 10 \
        --fp16
-
