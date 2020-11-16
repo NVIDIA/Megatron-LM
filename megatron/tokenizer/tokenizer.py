@@ -25,7 +25,7 @@ from .gpt2_tokenization import GPT2Tokenizer
 
 def copy_file_to_model_dir(args, file_from_args, file_name_in_model_dir):
     """Copy a file to the model directory and return the path to the file that should be used."""
-    if args.save and file_from_args and args.rank == 0:
+    if hasattr(args, "save") and args.save and file_from_args and args.rank == 0:
         file_in_model_dir = os.path.join(args.save, file_name_in_model_dir)
         print(f"copying vocab file from {file_from_args} to {file_in_model_dir}")
         os.makedirs(args.save, exist_ok=True)
