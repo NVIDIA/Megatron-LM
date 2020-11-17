@@ -161,15 +161,15 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            losses_dict, _ = train_step(forward_step, batch, model,
-                                        optimizer, lr_scheduler)
+            losses_dict, skipped_iter = train_step(forward_step, batch, model,
+                                                   optimizer, lr_scheduler)
             iteration += 1
 
             # Logging.
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               iteration, optimizer.loss_scale,
-                                              report_memory_flag)
+                                              report_memory_flag, skipped_iter)
 
             # Autoresume
             if args.adlr_autoresume and \

@@ -64,8 +64,7 @@ class MultipleChoice(MegatronModule):
         attention_mask = attention_mask.view(-1, attention_mask.size(-1))
         tokentype_ids = tokentype_ids.view(-1, tokentype_ids.size(-1))
 
-        extended_attention_mask = bert_extended_attention_mask(
-            attention_mask, next(self.language_model.parameters()).dtype)
+        extended_attention_mask = bert_extended_attention_mask(attention_mask)
         position_ids = bert_position_ids(input_ids)
 
         _, pooled_output = self.language_model(input_ids,
