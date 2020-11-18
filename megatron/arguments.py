@@ -358,7 +358,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='mixed precision')
+    group = parser.add_argument_group(title='distributed')
 
     group.add_argument('--model-parallel-size', type=int, default=1,
                        help='Size of the model parallel.')
