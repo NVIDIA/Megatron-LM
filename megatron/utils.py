@@ -65,7 +65,7 @@ def print_params_min_max_norm(optimizer, iteration):
             index += 1
             min_ = param.data.min()
             max_ = param.data.max()
-            norm = param.data.norm()
+            norm = torch.linalg.norm(param.data)
             string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
                 iteration, rank, index, int(param.model_parallel))
             string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)

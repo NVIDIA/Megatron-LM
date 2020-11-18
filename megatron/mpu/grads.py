@@ -112,7 +112,7 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
         total_norm = 0
         for p in parameters:
             if p.model_parallel or (get_model_parallel_rank() == 0):
-                param_norm = p.grad.data.norm(norm_type)
+                param_norm = torch.linalg.norm(p.grad.data.flatten(), norm_type)
                 total_norm += param_norm.item() ** norm_type
         # Sum across all model parallel GPUs.
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
