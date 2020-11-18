@@ -358,7 +358,7 @@ def _add_mixed_precision_args(parser):
 
 
 def _add_distributed_args(parser):
-    group = parser.add_argument_group(title='mixed precision')
+    group = parser.add_argument_group(title='distributed')
 
     group.add_argument('--model-parallel-size', type=int, default=1,
                        help='Size of the model parallel.')
@@ -402,8 +402,8 @@ def _add_data_args(parser):
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
-                       '`90,5,5` will use 90% of data for training, 5% for '
-                       'validation and 5% for test.')
+                       '`90,5,5` will use 90%% of data for training, 5%% for '
+                       'validation and 5%% for test.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
