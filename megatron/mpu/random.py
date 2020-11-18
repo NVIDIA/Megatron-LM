@@ -224,7 +224,7 @@ def model_parallel_cuda_manual_seed(seed):
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     model_parallel_seed = offset + get_model_parallel_rank()
-    # Data parallel gets the original sedd.
+    # Data parallel gets the original seed.
     data_parallel_seed = seed
 
     if torch.distributed.get_rank() == 0:
