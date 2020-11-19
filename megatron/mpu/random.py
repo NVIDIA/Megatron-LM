@@ -54,7 +54,7 @@ def init_checkpointed_activations_memory_buffer():
     dtype = torch.half
     if not args.fp16:
         dtype = torch.float
-        
+
     global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
     assert _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is None, \
         'checkpointed activations memory buffer is already allocated.'
@@ -224,7 +224,7 @@ def model_parallel_cuda_manual_seed(seed):
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
-    # Data parallel gets the original sedd.
+    # Data parallel gets the original seed.
     data_parallel_seed = seed
 
     if torch.distributed.get_rank() == 0:
@@ -268,11 +268,11 @@ class CheckpointFunction(torch.autograd.Function):
             args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
             args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
                 args[0].data)
-            
+
         # Store everything.
         ctx.save_for_backward(*args)
 
-            
+
         return outputs
 
     @staticmethod
