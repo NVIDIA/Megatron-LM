@@ -24,7 +24,7 @@ from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.checkpointing import save_checkpoint
-from megatron.data.samplers import DistributedBatchSampler
+from megatron.data.sampler import MegatronPretrainingSampler
 from megatron.fp16 import FP16_Optimizer
 
 
@@ -89,7 +89,7 @@ def check_adlr_autoresume_termination(iteration, model,
         sys.exit(0)
 
 
-def make_data_loader(dataset):
+def make_data_loader(dataset, consumed_samples):
     """Buld dataloader given an input dataset."""
     if dataset is None:
         return None
@@ -101,13 +101,11 @@ def make_data_loader(dataset):
     global_batch_size = args.batch_size * world_size
     num_workers = args.num_workers
 
-    # Use a simple sampler with distributed batch sampler.
-    sampler = torch.utils.data.SequentialSampler(dataset)
-    batch_sampler = DistributedBatchSampler(sampler=sampler,
-                                            batch_size=global_batch_size,
-                                            drop_last=True,
-                                            rank=rank,
-                                            world_size=world_size)
+    # Megatron sampler
+    batch_sampler = MegatronPretrainingSampler(
+        total_samples=len(dataset), consumed_samples=consumed_samples,
+        global_batch_size=global_batch_size, rank=rank, world_size=world_size)
+
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,

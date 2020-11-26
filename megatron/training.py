@@ -540,9 +540,12 @@ def build_train_valid_test_data_iterators(
             train_val_test_num_samples)
 
         # Build dataloders.
-        train_dataloader = make_data_loader(train_ds)
-        valid_dataloader = make_data_loader(valid_ds)
-        test_dataloader = make_data_loader(test_ds)
+        comsumed_samples = args.iteration * global_batch_size
+        train_dataloader = make_data_loader(train_ds, comsumed_samples)
+        comsumed_samples = (args.iteration // args.eval_interval) * \
+            args.eval_iters * global_batch_size
+        valid_dataloader = make_data_loader(valid_ds, comsumed_samples)
+        test_dataloader = make_data_loader(test_ds, comsumed_samples)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
@@ -561,21 +564,7 @@ def build_train_valid_test_data_iterators(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
-
-    # Shift the start iterations.
-    if train_dataloader is not None:
-        train_dataloader.batch_sampler.start_iter = args.iteration % \
-            len(train_dataloader)
-        print_rank_0('setting training data start iteration to {}'.
-                     format(train_dataloader.batch_sampler.start_iter))
-    if valid_dataloader is not None:
-        start_iter_val = (args.iteration // args.eval_interval) * \
-            args.eval_iters
-        valid_dataloader.batch_sampler.start_iter = start_iter_val % \
-            len(valid_dataloader)
-        print_rank_0('setting validation data start iteration to {}'.
-                     format(valid_dataloader.batch_sampler.start_iter))
-
+    
     # Build iterators.
     if train_dataloader is not None:
         train_data_iterator = iter(train_dataloader)
