@@ -72,6 +72,9 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
+    # Consumed tokens.
+    args.consumed_train_samples = 0
+    args.consumed_valid_samples = 0
 
     # Set input defaults.
     for key in defaults:

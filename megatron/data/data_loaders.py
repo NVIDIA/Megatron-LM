@@ -13,7 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Megatorn Sampler."""
+"""Dataloaders."""
+
+
+import torch
+
+from megatron import get_args
+from megatron import mpu
+
+
+def build_pretraining_data_loader(dataset, consumed_samples):
+    """Buld dataloader given an input dataset."""
+
+    if dataset is None:
+        return None
+    args = get_args()
+
+    world_size = mpu.get_data_parallel_world_size()
+    global_batch_size = args.batch_size * world_size
+
+    # Megatron sampler
+    batch_sampler = MegatronPretrainingSampler(
+        total_samples=len(dataset),
+        consumed_samples=consumed_samples,
+        global_batch_size=global_batch_size,
+        rank=mpu.get_data_parallel_rank(),
+        world_size=world_size)
+
+    # Torch dataloader.
+    return torch.utils.data.DataLoader(dataset,
+                                       batch_sampler=batch_sampler,
+                                       num_workers=args.num_workers,
+                                       pin_memory=True)
 
 
 class MegatronPretrainingSampler:

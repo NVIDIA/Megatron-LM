@@ -89,7 +89,8 @@ def get_checkpoint_tracker_filename(checkpoints_path):
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+def save_checkpoint(iteration, model, optimizer, lr_scheduler,
+                    consumed_train_samples=None, consumed_valid_samples=None):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -103,6 +104,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 2.0
         state_dict['iteration'] = iteration
+        if consumed_train_samples:
+            state_dict['consumed_train_samples'] = consumed_train_samples
+        if consumed_valid_samples:
+            state_dict['consumed_valid_samples'] = consumed_valid_samples
         state_dict['model'] = model.state_dict_for_save_checkpoint()
 
         # Optimizer stuff.
@@ -213,7 +218,13 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
                              'iteration from checkpoint {}, exiting'.format(
                                  checkpoint_name))
                 sys.exit()
- 
+
+    if 'consumed_train_samples' in state_dict:
+        assert args.consumed_train_samples == 0
+        args.consumed_train_samples = state_dict['consumed_train_samples']
+    if 'consumed_valid_samples' in state_dict:
+        assert args.consumed_valid_samples == 0
+        args.consumed_valid_samples = state_dict['consumed_valid_samples']
 
     # Check arguments.
     if 'args' in state_dict:
