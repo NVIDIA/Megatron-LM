@@ -18,17 +18,51 @@
 #   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
 # with some modifications.
 
+import math
 import time
 import collections
 
 import numpy as np
 from megatron import get_args, print_rank_0
+from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 
 DSET_TYPE_STD = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
 
 DSET_TYPES = [DSET_TYPE_ICT, DSET_TYPE_STD]
+
+
+def get_datasets_weights_and_num_samples(data_prefix,
+                                         train_valid_test_num_samples):
+
+    # The data prefix should be in the format of:
+    #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
+    assert len(data_prefix) % 2 == 0
+    num_datasets = len(data_prefix) // 2
+    weights = [0]*num_datasets
+    prefixes = [0]*num_datasets
+    for i in range(num_datasets):
+        weights[i] = float(data_prefix[2*i])
+        prefixes[i] = (data_prefix[2*i+1]).strip()
+    # Normalize weights
+    weight_sum = 0.0
+    for weight in weights:
+        weight_sum += weight
+    assert weight_sum > 0.0
+    weights = [weight / weight_sum for weight in weights]
+
+    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+    # not uniformly distribute the number of samples, we still have
+    # samples left to feed to the network.
+    datasets_train_valid_test_num_samples = []
+    for weight in weights:
+        datasets_train_valid_test_num_samples.append(
+            [int(math.ceil(val * weight * 1.005))
+             for val in train_valid_test_num_samples])
+
+
+    return prefixes, weights, datasets_train_valid_test_num_samples
 
 
 def compile_helper():
@@ -360,6 +394,46 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     short_seq_prob, seed, skip_warmup,
                                     dataset_type='standard_bert'):
 
+    if len(data_prefix) == 1:
+        return _build_train_valid_test_datasets(data_prefix[0],
+                                                data_impl, splits_string,
+                                                train_valid_test_num_samples,
+                                                max_seq_length, masked_lm_prob,
+                                                short_seq_prob, seed,
+                                                skip_warmup,
+                                                dataset_type=dataset_type)
+    # Blending dataset.
+    # Parse the values.
+    output = get_datasets_weights_and_num_samples(data_prefix,
+                                                  train_valid_test_num_samples)
+    prefixes, weights, datasets_train_valid_test_num_samples = output
+
+    # Build individual datasets.
+    train_datasets = []
+    valid_datasets = []
+    test_datasets = []
+    for i in range(len(prefixes)):
+        train_ds, valid_ds, test_ds = _build_train_valid_test_datasets(
+            prefixes[i], data_impl, splits_string,
+            datasets_train_valid_test_num_samples[i],
+            max_seq_length, masked_lm_prob, short_seq_prob,
+            seed, skip_warmup, dataset_type=dataset_type)
+
+    # Blend.
+    blending_train_dataset = BlendableDataset(train_datasets, weights)
+    blending_valid_dataset = BlendableDataset(valid_datasets, weights)
+    blending_test_dataset = BlendableDataset(test_datasets, weights)
+
+    return (blending_train_dataset, blending_valid_dataset,
+            blending_test_dataset)
+
+
+def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+                                     train_valid_test_num_samples,
+                                     max_seq_length, masked_lm_prob,
+                                     short_seq_prob, seed, skip_warmup,
+                                     dataset_type='standard_bert'):
+    
     if dataset_type not in DSET_TYPES:
         raise ValueError("Invalid dataset_type: ", dataset_type)
 

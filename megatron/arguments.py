@@ -400,7 +400,7 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
-    group.add_argument('--data-path', type=str, default=None,
+    group.add_argument('--data-path', nargs='*', default=None,
                        help='Path to combined dataset to split.')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
