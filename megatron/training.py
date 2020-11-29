@@ -37,7 +37,7 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import make_data_loader
+from megatron.data.data_loaders import build_pretraining_data_loader
 from megatron.utils import report_memory
 
 
@@ -104,7 +104,9 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler,
+                        consumed_train_samples=args.consumed_train_samples,
+                        consumed_valid_samples=args.consumed_valid_samples)
 
     if args.do_test:
         # Run on test data.
@@ -224,7 +226,8 @@ def setup_model_and_optimizer(model_provider_func):
     while hasattr(unwrapped_model, 'module'):
         unwrapped_model = unwrapped_model.module
 
-    if args.iteration == 0 and hasattr(unwrapped_model, 'init_state_dict_from_bert'):
+    if args.iteration == 0 and hasattr(unwrapped_model,
+                                       'init_state_dict_from_bert'):
         print("Initializing ICT from pretrained BERT model", flush=True)
         unwrapped_model.init_state_dict_from_bert()
 
@@ -414,6 +417,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                              optimizer,
                                              lr_scheduler)
         iteration += 1
+        args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                       args.batch_size
 
         # Logging.
         loss_scale = None
@@ -433,7 +438,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Checkpointing
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            save_checkpoint(iteration, model, optimizer, lr_scheduler,
+                            consumed_train_samples=args.consumed_train_samples,
+                            consumed_valid_samples=args.consumed_valid_samples)
 
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
@@ -472,6 +479,8 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                                                             args.eval_iters))
             # Forward evaluation.
             _, loss_dict = forward_step_func(data_iterator, model)
+            args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
+                                           * args.batch_size
             # Reduce across processes.
             for key in loss_dict:
                 total_loss_dict[key] = total_loss_dict.get(key, 0.) + \
@@ -517,11 +526,19 @@ def build_train_valid_test_data_iterators(
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
+
+    # Rank and  global batch size.
+    data_parallel_size = mpu.get_data_parallel_world_size()
+    global_batch_size = args.batch_size * data_parallel_size
+    # Backward compatibility, assume fixed batch size.
+    if args.iteration > 0 and args.consumed_train_samples == 0:
+        args.consumed_train_samples = args.iteration * global_batch_size
+    if args.iteration > 0 and args.consumed_valid_samples == 0:
+        args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
+            args.eval_iters * global_batch_size
+    
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_model_parallel_rank() == 0:
-        # Rank, size, and global batch size.
-        data_parallel_size = mpu.get_data_parallel_world_size()
-        global_batch_size = args.batch_size * data_parallel_size
 
         # Number of train/valid/test samples.
         train_iters = args.train_iters
@@ -540,9 +557,11 @@ def build_train_valid_test_data_iterators(
             train_val_test_num_samples)
 
         # Build dataloders.
-        train_dataloader = make_data_loader(train_ds)
-        valid_dataloader = make_data_loader(valid_ds)
-        test_dataloader = make_data_loader(test_ds)
+        train_dataloader = build_pretraining_data_loader(
+            train_ds, args.consumed_train_samples)
+        valid_dataloader = build_pretraining_data_loader(
+            valid_ds, args.consumed_valid_samples)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
@@ -561,21 +580,7 @@ def build_train_valid_test_data_iterators(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
-
-    # Shift the start iterations.
-    if train_dataloader is not None:
-        train_dataloader.batch_sampler.start_iter = args.iteration % \
-            len(train_dataloader)
-        print_rank_0('setting training data start iteration to {}'.
-                     format(train_dataloader.batch_sampler.start_iter))
-    if valid_dataloader is not None:
-        start_iter_val = (args.iteration // args.eval_interval) * \
-            args.eval_iters
-        valid_dataloader.batch_sampler.start_iter = start_iter_val % \
-            len(valid_dataloader)
-        print_rank_0('setting validation data start iteration to {}'.
-                     format(valid_dataloader.batch_sampler.start_iter))
-
+    
     # Build iterators.
     if train_dataloader is not None:
         train_data_iterator = iter(train_dataloader)
