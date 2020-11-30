@@ -39,6 +39,8 @@ class RaceDataset(Dataset):
         print_rank_0('  >> total number of samples: {}'.format(
             len(self.samples)))
 
+        self.sample_multiplier = NUM_CHOICES
+
     def __len__(self):
         return len(self.samples)
 

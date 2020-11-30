@@ -45,7 +45,7 @@ def process_batch(batch):
     return tokens, types, labels, attention_mask
 
 
-def _cross_entropy_forward_step(batch, model):
+def _cross_entropy_forward_step(batch, model, input_tensor):
     """Simple forward step with cross-entropy loss."""
     timers = get_timers()
 
@@ -59,16 +59,25 @@ def _cross_entropy_forward_step(batch, model):
     timers('batch generator').stop()
 
     # Forward model.
-    logits = model(tokens, attention_mask, types)
+    if mpu.is_pipeline_first_stage():
+        assert input_tensor is None
+        output_tensor = model(tokens, attention_mask, tokentype_ids=types)
+    else:
+        assert input_tensor is not None
+        output_tensor = model(input_tensor, attention_mask)
 
-    # Cross-entropy loss.
-    loss_func = torch.nn.CrossEntropyLoss()
-    loss = loss_func(logits.contiguous().float(), labels)
+    if mpu.is_pipeline_last_stage():
+        logits = output_tensor
 
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
+        # Cross-entropy loss.
+        loss_func = torch.nn.CrossEntropyLoss()
+        loss = loss_func(logits.contiguous().float(), labels)
 
-    return loss, {'lm loss': averaged_loss[0]}
+        # Reduce loss for logging.
+        averaged_loss = average_losses_across_data_parallel_group([loss])
+
+        return loss, {'lm loss': averaged_loss[0]}
+    return output_tensor
 
 
 def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
@@ -119,6 +128,11 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
     valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
                                           args.num_workers, not args.keep_last)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
+
+    # Now that we've built the data loaders, set args.batch_size to
+    # the actual batch size the model will see for this dataset
+    if hasattr(train_dataset, 'sample_multiplier'):
+        args.batch_size *= train_dataset.sample_multiplier
 
     return train_dataloader, valid_dataloader
 
@@ -211,6 +225,8 @@ def finetune(train_valid_datasets_provider, model_provider,
         train_dataset, valid_dataset = train_valid_datasets_provider()
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
             train_dataset, valid_dataset)
+    else:
+        args.train_iters = 0
     timers('train/valid/test dataset/dataloder').stop()
 
     # Build calback function.
@@ -255,5 +271,4 @@ def finetune(train_valid_datasets_provider, model_provider,
         if end_of_epoch_callback is not None:
             print_rank_0('evaluation only mode, setting epoch to -1')
             end_of_epoch_callback(model, epoch=-1, output_predictions=True)
-
     print_rank_0('done :-)')

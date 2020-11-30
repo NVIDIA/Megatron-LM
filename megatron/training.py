@@ -575,9 +575,10 @@ def train_step(forward_step_func, data_iterator,
         while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
             unwrapped_model = unwrapped_model.module
 
-        word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-        torch.distributed.all_reduce(word_embeddings_weight.grad,
-                                     group=mpu.get_embedding_group())
+        if unwrapped_model.share_word_embeddings:
+            word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+            torch.distributed.all_reduce(word_embeddings_weight.grad,
+                                         group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
     # Update master gradients.
@@ -846,7 +847,6 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
         total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
 
     return total_loss_dict
-
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,

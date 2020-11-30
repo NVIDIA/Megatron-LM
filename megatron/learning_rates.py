@@ -119,8 +119,9 @@ class AnnealingLR(object):
             return cls_value
 
         if not self.use_checkpoint_lr_scheduler:
-            assert cls_value == sd_value, 'AnnealingLR: class input value' \
-                'and checkpoint values for {} do not match'.format(name)
+            assert cls_value == sd_value, \
+                f'AnnealingLR: class input value {cls_value} and checkpoint' \
+                f'value {sd_value} for {name} do not match'
         print_rank_0(' > using checkpoint value {} for {}'.format(sd_value,
                                                                   name))
         return sd_value

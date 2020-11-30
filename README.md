@@ -493,7 +493,7 @@ Further command line arguments are described in the source file [`main.py`](./ta
 ## BERT Task Evaluation
 <a id="race-evaluation"></a>
 ### RACE Evaluation
-The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/). The `TRAIN_DATA` and `VALID_DATA` directory contain the RACE dataset as separate `.txt` files.
+The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/). The `TRAIN_DATA` and `VALID_DATA` directory contain the RACE dataset as separate `.txt` files. Note that for RACE, the batch size is the number of RACE query's to evaluate. Since each RACE query has four samples, the effective batch size passed through the model will be four times the batch size specified on the command line.
 
 <pre>
 TRAIN_DATA="data/RACE/train/middle"

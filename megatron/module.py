@@ -37,19 +37,27 @@ class MegatronModule(torch.nn.Module):
 class PipelinedMegatronModule(MegatronModule):
     """Pipelining specific extensions of MegatronModule."""
 
-    def __init__(self):
+    def __init__(self, share_word_embeddings=True):
         super(PipelinedMegatronModule, self).__init__()
+        args = get_args()
+        self.share_word_embeddings = share_word_embeddings
 
     def word_embeddings_weight(self):
         if mpu.is_pipeline_first_stage():
             return self.language_model.embedding.word_embeddings.weight
         if mpu.is_pipeline_last_stage():
+            if not self.share_word_embeddings:
+                raise Exception('word_embeddings_weight() called for last stage, '
+                                'but share_word_embeddings is false')
             return self.word_embeddings.weight
         raise Exception('word_embeddings_weight() should be '
                         'called for first and last stage only')
 
     def initialize_word_embeddings(self, init_method_normal):
         args = get_args()
+        if not self.share_word_embeddings:
+            raise Exception('initialize_word_embeddings() was called but '
+                            'share_word_embeddings is false')
         # Parameters are shared between the word embeddings layer, and the heads at
         # the end of the model. In a pipelined setup with more than one stage, the
         # initial embedding layer and the head are on different workers, so we do
