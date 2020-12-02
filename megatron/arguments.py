@@ -136,14 +136,16 @@ def parse_args(extra_args_provider=None, defaults={},
 def _print_args(args):
     """Print arguments."""
     if args.rank == 0:
-        print('-------------------- arguments --------------------', flush=True)
+        print('------------------------ arguments ------------------------',
+              flush=True)
         str_list = []
         for arg in vars(args):
-            dots = '.' * (32 - len(arg))
+            dots = '.' * (48 - len(arg))
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
-        print('---------------- end of arguments ----------------', flush=True)
+        print('-------------------- end of arguments ---------------------',
+              flush=True)
 
 
 def _check_arg_is_not_none(args, arg):
@@ -278,7 +280,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'exponential'],
+                       choices=['constant', 'linear', 'cosine'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -400,8 +402,11 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
-    group.add_argument('--data-path', type=str, default=None,
-                       help='Path to combined dataset to split.')
+    group.add_argument('--data-path', nargs='*', default=None,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
