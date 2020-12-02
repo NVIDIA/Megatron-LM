@@ -6,7 +6,6 @@ import torch
 
 from megatron import mpu, print_rank_0
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
-from megatron.data.samplers import DistributedBatchSampler
 from megatron import get_args, get_tokenizer, print_rank_0, mpu
 
 
@@ -23,6 +22,8 @@ def get_one_epoch_dataloader(dataset, batch_size=None):
 
     sampler = torch.utils.data.SequentialSampler(dataset)
     # importantly, drop_last must be False to get all the data.
+    assert False, 'DistributedBatchSampler deprecated, change the implementation'
+    from megatron.data.samplers import DistributedBatchSampler
     batch_sampler = DistributedBatchSampler(sampler,
                                             batch_size=global_batch_size,
                                             drop_last=False,
