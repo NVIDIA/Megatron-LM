@@ -104,9 +104,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    iteration, False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler,
-                        consumed_train_samples=args.consumed_train_samples,
-                        consumed_valid_samples=args.consumed_valid_samples)
+        save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -438,9 +436,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Checkpointing
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler,
-                            consumed_train_samples=args.consumed_train_samples,
-                            consumed_valid_samples=args.consumed_valid_samples)
+            save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \

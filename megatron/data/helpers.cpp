@@ -60,7 +60,7 @@ void build_blending_indices(py::array_t<uint8_t>& dataset_index,
   for(int64_t sample_idx = 0; sample_idx < size; ++sample_idx) {
 
     // Determine where the max error in sampling is happening.
-    double sample_idx_double = std::max(static_cast<double>(sample_idx), 1.0);
+    auto sample_idx_double = std::max(static_cast<double>(sample_idx), 1.0);
     int64_t max_error_index = 0;
     double max_error = weights_ptr[0] * sample_idx_double -
       static_cast<double>(current_samples[0]);
@@ -86,7 +86,7 @@ void build_blending_indices(py::array_t<uint8_t>& dataset_index,
   if (verbose) {
     std::cout << " > sample ratios:" << std::endl;
     for (int64_t dataset_idx = 0; dataset_idx < num_datasets; ++dataset_idx) {
-      double ratio = static_cast<double>(current_samples[dataset_idx]) /
+      auto ratio = static_cast<double>(current_samples[dataset_idx]) /
 	static_cast<double>(size);
       std::cout << "   dataset " << dataset_idx << ", input: " <<
 	weights_ptr[dataset_idx] << ", achieved: " << ratio << std::endl; 
