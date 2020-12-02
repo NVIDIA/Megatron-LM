@@ -280,7 +280,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'exponential'],
+                       choices=['constant', 'linear', 'cosine'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
