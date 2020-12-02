@@ -194,12 +194,12 @@ def get_learning_rate_scheduler(optimizer):
     warmup_iter = args.warmup * num_iters
     lr_scheduler = AnnealingLR(
         optimizer,
-        start_lr=args.lr,
-        warmup_iter=warmup_iter,
-        total_iters=num_iters,
-        decay_style=args.lr_decay_style,
-        last_iter=init_step,
+        max_lr=args.lr,
         min_lr=args.min_lr,
+        warmup_steps=warmup_iter,
+        decay_steps=num_iters,
+        decay_style=args.lr_decay_style,
+        num_steps=init_step,
         use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
         override_lr_scheduler=args.override_lr_scheduler)
 
