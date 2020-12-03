@@ -24,7 +24,6 @@ from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.checkpointing import save_checkpoint
-from megatron.data.samplers import DistributedBatchSampler
 from megatron.fp16 import FP16_Optimizer
 
 
@@ -89,32 +88,6 @@ def check_adlr_autoresume_termination(iteration, model,
             autoresume.request_resume()
         print_rank_0(">>> training terminated. Returning")
         sys.exit(0)
-
-
-def make_data_loader(dataset):
-    """Buld dataloader given an input dataset."""
-    if dataset is None:
-        return None
-    args = get_args()
-
-    # Data parallel arguments.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
-    global_batch_size = args.batch_size * world_size
-    num_workers = args.num_workers
-
-    # Use a simple sampler with distributed batch sampler.
-    sampler = torch.utils.data.SequentialSampler(dataset)
-    batch_sampler = DistributedBatchSampler(sampler=sampler,
-                                            batch_size=global_batch_size,
-                                            drop_last=True,
-                                            rank=rank,
-                                            world_size=world_size)
-    # Torch dataloader.
-    return torch.utils.data.DataLoader(dataset,
-                                       batch_sampler=batch_sampler,
-                                       num_workers=num_workers,
-                                       pin_memory=True)
 
 
 def get_ltor_masks_and_position_ids(data,
