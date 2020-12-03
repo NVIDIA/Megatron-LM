@@ -761,30 +761,31 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
 
-            if not mpu.is_pipeline_first_stage():
-                input_tensor, _ = communicate(
-                    tensor_send_next=None,
-                    tensor_send_prev=None,
-                    recv_forward=True,
-                    recv_backward=False)
-            else:
-                input_tensor = None
+            for _ in range(args.num_microbatches_in_minibatch):
+                if not mpu.is_pipeline_first_stage():
+                    input_tensor, _ = communicate(
+                        tensor_send_next=None,
+                        tensor_send_prev=None,
+                        recv_forward=True,
+                        recv_backward=False)
+                else:
+                    input_tensor = None
 
-            # Forward evaluation.
-            output_tensor = forward_step_func(data_iterator, model, input_tensor)
+                # Forward evaluation.
+                output_tensor = forward_step_func(data_iterator, model, input_tensor)
 
-            if mpu.is_pipeline_last_stage():
-                _, loss_dict = output_tensor
-                # Reduce across processes.
-                for key in loss_dict:
-                    total_loss_dict[key] = total_loss_dict.get(key, torch.cuda.FloatTensor([0.0])) + \
-                        loss_dict[key]
-            else:
-                communicate(
-                    tensor_send_next=output_tensor,
-                    tensor_send_prev=None,
-                    recv_forward=False,
-                    recv_backward=False)
+                if mpu.is_pipeline_last_stage():
+                    _, loss_dict = output_tensor
+                    # Reduce across processes.
+                    for key in loss_dict:
+                        total_loss_dict[key] = total_loss_dict.get(key, torch.cuda.FloatTensor([0.0])) + \
+                            loss_dict[key]
+                else:
+                    communicate(
+                        tensor_send_next=output_tensor,
+                        tensor_send_prev=None,
+                        recv_forward=False,
+                        recv_backward=False)
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.batch_size \
@@ -793,7 +794,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
     model.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters
+        total_loss_dict[key] /= args.eval_iters * args.num_microbatches_in_minibatch
 
     return total_loss_dict
 
