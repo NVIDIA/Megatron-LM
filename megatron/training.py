@@ -835,8 +835,6 @@ def build_train_valid_test_data_iterators(
 
     print_rank_0('> building train, validation, and test datasets ...')
 
-    # Rank and  global batch size.
-    data_parallel_size = mpu.get_data_parallel_world_size()
     # Backward compatibility, assume fixed batch size.
     if args.iteration > 0 and args.consumed_train_samples == 0:
         args.consumed_train_samples = args.iteration * args.global_batch_size

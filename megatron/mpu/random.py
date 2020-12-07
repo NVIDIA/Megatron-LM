@@ -46,7 +46,7 @@ def init_checkpointed_activations_memory_buffer():
     args = get_args()
 
     per_layer = args.micro_batch_size * args.max_position_embeddings * \
-                args.hidden_size // args.model_parallel_size
+                args.hidden_size // args.tensor_model_parallel_size
     assert args.num_layers % args.checkpoint_num_layers == 0, \
         'number of layers is not divisible by checkpoint-num-layers'
     num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers

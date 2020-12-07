@@ -113,7 +113,7 @@ def _build_num_microbatches_calculator(args):
     # Constant num micro-batches.
     if args.rampup_batch_size is None:
         micro_batch_times_data_parallel = args.micro_batch_size * \
-                                          arg.data_parallel_size
+                                          args.data_parallel_size
         assert args.global_batch_size % micro_batch_times_data_parallel == 0, \
             'global batch size ({}) is not divisible by micro batch size ({})' \
             ' times data parallel size ({})'.format(args.global_batch_size,
@@ -126,6 +126,7 @@ def _build_num_microbatches_calculator(args):
                 num_micro_batches), flush=True)
         _GLOBAL_NUM_MICROBATCHES_CALCULATOR = ConstantNumMicroBatches(
             num_micro_batches)
+        return
 
     raise Exception('should not be here.')
 
