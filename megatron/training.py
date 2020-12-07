@@ -25,6 +25,8 @@ from apex.optimizers import FusedAdam as Adam
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
+from megatron import get_num_microbatches
+from megatron import update_num_microbatches
 from megatron import mpu
 from megatron import print_rank_0
 from megatron import print_rank_last
@@ -137,10 +139,6 @@ def get_model(model_provider_func):
     if args.fp16:
         model = FP16_Module(model)
 
-    # Wrap model for distributed training."""
-    if args.num_microbatches > 1:
-        assert args.DDP_impl == 'local'
-
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
         model = torchDDP(model, device_ids=[i], output_device=i,
@@ -224,6 +222,10 @@ def setup_model_and_optimizer(model_provider_func):
         args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
         args.iteration = 0
+
+    # Wrap model for distributed training."""
+    if get_num_microbatches() > 1:
+        assert args.DDP_impl == 'local'
 
     # get model without FP16 and/or TorchDDP wrappers
     unwrapped_model = model
@@ -315,7 +317,7 @@ def forward_step_with_communication(forward_step_func, data_iterator, model,
 
     if mpu.is_pipeline_last_stage():
         loss, loss_reduced = output_tensor
-        output_tensor = loss / args.num_microbatches
+        output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
     else:
         timers('forward-send').start()
@@ -375,7 +377,7 @@ def forward_and_backward_steps_with_communication(forward_step_func, data_iterat
 
     if mpu.is_pipeline_last_stage():
         loss, loss_reduced = output_tensor
-        output_tensor = loss / args.num_microbatches
+        output_tensor = loss / get_num_microbatches()
         output_tensor_grad = None
         losses_reduced.append(loss_reduced)
     else:
@@ -419,10 +421,10 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     args = get_args()
 
     losses_reduced = []
-    for i in range(args.num_microbatches):
+    for i in range(get_num_microbatches()):
         timers('forward-compute').start()
         loss, loss_reduced = forward_step_func(data_iterator, model, input_tensor=None)
-        output_tensor = loss / args.num_microbatches
+        output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
         timers('forward-compute').stop()
 
@@ -441,7 +443,7 @@ def forward_backward_pipelining(forward_step_func, data_iterator, model,
     args = get_args()
 
     # Compute number of warmup microbatches.
-    num_microbatches = args.num_microbatches
+    num_microbatches = get_num_microbatches()
     num_warmup_microbatches = \
         (mpu.get_pipeline_model_parallel_world_size() -
          mpu.get_pipeline_model_parallel_rank() - 1)
@@ -695,6 +697,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     timers('interval time').start()
     report_memory_flag = True
     while iteration < args.train_iters:
+        update_num_microbatches(args.consumed_train_samples)
         loss_dict, skipped_iter = train_step(forward_step_func,
                                              train_data_iterator,
                                              model,
@@ -703,7 +706,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
-                                       args.num_microbatches
+                                       get_num_microbatches()
 
         # Logging.
         loss_scale = None
@@ -761,7 +764,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
 
-            for _ in range(args.num_microbatches):
+            for _ in range(get_num_microbatches()):
                 if not mpu.is_pipeline_first_stage():
                     input_tensor, _ = communicate(
                         tensor_send_next=None,
@@ -789,12 +792,12 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
-                                           * args.num_microbatches
+                                           * get_num_microbatches()
     # Move model back to the train mode.
     model.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * args.num_microbatches
+        total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
 
     return total_loss_dict
 
@@ -834,13 +837,12 @@ def build_train_valid_test_data_iterators(
 
     # Rank and  global batch size.
     data_parallel_size = mpu.get_data_parallel_world_size()
-    global_batch_size = args.micro_batch_size * data_parallel_size * args.num_microbatches
     # Backward compatibility, assume fixed batch size.
     if args.iteration > 0 and args.consumed_train_samples == 0:
-        args.consumed_train_samples = args.iteration * global_batch_size
+        args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
-            args.eval_iters * global_batch_size
+            args.eval_iters * args.global_batch_size
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -849,9 +851,9 @@ def build_train_valid_test_data_iterators(
         train_iters = args.train_iters
         eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
         test_iters = args.eval_iters
-        train_val_test_num_samples = [train_iters * global_batch_size,
-                                      eval_iters * global_batch_size,
-                                      test_iters * global_batch_size]
+        train_val_test_num_samples = [train_iters * args.global_batch_size,
+                                      eval_iters * args.global_batch_size,
+                                      test_iters * args.global_batch_size]
         print_rank_0(' > datasets target sizes (minimum size):')
         print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
         print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))

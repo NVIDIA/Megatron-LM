@@ -15,6 +15,8 @@
 
 """Megatron global variables."""
 
+from abc import ABC
+from abc import abstractmethod
 import os
 import sys
 import time
@@ -25,16 +27,33 @@ from megatron.tokenizer import build_tokenizer
 from .arguments import parse_args
 
 _GLOBAL_ARGS = None
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 
 
+
 def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def get_num_microbatches_calculator():
+    """Return num-microbatches calculator."""
+    _ensure_var_is_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR,
+                               'number of micro-batches calculator.')
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+
+
+def get_num_microbatches():
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
+
+
+def update_num_microbatches(consumed_samples):
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples)
 
 
 def get_tokenizer():
@@ -67,6 +86,7 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
     args = _parse_args(extra_args_provider=extra_args_provider,
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
+    _build_num_microbatches_calculator(args)
     _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
@@ -82,6 +102,62 @@ def _parse_args(extra_args_provider=None, defaults={},
                               defaults=defaults,
                               ignore_unknown_args=ignore_unknown_args)
     return _GLOBAL_ARGS
+
+
+def _build_num_microbatches_calculator(args):
+
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR,
+                                   'num microbatches calculator')
+
+    # Constant num micro-batches.
+    if args.rampup_batch_size is None:
+        micro_batch_times_data_parallel = args.micro_batch_size * \
+                                          arg.data_parallel_size
+        assert args.global_batch_size % micro_batch_times_data_parallel == 0, \
+            'global batch size ({}) is not divisible by micro batch size ({})' \
+            ' times data parallel size ({})'.format(args.global_batch_size,
+                                                    args.micro_batch_size,
+                                                    args.data_parallel_size)
+        num_micro_batches = args.global_batch_size // \
+                            micro_batch_times_data_parallel
+        if args.rank == 0:
+            print('setting number of micro-batches to constant {}'.format(
+                num_micro_batches), flush=True)
+        _GLOBAL_NUM_MICROBATCHES_CALCULATOR = ConstantNumMicroBatches(
+            num_micro_batches)
+
+    raise Exception('should not be here.')
+
+
+class NumMicroBatchesCalculator(ABC):
+
+    def __init__(self, name):
+        self.name = name
+        super(NumMicroBatchesCalculator, self).__init__()
+
+    @abstractmethod
+    def get(self):
+        pass
+
+    def update(self, consumed_samples):
+        pass
+
+
+class ConstantNumMicroBatches(NumMicroBatchesCalculator):
+
+    def __init__(self, num_micro_batches=1):
+        assert num_micro_batches >= 1
+        self.num_micro_batches = num_micro_batches
+        super(ConstantNumMicroBatches, self).__init__(
+            'constant: {}'.format(self.num_micro_batches))
+
+    def update(self, consumed_samples):
+        pass
+
+    def get(self):
+        return self.num_micro_batches
+
 
 
 def _build_tokenizer(args):

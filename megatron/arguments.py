@@ -54,18 +54,45 @@ def parse_args(extra_args_provider=None, defaults={},
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
+    assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
+        ' ({}) is not divisible by tensor model parallel size ({})'.format(
+            args.world_size, args.tensor_model_parallel_size)
+    # Pipeline model parallel size.
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
     if args.pipeline_model_parallel_size > 1:
         if "ring_exchange" not in dir(torch.distributed):
-            raise Exception('PyTorch with torch.distributed.ring_exchange needed '
-                            'to run pipeline MP!')
+            raise Exception('PyTorch with torch.distributed.ring_exchange '
+                            'needed to run pipeline MP!')
+    # Checks.
+    args.model_parallel_size = args.pipeline_model_parallel_size * \
+                               args.tensor_model_parallel_size
+    assert args.world_size % args.model_parallel_size == 0, 'world size is not'\
+        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
+                           args.pipeline_model_parallel_size)
+    args.data_parallel_size = args.world_size // args.model_parallel_size
     if args.rank == 0:
-        print('using world size: {}, tensor-model-parallel size: {}, pipeline-model-parallel size: {} '.format(
-            args.world_size, args.tensor_model_parallel_size, args.pipeline_model_parallel_size))
+        print('using world size: {}, data-parallel-size: {}, '
+              'tensor-model-parallel size: {}, '
+              'pipeline-model-parallel size: {} '.format(
+                  args.world_size, args.data_parallel_size,
+                  args.tensor_model_parallel_size,
+                  args.pipeline_model_parallel_size), flush=True)
+
+    # Batch size.
+    assert args.micro_batch_size is not None
+    assert args.micro_batch_size > 0
+    if args.global_batch_size is None:
+        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        if args.rank == 0:
+            print('setting global batch size to {}'.format(
+                args.global_batch_size), flush=True)
+    assert args.global_batch_size > 0
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -214,8 +241,22 @@ def _add_training_args(parser):
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size.')
-    group.add_argument('--num-microbatches', type=int, default=1,
-                       help='Number of microbatches in minibatch')
+    group.add_argument('--global-batch-size', type=int, default=None,
+                       help='Training batch size. If this value is None, then '
+                       'use micro-batch-size * data-parallel-size as the '
+                       'global batch size')
+    group.add_argument('--rampup-batch-size', nargs='*', default=None,
+                       help='Batch size ramp up with the following values:'
+                       '  --rampup-batch-size <start batch size> '
+                       '                      <batch size incerement> '
+                       '                      <ramp-up samples> '
+                       'For example:'
+                       '   --rampup-batch-size 16 8 300000 \ '
+                       '   --global-batch-size 1024'
+                       'will start with global batch size 16 and over '
+                       ' (1024 - 16) / 8 = 126 intervals will increase'
+                       'the batch size linearly to 1024. In each interval'
+                       'we will use approximately 300000 / 126 = 2380 samples.')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')

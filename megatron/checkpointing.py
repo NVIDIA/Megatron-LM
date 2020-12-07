@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-from megatron import mpu, get_args
+from megatron import mpu, get_args, update_num_microbatches
 from megatron import get_args
 from megatron import print_rank_0
 
@@ -236,6 +236,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
                                               'consumed_train_samples', 0)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
     else:
