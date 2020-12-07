@@ -63,8 +63,6 @@ def parse_args(extra_args_provider=None, defaults={},
         if "ring_exchange" not in dir(torch.distributed):
             raise Exception('PyTorch with torch.distributed.ring_exchange needed '
                             'to run pipeline MP!')
-    if args.num_microbatches_in_minibatch is None:
-        args.num_microbatches_in_minibatch = 1
     if args.rank == 0:
         print('using world size: {}, tensor-model-parallel size: {}, pipeline-model-parallel size: {} '.format(
             args.world_size, args.tensor_model_parallel_size, args.pipeline_model_parallel_size))
@@ -212,11 +210,11 @@ def _add_regularization_args(parser):
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
 
-    group.add_argument('--batch-size', type=int, default=None,
+    group.add_argument('--micro-batch-size', type=int, default=None,
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size.')
-    group.add_argument('--num-microbatches-in-minibatch', type=int, default=None,
+    group.add_argument('--num-microbatches', type=int, default=1,
                        help='Number of microbatches in minibatch')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

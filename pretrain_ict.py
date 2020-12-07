@@ -87,8 +87,8 @@ def forward_step(data_iterator, model, input_tensor):
 
     # Forward model.
     query_logits, block_logits = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask)
-    local_batch_size = query_logits.shape[0]
-    global_batch_size = dist.get_world_size() * local_batch_size  # recall we assert that tensor_model_parallel_size == 1
+    micro_batch_size = query_logits.shape[0]
+    global_batch_size = dist.get_world_size() * micro_batch_size  # recall we assert that tensor_model_parallel_size == 1
 
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
     all_block_logits = AllgatherFromDataParallelRegion.apply(block_logits)

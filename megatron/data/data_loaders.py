@@ -30,7 +30,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     args = get_args()
 
     world_size = mpu.get_data_parallel_world_size()
-    global_batch_size = args.batch_size * world_size
+    global_batch_size = args.micro_batch_size * world_size
 
     # Megatron sampler
     batch_sampler = MegatronPretrainingSampler(

@@ -186,7 +186,7 @@ def main():
 
     # Data stuff.
     dataset = build_dataset(args.task)
-    dataloader = build_data_loader(dataset, args.batch_size,
+    dataloader = build_data_loader(dataset, args.micro_batch_size,
                                    args.num_workers, drop_last=False)
 
     # Run evaluation.

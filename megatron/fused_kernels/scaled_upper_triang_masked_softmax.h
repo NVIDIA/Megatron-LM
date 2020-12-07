@@ -79,7 +79,7 @@ __global__ void scaled_upper_triang_masked_softmax_warp_forward(
     output_t *dst, 
     const input_t *src, 
     const acc_t scale, 
-    int batch_size, 
+    int micro_batch_size, 
     int stride, 
     int element_count) 
 {
@@ -94,9 +94,9 @@ __global__ void scaled_upper_triang_masked_softmax_warp_forward(
     int local_seq = blockIdx.x + 1; 
     int warp_iteration_limit = (local_seq + WARP_SIZE - 1)/WARP_SIZE;
 
-    // batch_size might not be a multiple of WARP_BATCH. Check how
+    // micro_batch_size might not be a multiple of WARP_BATCH. Check how
     // many batches have to computed within this WARP.
-    int local_batches = batch_size - first_batch;
+    int local_batches = micro_batch_size - first_batch;
     if (local_batches > WARP_BATCH)
         local_batches = WARP_BATCH;
 
@@ -173,7 +173,7 @@ __global__ void scaled_upper_triang_masked_softmax_warp_backward(
     input_t *grad, 
     const input_t *output,
     acc_t scale, 
-    int batch_size, 
+    int micro_batch_size, 
     int stride, 
     int element_count)
 {
@@ -187,9 +187,9 @@ __global__ void scaled_upper_triang_masked_softmax_warp_backward(
     int first_batch = (blockDim.y * blockIdx.y + threadIdx.y) * gridDim.x * WARP_BATCH + blockIdx.x;
     int local_seq = blockIdx.x + 1; 
     
-    // batch_size might not be a multiple of WARP_BATCH. Check how
+    // micro_batch_size might not be a multiple of WARP_BATCH. Check how
     // many batches have to computed within this WARP.
-    int local_batches = batch_size - first_batch;
+    int local_batches = micro_batch_size - first_batch;
     if (local_batches > WARP_BATCH)
         local_batches = WARP_BATCH;
 

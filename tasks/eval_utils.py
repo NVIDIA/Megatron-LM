@@ -37,7 +37,7 @@ def accuracy_func_provider(single_dataset_provider):
     for datapath in datapaths:
         dataset = single_dataset_provider(datapath)
         dataloader = build_data_loader(
-            dataset, args.batch_size, num_workers=args.num_workers,
+            dataset, args.micro_batch_size, num_workers=args.num_workers,
             drop_last=(mpu.get_data_parallel_world_size() > 1))
         dataloaders.append((dataset.dataset_name, dataloader))
 

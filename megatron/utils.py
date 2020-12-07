@@ -98,11 +98,11 @@ def get_ltor_masks_and_position_ids(data,
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
-    batch_size, seq_length = data.size()
+    micro_batch_size, seq_length = data.size()
 
     # Attention mask (lower triangular).
     if reset_attention_mask:
-        att_mask_batch = batch_size
+        att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
     attention_mask = torch.tril(torch.ones(
@@ -124,7 +124,7 @@ def get_ltor_masks_and_position_ids(data,
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
-        for b in range(batch_size):
+        for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
             eod_index = position_ids[b, data[b] == eod_token]

@@ -9,15 +9,15 @@ from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_co
 from megatron import get_args, get_tokenizer, print_rank_0, mpu
 
 
-def get_one_epoch_dataloader(dataset, batch_size=None):
+def get_one_epoch_dataloader(dataset, micro_batch_size=None):
     """Specifically one epoch to be used in an indexing job."""
     args = get_args()
 
     world_size = mpu.get_data_parallel_world_size()
     rank = mpu.get_data_parallel_rank()
-    if batch_size is None:
-        batch_size = args.batch_size
-    global_batch_size = batch_size * world_size
+    if micro_batch_size is None:
+        micro_batch_size = args.micro_batch_size
+    global_batch_size = micro_batch_size * world_size
     num_workers = args.num_workers
 
     sampler = torch.utils.data.SequentialSampler(dataset)

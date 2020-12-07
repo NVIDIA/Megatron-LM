@@ -80,7 +80,7 @@ __global__ void scaled_masked_softmax_warp_forward(
     const input_t *src,
     const uint8_t *mask, 
     const acc_t scale, 
-    int batch_size, 
+    int micro_batch_size, 
     int stride, 
     int element_count,
     int pad_batches) 
@@ -102,9 +102,9 @@ __global__ void scaled_masked_softmax_warp_forward(
         pad_first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * WARP_BATCH;
     }
 
-    // batch_size might not be a multiple of WARP_BATCH. Check how
+    // micro_batch_size might not be a multiple of WARP_BATCH. Check how
     // many batches have to computed within this WARP.
-    int local_batches = batch_size - first_batch;
+    int local_batches = micro_batch_size - first_batch;
     if (local_batches > WARP_BATCH)
         local_batches = WARP_BATCH;
 
@@ -184,7 +184,7 @@ __global__ void scaled_masked_softmax_warp_backward(
     input_t *grad, 
     const input_t *output,
     acc_t scale, 
-    int batch_size, 
+    int micro_batch_size, 
     int stride, 
     int element_count)
 {
@@ -199,9 +199,9 @@ __global__ void scaled_masked_softmax_warp_backward(
     // gridDim/blockIdx = (seq_len, attn_heads, batches) 
     int first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * WARP_BATCH;
     
-    // batch_size might not be a multiple of WARP_BATCH. Check how
+    // micro_batch_size might not be a multiple of WARP_BATCH. Check how
     // many batches have to computed within this WARP.
-    int local_batches = batch_size - first_batch;
+    int local_batches = micro_batch_size - first_batch;
     if (local_batches > WARP_BATCH)
         local_batches = WARP_BATCH;
 
