@@ -244,7 +244,8 @@ def _add_training_args(parser):
     group.add_argument('--global-batch-size', type=int, default=None,
                        help='Training batch size. If this value is None, then '
                        'use micro-batch-size * data-parallel-size as the '
-                       'global batch size')
+                       'global batch size. This choice will result in 1 for '
+                       'number of micro-batches.')
     group.add_argument('--rampup-batch-size', nargs='*', default=None,
                        help='Batch size ramp up with the following values:'
                        '  --rampup-batch-size <start batch size> '

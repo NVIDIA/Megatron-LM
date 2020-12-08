@@ -34,18 +34,10 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 
 
-
 def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
-
-
-def get_num_microbatches_calculator():
-    """Return num-microbatches calculator."""
-    _ensure_var_is_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR,
-                               'number of micro-batches calculator.')
-    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR
 
 
 def get_num_microbatches():
@@ -141,6 +133,7 @@ class NumMicroBatchesCalculator(ABC):
     def get(self):
         pass
 
+    @abstractmethod
     def update(self, consumed_samples):
         pass
 

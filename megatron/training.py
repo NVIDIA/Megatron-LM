@@ -223,7 +223,7 @@ def setup_model_and_optimizer(model_provider_func):
     else:
         args.iteration = 0
 
-    # Wrap model for distributed training."""
+    # We only support local DDP with multiple micro-batches.
     if get_num_microbatches() > 1:
         assert args.DDP_impl == 'local'
 
