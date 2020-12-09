@@ -125,6 +125,30 @@ def parse_args(extra_args_provider=None, defaults={},
         else:
             setattr(args, key, defaults[key])
 
+    # Iteration-based training.
+    if args.train_iters:
+        # If we use iteration-based training, make sure the
+        # sample-based options are off.
+        assert args.train_samples is None, \
+            'expected iteration-based training'
+        assert args.lr_decay_samples is None, \
+            'expected iteration-based learning rate decay'
+        assert args.lr_warmup_samples == 0, \
+            'expected iteration-based learnig rate warmup'
+        assert args.rampup_batch_size is None, \
+            'expected no batch-size rampup for iteration-based training'
+
+    # Sample-based training.
+    if args.train_samples:
+        # If we use sample-based training, make sure the
+        # iteration-based options are off.
+        assert args.train_iters is None, \
+            'expected sample-based training'
+        assert args.lr_decay_iters is None, \
+            'expected sample-based learning rate decay'
+        assert args.lr_warmup_iters == 0, \
+            'expected sample-based learnig rate warmup'
+
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
@@ -269,7 +293,12 @@ def _add_training_args(parser):
                        help='chunk size (number of layers) for checkpointing.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
-                       'training runs.')
+                       'training runs. Note that either train-iters or '
+                       'train-samples should be provided.')
+    group.add_argument('--train-samples', type=int, default=None,
+                       help='Total number of samples to train over all '
+                       'training runs. Note that either train-iters or '
+                       'train-samples should be provided.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
@@ -319,12 +348,18 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
                        ' If None defaults to `--train-iters`')
+    group.add_argument('--lr-decay-samples', type=int, default=None,
+                       help='number of samples to decay learning rate over,'
+                       ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-warmup-iters', type=int, default=0,
+                       help='number of iterations to linearly warmup '
+                       'learning rate over.')
+    group.add_argument('--lr-warmup-samples', type=int, default=0,
+                       help='number of samples to linearly warmup '
+                       'learning rate over.')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--warmup', type=float, default=0.01,
-                       help='Percentage of total iterations to warmup on '
-                       '(.01 = 1 percent of all training iters).')
     group.add_argument('--override-lr-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '

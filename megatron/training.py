@@ -116,6 +116,37 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
                                    test_data_iterator, model,
                                    0, True)
 
+def update_train_iters(args):
+
+    # For iteration-based training, we don't need to do anything
+    if args.train_iters:
+        return
+
+    # Constant batch size with sample-based training.
+    if args.rampup_batch_size is None:
+        args.train_iters = args.train_samples // args.global_batch_size
+
+    else:
+        # Sample based training with rampup batch size.
+        iterations = 0
+        consumed_samples = 0
+        # Rampup phase.
+        while consumed_samples <= int(args.rampup_batch_size[2]):
+            update_num_microbatches(consumed_samples)
+            consumed_samples += get_num_microbatches() * \
+                                args.micro_batch_size * \
+                                args.data_parallel_size
+            iterations += 1
+        # Reset
+        update_num_microbatches(0)
+        # Constant phase
+        # Note that we throw away any partial last batch.
+        iterations += (args.train_samples - consumed_samples) // \
+                      args.global_batch_size
+        args.train_iters = iterations
+
+    print_rank_0('setting training iterations to {}'.format(args.train_iters))
+
 
 def get_model(model_provider_func):
     """Build the model."""
@@ -188,22 +219,33 @@ def get_learning_rate_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
 
-    # Add linear learning rate scheduler.
-    if args.lr_decay_iters is not None:
-        num_iters = args.lr_decay_iters
+    # Iteration-based training.
+    if args.train_iters:
+        if args.lr_decay_iters is None:
+            args.lr_decay_iters = args.train_iters
+        warmup_steps = args.lr_warmup_iters * args.global_batch_size
+        decay_steps = args.lr_decay_iters * args.global_batch_size
+    # Sample-based training.
+    elif args.train_samples:
+        # We need to set training iters for later use. Technically
+        # we need to adjust the training samples too (due to last
+        # batch being incomplete) but we leave it as is for now.
+        update_train_iters(args)        
+        if args.lr_decay_samples is None:
+            args.lr_decay_samples = args.train_samples
+        warmup_steps = args.lr_warmup_samples
+        decay_steps = args.lr_decay_samples
     else:
-        num_iters = args.train_iters
-    num_iters = max(1, num_iters)
-    init_step = 0
-    warmup_iter = args.warmup * num_iters
+        raise Exception(
+            'either train-iters or train-samples should be provided.')
+
     lr_scheduler = AnnealingLR(
         optimizer,
         max_lr=args.lr,
         min_lr=args.min_lr,
-        warmup_steps=warmup_iter,
-        decay_steps=num_iters,
+        warmup_steps=warmup_steps,
+        decay_steps=decay_steps,
         decay_style=args.lr_decay_style,
-        num_steps=init_step,
         use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
         override_lr_scheduler=args.override_lr_scheduler)
 
@@ -568,7 +610,10 @@ def train_step(forward_step_func, data_iterator,
     # Update learning rate.
     skipped_iter = 0
     if not (args.fp16 and optimizer.overflow):
-        lr_scheduler.step()
+        increment = get_num_microbatches() * \
+                    args.micro_batch_size * \
+                    args.data_parallel_size
+        lr_scheduler.step(increment=increment)
     else:
         skipped_iter = 1
 
@@ -649,8 +694,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if writer and torch.distributed.get_rank() == 0:
             writer.add_scalar('iteration_time',
                               elapsed_time / args.log_interval, iteration)
-        log_string = ' iteration {:8d}/{:8d} |'.format(iteration,
-                                                       args.train_iters)
+        log_string = ' iteration {:8d}/{:8d} |'.format(
+            iteration, args.train_iters)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time * 1000.0 / args.log_interval)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
@@ -837,8 +882,12 @@ def build_train_valid_test_data_iterators(
 
     # Backward compatibility, assume fixed batch size.
     if args.iteration > 0 and args.consumed_train_samples == 0:
+        assert args.train_samples is None, \
+            'only backward compatiblity support for iteration-based training'
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
+        assert args.train_samples is None, \
+            'only backward compatiblity support for iteration-based training'
         args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
             args.eval_iters * args.global_batch_size
 
@@ -846,10 +895,14 @@ def build_train_valid_test_data_iterators(
     if mpu.get_tensor_model_parallel_rank() == 0:
 
         # Number of train/valid/test samples.
-        train_iters = args.train_iters
-        eval_iters = (train_iters // args.eval_interval + 1) * args.eval_iters
+        if args.train_samples:
+            train_samples = args.train_samples
+        else:
+            train_samples = args.train_iters * args.global_batch_size
+        eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                     args.eval_iters
         test_iters = args.eval_iters
-        train_val_test_num_samples = [train_iters * args.global_batch_size,
+        train_val_test_num_samples = [train_samples,
                                       eval_iters * args.global_batch_size,
                                       test_iters * args.global_batch_size]
         print_rank_0(' > datasets target sizes (minimum size):')

@@ -106,20 +106,12 @@ def _build_num_microbatches_calculator(args):
 
     # Constant num micro-batches.
     if args.rampup_batch_size is None:
-        micro_batch_times_data_parallel = args.micro_batch_size * \
-                                          args.data_parallel_size
-        assert args.global_batch_size % micro_batch_times_data_parallel == 0, \
-            'global batch size ({}) is not divisible by micro batch size ({})' \
-            ' times data parallel size ({})'.format(args.global_batch_size,
-                                                    args.micro_batch_size,
-                                                    args.data_parallel_size)
-        num_micro_batches = args.global_batch_size // \
-                            micro_batch_times_data_parallel
+        _GLOBAL_NUM_MICROBATCHES_CALCULATOR = ConstantNumMicroBatches(
+            args.global_batch_size, args.micro_batch_size,
+            args.data_parallel_size)
         if args.rank == 0:
             print('setting number of micro-batches to constant {}'.format(
-                num_micro_batches), flush=True)
-        _GLOBAL_NUM_MICROBATCHES_CALCULATOR = ConstantNumMicroBatches(
-            num_micro_batches)
+                _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()), flush=True)
 
     else:
         assert len(args.rampup_batch_size) == 3, 'expected the following ' \
@@ -143,10 +135,8 @@ def _build_num_microbatches_calculator(args):
 
 class NumMicroBatchesCalculator(ABC):
 
-    def __init__(self, name):
-        self.name = name
+    def __init__(self):
         self.num_micro_batches = None
-        super(NumMicroBatchesCalculator, self).__init__()
 
     def get(self):
         return self.num_micro_batches
@@ -158,11 +148,17 @@ class NumMicroBatchesCalculator(ABC):
 
 class ConstantNumMicroBatches(NumMicroBatchesCalculator):
 
-    def __init__(self, num_micro_batches=1):
-        super(ConstantNumMicroBatches, self).__init__(
-            'constant: {}'.format(num_micro_batches))
-        assert num_micro_batches >= 1
-        self.num_micro_batches = num_micro_batches
+    def __init__(self, global_batch_size, micro_batch_size, data_parallel_size):
+        micro_batch_times_data_parallel = micro_batch_size * \
+                                          data_parallel_size
+        assert global_batch_size % micro_batch_times_data_parallel == 0, \
+            'global batch size ({}) is not divisible by micro batch size ({})' \
+            ' times data parallel size ({})'.format(global_batch_size,
+                                                    micro_batch_size,
+                                                    data_parallel_size)
+        self.num_micro_batches = global_batch_size // \
+                                 micro_batch_times_data_parallel
+        assert self.num_micro_batches >= 1
 
     def update(self, consumed_samples):
         pass
@@ -188,10 +184,6 @@ class RampupBatchsizeNumMicroBatches(NumMicroBatchesCalculator):
             data_parallel_size: data parallel size.
         """
 
-        super(RampupBatchsizeNumMicroBatches, self).__init__(
-            'batch size ramup: {}, {}, {}'.format(
-                start_batch_size, batch_size_increment, ramup_samples))
-        
         self.micro_batch_size = micro_batch_size
         self.data_parallel_size = data_parallel_size
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * \
@@ -212,8 +204,9 @@ class RampupBatchsizeNumMicroBatches(NumMicroBatchesCalculator):
             'size increment ({})'.format(diff_batch_size, batch_size_increment)
 
         num_increments = diff_batch_size // self.batch_size_increment
-        assert ramup_samples >= 0
-        self.rampup_samples_per_increment = ramup_samples / num_increments
+        self.ramup_samples = ramup_samples
+        assert self.ramup_samples >= 0
+        self.rampup_samples_per_increment = self.ramup_samples / num_increments
 
         # Initialize number of microbatches.
         self.update(0)
@@ -221,11 +214,13 @@ class RampupBatchsizeNumMicroBatches(NumMicroBatchesCalculator):
 
     def update(self, consumed_samples):
 
-        steps = int(consumed_samples / self.rampup_samples_per_increment)
-        current_global_batch_size = self.start_batch_size + \
-                                    steps * self.batch_size_increment
-        current_global_batch_size = min(current_global_batch_size,
-                                        self.global_batch_size)
+        if consumed_samples > self.ramup_samples:
+            current_global_batch_size = self.global_batch_size
+        else:
+            steps = int(consumed_samples / self.rampup_samples_per_increment)
+            current_global_batch_size = self.start_batch_size + \
+                                        steps * self.batch_size_increment
+            assert current_global_batch_size <= self.global_batch_size
         
         assert current_global_batch_size % \
             self.micro_batch_times_data_parallel_size == 0, 'current global ' \
