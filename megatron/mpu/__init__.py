@@ -34,7 +34,8 @@ from .initialize import get_tensor_model_parallel_rank, set_tensor_model_paralle
 from .initialize import get_pipeline_model_parallel_rank, set_pipeline_model_parallel_rank
 from .initialize import is_pipeline_first_stage, is_pipeline_last_stage
 from .initialize import get_tensor_model_parallel_src_rank
-from .initialize import get_pipeline_model_parallel_src_rank
+from .initialize import get_pipeline_model_parallel_first_rank
+from .initialize import get_pipeline_model_parallel_last_rank
 from .initialize import get_tensor_model_parallel_world_size, set_tensor_model_parallel_world_size
 from .initialize import get_pipeline_model_parallel_world_size, set_pipeline_model_parallel_world_size
 from .initialize import initialize_model_parallel

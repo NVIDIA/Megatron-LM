@@ -38,6 +38,7 @@ _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
+_PIPELINE_GLOBAL_RANKS = None
 
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -131,6 +132,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
+    global _PIPELINE_GLOBAL_RANKS
     assert _PIPELINE_MODEL_PARALLEL_GROUP is None, \
         'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
@@ -142,6 +144,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
+            _PIPELINE_GLOBAL_RANKS = ranks
         # Setup embedding group (to exchange gradients between
         # first and last stages).
         if len(ranks) > 1:
@@ -265,21 +268,22 @@ def is_pipeline_last_stage():
 
 
 def get_tensor_model_parallel_src_rank():
-    """Calculate the global rank corresponding to a local rank
+    """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
     global_rank = torch.distributed.get_rank()
     local_world_size = get_tensor_model_parallel_world_size()
     return (global_rank // local_world_size) * local_world_size
 
+def get_pipeline_model_parallel_last_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "Pipeline parallel group is not initialized"
+    last_rank_local = get_pipeline_model_parallel_world_size() - 1
+    return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
-def get_pipeline_model_parallel_src_rank():
-    """Calculate the global rank corresponding to a local rank
-    in the pipeline model parallel group."""
-    global_rank = torch.distributed.get_rank()
-    global_world_size = torch.distributed.get_world_size()
-    local_world_size = get_pipeline_model_parallel_world_size()
-    return global_rank % (global_world_size // local_world_size)
-
+def get_pipeline_model_parallel_first_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "Pipeline parallel group is not initialized"
+    return _PIPELINE_GLOBAL_RANKS[0]
 
 def get_data_parallel_world_size():
     """Return world size for the data parallel group."""
