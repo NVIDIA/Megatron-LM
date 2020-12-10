@@ -264,9 +264,11 @@ def _add_training_args(parser):
     group.add_argument('--micro-batch-size', type=int, default=None,
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
-                       'parallel size.')
+                       'parallel size times number of micro batches.')
     group.add_argument('--global-batch-size', type=int, default=None,
-                       help='Training batch size. If this value is None, then '
+                       help='Training batch size. If set, it should be a '
+                       'multiple of micro-batch-size times data-parallel-size. '
+                       'If this value is None, then '
                        'use micro-batch-size * data-parallel-size as the '
                        'global batch size. This choice will result in 1 for '
                        'number of micro-batches.')
