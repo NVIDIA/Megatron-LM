@@ -223,18 +223,24 @@ def get_learning_rate_scheduler(optimizer):
     if args.train_iters:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
-        warmup_steps = args.lr_warmup_iters * args.global_batch_size
         decay_steps = args.lr_decay_iters * args.global_batch_size
+        if args.lr_warmup_percent is not None:
+            warmup_steps = args.lr_warmup_percent * decay_steps
+        else:
+            warmup_steps = args.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
-        update_train_iters(args)        
+        update_train_iters(args)
         if args.lr_decay_samples is None:
             args.lr_decay_samples = args.train_samples
-        warmup_steps = args.lr_warmup_samples
         decay_steps = args.lr_decay_samples
+        if args.lr_warmup_percent is not None:
+            warmup_steps = args.lr_warmup_percent * decay_steps
+        else:
+            warmup_steps = args.lr_warmup_samples
     else:
         raise Exception(
             'either train-iters or train-samples should be provided.')

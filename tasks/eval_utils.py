@@ -80,7 +80,7 @@ def calculate_correct_answers(name, model, dataloader,
     args = get_args()
     start_time = time.time()
     model.eval()
-    saved_batch_size = args.batch_size
+    saved_batch_size = args.micro_batch_size
     with torch.no_grad():
         # For all the batches in the dataset.
         total = 0
@@ -103,7 +103,7 @@ def calculate_correct_answers(name, model, dataloader,
             ds = dataloader.dataset
             if hasattr(ds, 'sample_multiplier'):
                 actual_batch_size *= ds.sample_multiplier
-            args.batch_size = actual_batch_size
+            args.micro_batch_size = actual_batch_size
 
             if not mpu.is_pipeline_first_stage():
                 input_tensor, _ = communicate(
@@ -145,7 +145,7 @@ def calculate_correct_answers(name, model, dataloader,
                     recv_backward=False)
 
     model.train()
-    args.batch_size = saved_batch_size
+    args.micro_batch_size = saved_batch_size
 
     # Reduce.
     if mpu.is_pipeline_last_stage():

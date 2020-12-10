@@ -134,9 +134,12 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.lr_decay_samples is None, \
             'expected iteration-based learning rate decay'
         assert args.lr_warmup_samples == 0, \
-            'expected iteration-based learnig rate warmup'
+            'expected iteration-based learning rate warmup'
         assert args.rampup_batch_size is None, \
             'expected no batch-size rampup for iteration-based training'
+        if args.lr_warmup_percent is not None:
+            assert args.lr_warmup_iters == 0, \
+                'can only specify one of lr-warmup-percent and lr-warmup-iters'
 
     # Sample-based training.
     if args.train_samples:
@@ -148,11 +151,14 @@ def parse_args(extra_args_provider=None, defaults={},
             'expected sample-based learning rate decay'
         assert args.lr_warmup_iters == 0, \
             'expected sample-based learnig rate warmup'
+        if args.lr_warmup_percent is not None:
+            assert args.lr_warmup_samples == 0, \
+                'can only specify one of lr-warmup-percent and lr-warmup-samples'
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
-    for req_arg in required_args: 
+    for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
@@ -353,6 +359,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-samples', type=int, default=None,
                        help='number of samples to decay learning rate over,'
                        ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-warmup-percent', type=float, default=None,
+                       help='percentage of lr-warmup-(iters/samples) to use '
+                       'for warmup')
     group.add_argument('--lr-warmup-iters', type=int, default=0,
                        help='number of iterations to linearly warmup '
                        'learning rate over.')
@@ -568,4 +577,3 @@ def _add_realm_args(parser):
     group.add_argument('--indexer-log-interval', type=int, default=1000,
                        help='After how many batches should the indexer report progress')
     return parser
-

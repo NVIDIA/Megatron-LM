@@ -36,7 +36,7 @@ def get_batch(context_tokens):
     tokenizer = get_tokenizer()
 
     # Move to GPU.
-    tokens = context_tokens.view(args.batch_size, -1).contiguous().cuda()
+    tokens = context_tokens.view(args.micro_batch_size, -1).contiguous().cuda()
     # Get the attention mask and postition ids.
     attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
@@ -294,7 +294,7 @@ def generate_samples_unconditional(model):
 
     num_samples = args.num_samples
     context_tokens = [[tokenizer.eod]
-                      for _ in range(args.batch_size)]
+                      for _ in range(args.micro_batch_size)]
     ctr = 0
     while True:
         start_time = time.time()
@@ -310,7 +310,7 @@ def generate_samples_unconditional(model):
             length = len(token_stream)
             token_batch = token_stream[0].cpu().numpy().tolist()
             length_batch = token_stream[1].cpu().numpy().tolist()
-            assert len(length_batch) == args.batch_size
+            assert len(length_batch) == args.micro_batch_size
             for tokens, length in zip(token_batch, length_batch):
                 tokens = tokens[1:length - 1]
                 text = tokenizer.detokenize(tokens)
@@ -321,7 +321,7 @@ def generate_samples_unconditional(model):
                 if ctr >= num_samples:
                     break
         else:
-            for _ in range(args.batch_size):
+            for _ in range(args.micro_batch_size):
                 yield None
                 ctr += 1
                 if ctr >= num_samples:

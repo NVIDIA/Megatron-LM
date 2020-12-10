@@ -129,10 +129,10 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
                                           args.num_workers, not args.keep_last)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
-    # Now that we've built the data loaders, set args.batch_size to
+    # Now that we've built the data loaders, set args.micro_batch_size to
     # the actual batch size the model will see for this dataset
     if hasattr(train_dataset, 'sample_multiplier'):
-        args.batch_size *= train_dataset.sample_multiplier
+        args.micro_batch_size *= train_dataset.sample_multiplier
 
     return train_dataloader, valid_dataloader
 
