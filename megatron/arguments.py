@@ -84,6 +84,17 @@ def parse_args(extra_args_provider=None, defaults={},
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
 
+    # Deprecated arguments
+    assert args.batch_size is None, '--batch-size argument is no longer ' \
+        'valid, use --micro-batch-size instead'
+    del args.batch_size
+    assert args.warmup is None, '--warmup argument is no longer valid, use ' \
+        '--lr-warmup-fraction instead'
+    del args.warmup
+    assert args.model_parallel_size is None, '--model-parallel-size is no ' \
+        'longer valid, use --tensor-model-parallel-size instead'
+    del args.model_parallel_size
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -271,6 +282,9 @@ def _add_training_args(parser):
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
                        'parallel size times number of micro batches.')
+    group.add_argument('--batch-size', type=int, default=None,
+                       help='Old batch size parameter, do not use. '
+                       'Use --micro-batch-size instead')
     group.add_argument('--global-batch-size', type=int, default=None,
                        help='Training batch size. If set, it should be a '
                        'multiple of micro-batch-size times data-parallel-size. '
@@ -368,6 +382,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
                        'learning rate over.')
+    group.add_argument('--warmup', type=int, default=None,
+                       help='Old lr warmup argument, do not use. Use one of the '
+                       '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
@@ -449,6 +466,9 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--model-parallel-size', type=int, default=None,
+                       help='Old model parallel argument, do not use. Use '
+                       '--tensor-model-parallel-size instead.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
