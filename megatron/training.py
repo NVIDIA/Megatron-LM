@@ -224,8 +224,8 @@ def get_learning_rate_scheduler(optimizer):
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
         decay_steps = args.lr_decay_iters * args.global_batch_size
-        if args.lr_warmup_percent is not None:
-            warmup_steps = args.lr_warmup_percent * decay_steps
+        if args.lr_warmup_fraction is not None:
+            warmup_steps = args.lr_warmup_fraction * decay_steps
         else:
             warmup_steps = args.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
@@ -237,8 +237,8 @@ def get_learning_rate_scheduler(optimizer):
         if args.lr_decay_samples is None:
             args.lr_decay_samples = args.train_samples
         decay_steps = args.lr_decay_samples
-        if args.lr_warmup_percent is not None:
-            warmup_steps = args.lr_warmup_percent * decay_steps
+        if args.lr_warmup_fraction is not None:
+            warmup_steps = args.lr_warmup_fraction * decay_steps
         else:
             warmup_steps = args.lr_warmup_samples
     else:
