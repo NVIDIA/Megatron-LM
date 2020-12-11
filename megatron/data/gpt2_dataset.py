@@ -55,14 +55,23 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             prefixes[i], data_impl, splits_string,
             datasets_train_valid_test_num_samples[i],
             seq_length, seed, skip_warmup)
-        train_datasets.append(train_ds)
-        valid_datasets.append(valid_ds)
-        test_datasets.append(test_ds)
+        if train_ds:
+            train_datasets.append(train_ds)
+        if valid_ds:
+            valid_datasets.append(valid_ds)
+        if test_ds:
+            test_datasets.append(test_ds)
 
     # Blend.
-    blending_train_dataset = BlendableDataset(train_datasets, weights)
-    blending_valid_dataset = BlendableDataset(valid_datasets, weights)
-    blending_test_dataset = BlendableDataset(test_datasets, weights)
+    blending_train_dataset = None
+    if train_datasets:
+        blending_train_dataset = BlendableDataset(train_datasets, weights)
+    blending_valid_dataset = None
+    if valid_datasets:
+        blending_valid_dataset = BlendableDataset(valid_datasets, weights)
+    blending_test_dataset = None
+    if test_datasets:
+        blending_test_dataset = BlendableDataset(test_datasets, weights)
 
     return (blending_train_dataset, blending_valid_dataset,
             blending_test_dataset)

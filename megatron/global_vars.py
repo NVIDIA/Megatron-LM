@@ -43,8 +43,13 @@ def get_num_microbatches():
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
 
 
-def update_num_microbatches(consumed_samples):
-    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples)
+def get_current_global_batch_size():
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_global_batch_size()
+
+
+def update_num_microbatches(consumed_samples, consistency_check=True):
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples,
+                                               consistency_check)
 
 
 def get_tokenizer():

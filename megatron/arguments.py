@@ -326,6 +326,8 @@ def _add_training_args(parser):
     group.add_argument('--exit-interval', type=int, default=None,
                        help='Exit the program after the iteration is divisible '
                        'by this value.')
+    group.add_argument('--exit-duration-in-mins', type=int, default=None,
+                       help='Exit the program after this many minutes.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--scaled-upper-triang-masked-softmax-fusion',

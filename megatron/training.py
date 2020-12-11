@@ -18,6 +18,10 @@
 from datetime import datetime
 import math
 import sys
+import time
+# The earliest we can measure the start time.
+_TRAIN_START_TIME = time.time()
+
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from apex.optimizers import FusedAdam as Adam
@@ -25,6 +29,7 @@ from apex.optimizers import FusedAdam as Adam
 from megatron import get_args
 from megatron import get_timers
 from megatron import get_tensorboard_writer
+from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import update_num_microbatches
 from megatron import mpu
@@ -42,6 +47,13 @@ from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
 from megatron.utils import report_memory
+
+
+def print_datetime(string):
+    """Note that this call will sync across all ranks."""
+    torch.distributed.barrier()
+    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
@@ -74,6 +86,18 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
 
+    # Adjust the startup time so it reflects the largest value.
+    # This will be closer to what scheduler will see (outside of
+    # image ... launches.
+    global _TRAIN_START_TIME
+    start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
+    torch.distributed.all_reduce(start_time_tensor,
+                                 op=torch.distributed.ReduceOp.MIN)
+    _TRAIN_START_TIME = start_time_tensor.item()
+    print_rank_0('time took to initialize megatron (seconds): {:.3f}'.format(
+        time.time() - _TRAIN_START_TIME))
+    print_datetime('after megatron is initialized')
+
     args = get_args()
     timers = get_timers()
 
@@ -81,6 +105,8 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     timers('model and optimizer').start()
     model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
     timers('model and optimizer').stop()
+    print_datetime('after model, optimizer, and learning rate '
+                   'scheduler are built')
 
     # Data stuff.
     timers('train/valid/test data iterators').start()
@@ -88,6 +114,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         = build_train_valid_test_data_iterators(
             train_valid_test_dataset_provider)
     timers('train/valid/test data iterators').stop()
+    print_datetime('after dataloaders are build')
 
     # Print setup timing.
     print_rank_0('done with setups ...')
@@ -99,6 +126,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         iteration = train(forward_step_func,
                           model, optimizer, lr_scheduler,
                           train_data_iterator, valid_data_iterator)
+    print_datetime('after training is done')
 
     if args.do_valid:
         prefix = 'the end of training for val data'
@@ -132,13 +160,11 @@ def update_train_iters(args):
         consumed_samples = 0
         # Rampup phase.
         while consumed_samples <= int(args.rampup_batch_size[2]):
-            update_num_microbatches(consumed_samples)
-            consumed_samples += get_num_microbatches() * \
-                                args.micro_batch_size * \
-                                args.data_parallel_size
+            update_num_microbatches(consumed_samples, consistency_check=False)
+            consumed_samples += get_current_global_batch_size()
             iterations += 1
         # Reset
-        update_num_microbatches(0)
+        update_num_microbatches(0, consistency_check=False)
         # Constant phase
         # Note that we throw away any partial last batch.
         iterations += (args.train_samples - consumed_samples) // \
@@ -267,7 +293,15 @@ def setup_model_and_optimizer(model_provider_func):
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.load is not None:
+        timers = get_timers()
+        # Extra barrier is added to make sure all ranks report the
+        # max time.
+        torch.distributed.barrier()
+        timers('load checkpoint').start()
         args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        torch.distributed.barrier()
+        timers('load checkpoint').stop()
+        timers.log(['load checkpoint'])
     else:
         args.iteration = 0
 
@@ -685,11 +719,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     # Tensorboard values.
     if writer and torch.distributed.get_rank() == 0:
-        writer.add_scalar('learning_rate', learning_rate, iteration)
+        writer.add_scalar('learning_rate-iterations', learning_rate, iteration)
+        writer.add_scalar('learning_rate-samples', learning_rate,
+                          args.consumed_train_samples)
+        batch_size = args.micro_batch_size * args.data_parallel_size * \
+            get_num_microbatches()
+        writer.add_scalar('batch_size-iterations', batch_size, iteration)
+        writer.add_scalar('batch_size-samples', batch_size,
+                          args.consumed_train_samples)
         for key in loss_dict:
-            writer.add_scalar(key, loss_dict[key], iteration)
+            writer.add_scalar(key, loss_dict[key] + '-iterations', iteration)
+            writer.add_scalar(key, loss_dict[key] + '-samples',
+                              args.consumed_train_samples)
         if args.fp16:
-            writer.add_scalar('loss_scale', loss_scale, iteration)
+            writer.add_scalar('loss_scale-iterations', loss_scale, iteration)
+            writer.add_scalar('loss_scale-samples', loss_scale,
+                              args.consumed_train_samples)
         normalizer = iteration % args.log_interval
         if normalizer == 0:
             normalizer = args.log_interval
@@ -703,6 +748,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               elapsed_time / args.log_interval, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        log_string += ' consumed samples {:12d} |'.format(
+            args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time * 1000.0 / args.log_interval)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
@@ -732,6 +779,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     return report_memory_flag
 
 
+def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
+    timers = get_timers()
+    # Extra barrier is added to make sure
+    # all ranks report the max time.
+    torch.distributed.barrier()
+    timers('save checkpoint').start()
+    save_checkpoint(iteration, model, optimizer, lr_scheduler)
+    torch.distributed.barrier()
+    timers('save checkpoint').stop()
+    timers.log(['save checkpoint'])
+
+
 def train(forward_step_func, model, optimizer, lr_scheduler,
           train_data_iterator, valid_data_iterator):
     """Train the model function."""
@@ -748,6 +807,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     iteration = args.iteration
 
     timers('interval time').start()
+    print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
@@ -777,9 +837,13 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                               lr_scheduler)
 
         # Checkpointing
+        saved_checkpoint = False
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     lr_scheduler)
+            saved_checkpoint = True
+
 
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
@@ -789,13 +853,30 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        valid_data_iterator, model,
                                        iteration, False)
 
+        # Exiting based on duration
+        if args.exit_duration_in_mins:
+            train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+            done_cuda = torch.cuda.IntTensor(
+                [train_time > args.exit_duration_in_mins])
+            torch.distributed.all_reduce(
+                done_cuda, op=torch.distributed.ReduceOp.MAX)
+            done = done_cuda.item()
+            if done:
+                if not saved_checkpoint:
+                    save_checkpoint_and_time(iteration, model, optimizer,
+                                             lr_scheduler)
+                print_datetime('exiting program after {} minutes'.format(train_time))                
+                sys.exit()
+
+        # Exiting based on iterations        
         if args.exit_interval and iteration % args.exit_interval == 0:
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
             torch.distributed.barrier()
-            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            rank = torch.distributed.get_rank()
-            print_rank_0('rank: {} | time: {} | exiting the program at '
-                         'iteration {}'.format(rank, time_str, iteration))
+            print_datetime('exiting program at iteration {}'.format(iteration))                
             sys.exit()
+
 
     return iteration
 
