@@ -38,6 +38,8 @@ _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
+# A list of global ranks for each pipeline group to ease calculation of the source
+# rank when broadcasting from the first or last pipeline stage
 _PIPELINE_GLOBAL_RANKS = None
 
 def is_unitialized():
