@@ -94,7 +94,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
-    print_rank_0('time took to initialize megatron (seconds): {:.3f}'.format(
+    print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
         time.time() - _TRAIN_START_TIME))
     print_datetime('after megatron is initialized')
 
@@ -114,7 +114,7 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
         = build_train_valid_test_data_iterators(
             train_valid_test_dataset_provider)
     timers('train/valid/test data iterators').stop()
-    print_datetime('after dataloaders are build')
+    print_datetime('after dataloaders are built')
 
     # Print setup timing.
     print_rank_0('done with setups ...')
