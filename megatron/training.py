@@ -717,13 +717,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer')
     add_to_logging('batch generator')
 
+    batch_size = args.micro_batch_size * args.data_parallel_size * \
+        get_num_microbatches()
+
     # Tensorboard values.
     if writer and torch.distributed.get_rank() == 0:
         writer.add_scalar('learning_rate-iterations', learning_rate, iteration)
         writer.add_scalar('learning_rate-samples', learning_rate,
                           args.consumed_train_samples)
-        batch_size = args.micro_batch_size * args.data_parallel_size * \
-            get_num_microbatches()
         writer.add_scalar('batch_size-iterations', batch_size, iteration)
         writer.add_scalar('batch_size-samples', batch_size,
                           args.consumed_train_samples)
@@ -748,11 +749,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               elapsed_time / args.log_interval, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
-        log_string += ' consumed samples {:12d} |'.format(
+        log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time * 1000.0 / args.log_interval)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
+        log_string += ' global batch size: {:6d} |'.format(batch_size)
         num_iterations = max(
             1, args.log_interval - total_loss_dict[skipped_iters_key])
         for key in total_loss_dict:

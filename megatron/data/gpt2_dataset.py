@@ -408,7 +408,7 @@ def _build_sample_idx(sizes, doc_idx, seq_length,
     return sample_idx
 
 
-def def _build_shuffle_idx(num_samples, total_size, np_rng):
+def _build_shuffle_idx(num_samples, total_size, np_rng):
     """Build the range [0, size) and shuffle."""
     print(' > building shuffle index with split [0, {}) and [{}, {}) '
           '...'.format(num_samples, num_samples, total_size), flush=True)
