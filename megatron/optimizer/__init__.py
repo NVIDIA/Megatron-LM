@@ -23,7 +23,7 @@ from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import FP16OptimizerWithFP16Params, FP32Optimizer
 
 
-def _get_params_for_weight_decay_optimization(module):
+def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
     Layernorms and baises will have no weight decay but the rest will.
     """
@@ -32,18 +32,19 @@ def _get_params_for_weight_decay_optimization(module):
 
     weight_decay_params = {'params': []}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
-    for module_ in module.modules():
-        if isinstance(module_, LayerNorm):
-            no_weight_decay_params['params'].extend(
-                [p for p in list(module_._parameters.values())
-                 if p is not None])
-        else:
-            weight_decay_params['params'].extend(
-                [p for n, p in list(module_._parameters.items())
-                 if p is not None and n != 'bias'])
-            no_weight_decay_params['params'].extend(
-                [p for n, p in list(module_._parameters.items())
-                 if p is not None and n == 'bias'])
+    for module in modules:
+        for module_ in module.modules():
+            if isinstance(module_, LayerNorm):
+                no_weight_decay_params['params'].extend(
+                    [p for p in list(module_._parameters.values())
+                     if p is not None])
+            else:
+                weight_decay_params['params'].extend(
+                    [p for n, p in list(module_._parameters.items())
+                     if p is not None and n != 'bias'])
+                no_weight_decay_params['params'].extend(
+                    [p for n, p in list(module_._parameters.items())
+                     if p is not None and n == 'bias'])
 
     return weight_decay_params, no_weight_decay_params
 

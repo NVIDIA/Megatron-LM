@@ -557,6 +557,8 @@ def _add_distributed_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
+    group.add_argument('--virtual-pipeline-model-parallel-size', type=int, default=None,
+                       help='Number of virtual pipeline stages in physical stage.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

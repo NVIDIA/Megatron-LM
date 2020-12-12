@@ -552,7 +552,15 @@ class ParallelTransformer(MegatronModule):
                 layer_number,
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type)
-        offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+        if args.virtual_pipeline_model_parallel_size is not None:
+            assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
+                'num_layers_per_stage must be divisible by virtual_pipeline_model_parallel_size'
+            self.num_layers = self.num_layers // args.virtual_pipeline_model_parallel_size
+            offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
+                    args.num_layers // args.virtual_pipeline_model_parallel_size) + \
+                (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
+        else:
+            offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
