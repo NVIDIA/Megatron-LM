@@ -729,8 +729,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         writer.add_scalar('batch_size-samples', batch_size,
                           args.consumed_train_samples)
         for key in loss_dict:
-            writer.add_scalar(key, loss_dict[key] + '-iterations', iteration)
-            writer.add_scalar(key, loss_dict[key] + '-samples',
+            writer.add_scalar(key + '-iterations', loss_dict[key], iteration)
+            writer.add_scalar(key + '-samples', loss_dict[key],
                               args.consumed_train_samples)
         if args.fp16:
             writer.add_scalar('loss_scale-iterations', loss_scale, iteration)
