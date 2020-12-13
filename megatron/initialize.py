@@ -79,8 +79,6 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Autoresume.
         _init_autoresume()
         
-        # Write arguments to tensorboard.
-        _write_args_to_tensorboard()
         # No continuation function
         return None
         
@@ -154,13 +152,14 @@ def _set_random_seed(seed_):
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 
 
-def _write_args_to_tensorboard():
+def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
     writer = get_tensorboard_writer()
     if writer:
         for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)))
+            writer.add_text(arg, str(getattr(args, arg)),
+                            global_step=args.iteration)
 
 
 def _initialize_mem_buffs():

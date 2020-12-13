@@ -41,6 +41,7 @@ from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
 from megatron.fp16 import FP16_Optimizer
 from megatron.initialize import initialize_megatron
+from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import get_params_for_weight_decay_optimization
@@ -810,6 +811,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     """Train the model function."""
     args = get_args()
     timers = get_timers()
+
+    # Write args to tensorboard
+    write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
     model.train()
