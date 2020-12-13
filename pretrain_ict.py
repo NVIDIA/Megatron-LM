@@ -79,10 +79,10 @@ def forward_step(data_iterator, model, input_tensor):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch-generator').start()
     query_tokens, query_pad_mask, \
     block_tokens, block_pad_mask, block_indices = get_ict_batch(data_iterator)
-    timers('batch generator').stop()
+    timers('batch-generator').stop()
 
 
     # Forward model.

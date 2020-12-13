@@ -50,13 +50,13 @@ def _cross_entropy_forward_step(batch, model, input_tensor):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch-generator').start()
     try:
         batch_ = next(batch)
     except BaseException:
         batch_ = batch
     tokens, types, labels, attention_mask = process_batch(batch_)
-    timers('batch generator').stop()
+    timers('batch-generator').stop()
 
     # Forward model.
     if mpu.is_pipeline_first_stage():

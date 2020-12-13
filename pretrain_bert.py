@@ -87,10 +87,10 @@ def forward_step(data_iterator, model, input_tensor):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch-generator').start()
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask \
         = get_batch(data_iterator)
-    timers('batch generator').stop()
+    timers('batch-generator').stop()
 
     # Forward pass through the model.
     if mpu.is_pipeline_first_stage():
