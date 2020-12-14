@@ -243,6 +243,8 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
                     'last epoch number of samples exceeded max value.'
                 # If we have less than 80% of the samples for the last epoch,
                 # seperate out the epoch and treat it differently.
+                # Note: the 80% number is just based on common sense and can
+                # be adjusted if needed.
                 separate_last_epoch = (last_epoch_num_samples <
                                        int(0.80 * num_samples_per_epoch))
                 if separate_last_epoch:
