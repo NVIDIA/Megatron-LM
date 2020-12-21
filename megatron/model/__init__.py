@@ -14,8 +14,8 @@
 # limitations under the License.
 
 from .distributed import *
-from .bert_model import BertModel
+from .bert_model import BertModel, BertModelFirstStage, BertModelIntermediateStage, BertModelLastStage
 from .realm_model import ICTBertModel
-from .gpt2_model import GPT2Model
+from .gpt2_model import GPT2Model, GPT2ModelFirstStage, GPT2ModelIntermediateStage, GPT2ModelLastStage
 from .utils import get_params_for_weight_decay_optimization
 from .language_model import get_language_model

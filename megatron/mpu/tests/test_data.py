@@ -24,15 +24,15 @@ import sys
 sys.path.append("../..")
 
 
-def test_boradcast_data(model_parallel_size):
+def test_broadcast_data(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
-        print('> testing boradcast_data with model parallel size {} ...'.
-              format(model_parallel_size))
+        print('> testing broadcast_data with model parallel size {} ...'.
+              format(tensor_model_parallel_size))
 
-    mpu.initialize_model_parallel(model_parallel_size)
+    mpu.initialize_model_parallel(tensor_model_parallel_size)
     torch.manual_seed(1234 + mpu.get_data_parallel_rank())
-    model_parallel_size = mpu.get_model_parallel_world_size()
+    tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
 
     key_size_t = {'key1': [7, 11],
                   'key2': [8, 2, 1],
@@ -48,7 +48,7 @@ def test_boradcast_data(model_parallel_size):
         data_t[key] = data[key].clone()
     data['keyX'] = torch.FloatTensor(size=(5, )).random_(0, 1000)
     data_t['keyX'] = data['keyX'].clone()
-    if mpu.get_model_parallel_rank() != 0:
+    if mpu.get_tensor_model_parallel_rank() != 0:
         data = None
 
     data_utils._check_data_types(keys, data_t, torch.int64)
@@ -69,7 +69,7 @@ def test_boradcast_data(model_parallel_size):
         assert data_b[key].sub(tensor).abs().max() == 0
 
     # Reset groups
-    mpu.destroy_model_parallel()
+    mpu.destroy_tensor_model_parallel()
 
     torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
@@ -81,8 +81,8 @@ if __name__ == '__main__':
     initialize_distributed()
     world_size = torch.distributed.get_world_size()
 
-    model_parallel_size = 1
-    while model_parallel_size <= world_size:
-        print_separator('test test boradcast data')
-        test_boradcast_data(model_parallel_size)
-        model_parallel_size *= 2
+    tensor_model_parallel_size = 1
+    while tensor_model_parallel_size <= world_size:
+        print_separator('test test broadcast data')
+        test_broadcast_data(tensor_model_parallel_size)
+        tensor_model_parallel_size *= 2

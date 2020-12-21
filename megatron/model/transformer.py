@@ -130,7 +130,7 @@ class ParallelSelfAttention(MegatronModule):
         self.layer_number = max(1, layer_number)
 
         # Per attention head and per partition values.
-        world_size = mpu.get_model_parallel_world_size()
+        world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = mpu.divide(args.hidden_size,
                                                     world_size)
         self.hidden_size_per_attention_head = mpu.divide(
@@ -504,46 +504,28 @@ class ParallelTransformer(MegatronModule):
         self.checkpoint_activations = args.checkpoint_activations
         self.checkpoint_num_layers = args.checkpoint_num_layers
 
-        # Number of layers:
-        self.num_layers = args.num_layers
-        self.num_unique_layers = args.num_unique_layers
-        if self.num_unique_layers is None:
-            self.num_unique_layers = self.num_layers
-        assert self.num_layers % self.num_unique_layers == 0, \
-            'number of layers should be divisible by number of unique layers'
-        self.param_sharing_style = args.param_sharing_style
+        # Number of layers.
+        assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
+            'num_layers must be divisible by pipeline_model_parallel_size'
+        self.num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
 
         # Transformer layers.
         def build_layer(layer_number):
             return ParallelTransformerLayer(
                 attention_mask_func, init_method,
                 output_layer_init_method, layer_number)
+        offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
         self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1) for i in range(self.num_unique_layers)])
+            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        # Print layer ordering.
-        if self.num_layers != self.num_unique_layers:
-            if torch.distributed.get_rank() == 0:
-                print('> will be using the following layer ordering:')
-                for i in range(self.num_layers):
-                    print('   layer id: {:3d} --> unique layer id: '
-                          '{:3d}'.format(i, self._get_layer_index(i)),
-                          flush=True)
-
-        # Final layer norm before output.
-        self.final_layernorm = LayerNorm(
-            args.hidden_size,
-            eps=args.layernorm_epsilon)
-
-    def _get_layer_index(self, layer_number):
-        if self.param_sharing_style == 'grouped':
-            return layer_number % self.num_unique_layers
-        if self.param_sharing_style == 'spaced':
-            return layer_number // (self.num_layers // self.num_unique_layers) 
-        assert False, 'should not be here'
+        if mpu.is_pipeline_last_stage():
+            # Final layer norm before output.
+            self.final_layernorm = LayerNorm(
+                args.hidden_size,
+                eps=args.layernorm_epsilon)
 
     def _get_layer(self, layer_number):
-        return self.layers[self._get_layer_index(layer_number)]
+        return self.layers[layer_number]
 
     def _checkpointed_forward(self, hidden_states, attention_mask):
         """Forward method with activation checkpointing."""
@@ -570,7 +552,7 @@ class ParallelTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
 
-        # Checks
+        # Checks.
         if layer_past is not None:
             assert get_key_value, \
                 'for not None values in layer_past, ' \
@@ -580,8 +562,9 @@ class ParallelTransformer(MegatronModule):
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
-        # data format change to avoid explicit tranposes : [b s h] --> [s b h]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        if mpu.is_pipeline_first_stage():
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
 
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,
@@ -602,11 +585,13 @@ class ParallelTransformer(MegatronModule):
                     hidden_states, present = hidden_states
                     presents.append(present)
         
-        # reverting data format change [s b h] --> [b s h]
-        hidden_states = hidden_states.transpose(0, 1).contiguous()
-
         # Final layer norm.
-        output = self.final_layernorm(hidden_states)
+        if mpu.is_pipeline_last_stage():
+            # Reverting data format change [s b h] --> [b s h].
+            hidden_states = hidden_states.transpose(0, 1).contiguous()
+            output = self.final_layernorm(hidden_states)
+        else:
+            output = hidden_states
         if get_key_value:
             output = [output, presents]
 

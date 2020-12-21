@@ -20,12 +20,12 @@ import math
 import torch
 
 from megatron import get_args
-from megatron import print_rank_0
+from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
-from megatron.model import GPT2Model
-from megatron.training import get_model
+from megatron.model import GPT2Model, GPT2ModelFirstStage, GPT2ModelLastStage, GPT2ModelIntermediateStage
+from megatron.training import get_model, communicate
 from megatron.utils import get_ltor_masks_and_position_ids
 from tasks.finetune_utils import build_data_loader
 
@@ -48,7 +48,17 @@ def get_model_provider(eval_metric):
                                       'is not supported.'.format(eval_metric))
 
         print_rank_0('building GPT2 model ...')
-        model = GPT2Model(num_tokentypes=0, parallel_output=parallel_output)
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            # Determine model based on position of stage in pipeline.
+            if mpu.is_pipeline_first_stage():
+                model = GPT2ModelFirstStage(num_tokentypes=0)
+            elif mpu.is_pipeline_last_stage():
+                model = GPT2ModelLastStage(
+                    parallel_output=parallel_output, num_tokentypes=0)
+            else:
+                model = GPT2ModelIntermediateStage(num_tokentypes=0)
+        else:
+            model = GPT2Model(num_tokentypes=0, parallel_output=parallel_output)
 
         return model
 
@@ -83,27 +93,58 @@ def forward_step(batch, model, eval_metric):
     tokens, labels, attention_mask, position_ids, loss_mask = process_batch(
         batch)
 
+    # Tell the model what our actual batch size will be
+    args = get_args()
+    args.micro_batch_size = len(labels)
+
     # Forward model.
-    output = model(tokens, position_ids, attention_mask)
+    if not mpu.is_pipeline_first_stage():
+        input_tensor, _ = communicate(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_forward=True,
+            recv_backward=False)
+    else:
+        input_tensor = None
 
-    # For loss, return the unreduced loss.
-    if eval_metric == 'loss':
-        losses = mpu.vocab_parallel_cross_entropy(
-            output.contiguous().float(), labels.contiguous())
-        loss = torch.sum(
-            losses.view(-1) * loss_mask.contiguous().view(-1).float())
-        return loss
+    # Forward pass through the model.
+    if mpu.is_pipeline_first_stage():
+        assert input_tensor is None
+        if mpu.is_pipeline_last_stage():
+            output = model(tokens, position_ids, attention_mask)
+        else:
+            output = model(tokens, position_ids, attention_mask)
+    else:
+        assert input_tensor is not None
+        output = model(input_tensor, attention_mask)
 
-    # For accuracy, return the number of correctly predicted samples.
-    if eval_metric == 'accuracy':
-        outputs = torch.argmax(output, -1)
-        correct = (outputs == labels).float()
-        correct[(1 - loss_mask).bool()] = 1
-        correct = correct.prod(-1)
-        return correct.sum()
+    if not mpu.is_pipeline_last_stage():
+        communicate(tensor_send_next=output,
+                    tensor_send_prev=None,
+                    recv_forward=False,
+                    recv_backward=False)
+        return None
 
-    raise NotImplementedError('forward method for evaluation metric {} '
-                              'is not implemented.'.format(eval_metric))
+    if mpu.is_pipeline_last_stage():
+        # For loss, return the unreduced loss.
+        if eval_metric == 'loss':
+            losses = mpu.vocab_parallel_cross_entropy(
+                output.contiguous().float(), labels.contiguous())
+            loss = torch.sum(
+                losses.view(-1) * loss_mask.contiguous().view(-1).float())
+            return loss
+
+        # For accuracy, return the number of correctly predicted samples.
+        if eval_metric == 'accuracy':
+            outputs = torch.argmax(output, -1)
+            correct = (outputs == labels).float()
+            correct[(1 - loss_mask).bool()] = 1
+            correct = correct.prod(-1)
+            return correct.sum()
+
+        raise NotImplementedError('forward method for evaluation metric {} '
+                                  'is not implemented.'.format(eval_metric))
+    return None
 
 
 def evaluate(data_loader, model, eval_metric):
@@ -123,10 +164,11 @@ def evaluate(data_loader, model, eval_metric):
             output = forward_step(batch, model, eval_metric)
 
             # Reduce across processes.
-            torch.distributed.all_reduce(output,
-                                         group=mpu.get_data_parallel_group())
+            if mpu.is_pipeline_last_stage():
+                torch.distributed.all_reduce(output,
+                                             group=mpu.get_data_parallel_group())
 
-            total_output += output
+                total_output += output
 
     return total_output
 
@@ -138,33 +180,34 @@ def evaluate_and_print_results(task, data_loader, model, eval_metric):
     output = evaluate(data_loader, model, eval_metric)
 
     string = ' validation results on {} | '.format(task)
-    if eval_metric == 'loss':
-        num_tokenized_tokens = data_loader.dataset.num_tokenized_tokens
-        num_original_tokens = data_loader.dataset.num_original_tokens
-        val_loss = output / (num_tokenized_tokens - 1)
-        ppl = math.exp(min(20, val_loss))
-        token_ratio = (num_tokenized_tokens - 1) / (num_original_tokens - 1)
-        adjusted_ppl = math.exp(min(20, val_loss * token_ratio))
-        string += 'avg loss: {:.4E} | '.format(val_loss)
-        string += 'ppl: {:.4E} | '.format(ppl)
-        string += 'adjusted ppl: {:.4E} | '.format(adjusted_ppl)
-        string += 'token ratio: {} |'.format(token_ratio)
+    if is_last_rank():
+        if eval_metric == 'loss':
+            num_tokenized_tokens = data_loader.dataset.num_tokenized_tokens
+            num_original_tokens = data_loader.dataset.num_original_tokens
+            val_loss = output / (num_tokenized_tokens - 1)
+            ppl = math.exp(min(20, val_loss))
+            token_ratio = (num_tokenized_tokens - 1) / (num_original_tokens - 1)
+            adjusted_ppl = math.exp(min(20, val_loss * token_ratio))
+            string += 'avg loss: {:.4E} | '.format(val_loss)
+            string += 'ppl: {:.4E} | '.format(ppl)
+            string += 'adjusted ppl: {:.4E} | '.format(adjusted_ppl)
+            string += 'token ratio: {} |'.format(token_ratio)
 
-    elif eval_metric == 'accuracy':
-        num_examples = len(data_loader.dataset)
-        acc = output / num_examples
-        string += 'number correct: {:.4E} | '.format(output)
-        string += 'total examples: {:.4E} | '.format(num_examples)
-        string += 'avg accuracy: {:.4E}'.format(acc)
+        elif eval_metric == 'accuracy':
+            num_examples = len(data_loader.dataset)
+            acc = output / num_examples
+            string += 'number correct: {:.4E} | '.format(output)
+            string += 'total examples: {:.4E} | '.format(num_examples)
+            string += 'avg accuracy: {:.4E}'.format(acc)
 
-    else:
-        raise NotImplementedError('evaluation method for {} metric is not '
-                                  'implemented yet.'.format(eval_metric))
+        else:
+            raise NotImplementedError('evaluation method for {} metric is not '
+                                      'implemented yet.'.format(eval_metric))
 
-    length = len(string) + 1
-    print_rank_0('-' * length)
-    print_rank_0(string)
-    print_rank_0('-' * length)
+        length = len(string) + 1
+        print('-' * length)
+        print(string)
+        print('-' * length)
 
 
 def main():
@@ -186,7 +229,7 @@ def main():
 
     # Data stuff.
     dataset = build_dataset(args.task)
-    dataloader = build_data_loader(dataset, args.batch_size,
+    dataloader = build_data_loader(dataset, args.micro_batch_size,
                                    args.num_workers, drop_last=False)
 
     # Run evaluation.

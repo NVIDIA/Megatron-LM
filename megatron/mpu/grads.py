@@ -28,8 +28,9 @@ try:
 except Exception as e:
     print('WARNING: APEX is not installed, multi_tensor_applier will not be available.')
 
+from .initialize import is_pipeline_first_stage
 from .initialize import get_model_parallel_group
-from .initialize import get_model_parallel_rank
+from .initialize import get_tensor_model_parallel_rank
 
 
 def l2_grad_clipper(parameters, max_norm):
@@ -43,9 +44,9 @@ def l2_grad_clipper(parameters, max_norm):
     parameters_with_grads = list(filter(
         lambda p: p.grad is not None, parameters))
     # Filter parameters for norm calculations.
-    mp_rank_is_zero = (get_model_parallel_rank() == 0)
+    mp_rank_is_zero = (get_tensor_model_parallel_rank() == 0)
     parameters_for_norm = list(filter(
-        lambda p: p.model_parallel or mp_rank_is_zero, parameters_with_grads))
+        lambda p: p.tensor_model_parallel or mp_rank_is_zero, parameters_with_grads))
     # Calculate L2 norm.
     norm, _ = multi_tensor_applier(
         amp_C.multi_tensor_l2norm,
@@ -71,7 +72,7 @@ def l2_grad_clipper(parameters, max_norm):
     return total_norm
 
 
-def clip_grad_norm(parameters, max_norm, norm_type=2):
+def clip_grad_norm(parameters, max_norm, norm_type=2, parameter_names=None):
     """Clips gradient norm of an iterable of parameters.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -90,13 +91,27 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    parameters = list(filter(lambda p: p.grad is not None, parameters))
+    if parameter_names is not None:
+        filtered_parameters = []
+        assert len(parameters) == len(parameter_names), \
+            'length of parameters and parameter_names should be the same'
+        for p, n in zip(parameters, parameter_names):
+            if p.grad is not None:
+                # TODO: Bit hacky; is there a cleaner way to do this?
+                # Count embedding layer only once (in first stage).
+                # Don't count the weights a second time in the last stage.
+                if "embedding" not in n or \
+                    is_pipeline_first_stage():
+                    filtered_parameters.append(p)
+        parameters = filtered_parameters
+    else:
+        parameters = list(filter(lambda p: p.grad is not None, parameters))
     max_norm = float(max_norm)
     norm_type = float(norm_type)
     if norm_type == inf:
         total_norm = max(p.grad.data.abs().max() for p in parameters)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        # Take max across all GPUs.
+        # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=get_model_parallel_group())
@@ -105,16 +120,13 @@ def clip_grad_norm(parameters, max_norm, norm_type=2):
         if clip_coef < 1:
             for p in parameters:
                 p.grad.data.mul_(clip_coef)
-    #elif norm_type == 2:
-    #    total_norm = l2_grad_clipper(parameters, max_norm)
-
     else:
         total_norm = 0
         for p in parameters:
-            if p.model_parallel or (get_model_parallel_rank() == 0):
+            if p.tensor_model_parallel or (get_tensor_model_parallel_rank() == 0):
                 param_norm = torch.linalg.norm(p.grad.data.flatten(), norm_type)
                 total_norm += param_norm.item() ** norm_type
-        # Sum across all model parallel GPUs.
+        # Sum across all model-parallel GPUs.
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.SUM,

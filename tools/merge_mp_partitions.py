@@ -188,18 +188,18 @@ def main():
     # Args
     args = _parse_args(extra_args_provider=get_mp_merge_args)
     model_type = args.model_type
-    orig_model_parallel_size = args.model_parallel_size
-    args.model_parallel_size = 1
+    orig_tensor_model_parallel_size = args.tensor_model_parallel_size
+    args.tensor_model_parallel_size = 1
     tokenizer = rebuild_tokenizer(args)
 
     print('\n merging model parallel partitions ...')
-    print(' > number of partitions: {}'.format(orig_model_parallel_size))
+    print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size))
     print(' > checkpoint path: {}'.format(args.load))
     print(' > model parameters:')
     print('    number of tokens ................ {} '.format(
         tokenizer.vocab_size))
     print('    number of layers ................ {}'.format(args.num_layers))
-    print('    hidden sise ..................... {}'.format(args.hidden_size))
+    print('    hidden size ..................... {}'.format(args.hidden_size))
     print('    number of attention heads ....... {}'.format(
         args.num_attention_heads))
     print('    maximum position embeddings ..... {}'.format(
@@ -207,18 +207,18 @@ def main():
 
     # Full model.
     print('> building the full model ...')
-    mpu.initialize.set_model_parallel_world_size(1)
-    mpu.initialize.set_model_parallel_rank(0)
+    mpu.initialize.set_tensor_model_parallel_world_size(1)
+    mpu.initialize.set_tensor_model_parallel_rank(0)
     merged_model = get_model(model_type)
 
     # Build and load partitions.
     partitions = []
     iteration = 0
-    args.model_parallel_size = orig_model_parallel_size
+    args.tensor_model_parallel_size = orig_tensor_model_parallel_size
     tokenizer = rebuild_tokenizer(args)
-    mpu.initialize.set_model_parallel_world_size(args.model_parallel_size)
-    for rank in range(args.model_parallel_size):
-        mpu.initialize.set_model_parallel_rank(rank)
+    mpu.initialize.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+    for rank in range(args.tensor_model_parallel_size):
+        mpu.initialize.set_tensor_model_parallel_rank(rank)
         checkpoint_name, iteration = get_parallel_checkpoint_name(args.load)
         print('> loading {} ...'.format(checkpoint_name))
         model_ = get_model(model_type)
@@ -248,7 +248,7 @@ def main():
                     rank, partition_param.dtype, list(partition_param.size())))
 
             # For the non-parallel parameters, simply copy the rank 0 values.
-            if not hasattr(merged_param, 'model_parallel'):
+            if not hasattr(merged_param, 'tensor_model_parallel'):
                 print('     none-parallel parameter, simple copy from rank 0')
                 with torch.no_grad():
                     merged_param.data.copy_(partitions_param[0].data)
@@ -267,8 +267,8 @@ def main():
 
 
     # Save the model.
-    args.model_parallel_size = 1
-    mpu.initialize.set_model_parallel_rank(0)
+    args.tensor_model_parallel_size = 1
+    mpu.initialize.set_tensor_model_parallel_rank(0)
     sd = {}
     sd['model'] = merged_model.state_dict_for_save_checkpoint()
     sd['iteration'] = iteration

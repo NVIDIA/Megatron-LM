@@ -25,12 +25,13 @@ from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.training import pretrain
-from megatron.utils import reduce_losses
+from megatron.utils import average_losses_across_data_parallel_group
 from megatron.model.realm_model import general_ict_model_provider
 from megatron.data.realm_dataset_utils import get_ict_batch
 
 
 def pretrain_ict_model_provider():
+    args = get_args()
     return general_ict_model_provider(False, False)
 
 
@@ -72,22 +73,22 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
         return output
 
 
-def forward_step(data_iterator, model):
+def forward_step(data_iterator, model, input_tensor):
     """Forward step."""
     args = get_args()
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch-generator').start()
     query_tokens, query_pad_mask, \
     block_tokens, block_pad_mask, block_indices = get_ict_batch(data_iterator)
-    timers('batch generator').stop()
+    timers('batch-generator').stop()
 
 
     # Forward model.
     query_logits, block_logits = model(query_tokens, query_pad_mask, block_tokens, block_pad_mask)
-    local_batch_size = query_logits.shape[0]
-    global_batch_size = dist.get_world_size() * local_batch_size  # recall we assert that model_parallel_size == 1
+    micro_batch_size = query_logits.shape[0]
+    global_batch_size = dist.get_world_size() * micro_batch_size  # recall we assert that tensor_model_parallel_size == 1
 
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
     all_block_logits = AllgatherFromDataParallelRegion.apply(block_logits)
@@ -102,11 +103,12 @@ def forward_step(data_iterator, model):
 
     topk_accs = [topk_accuracy(int(k)) for k in args.report_topk_accuracies]
     retrieval_loss = torch.nn.CrossEntropyLoss()(retrieval_scores, torch.arange(global_batch_size).long().cuda())
-    reduced_losses = reduce_losses([retrieval_loss, *topk_accs])
+    retrieval_loss = retrieval_loss.float()
+    averaged_losses = average_losses_across_data_parallel_group([retrieval_loss, *topk_accs])
 
     # create stats_dict with retrieval loss and all specified top-k accuracies
-    topk_acc_dict = {'top{}_acc'.format(k): v for k, v in zip(args.report_topk_accuracies, reduced_losses[1:])}
-    stats_dict = dict(retrieval_loss=reduced_losses[0], **topk_acc_dict)
+    topk_acc_dict = {'top{}_acc'.format(k): v for k, v in zip(args.report_topk_accuracies, averaged_losses[1:])}
+    stats_dict = dict(retrieval_loss=averaged_losses[0], **topk_acc_dict)
 
     return retrieval_loss, stats_dict
 

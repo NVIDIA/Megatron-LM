@@ -23,8 +23,7 @@ class AnnealingLR(object):
     """Anneals the learning rate."""
 
     def __init__(self, optimizer, max_lr, min_lr,
-                 warmup_steps, decay_steps,
-                 decay_style, num_steps,
+                 warmup_steps, decay_steps, decay_style,
                  use_checkpoint_lr_scheduler=True,
                  override_lr_scheduler=False):
 
@@ -37,7 +36,7 @@ class AnnealingLR(object):
         assert self.max_lr >= self.min_lr
 
         self.warmup_steps = warmup_steps
-        self.num_steps = num_steps
+        self.num_steps = 0
         self.decay_steps = decay_steps
         assert self.decay_steps > 0
         assert self.warmup_steps < self.decay_steps
@@ -51,7 +50,7 @@ class AnnealingLR(object):
                 'use-checkpoint are set.'
 
         # Set the learning rate
-        self.step(step_num=self.num_steps)
+        self.step(0)
 
         print_rank_0('> learning rate decay style: {}'.format(self.decay_style))
 
@@ -92,11 +91,9 @@ class AnnealingLR(object):
         return self.min_lr + coeff * delta_lr
 
 
-    def step(self, increment=1, step_num=None):
+    def step(self, increment):
         """Set lr for all parameters groups."""
-        if step_num is None:
-            step_num = self.num_steps + increment
-        self.num_steps = step_num
+        self.num_steps += increment
         new_lr = self.get_lr()
         for group in self.optimizer.param_groups:
             group['lr'] = new_lr
@@ -122,8 +119,9 @@ class AnnealingLR(object):
             return cls_value
 
         if not self.use_checkpoint_lr_scheduler:
-            assert cls_value == sd_value, 'AnnealingLR: class input value' \
-                'and checkpoint values for {} do not match'.format(name)
+            assert cls_value == sd_value, \
+                f'AnnealingLR: class input value {cls_value} and checkpoint' \
+                f'value {sd_value} for {name} do not match'
         print_rank_0(' > using checkpoint value {} for {}'.format(sd_value,
                                                                   name))
         return sd_value
@@ -160,7 +158,7 @@ class AnnealingLR(object):
                                                'decay style')
 
         if 'num_iters' in sd:
-            self.num_steps = sd['num_iters']
+            num_steps = sd['num_iters']
         else:
-            self.num_steps = sd['num_steps']
-        self.step(step_num=self.num_steps)
+            num_steps = sd['num_steps']
+        self.step(increment=num_steps)

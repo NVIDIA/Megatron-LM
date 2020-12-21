@@ -5,7 +5,7 @@ VOCAB_FILE=gpt2-vocab.json
 MERGE_FILE=gpt2-merges.txt
 
 python tools/generate_samples_gpt2.py \
-       --model-parallel-size 1 \
+       --tensor-model-parallel-size 1 \
        --num-layers 24 \
        --hidden-size 1024 \
        --load $CHECKPOINT_PATH \

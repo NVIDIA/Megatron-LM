@@ -15,7 +15,7 @@
 
 import torch
 
-from .initialize import get_model_parallel_group, get_model_parallel_world_size, get_model_parallel_rank
+from .initialize import get_tensor_model_parallel_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from .utils import split_tensor_along_last_dim
 
 
@@ -23,11 +23,11 @@ def _reduce(input_):
     """All-reduce the the input tensor across model parallel group."""
 
     # Bypass the function if we are using only 1 GPU.
-    if get_model_parallel_world_size()==1:
+    if get_tensor_model_parallel_world_size()==1:
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_, group=get_model_parallel_group())
+    torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
 
     return input_
 
@@ -36,7 +36,7 @@ def _split(input_):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
 
-    world_size = get_model_parallel_world_size()
+    world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
@@ -45,7 +45,7 @@ def _split(input_):
     input_list = split_tensor_along_last_dim(input_, world_size)
 
     # Note: torch.split does not create contiguous tensors by default.
-    rank = get_model_parallel_rank()
+    rank = get_tensor_model_parallel_rank()
     output = input_list[rank].contiguous()
 
     return output
@@ -54,18 +54,18 @@ def _split(input_):
 def _gather(input_):
     """Gather tensors and concatinate along the last dimension."""
 
-    world_size = get_model_parallel_world_size()
+    world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
 
     # Size and dimension.
     last_dim = input_.dim() - 1
-    rank = get_model_parallel_rank()
+    rank = get_tensor_model_parallel_rank()
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
-    torch.distributed.all_gather(tensor_list, input_, group=get_model_parallel_group())
+    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
 
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
@@ -141,17 +141,17 @@ class _GatherFromModelParallelRegion(torch.autograd.Function):
 # Helper functions.
 # -----------------
 
-def copy_to_model_parallel_region(input_):
+def copy_to_tensor_model_parallel_region(input_):
     return _CopyToModelParallelRegion.apply(input_)
 
 
-def reduce_from_model_parallel_region(input_):
+def reduce_from_tensor_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
 
-def scatter_to_model_parallel_region(input_):
+def scatter_to_tensor_model_parallel_region(input_):
     return _ScatterToModelParallelRegion.apply(input_)
 
 
-def gather_from_model_parallel_region(input_):
+def gather_from_tensor_model_parallel_region(input_):
     return _GatherFromModelParallelRegion.apply(input_)

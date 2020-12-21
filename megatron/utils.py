@@ -27,14 +27,16 @@ from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Optimizer
 
 
-def reduce_losses(losses):
+def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
-    reduced_losses = torch.cat(
+    averaged_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(reduced_losses)
-    reduced_losses = reduced_losses / torch.distributed.get_world_size()
+    torch.distributed.all_reduce(averaged_losses,
+                                 group=mpu.get_data_parallel_group())
+    averaged_losses = averaged_losses / \
+        torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
-    return reduced_losses
+    return averaged_losses
 
 
 def report_memory(name):
@@ -48,14 +50,15 @@ def report_memory(name):
     string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(
         torch.cuda.max_memory_reserved() / mega_bytes)
-    print_rank_0(string)
+    if mpu.get_data_parallel_rank() == 0:
+        print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):
     """Print min, max, and norm of all parameters."""
     index = 0
     rank = torch.distributed.get_rank()
-    string = 'iteration, rank, index, model-parallel,min, max, norm\n'
+    string = 'iteration, rank, index, tensor-model-parallel, min, max, norm\n'
     optimizer_ = optimizer
     if isinstance(optimizer, FP16_Optimizer):
         optimizer_ = optimizer.optimizer
@@ -66,7 +69,7 @@ def print_params_min_max_norm(optimizer, iteration):
             max_ = param.data.max()
             norm = torch.linalg.norm(param.data)
             string += '{:7d}, {:4d}, {:4d}, {:2d}, '.format(
-                iteration, rank, index, int(param.model_parallel))
+                iteration, rank, index, int(param.tensor_model_parallel))
             string += '{:.6E}, {:.6E}, {:.6E}\n'.format(min_, max_, norm)
     print(string, flush=True)
 
@@ -96,11 +99,11 @@ def get_ltor_masks_and_position_ids(data,
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
-    batch_size, seq_length = data.size()
+    micro_batch_size, seq_length = data.size()
 
     # Attention mask (lower triangular).
     if reset_attention_mask:
-        att_mask_batch = batch_size
+        att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
     attention_mask = torch.tril(torch.ones(
@@ -122,7 +125,7 @@ def get_ltor_masks_and_position_ids(data,
 
     if reset_position_ids or reset_attention_mask:
         # Loop through the batches:
-        for b in range(batch_size):
+        for b in range(micro_batch_size):
 
             # Find indecies where EOD token is.
             eod_index = position_ids[b, data[b] == eod_token]

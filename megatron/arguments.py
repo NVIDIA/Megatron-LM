@@ -54,10 +54,56 @@ def parse_args(extra_args_provider=None, defaults={},
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-    args.model_parallel_size = min(args.model_parallel_size, args.world_size)
+    # Tensor model parallel size.
+    args.tensor_model_parallel_size = min(
+        args.tensor_model_parallel_size, args.world_size)
+    assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
+        ' ({}) is not divisible by tensor model parallel size ({})'.format(
+            args.world_size, args.tensor_model_parallel_size)
+    # Pipeline model parallel size.
+    args.pipeline_model_parallel_size = min(
+        args.pipeline_model_parallel_size,
+        (args.world_size // args.tensor_model_parallel_size))
+    if args.pipeline_model_parallel_size > 1:
+        if "ring_exchange" not in dir(torch.distributed):
+            raise Exception('PyTorch with torch.distributed.ring_exchange '
+                            'needed to run pipeline MP!')
+    # Checks.
+    model_parallel_size = args.pipeline_model_parallel_size * \
+                          args.tensor_model_parallel_size
+    assert args.world_size % model_parallel_size == 0, 'world size is not'\
+        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
+                           args.pipeline_model_parallel_size)
+    args.data_parallel_size = args.world_size // model_parallel_size
     if args.rank == 0:
-        print('using world size: {} and model-parallel size: {} '.format(
-            args.world_size, args.model_parallel_size))
+        print('using world size: {}, data-parallel-size: {}, '
+              'tensor-model-parallel size: {}, '
+              'pipeline-model-parallel size: {} '.format(
+                  args.world_size, args.data_parallel_size,
+                  args.tensor_model_parallel_size,
+                  args.pipeline_model_parallel_size), flush=True)
+
+    # Deprecated arguments
+    assert args.batch_size is None, '--batch-size argument is no longer ' \
+        'valid, use --micro-batch-size instead'
+    del args.batch_size
+    assert args.warmup is None, '--warmup argument is no longer valid, use ' \
+        '--lr-warmup-fraction instead'
+    del args.warmup
+    assert args.model_parallel_size is None, '--model-parallel-size is no ' \
+        'longer valid, use --tensor-model-parallel-size instead'
+    del args.model_parallel_size
+
+    # Batch size.
+    assert args.micro_batch_size is not None
+    assert args.micro_batch_size > 0
+    if args.global_batch_size is None:
+        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        if args.rank == 0:
+            print('setting global batch size to {}'.format(
+                args.global_batch_size), flush=True)
+    assert args.global_batch_size > 0
 
     # Fp16 loss scaling.
     args.dynamic_loss_scale = False
@@ -90,10 +136,40 @@ def parse_args(extra_args_provider=None, defaults={},
         else:
             setattr(args, key, defaults[key])
 
+    # Iteration-based training.
+    if args.train_iters:
+        # If we use iteration-based training, make sure the
+        # sample-based options are off.
+        assert args.train_samples is None, \
+            'expected iteration-based training'
+        assert args.lr_decay_samples is None, \
+            'expected iteration-based learning rate decay'
+        assert args.lr_warmup_samples == 0, \
+            'expected iteration-based learning rate warmup'
+        assert args.rampup_batch_size is None, \
+            'expected no batch-size rampup for iteration-based training'
+        if args.lr_warmup_fraction is not None:
+            assert args.lr_warmup_iters == 0, \
+                'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+    # Sample-based training.
+    if args.train_samples:
+        # If we use sample-based training, make sure the
+        # iteration-based options are off.
+        assert args.train_iters is None, \
+            'expected sample-based training'
+        assert args.lr_decay_iters is None, \
+            'expected sample-based learning rate decay'
+        assert args.lr_warmup_iters == 0, \
+            'expected sample-based learnig rate warmup'
+        if args.lr_warmup_fraction is not None:
+            assert args.lr_warmup_samples == 0, \
+                'can only specify one of lr-warmup-fraction and lr-warmup-samples'
+
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
-    for req_arg in required_args: 
+    for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
@@ -104,14 +180,6 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.min_lr <= args.lr
     if args.save is not None:
         assert args.save_interval is not None
-    # Parameters sharing does not work with torch DDP.
-    if (args.num_unique_layers is not None) and (args.num_layers is not None):
-        assert args.num_unique_layers <= args.num_layers
-        assert args.num_layers % args.num_unique_layers == 0, \
-            'num-layers should be divisible by num-unique-layers.'
-        if args.num_unique_layers < args.num_layers:
-            assert args.DDP_impl == 'local', \
-                'torch-DDP does not work with parameters sharing.'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -157,16 +225,6 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
-    group.add_argument('--num-unique-layers', type=int, default=None,
-                       help='Number of unique transformer layers. '
-                       '`num-layers` should be divisible by this value.')
-    group.add_argument('--param-sharing-style', default='grouped',
-                       choices=['grouped', 'spaced'],
-                       help='Ordering of the shared parameters. For example, '
-                       'for a `num-layers`=4 and `--num-unique-layers`=2, '
-                       'we will have the following ordering for two unique '
-                       'layers 1 and 2: '
-                       '    grouped: [1, 2, 1, 2] and spaced: [1, 1, 2, 2].')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--num-attention-heads', type=int, default=None,
@@ -197,7 +255,7 @@ def _add_regularization_args(parser):
     group = parser.add_argument_group(title='regularization')
 
     group.add_argument('--attention-dropout', type=float, default=0.1,
-                       help='Post attention dropout ptobability.')
+                       help='Post attention dropout probability.')
     group.add_argument('--hidden-dropout', type=float, default=0.1,
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
@@ -220,10 +278,32 @@ def _add_regularization_args(parser):
 def _add_training_args(parser):
     group = parser.add_argument_group(title='training')
 
-    group.add_argument('--batch-size', type=int, default=None,
+    group.add_argument('--micro-batch-size', type=int, default=None,
                        help='Batch size per model instance (local batch size). '
                        'Global batch size is local batch size times data '
-                       'parallel size.')
+                       'parallel size times number of micro batches.')
+    group.add_argument('--batch-size', type=int, default=None,
+                       help='Old batch size parameter, do not use. '
+                       'Use --micro-batch-size instead')
+    group.add_argument('--global-batch-size', type=int, default=None,
+                       help='Training batch size. If set, it should be a '
+                       'multiple of micro-batch-size times data-parallel-size. '
+                       'If this value is None, then '
+                       'use micro-batch-size * data-parallel-size as the '
+                       'global batch size. This choice will result in 1 for '
+                       'number of micro-batches.')
+    group.add_argument('--rampup-batch-size', nargs='*', default=None,
+                       help='Batch size ramp up with the following values:'
+                       '  --rampup-batch-size <start batch size> '
+                       '                      <batch size incerement> '
+                       '                      <ramp-up samples> '
+                       'For example:'
+                       '   --rampup-batch-size 16 8 300000 \ '
+                       '   --global-batch-size 1024'
+                       'will start with global batch size 16 and over '
+                       ' (1024 - 16) / 8 = 126 intervals will increase'
+                       'the batch size linearly to 1024. In each interval'
+                       'we will use approximately 300000 / 126 = 2380 samples.')
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
@@ -235,12 +315,19 @@ def _add_training_args(parser):
                        help='chunk size (number of layers) for checkpointing.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
-                       'training runs.')
+                       'training runs. Note that either train-iters or '
+                       'train-samples should be provided.')
+    group.add_argument('--train-samples', type=int, default=None,
+                       help='Total number of samples to train over all '
+                       'training runs. Note that either train-iters or '
+                       'train-samples should be provided.')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Report loss and timing interval.')
     group.add_argument('--exit-interval', type=int, default=None,
                        help='Exit the program after the iteration is divisible '
                        'by this value.')
+    group.add_argument('--exit-duration-in-mins', type=int, default=None,
+                       help='Exit the program after this many minutes.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--scaled-upper-triang-masked-softmax-fusion',
@@ -285,12 +372,24 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
                        ' If None defaults to `--train-iters`')
+    group.add_argument('--lr-decay-samples', type=int, default=None,
+                       help='number of samples to decay learning rate over,'
+                       ' If None defaults to `--train-samples`')
+    group.add_argument('--lr-warmup-fraction', type=float, default=None,
+                       help='fraction of lr-warmup-(iters/samples) to use '
+                       'for warmup (as a float)')
+    group.add_argument('--lr-warmup-iters', type=int, default=0,
+                       help='number of iterations to linearly warmup '
+                       'learning rate over.')
+    group.add_argument('--lr-warmup-samples', type=int, default=0,
+                       help='number of samples to linearly warmup '
+                       'learning rate over.')
+    group.add_argument('--warmup', type=int, default=None,
+                       help='Old lr warmup argument, do not use. Use one of the '
+                       '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--warmup', type=float, default=0.01,
-                       help='Percentage of total iterations to warmup on '
-                       '(.01 = 1 percent of all training iters).')
     group.add_argument('--override-lr-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
@@ -365,8 +464,13 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
 
-    group.add_argument('--model-parallel-size', type=int, default=1,
-                       help='Size of the model parallel.')
+    group.add_argument('--tensor-model-parallel-size', type=int, default=1,
+                       help='Degree of tensor model parallelism.')
+    group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
+                       help='Degree of pipeline model parallelism.')
+    group.add_argument('--model-parallel-size', type=int, default=None,
+                       help='Old model parallel argument, do not use. Use '
+                       '--tensor-model-parallel-size instead.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -495,4 +599,3 @@ def _add_realm_args(parser):
     group.add_argument('--indexer-log-interval', type=int, default=1000,
                        help='After how many batches should the indexer report progress')
     return parser
-

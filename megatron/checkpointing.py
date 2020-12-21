@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-from megatron import mpu, get_args
+from megatron import mpu, get_args, update_num_microbatches
 from megatron import get_args
 from megatron import print_rank_0
 
@@ -41,11 +41,14 @@ def get_checkpoint_version():
 
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
-    arguments and the one retreived frm checkpoint."""
+    arguments and the one retrieved from checkpoint."""
     args = get_args()
 
-    def _compare(arg_name):
-        checkpoint_value = getattr(checkpoint_args, arg_name)
+    def _compare(arg_name, old_arg_name=None):
+        if old_arg_name is not None:
+            checkpoint_value = getattr(checkpoint_args, old_arg_name)
+        else:
+            checkpoint_value = getattr(checkpoint_args, arg_name)
         args_value = getattr(args, arg_name)
         error_message = '{} value from checkpoint ({}) is not equal to the ' \
                         'input argument value ({}).'.format(
@@ -59,7 +62,12 @@ def check_checkpoint_args(checkpoint_args):
     _compare('make_vocab_size_divisible_by')
     _compare('padded_vocab_size')
     _compare('tokenizer_type')
-    _compare('model_parallel_size')
+    if get_checkpoint_version() < 3.0:
+        _compare('tensor_model_parallel_size',
+                 old_arg_name='model_parallel_size')
+    if get_checkpoint_version() >= 3.0:
+        _compare('tensor_model_parallel_size')
+        _compare('pipeline_model_parallel_size')
 
 
 def ensure_directory_exists(filename):
@@ -70,16 +78,22 @@ def ensure_directory_exists(filename):
 
 
 def get_checkpoint_name(checkpoints_path, iteration,
-                        release=False, mp_rank=None):
+                        release=False):
     """A unified checkpoint name."""
     if release:
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
+    # Use both the tensor and pipeline MP rank.
+    if mpu.get_pipeline_model_parallel_world_size() == 1:
+        return os.path.join(checkpoints_path, directory,
+                            'mp_rank_{:02d}'.format(
+                                mpu.get_tensor_model_parallel_rank()),
+                            'model_optim_rng.pt')
     return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}'.format(
-                            mpu.get_model_parallel_rank() if mp_rank is None
-                            else mp_rank),
+                        'mp_rank_{:02d}_{:03d}'.format(
+                            mpu.get_tensor_model_parallel_rank(),
+                            mpu.get_pipeline_model_parallel_rank()),
                         'model_optim_rng.pt')
 
 
@@ -96,12 +110,17 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     # Only rank zero of the data parallel writes to the disk.
     if isinstance(model, torchDDP):
         model = model.module
+
+    if torch.distributed.get_rank() == 0:
+        print('saving checkpoint at iteration {:7d} to {}'.format(
+            iteration, args.save), flush=True)
+
     if mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         state_dict = {}
         state_dict['args'] = args
-        state_dict['checkpoint_version'] = 2.0
+        state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
         state_dict['model'] = model.state_dict_for_save_checkpoint()
 
@@ -123,14 +142,14 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
         # Save.
         checkpoint_name = get_checkpoint_name(args.save, iteration)
-        print('global rank {} is saving checkpoint at iteration {:7d} to {}'.
-              format(torch.distributed.get_rank(), iteration, checkpoint_name))
         ensure_directory_exists(checkpoint_name)
         torch.save(state_dict, checkpoint_name)
-        print('  successfully saved {}'.format(checkpoint_name))
 
     # Wait so everyone is done (necessary)
     torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        print('  successfully saved checkpoint at iteration {:7d} to {}'.format(
+            iteration, args.save), flush=True)
     # And update the latest iteration
     if torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
@@ -178,9 +197,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-    if mpu.get_data_parallel_rank() == 0:
-        print('global rank {} is loading checkpoint {}'.format(
-            torch.distributed.get_rank(), checkpoint_name))
+    if torch.distributed.get_rank() == 0:
+        print(' loading checkpoint from {} at iteration {}'.format(
+            args.load, iteration), flush=True)
 
     # Load the checkpoint.
     try:
@@ -222,6 +241,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
                                               'consumed_train_samples', 0)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
     else:
@@ -261,8 +281,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
             sys.exit()
 
     torch.distributed.barrier()
-    if mpu.get_data_parallel_rank() == 0:
-        print('  successfully loaded {}'.format(checkpoint_name))
+    if torch.distributed.get_rank() == 0:
+        print('  successfully loaded checkpoint from {} at iteration {}'.format(
+            args.load, iteration), flush=True)
 
     return iteration
 

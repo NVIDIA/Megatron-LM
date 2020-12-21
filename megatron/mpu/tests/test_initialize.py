@@ -21,15 +21,15 @@ import sys
 sys.path.append("../..")
 
 
-def test_initialize_model_parallel(model_parallel_size):
+def test_initialize_model_parallel(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
         print('> testing initialize_model_parallel with size {} ...'.format(
-            model_parallel_size))
-    model_parallel_size_ = min(model_parallel_size,
+            tensor_model_parallel_size))
+    tensor_model_parallel_size_ = min(tensor_model_parallel_size,
                                torch.distributed.get_world_size())
     assert not mpu.model_parallel_is_initialized()
-    mpu.initialize_model_parallel(model_parallel_size_)
+    mpu.initialize_model_parallel(tensor_model_parallel_size_)
     assert mpu.model_parallel_is_initialized()
 
     # Checks.
@@ -38,15 +38,15 @@ def test_initialize_model_parallel(model_parallel_size):
         assert rank == torch.distributed.get_rank(group=group)
 
     # Model parallel.
-    world_size = model_parallel_size_
-    rank = torch.distributed.get_rank() % model_parallel_size_
-    assert world_size == mpu.get_model_parallel_world_size()
-    assert rank == mpu.get_model_parallel_rank()
-    check(mpu.get_model_parallel_group(), world_size, rank)
+    world_size = tensor_model_parallel_size_
+    rank = torch.distributed.get_rank() % tensor_model_parallel_size_
+    assert world_size == mpu.get_tensor_model_parallel_world_size()
+    assert rank == mpu.get_tensor_model_parallel_rank()
+    check(mpu.get_tensor_model_parallel_group(), world_size, rank)
 
     # Data parallel.
-    world_size = torch.distributed.get_world_size() // model_parallel_size_
-    rank = torch.distributed.get_rank() // model_parallel_size
+    world_size = torch.distributed.get_world_size() // tensor_model_parallel_size_
+    rank = torch.distributed.get_rank() // tensor_model_parallel_size
     assert world_size == mpu.get_data_parallel_world_size()
     assert rank == mpu.get_data_parallel_rank()
     check(mpu.get_data_parallel_group(), world_size, rank)
@@ -59,20 +59,20 @@ def test_initialize_model_parallel(model_parallel_size):
         print('>> passed the test :-)')
 
 
-def test_get_model_parallel_src_rank(model_parallel_size_):
+def test_get_tensor_model_parallel_src_rank(tensor_model_parallel_size_):
 
     if torch.distributed.get_rank() == 0:
-        print('> testing get_model_parallel_src_rank with size {} ...'.format(
-            model_parallel_size_))
-    model_parallel_size = min(model_parallel_size_,
+        print('> testing get_tensor_model_parallel_src_rank with size {} ...'.format(
+            tensor_model_parallel_size_))
+    tensor_model_parallel_size = min(tensor_model_parallel_size_,
                               torch.distributed.get_world_size())
     assert not mpu.model_parallel_is_initialized()
-    mpu.initialize_model_parallel(model_parallel_size)
+    mpu.initialize_model_parallel(tensor_model_parallel_size)
     assert mpu.model_parallel_is_initialized()
 
     # Checks
-    src_rank = torch.distributed.get_rank() - mpu.get_model_parallel_rank()
-    assert mpu.get_model_parallel_src_rank() == src_rank
+    src_rank = torch.distributed.get_rank() - mpu.get_tensor_model_parallel_rank()
+    assert mpu.get_tensor_model_parallel_src_rank() == src_rank
 
     # Reset groups
     mpu.destroy_model_parallel()
@@ -86,10 +86,10 @@ if __name__ == '__main__':
 
     initialize_distributed()
     world_size = torch.distributed.get_world_size()
-    model_parallel_size = 1
-    while model_parallel_size <= world_size:
+    tensor_model_parallel_size = 1
+    while tensor_model_parallel_size <= world_size:
         print_separator('test initialize model parallel')
-        test_initialize_model_parallel(model_parallel_size)
+        test_initialize_model_parallel(tensor_model_parallel_size)
         print_separator('test model parallel source rank')
-        test_get_model_parallel_src_rank(model_parallel_size)
-        model_parallel_size *= 2
+        test_get_tensor_model_parallel_src_rank(tensor_model_parallel_size)
+        tensor_model_parallel_size *= 2

@@ -18,7 +18,8 @@
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron.model.classification import Classification
+from megatron import mpu
+from megatron.model.classification import Classification, ClassificationFirstStage, ClassificationIntermediateStage, ClassificationLastStage
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
 
@@ -44,8 +45,21 @@ def glue_classification(num_classes, Dataset,
 
         print_rank_0('building classification model for {} ...'.format(
             args.task))
+        if mpu.get_pipeline_model_parallel_world_size() > 1:
+            # Determine model based on position of stage in pipeline.
+            if mpu.is_pipeline_first_stage():
+                model = ClassificationFirstStage(
+                    num_classes=num_classes, num_tokentypes=2)
+            elif mpu.is_pipeline_last_stage():
+                model = ClassificationLastStage(
+                    num_classes=num_classes, num_tokentypes=2)
+            else:
+                model = ClassificationIntermediateStage(
+                    num_classes=num_classes, num_tokentypes=2)
+        else:
+            model = Classification(num_classes=num_classes, num_tokentypes=2)
 
-        return Classification(num_classes=num_classes, num_tokentypes=2)
+        return model
 
     def metrics_func_provider():
         """Privde metrics callback function."""

@@ -23,8 +23,10 @@ import torch
 
 from megatron.tokenizer import build_tokenizer
 from .arguments import parse_args
+from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
+_GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
@@ -35,6 +37,19 @@ def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
     return _GLOBAL_ARGS
+
+
+def get_num_microbatches():
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
+
+
+def get_current_global_batch_size():
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_global_batch_size()
+
+
+def update_num_microbatches(consumed_samples, consistency_check=True):
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples,
+                                               consistency_check)
 
 
 def get_tokenizer():
@@ -67,6 +82,7 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
     args = _parse_args(extra_args_provider=extra_args_provider,
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
+    _build_num_microbatches_calculator(args)
     _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
@@ -82,6 +98,16 @@ def _parse_args(extra_args_provider=None, defaults={},
                               defaults=defaults,
                               ignore_unknown_args=ignore_unknown_args)
     return _GLOBAL_ARGS
+
+
+def _build_num_microbatches_calculator(args):
+
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR,
+                                   'num microbatches calculator')
+
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(
+        args)
 
 
 def _build_tokenizer(args):
@@ -105,7 +131,7 @@ def _set_tensorboard_writer(args):
                                    'tensorboard writer')
 
     if hasattr(args, 'tensorboard_dir') and \
-       args.tensorboard_dir and args.rank == 0:
+       args.tensorboard_dir and args.rank == (args.world_size -1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
@@ -216,7 +242,7 @@ class Timers:
         assert normalizer > 0.0
         for name in names:
             value = self.timers[name].elapsed(reset=reset) / normalizer
-            writer.add_scalar(name + '_time', value, iteration)
+            writer.add_scalar(name + '-time', value, iteration)
 
     def log(self, names, normalizer=1.0, reset=True):
         """Log a group of timers."""
@@ -227,7 +253,8 @@ class Timers:
                 reset=reset) * 1000.0 / normalizer
             string += ' | {}: {:.2f}'.format(name, elapsed_time)
         if torch.distributed.is_initialized():
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == (
+                    torch.distributed.get_world_size() - 1):
                 print(string, flush=True)
         else:
             print(string, flush=True)

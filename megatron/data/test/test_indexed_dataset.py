@@ -112,7 +112,7 @@ def main():
     args = parser.parse_args()
     args.rank = 0
     args.make_vocab_size_divisible_by = 128
-    args.model_parallel_size = 1
+    args.tensor_model_parallel_size = 1
 
     if args.dataset_impl == "infer":
         args.dataset_impl = indexed_dataset.infer_dataset_impl(args.data)

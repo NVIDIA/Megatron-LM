@@ -18,7 +18,8 @@
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron.model.multiple_choice import MultipleChoice
+from megatron import mpu
+from megatron.model.multiple_choice import MultipleChoice, MultipleChoiceFirstStage, MultipleChoiceIntermediateStage, MultipleChoiceLastStage
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
 from tasks.race.data import RaceDataset
@@ -41,8 +42,18 @@ def model_provider():
     """Build the model."""
 
     print_rank_0('building multichoice model for RACE ...')
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        # Determine model based on position of stage in pipeline.
+        if mpu.is_pipeline_first_stage():
+            model = MultipleChoiceFirstStage(num_tokentypes=2)
+        elif mpu.is_pipeline_last_stage():
+            model = MultipleChoiceLastStage(num_tokentypes=2)
+        else:
+            model = MultipleChoiceIntermediateStage(num_tokentypes=2)
+    else:
+        model = MultipleChoice(num_tokentypes=2)
 
-    return MultipleChoice(num_tokentypes=2)
+    return model
 
 
 def metrics_func_provider():

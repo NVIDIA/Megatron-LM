@@ -24,7 +24,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --vocab-file $VOCAB_FILE \
                --epochs 3 \
                --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
-               --model-parallel-size 1 \
+               --tensor-model-parallel-size 1 \
                --num-layers 24 \
                --hidden-size 1024 \
                --num-attention-heads 16 \

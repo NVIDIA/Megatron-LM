@@ -29,16 +29,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         return None
     args = get_args()
 
-    world_size = mpu.get_data_parallel_world_size()
-    global_batch_size = args.batch_size * world_size
-
     # Megatron sampler
     batch_sampler = MegatronPretrainingSampler(
         total_samples=len(dataset),
         consumed_samples=consumed_samples,
-        global_batch_size=global_batch_size,
-        rank=mpu.get_data_parallel_rank(),
-        world_size=world_size)
+        micro_batch_size=args.micro_batch_size,
+        data_parallel_rank=mpu.get_data_parallel_rank(),
+        data_parallel_size=mpu.get_data_parallel_world_size())
 
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
@@ -50,13 +47,15 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 class MegatronPretrainingSampler:
 
 
-    def __init__(self, total_samples, consumed_samples,
-                 global_batch_size, rank, world_size):
+    def __init__(self, total_samples, consumed_samples, micro_batch_size,
+                 data_parallel_rank, data_parallel_size):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
-        self.global_batch_size = global_batch_size
-        self.rank = rank
+        self.micro_batch_size = micro_batch_size
+        self.data_parallel_rank = data_parallel_rank
+        self.micro_batch_times_data_parallel_size = self.micro_batch_size * \
+                                                    data_parallel_size
 
         # Sanity checks.
         assert self.total_samples > 0, \
@@ -64,19 +63,11 @@ class MegatronPretrainingSampler:
         assert self.consumed_samples < self.total_samples, \
             'no samples left to consume: {}, {}'.format(self.consumed_samples,
                                                         self.total_samples)
-        assert self.global_batch_size > 0, \
-            'Unexpected global batch size: {}'.format(self.global_batch_size)
-        assert world_size > 0,\
-            'non zero world size is expected: {}'.format(world_size)
-        assert self.rank < world_size,\
-            'rank should be smaller than world size: {}, {}'.format(
-                self.rank, world_size)
-
-        # Batch size per rank.
-        assert self.global_batch_size % world_size == 0,\
-            'global batch size must be divisible by world size: {}, {}'.format(
-                self.global_batch_size, world_size)
-        self.batch_size_per_rank = self.global_batch_size // world_size
+        assert self.micro_batch_size > 0
+        assert data_parallel_size > 0
+        assert self.data_parallel_rank < data_parallel_size, \
+            'data_parallel_rank should be smaller than data size: {}, ' \
+            '{}'.format(self.data_parallel_rank, data_parallel_size)
 
 
     def __len__(self):
@@ -88,8 +79,8 @@ class MegatronPretrainingSampler:
         # Last batch if not complete will be dropped.
         for idx in range(self.consumed_samples, self.total_samples):
             batch.append(idx)
-            if len(batch) == self.global_batch_size:
-                start_idx = self.rank * self.batch_size_per_rank
-                end_idx = start_idx + self.batch_size_per_rank
+            if len(batch) == self.micro_batch_times_data_parallel_size:
+                start_idx = self.data_parallel_rank * self.micro_batch_size
+                end_idx = start_idx + self.micro_batch_size
                 yield batch[start_idx:end_idx]
                 batch = []

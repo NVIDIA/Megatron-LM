@@ -28,9 +28,9 @@ from megatron import get_args
 from megatron.memory import allocate_mem_buff
 
 from .initialize import get_data_parallel_rank
-from .initialize import get_model_parallel_group
-from .initialize import get_model_parallel_rank
-from .initialize import get_model_parallel_world_size
+from .initialize import get_tensor_model_parallel_group
+from .initialize import get_tensor_model_parallel_rank
+from .initialize import get_tensor_model_parallel_world_size
 
 
 # Default name for the model parallel rng tracker.
@@ -45,8 +45,8 @@ def init_checkpointed_activations_memory_buffer():
     """Initializ the memory buffer for the checkpointed activations."""
     args = get_args()
 
-    per_layer = args.batch_size * args.max_position_embeddings * \
-                args.hidden_size // args.model_parallel_size
+    per_layer = args.micro_batch_size * args.max_position_embeddings * \
+                args.hidden_size // args.tensor_model_parallel_size
     assert args.num_layers % args.checkpoint_num_layers == 0, \
         'number of layers is not divisible by checkpoint-num-layers'
     num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
@@ -54,7 +54,7 @@ def init_checkpointed_activations_memory_buffer():
     dtype = torch.half
     if not args.fp16:
         dtype = torch.float
-        
+
     global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
     assert _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is None, \
         'checkpointed activations memory buffer is already allocated.'
@@ -104,15 +104,15 @@ def _set_cuda_rng_state(new_state, device=-1):
 def split_tensor_into_1d_equal_chunks(tensor):
     """Break a tensor into equal 1D chunks."""
     data = tensor.view(-1)
-    partition_size = torch.numel(data) // get_model_parallel_world_size()
-    start_index = partition_size * get_model_parallel_rank()
+    partition_size = torch.numel(data) // get_tensor_model_parallel_world_size()
+    start_index = partition_size * get_tensor_model_parallel_rank()
     end_index = start_index + partition_size
     return data[start_index:end_index]
 
 
 def gather_split_1d_tensor(tensor):
     """Opposite of above function, gather values from model parallel ranks."""
-    world_size = get_model_parallel_world_size()
+    world_size = get_tensor_model_parallel_world_size()
     numel = torch.numel(tensor)
     numel_gathered = world_size * numel
     gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
@@ -120,7 +120,7 @@ def gather_split_1d_tensor(tensor):
                            requires_grad=False)
     chunks = [gathered[i*numel:(i+1)*numel] for i in range(world_size)]
     torch.distributed.all_gather(chunks, tensor,
-                                 group=get_model_parallel_group())
+                                 group=get_tensor_model_parallel_group())
     return gathered
 
 
@@ -215,15 +215,15 @@ def model_parallel_cuda_manual_seed(seed):
         default state: This is for data parallelism and is the same among a
                        set of model parallel GPUs but different across
                        different model paralle groups. This is used for
-                       example for dropout in the non-model-parallel regions.
-        model-parallel state: This state is different among a set of model
+                       example for dropout in the non-tensor-model-parallel regions.
+        tensor-model-parallel state: This state is different among a set of model
                               parallel GPUs, but the same across data parallel
                               groups. This is used for example for dropout in
                               model parallel regions.
     """
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
-    model_parallel_seed = offset + get_model_parallel_rank()
+    tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
@@ -231,15 +231,15 @@ def model_parallel_cuda_manual_seed(seed):
         print('> initializing model parallel cuda seeds on global rank {}, '
               'model parallel rank {}, and data parallel rank {} with '
               'model parallel seed: {} and data parallel seed: {}'.format(
-                  torch.distributed.get_rank(), get_model_parallel_rank(),
-                  get_data_parallel_rank(), model_parallel_seed,
+                  torch.distributed.get_rank(), get_tensor_model_parallel_rank(),
+                  get_data_parallel_rank(), tensor_model_parallel_seed,
                   data_parallel_seed), flush=True)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
-                                model_parallel_seed)
+                                tensor_model_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -268,11 +268,11 @@ class CheckpointFunction(torch.autograd.Function):
             args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
             args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
                 args[0].data)
-            
+
         # Store everything.
         ctx.save_for_backward(*args)
 
-            
+
         return outputs
 
     @staticmethod

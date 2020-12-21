@@ -56,7 +56,7 @@ def _vocab_size_with_padding(orig_vocab_size, args):
 
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
-        args.model_parallel_size
+        args.tensor_model_parallel_size
     while (after % multiple) != 0:
         after += 1
     if args.rank == 0:

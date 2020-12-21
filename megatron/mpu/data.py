@@ -15,9 +15,9 @@
 
 import torch
 
-from .initialize import get_model_parallel_group
-from .initialize import get_model_parallel_rank
-from .initialize import get_model_parallel_src_rank
+from .initialize import get_tensor_model_parallel_group
+from .initialize import get_tensor_model_parallel_rank
+from .initialize import get_tensor_model_parallel_src_rank
 
 
 _MAX_DATA_DIM = 4
@@ -36,7 +36,7 @@ def _build_key_size_numel_dictionaries(keys, data):
     sizes = [0 for _ in range(max_dim) for _ in keys]
 
     # Pack the sizes on rank zero.
-    if get_model_parallel_rank() == 0:
+    if get_tensor_model_parallel_rank() == 0:
         offset = 0
         for key in keys:
             assert data[key].dim() < max_dim, 'you should increase MAX_DATA_DIM'
@@ -47,8 +47,8 @@ def _build_key_size_numel_dictionaries(keys, data):
 
     # Move to GPU and broadcast.
     sizes_cuda = torch.cuda.LongTensor(sizes)
-    torch.distributed.broadcast(sizes_cuda, get_model_parallel_src_rank(),
-                                group=get_model_parallel_group())
+    torch.distributed.broadcast(sizes_cuda, get_tensor_model_parallel_src_rank(),
+                                group=get_tensor_model_parallel_group())
 
     # Move back to cpu and unpack.
     sizes_cpu = sizes_cuda.cpu()
@@ -89,7 +89,7 @@ def broadcast_data(keys, data, datatype):
                                                                           data)
 
     # Pack on rank zero.
-    if get_model_parallel_rank() == 0:
+    if get_tensor_model_parallel_rank() == 0:
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
@@ -100,9 +100,9 @@ def broadcast_data(keys, data, datatype):
                                    device=torch.cuda.current_device(),
                                    dtype=datatype)
 
-    # Boradcast
-    torch.distributed.broadcast(flatten_data, get_model_parallel_src_rank(),
-                                group=get_model_parallel_group())
+    # Broadcast
+    torch.distributed.broadcast(flatten_data, get_tensor_model_parallel_src_rank(),
+                                group=get_tensor_model_parallel_group())
 
     # Unpack
     output = {}

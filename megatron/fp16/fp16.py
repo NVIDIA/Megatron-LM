@@ -26,6 +26,7 @@ from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
 from megatron.module import MegatronModule
+from megatron import mpu
 
 FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
@@ -71,7 +72,12 @@ class FP16_Module(MegatronModule):
         self.add_module('module', module.half())
 
     def forward(self, *inputs, **kwargs):
-        return fp16_to_fp32(self.module(*(fp32_to_fp16(inputs)), **kwargs))
+        if mpu.is_pipeline_first_stage():
+            inputs = fp32_to_fp16(inputs)
+        outputs = self.module(*inputs, **kwargs)
+        if mpu.is_pipeline_last_stage():
+            outputs = fp16_to_fp32(outputs)
+        return outputs
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)
@@ -214,7 +220,7 @@ class FP16_Optimizer(object):
                         master_param = param.detach().clone().float()
                         master_param.requires_grad = True
                         # Copythe model parallel flag.
-                        master_param.model_parallel = param.model_parallel
+                        master_param.tensor_model_parallel = param.tensor_model_parallel
                         param_group['params'][i] = master_param
                         fp32_from_fp16_params_this_group.append(master_param)
                         # Reset existing state dict key to the new master param.
@@ -512,7 +518,8 @@ class FP16_Optimizer(object):
 
         return retval
 
-    def backward(self, loss, update_master_grads=True, retain_graph=False):
+    def backward(self, output_tensor, update_master_grads=True, retain_graph=False,
+                 output_tensor_grad=None):
         """
         :attr:`backward` performs the following conceptual steps:
 
@@ -570,7 +577,8 @@ class FP16_Optimizer(object):
         # a loss scale that works.  After you find a loss scale that works, do a final dummy
         # backward pass with retain_graph=False to tear down the graph.  Doing this would avoid
         # discarding the iteration,  but probably wouldn't improve overall efficiency.
-        self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+        self.loss_scaler.backward(output_tensor, retain_graph=retain_graph,
+                                  output_tensor_grad=output_tensor_grad)
         if update_master_grads:
             self.update_master_grads()
 

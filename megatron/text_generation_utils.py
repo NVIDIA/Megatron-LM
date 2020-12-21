@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import get_tokenizer
 from megatron import mpu
+from megatron.training import communicate
 from megatron.utils import get_ltor_masks_and_position_ids
 
 
@@ -35,7 +36,7 @@ def get_batch(context_tokens):
     tokenizer = get_tokenizer()
 
     # Move to GPU.
-    tokens = context_tokens.view(args.batch_size, -1).contiguous().cuda()
+    tokens = context_tokens.view(args.micro_batch_size, -1).contiguous().cuda()
     # Get the attention mask and postition ids.
     attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
@@ -88,14 +89,14 @@ def generate_samples_input_from_file(model):
     # Read the sample file and open the output file.
     assert args.sample_input_file is not None, \
         'sample input file is not provided.'
-    if mpu.get_model_parallel_rank() == 0:
+    if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         fname = open(args.sample_input_file, "r")
         all_raw_text = fname.readlines()
         input_count = len(all_raw_text)
         input_pos = 0
         if args.sample_output_file is None:
             sample_output_file = args.sample_input_file + ".out"
-            print('could not find `sample-output-file`, setting '
+            print('`sample-output-file` not specified, setting '
                   'it to {}'.format(sample_output_file))
         else:
             sample_output_file = args.sample_output_file
@@ -105,14 +106,16 @@ def generate_samples_input_from_file(model):
     model.eval()
     with torch.no_grad():
         while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
             terminate_runs = 0
+            raw_text_len = 0
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
                 raw_text = all_raw_text[input_pos]
                 input_pos += 1
                 if input_pos == input_count:
                     raw_text = "stop"
+                raw_text_len = len(raw_text)
 
                 if "stop" in raw_text:
                     terminate_runs = 1
@@ -127,38 +130,60 @@ def generate_samples_input_from_file(model):
                         continue
             else:
                 context_tokens = tokenizer.tokenize("EMPTY TEXT")
-                context_length = len(context_tokens)
+                context_length = 0
 
-            terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
-            torch.distributed.broadcast(terminate_runs_tensor,
-                                        mpu.get_model_parallel_src_rank(),
-                                        group=mpu.get_model_parallel_group())
-            terminate_runs = terminate_runs_tensor[0].item()
+            input_info = [terminate_runs, raw_text_len, context_length]
+            input_info_tensor = torch.cuda.LongTensor(input_info)
+            torch.distributed.all_reduce(input_info_tensor,
+                                         group=mpu.get_model_parallel_group())
+            terminate_runs = input_info_tensor[0].item()
+            raw_text_len = input_info_tensor[1].item()
+            context_length = input_info_tensor[2].item()
 
             if terminate_runs == 1:
                 return
 
+            # For pipeline parallel we send context tokens to other stages
+            # so they get the lengths correct
+            if mpu.get_tensor_model_parallel_rank() == 0 \
+               and args.pipeline_model_parallel_size > 1:
+                if mpu.is_pipeline_first_stage():
+                    src = mpu.get_pipeline_model_parallel_first_rank()
+                    group = mpu.get_pipeline_model_parallel_group()
+                    context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
+                    torch.distributed.broadcast(context_tokens_tensor, src, group)
+                else:
+                    src = mpu.get_pipeline_model_parallel_first_rank()
+                    group = mpu.get_pipeline_model_parallel_group()
+                    context_tokens_tensor = torch.empty(context_length,
+                                                        dtype=torch.int64,
+                                                        device=torch.device("cuda"))
+                    torch.distributed.broadcast(context_tokens_tensor, src, group)
+                    context_tokens = context_tokens_tensor.cpu().numpy().tolist()
+
             token_stream = get_token_stream(model, [context_tokens])
             for _, decode_tokens in enumerate(token_stream):
-                decode_tokens, _ = decode_tokens
-                decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                pass
 
-            if mpu.get_model_parallel_rank() == 0:
-                os.system('clear')
-                print("\nContext:", raw_text, flush=True)
-                trim_decode_tokens = tokenizer.detokenize(
-                    decode_tokens)[len(raw_text):]
-                print("\nMegatron-LM:", trim_decode_tokens, flush=True)
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+                    os.system('clear')
+                    print("\nContext:", raw_text, flush=True)
 
-                fname_out.write("\nContext:")
-                fname_out.write(raw_text)
-                fname_out.write("\n\nMegatron-LM:")
-                fname_out.write(trim_decode_tokens)
-                fname_out.write("\n")
+                    fname_out.write("\nContext:")
+                    fname_out.write(raw_text)
+
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    trim_decode_tokens = tokenizer.detokenize(
+                        decode_tokens)[raw_text_len:]
+                    print("\nMegatron-LM:", trim_decode_tokens, flush=True)
+
+                    fname_out.write("\n\nMegatron-LM:")
+                    fname_out.write(trim_decode_tokens)
+                    fname_out.write("\n")
 
             raw_text = None
-
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
             context_count += 1
 
 
@@ -171,15 +196,17 @@ def generate_samples_interactive(model, print_frequency=24):
     model.eval()
     with torch.no_grad():
         while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
             terminate_runs = 0
+            raw_text_len = 0
 
-            if mpu.get_model_parallel_rank() == 0:
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
                 os.system('clear')
                 raw_text = input("\nContext prompt (stop to exit) >>> ")
                 while not raw_text:
                     print('Prompt should not be empty!')
                     raw_text = input("\nContext prompt (stop to exit) >>> ")
+                raw_text_len = len(raw_text)
 
                 if "stop" in raw_text:
                     terminate_runs = 1
@@ -194,43 +221,71 @@ def generate_samples_interactive(model, print_frequency=24):
                         continue
             else:
                 context_tokens = tokenizer.tokenize("EMPTY TEXT")
-                context_length = len(context_tokens)
+                context_length = 0
 
-            terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
-            torch.distributed.broadcast(terminate_runs_tensor,
-                                        mpu.get_model_parallel_src_rank(),
-                                        group=mpu.get_model_parallel_group())
-            terminate_runs = terminate_runs_tensor[0].item()
+            input_info = [terminate_runs, raw_text_len, context_length]
+            input_info_tensor = torch.cuda.LongTensor(input_info)
+            torch.distributed.all_reduce(input_info_tensor,
+                                         group=mpu.get_model_parallel_group())
+            terminate_runs = input_info_tensor[0].item()
+            raw_text_len = input_info_tensor[1].item()
+            context_length = input_info_tensor[2].item()
 
             if terminate_runs == 1:
                 return
 
+            # For pipeline parallel we send context tokens to other stages
+            # so they get the lengths correct
+            if mpu.get_tensor_model_parallel_rank() == 0 \
+               and args.pipeline_model_parallel_size > 1:
+                if mpu.is_pipeline_first_stage():
+                    src = mpu.get_pipeline_model_parallel_first_rank()
+                    group = mpu.get_pipeline_model_parallel_group()
+                    context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
+                    torch.distributed.broadcast(context_tokens_tensor, src, group)
+                else:
+                    src = mpu.get_pipeline_model_parallel_first_rank()
+                    group = mpu.get_pipeline_model_parallel_group()
+                    context_tokens_tensor = torch.empty(context_length,
+                                                        dtype=torch.int64,
+                                                        device=torch.device("cuda"))
+                    torch.distributed.broadcast(context_tokens_tensor, src, group)
+                    context_tokens = context_tokens_tensor.cpu().numpy().tolist()
+
             token_stream = get_token_stream(model, [context_tokens])
+
             for counter, decode_tokens in enumerate(token_stream):
-                decode_tokens, _ = decode_tokens
-                decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                if counter % print_frequency != 0 \
+                   or mpu.get_tensor_model_parallel_rank() != 0 \
+                   or not mpu.is_pipeline_first_stage():
+                    continue
 
-                if mpu.get_model_parallel_rank() == 0 and \
-                   counter % print_frequency == 0:
-                    os.system('clear')
-                    print("\nContext:", raw_text, flush=True)
-                    trim_decode_tokens = tokenizer.detokenize(
-                        decode_tokens)[len(raw_text):]
-                    print("\nMegatron-LM:", trim_decode_tokens, flush=True)
-
-            if mpu.get_model_parallel_rank() == 0:
                 os.system('clear')
                 print("\nContext:", raw_text, flush=True)
+
+                decode_tokens, _ = decode_tokens
+                decode_tokens = decode_tokens[0].cpu().numpy().tolist()
                 trim_decode_tokens = tokenizer.detokenize(
-                    decode_tokens)[len(raw_text):]
+                    decode_tokens)[raw_text_len:]
                 print("\nMegatron-LM:", trim_decode_tokens, flush=True)
 
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
+                os.system('clear')
+                print("\nContext:", raw_text, flush=True)
+
+                if not isinstance(decode_tokens, list):
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                trim_decode_tokens = tokenizer.detokenize(
+                    decode_tokens)[raw_text_len:]
+                print("\nMegatron-LM:", trim_decode_tokens, flush=True)
+
+                input("\nPress Enter to continue >>>")
+
             raw_text = None
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
             context_count += 1
 
-            if mpu.get_model_parallel_rank() == 0:
-                input("\nPress any key to continue >>>")
 
 
 def generate_samples_unconditional(model):
@@ -240,29 +295,38 @@ def generate_samples_unconditional(model):
 
     num_samples = args.num_samples
     context_tokens = [[tokenizer.eod]
-                      for _ in range(args.batch_size)]
+                      for _ in range(args.micro_batch_size)]
     ctr = 0
     while True:
         start_time = time.time()
         for token_stream in get_token_stream(model,
                                              copy.deepcopy(context_tokens)):
             pass
-        if ctr % args.log_interval == 0:
-            print('Avg s/batch:',
-                  (time.time() - start_time) / min(args.log_interval, ctr + 1))
-            start_time = time.time()
-        length = len(token_stream)
-        token_batch = token_stream[0].cpu().numpy().tolist()
-        length_batch = token_stream[1].cpu().numpy().tolist()
-        for tokens, length in zip(token_batch, length_batch):
-            tokens = tokens[1:length - 1]
-            text = tokenizer.detokenize(tokens)
-            is_finished = length < args.seq_length - 1
-            datum = {'text': text, 'length': length - 1, 'finished': is_finished}
-            yield datum
-            ctr += 1
-            if ctr >= num_samples:
-                break
+        if mpu.is_pipeline_last_stage() and \
+           mpu.get_tensor_model_parallel_rank() == 0:
+            if ctr % args.log_interval == 0:
+                print('Avg s/batch:',
+                      (time.time() - start_time) / min(args.log_interval, ctr + 1))
+                start_time = time.time()
+            length = len(token_stream)
+            token_batch = token_stream[0].cpu().numpy().tolist()
+            length_batch = token_stream[1].cpu().numpy().tolist()
+            assert len(length_batch) == args.micro_batch_size
+            for tokens, length in zip(token_batch, length_batch):
+                tokens = tokens[1:length - 1]
+                text = tokenizer.detokenize(tokens)
+                is_finished = length < args.seq_length - 1
+                datum = {'text': text, 'length': length - 1, 'finished': is_finished}
+                yield datum
+                ctr += 1
+                if ctr >= num_samples:
+                    break
+        else:
+            for _ in range(args.micro_batch_size):
+                yield None
+                ctr += 1
+                if ctr >= num_samples:
+                    break
         if ctr >= num_samples:
             break
 
@@ -273,7 +337,9 @@ def generate_and_write_samples_unconditional(model):
     assert args.genfile is not None
     with open(args.genfile, 'w') as f:
         for datum in generate_samples_unconditional(model):
-            f.write(json.dumps(datum) + '\n')
+            if mpu.is_pipeline_last_stage() and \
+               mpu.get_tensor_model_parallel_rank() == 0:
+                f.write(json.dumps(datum) + '\n')
 
 
 def pad_batch(batch, pad_id, args):
@@ -299,11 +365,11 @@ def get_token_stream(model, context_tokens):
     context_length_tensor = torch.cuda.LongTensor(context_lengths)
 
     torch.distributed.broadcast(context_length_tensor,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+                                mpu.get_tensor_model_parallel_src_rank(),
+                                group=mpu.get_tensor_model_parallel_group())
     torch.distributed.broadcast(context_tokens_tensor,
-                                mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
+                                mpu.get_tensor_model_parallel_src_rank(),
+                                group=mpu.get_tensor_model_parallel_group())
 
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
@@ -313,13 +379,76 @@ def get_token_stream(model, context_tokens):
                                                  attention_mask, position_ids)
     for tokens, lengths in batch_token_iterator:
         context_length += 1
-        yield tokens[:, :context_length], lengths
+        if tokens is not None:
+            yield tokens[:, :context_length], lengths
+        else:
+            yield None, None
 
 
 def switch(val1, val2, boolean):
 
     boolean = boolean.type_as(val1)
     return (1 - boolean) * val1 + boolean * val2
+
+
+def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
+                 layer_past=None, get_key_value=None,
+                 forward_method_parallel_output=None):
+
+    # Hidden size changes when not using recompute, need to tell communicate()
+    # the correct size
+    args = get_args()
+    orig_seq_length = args.seq_length
+    args.seq_length = tokens.shape[1]
+
+    if not mpu.is_pipeline_first_stage():
+        input_tensor, _ = communicate(
+            tensor_send_next=None,
+            tensor_send_prev=None,
+            recv_forward=True,
+            recv_backward=False)
+    else:
+        input_tensor = None
+
+    # Forward pass through the model.
+    if mpu.is_pipeline_first_stage():
+        assert input_tensor is None
+        if mpu.is_pipeline_last_stage():
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                  tokentype_ids=tokentype_ids,
+                                  layer_past=layer_past,
+                                  get_key_value=get_key_value,
+                                  forward_method_parallel_output=forward_method_parallel_output)
+        else:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                  tokentype_ids=tokentype_ids,
+                                  layer_past=layer_past,
+                                  get_key_value=get_key_value)
+    elif mpu.is_pipeline_last_stage():
+        assert input_tensor is not None
+        output_tensor = model(input_tensor, attention_mask,
+                              layer_past=layer_past,
+                              get_key_value=get_key_value,
+                              forward_method_parallel_output=forward_method_parallel_output)
+    else:
+        assert input_tensor is not None
+        output_tensor = model(input_tensor, attention_mask,
+                              layer_past=layer_past,
+                              get_key_value=get_key_value)
+
+    if get_key_value:
+        output_tensor, layer_past = output_tensor
+
+    if not mpu.is_pipeline_last_stage():
+        communicate(tensor_send_next=output_tensor,
+                    tensor_send_prev=None,
+                    recv_forward=False,
+                    recv_backward=False)
+
+    args.seq_length = orig_seq_length
+    if get_key_value:
+        return output_tensor, layer_past
+    return output_tensor
 
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
@@ -349,14 +478,15 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
 
         while context_length <= (maxlen):
-
             if args.recompute:
-                logits = model(tokens,
-                               position_ids,
-                               attention_mask,
-                               tokentype_ids=type_ids,
-                               forward_method_parallel_output=False)
-                logits = logits[:, context_length - 1, :]
+                output = forward_step(model, tokens,
+                                      position_ids,
+                                      attention_mask,
+                                      tokentype_ids=type_ids,
+                                      forward_method_parallel_output=False)
+                if mpu.is_pipeline_last_stage():
+                    assert output is not None
+                    logits = output[:, context_length - 1, :]
             else:
                 types2use = None
                 if counter == 0:
@@ -372,41 +502,65 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                     if type_ids is not None:
                         types2use = type_ids[:, context_length - 1].view(
                             batch_size, -1)
-                logits, layer_past = model(tokens2use,
-                                           positions2use,
-                                           attention_mask,
-                                           layer_past=layer_past,
-                                           get_key_value=True,
-                                           tokentype_ids=types2use,
-                                           forward_method_parallel_output=False)
-                logits = logits[:, -1].view(batch_size, -1).contiguous()
+                output, layer_past = forward_step(model, tokens2use,
+                                                  positions2use,
+                                                  attention_mask,
+                                                  layer_past=layer_past,
+                                                  get_key_value=True,
+                                                  tokentype_ids=types2use,
+                                                  forward_method_parallel_output=False)
+                if mpu.is_pipeline_last_stage():
+                    assert output is not None
+                    logits = output[:, -1].view(batch_size, -1).contiguous()
 
-            if args.greedy:
-                prev = torch.argmax(logits, dim=-1).view(-1)
+            if mpu.is_pipeline_last_stage():
+                if args.greedy:
+                    prev = torch.argmax(logits, dim=-1).view(-1)
+                else:
+                    logits = logits.float()
+                    logits /= args.temperature
+                    logits = top_k_logits(logits, top_k=args.top_k,
+                                          top_p=args.top_p)
+                    log_probs = F.softmax(logits, dim=-1)
+                    prev = torch.multinomial(log_probs, num_samples=1).view(-1)
+
+                started = context_lengths <= context_length
+
+                new_tokens = switch(
+                    tokens[:, context_length].view(-1), prev, started)
+                tokens[:, context_length] = new_tokens
+                src = mpu.get_pipeline_model_parallel_last_rank()
+                group = mpu.get_embedding_group()
+                torch.distributed.broadcast(new_tokens, src, group)
+
+                done_token = (prev == eos_id).byte() & started.byte()
+                just_finished = (done_token & ~is_done).bool()
+                lengths[just_finished.view(-1)] = context_length
+                is_done = is_done | done_token
+
+                done = torch.all(is_done)
+                src = mpu.get_pipeline_model_parallel_last_rank()
+                group = mpu.get_pipeline_model_parallel_group()
+                torch.distributed.broadcast(done, src, group)
+                yield tokens, lengths
+
             else:
-                logits = logits.float()
-                logits /= args.temperature
-                logits = top_k_logits(logits, top_k=args.top_k,
-                                      top_p=args.top_p)
-                log_probs = F.softmax(logits, dim=-1)
-                prev = torch.multinomial(log_probs, num_samples=1).view(-1)
+                if mpu.is_pipeline_first_stage():
+                    src = mpu.get_pipeline_model_parallel_last_rank()
+                    group = mpu.get_embedding_group()
+                    new_tokens = torch.empty_like(tokens[:, context_length])
+                    torch.distributed.broadcast(new_tokens, src, group)
+                    tokens[:, context_length] = new_tokens
+                    yield tokens, None
+                else:
+                    yield None, None
 
-            print_logits = []
-            for p in prev:
-                print_logits.append([logits[i, p].item()
-                                     for i in range(batch_size)])
-            started = context_lengths <= context_length
-            tokens[:, context_length] = switch(
-                tokens[:, context_length].view(-1), prev, started)
+                done = torch.cuda.ByteTensor([0])
+                src = mpu.get_pipeline_model_parallel_last_rank()
+                group = mpu.get_pipeline_model_parallel_group()
+                torch.distributed.broadcast(done, src, group)
+
             context_length += 1
             counter += 1
-
-            done_token = (prev == eos_id).byte() & started.byte()
-            just_finished = (done_token & ~is_done).bool()
-            lengths[just_finished.view(-1)] = context_length
-            is_done = is_done | done_token
-            done = torch.all(is_done)
-
-            yield tokens, lengths
             if done:
                 break
