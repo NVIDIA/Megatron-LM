@@ -200,6 +200,10 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.scaled_masked_softmax_fusion:
         fused_kernels.load_scaled_masked_softmax_fusion_kernel()
 
+    # Load mixed precision fused layer norm.
+    if args.fp32_residual_connection:
+        fused_kernels.load_fused_mix_prec_layer_norm_kernel()
+
     _print_args(args)
     return args
 

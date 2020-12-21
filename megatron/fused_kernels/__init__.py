@@ -98,3 +98,29 @@ def load_scaled_masked_softmax_fusion_kernel():
                            '--expt-relaxed-constexpr',
                            '--expt-extended-lambda',
                            '--use_fast_math'] + cc_flag)
+
+
+def load_fused_mix_prec_layer_norm_kernel():
+
+    # Check, if CUDA11 is installed for compute capability 8.0
+    cc_flag = []
+    _, bare_metal_major, _ = get_cuda_bare_metal_version(cpp_extension.CUDA_HOME)
+    if int(bare_metal_major) >= 11:
+        cc_flag.append('-gencode')
+        cc_flag.append('arch=compute_80,code=sm_80')
+
+    srcpath = pathlib.Path(__file__).parent.absolute()
+    buildpath = srcpath / 'build'
+
+    create_build_dir(buildpath)
+
+    fused_mix_prec_layer_norm_cuda = cpp_extension.load(
+        name='fused_mix_prec_layer_norm_cuda',
+        sources=[srcpath / 'layer_norm_cuda.cpp',
+                 srcpath / 'layer_norm_cuda_kernel.cu'],
+        build_directory=buildpath,
+        extra_cflags=['-O3'],
+        extra_cuda_cflags=['-O3',
+                           '-gencode', 'arch=compute_70,code=sm_70',
+                           '-maxrregcount=50',
+                           '--use_fast_math'] + cc_flag)
