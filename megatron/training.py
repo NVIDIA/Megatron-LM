@@ -333,16 +333,19 @@ def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward)
     tensor_recv_prev = None
     tensor_recv_next = None
     tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
+    dtype = args.params_dtype
+    if args.fp32_residual_connection:
+        dtype = torch.float
     if recv_forward:
         tensor_recv_prev = torch.empty(tensor_shape,
                                        requires_grad=True,
                                        device=torch.cuda.current_device(),
-                                       dtype=args.params_dtype)
+                                       dtype=dtype)
     if recv_backward:
         tensor_recv_next = torch.empty(tensor_shape,
                                        requires_grad=True,
                                        device=torch.cuda.current_device(),
-                                       dtype=args.params_dtype)
+                                       dtype=dtype)
 
     # Send tensors in both the forward and backward directions as appropriate.
     torch.distributed.ring_exchange(tensor_send_prev=tensor_send_prev,

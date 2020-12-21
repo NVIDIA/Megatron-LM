@@ -19,8 +19,8 @@ import math
 
 import torch
 
-from .transformer import LayerNorm
-
+from megatron import get_args
+from megatron.model import import_layernorm
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
@@ -65,6 +65,10 @@ def get_params_for_weight_decay_optimization(module):
     """Divide params into with-weight-decay and without-weight-decay groups.
     Layernorms and baises will have no weight decay but the rest will.
     """
+
+    args = get_args()
+    LayerNorm = import_layernorm(args.fp32_residual_connection)
+    
     weight_decay_params = {'params': []}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
     for module_ in module.modules():

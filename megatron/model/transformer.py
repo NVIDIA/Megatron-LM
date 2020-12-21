@@ -21,9 +21,9 @@ import torch.nn.functional as F
 
 from megatron import get_args
 from megatron import mpu
-from megatron.mpu import LayerNorm
 from megatron.module import MegatronModule
 from megatron.checkpointing import get_checkpoint_version
+from megatron.model import import_layernorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import openai_gelu, erf_gelu
@@ -404,6 +404,7 @@ class ParallelTransformerLayer(MegatronModule):
             = args.apply_residual_connection_post_layernorm
 
         # Layernorm on the input data.
+        LayerNorm = import_layernorm(args.fp32_residual_connection)
         self.input_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon)
@@ -500,6 +501,8 @@ class ParallelTransformer(MegatronModule):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
+        self.fp32_residual_connection = args.fp32_residual_connection
+
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
         self.checkpoint_num_layers = args.checkpoint_num_layers
@@ -520,6 +523,7 @@ class ParallelTransformer(MegatronModule):
 
         if mpu.is_pipeline_last_stage():
             # Final layer norm before output.
+            LayerNorm = import_layernorm(args.fp32_residual_connection)
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
@@ -564,7 +568,10 @@ class ParallelTransformer(MegatronModule):
 
         if mpu.is_pipeline_first_stage():
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
+            if self.fp32_residual_connection:
+                hidden_states = hidden_states.transpose(0, 1).contiguous().float()
+            else:
+                hidden_states = hidden_states.transpose(0, 1).contiguous()
 
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,

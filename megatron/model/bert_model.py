@@ -21,7 +21,7 @@ from megatron import get_args
 from megatron import mpu
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
-from megatron.model.transformer import LayerNorm
+from megatron.model import import_layernorm
 from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
@@ -83,6 +83,7 @@ class BertLMHead(MegatronModule):
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        LayerNorm = import_layernorm(args.fp32_residual_connection)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:

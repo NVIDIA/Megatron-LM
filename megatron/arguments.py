@@ -183,6 +183,9 @@ def parse_args(extra_args_provider=None, defaults={},
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
+    if args.fp32_residual_connection:
+        assert args.fp16, \
+            'residual connection in fp32 only supports in fp16 mode.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.checkpoint_activations, \
@@ -435,6 +438,8 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
+    group.add_argument('--fp32-residual-connection', action='store_true',
+                       help='Move residual connections to fp32.')
     group.add_argument('--apply-query-key-layer-scaling', action='store_true',
                        help='Scale Q * K^T by 1 / layer-number. If this flag '
                        'is set, then it will automatically set '
