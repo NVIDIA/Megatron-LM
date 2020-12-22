@@ -185,7 +185,7 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
     if args.fp32_residual_connection:
         assert args.fp16, \
-            'residual connection in fp32 only supports in fp16 mode.'
+            'residual connection in fp32 only supported when using fp16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.checkpoint_activations, \

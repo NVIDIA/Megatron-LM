@@ -568,8 +568,10 @@ class ParallelTransformer(MegatronModule):
 
         if mpu.is_pipeline_first_stage():
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            # If the input flag for fp32 residual connection is set, convert for float.
             if self.fp32_residual_connection:
                 hidden_states = hidden_states.transpose(0, 1).contiguous().float()
+            # Otherwise, leave it as is.
             else:
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
 
