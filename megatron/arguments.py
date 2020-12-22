@@ -183,6 +183,9 @@ def parse_args(extra_args_provider=None, defaults={},
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
+    if args.fp32_residual_connection:
+        assert args.fp16, \
+            'residual connection in fp32 only supported when using fp16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.checkpoint_activations, \
@@ -196,6 +199,10 @@ def parse_args(extra_args_provider=None, defaults={},
     # load scaled_masked_softmax_fusion kernel
     if args.scaled_masked_softmax_fusion:
         fused_kernels.load_scaled_masked_softmax_fusion_kernel()
+
+    # Load mixed precision fused layer norm.
+    if args.fp32_residual_connection:
+        fused_kernels.load_fused_mix_prec_layer_norm_kernel()
 
     _print_args(args)
     return args
@@ -435,6 +442,8 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
+    group.add_argument('--fp32-residual-connection', action='store_true',
+                       help='Move residual connections to fp32.')
     group.add_argument('--apply-query-key-layer-scaling', action='store_true',
                        help='Scale Q * K^T by 1 / layer-number. If this flag '
                        'is set, then it will automatically set '

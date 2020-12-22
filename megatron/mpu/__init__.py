@@ -41,7 +41,6 @@ from .initialize import get_pipeline_model_parallel_world_size, set_pipeline_mod
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
 
-from .layers import LayerNorm
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding

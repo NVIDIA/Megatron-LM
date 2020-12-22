@@ -25,16 +25,6 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
-try:
-    from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
-    # Try to use FusedLayerNorm from Apex - this will trigger an error.
-    _ = LayerNorm(8, eps=1e-5)
-
-except Exception as e:
-    print('WARNING: APEX is not installed, using torch.nn.LayerNorm '
-          'instead of apex.normalization.FusedLayerNorm!')
-    from torch.nn import LayerNorm
-
 from .initialize import get_tensor_model_parallel_rank
 from .initialize import get_tensor_model_parallel_world_size
 from .mappings import copy_to_tensor_model_parallel_region
