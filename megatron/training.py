@@ -857,15 +857,6 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             check_adlr_autoresume_termination(iteration, model, optimizer,
                                               lr_scheduler)
 
-        # Checkpointing
-        saved_checkpoint = False
-        if args.save and args.save_interval and \
-           iteration % args.save_interval == 0:
-            save_checkpoint_and_time(iteration, model, optimizer,
-                                     lr_scheduler)
-            saved_checkpoint = True
-
-
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
@@ -873,6 +864,14 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, False)
+
+        # Checkpointing
+        saved_checkpoint = False
+        if args.save and args.save_interval and \
+           iteration % args.save_interval == 0:
+            save_checkpoint_and_time(iteration, model, optimizer,
+                                     lr_scheduler)
+            saved_checkpoint = True
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
