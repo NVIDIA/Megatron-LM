@@ -24,7 +24,6 @@ _TRAIN_START_TIME = time.time()
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from apex.optimizers import FusedAdam as Adam
 
 from megatron import get_args
 from megatron import get_timers
@@ -45,7 +44,6 @@ from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
@@ -184,6 +182,10 @@ def get_model(model_provider_func):
     # Build model on cpu.
     model = model_provider_func()
 
+    # Set tensor model parallel attributes if not set.
+    for param in model.parameters():
+        mpu.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
@@ -210,30 +212,6 @@ def get_model(model_provider_func):
 
     raise NotImplementedError('Unknown DDP implementation specified: {}. '
                               'Exiting.'.format(args.DDP_impl))
-
-
-def get_optimizer(model):
-    """Set up the optimizer."""
-    args = get_args()
-
-    # Build parameter groups (weight decay and non-decay).
-    while isinstance(model, (torchDDP, LocalDDP, FP16_Module)):
-        model = model.module
-    param_groups = get_params_for_weight_decay_optimization(model)
-
-    # Add model parallel attribute if it is not set.
-    for param_group in param_groups:
-        for param in param_group['params']:
-            if not hasattr(param, 'tensor_model_parallel'):
-                param.tensor_model_parallel = False
-
-    # Use Adam.
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
-        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
-
-    # Wrap into fp16 optimizer.
-    optimizer = get_megatron_optimizer(optimizer, model)
-    return optimizer
 
 
 def get_learning_rate_scheduler(optimizer):
@@ -284,7 +262,12 @@ def setup_model_and_optimizer(model_provider_func):
     args = get_args()
 
     model = get_model(model_provider_func)
-    optimizer = get_optimizer(model)
+
+    unwrapped_model = model
+    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
+        unwrapped_model = unwrapped_model.module
+    optimizer = get_megatron_optimizer(unwrapped_model)
+
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.load is not None:

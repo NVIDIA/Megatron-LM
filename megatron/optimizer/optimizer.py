@@ -21,16 +21,49 @@ from abc import abstractmethod
 import torch
 
 from apex.multi_tensor_apply import multi_tensor_applier
+from apex.optimizers import FusedAdam as Adam
 import amp_C
 
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
+from megatron.model import import_layernorm
 
 
-def get_megatron_optimizer(optimizer, model):
+def get_params_for_weight_decay_optimization(module):
+    """Divide params into with-weight-decay and without-weight-decay groups.
+    Layernorms and baises will have no weight decay but the rest will.
+    """
 
     args = get_args()
+    LayerNorm = import_layernorm(args.fp32_residual_connection)
+    
+    weight_decay_params = {'params': []}
+    no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
+    for module_ in module.modules():
+        if isinstance(module_, LayerNorm):
+            no_weight_decay_params['params'].extend(
+                [p for p in list(module_._parameters.values())
+                 if p is not None])
+        else:
+            weight_decay_params['params'].extend(
+                [p for n, p in list(module_._parameters.items())
+                 if p is not None and n != 'bias'])
+            no_weight_decay_params['params'].extend(
+                [p for n, p in list(module_._parameters.items())
+                 if p is not None and n == 'bias'])
+
+    return weight_decay_params, no_weight_decay_params
+
+
+def get_megatron_optimizer(model):
+
+    args = get_args()
+
+    # Base optimizer.
+    param_groups = get_params_for_weight_decay_optimization(model)
+    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
+        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
 
     if args.fp16:
         # Constant loss scale.
