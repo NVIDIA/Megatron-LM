@@ -72,7 +72,7 @@ def l2_grad_clipper(parameters, max_norm):
     return total_norm
 
 
-def clip_grad_norm(parameters, max_norm, norm_type=2, parameter_names=None):
+def clip_grad_norm(parameters, max_norm, norm_type=2):
     """Clips gradient norm of an iterable of parameters.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -89,51 +89,55 @@ def clip_grad_norm(parameters, max_norm, norm_type=2, parameter_names=None):
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
+    
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
-    if parameter_names is not None:
-        filtered_parameters = []
-        assert len(parameters) == len(parameter_names), \
-            'length of parameters and parameter_names should be the same'
-        for p, n in zip(parameters, parameter_names):
-            if p.grad is not None:
-                # TODO: Bit hacky; is there a cleaner way to do this?
-                # Count embedding layer only once (in first stage).
-                # Don't count the weights a second time in the last stage.
-                if "embedding" not in n or \
-                    is_pipeline_first_stage():
-                    filtered_parameters.append(p)
-        parameters = filtered_parameters
-    else:
-        parameters = list(filter(lambda p: p.grad is not None, parameters))
+
+    # Filter parameters based on:
+    #   - grad should not be none
+    #   - parameter should not be shared
+    #   - should not be a replica due to tensor model parallelism
+    filtered_parameters = []
+    for param in parameters:
+        grad_not_none = param.grad is not None
+        is_not_shared = not hasattr(param, 'shared') or not param.shared
+        is_not_tp_duplicate = param.tensor_model_parallel or \
+                              (get_tensor_model_parallel_rank() == 0)
+        if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            filtered_parameters.append(param)
+    parameters = filtered_parameters
+
+    # Norm parameters.
     max_norm = float(max_norm)
     norm_type = float(norm_type)
+    total_norm = 0
+
+    # Calculate norm.
     if norm_type == inf:
-        total_norm = max(p.grad.data.abs().max() for p in parameters)
+        total_norm = max(param.grad.detach().abs().max()
+                         for param in parameters)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item()
-        clip_coef = max_norm / (total_norm + 1e-6)
-        if clip_coef < 1:
-            for p in parameters:
-                p.grad.data.mul_(clip_coef)
-    else:
-        total_norm = 0
-        for p in parameters:
-            if p.tensor_model_parallel or (get_tensor_model_parallel_rank() == 0):
-                param_norm = torch.linalg.norm(p.grad.data.flatten(), norm_type)
-                total_norm += param_norm.item() ** norm_type
+
+    else:    
+        for param in parameters:
+            param_norm = torch.norm(param.grad.detach(), norm_type)
+            total_norm += param_norm.item() ** norm_type
         # Sum across all model-parallel GPUs.
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=get_model_parallel_group())
         total_norm = total_norm_cuda[0].item() ** (1. / norm_type)
-        clip_coef = max_norm / (total_norm + 1e-6)
-        if clip_coef < 1:
-            for p in parameters:
-                p.grad.data.mul_(clip_coef)
+
+    # Scale.
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1:
+        for param in parameters:
+            param.grad.detach().mul_(clip_coef)
+
     return total_norm

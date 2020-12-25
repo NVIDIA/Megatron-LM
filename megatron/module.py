@@ -79,6 +79,7 @@ class PipelinedMegatronModule(MegatronModule):
                     args.padded_vocab_size, args.hidden_size,
                     init_method=init_method_normal(args.init_method_std))
                 self.word_embeddings.weight.data.fill_(0)
+                self.word_embeddings.weight.shared = True
         # Ensure that first and last stages have the same initial parameter values.
         if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
             torch.distributed.all_reduce(self.word_embeddings_weight().data,
