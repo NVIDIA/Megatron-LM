@@ -39,7 +39,9 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
-from megatron.fp16 import FP16_Optimizer
+#from megatron.fp16 import FP16_Optimizer
+from megatron.optimizer.optimizer import get_megatron_optimizer
+
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
@@ -232,6 +234,8 @@ def get_optimizer(model):
 
     # Wrap into fp16 optimizer.
     if args.fp16:
+        optimizer = get_megatron_optimizer(optimizer)
+        '''
         optimizer = FP16_Optimizer(optimizer,
                                    static_loss_scale=args.loss_scale,
                                    dynamic_loss_scale=args.dynamic_loss_scale,
@@ -239,7 +243,7 @@ def get_optimizer(model):
                                        'scale_window': args.loss_scale_window,
                                        'min_scale': args.min_scale,
                                        'delayed_shift': args.hysteresis})
-
+        '''
     return optimizer
 
 
@@ -367,12 +371,16 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
         input_tensor.retain_grad()
 
     # Backward pass.
-    if args.fp16:
+    if output_tensor_grad is None:
+        output_tensor = optimizer.scale_loss(output_tensor)
+    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+    '''
+    if args.fp16 and output_tensor_grad is None:
         optimizer.backward(output_tensor, update_master_grads=False,
                            output_tensor_grad=output_tensor_grad)
     else:
         torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
-
+    '''
     # Collect the grad of the input_tensor.
     input_tensor_grad = None
     if input_tensor is not None:
@@ -590,10 +598,13 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
+    optimizer.zero_grad()
+    '''
     if args.fp16:
         optimizer.zero_grad(set_grads_to_None=True)
     else:
         optimizer.zero_grad()
+    '''
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         losses_reduced = forward_backward_pipelining(
@@ -627,12 +638,14 @@ def train_step(forward_step_func, data_iterator,
     timers('backward-embedding-all-reduce').stop()
 
     # Update master gradients.
+    '''
     timers('backward-master-grad').start()
     if args.fp16:
         optimizer.update_master_grads()
     timers('backward-master-grad').stop()
-
+    '''
     # Clipping gradients helps prevent the exploding gradient.
+    '''
     timers('backward-clip-grad').start()
     if args.clip_grad > 0.:
         if not args.fp16:
@@ -647,19 +660,20 @@ def train_step(forward_step_func, data_iterator,
         else:
             optimizer.clip_master_grads(args.clip_grad)
     timers('backward-clip-grad').stop()
+    '''
 
     # Update parameters.
     timers('optimizer').start()
-    optimizer.step()
+    update_successfull = optimizer.step()
     timers('optimizer').stop()
 
     # Update learning rate.
-    skipped_iter = 0
-    if not (args.fp16 and optimizer.overflow):
+    if update_successfull:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
         lr_scheduler.step(increment=increment)
+        skipped_iter = 0
     else:
         skipped_iter = 1
 
@@ -845,7 +859,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Logging.
         loss_scale = None
         if args.fp16:
-            loss_scale = optimizer.loss_scale
+            loss_scale = optimizer.get_loss_scale().item()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
