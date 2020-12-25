@@ -1,4 +1,19 @@
+# coding=utf-8
+# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+"""Megatron optimizer."""
 
 from abc import ABC
 from abc import abstractmethod
@@ -22,7 +37,7 @@ def get_megatron_optimizer(optimizer, model):
         if args.loss_scale:
             grad_scaler = ConstantGradScaler(args.loss_scale)
         # Dynamic loss scale.
-        else:        
+        else:
             grad_scaler = DynamicGradScaler(
                 initial_scale=args.initial_loss_scale,
                 min_scale=args.min_loss_scale,
@@ -70,7 +85,9 @@ class MegatronGradScaler(ABC):
 
 
 class ConstantGradScaler(MegatronGradScaler):
-    pass
+
+    def update(self, found_inf):
+        pass
 
 
 class DynamicGradScaler(MegatronGradScaler):

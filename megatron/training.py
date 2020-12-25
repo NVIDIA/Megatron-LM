@@ -39,7 +39,6 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
-#from megatron.fp16 import FP16_Optimizer
 from megatron.optimizer.optimizer import get_megatron_optimizer
 
 from megatron.initialize import initialize_megatron
@@ -234,15 +233,6 @@ def get_optimizer(model):
 
     # Wrap into fp16 optimizer.
     optimizer = get_megatron_optimizer(optimizer, model)
-    '''
-        optimizer = FP16_Optimizer(optimizer,
-                                   static_loss_scale=args.loss_scale,
-                                   dynamic_loss_scale=args.dynamic_loss_scale,
-                                   dynamic_loss_args={
-                                       'scale_window': args.loss_scale_window,
-                                       'min_scale': args.min_scale,
-                                       'delayed_shift': args.hysteresis})
-    '''
     return optimizer
 
 
@@ -373,13 +363,7 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
     if output_tensor_grad is None:
         output_tensor = optimizer.scale_loss(output_tensor)
     torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
-    '''
-    if args.fp16 and output_tensor_grad is None:
-        optimizer.backward(output_tensor, update_master_grads=False,
-                           output_tensor_grad=output_tensor_grad)
-    else:
-        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
-    '''
+
     # Collect the grad of the input_tensor.
     input_tensor_grad = None
     if input_tensor is not None:
@@ -598,12 +582,6 @@ def train_step(forward_step_func, data_iterator,
 
     # Set grad to zero.
     optimizer.zero_grad()
-    '''
-    if args.fp16:
-        optimizer.zero_grad(set_grads_to_None=True)
-    else:
-        optimizer.zero_grad()
-    '''
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         losses_reduced = forward_backward_pipelining(
@@ -635,31 +613,6 @@ def train_step(forward_step_func, data_iterator,
             torch.distributed.all_reduce(word_embeddings_weight.grad,
                                          group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
-
-    # Update master gradients.
-    '''
-    timers('backward-master-grad').start()
-    if args.fp16:
-        optimizer.update_master_grads()
-    timers('backward-master-grad').stop()
-    '''
-    # Clipping gradients helps prevent the exploding gradient.
-    '''
-    timers('backward-clip-grad').start()
-    if args.clip_grad > 0.:
-        if not args.fp16:
-            named_parameters = model.named_parameters()
-            parameters = []
-            parameter_names = []
-            for parameter_name, parameter in model.named_parameters():
-                parameters.append(parameter)
-                parameter_names.append(parameter_name)
-            mpu.clip_grad_norm(parameters, args.clip_grad,
-                               parameter_names=parameter_names)
-        else:
-            optimizer.clip_master_grads(args.clip_grad)
-    timers('backward-clip-grad').stop()
-    '''
 
     # Update parameters.
     timers('optimizer').start()
