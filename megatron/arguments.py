@@ -105,11 +105,6 @@ def parse_args(extra_args_provider=None, defaults={},
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
-    # Fp16 loss scaling.
-    args.dynamic_loss_scale = False
-    if args.loss_scale is None:
-        args.dynamic_loss_scale = True
-
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -442,6 +437,18 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
+    group.add_argument('--loss-scale', type=float, default=None,
+                       help='Static loss scaling, positive power of 2 '
+                       'values can improve fp16 convergence. If None, dynamic'
+                       'loss scaling is used.')
+    group.add_argument('--initial-loss-scale', type=float, default=2**32,
+                       help='Initial loss-scale for dynamic loss scaling.')
+    group.add_argument('--min-loss-scale', type=float, default=1.0,
+                       help='Minimum loss scale for dynamic loss scale.')
+    group.add_argument('--loss-scale-window', type=float, default=1000,
+                       help='Window over which to raise/lower dynamic scale.')
+    group.add_argument('--hysteresis', type=int, default=2,
+                       help='hysteresis for dynamic loss scaling')
     group.add_argument('--fp32-residual-connection', action='store_true',
                        help='Move residual connections to fp32.')
     group.add_argument('--apply-query-key-layer-scaling', action='store_true',
@@ -452,20 +459,9 @@ def _add_mixed_precision_args(parser):
                        help='Run attention masking and softmax in fp32.')
     group.add_argument('--fp32-allreduce', action='store_true',
                        help='All-reduce in fp32')
-    group.add_argument('--hysteresis', type=int, default=2,
-                       help='hysteresis for dynamic loss scaling')
-    group.add_argument('--loss-scale', type=float, default=None,
-                       help='Static loss scaling, positive power of 2 '
-                       'values can improve fp16 convergence. If None, dynamic'
-                       'loss scaling is used.')
-    group.add_argument('--loss-scale-window', type=float, default=1000,
-                       help='Window over which to raise/lower dynamic scale.')
-    group.add_argument('--min-scale', type=float, default=1,
-                       help='Minimum loss scale for dynamic loss scale.')
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
-
 
     return parser
 

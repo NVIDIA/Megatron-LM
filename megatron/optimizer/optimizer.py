@@ -8,26 +8,34 @@ import torch
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from megatron import mpu
 from megatron import get_args
+from megatron import get_timers
+from megatron import mpu
 
 
-def get_megatron_optimizer(optimizer):
+def get_megatron_optimizer(optimizer, model):
 
     args = get_args()
 
-    grad_scaler = DynamicGradScaler(
-        initial_scale=2**32,
-        min_scale=args.min_scale,
-        growth_factor=2.0,
-        backoff_factor=0.5,
-        growth_interval=args.loss_scale_window,
-        hysteresis=args.hysteresis)
+    if args.fp16:
+        # Constant loss scale.
+        if args.loss_scale:
+            grad_scaler = ConstantGradScaler(args.loss_scale)
+        # Dynamic loss scale.
+        else:        
+            grad_scaler = DynamicGradScaler(
+                initial_scale=args.initial_loss_scale,
+                min_scale=args.min_loss_scale,
+                growth_factor=2.0,
+                backoff_factor=0.5,
+                growth_interval=args.loss_scale_window,
+                hysteresis=args.hysteresis)
+        # Megatron optimizer.
+        return FP16OptimizerWithFP16Params(optimizer, grad_scaler,
+                                           args.clip_grad)
 
-    megatron_optimizer = FP16OptimizerWithFP16Params(
-        optimizer, grad_scaler, args.clip_grad)
-
-    return megatron_optimizer
+    # FP32.
+    return FP32Optimizer(optimizer, model, args.clip_grad)
 
 
 
@@ -239,9 +247,8 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                         # Store grads
                         master_param.requires_grad = True
                         # Copy tensor model parallel attributes.
-                        master_param.tensor_model_parallel = param.tensor_model_parallel
-                        #mpu.copy_tensor_model_parallel_attributes(master_param,
-                        #                                          param)
+                        mpu.copy_tensor_model_parallel_attributes(master_param,
+                                                                  param)
                         # Replace the optimizer params with the new fp32 copy.
                         param_group['params'][i] = master_param
                         fp32_from_fp16_params_this_group.append(master_param)
@@ -286,10 +293,13 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
 
+        timers = get_timers()
+
         # ==================================================
         # Copy gradients from model params to master params.
         # ==================================================
 
+        timers('optimizer-copy-to-master-grad').start()
         # This only needs to be done for the fp16 group.
         model_grads = []
         master_grads = []
@@ -307,11 +317,13 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                              self._dummy_overflow_buf,
                              [model_grads, master_grads],
                              1.0)
+        timers('optimizer-copy-to-master-grad').stop()
 
         # ==============================
         # Unscale and check for inf/nan.
         # ==============================
 
+        timers('optimizer-unscale-and-check-inf').start()
         # Append fp32 parameters.
         for master_group in self.fp32_from_fp32_groups:
             for master_param in master_group:
@@ -326,6 +338,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         torch.distributed.all_reduce(self.found_inf,
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=mpu.get_model_parallel_group())
+        timers('optimizer-unscale-and-check-inf').stop()
 
         # ==================================
         # We are done with scaling gradients
@@ -344,11 +357,13 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         # Clip the master gradients.
         # ==========================
 
+        timers('optimizer-clip-master-grad').start()
         fp32_params = []
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 fp32_params.append(param)
         mpu.clip_grad_norm(fp32_params, self.clip_grad)
+        timers('optimizer-clip-master-grad').stop()
 
         # ===================
         # Step the optimizer.
@@ -360,6 +375,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         # Update params from master params.
         # =================================
 
+        timers('optimizer-copy-master-to-model-params').start()
         # Only needed for the fp16 params.
         model_data = []
         master_data = []
@@ -374,5 +390,57 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                              self._dummy_overflow_buf,
                              [master_data, model_data],
                              1.0)
+        timers('optimizer-copy-master-to-model-params').stop()
 
         return True
+
+
+class FP32Optimizer(MegatronOptimizer):
+
+    def __init__(self, optimizer, model, clip_grad):
+
+        super(FP32Optimizer, self).__init__(optimizer)
+        self.model = model
+        self.clip_grad = clip_grad
+        self._scale = torch.cuda.FloatTensor([1.0])
+
+
+    def zero_grad(self, set_to_none=True):
+        """Copied from torch.optim.optimizer"""
+        for group in self.optimizer.param_groups:
+            _zero_grad_group_helper(group['params'], set_to_none)
+
+
+    def get_loss_scale(self):
+        """FP32 optimizer does not do any scaling."""
+        return self._scale
+
+
+    @torch.no_grad()
+    def step(self):
+        """Clip gradients (if needed) and step the base optimizer.
+        Always return auccessful since there is no overflow."""
+
+        # Clip gradients.
+        if self.clip_grad > 0.0:
+            parameters = []
+            parameter_names = []
+            for parameter_name, parameter in self.model.named_parameters():
+                parameters.append(parameter)
+                parameter_names.append(parameter_name)
+            mpu.clip_grad_norm(parameters, self.clip_grad,
+                               parameter_names=parameter_names)
+
+        # Update parameters.
+        self.optimizer.step()
+
+        # No overflow for FP32 optimizer.
+        return True
+
+
+    def state_dict(self):
+        return self.optimizer.state_dict()
+
+
+    def load_state_dict(self, state_dict):
+        self.optimizer.load_state_dict(state_dict)

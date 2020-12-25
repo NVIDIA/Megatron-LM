@@ -37,14 +37,48 @@ from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args
 
+
+_MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
+                                      'partition_dim': -1,
+                                      'partition_stride': 1}
+
+
+def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
+    # Make sure the attributes are not set.
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        assert not hasattr(tensor, attribute)
+    # Set the attributes.
+    setattr(tensor, 'tensor_model_parallel', is_parallel)
+    setattr(tensor, 'partition_dim', dim)
+    setattr(tensor, 'partition_stride', stride)
+
+
+def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
+    def maybe_set(attribute, value):
+        if not hasattr(tensor, attribute):
+            setattr(tensor, attribute, value)
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_set(attribute, _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS[attribute])
+
+
+def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
+    def maybe_copy(attribute):
+        if hasattr(source_tensor, attribute):
+            setattr(destination_tensor, attribute,
+                    getattr(source_tensor, attribute))
+    for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+        maybe_copy(attribute)
+
+
 def _initialize_affine_weight_gpu(weight, init_method,
                                   partition_dim, stride=1):
     """Initialize affine weight for model parallel on GPU."""
 
-    weight.tensor_model_parallel = True
-    weight.partition_dim = partition_dim
-    weight.partition_stride = stride
-    
+    set_tensor_model_parallel_attributes(tensor=weight,
+                                         is_parallel=True,
+                                         dim=partition_dim,
+                                         stride=stride)
+
     with get_cuda_rng_tracker().fork():
         init_method(weight)
 
@@ -58,9 +92,10 @@ def _initialize_affine_weight_cpu(weight, output_size, input_size,
     Build the master weight on all processes and scatter
     the relevant chunk."""
 
-    weight.tensor_model_parallel = True
-    weight.partition_dim = partition_dim
-    weight.partition_stride = stride
+    set_tensor_model_parallel_attributes(tensor=weight,
+                                         is_parallel=True,
+                                         dim=partition_dim,
+                                         stride=stride)
 
     # Initialize master weight
     master_weight = torch.empty(output_size, input_size,

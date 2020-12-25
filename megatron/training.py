@@ -233,9 +233,8 @@ def get_optimizer(model):
         betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
 
     # Wrap into fp16 optimizer.
-    if args.fp16:
-        optimizer = get_megatron_optimizer(optimizer)
-        '''
+    optimizer = get_megatron_optimizer(optimizer, model)
+    '''
         optimizer = FP16_Optimizer(optimizer,
                                    static_loss_scale=args.loss_scale,
                                    dynamic_loss_scale=args.dynamic_loss_scale,
@@ -243,7 +242,7 @@ def get_optimizer(model):
                                        'scale_window': args.loss_scale_window,
                                        'min_scale': args.min_scale,
                                        'delayed_shift': args.hysteresis})
-        '''
+    '''
     return optimizer
 
 
@@ -737,10 +736,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-recv')
     add_to_logging('backward-send')
     add_to_logging('backward-send-forward-recv')
-    add_to_logging('backward-master-grad')
     add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('backward-clip-grad')
+    add_to_logging('optimizer-copy-to-master-grad')
+    add_to_logging('optimizer-unscale-and-check-inf')
+    add_to_logging('optimizer-clip-master-grad')
+    add_to_logging('optimizer-copy-master-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
 
