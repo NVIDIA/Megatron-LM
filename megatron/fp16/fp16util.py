@@ -209,7 +209,7 @@ def to_python_float(t):
 TORCH_MAJOR = int(torch.__version__.split('.')[0])
 TORCH_MINOR = int(torch.__version__.split('.')[1])
 
-clip_grad_norm = mpu.clip_grad_norm
+clip_grad_norm = None #mpu.clip_grad_norm
 # elif TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
 #    clip_grad_norm = torch.nn.utils.clip_grad_norm
 # else:

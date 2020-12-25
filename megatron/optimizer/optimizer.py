@@ -38,7 +38,7 @@ def get_params_for_weight_decay_optimization(module):
 
     args = get_args()
     LayerNorm = import_layernorm(args.fp32_residual_connection)
-    
+
     weight_decay_params = {'params': []}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
     for module_ in module.modules():
@@ -63,8 +63,11 @@ def get_megatron_optimizer(model):
 
     # Base optimizer.
     param_groups = get_params_for_weight_decay_optimization(model)
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
-        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
+    optimizer = Adam(param_groups,
+                     lr=args.lr,
+                     weight_decay=args.weight_decay,
+                     betas=(args.adam_beta1, args.adam_beta2),
+                     eps=args.adam_eps)
 
     if args.fp16:
         # Constant loss scale.
@@ -213,7 +216,7 @@ def _clip_grad_norm(parameters, max_norm, norm_type=2):
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
-    
+
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
@@ -247,7 +250,7 @@ def _clip_grad_norm(parameters, max_norm, norm_type=2):
                                      group=mpu.get_model_parallel_group())
         total_norm = total_norm_cuda[0].item()
 
-    else:    
+    else:
         for param in parameters:
             param_norm = torch.norm(param.grad.detach(), norm_type)
             total_norm += param_norm.item() ** norm_type
