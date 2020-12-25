@@ -38,7 +38,7 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.fp16 import FP16_Module
-from megatron.optimizer.optimizer import get_megatron_optimizer
+from megatron.optimizer import get_megatron_optimizer
 
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
