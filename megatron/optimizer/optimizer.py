@@ -145,7 +145,6 @@ class MegatronOptimizer(ABC):
     def step(self):
         pass
 
-    '''
     @abstractmethod
     def state_dict(self):
         pass
@@ -153,7 +152,6 @@ class MegatronOptimizer(ABC):
     @abstractmethod
     def load_state_dict(self, state_dict):
         pass
-    '''
 
     # Promote state so it can be retrieved or set via
     # "optimizer_instance.state"
@@ -179,7 +177,6 @@ class MegatronOptimizer(ABC):
 
 
 class FP16OptimizerWithFP16Params(MegatronOptimizer):
-
 
     def __init__(self, optimizer, grad_scaler, clip_grad):
         super(FP16OptimizerWithFP16Params, self).__init__(optimizer)
@@ -369,12 +366,32 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         return True
 
 
+    def state_dict(self):
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        state_dict['fp32_from_fp16_params'] = self.fp32_from_fp16_groups
+        return state_dict
+
+
+    def load_state_dict(self, state_dict):
+        # Defer to the class to load.
+        self.optimizer.load_state_dict(state_dict['optimizer'])
+        self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+        # Copy data for the master params.
+        for current_group, saved_group in zip(
+                self.fp32_from_fp16_groups,
+                state_dict['fp32_from_fp16_params']):
+            for current_param, saved_param in zip(current_group, saved_group):
+                current_param.data.copy_(saved_param.data)
+
+
+
 class FP32Optimizer(MegatronOptimizer):
 
-    def __init__(self, optimizer, model, clip_grad):
+    def __init__(self, optimizer, clip_grad):
 
         super(FP32Optimizer, self).__init__(optimizer)
-        self.model = model
         self.clip_grad = clip_grad
         self._scale = torch.cuda.FloatTensor([1.0])
 

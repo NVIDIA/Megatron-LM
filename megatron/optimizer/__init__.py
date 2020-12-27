@@ -25,7 +25,6 @@ def _get_params_for_weight_decay_optimization(module):
     """Divide params into with-weight-decay and without-weight-decay groups.
     Layernorms and baises will have no weight decay but the rest will.
     """
-
     args = get_args()
     LayerNorm = import_layernorm(args.fp32_residual_connection)
 
@@ -48,7 +47,6 @@ def _get_params_for_weight_decay_optimization(module):
 
 
 def get_megatron_optimizer(model):
-
     args = get_args()
 
     # Base optimizer.
@@ -77,4 +75,4 @@ def get_megatron_optimizer(model):
                                            args.clip_grad)
 
     # FP32.
-    return FP32Optimizer(optimizer, model, args.clip_grad)
+    return FP32Optimizer(optimizer, args.clip_grad)
