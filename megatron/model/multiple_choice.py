@@ -24,10 +24,10 @@ from megatron.model.language_model import get_language_model
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
-from megatron.module import PipelinedMegatronModule
+from .module import MegatronModule
 
 
-class MultipleChoiceBase(PipelinedMegatronModule):
+class MultipleChoiceBase(MegatronModule):
 
     def __init__(self, num_tokentypes=2):
         super(MultipleChoiceBase, self).__init__(share_word_embeddings=False)

@@ -37,7 +37,7 @@ from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
-from megatron.fp16 import FP16_Module
+from megatron.model import FP16Module
 from megatron.optimizer import get_megatron_optimizer
 
 from megatron.initialize import initialize_megatron
@@ -199,7 +199,7 @@ def get_model(model_provider_func):
 
     # Fp16 conversion.
     if args.fp16:
-        model = FP16_Module(model)
+        model = FP16Module(model)
 
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
@@ -264,7 +264,7 @@ def setup_model_and_optimizer(model_provider_func):
     model = get_model(model_provider_func)
 
     unwrapped_model = model
-    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
+    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
         unwrapped_model = unwrapped_model.module
     optimizer = get_megatron_optimizer(unwrapped_model)
 
@@ -588,7 +588,7 @@ def train_step(forward_step_func, data_iterator,
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
             mpu.get_pipeline_model_parallel_world_size() > 1:
         unwrapped_model = model
-        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
+        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
             unwrapped_model = unwrapped_model.module
 
         if unwrapped_model.share_word_embeddings:

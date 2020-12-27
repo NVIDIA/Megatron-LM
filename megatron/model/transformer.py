@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from megatron import get_args
 from megatron import mpu
-from megatron.module import MegatronModule
+from .module import MegatronModule
 from megatron.checkpointing import get_checkpoint_version
 from megatron.model import import_layernorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
