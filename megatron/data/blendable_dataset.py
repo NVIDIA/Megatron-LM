@@ -49,13 +49,6 @@ class BlendableDataset(torch.utils.data.Dataset):
         self.dataset_index = np.zeros(self.size, dtype=np.uint8)
         self.dataset_sample_index = np.zeros(self.size, dtype=np.int64)
 
-        if torch.distributed.get_rank() == 0:
-            from megatron.data.dataset_utils import compile_helper
-            compile_helper()
-        # Simple barrier
-        tmp = torch.cuda.LongTensor([1])
-        torch.distributed.all_reduce(tmp, group=mpu.get_data_parallel_group())
-
         from megatron.data import helpers
         helpers.build_blending_indices(self.dataset_index,
                                        self.dataset_sample_index,
