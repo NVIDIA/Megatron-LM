@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from apex.optimizers import FusedAdam as Adam
+
 from megatron import get_args
 from megatron.model import import_layernorm
 
