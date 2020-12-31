@@ -183,6 +183,9 @@ def get_model(model_provider_func):
     model = model_provider_func()
 
     # Set tensor model parallel attributes if not set.
+    # Only parameters that are already tensor model parallel have these
+    # attributes set for them. We should make sure the default attributes
+    # are set for all params so the optimizer can use them.
     for param in model.parameters():
         mpu.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 

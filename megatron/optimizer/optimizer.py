@@ -375,7 +375,7 @@ class FP32Optimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """Clip gradients (if needed) and step the base optimizer.
-        Always return auccessful since there is no overflow."""
+        Always return successful since there is no overflow."""
 
         # Clip gradients.
         if self.clip_grad > 0.0:
