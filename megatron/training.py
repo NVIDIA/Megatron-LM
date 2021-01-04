@@ -325,7 +325,7 @@ def setup_model_and_optimizer(model_provider_func):
 
 
 def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward):
-    """Communicate tensors between stages using torch.distributed.ring_exchange(.) API."""
+    """Communicate tensors between stages."""
     args = get_args()
 
     # Create placeholder tensors for receive in forward and backward directions
@@ -348,11 +348,26 @@ def communicate(tensor_send_next, tensor_send_prev, recv_forward, recv_backward)
                                        dtype=dtype)
 
     # Send tensors in both the forward and backward directions as appropriate.
-    torch.distributed.ring_exchange(tensor_send_prev=tensor_send_prev,
-                                    tensor_recv_prev=tensor_recv_prev,
-                                    tensor_send_next=tensor_send_next,
-                                    tensor_recv_next=tensor_recv_next,
-                                    group=mpu.get_pipeline_model_parallel_group())
+    ops = []
+    if tensor_send_prev is not None:
+        send_prev_op = torch.distributed.P2POp(torch.distributed.isend, tensor_send_prev,
+                                               mpu.get_pipeline_model_parallel_prev_rank())
+        ops.append(send_prev_op)
+    if tensor_recv_prev is not None:
+        recv_prev_op = torch.distributed.P2POp(torch.distributed.irecv, tensor_recv_prev,
+                                               mpu.get_pipeline_model_parallel_prev_rank())
+        ops.append(recv_prev_op)
+    if tensor_send_next is not None:
+        send_next_op = torch.distributed.P2POp(torch.distributed.isend, tensor_send_next,
+                                               mpu.get_pipeline_model_parallel_next_rank())
+        ops.append(send_next_op)
+    if tensor_recv_next is not None:
+        recv_next_op = torch.distributed.P2POp(torch.distributed.irecv, tensor_recv_next,
+                                               mpu.get_pipeline_model_parallel_next_rank())
+        ops.append(recv_next_op)
+    reqs = torch.distributed.batch_isend_irecv(ops)
+    for req in reqs:
+        req.wait()
 
     return tensor_recv_prev, tensor_recv_next
 
