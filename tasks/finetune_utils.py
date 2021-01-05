@@ -186,7 +186,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             # Logging.
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
-                                              iteration, optimizer.loss_scale,
+                                              iteration,
+                                              optimizer.get_loss_scale().item(),
                                               report_memory_flag, skipped_iter)
 
             # Autoresume
