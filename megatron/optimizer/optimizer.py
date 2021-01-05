@@ -217,7 +217,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         model_grads = []
         main_grads = []
         for model_group, main_group in zip(self.fp16_groups,
-                                             self.fp32_from_fp16_groups):
+                                           self.fp32_from_fp16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 if model_param.grad is not None:
                     if main_param.grad is None:
@@ -259,7 +259,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         model_data = []
         main_data = []
         for model_group, main_group in zip(self.fp16_groups,
-                                             self.fp32_from_fp16_groups):
+                                           self.fp32_from_fp16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 model_data.append(model_param.data)
                 main_data.append(main_param.data)
@@ -282,7 +282,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
     def reload_model_params(self):
         self._copy_model_params_to_main_params()
-                
+
 
     @torch.no_grad()
     def step(self):
