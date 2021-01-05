@@ -677,10 +677,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-send-forward-recv')
     add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('optimizer-copy-to-master-grad')
+    add_to_logging('optimizer-copy-to-main-grad')
     add_to_logging('optimizer-unscale-and-check-inf')
-    add_to_logging('optimizer-clip-master-grad')
-    add_to_logging('optimizer-copy-master-to-model-params')
+    add_to_logging('optimizer-clip-main-grad')
+    add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
 
