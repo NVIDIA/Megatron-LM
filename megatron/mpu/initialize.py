@@ -276,16 +276,30 @@ def get_tensor_model_parallel_src_rank():
     local_world_size = get_tensor_model_parallel_world_size()
     return (global_rank // local_world_size) * local_world_size
 
+def get_pipeline_model_parallel_first_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "Pipeline parallel group is not initialized"
+    return _PIPELINE_GLOBAL_RANKS[0]
+
 def get_pipeline_model_parallel_last_rank():
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
     return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
-def get_pipeline_model_parallel_first_rank():
+def get_pipeline_model_parallel_next_rank():
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
-    return _PIPELINE_GLOBAL_RANKS[0]
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_world_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
+
+def get_pipeline_model_parallel_prev_rank():
+    assert _PIPELINE_GLOBAL_RANKS is not None, \
+        "Pipeline parallel group is not initialized"
+    rank_in_pipeline = get_pipeline_model_parallel_rank()
+    world_size = get_pipeline_model_parallel_world_size()
+    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 def get_data_parallel_world_size():
     """Return world size for the data parallel group."""

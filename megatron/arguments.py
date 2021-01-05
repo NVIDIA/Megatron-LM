@@ -64,10 +64,6 @@ def parse_args(extra_args_provider=None, defaults={},
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
-    if args.pipeline_model_parallel_size > 1:
-        if "ring_exchange" not in dir(torch.distributed):
-            raise Exception('PyTorch with torch.distributed.ring_exchange '
-                            'needed to run pipeline MP!')
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
