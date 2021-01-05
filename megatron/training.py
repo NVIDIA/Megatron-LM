@@ -703,10 +703,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
-        if args.fp16:
-            writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale,
-                              args.consumed_train_samples)
+        writer.add_scalar('loss-scale', loss_scale, iteration)
+        writer.add_scalar('loss-scale vs samples', loss_scale,
+                          args.consumed_train_samples)
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
 
@@ -732,8 +731,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
-        if args.fp16:
-            log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+        log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -797,9 +795,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        get_num_microbatches()
 
         # Logging.
-        loss_scale = None
-        if args.fp16:
-            loss_scale = optimizer.get_loss_scale().item()
+        loss_scale = optimizer.get_loss_scale().item()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,

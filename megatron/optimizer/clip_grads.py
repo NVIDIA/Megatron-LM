@@ -83,6 +83,9 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     else:
         if norm_type == 2.0:
             dummy_overflow_buf = torch.cuda.IntTensor([0])
+            # Use apex's multi-tensor applier for efficiency reasons.
+            # Multi-tensor applier takes a function and a list of list
+            # and performs the operation on that list all in one kernel.
             grad_norm, _ = multi_tensor_applier(
                 amp_C.multi_tensor_l2norm,
                 dummy_overflow_buf,

@@ -78,6 +78,7 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def get_loss_scale(self):
+        """The output should be a cuda tensor of size 1."""
         pass
 
     def scale_loss(self, loss):
@@ -90,6 +91,11 @@ class MegatronOptimizer(ABC):
 
     @abstractmethod
     def reload_model_params(self):
+        """Refreshes any internal state from the current model parameters.
+        Call whenever the parameters are changed outside of the optimizer.
+        For example, when we load a model from a checkpoint  without loading
+        the optimizer, the model parameters are updated but for fp16 optimizer
+        with main parameters, the main parameters need to also be updated."""
         pass
 
     @abstractmethod
@@ -289,54 +295,38 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
         timers = get_timers()
 
-        # ==================================================
         # Copy gradients from model params to main params.
-        # ==================================================
         timers('optimizer-copy-to-main-grad').start()
         self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
-        # ==============================
         # Unscale and check for inf/nan.
-        # ==============================
         timers('optimizer-unscale-and-check-inf').start()
         found_inf_flag = self._unscale_main_grads_and_check_for_nan()
         timers('optimizer-unscale-and-check-inf').stop()
 
-        # ==================================
         # We are done with scaling gradients
         # so we can update the loss scale.
-        # ==================================
         self.grad_scaler.update(found_inf_flag)
 
-        # =====================================
         # If we found inf/nan, skip the update.
-        # =====================================
         if found_inf_flag:
             return False
 
-        # ==========================
         # Clip the main gradients.
-        # ==========================
         timers('optimizer-clip-main-grad').start()
         self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
-        # ===================
         # Step the optimizer.
-        # ===================
         self.optimizer.step()
 
-        # =================================
         # Update params from main params.
-        # =================================
         timers('optimizer-copy-main-to-model-params').start()
         self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
 
-        # ==================
         # Successful update.
-        # ==================
         return True
 
 
