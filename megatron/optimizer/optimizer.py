@@ -77,6 +77,10 @@ class MegatronOptimizer(ABC):
         pass
 
     @abstractmethod
+    def reload_model_params(self):
+        pass
+
+    @abstractmethod
     def state_dict(self):
         pass
 
@@ -243,8 +247,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         return found_inf_flag
 
 
-    def _copy_master_params_to_model_params(self):
-        # Only needed for the fp16 params.
+    def _get_model_and_master_params_data_fp16(self):
         model_data = []
         master_data = []
         for model_group, master_group in zip(self.fp16_groups,
@@ -252,6 +255,12 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
             for model_param, master_param in zip(model_group, master_group):
                 model_data.append(model_param.data)
                 master_data.append(master_param.data)
+        return model_data, master_data
+
+
+    def _copy_master_params_to_model_params(self):
+        # Only needed for the fp16 params.
+        model_data, master_data = self._get_model_and_master_params_data_fp16()
         self._dummy_overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
         multi_tensor_applier(amp_C.multi_tensor_scale,
@@ -259,6 +268,20 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
                              [master_data, model_data],
                              1.0)
 
+    def _copy_model_params_to_master_params(self):
+        # Only needed for the fp16 params.
+        model_data, master_data = self._get_model_and_master_params_data_fp16()
+        self._dummy_overflow_buf.fill_(0)
+        # Scaling with factor `1.0` is equivalent to copy.
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             self._dummy_overflow_buf,
+                             [model_data, master_data],
+                             1.0)
+
+
+    def reload_model_params(self):
+        self._copy_model_params_to_master_params()
+                
 
     @torch.no_grad()
     def step(self):
@@ -386,6 +409,10 @@ class FP32Optimizer(MegatronOptimizer):
 
         # No overflow for FP32 optimizer.
         return True
+
+
+    def reload_model_params(self):
+        pass
 
 
     def state_dict(self):
