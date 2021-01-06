@@ -205,12 +205,16 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     try:
         state_dict = torch.load(checkpoint_name, map_location='cpu')
     except ModuleNotFoundError:
+        from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
         print_rank_0(' > deserializing using the old code structure ...')
         sys.modules['fp16.loss_scaler'] = sys.modules[
-            'megatron.fp16.loss_scaler']
+            'megatron.fp16_deprecated.loss_scaler']
+        sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
+            'megatron.fp16_deprecated.loss_scaler']
         state_dict = torch.load(checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
+        sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException:
         print_rank_0('could not load the checkpoint')
         sys.exit()
