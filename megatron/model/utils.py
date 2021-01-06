@@ -20,7 +20,6 @@ import math
 import torch
 
 from megatron import get_args
-from megatron.model import import_layernorm
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
@@ -60,28 +59,3 @@ def openai_gelu(x):
 @torch.jit.script
 def erf_gelu(x):
     return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
-
-def get_params_for_weight_decay_optimization(module):
-    """Divide params into with-weight-decay and without-weight-decay groups.
-    Layernorms and baises will have no weight decay but the rest will.
-    """
-
-    args = get_args()
-    LayerNorm = import_layernorm(args.fp32_residual_connection)
-    
-    weight_decay_params = {'params': []}
-    no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
-    for module_ in module.modules():
-        if isinstance(module_, LayerNorm):
-            no_weight_decay_params['params'].extend(
-                [p for p in list(module_._parameters.values())
-                 if p is not None])
-        else:
-            weight_decay_params['params'].extend(
-                [p for n, p in list(module_._parameters.items())
-                 if p is not None and n != 'bias'])
-            no_weight_decay_params['params'].extend(
-                [p for n, p in list(module_._parameters.items())
-                 if p is not None and n == 'bias'])
-
-    return weight_decay_params, no_weight_decay_params

@@ -19,7 +19,7 @@ import torch
 
 from megatron import get_args
 from megatron import mpu
-from megatron.module import PipelinedMegatronModule
+from .module import MegatronModule
 
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
@@ -61,7 +61,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         return loss
 
 
-class GPT2ModelBase(PipelinedMegatronModule):
+class GPT2ModelBase(MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self, num_tokentypes=0, parallel_output=True):

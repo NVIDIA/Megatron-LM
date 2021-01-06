@@ -19,8 +19,6 @@ from .cross_entropy import vocab_parallel_cross_entropy
 
 from .data import broadcast_data
 
-from .grads import clip_grad_norm
-
 from .initialize import is_unitialized
 from .initialize import destroy_model_parallel
 from .initialize import get_data_parallel_group
@@ -46,7 +44,9 @@ from .initialize import model_parallel_is_initialized
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding
-
+from .layers import (set_defaults_if_not_set_tensor_model_parallel_attributes,
+                     copy_tensor_model_parallel_attributes)
+                     
 from .mappings import copy_to_tensor_model_parallel_region
 from .mappings import gather_from_tensor_model_parallel_region
 from .mappings import reduce_from_tensor_model_parallel_region

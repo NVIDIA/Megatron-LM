@@ -186,7 +186,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             # Logging.
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
-                                              iteration, optimizer.loss_scale,
+                                              iteration,
+                                              optimizer.get_loss_scale().item(),
                                               report_memory_flag, skipped_iter)
 
             # Autoresume
@@ -255,9 +256,8 @@ def finetune(train_valid_datasets_provider, model_provider,
         _ = load_checkpoint(model, None, None)
         args.load = original_load
         # This is critical when only model is loaded. We should make sure
-        # master parameters are also updated.
-        if args.fp16:
-            optimizer._model_params_to_master_params()
+        # main parameters are also updated.
+        optimizer.reload_model_params()
     timers('pretrained checkpoint').stop()
 
     # Print setup timing.

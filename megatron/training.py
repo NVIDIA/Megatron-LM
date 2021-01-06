@@ -24,7 +24,6 @@ _TRAIN_START_TIME = time.time()
 
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from apex.optimizers import FusedAdam as Adam
 
 from megatron import get_args
 from megatron import get_timers
@@ -38,13 +37,13 @@ from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
-from megatron.fp16 import FP16_Module
-from megatron.fp16 import FP16_Optimizer
+from megatron.model import FP16Module
+from megatron.optimizer import get_megatron_optimizer
+
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
@@ -183,6 +182,13 @@ def get_model(model_provider_func):
     # Build model on cpu.
     model = model_provider_func()
 
+    # Set tensor model parallel attributes if not set.
+    # Only parameters that are already tensor model parallel have these
+    # attributes set for them. We should make sure the default attributes
+    # are set for all params so the optimizer can use them.
+    for param in model.parameters():
+        mpu.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
@@ -196,7 +202,7 @@ def get_model(model_provider_func):
 
     # Fp16 conversion.
     if args.fp16:
-        model = FP16_Module(model)
+        model = FP16Module(model)
 
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
@@ -209,38 +215,6 @@ def get_model(model_provider_func):
 
     raise NotImplementedError('Unknown DDP implementation specified: {}. '
                               'Exiting.'.format(args.DDP_impl))
-
-
-def get_optimizer(model):
-    """Set up the optimizer."""
-    args = get_args()
-
-    # Build parameter groups (weight decay and non-decay).
-    while isinstance(model, (torchDDP, LocalDDP, FP16_Module)):
-        model = model.module
-    param_groups = get_params_for_weight_decay_optimization(model)
-
-    # Add model parallel attribute if it is not set.
-    for param_group in param_groups:
-        for param in param_group['params']:
-            if not hasattr(param, 'tensor_model_parallel'):
-                param.tensor_model_parallel = False
-
-    # Use Adam.
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay,
-        betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps)
-
-    # Wrap into fp16 optimizer.
-    if args.fp16:
-        optimizer = FP16_Optimizer(optimizer,
-                                   static_loss_scale=args.loss_scale,
-                                   dynamic_loss_scale=args.dynamic_loss_scale,
-                                   dynamic_loss_args={
-                                       'scale_window': args.loss_scale_window,
-                                       'min_scale': args.min_scale,
-                                       'delayed_shift': args.hysteresis})
-
-    return optimizer
 
 
 def get_learning_rate_scheduler(optimizer):
@@ -291,7 +265,12 @@ def setup_model_and_optimizer(model_provider_func):
     args = get_args()
 
     model = get_model(model_provider_func)
-    optimizer = get_optimizer(model)
+
+    unwrapped_model = model
+    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
+        unwrapped_model = unwrapped_model.module
+    optimizer = get_megatron_optimizer(unwrapped_model)
+
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.load is not None:
@@ -382,11 +361,9 @@ def backward_step(optimizer, model, input_tensor, output_tensor, output_tensor_g
         input_tensor.retain_grad()
 
     # Backward pass.
-    if args.fp16:
-        optimizer.backward(output_tensor, update_master_grads=False,
-                           output_tensor_grad=output_tensor_grad)
-    else:
-        torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+    if output_tensor_grad is None:
+        output_tensor = optimizer.scale_loss(output_tensor)
+    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = None
@@ -605,10 +582,7 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.fp16:
-        optimizer.zero_grad(set_grads_to_None=True)
-    else:
-        optimizer.zero_grad()
+    optimizer.zero_grad()
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         losses_reduced = forward_backward_pipelining(
@@ -632,7 +606,7 @@ def train_step(forward_step_func, data_iterator,
     if (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and \
             mpu.get_pipeline_model_parallel_world_size() > 1:
         unwrapped_model = model
-        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16_Module)):
+        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
             unwrapped_model = unwrapped_model.module
 
         if unwrapped_model.share_word_embeddings:
@@ -641,40 +615,18 @@ def train_step(forward_step_func, data_iterator,
                                          group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
-    # Update master gradients.
-    timers('backward-master-grad').start()
-    if args.fp16:
-        optimizer.update_master_grads()
-    timers('backward-master-grad').stop()
-
-    # Clipping gradients helps prevent the exploding gradient.
-    timers('backward-clip-grad').start()
-    if args.clip_grad > 0.:
-        if not args.fp16:
-            named_parameters = model.named_parameters()
-            parameters = []
-            parameter_names = []
-            for parameter_name, parameter in model.named_parameters():
-                parameters.append(parameter)
-                parameter_names.append(parameter_name)
-            mpu.clip_grad_norm(parameters, args.clip_grad,
-                               parameter_names=parameter_names)
-        else:
-            optimizer.clip_master_grads(args.clip_grad)
-    timers('backward-clip-grad').stop()
-
     # Update parameters.
     timers('optimizer').start()
-    optimizer.step()
+    update_successfull = optimizer.step()
     timers('optimizer').stop()
 
     # Update learning rate.
-    skipped_iter = 0
-    if not (args.fp16 and optimizer.overflow):
+    if update_successfull:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
         lr_scheduler.step(increment=increment)
+        skipped_iter = 0
     else:
         skipped_iter = 1
 
@@ -738,10 +690,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-recv')
     add_to_logging('backward-send')
     add_to_logging('backward-send-forward-recv')
-    add_to_logging('backward-master-grad')
     add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('backward-clip-grad')
+    add_to_logging('optimizer-copy-to-main-grad')
+    add_to_logging('optimizer-unscale-and-check-inf')
+    add_to_logging('optimizer-clip-main-grad')
+    add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
 
@@ -764,10 +718,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
-        if args.fp16:
-            writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale,
-                              args.consumed_train_samples)
+        writer.add_scalar('loss-scale', loss_scale, iteration)
+        writer.add_scalar('loss-scale vs samples', loss_scale,
+                          args.consumed_train_samples)
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
 
@@ -793,8 +746,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
-        if args.fp16:
-            log_string += ' loss scale: {:.1f} |'.format(loss_scale)
+        log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -858,9 +810,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        get_num_microbatches()
 
         # Logging.
-        loss_scale = None
-        if args.fp16:
-            loss_scale = optimizer.loss_scale
+        loss_scale = optimizer.get_loss_scale().item()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,

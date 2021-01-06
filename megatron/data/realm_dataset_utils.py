@@ -152,10 +152,6 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
 
-        # compile/bind the C++ helper code
-        from megatron.data.dataset_utils import compile_helper
-        compile_helper()
-
         from megatron.data import helpers
         mapping_array = helpers.build_blocks_mapping(
             block_dataset.doc_idx,

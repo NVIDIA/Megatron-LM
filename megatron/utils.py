@@ -24,7 +24,6 @@ from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.checkpointing import save_checkpoint
-from megatron.fp16 import FP16_Optimizer
 
 
 def average_losses_across_data_parallel_group(losses):
@@ -47,11 +46,13 @@ def report_memory(name):
         torch.cuda.memory_allocated() / mega_bytes)
     string += ' | max allocated: {}'.format(
         torch.cuda.max_memory_allocated() / mega_bytes)
-    string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
+    string += ' | reserved: {}'.format(
+        torch.cuda.memory_reserved() / mega_bytes)
     string += ' | max reserved: {}'.format(
         torch.cuda.max_memory_reserved() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
-        print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
+        print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
+              flush=True)
 
 
 def print_params_min_max_norm(optimizer, iteration):
@@ -59,9 +60,7 @@ def print_params_min_max_norm(optimizer, iteration):
     index = 0
     rank = torch.distributed.get_rank()
     string = 'iteration, rank, index, tensor-model-parallel, min, max, norm\n'
-    optimizer_ = optimizer
-    if isinstance(optimizer, FP16_Optimizer):
-        optimizer_ = optimizer.optimizer
+    optimizer_ = optimizer.optimizer
     for param_group in optimizer_.param_groups:
         for param in param_group['params']:
             index += 1

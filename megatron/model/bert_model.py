@@ -26,7 +26,7 @@ from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
-from megatron.module import MegatronModule, PipelinedMegatronModule
+from .module import MegatronModule
 
 def bert_attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
@@ -127,7 +127,7 @@ def post_language_model_processing(lm_output, pooled_output,
         return lm_loss, binary_logits
 
 
-class BertModelBase(PipelinedMegatronModule):
+class BertModelBase(MegatronModule):
     """Bert Language model."""
 
     def __init__(self, num_tokentypes=2, add_binary_head=True,
