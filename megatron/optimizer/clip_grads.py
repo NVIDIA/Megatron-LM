@@ -92,6 +92,8 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
                 [grads_for_norm],
                 False # no per-parameter norm
             )
+            # Since we will be summing across data parallel groups,
+            # we need the pow(norm-type).
             total_norm = grad_norm ** norm_type
 
         else:
