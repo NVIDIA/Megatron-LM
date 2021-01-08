@@ -42,7 +42,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
-def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
+def get_language_model(num_tokentypes, add_pooler,
                        init_method=None, scaled_init_method=None):
     """Build language model and return along with the key to save."""
     args = get_args()
@@ -54,7 +54,7 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
         scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
 
     # Language model.
-    args = [attention_mask_func, init_method, scaled_init_method]
+    args = [init_method, scaled_init_method]
     kwargs = {}
     cls = None
     if mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage():
@@ -262,12 +262,6 @@ class TransformerLanguageModelBase(MegatronModule):
 
     Arguments:
         transformer_hparams: transformer hyperparameters
-        attention_mask_func: a function that takes `unmaksed-attention-scores`
-            with size [b, np, s, s] and an `attention-mask` and will apply
-            the masking. The function should return a masked score of the
-            same size [b, np, s, s].
-          masked-attention-scores = attention_mask_func(
-                                     unmaksed-attention-scores, attention-mask)
         vocab_size: vocabulary size
         max_sequence_length: maximum size of sequence. This
                              is used for positional embedding
@@ -277,7 +271,6 @@ class TransformerLanguageModelBase(MegatronModule):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
@@ -302,8 +295,7 @@ class TransformerLanguageModelBase(MegatronModule):
 
         # Transformer.
         self.transformer = ParallelTransformer(
-            attention_mask_func, self.init_method, 
-            output_layer_init_method)
+            self.init_method, output_layer_init_method)
         self._transformer_key = 'transformer'
 
         # Pooler.
@@ -396,13 +388,11 @@ class TransformerLanguageModel(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
                  add_pooler=False):
         super(TransformerLanguageModel, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             num_tokentypes=num_tokentypes,
@@ -427,12 +417,10 @@ class TransformerLanguageModelFirstStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0):
         super(TransformerLanguageModelFirstStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             num_tokentypes=num_tokentypes)
@@ -454,11 +442,9 @@ class TransformerLanguageModelIntermediateStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method):
         super(TransformerLanguageModelIntermediateStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method)
 
@@ -478,12 +464,10 @@ class TransformerLanguageModelLastStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  add_pooler=False):
         super(TransformerLanguageModelLastStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             add_pooler=add_pooler)

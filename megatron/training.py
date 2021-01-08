@@ -57,8 +57,12 @@ def print_datetime(string):
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def pretrain(train_valid_test_dataset_provider, model_provider,
-             forward_step_func, extra_args_provider=None, args_defaults={}):
+def pretrain(train_valid_test_dataset_provider, 
+             model_provider,
+             forward_step_func, 
+             extra_args_provider=None, 
+             args_defaults={},
+             random_sample = False):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -113,7 +117,8 @@ def pretrain(train_valid_test_dataset_provider, model_provider,
     timers('train/valid/test data iterators').start()
     train_data_iterator, valid_data_iterator, test_data_iterator \
         = build_train_valid_test_data_iterators(
-            train_valid_test_dataset_provider)
+            train_valid_test_dataset_provider, 
+            random_sample)
     timers('train/valid/test data iterators').stop()
     print_datetime('after dataloaders are built')
 
@@ -944,8 +949,13 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_last('-' * length)
 
 
+def cyclic_iterable(iterable):
+    while True:
+        for x in iterable:
+            yield x
+
 def build_train_valid_test_data_iterators(
-        build_train_valid_test_datasets_provider):
+        build_train_valid_test_datasets_provider, random_sample=False):
     """XXX"""
     args = get_args()
 
@@ -989,10 +999,10 @@ def build_train_valid_test_data_iterators(
 
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
-            train_ds, args.consumed_train_samples)
+            train_ds, args.consumed_train_samples, random_sample)
         valid_dataloader = build_pretraining_data_loader(
-            valid_ds, args.consumed_valid_samples)
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+            valid_ds, args.consumed_valid_samples, random_sample)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0, random_sample)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
@@ -1014,17 +1024,17 @@ def build_train_valid_test_data_iterators(
 
     # Build iterators.
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader)
+        train_data_iterator = iter(cyclic_iterable(train_dataloader))
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader)
+        valid_data_iterator = iter(cyclic_iterable(valid_dataloader))
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader)
+        test_data_iterator = iter(cyclic_iterable(test_dataloader))
     else:
         test_data_iterator = None
 

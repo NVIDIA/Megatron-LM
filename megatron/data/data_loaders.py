@@ -22,7 +22,7 @@ from megatron import get_args
 from megatron import mpu
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
+def build_pretraining_data_loader(dataset, consumed_samples, random_sample=False):
     """Buld dataloader given an input dataset."""
 
     if dataset is None:
@@ -35,7 +35,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         consumed_samples=consumed_samples,
         micro_batch_size=args.micro_batch_size,
         data_parallel_rank=mpu.get_data_parallel_rank(),
-        data_parallel_size=mpu.get_data_parallel_world_size())
+        data_parallel_size=mpu.get_data_parallel_world_size(),
+        random_sample=random_sample)
 
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
@@ -46,41 +47,52 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
 class MegatronPretrainingSampler:
 
-
     def __init__(self, total_samples, consumed_samples, micro_batch_size,
-                 data_parallel_rank, data_parallel_size):
+                 data_parallel_rank, data_parallel_size, random_sample=False):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
         self.micro_batch_size = micro_batch_size
         self.data_parallel_rank = data_parallel_rank
-        self.micro_batch_times_data_parallel_size = self.micro_batch_size * \
-                                                    data_parallel_size
+        self.micro_batch_times_data_parallel_size = \
+            self.micro_batch_size * data_parallel_size
+        self.random_sample = random_sample
 
         # Sanity checks.
         assert self.total_samples > 0, \
             'no sample to consume: {}'.format(self.total_samples)
-        assert self.consumed_samples < self.total_samples, \
-            'no samples left to consume: {}, {}'.format(self.consumed_samples,
-                                                        self.total_samples)
+        #assert self.consumed_samples < self.total_samples, \
+        #    'no samples left to consume: {}, {}'.format(self.consumed_samples,
+        #                                                self.total_samples)
         assert self.micro_batch_size > 0
         assert data_parallel_size > 0
         assert self.data_parallel_rank < data_parallel_size, \
             'data_parallel_rank should be smaller than data size: {}, ' \
             '{}'.format(self.data_parallel_rank, data_parallel_size)
 
-
     def __len__(self):
         return self.total_samples
 
-
     def __iter__(self):
+        self.epoch = self.consumed_samples // self.total_samples
+        current_epoch_samples = self.consumed_samples % self.total_samples
+        if self.random_sample:
+            g = torch.Generator()
+            g.manual_seed(self.epoch)
+            idx_range_total = \
+                torch.randperm(self.total_samples, generator=g).tolist()
+            idx_range = idx_range_total[current_epoch_samples:]
+        else:
+            idx_range = range(current_epoch_samples, self.total_samples)
+
         batch = []
         # Last batch if not complete will be dropped.
-        for idx in range(self.consumed_samples, self.total_samples):
+        for idx in idx_range:
             batch.append(idx)
             if len(batch) == self.micro_batch_times_data_parallel_size:
+                self.consumed_samples += len(batch)
                 start_idx = self.data_parallel_rank * self.micro_batch_size
                 end_idx = start_idx + self.micro_batch_size
                 yield batch[start_idx:end_idx]
                 batch = []
+        self.consumed_samples += len(batch)

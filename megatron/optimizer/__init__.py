@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from apex.optimizers import FusedAdam as Adam
+from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
 from megatron.model import import_layernorm
@@ -52,11 +53,18 @@ def get_megatron_optimizer(model):
 
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
-    optimizer = Adam(param_groups,
-                     lr=args.lr,
-                     weight_decay=args.weight_decay,
-                     betas=(args.adam_beta1, args.adam_beta2),
-                     eps=args.adam_eps)
+    if args.optimizer == 'adam':
+        optimizer = Adam(param_groups,
+                         lr=args.lr,
+                         weight_decay=args.weight_decay,
+                         betas=(args.adam_beta1, args.adam_beta2),
+                         eps=args.adam_eps)
+    else:
+        assert args.optimizer == 'sgd'
+        optimizer = SGD(param_groups,
+                        lr=args.lr,
+                        weight_decay=args.weight_decay,
+                        momentum=args.sgd_momentum)
 
     if args.fp16:
         # Constant loss scale.

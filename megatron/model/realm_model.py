@@ -10,7 +10,7 @@ from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.language_model import get_language_model
 from megatron.model.utils import scaled_init_method_normal
-from megatron.model.bert_model import bert_attention_mask_func, bert_extended_attention_mask, bert_position_ids
+from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
 
 
 def general_ict_model_provider(only_query_model=False, only_block_model=False):
@@ -156,7 +156,6 @@ class IREncoderBertModel(MegatronModule):
                                                        args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
-            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=True,
             init_method=init_method,

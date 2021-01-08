@@ -27,11 +27,6 @@ from .utils import init_method_normal
 from .utils import scaled_init_method_normal
 
 
-def gpt2_attention_mask_func(attention_scores, ltor_mask):
-    attention_scores.masked_fill_(ltor_mask, -10000.0)
-    return attention_scores
-
-
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    get_key_value, parallel_output,
                                    forward_method_parallel_output,
@@ -72,7 +67,6 @@ class GPT2ModelBase(MegatronModule):
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
 
         self.language_model, self._language_model_key = get_language_model(
-            attention_mask_func=gpt2_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
             init_method=init_method_normal(args.init_method_std),
