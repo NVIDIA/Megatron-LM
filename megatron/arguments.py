@@ -620,8 +620,6 @@ def _add_realm_args(parser):
 def _add_vit_args(parser):
     group = parser.add_argument_group(title="vit")
 
-    group.add_argument('--vit-load', type=str, default=None,
-                       help='Director containing a VitModel checkpoint')
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
     group.add_argument('--img-dim', type=int, default=224,
