@@ -595,7 +595,7 @@ class TransformerLanguageModelLastStage(TransformerLanguageModelBase):
         return super(TransformerLanguageModelLastStage, self).forward(
             hidden_states,
             enc_attention_mask,
-            dec_language_input=(dec_input_ids, dec_position_ids),
+            dec_language_model_input=(dec_input_ids, dec_position_ids),
             dec_attn_mask=dec_attn_mask,
             enc_dec_attn_mask=enc_dec_attn_mask,
             layer_past=layer_past,

@@ -673,6 +673,9 @@ class ParallelTransformer(MegatronModule):
             else:
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
 
+        if encoder_output is not None:
+             encoder_output = encoder_output.transpose(0, 1).contiguous()
+          
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,
                                                        attention_mask,
