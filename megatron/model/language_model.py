@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
+from megatron.model.enums import LayerType, AttnMaskType
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
@@ -43,7 +44,9 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 
 
 def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
-                       init_method=None, scaled_init_method=None):
+                       add_decoder=False, init_method=None,
+                       scaled_init_method=None,
+                       self_attn_mask_type=AttnMaskType.padding):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -51,7 +54,8 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
         init_method = init_method_normal(args.init_method_std)
 
     if scaled_init_method is None:
-        scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
+        scaled_init_method = scaled_init_method_normal(args.init_method_std,
+                                                       args.num_layers)
 
     # Language model.
     args = [attention_mask_func, init_method, scaled_init_method]
@@ -60,6 +64,8 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
     if mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage():
         cls = TransformerLanguageModel
         kwargs['num_tokentypes'] = num_tokentypes
+        kwargs['self_attn_mask_type'] = self_attn_mask_type
+        kwargs['add_decoder'] = add_decoder
         kwargs['add_pooler'] = add_pooler
     elif mpu.is_pipeline_first_stage() and not mpu.is_pipeline_last_stage():
         cls = TransformerLanguageModelFirstStage
@@ -186,8 +192,6 @@ class Embedding(MegatronModule):
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
-        else:
-            assert self.tokentype_embeddings is None
 
         # Dropout.
         embeddings = self.embedding_dropout(embeddings)
@@ -281,6 +285,8 @@ class TransformerLanguageModelBase(MegatronModule):
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
+                 self_attn_mask_type=AttnMaskType.padding,
+                 add_decoder=False,
                  add_pooler=False):
         super(TransformerLanguageModelBase, self).__init__()
         args = get_args()
@@ -288,6 +294,8 @@ class TransformerLanguageModelBase(MegatronModule):
         self.hidden_size = args.hidden_size
         self.num_tokentypes = num_tokentypes
         self.init_method = init_method
+        self.self_attn_mask_type = self_attn_mask_type
+        self.add_decoder = add_decoder
         self.add_pooler = add_pooler
 
         # Embeddings.
@@ -301,41 +309,87 @@ class TransformerLanguageModelBase(MegatronModule):
             self._embedding_key = 'embedding'
 
         # Transformer.
-        self.transformer = ParallelTransformer(
-            attention_mask_func, self.init_method, 
-            output_layer_init_method)
-        self._transformer_key = 'transformer'
+        self.encoder = ParallelTransformer(
+            attention_mask_func,
+            self.init_method,
+            output_layer_init_method,
+            self_attn_mask_type=self_attn_mask_type)
+        self._encoder_key = 'encoder'
 
-        # Pooler.
-        if mpu.is_pipeline_last_stage() and self.add_pooler:
-            self.pooler = Pooler(self.hidden_size, self.init_method)
-            self._pooler_key = 'pooler'
+        # assuming pooler and decoder are in the last stage
+        # of the pipeline(to be revised)
+        if mpu.is_pipeline_last_stage():
+            # decoder
+            if self.add_decoder:
+                self.decoder = ParallelTransformer(
+                    attention_mask_func,
+                    self.init_method,
+                    output_layer_init_method,
+                    layer_type=LayerType.decoder,
+                    self_attn_mask_type=AttnMaskType.causal)
+                self._decoder_key = 'decoder'
 
-    def forward(self, language_model_input, attention_mask,
-                tokentype_ids=None, layer_past=None, get_key_value=False,
-                pooling_sequence_index=0):
+            # Pooler.
+            if self.add_pooler:
+                self.pooler = Pooler(self.hidden_size, self.init_method)
+                self._pooler_key = 'pooler'
+
+    def forward(self, enc_language_model_input, enc_attention_mask,
+                dec_language_model_input=None, dec_attn_mask=None,
+                enc_dec_attn_mask=None, tokentype_ids=None, layer_past=None,
+                get_key_value=False, pooling_sequence_index=0, 
+                enc_hidden_states=None, output_enc_hidden=False):
 
         # Embeddings.
         if mpu.is_pipeline_first_stage():
-            (input_ids, position_ids) = language_model_input
+            (input_ids, position_ids) = enc_language_model_input
             embedding_output = self.embedding(input_ids, position_ids,
                                               tokentype_ids=tokentype_ids)
-            transformer_input = embedding_output
+            encoder_input = embedding_output
         else:
-            transformer_input = language_model_input
+            encoder_input = enc_language_model_input
 
-        # Transformer.
-        transformer_output = self.transformer(transformer_input,
-                                              attention_mask,
-                                              layer_past=layer_past,
-                                              get_key_value=get_key_value)
+        # encoder.
+        if enc_hidden_states is None:
+            encoder_output = self.encoder(encoder_input,
+                                          enc_attention_mask,
+                                          layer_past=layer_past,
+                                          get_key_value=get_key_value)
+        else:
+            encoder_output = enc_hidden_states.to(encoder_input.dtype)
 
-        if mpu.is_pipeline_last_stage() and self.add_pooler:
-            pooled_output = self.pooler(transformer_output,
-                                        pooling_sequence_index)
-            return transformer_output, pooled_output
+        if mpu.is_pipeline_last_stage():
+            if self.add_pooler:
+                pooled_output = self.pooler(encoder_output,
+                                            pooling_sequence_index)
 
-        return transformer_output
+            # output_enc_hidden refers to when we just need the encoder's
+            # output. For example, it is helpful to compute
+            # similarity between two sequences by average pooling
+            if not self.add_decoder or output_enc_hidden:
+                if self.add_pooler:
+                    return encoder_output, pooled_output
+                else:
+                    return encoder_output
+
+            # Decoder Embedding
+            (dec_input_ids, dec_position_ids) = dec_language_model_input
+            dec_embedding_output = self.embedding(dec_input_ids,
+                                                  dec_position_ids)
+            # decoder
+            decoder_output = self.decoder(dec_embedding_output,
+                                          dec_attn_mask,
+                                          layer_past=layer_past,
+                                          get_key_value=get_key_value,
+                                          encoder_output=encoder_output,
+                                          enc_dec_attn_mask=enc_dec_attn_mask)
+
+            if self.add_pooler:
+                return decoder_output, encoder_output, pooled_output
+            else:
+                return decoder_output, encoder_output
+
+        return encoder_output
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
@@ -346,13 +400,18 @@ class TransformerLanguageModelBase(MegatronModule):
             state_dict_[self._embedding_key] \
                 = self.embedding.state_dict_for_save_checkpoint(
                     destination, prefix, keep_vars)
-        state_dict_[self._transformer_key] \
-            = self.transformer.state_dict_for_save_checkpoint(
+        state_dict_[self._encoder_key] \
+            = self.encoder.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
-        if mpu.is_pipeline_last_stage() and self.add_pooler:
-            state_dict_[self._pooler_key] \
-                = self.pooler.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+        if mpu.is_pipeline_last_stage():
+            if self.add_pooler:
+                state_dict_[self._pooler_key] \
+                    = self.pooler.state_dict_for_save_checkpoint(
+                        destination, prefix, keep_vars)
+            if self.add_decoder:
+                state_dict_[self._decoder_key] \
+                    = self.decoder.state_dict_for_save_checkpoint(
+                        destination, prefix, keep_vars)
 
         return state_dict_
 
@@ -371,23 +430,44 @@ class TransformerLanguageModelBase(MegatronModule):
                         state_dict_[key] = state_dict[key]
             self.embedding.load_state_dict(state_dict_, strict=strict)
 
-        # Transformer.
-        if self._transformer_key in state_dict:
-            state_dict_ = state_dict[self._transformer_key]
+        # Encoder.
+        if self._encoder_key in state_dict:
+            state_dict_ = state_dict[self._encoder_key]
+        # for backward compatibility.
+        elif 'transformer' in state_dict:
+            state_dict_ = state_dict['transformer']
         else:
             # for backward compatibility.
             state_dict_ = {}
             for key in state_dict.keys():
-                if 'transformer.' in key:
-                    state_dict_[key.split('transformer.')[1]] = state_dict[key]
-        self.transformer.load_state_dict(state_dict_, strict=strict)
+                if 'encoder.' in key:
+                    state_dict_[key.split('encoder.')[1]] = state_dict[key]
 
-        # Pooler.
-        if mpu.is_pipeline_last_stage() and self.add_pooler:
-            assert 'pooler' in state_dict, \
-                'could not find data for pooler in the checkpoint'
-            self.pooler.load_state_dict(state_dict[self._pooler_key],
-                                        strict=strict)
+        # for backward compatibility.
+        state_dict_self_attention = {}
+        for key in state_dict_.keys():
+            if '.attention.' in key:
+                state_dict_self_attention[key.replace(".attention.",
+                    ".self_attention.")] = state_dict_[key]
+            else:
+                state_dict_self_attention[key] = state_dict_[key]
+        state_dict_ = state_dict_self_attention
+
+        self.encoder.load_state_dict(state_dict_, strict=strict)
+
+        if mpu.is_pipeline_last_stage():
+            # pooler
+            if self.add_pooler:
+                assert 'pooler' in state_dict, \
+                    'could not find data for pooler in the checkpoint'
+                self.pooler.load_state_dict(state_dict[self._pooler_key],
+                                            strict=strict)
+            # decoder
+            if self.add_decoder:
+                assert 'decoder' in state_dict, \
+                    'could not find data for pooler in the checkpoint'
+                self.decoder.load_state_dict(state_dict[self._decoder_key],
+                                             strict=strict)
 
 
 class TransformerLanguageModel(TransformerLanguageModelBase):
@@ -400,24 +480,35 @@ class TransformerLanguageModel(TransformerLanguageModelBase):
                  init_method,
                  output_layer_init_method,
                  num_tokentypes=0,
+                 self_attn_mask_type=AttnMaskType.padding,
+                 add_decoder=False,
                  add_pooler=False):
         super(TransformerLanguageModel, self).__init__(
             attention_mask_func,
             init_method,
             output_layer_init_method,
             num_tokentypes=num_tokentypes,
+            self_attn_mask_type=self_attn_mask_type,
+            add_decoder=add_decoder,
             add_pooler=add_pooler)
 
-    def forward(self, input_ids, position_ids, attention_mask,
-                tokentype_ids=None, layer_past=None, get_key_value=False,
-                pooling_sequence_index=0):
+    def forward(self, enc_input_ids, enc_position_ids, enc_attention_mask,
+                dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
+                enc_dec_attn_mask=None, tokentype_ids=None, layer_past=None,
+                get_key_value=False, pooling_sequence_index=0,
+                enc_hidden_states=None, output_enc_hidden=False):
         return super(TransformerLanguageModel, self).forward(
-            (input_ids, position_ids),
-            attention_mask,
+            (enc_input_ids, enc_position_ids),
+            enc_attention_mask,
+            dec_language_model_input=(dec_input_ids, dec_position_ids),
+            dec_attn_mask=dec_attn_mask,
+            enc_dec_attn_mask=enc_dec_attn_mask,
             tokentype_ids=tokentype_ids,
             layer_past=layer_past,
             get_key_value=get_key_value,
-            pooling_sequence_index=pooling_sequence_index
+            pooling_sequence_index=pooling_sequence_index,
+            enc_hidden_states=enc_hidden_states,
+            output_enc_hidden=output_enc_hidden
         )
 
 
@@ -430,12 +521,14 @@ class TransformerLanguageModelFirstStage(TransformerLanguageModelBase):
                  attention_mask_func,
                  init_method,
                  output_layer_init_method,
-                 num_tokentypes=0):
+                 num_tokentypes=0,
+                 self_attn_mask_type=AttnMaskType.padding):
         super(TransformerLanguageModelFirstStage, self).__init__(
             attention_mask_func,
             init_method,
             output_layer_init_method,
-            num_tokentypes=num_tokentypes)
+            num_tokentypes=num_tokentypes,
+            self_attn_mask_type=self_attn_mask_type)
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False):
@@ -456,11 +549,13 @@ class TransformerLanguageModelIntermediateStage(TransformerLanguageModelBase):
     def __init__(self,
                  attention_mask_func,
                  init_method,
-                 output_layer_init_method):
+                 output_layer_init_method,
+                 self_attn_mask_type=AttnMaskType.padding):
         super(TransformerLanguageModelIntermediateStage, self).__init__(
             attention_mask_func,
             init_method,
-            output_layer_init_method)
+            output_layer_init_method,
+            self_attn_mask_type=self_attn_mask_type)
 
     def forward(self, hidden_states, attention_mask,
                 layer_past=None, get_key_value=False):
@@ -481,20 +576,31 @@ class TransformerLanguageModelLastStage(TransformerLanguageModelBase):
                  attention_mask_func,
                  init_method,
                  output_layer_init_method,
+                 self_attn_mask_type=AttnMaskType.padding,
+                 add_decoder=False,
                  add_pooler=False):
         super(TransformerLanguageModelLastStage, self).__init__(
             attention_mask_func,
             init_method,
             output_layer_init_method,
+            self_attn_mask_type=AttnMaskType.padding,
+            add_decoder=add_decoder,
             add_pooler=add_pooler)
 
-    def forward(self, hidden_states, attention_mask,
-                layer_past=None, get_key_value=False,
-                pooling_sequence_index=0):
+    def forward(self, hidden_states, enc_attention_mask,
+                dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
+                enc_dec_attn_mask=None, layer_past=None, get_key_value=False,
+                pooling_sequence_index=0, enc_hidden_states=None,
+                output_enc_hidden=False):
         return super(TransformerLanguageModelLastStage, self).forward(
             hidden_states,
-            attention_mask,
+            enc_attention_mask,
+            dec_language_input=(dec_input_ids, dec_position_ids),
+            dec_attn_mask=dec_attn_mask,
+            enc_dec_attn_mask=enc_dec_attn_mask,
             layer_past=layer_past,
             get_key_value=get_key_value,
-            pooling_sequence_index=pooling_sequence_index
+            pooling_sequence_index=pooling_sequence_index,
+            enc_hidden_states=enc_hidden_states,
+            ouput_enc_hidden=output_enc_hidden
         )
