@@ -19,7 +19,27 @@ The following figures show achieved percentage of theoretical peak FLOPs and ach
 ![Model Parallel Scaling](images/scaling.png)
 
 # Contents
-[[_TOC_]]
+   * [Contents](#contents)
+   * [Setup](#setup)
+      * [Downloading Checkpoints](#downloading-checkpoints)
+   * [Usage](#usage)
+   * [Training](#training)
+      * [Data Preprocessing](#data-preprocessing)
+      * [BERT Pretraining](#bert-pretraining)
+      * [GPT Pretraining](#gpt-pretraining)
+      * [Distributed BERT or GPT Pretraining](#distributed-bert-or-gpt-pretraining)
+      * [GPT-3 Example](#gpt-3-example)
+   * [Evaluation and Tasks](#evaluation-and-tasks)
+      * [GPT Text Generation](#gpt-text-generation)
+      * [GPT Evaluation](#gpt-evaluation)
+         * [WikiText Perplexity Evaluation](#wikitext-perplexity-evaluation)
+         * [LAMBADA Cloze Accuracy](#lambada-cloze-accuracy)
+      * [BERT Task Evaluation](#bert-task-evaluation)
+         * [RACE Evaluation](#race-evaluation)
+         * [MNLI Evaluation](#mnli-evaluation)
+   * [Datasets](#datasets)
+      * [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
+      * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
 
 # Setup
 We have tested Megatron with [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) version 20.12, which uses python 3.8, pytorch 1.8, cuda 11.1, and nccl 2.8.3.
