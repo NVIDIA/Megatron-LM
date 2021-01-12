@@ -108,8 +108,8 @@ def get_model(model_type):
 
     if model_type == 'BERT':
         from pretrain_bert import model_provider
-    elif model_type == 'GPT2':
-        from pretrain_gpt2 import model_provider
+    elif model_type == 'GPT':
+        from pretrain_gpt import model_provider
     elif model_type == 'RACE':
         from tasks.race.finetune import model_provider
     elif model_type == ['MNLI', 'QQP']:
@@ -177,7 +177,7 @@ def get_mp_merge_args(parser):
     group = parser.add_argument_group(title='mp merge')
 
     group.add_argument('--model-type', type=str, required=True,
-                       choices=['BERT', 'GPT2', 'RACE', 'MNLI', 'QQP'],
+                       choices=['BERT', 'GPT', 'RACE', 'MNLI', 'QQP'],
                        help='Type of the mdoel.')
 
     return parser

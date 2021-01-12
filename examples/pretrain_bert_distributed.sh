@@ -15,11 +15,11 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_bert.py \
-       --tensor-model-parallel-size 1 \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \
-       --batch-size 4 \
+       --micro-batch-size 4 \
+       --global-batch-size 32 \
        --seq-length 512 \
        --max-position-embeddings 512 \
        --train-iters 1000000 \
@@ -36,7 +36,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --lr-decay-iters 990000 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
-       --warmup .01 \
+       --lr-warmup-fraction .01 \
        --log-interval 100 \
        --save-interval 10000 \
        --eval-interval 1000 \
