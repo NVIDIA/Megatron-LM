@@ -406,10 +406,10 @@ class TransformerLanguageModelBase(MegatronModule):
                 state_dict_[self._pooler_key] \
                     = self.pooler.state_dict_for_save_checkpoint(
                         destination, prefix, keep_vars)
-            if self.add_decoder:
-                state_dict_[self._decoder_key] \
-                    = self.decoder.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+        if self.add_decoder:
+            state_dict_[self._decoder_key] \
+                = self.decoder.state_dict_for_save_checkpoint(
+                    destination, prefix, keep_vars)
 
         return state_dict_
 
