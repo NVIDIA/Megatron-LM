@@ -56,11 +56,11 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         return loss
 
 
-class GPT2ModelBase(MegatronModule):
+class GPTModelBase(MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPT2ModelBase, self).__init__()
+        super(GPTModelBase, self).__init__()
         args = get_args()
 
         self.parallel_output = parallel_output
@@ -75,17 +75,17 @@ class GPT2ModelBase(MegatronModule):
 
         self.initialize_word_embeddings(init_method_normal)
 
-    def forward(self, gpt2_model_input, attention_mask, labels=None,
+    def forward(self, gpt_model_input, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
 
         kwargs = {'layer_past': layer_past, 'get_key_value': get_key_value}
         if mpu.is_pipeline_first_stage():
-            (input_ids, position_ids) = gpt2_model_input
+            (input_ids, position_ids) = gpt_model_input
             args = [input_ids, position_ids, attention_mask]
             kwargs['tokentype_ids'] = tokentype_ids
         else:
-            args = [gpt2_model_input, attention_mask]
+            args = [gpt_model_input, attention_mask]
         lm_output = self.language_model(*args, **kwargs)
 
         if mpu.is_pipeline_last_stage():
@@ -124,17 +124,17 @@ class GPT2ModelBase(MegatronModule):
         self.language_model.load_state_dict(state_dict, strict=strict)
 
 
-class GPT2Model(GPT2ModelBase):
+class GPTModel(GPTModelBase):
 
     def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPT2Model, self).__init__(
+        super(GPTModel, self).__init__(
             num_tokentypes=num_tokentypes,
             parallel_output=parallel_output)
 
     def forward(self, input_ids, position_ids, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
-        return super(GPT2Model, self).forward(
+        return super(GPTModel, self).forward(
             (input_ids, position_ids),
             attention_mask,
             labels=labels,
@@ -144,15 +144,15 @@ class GPT2Model(GPT2ModelBase):
             forward_method_parallel_output=forward_method_parallel_output)
 
 
-class GPT2ModelFirstStage(GPT2ModelBase):
+class GPTModelFirstStage(GPTModelBase):
 
     def __init__(self, num_tokentypes=0):
-        super(GPT2ModelFirstStage, self).__init__(
+        super(GPTModelFirstStage, self).__init__(
             num_tokentypes=num_tokentypes)
 
     def forward(self, input_ids, position_ids, attention_mask,
                 tokentype_ids=None, layer_past=None, get_key_value=False):
-        return super(GPT2ModelFirstStage, self).forward(
+        return super(GPTModelFirstStage, self).forward(
             (input_ids, position_ids),
             attention_mask,
             tokentype_ids=tokentype_ids,
@@ -160,32 +160,32 @@ class GPT2ModelFirstStage(GPT2ModelBase):
             get_key_value=get_key_value)
 
 
-class GPT2ModelIntermediateStage(GPT2ModelBase):
+class GPTModelIntermediateStage(GPTModelBase):
 
     def __init__(self, num_tokentypes=0):
-        super(GPT2ModelIntermediateStage, self).__init__(
+        super(GPTModelIntermediateStage, self).__init__(
             num_tokentypes=num_tokentypes)
 
     def forward(self, hidden_state, attention_mask,
                 layer_past=None, get_key_value=False):
-        return super(GPT2ModelIntermediateStage, self).forward(
+        return super(GPTModelIntermediateStage, self).forward(
             hidden_state,
             attention_mask,
             layer_past=layer_past,
             get_key_value=get_key_value)
 
 
-class GPT2ModelLastStage(GPT2ModelBase):
+class GPTModelLastStage(GPTModelBase):
 
     def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPT2ModelLastStage, self).__init__(
+        super(GPTModelLastStage, self).__init__(
             num_tokentypes=num_tokentypes,
             parallel_output=parallel_output)
 
     def forward(self, hidden_state, attention_mask, labels=None,
                 layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
-        return super(GPT2ModelLastStage, self).forward(
+        return super(GPTModelLastStage, self).forward(
             hidden_state,
             attention_mask,
             labels=labels,
