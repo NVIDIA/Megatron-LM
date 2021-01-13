@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import torch
+from megatron.model.enums import AttnMaskType
 
-class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function) :
+
+class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
        Fused operation which performs following three operations in sequence
-       1. Scale the tensor. 
+       1. Scale the tensor.
        2. Apply upper triangular mask (typically used in gpt models).
        3. Perform softmax.
     """
@@ -38,15 +40,16 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function) :
         softmax_results, scale_t = ctx.saved_tensors
 
         input_grads =   \
-            scaled_upper_triang_masked_softmax_cuda.backward(output_grads,                             
-                                                 softmax_results,                          
-                                                 scale_t[0])
+            scaled_upper_triang_masked_softmax_cuda.backward(output_grads,
+                                                             softmax_results,
+                                                             scale_t[0])
         return input_grads, None
 
-class ScaledMaskedSoftmax(torch.autograd.Function) :
+
+class ScaledMaskedSoftmax(torch.autograd.Function):
     """
        Fused operation which performs following three operations in sequence
-       1. Scale the tensor. 
+       1. Scale the tensor.
        2. Apply the mask.
        3. Perform softmax.
     """
@@ -71,24 +74,25 @@ class ScaledMaskedSoftmax(torch.autograd.Function) :
                                                 scale_t[0])
         return input_grads, None, None
 
+
 class FusedScaleMaskSoftmax(torch.nn.Module):
     """
        fused operation: scaling + mask + softmax
        Arguments:
            input_in_fp16: flag to indicate if input in fp16 data format.
-           upper_triang_mask: if true, apply upper triangular masking.
-                              (used in gpt family networks)
+           attn_mask_type: attention mask type (pad or causal)
            mask_func: mask function to be applied.
            softmax_in_fp32: if true, softmax in performed at fp32 precision.
            scale: scaling factor used in input tensor scaling.
 
     """
-    def __init__(self, input_in_fp16, upper_triang_mask_fusion, 
-                 general_mask_fusion, mask_func, softmax_in_fp32, scale):
+    def __init__(self, input_in_fp16, attn_mask_type,
+                 scaled_masked_softmax_fusion, mask_func,
+                 softmax_in_fp32, scale):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
-        self.upper_triang_mask_fusion = upper_triang_mask_fusion
-        self.general_mask_fusion = general_mask_fusion
+        self.attn_mask_type = attn_mask_type
+        self.scaled_masked_softmax_fusion = scaled_masked_softmax_fusion
         self.mask_func = mask_func
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
@@ -97,20 +101,26 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
             'softmax should be in fp32 when scaled'
 
     def forward(self, input, mask):
-        # [b, np, s, s]
+        # [b, np, sq, sk]
         data_size = input.size()
-        assert input.dim() == 4 
+        query_seq_len = data_size[-2]
+        key_seq_len = data_size[-1]
+        assert input.dim() == 4
 
         # invoke custom kernel
-        if self.input_in_fp16 and data_size[-1] <= 2048 and \
-            (self.upper_triang_mask_fusion or self.general_mask_fusion) and \
-            input.size()[2] == input.size()[3]:
-            scale = self.scale if self.scale is not None  else 1.0
-            if self.upper_triang_mask_fusion:
-                input = input.view(-1, data_size[2], data_size[3])
+        if self.input_in_fp16 and key_seq_len <= 2048 and \
+           query_seq_len % 4 == 0 and self.scaled_masked_softmax_fusion:
+
+            scale = self.scale if self.scale is not None else 1.0
+
+            if self.attn_mask_type == AttnMaskType.causal:
+                assert query_seq_len == key_seq_len, \
+                    "causal mask is only for self attention"
+                input = input.view(-1, query_seq_len, key_seq_len)
                 probs = ScaledUpperTriangMaskedSoftmax.apply(input, scale)
                 probs = probs.view(*data_size)
             else:
+                assert self.attn_mask_type == AttnMaskType.padding
                 probs = ScaledMaskedSoftmax.apply(input, mask, scale)
         else:
             if self.input_in_fp16 and self.softmax_in_fp32:

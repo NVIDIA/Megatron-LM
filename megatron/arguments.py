@@ -164,6 +164,20 @@ def parse_args(extra_args_provider=None, defaults={},
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    if args.ffn_hidden_size is None:
+        args.ffn_hidden_size = 4 * args.hidden_size
+
+    if args.kv_channels is None:
+        assert args.hidden_size % args.num_attention_heads == 0
+        args.kv_channels = args.hidden_size // args.num_attention_heads
+
+    if args.seq_length is not None:
+        assert args.encoder_seq_length is None
+        args.encoder_seq_length = args.seq_length
+    else:
+        assert args.encoder_seq_length is not None
+        args.seq_length = args.encoder_seq_length
+ 
     assert args.hidden_size % args.num_attention_heads == 0
     if args.seq_length is not None:
         assert args.max_position_embeddings >= args.seq_length
@@ -182,16 +196,11 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-
-    if args.scaled_masked_softmax_fusion:
-        if args.scaled_upper_triang_masked_softmax_fusion:
-            fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
-        else:
-            fused_kernels.load_scaled_masked_softmax_fusion_kernel()
-    else:
-        # This argument will eventually go away, for now make sure it is off
-        # if scaled_masked_softmax_fusion is off.
-        args.scaled_upper_triang_masked_softmax_fusion = False
+   
+    # Load scaled_masked_softmax_fusion_kernels
+    if args.masked_softmax_fusion:
+        fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
+        fused_kernels.load_scaled_masked_softmax_fusion_kernel()
 
     # Load mixed precision fused layer norm.
     if args.fp32_residual_connection:
@@ -227,8 +236,14 @@ def _add_network_size_args(parser):
                        help='Number of transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
+    group.add_argument('--ffn-hidden-size', type=int, default=None,
+                       help='Transformer Feed-Forward Network hidden size. This is set to 4*hidden-size if not '
+                            'provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
+    group.add_argument('--kv-channels', type=int, default=None,
+                       help='Projection weights dimension in multi-head attention. '
+                            'This is set to args.hidden_size // args.num_attention_heads if not provided.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -330,16 +345,11 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
-    group.add_argument('--no-scaled-masked-softmax-fusion',
+    group.add_argument('--no-masked-softmax-fusion',
                        action='store_false',
                        help='Disable fusion of query_key_value scaling, '
                        'masking, and softmax.',
-                       dest='scaled_masked_softmax_fusion')
-    group.add_argument('--scaled-upper-triang-masked-softmax-fusion',
-                       type=bool,
-                       help='Use upper triangular version of fused '
-                       'scale, mask, softmax fusion kernel (default for GPT). '
-                       '- DEPRECATED')
+                       dest='masked_softmax_fusion')
     group.add_argument('--no-bias-gelu-fusion', action='store_false',
                        help='Disable bias and gelu fusion.',
                        dest='bias_gelu_fusion')
@@ -529,7 +539,12 @@ def _add_data_args(parser):
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
     group.add_argument('--seq-length', type=int, default=None,
-                       help="Maximum sequence length to process.")
+                       help='Maximum sequence length to process.')
+    group.add_argument('--encoder-seq-length', type=int, default=None,
+                       help='Maximum encoder sequence length to process.'
+                       'This should be exclusive of --seq-length')
+    group.add_argument('--decoder-seq-length', type=int, default=None,
+                       help="Maximum decoder sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
