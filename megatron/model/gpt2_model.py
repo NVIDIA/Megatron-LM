@@ -76,7 +76,7 @@ class GPT2ModelBase(MegatronModule):
             attention_mask_func=gpt2_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            self_attn_mask_type=AttnMaskType.causal,
+            encoder_attn_mask_type=AttnMaskType.causal,
             init_method=init_method_normal(args.init_method_std),
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
                                                          args.num_layers))

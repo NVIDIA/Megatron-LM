@@ -14,7 +14,6 @@
 # limitations under the License.
 
 """Transformer."""
-import enum
 import math
 import torch
 import torch.nn.functional as F

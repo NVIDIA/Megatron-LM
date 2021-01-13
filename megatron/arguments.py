@@ -539,9 +539,10 @@ def _add_data_args(parser):
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
     group.add_argument('--seq-length', type=int, default=None,
-                       help="Maximum sequence length to process.")
+                       help='Maximum sequence length to process.')
     group.add_argument('--encoder-seq-length', type=int, default=None,
-                       help="Maximum encoder sequence length to process.")
+                       help='Maximum encoder sequence length to process.'
+                       'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,
