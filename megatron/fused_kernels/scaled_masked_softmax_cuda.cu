@@ -37,17 +37,19 @@ torch::Tensor fwd_cuda(
   const int batches = input.size(0);
   const int pad_batches = mask.size(0);
   const int attn_heads = input.size(1);
-  const int seq_len = input.size(2);
-  TORCH_INTERNAL_ASSERT(seq_len <= 2048);
+  const int query_seq_len = input.size(2);
+  const int key_seq_len = input.size(3);
+  TORCH_INTERNAL_ASSERT(key_seq_len <= 2048);
+  TORCH_INTERNAL_ASSERT(query_seq_len > 1);
   TORCH_INTERNAL_ASSERT(pad_batches == 1 || pad_batches == batches);
   TORCH_INTERNAL_ASSERT(mask.size(1) == 1);
-  TORCH_INTERNAL_ASSERT(mask.size(2) == seq_len);
-  TORCH_INTERNAL_ASSERT(mask.size(3) == seq_len);
+  TORCH_INTERNAL_ASSERT(mask.size(2) == query_seq_len);
+  TORCH_INTERNAL_ASSERT(mask.size(3) == key_seq_len);
 
   // Output 
   auto act_options = input.options().requires_grad(false);
   torch::Tensor softmax_results = 
-      torch::empty({batches, attn_heads, seq_len, seq_len}, act_options);
+      torch::empty({batches, attn_heads, query_seq_len, key_seq_len}, act_options);
 
   // Softmax Intermediate Result Ptr
   void* input_ptr = static_cast<void*>(input.data_ptr());
@@ -59,8 +61,8 @@ torch::Tensor fwd_cuda(
       reinterpret_cast<const half*>(input_ptr),
       reinterpret_cast<const uint8_t*>(mask_ptr),
       scale_factor,
-      seq_len,
-      seq_len,
+      query_seq_len,
+      key_seq_len,
       batches,
       attn_heads,
       pad_batches);
@@ -78,8 +80,8 @@ torch::Tensor bwd_cuda(
   //output grads is a 4d tensor with dimensions [batches, attn_heads, seq_len, seq_len]
   const int batches = output_grads.size(0);
   const int attn_heads = output_grads.size(1);
-  const int seq_len = output_grads.size(2);
-  TORCH_INTERNAL_ASSERT(output_grads.size(2) == output_grads.size(3));
+  const int query_seq_len = output_grads.size(2);
+  const int key_seq_len = output_grads.size(3);
 
   void* output_grads_ptr = static_cast<void*>(output_grads.data_ptr());
 
@@ -89,8 +91,8 @@ torch::Tensor bwd_cuda(
       reinterpret_cast<half*>(output_grads_ptr), 
       reinterpret_cast<half const*>(softmax_results.data_ptr()),
       scale_factor,
-      seq_len,
-      seq_len,
+      query_seq_len,
+      key_seq_len,
       batches,
       attn_heads);
   

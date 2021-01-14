@@ -19,6 +19,7 @@ import torch
 
 from megatron import get_args
 from megatron import mpu
+from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
 from megatron.model import import_layernorm
@@ -143,6 +144,7 @@ class BertModelBase(MegatronModule):
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
             add_pooler=self.add_binary_head,
+            encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
