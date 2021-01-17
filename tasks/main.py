@@ -61,7 +61,7 @@ if __name__ == '__main__':
     elif args.task in ['MNLI', 'QQP']:
         from glue.finetune import main
     elif args.task in ['LAMBADA', 'WIKITEXT103']:
-        from zeroshot_gpt2.evaluate import main
+        from zeroshot_gpt.evaluate import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))
