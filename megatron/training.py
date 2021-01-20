@@ -381,11 +381,11 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer').start()
-    update_successfull, grad_norm = optimizer.step()
+    update_successful, grad_norm = optimizer.step()
     timers('optimizer').stop()
 
     # Update learning rate.
-    if update_successfull:
+    if update_successful:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size

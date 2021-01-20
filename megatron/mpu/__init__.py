@@ -59,6 +59,8 @@ from .random import get_cuda_rng_tracker
 from .random import init_checkpointed_activations_memory_buffer
 from .random import model_parallel_cuda_manual_seed
 from .random import reset_checkpointed_activations_memory_buffer
+from .random import gather_split_1d_tensor
+from .random import split_tensor_into_1d_equal_chunks
 
 from .utils import divide
 from .utils import split_tensor_along_last_dim
