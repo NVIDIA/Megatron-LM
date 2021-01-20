@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import reduce
+import operator
 import torch
 
 from megatron import get_args
@@ -30,9 +32,8 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     tensor_recv_next = None
     tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
     if args.scatter_gather_tensors_in_pipeline:
-        tensor_chunk_shape = (
-            args.seq_length * args.micro_batch_size * args.hidden_size) // \
-                    mpu.get_tensor_model_parallel_world_size()
+        tensor_chunk_shape = reduce(operator.mul, tensor_shape, 1) // \
+            mpu.get_tensor_model_parallel_world_size()
     else:
         tensor_chunk_shape = tensor_shape
     dtype = args.params_dtype

@@ -70,7 +70,7 @@ def parse_args(extra_args_provider=None, defaults={},
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
-        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
@@ -116,6 +116,10 @@ def parse_args(extra_args_provider=None, defaults={},
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.virtual_pipeline_model_parallel_size is not None:
+        assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+            'global batch size is not divisible by pipeline parallel size when '\
+            'using interleaved schedule'
 
     # Parameters dtype.
     args.params_dtype = torch.float
