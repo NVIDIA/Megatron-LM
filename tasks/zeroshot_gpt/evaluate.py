@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPT2 zero-shot evaluation."""
+"""GPT zero-shot evaluation."""
 
 import math
 
@@ -24,7 +24,7 @@ from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
-from megatron.model import GPT2Model, GPT2ModelFirstStage, GPT2ModelLastStage, GPT2ModelIntermediateStage
+from megatron.model import GPTModel, GPTModelFirstStage, GPTModelLastStage, GPTModelIntermediateStage
 from megatron.training import get_model, communicate
 from megatron.utils import get_ltor_masks_and_position_ids
 from tasks.finetune_utils import build_data_loader
@@ -47,18 +47,18 @@ def get_model_provider(eval_metric):
             raise NotImplementedError('output type for {} evaluation metric '
                                       'is not supported.'.format(eval_metric))
 
-        print_rank_0('building GPT2 model ...')
+        print_rank_0('building GPT model ...')
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             # Determine model based on position of stage in pipeline.
             if mpu.is_pipeline_first_stage():
-                model = GPT2ModelFirstStage(num_tokentypes=0)
+                model = GPTModelFirstStage(num_tokentypes=0)
             elif mpu.is_pipeline_last_stage():
-                model = GPT2ModelLastStage(
+                model = GPTModelLastStage(
                     parallel_output=parallel_output, num_tokentypes=0)
             else:
-                model = GPT2ModelIntermediateStage(num_tokentypes=0)
+                model = GPTModelIntermediateStage(num_tokentypes=0)
         else:
-            model = GPT2Model(num_tokentypes=0, parallel_output=parallel_output)
+            model = GPTModel(num_tokentypes=0, parallel_output=parallel_output)
 
         return model
 
