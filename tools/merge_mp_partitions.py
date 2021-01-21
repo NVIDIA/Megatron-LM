@@ -23,11 +23,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import torch
 
 from megatron import mpu
+from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.checkpointing import ensure_directory_exists
 from megatron.checkpointing import get_checkpoint_name
+from megatron.checkpointing import get_checkpoint_version
 from megatron.checkpointing import get_checkpoint_tracker_filename
+from megatron.global_vars import set_global_variables, get_args
 from megatron.global_vars import rebuild_tokenizer
-from megatron.global_vars import _parse_args
 
 
 def split_into_partitions(tensor, num_partitions, partition_dim, stride):
@@ -185,12 +187,26 @@ def get_mp_merge_args(parser):
 
 def main():
 
+    # Arguments do sanity checks on the world size, but we don't care,
+    # so trick it into thinking we are plenty of processes
+    os.environ["WORLD_SIZE"] = f'{2**31}'
+
     # Args
-    args = _parse_args(extra_args_provider=get_mp_merge_args)
+    set_global_variables(extra_args_provider=get_mp_merge_args,
+                         args_defaults = {'use_cpu_initialization': True,
+                                          'micro_batch_size': 1,
+                                          'no_load_optim': True,
+                                          'no_load_rng': True,
+                                          'save_interval': 1})
+    args = get_args()
     model_type = args.model_type
     orig_tensor_model_parallel_size = args.tensor_model_parallel_size
     args.tensor_model_parallel_size = 1
     tokenizer = rebuild_tokenizer(args)
+
+    if args.pipeline_model_parallel_size > 1:
+        print("Checkpoints with pipeline model parallelism are not currently supported.")
+        exit()
 
     print('\n merging model parallel partitions ...')
     print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size))
@@ -209,6 +225,8 @@ def main():
     print('> building the full model ...')
     mpu.initialize.set_tensor_model_parallel_world_size(1)
     mpu.initialize.set_tensor_model_parallel_rank(0)
+    mpu.initialize.set_pipeline_model_parallel_world_size(1)
+    mpu.initialize.set_pipeline_model_parallel_rank(0)
     merged_model = get_model(model_type)
 
     # Build and load partitions.
@@ -220,12 +238,15 @@ def main():
     for rank in range(args.tensor_model_parallel_size):
         mpu.initialize.set_tensor_model_parallel_rank(rank)
         checkpoint_name, iteration = get_parallel_checkpoint_name(args.load)
-        print('> loading {} ...'.format(checkpoint_name))
         model_ = get_model(model_type)
-        sd = torch.load(checkpoint_name, map_location='cpu')
-        model_.load_state_dict(sd['model'])
+        print(f'> loading {checkpoint_name} ...')
+        load_checkpoint(model_, None, None)
+        print(f'> checkpoint version {get_checkpoint_version()}')
+        if get_checkpoint_version() < 2.0:
+            # Need to deal with the qkv matrix order of old versions
+            print("Checkpoints less than version 2.0 are not currently supported.")
+            exit()
         partitions.append(model_)
-
 
     # Parameter generators so we can loop through them semiltaneouly.
     merged_params_gen = merged_model.named_parameters()
@@ -254,29 +275,26 @@ def main():
                     merged_param.data.copy_(partitions_param[0].data)
             # For parallel parameters, merge the values
             else:
-                print('     parallel parameter merge with stride {} along '
-                      'dimention {}'.format(merged_param.stride,
-                                            merged_param.partition_dim))
+                dim = merged_param.partition_dim
+                stride = merged_param.partition_stride
+                print(f'     parallel parameter merge with stride {stride} along '
+                      f'dimention {dim}')
                 merge_partitions(merged_param,
                                  partitions_param,
-                                 merged_param.partition_dim,
-                                 merged_param.stride)
+                                 dim,
+                                 stride)
 
         except StopIteration:
             break
 
-
     # Save the model.
     args.tensor_model_parallel_size = 1
+    args.pipeline_model_parallel_size = 1
+    # And now one last time so proper arguments are set in saved checkpoint
+    tokenizer = rebuild_tokenizer(args)
     mpu.initialize.set_tensor_model_parallel_rank(0)
-    sd = {}
-    sd['model'] = merged_model.state_dict_for_save_checkpoint()
-    sd['iteration'] = iteration
-    merged_path = os.path.join(args.load, 'merged')
-    checkpoint_name = get_checkpoint_name(merged_path, iteration)
-    ensure_directory_exists(checkpoint_name)
-    print('> saving merged model to {}'.format(checkpoint_name))
-    torch.save(sd, checkpoint_name)
+    print('> saving merged model')
+    save_checkpoint(iteration, merged_model, None, None)
 
     print('done :-)')
 

@@ -60,6 +60,8 @@ class MegatronModule(torch.nn.Module):
         if not self.share_word_embeddings:
             raise Exception('initialize_word_embeddings() was called but '
                             'share_word_embeddings is false')
+        if args.pipeline_model_parallel_size == 1:
+            return
         # Parameters are shared between the word embeddings layer, and the
         # heads at the end of the model. In a pipelined setup with more than
         # one stage, the initial embedding layer and the head are on different
