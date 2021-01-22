@@ -33,8 +33,8 @@ from megatron.utils import average_losses_across_data_parallel_group
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
-    images = batch[0].half().cuda().contiguous()
-    labels = batch[1].long().cuda().contiguous()
+    images = batch[0].cuda().contiguous()
+    labels = batch[1].cuda().contiguous()
     return images, labels
 
 

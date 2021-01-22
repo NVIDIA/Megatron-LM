@@ -23,7 +23,6 @@ from megatron.model import VitModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
-
 def model_provider():
     """Build the model."""
 
@@ -33,30 +32,15 @@ def model_provider():
     model = VitModel(num_classes=args.num_classes)
     return model
 
-
 def get_batch(data_iterator):
     """Build the batch."""
+    data = next(data_iterator)
 
-    # Items and their type.
-    keys = ["image", "label"]
-    datatype = torch.half
+    # only data parallelism; no need for broadcast
+    images = data[0].cuda()
+    labels = data[1].cuda()
 
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
-    else:
-        data = None
-
-    dict_data = {}
-    dict_data["image"] = data[0].half()
-    dict_data["label"] = data[1].half()
-    data_b = mpu.broadcast_data(keys, dict_data, datatype)
-
-    # Unpack.
-    images = data_b["image"]
-    labels = data_b["label"].long()
     return images, labels
-
 
 def forward_step(data_iterator, model, input_tensor):
     """Forward step."""
@@ -64,12 +48,12 @@ def forward_step(data_iterator, model, input_tensor):
     assert input_tensor is None
 
     # Get the batch.
-    timers("batch generator").start()
+    timers("batch-generator").start()
     (
         images,
         labels,
     ) = get_batch(data_iterator)
-    timers("batch generator").stop()
+    timers("batch-generator").stop()
 
     # Forward model. lm_labels
     logits = model(images).contiguous().float()
@@ -103,5 +87,5 @@ if __name__ == "__main__":
         train_valid_test_datasets_provider,
         model_provider,
         forward_step,
-        random_sample=True
+        args_defaults={'dataloader_type': 'cyclic'}
     )

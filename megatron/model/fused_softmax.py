@@ -122,7 +122,7 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
         assert input.dim() == 4
 
         # invoke custom kernel
-        if self.input_in_fp16 and key_seq_len <= 2048 and \
+        if self.input_in_fp16 and key_seq_len <= 2048 and mask is not None and \
            query_seq_len % 4 == 0 and self.scaled_masked_softmax_fusion:
 
             scale = self.scale if self.scale is not None else 1.0
@@ -142,7 +142,7 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
 
             if self.scale is not None:
                 input = input * self.scale
-            mask_output = self.mask_func(input, mask) if mask else input
+            mask_output = self.mask_func(input, mask) if mask is not None else input
             probs = torch.nn.Softmax(dim=-1)(mask_output)
 
             if self.input_in_fp16 and self.softmax_in_fp32:

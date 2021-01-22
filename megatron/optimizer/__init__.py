@@ -59,12 +59,14 @@ def get_megatron_optimizer(model):
                          weight_decay=args.weight_decay,
                          betas=(args.adam_beta1, args.adam_beta2),
                          eps=args.adam_eps)
-    else:
-        assert args.optimizer == 'sgd'
+    elif args.optimizer == 'sgd':
         optimizer = SGD(param_groups,
                         lr=args.lr,
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)
+    else:
+        raise Exception('{} optimizer is not supported.'.format(
+                args.optimizer))
 
     if args.fp16:
         # Constant loss scale.

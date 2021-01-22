@@ -120,7 +120,7 @@ def twod_interpolate_position_embeddings_hook(
 
 
 class VitModel(MegatronModule):
-    """Bert Language model."""
+    """Vision Transformer Model."""
 
     def __init__(self, num_classes, finetune=False):
         super(VitModel, self).__init__()

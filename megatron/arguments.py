@@ -362,7 +362,9 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
-
+    group.add_argument('--dataloader_type', type=str, default='single',
+                       choices=['single', 'cyclic'],
+                       help='Single pass vs multiple pass data loader')
     return parser
 
 

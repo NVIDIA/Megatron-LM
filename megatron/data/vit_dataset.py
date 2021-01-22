@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import torch
 from torchvision import datasets, transforms
 from megatron.data.autoaugment import ImageNetPolicy
 
@@ -32,7 +33,8 @@ def build_train_valid_datasets(data_path, crop_size=224, color_jitter=True):
                 brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
             )
         ]
-    process += [ImageNetPolicy(), transforms.ToTensor(), normalize]
+    fp16_t = transforms.ConvertImageDtype(torch.half)
+    process += [ImageNetPolicy(), transforms.ToTensor(), normalize, fp16_t]
     transform_train = transforms.Compose(process)
     train_data = datasets.ImageFolder(
         root=train_data_path, transform=transform_train
@@ -46,6 +48,7 @@ def build_train_valid_datasets(data_path, crop_size=224, color_jitter=True):
             transforms.CenterCrop(crop_size),
             transforms.ToTensor(),
             normalize,
+            fp16_t
         ]
     )
     val_data = datasets.ImageFolder(
