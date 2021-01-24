@@ -70,7 +70,7 @@ class MegatronOptimizer(ABC):
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 params.append(param)
-        clip_grad_norm_fp32(params, clip_grad)
+        return clip_grad_norm_fp32(params, clip_grad)
 
     @abstractmethod
     def zero_grad(self, set_to_none=True):
@@ -311,11 +311,13 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
         # If we found inf/nan, skip the update.
         if found_inf_flag:
-            return False
+            return False, None
 
         # Clip the main gradients.
         timers('optimizer-clip-main-grad').start()
-        self.clip_grad_norm(self.clip_grad)
+        grad_norm = None
+        if self.clip_grad > 0.0:
+            grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # Step the optimizer.
@@ -327,7 +329,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         timers('optimizer-copy-main-to-model-params').stop()
 
         # Successful update.
-        return True
+        return True, grad_norm
 
 
     def state_dict(self):
@@ -392,14 +394,15 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
 
         # Clip gradients.
+        grad_norm = None
         if self.clip_grad > 0.0:
-            self.clip_grad_norm(self.clip_grad)
+            grad_norm = self.clip_grad_norm(self.clip_grad)
 
         # Update parameters.
         self.optimizer.step()
 
         # No overflow for FP32 optimizer.
-        return True
+        return True, grad_norm
 
 
     def reload_model_params(self):
