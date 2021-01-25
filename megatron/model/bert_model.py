@@ -78,9 +78,7 @@ class BertLMHead(MegatronModule):
         args = get_args()
 
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        self.bias.tensor_model_parallel = True
-        self.bias.partition_dim = 0
-        self.bias.stride = 1
+        mpu.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
