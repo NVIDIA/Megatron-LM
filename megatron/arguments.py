@@ -503,7 +503,7 @@ def _add_distributed_args(parser):
                        ' and returns function to complete it instead.'
                        'Also turns on --use-cpu-initialization flag.'
                        'This is for external DDP manager.' )
-    group.add_argument('--use-cpu-initialization', type=bool, required=False,
+    group.add_argument('--use-cpu-initialization', action='store_true', default=None,
                        help='If set, affine parallel weights initialization uses CPU' )
     return parser
 

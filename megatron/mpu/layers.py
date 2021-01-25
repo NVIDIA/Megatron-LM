@@ -260,9 +260,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=args.params_dtype))
-            self.bias.tensor_model_parallel = True
-            self.bias.partition_dim = 0
-            self.bias.partition_stride = stride
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()

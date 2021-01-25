@@ -199,14 +199,15 @@ def main():
                                           'no_load_rng': True,
                                           'save_interval': 1})
     args = get_args()
-    model_type = args.model_type
-    orig_tensor_model_parallel_size = args.tensor_model_parallel_size
-    args.tensor_model_parallel_size = 1
-    tokenizer = rebuild_tokenizer(args)
 
     if args.pipeline_model_parallel_size > 1:
         print("Checkpoints with pipeline model parallelism are not currently supported.")
         exit()
+
+    model_type = args.model_type
+    orig_tensor_model_parallel_size = args.tensor_model_parallel_size
+    args.tensor_model_parallel_size = 1
+    tokenizer = rebuild_tokenizer(args)
 
     print('\n merging model parallel partitions ...')
     print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size))
