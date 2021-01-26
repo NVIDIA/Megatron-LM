@@ -36,13 +36,14 @@ class BertDataset(Dataset):
 
     def __init__(self, name, indexed_dataset, data_prefix,
                  num_epochs, max_num_samples, masked_lm_prob,
-                 max_seq_length, short_seq_prob, seed):
+                 max_seq_length, short_seq_prob, seed, binary_head):
 
         # Params to store.
         self.name = name
         self.seed = seed
         self.masked_lm_prob = masked_lm_prob
         self.max_seq_length = max_seq_length
+        self.binary_head = binary_head
 
         # Dataset.
         self.indexed_dataset = indexed_dataset
@@ -55,7 +56,8 @@ class BertDataset(Dataset):
                                                     self.max_seq_length,
                                                     short_seq_prob,
                                                     self.seed,
-                                                    self.name)
+                                                    self.name,
+                                                    self.binary_head)
 
         # Vocab stuff.
         tokenizer = get_tokenizer()
@@ -81,7 +83,8 @@ class BertDataset(Dataset):
                                      self.vocab_id_to_token_dict,
                                      self.cls_id, self.sep_id,
                                      self.mask_id, self.pad_id,
-                                     self.masked_lm_prob, np_rng)
+                                     self.masked_lm_prob, np_rng,
+                                     self.binary_head)
 
 
 def get_samples_mapping_(indexed_dataset,
@@ -91,7 +94,8 @@ def get_samples_mapping_(indexed_dataset,
                          max_seq_length,
                          short_seq_prob,
                          seed,
-                         name):
+                         name,
+                         binary_head):
     if not num_epochs:
         if not max_num_samples:
             raise ValueError("Need to specify either max_num_samples "
@@ -137,7 +141,8 @@ def get_samples_mapping_(indexed_dataset,
             max_seq_length - 3,  # account for added tokens
             short_seq_prob,
             seed,
-            verbose)
+            verbose,
+            2 if binary_head else 1)
         print_rank_0(' > done building sapmles index maping')
         np.save(indexmap_filename, samples_mapping, allow_pickle=True)
         print_rank_0(' > saved the index mapping in {}'.format(
@@ -173,7 +178,7 @@ def build_training_sample(sample,
                           target_seq_length, max_seq_length,
                           vocab_id_list, vocab_id_to_token_dict,
                           cls_id, sep_id, mask_id, pad_id,
-                          masked_lm_prob, np_rng):
+                          masked_lm_prob, np_rng, binary_head):
     """Biuld training sample.
 
     Arguments:
@@ -193,12 +198,21 @@ def build_training_sample(sample,
               the opper bound whereas the numpy one is exclusive.
     """
 
-    # We assume that we have at least two sentences in the sample
-    assert len(sample) > 1
+    if binary_head:
+        # We assume that we have at least two sentences in the sample
+        assert len(sample) > 1
     assert target_seq_length <= max_seq_length
 
     # Divide sample into two segments (A and B).
-    tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample, np_rng)
+    if binary_head:
+        tokens_a, tokens_b, is_next_random = get_a_and_b_segments(sample,
+                                                                  np_rng)
+    else:
+        tokens_a = []
+        for j in range(len(sample)):
+            tokens_a.extend(sample[j])
+        tokens_b = []
+        is_next_random = False
 
     # Truncate to `target_sequence_length`.
     max_num_tokens = target_seq_length

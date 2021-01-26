@@ -26,7 +26,7 @@ from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model import import_layernorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.utils import openai_gelu, erf_gelu
+from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
@@ -47,12 +47,6 @@ torch._C._jit_override_can_fuse_on_gpu(True)
     Transformer takes input of size [s, b, h] and returns a
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
-        attention_mask_func: a function that takes `unmaksed-attention-scores`
-            with size [b, np, s, s] and an `attention-mask` and will apply
-            the masking. The function should return a masked score of the
-            same size [b, np, s, s].
-               masked-attention-scores = attention_mask_func(
-                                     unmaksed-attention-scores, attention-mask)
 """
 
 class ParallelMLP(MegatronModule):
@@ -115,7 +109,7 @@ class ParallelAttention(MegatronModule):
     and returns output of the same size.
     """
 
-    def __init__(self, attention_mask_func, init_method,
+    def __init__(self, init_method,
                  output_layer_init_method, layer_number,
                  attention_type=AttnType.self_attn,
                  attn_mask_type=AttnMaskType.padding):
@@ -123,7 +117,6 @@ class ParallelAttention(MegatronModule):
         args = get_args()
         self.fp16 = args.fp16
 
-        self.attention_mask_func = attention_mask_func
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
         if self.apply_query_key_layer_scaling:
@@ -174,7 +167,7 @@ class ParallelAttention(MegatronModule):
             self.fp16,
             self.attn_mask_type,
             args.masked_softmax_fusion,
-            self.attention_mask_func,
+            attention_mask_func,
             self.attention_softmax_in_fp32,
             coeff)
 
@@ -440,9 +433,8 @@ class ParallelTransformerLayer(MegatronModule):
     output of the same size.
     """
 
-    def __init__(self, attention_mask_func, init_method,
-                 output_layer_init_method, layer_number,
-                 layer_type=LayerType.encoder,
+    def __init__(self, init_method, output_layer_init_method,
+                 layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding):
         args = get_args()
 
@@ -461,7 +453,6 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Self attention.
         self.self_attention = ParallelAttention(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             layer_number,
@@ -477,7 +468,6 @@ class ParallelTransformerLayer(MegatronModule):
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
-                attention_mask_func,
                 init_method,
                 output_layer_init_method,
                 layer_number,
@@ -585,8 +575,7 @@ class ParallelTransformerLayer(MegatronModule):
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
-    def __init__(self, attention_mask_func,
-                 init_method, output_layer_init_method,
+    def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding):
         super(ParallelTransformer, self).__init__()
@@ -606,8 +595,9 @@ class ParallelTransformer(MegatronModule):
         # Transformer layers.
         def build_layer(layer_number):
             return ParallelTransformerLayer(
-                attention_mask_func, init_method,
-                output_layer_init_method, layer_number,
+                init_method,
+                output_layer_init_method,
+                layer_number,
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type)
         offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers

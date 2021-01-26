@@ -23,7 +23,10 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import BertModel, BertModelFirstStage, BertModelIntermediateStage, BertModelLastStage
+from megatron.model import (BertModel,
+                            BertModelFirstStage,
+                            BertModelIntermediateStage,
+                            BertModelLastStage)
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
@@ -34,23 +37,24 @@ def model_provider():
     print_rank_0('building BERT model ...')
 
     args = get_args()
+    num_tokentypes = 2 if args.bert_binary_head else 0
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         # Determine model based on position of stage in pipeline.
         if mpu.is_pipeline_first_stage():
             model = BertModelFirstStage(
-                num_tokentypes=2)
+                num_tokentypes=num_tokentypes)
         elif mpu.is_pipeline_last_stage():
             model = BertModelLastStage(
-                num_tokentypes=2,
-                add_binary_head=True,
+                num_tokentypes=num_tokentypes,
+                add_binary_head=args.bert_binary_head,
                 parallel_output=True)
         else:
             model = BertModelIntermediateStage(
-                num_tokentypes=2)
+                num_tokentypes=num_tokentypes)
     else:
         model = BertModel(
-            num_tokentypes=2,
-            add_binary_head=True,
+            num_tokentypes=num_tokentypes,
+            add_binary_head=args.bert_binary_head,
             parallel_output=True)
 
     return model
@@ -92,6 +96,9 @@ def forward_step(data_iterator, model, input_tensor):
         = get_batch(data_iterator)
     timers('batch-generator').stop()
 
+    if not args.bert_binary_head:
+        types = None
+
     # Forward pass through the model.
     if mpu.is_pipeline_first_stage():
         assert input_tensor is None
@@ -109,22 +116,29 @@ def forward_step(data_iterator, model, input_tensor):
 
     if mpu.is_pipeline_last_stage():
         lm_loss_, sop_logits = output_tensor
-
-        sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
-                                   sentence_order.view(-1),
-                                   ignore_index=-1)
-        sop_loss = sop_loss.float()
-
+        
         lm_loss_ = lm_loss_.float()
         loss_mask = loss_mask.float()
         lm_loss = torch.sum(
             lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+        
+        if sop_logits is not None:
+            sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
+                                       sentence_order.view(-1),
+                                       ignore_index=-1)
+            sop_loss = sop_loss.float()
+            loss = lm_loss + sop_loss
+            averaged_losses = average_losses_across_data_parallel_group(
+                [lm_loss, sop_loss])
+            return loss, {'lm loss': averaged_losses[0],
+                          'sop loss': averaged_losses[1]}
+            
+        else:
+            loss = lm_loss
+            averaged_losses = average_losses_across_data_parallel_group(
+                [lm_loss])
+            return loss, {'lm loss': averaged_losses[0]}
 
-        loss = lm_loss + sop_loss
-
-        averaged_losses = average_losses_across_data_parallel_group([lm_loss, sop_loss])
-
-        return loss, {'lm loss': averaged_losses[0], 'sop loss': averaged_losses[1]}
     return output_tensor
 
 
@@ -143,7 +157,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup))
+        skip_warmup=(not args.mmap_warmup),
+        binary_head=args.bert_binary_head)
     print_rank_0("> finished creating BERT datasets ...")
 
     return train_ds, valid_ds, test_ds

@@ -43,7 +43,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
-def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
+def get_language_model(num_tokentypes, add_pooler,
                        encoder_attn_mask_type, init_method=None,
                        scaled_init_method=None, add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal):
@@ -58,8 +58,7 @@ def get_language_model(attention_mask_func, num_tokentypes, add_pooler,
                                                        args.num_layers)
 
     # Language model.
-    args = [attention_mask_func, init_method,
-            scaled_init_method, encoder_attn_mask_type]
+    args = [init_method, scaled_init_method, encoder_attn_mask_type]
     kwargs = {}
     cls = None
     if mpu.is_pipeline_first_stage() and mpu.is_pipeline_last_stage():
@@ -269,12 +268,6 @@ class TransformerLanguageModelBase(MegatronModule):
 
     Arguments:
         transformer_hparams: transformer hyperparameters
-        attention_mask_func: a function that takes `unmaksed-attention-scores`
-            with size [b, np, s, s] and an `attention-mask` and will apply
-            the masking. The function should return a masked score of the
-            same size [b, np, s, s].
-          masked-attention-scores = attention_mask_func(
-                                     unmaksed-attention-scores, attention-mask)
         vocab_size: vocabulary size
         max_sequence_length: maximum size of sequence. This
                              is used for positional embedding
@@ -284,7 +277,6 @@ class TransformerLanguageModelBase(MegatronModule):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  encoder_attn_mask_type,
@@ -315,7 +307,6 @@ class TransformerLanguageModelBase(MegatronModule):
 
         # Transformer.
         self.encoder = ParallelTransformer(
-            attention_mask_func,
             self.init_method,
             output_layer_init_method,
             self_attn_mask_type=self.encoder_attn_mask_type)
@@ -326,7 +317,6 @@ class TransformerLanguageModelBase(MegatronModule):
             assert args.pipeline_model_parallel_size == 1, \
                 'pipeline parallelism is not supported in the presence of decoder'
             self.decoder = ParallelTransformer(
-                attention_mask_func,
                 self.init_method,
                 output_layer_init_method,
                 layer_type=LayerType.decoder,
@@ -479,7 +469,6 @@ class TransformerLanguageModel(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  encoder_attn_mask_type,
@@ -488,7 +477,6 @@ class TransformerLanguageModel(TransformerLanguageModelBase):
                  add_decoder=False,
                  add_pooler=False):
         super(TransformerLanguageModel, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             encoder_attn_mask_type,
@@ -523,13 +511,11 @@ class TransformerLanguageModelFirstStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  encoder_attn_mask_type,
                  num_tokentypes=0):
         super(TransformerLanguageModelFirstStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             encoder_attn_mask_type,
@@ -552,12 +538,10 @@ class TransformerLanguageModelIntermediateStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  encoder_attn_mask_type):
         super(TransformerLanguageModelIntermediateStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             encoder_attn_mask_type)
@@ -578,13 +562,11 @@ class TransformerLanguageModelLastStage(TransformerLanguageModelBase):
     """
 
     def __init__(self,
-                 attention_mask_func,
                  init_method,
                  output_layer_init_method,
                  encoder_attn_mask_type,
                  add_pooler=False):
         super(TransformerLanguageModelLastStage, self).__init__(
-            attention_mask_func,
             init_method,
             output_layer_init_method,
             encoder_attn_mask_type,

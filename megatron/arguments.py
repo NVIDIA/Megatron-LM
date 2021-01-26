@@ -91,6 +91,20 @@ def parse_args(extra_args_provider=None, defaults={},
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
 
+    # Set input defaults.
+    for key in defaults:
+        # For default to be valid, it should not be provided in the
+        # arguments that are passed to the program. We check this by
+        # ensuring the arg is set to None.
+        if getattr(args, key) is not None:
+            if args.rank == 0:
+                print('WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(key=key, v=defaults[key],
+                                               v2=getattr(args, key)),
+                                               flush=True)
+        else:
+            setattr(args, key, defaults[key])
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -112,20 +126,6 @@ def parse_args(extra_args_provider=None, defaults={},
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
-
-    # Set input defaults.
-    for key in defaults:
-        # For default to be valid, it should not be provided in the
-        # arguments that are passed to the program. We check this by
-        # ensuring the arg is set to None.
-        if getattr(args, key) is not None:
-            if args.rank == 0:
-                print('WARNING: overriding default arguments for {key}:{v} \
-                       with {key}:{v2}'.format(key=key, v=defaults[key],
-                                               v2=getattr(args, key)),
-                                               flush=True)
-        else:
-            setattr(args, key, defaults[key])
 
     # Iteration-based training.
     if args.train_iters:
@@ -262,6 +262,9 @@ def _add_network_size_args(parser):
                        'reasons.')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with Torch ONNX exporter')
+    group.add_argument('--bert-no-binary-head', action='store_false',
+                       help='Disable BERT binary head.',
+                       dest='bert_binary_head')
 
     return parser
 
@@ -432,9 +435,9 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
-    group.add_argument('--no-load-optim', action='store_true',
+    group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
-    group.add_argument('--no-load-rng', action='store_true',
+    group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
@@ -503,7 +506,7 @@ def _add_distributed_args(parser):
                        ' and returns function to complete it instead.'
                        'Also turns on --use-cpu-initialization flag.'
                        'This is for external DDP manager.' )
-    group.add_argument('--use-cpu-initialization', action='store_true',
+    group.add_argument('--use-cpu-initialization', action='store_true', default=None,
                        help='If set, affine parallel weights initialization uses CPU' )
     return parser
 
