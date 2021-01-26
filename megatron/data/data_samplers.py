@@ -105,6 +105,8 @@ class MegatronPretrainingRandomSampler:
         self.data_parallel_size = data_parallel_size
         self.micro_batch_times_data_parallel_size = \
             self.micro_batch_size * data_parallel_size
+        self.last_batch_size = \
+            self.total_samples % self.micro_batch_times_data_parallel_size
 
         # Sanity checks.
         assert self.total_samples > 0, \
@@ -119,8 +121,9 @@ class MegatronPretrainingRandomSampler:
         return self.total_samples
 
     def __iter__(self):
-        self.epoch = self.consumed_samples // self.total_samples
-        current_epoch_samples = self.consumed_samples % self.total_samples
+        active_total_samples = self.total_samples - self.last_batch_size
+        self.epoch = self.consumed_samples // active_total_samples
+        current_epoch_samples = self.consumed_samples % active_total_samples
         assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
 
         # data sharding and random sampling
@@ -132,7 +135,7 @@ class MegatronPretrainingRandomSampler:
         g = torch.Generator()
         g.manual_seed(self.epoch)
         random_idx = torch.randperm(bucket_size, generator=g).tolist()
-        idx_range = [start_idx + x for x in random_idx[bucket_offset:]] 
+        idx_range = [start_idx + x for x in random_idx[bucket_offset:]]
 
         batch = []
         # Last batch if not complete will be dropped.
@@ -142,4 +145,3 @@ class MegatronPretrainingRandomSampler:
                 self.consumed_samples += self.micro_batch_times_data_parallel_size
                 yield batch
                 batch = []
-        self.consumed_samples += self.total_samples % self.micro_batch_times_data_parallel_size

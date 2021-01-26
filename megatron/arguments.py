@@ -124,6 +124,9 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
+    if args.dataloader_type is None:
+        args.dataloader_type = 'single'
+
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
@@ -365,7 +368,7 @@ def _add_training_args(parser):
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
-    group.add_argument('--dataloader_type', type=str, default='single',
+    group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
     return parser
