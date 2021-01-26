@@ -165,7 +165,11 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
 
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
-    """Load a model checkpoint and return the iteration."""
+    """Load a model checkpoint and return the iteration.
+    strict (bool): whether to strictly enforce that the keys in
+        :attr:`state_dict` of the checkpoint match the names of
+        parameters and buffers in model.
+    """
     args = get_args()
     load_dir = getattr(args, load_arg)
 

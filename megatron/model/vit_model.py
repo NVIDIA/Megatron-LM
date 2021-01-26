@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BERT model."""
+"""Vision Transformer(VIT) model."""
 
 import math
 import einops

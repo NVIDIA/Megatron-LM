@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GLUE finetuning/evaluation."""
+"""Vision-classification finetuning/evaluation."""
 
 from megatron import get_args
 from megatron import print_rank_0
