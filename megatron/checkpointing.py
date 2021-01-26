@@ -31,8 +31,9 @@ _CHECKPOINT_VERSION = None
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
-    assert _CHECKPOINT_VERSION is None, \
-        "checkpoint version already set"
+    if _CHECKPOINT_VERSION is not None:
+        assert _CHECKPOINT_VERSION == value, \
+            "checkpoint versions do not match"
     _CHECKPOINT_VERSION = value
 
 def get_checkpoint_version():
@@ -112,11 +113,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     if isinstance(model, torchDDP):
         model = model.module
 
-    if torch.distributed.get_rank() == 0:
-        print('saving checkpoint at iteration {:7d} to {}'.format(
-            iteration, args.save), flush=True)
+    print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
+        iteration, args.save))
 
-    if mpu.get_data_parallel_rank() == 0:
+    if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -147,17 +147,21 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         torch.save(state_dict, checkpoint_name)
 
     # Wait so everyone is done (necessary)
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print('  successfully saved checkpoint at iteration {:7d} to {}'.format(
-            iteration, args.save), flush=True)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}'.format(
+        iteration, args.save))
+
     # And update the latest iteration
-    if torch.distributed.get_rank() == 0:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
+
     # Wait so everyone is done (not necessary)
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
@@ -198,9 +202,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-    if torch.distributed.get_rank() == 0:
-        print(' loading checkpoint from {} at iteration {}'.format(
-            args.load, iteration), flush=True)
+    print_rank_0(f' loading checkpoint from {args.load} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
@@ -285,10 +287,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print('  successfully loaded checkpoint from {} at iteration {}'.format(
-            args.load, iteration), flush=True)
+    # Some utilities want to load a checkpoint without distributed being initialized
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    print_rank_0(f'  successfully loaded checkpoint from {args.load} '
+                 f'at iteration {iteration}')
 
     return iteration
 

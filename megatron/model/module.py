@@ -60,6 +60,13 @@ class MegatronModule(torch.nn.Module):
         if not self.share_word_embeddings:
             raise Exception('initialize_word_embeddings() was called but '
                             'share_word_embeddings is false')
+
+        # This function just initializes the word embeddings in the final stage
+        # when we are using pipeline parallelism. If we aren't using pipeline
+        # parallelism there is nothing to do.
+        if args.pipeline_model_parallel_size == 1:
+            return
+
         # Parameters are shared between the word embeddings layer, and the
         # heads at the end of the model. In a pipelined setup with more than
         # one stage, the initial embedding layer and the head are on different
@@ -73,16 +80,16 @@ class MegatronModule(torch.nn.Module):
         #    the two word_embeddings layers to ensure that every applied weight
         #    update is the same on both stages.
         if mpu.is_pipeline_last_stage():
-            if not mpu.is_pipeline_first_stage():
-                self._word_embeddings_for_head_key = 'word_embeddings_for_head'
-                # If first and last stages are different, set word_embeddings
-                # weights to 0 here, then copy first stage's weights using
-                # all_reduce below.
-                self.word_embeddings = mpu.VocabParallelEmbedding(
-                    args.padded_vocab_size, args.hidden_size,
-                    init_method=init_method_normal(args.init_method_std))
-                self.word_embeddings.weight.data.fill_(0)
-                self.word_embeddings.weight.shared = True
+            assert not mpu.is_pipeline_first_stage()
+            self._word_embeddings_for_head_key = 'word_embeddings_for_head'
+            # set word_embeddings weights to 0 here, then copy first
+            # stage's weights using all_reduce below.
+            self.word_embeddings = mpu.VocabParallelEmbedding(
+                args.padded_vocab_size, args.hidden_size,
+                init_method=init_method_normal(args.init_method_std))
+            self.word_embeddings.weight.data.fill_(0)
+            self.word_embeddings.weight.shared = True
+
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():

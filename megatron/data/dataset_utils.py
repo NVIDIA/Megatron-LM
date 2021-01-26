@@ -114,7 +114,6 @@ def truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, np_rng):
     """Truncates a pair of sequences to a maximum sequence length."""
     #print(len_a, len_b, max_num_tokens)
     assert len_a > 0
-    assert len_b > 0
     if len_a + len_b <= max_num_tokens:
         return False
     while len_a + len_b > max_num_tokens:
@@ -150,10 +149,11 @@ def create_tokens_and_tokentypes(tokens_a, tokens_b, cls_id, sep_id):
     for token in tokens_b:
         tokens.append(token)
         tokentypes.append(1)
-    # [SEP].
-    tokens.append(sep_id)
-    tokentypes.append(1)
-
+    if tokens_b:
+        # [SEP].
+        tokens.append(sep_id)
+        tokentypes.append(1)
+    
     return tokens, tokentypes
 
 
@@ -392,6 +392,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_valid_test_num_samples,
                                     max_seq_length, masked_lm_prob,
                                     short_seq_prob, seed, skip_warmup,
+                                    binary_head,
                                     dataset_type='standard_bert'):
 
     if len(data_prefix) == 1:
@@ -401,6 +402,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                                 max_seq_length, masked_lm_prob,
                                                 short_seq_prob, seed,
                                                 skip_warmup,
+                                                binary_head,
                                                 dataset_type=dataset_type)
     # Blending dataset.
     # Parse the values.
@@ -417,7 +419,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             prefixes[i], data_impl, splits_string,
             datasets_train_valid_test_num_samples[i],
             max_seq_length, masked_lm_prob, short_seq_prob,
-            seed, skip_warmup, dataset_type=dataset_type)
+            seed, skip_warmup, binary_head, dataset_type=dataset_type)
         if train_ds:
             train_datasets.append(train_ds)
         if valid_ds:
@@ -444,6 +446,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                      train_valid_test_num_samples,
                                      max_seq_length, masked_lm_prob,
                                      short_seq_prob, seed, skip_warmup,
+                                     binary_head,
                                      dataset_type='standard_bert'):
     
     if dataset_type not in DSET_TYPES:
@@ -503,7 +506,8 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                 num_epochs=None,
                 max_num_samples=train_valid_test_num_samples[index],
                 max_seq_length=max_seq_length,
-                seed=seed
+                seed=seed,
+                binary_head=binary_head
             )
 
             if dataset_type == DSET_TYPE_ICT:
