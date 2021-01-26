@@ -47,6 +47,7 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
+from megatron.utils import calc_params_l2_norm
 from megatron.utils import report_memory
 
 
@@ -641,7 +642,8 @@ def train_step(forward_step_func, data_iterator,
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-                 loss_scale, report_memory_flag, skipped_iter, grad_norm):
+                 loss_scale, report_memory_flag, skipped_iter,
+                 grad_norm, params_norm):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -725,6 +727,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
+        if params_norm is not None:
+            writer.add_scalar('params-norm', params_norm, iteration)
+            writer.add_scalar('params-norm vs samples', params_norm,
+                              args.consumed_train_samples)
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
 
@@ -753,6 +759,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
+        if params_norm is not None:
+            log_string += ' params norm: {:.3f} |'.format(params_norm)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -817,11 +825,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
+        params_norm = calc_params_l2_norm(model)
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm)
+                                          grad_norm, params_norm)
 
         # Autoresume
         if args.adlr_autoresume and \
