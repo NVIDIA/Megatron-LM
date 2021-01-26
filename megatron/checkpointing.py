@@ -60,9 +60,10 @@ def check_checkpoint_args(checkpoint_args):
     _compare('hidden_size')
     _compare('num_attention_heads')
     _compare('max_position_embeddings')
-    _compare('make_vocab_size_divisible_by')
-    _compare('padded_vocab_size')
-    _compare('tokenizer_type')
+    if args.vocab_file:
+        _compare('make_vocab_size_divisible_by')
+        _compare('padded_vocab_size')
+        _compare('tokenizer_type')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
@@ -163,8 +164,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         torch.distributed.barrier()
 
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
-    """Load a model checkpoint and return the iteration."""
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
+    """Load a model checkpoint and return the iteration.
+    strict (bool): whether to strictly enforce that the keys in
+        :attr:`state_dict` of the checkpoint match the names of
+        parameters and buffers in model.
+    """
     args = get_args()
     load_dir = getattr(args, load_arg)
 
@@ -254,7 +259,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    model.load_state_dict(state_dict['model'])
+    model.load_state_dict(state_dict['model'], strict=strict)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
