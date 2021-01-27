@@ -46,7 +46,7 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.data.data_loaders import build_pretraining_data_loader
+from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.utils import report_memory
 
@@ -58,8 +58,11 @@ def print_datetime(string):
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def pretrain(train_valid_test_dataset_provider, model_provider,
-             forward_step_func, extra_args_provider=None, args_defaults={}):
+def pretrain(train_valid_test_dataset_provider, 
+             model_provider,
+             forward_step_func, 
+             extra_args_provider=None, 
+             args_defaults={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -966,6 +969,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
     print_rank_last('-' * length)
 
 
+def cyclic_iter(iter):
+    while True:
+        for x in iter:
+            yield x
+
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
     """XXX"""
@@ -1034,19 +1042,26 @@ def build_train_valid_test_data_iterators(
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
 
+
     # Build iterators.
+    dl_type = args.dataloader_type
+    assert dl_type in ['single', 'cyclic']
+
     if train_dataloader is not None:
-        train_data_iterator = iter(train_dataloader)
+        train_data_iterator = iter(train_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(train_dataloader))
     else:
         train_data_iterator = None
 
     if valid_dataloader is not None:
-        valid_data_iterator = iter(valid_dataloader)
+        valid_data_iterator = iter(valid_dataloader) if dl_type == 'single' \
+                              else iter(cyclic_iter(valid_dataloader))
     else:
         valid_data_iterator = None
 
     if test_dataloader is not None:
-        test_data_iterator = iter(test_dataloader)
+        test_data_iterator = iter(test_dataloader) if dl_type == 'single' \
+                             else iter(cyclic_iter(test_dataloader))
     else:
         test_data_iterator = None
 

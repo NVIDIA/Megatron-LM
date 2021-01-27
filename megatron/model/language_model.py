@@ -332,7 +332,7 @@ class TransformerLanguageModelBase(MegatronModule):
     def forward(self, enc_language_model_input, enc_attn_mask,
                 dec_language_model_input=None, dec_attn_mask=None,
                 enc_dec_attn_mask=None, tokentype_ids=None, layer_past=None,
-                get_key_value=False, pooling_sequence_index=0, 
+                get_key_value=False, pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
         # Embeddings.

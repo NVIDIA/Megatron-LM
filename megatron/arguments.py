@@ -40,6 +40,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
+    parser = _add_vit_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -122,6 +123,9 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
+
+    if args.dataloader_type is None:
+        args.dataloader_type = 'single'
 
     # Consumed tokens.
     args.consumed_train_samples = 0
@@ -289,6 +293,8 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
+    group.add_argument('--sgd-momentum', type=float, default=0.9,
+                       help='Momentum factor for sgd')
 
     return parser
 
@@ -359,7 +365,12 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
-
+    group.add_argument('--optimizer', type=str, default='adam',
+                       choices=['adam', 'sgd'],
+                       help='Optimizer function')
+    group.add_argument('--dataloader-type', type=str, default=None,
+                       choices=['single', 'cyclic'],
+                       help='Single pass vs multiple pass data loader')
     return parser
 
 
@@ -372,6 +383,8 @@ def _add_initialization_args(parser):
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
+    group.add_argument('--init-method-xavier-uniform', action='store_true',
+                       help='Enable Xavier uniform parameter initialization')
 
     return parser
 
@@ -624,4 +637,19 @@ def _add_realm_args(parser):
                        help='How large of batches to use when doing indexing jobs')
     group.add_argument('--indexer-log-interval', type=int, default=1000,
                        help='After how many batches should the indexer report progress')
+    return parser
+
+
+def _add_vit_args(parser):
+    group = parser.add_argument_group(title="vit")
+
+    group.add_argument('--num-classes', type=int, default=1000,
+                       help='num of classes in vision classificaiton task')
+    group.add_argument('--img-dim', type=int, default=224,
+                       help='Image size for vision classification task')
+    group.add_argument('--num-channels', type=int, default=3,
+                       help='Number of channels in input image data')
+    group.add_argument('--patch-dim', type=int, default=16,
+                       help='patch dimension used in vit')
+
     return parser
