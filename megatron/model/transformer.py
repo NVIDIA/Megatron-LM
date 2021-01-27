@@ -21,7 +21,6 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-from megatron.checkpointing import get_checkpoint_version
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model import import_layernorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
@@ -185,36 +184,6 @@ class ParallelAttention(MegatronModule):
             init_method=output_layer_init_method,
             skip_bias_add=True)
 
-    def _transpose_last_dim(self, mixed_layer, num_splits, num_splits_first):
-        input_shape = mixed_layer.size()
-        if num_splits_first:
-            """[s, b, num_splits * np * hn] 
-            -->(view) [s, b, num_splits, np, hn]
-            -->(tranpose) [s, b, np, num_splits, hn]
-            -->(view) [s, b, np * num_splits * hn] """
-
-            intermediate_shape = input_shape[:-1] +\
-                (num_splits, self.num_attention_heads_per_partition,
-                 self.hidden_size_per_attention_head)
-
-            mixed_layer = mixed_layer.view(*intermediate_shape)
-            mixed_layer = mixed_layer.transpose(-2, -3).contiguous()
-        else:
-            """[s, b, np * hn * num_splits] 
-            -->(view) [s, b, np, hn, num_splits]
-            -->(tranpose) [s, b, np, num_splits, hn]
-            -->(view) [s, b, np * num_splits * hn] """
-
-            intermediate_shape = input_shape[:-1] +\
-                (self.num_attention_heads_per_partition,
-                 self.hidden_size_per_attention_head, num_splits)
-
-            mixed_layer = mixed_layer.view(*intermediate_shape)
-            mixed_layer = mixed_layer.transpose(-1, -2).contiguous()
-        mixed_layer = mixed_layer.view(*input_shape)
-
-        return mixed_layer
-
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False, encoder_output=None):
         # hidden_states: [sq, b, h]
@@ -226,15 +195,6 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
-
-            checkpoint_version = get_checkpoint_version()
-            if checkpoint_version is not None:
-                if checkpoint_version == 0:
-                    # [s, b, (3 * np * hn)] --> [s, b, (np * 3 * hn)]
-                    mixed_x_layer = self._transpose_last_dim(mixed_x_layer, 3, True)
-                elif checkpoint_version == 1.0:
-                    # [s, b, (np * hn * 3)] --> [s, b, (np * 3 * hn)]
-                    mixed_x_layer = self._transpose_last_dim(mixed_x_layer, 3, False)
 
             # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + \
@@ -249,15 +209,6 @@ class ParallelAttention(MegatronModule):
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
-
-            checkpoint_version = get_checkpoint_version()
-            if checkpoint_version is not None:
-                if checkpoint_version == 0:
-                    # [s, b, (2 * np * hn)] --> [s, b, (np * 2 * hn)]
-                    mixed_kv_layer = self._transpose_last_dim(mixed_kv_layer, 2, True)
-                elif checkpoint_version == 1.0:
-                    # [s, b, (np * hn * 2)] --> [s, b, (np * 2 * hn)]
-                    mixed_kv_layer = self._transpose_last_dim(mixed_kv_layer, 2, False)
 
             # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
             new_tensor_shape = mixed_kv_layer.size()[:-1] + \

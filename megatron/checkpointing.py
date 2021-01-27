@@ -23,9 +23,10 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-from megatron import mpu, get_args, update_num_microbatches
-from megatron import get_args
-from megatron import print_rank_0
+from megatron import (get_args,
+                      mpu,
+                      print_rank_0,
+                      update_num_microbatches)
 
 _CHECKPOINT_VERSION = None
 
@@ -163,6 +164,43 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+def _transpose_first_dim(t, num_splits, num_splits_first, model):
+    input_shape = t.size()
+    # We use a self_attention module but the values extracted aren't
+    # specific to self attention so should work for cross attention as well
+    while hasattr(model, 'module'):
+        model = model.module
+    attention_module = model.language_model.encoder.layers[0].self_attention
+    hidden_size_per_attention_head = attention_module.hidden_size_per_attention_head
+    num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
+    if num_splits_first:
+        """[num_splits * np * hn, h]
+        -->(view) [num_splits, np, hn, h]
+        -->(tranpose) [np, num_splits, hn, h]
+        -->(view) [np * num_splits * hn, h] """
+
+        intermediate_shape = \
+            (num_splits, num_attention_heads_per_partition,
+             hidden_size_per_attention_head) + input_shape[1:]
+
+        t = t.view(*intermediate_shape)
+        t = t.transpose(0, 1).contiguous()
+    else:
+        """[np * hn * num_splits, h]
+        -->(view) [np, hn, num_splits, h]
+        -->(tranpose) [np, num_splits, hn, h]
+        -->(view) [np * num_splits * hn, h] """
+
+        intermediate_shape = \
+            (num_attention_heads_per_partition,
+             hidden_size_per_attention_head, num_splits) +\
+             input_shape[1:]
+
+        t = t.view(*intermediate_shape)
+        t = t.transpose(1, 2).contiguous()
+    t = t.view(*input_shape)
+
+    return t
 
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
     """Load a model checkpoint and return the iteration.
@@ -260,6 +298,29 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
 
     # Model.
     model.load_state_dict(state_dict['model'], strict=strict)
+
+    # Fix up query/key/value matrix ordering
+    if get_checkpoint_version() < 2.0:
+        checkpoint_version = get_checkpoint_version()
+        for name, param in model.named_parameters():
+            if name.endswith(('.query_key_value.weight', '.query_key_value.bias')):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 3, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 3, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
+            if name.endswith(('.key_value.weight', '.key_value.bias'):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 2, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 2, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
