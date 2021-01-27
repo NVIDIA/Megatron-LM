@@ -43,6 +43,12 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_stride': 1}
 
 
+def param_is_not_tensor_parallel_duplicate(param):
+    return (hasattr(param, 'tensor_model_parallel') and
+            param.tensor_model_parallel) or (
+                get_tensor_model_parallel_rank() == 0)
+
+
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:

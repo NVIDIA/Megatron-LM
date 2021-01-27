@@ -41,6 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_autoresume_args(parser)
     parser = _add_realm_args(parser)
     parser = _add_vit_args(parser)
+    parser = _add_logging_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -269,6 +270,15 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+
+    return parser
+
+
+def _add_logging_args(parser):
+    group = parser.add_argument_group(title='logging')
+
+    group.add_argument('--log-params-norm', action='store_true',
+                       help='If set, calculate and log parameters norm.')
 
     return parser
 

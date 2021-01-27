@@ -27,8 +27,9 @@ from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
 from megatron.training import train_step
 from megatron.training import training_log
-from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.utils import calc_params_l2_norm
+from megatron.utils import check_adlr_autoresume_termination
 
 
 def process_batch(batch):
@@ -179,16 +180,22 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            losses_dict, skipped_iter = train_step(forward_step, batch, model,
-                                                   optimizer, lr_scheduler)
+            losses_dict, skipped_iter, grad_norm = train_step(forward_step,
+                                                              batch, model,
+                                                              optimizer,
+                                                              lr_scheduler)
             iteration += 1
 
             # Logging.
+            params_norm = None
+            if args.log_params_norm:
+                params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               iteration,
                                               optimizer.get_loss_scale().item(),
-                                              report_memory_flag, skipped_iter)
+                                              report_memory_flag, skipped_iter,
+                                              grad_norm, params_norm)
 
             # Autoresume
             if args.adlr_autoresume and \

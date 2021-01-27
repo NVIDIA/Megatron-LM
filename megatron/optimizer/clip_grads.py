@@ -22,6 +22,8 @@ from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
 from megatron import mpu
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 
 def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
@@ -54,9 +56,8 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     grads_for_norm = []
     for param in parameters:
         grad_not_none = param.grad is not None
-        is_not_shared = not hasattr(param, 'shared') or not param.shared
-        is_not_tp_duplicate = param.tensor_model_parallel or \
-                              (mpu.get_tensor_model_parallel_rank() == 0)
+        is_not_shared = param_is_not_shared(param)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
         grad = param.grad.detach()
         if grad_not_none:
             # Make sure the grads are in fp32

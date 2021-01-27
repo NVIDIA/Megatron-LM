@@ -19,11 +19,41 @@ import sys
 
 import torch
 
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
+
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.checkpointing import save_checkpoint
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+
+
+def calc_params_l2_norm(model):
+    """Calculate l2 norm of parameters """
+    # Remove duplicate params.
+    params_data = []
+    for param in model.parameters():
+        is_not_shared = param_is_not_shared(param)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        if is_not_shared and is_not_tp_duplicate:
+            params_data.append(param.data)
+    # Calculate norm
+    dummy_overflow_buf = torch.cuda.IntTensor([0])
+    norm, _ = multi_tensor_applier(
+        amp_C.multi_tensor_l2norm,
+        dummy_overflow_buf,
+        [params_data],
+        False # no per-parameter norm
+    )
+    norm_2 = norm * norm
+    # Sum across all model-parallel GPUs.
+    torch.distributed.all_reduce(norm_2,
+                                 op=torch.distributed.ReduceOp.SUM,
+                                 group=mpu.get_model_parallel_group())
+    return norm_2.item() ** 0.5
 
 
 def average_losses_across_data_parallel_group(losses):
