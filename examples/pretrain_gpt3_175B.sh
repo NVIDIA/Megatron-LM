@@ -46,6 +46,7 @@ options=" \
 	--weight-decay 0.1 \
 	--adam-beta1 0.9 \
 	--adam-beta2 0.95 \
+	--init-method-std 0.006 \
 	--tensorboard-dir <TENSORBOARD DIRECTORY> \
         --fp16 \
 	--checkpoint-activations "
