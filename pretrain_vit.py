@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from megatron import get_args, get_timers, mpu, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
-from megatron.model import VitModel
+from megatron.model.vit_model import VitModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 

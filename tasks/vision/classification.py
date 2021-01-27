@@ -17,7 +17,7 @@
 
 from megatron import get_args
 from megatron import print_rank_0
-from megatron.model import VitModel
+from megatron.model.vit_model import VitModel
 from megatron.data.vit_dataset import build_train_valid_datasets
 from tasks.vision.eval_utils import accuracy_func_provider
 from tasks.vision.finetune_utils import finetune
