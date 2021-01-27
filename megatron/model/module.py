@@ -98,11 +98,16 @@ class MegatronModule(torch.nn.Module):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
-        if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
-            torch.distributed.all_reduce(self.word_embeddings_weight().data,
-                                         group=mpu.get_embedding_group())
-
-
+        if torch.distributed.is_initialized():
+            if mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage():
+                torch.distributed.all_reduce(self.word_embeddings_weight().data,
+                                             group=mpu.get_embedding_group())
+        else:
+            print("WARNING! Distributed processes aren't initialized, so "
+                  "word embeddings in the last layer are not initialized. "
+                  "If you are just manipulating a model this is fine, but "
+                  "this needs to be handled manually. If you are training "
+                  "something is definitely wrong.")
 
 def conversion_helper(val, conversion):
     """Apply conversion to val. Recursively apply conversion if `val`
