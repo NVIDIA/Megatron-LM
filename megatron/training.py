@@ -828,7 +828,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
-        params_norm = calc_params_l2_norm(model)
+        params_norm = None
+        if args.log_params_norm:
+            params_norm = calc_params_l2_norm(model)
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,

@@ -187,7 +187,9 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             iteration += 1
 
             # Logging.
-            params_norm = calc_params_l2_norm(model)
+            params_norm = None
+            if args.log_params_norm:
+                params_norm = calc_params_l2_norm(model)
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
                                               iteration,
