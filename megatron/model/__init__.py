@@ -30,7 +30,6 @@ def import_layernorm(fp32_residual_connection):
 
 
 from .distributed import *
-from .vit_model import VitModel
 from .bert_model import (BertModel,
                          BertModelFirstStage,
                          BertModelIntermediateStage,
