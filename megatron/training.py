@@ -961,16 +961,16 @@ def evaluate_and_print_results(prefix, forward_step_func,
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
         if writer and is_last_rank():
-            writer.add_scalar('{} value-validation'.format(key),
+            writer.add_scalar('{} validation'.format(key),
                               total_loss_dict[key].item(),
                               iteration)
-            writer.add_scalar('{} value-validation vs samples'.format(key),
+            writer.add_scalar('{} validation vs samples'.format(key),
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
             if args.log_validation_ppl_to_tensorboard:
-                writer.add_scalar('{} ppl-validation'.format(key), ppl,
+                writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
-                writer.add_scalar('{} ppl-validation vs samples'.format(key),
+                writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
 
     length = len(string) + 1
