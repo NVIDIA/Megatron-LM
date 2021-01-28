@@ -160,7 +160,8 @@ def parse_args(extra_args_provider=None, defaults={},
             'expected sample-based learnig rate warmup'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_samples == 0, \
-                'can only specify one of lr-warmup-fraction and lr-warmup-samples'
+                'can only specify one of lr-warmup-fraction ' \
+                'and lr-warmup-samples'
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -242,13 +243,15 @@ def _add_network_size_args(parser):
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
-                       help='Transformer Feed-Forward Network hidden size. This is set to 4*hidden-size if not '
-                            'provided')
+                       help='Transformer Feed-Forward Network hidden size. '
+                       'This is set to 4*hidden-size if not provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--kv-channels', type=int, default=None,
-                       help='Projection weights dimension in multi-head attention. '
-                            'This is set to args.hidden_size // args.num_attention_heads if not provided.')
+                       help='Projection weights dimension in multi-head '
+                       'attention. This is set to '
+                       '   args.hidden_size // args.num_attention_heads '
+                       'if not provided.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -266,7 +269,8 @@ def _add_network_size_args(parser):
                        'should not be used unless for backward compatibility'
                        'reasons.')
     group.add_argument('--onnx-safe', type=bool, required=False,
-                       help='Use workarounds for known problems with Torch ONNX exporter')
+                       help='Use workarounds for known problems with '
+                       'Torch ONNX exporter')
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
@@ -279,6 +283,24 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--tensorboard-log-interval', type=int, default=1,
+                       help='Report to tensorboard interval.')
+    group.add_argument('--log-timers-to-tensorboard', action='store_true',
+                       help='If set, write timers to tensorboard.')
+    group.add_argument('--log-batch-size-to-tensorboard', action='store_true',
+                       help='If set, write batch-size to tensorboard.')
+    group.add_argument('--no-log-learnig-rate-to-tensorboard',
+                       action='store_false',
+                       help='Disable learning rate logging to tensorboard.',
+                       dest='log_learning_rate_to_tensorboard')
+    group.add_argument('--no-log-loss-scale-to-tensorboard',
+                       action='store_false',
+                       help='Disable loss-scale logging to tensorboard.',
+                       dest='log_loss_scale_to_tensorboard')
+    group.add_argument('--log-validation-ppl-to-tensorboard',
+                       action='store_true',
+                       help='If set, write validation perplexity to '
+                       'tensorboard.')
 
     return parser
 
@@ -295,11 +317,11 @@ def _add_regularization_args(parser):
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
-                       help='First coefficient for computing running averages of'
-                       'gradient and its square')
+                       help='First coefficient for computing running averages '
+                       'of gradient and its square')
     group.add_argument('--adam-beta2', type=float, default=0.999,
-                       help='Second coefficient for computing running averages of'
-                       'gradient and its square')
+                       help='Second coefficient for computing running averages '
+                       'of gradient and its square')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
@@ -425,7 +447,7 @@ def _add_learning_rate_args(parser):
                        help='number of samples to linearly warmup '
                        'learning rate over.')
     group.add_argument('--warmup', type=int, default=None,
-                       help='Old lr warmup argument, do not use. Use one of the '
+                       help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
@@ -525,12 +547,14 @@ def _add_distributed_args(parser):
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
-                       help='If set to True, initialize_megatron() skips DDP initialization'
-                       ' and returns function to complete it instead.'
-                       'Also turns on --use-cpu-initialization flag.'
-                       'This is for external DDP manager.' )
-    group.add_argument('--use-cpu-initialization', action='store_true', default=None,
-                       help='If set, affine parallel weights initialization uses CPU' )
+                       help='If set to True, initialize_megatron() '
+                       'skips DDP initialization and returns function to '
+                       'complete it instead.Also turns on '
+                       '--use-cpu-initialization flag. This is for '
+                       'external DDP manager.' )
+    group.add_argument('--use-cpu-initialization', action='store_true',
+                       default=None, help='If set, affine parallel weights '
+                       'initialization uses CPU' )
     return parser
 
 
@@ -616,19 +640,22 @@ def _add_realm_args(parser):
 
     # network size
     group.add_argument('--ict-head-size', type=int, default=None,
-                       help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
+                       help='Size of block embeddings to be used in ICT and '
+                       'REALM (paper default: 128)')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
                        help='Directory containing an ICTBertModel checkpoint')
     group.add_argument('--bert-load', type=str, default=None,
-                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
+                       help='Directory containing an BertModel checkpoint '
+                       '(needed to start ICT and REALM)')
 
     # data
     group.add_argument('--titles-data-path', type=str, default=None,
                        help='Path to titles dataset used for ICT')
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
-                       help='Probability of keeping query in block for ICT dataset')
+                       help='Probability of keeping query in block for '
+                       'ICT dataset')
     group.add_argument('--use-one-sent-docs', action='store_true',
                        help='Whether to use one sentence documents in ICT')
 
@@ -644,9 +671,11 @@ def _add_realm_args(parser):
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,
-                       help='How large of batches to use when doing indexing jobs')
+                       help='How large of batches to use when doing indexing '
+                       'jobs')
     group.add_argument('--indexer-log-interval', type=int, default=1000,
-                       help='After how many batches should the indexer report progress')
+                       help='After how many batches should the indexer '
+                       'report progress')
     return parser
 
 

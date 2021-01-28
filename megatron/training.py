@@ -712,20 +712,24 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                        total_loss_dict[skipped_iters_key]
 
     # Tensorboard values.
-    if writer and is_last_rank():
-        writer.add_scalar('learning-rate', learning_rate, iteration)
-        writer.add_scalar('learning-rate vs samples', learning_rate,
-                          args.consumed_train_samples)
-        writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size,
-                          args.consumed_train_samples)
+    if writer and (iteration % args.tensorboard_log_interval == 0 ) and \
+       is_last_rank():
+        if args.log_learning_rate_to_tensorboard:
+            writer.add_scalar('learning-rate', learning_rate, iteration)
+            writer.add_scalar('learning-rate vs samples', learning_rate,
+                              args.consumed_train_samples)
+        if args.log_batch_size_to_tensorboard:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size,
+                              args.consumed_train_samples)
         for key in loss_dict:
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
-        writer.add_scalar('loss-scale', loss_scale, iteration)
-        writer.add_scalar('loss-scale vs samples', loss_scale,
-                          args.consumed_train_samples)
+        if args.log_loss_scale_to_tensorboard:
+            writer.add_scalar('loss-scale', loss_scale, iteration)
+            writer.add_scalar('loss-scale vs samples', loss_scale,
+                              args.consumed_train_samples)
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
@@ -734,15 +738,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
                               args.consumed_train_samples)
-        timers.write(timers_to_log, writer, iteration,
-                     normalizer=total_iterations)
+        if args.log_timers_to_tensorboard:
+            timers.write(timers_to_log, writer, iteration,
+                         normalizer=total_iterations)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
         if writer and torch.distributed.get_rank() == 0:
-            writer.add_scalar('iteration-time',
-                              elapsed_time_per_iteration, iteration)
+            if args.log_timers_to_tensorboard:
+                writer.add_scalar('iteration-time',
+                                  elapsed_time_per_iteration, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
@@ -955,15 +961,17 @@ def evaluate_and_print_results(prefix, forward_step_func,
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
         if writer and is_last_rank():
-            writer.add_scalar('{} value-validation'.format(key),
+            writer.add_scalar('{} validation'.format(key),
                               total_loss_dict[key].item(),
                               iteration)
-            writer.add_scalar('{} ppl-validation'.format(key), ppl, iteration)
-            writer.add_scalar('{} value-validation vs samples'.format(key),
+            writer.add_scalar('{} validation vs samples'.format(key),
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
-            writer.add_scalar('{} ppl-validation vs samples'.format(key), ppl,
-                              args.consumed_train_samples)
+            if args.log_validation_ppl_to_tensorboard:
+                writer.add_scalar('{} validation ppl'.format(key), ppl,
+                                  iteration)
+                writer.add_scalar('{} validation ppl vs samples'.format(key),
+                                  ppl, args.consumed_train_samples)
 
     length = len(string) + 1
     print_rank_last('-' * length)
