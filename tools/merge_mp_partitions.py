@@ -243,10 +243,6 @@ def main():
         print(f'> loading {checkpoint_name} ...')
         load_checkpoint(model_, None, None)
         print(f'> checkpoint version {get_checkpoint_version()}')
-        if get_checkpoint_version() < 2.0:
-            # Need to deal with the qkv matrix order of old versions
-            print("Checkpoints less than version 2.0 are not currently supported.")
-            exit()
         partitions.append(model_)
 
     # Parameter generators so we can loop through them semiltaneouly.
