@@ -29,7 +29,7 @@ The following applies to all files unless otherwise noted:
 --
 
 This repository also contains code from Hugging Face Inc., Google Research,
-and Facebook (from their Fairseq project). Files from these
+Facebook (from their Fairseq project), and Philip Popien. Files from these
 organizations have notices at the top of each file. Below are licenses
 used in those files, as indicated.
 
@@ -262,3 +262,4 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
