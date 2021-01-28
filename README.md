@@ -370,10 +370,11 @@ python tools/create_doc_index.py \
 
 We provide several command line arguments, detailed in the scripts listed below, to handle various zero-shot and fine-tuned downstream tasks. However, you can also finetune your model from a pretrained checkpoint on other corpora as desired. To do so, simply add the `--finetune` flag and adjust the input files and training parameters within the original training script. The iteration count will be reset to zero, and the optimizer and internal state will be reinitialized. If the fine-tuning is interrupted for any reason, be sure to remove the `--finetune` flag before continuing, otherwise the training will start again from the beginning.
 
-Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this. Currently only tensor model parallelism is supported (not pipeline model parallelism).
+Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this. Currently only tensor model parallelism is supported on input and pipeline model parallelsim on the output. This example reads in a model with 2-way tensor model parallelism and writes out a model with 2-way pipeline model parallelism.
 
 <pre>
 TENSOR_MODEL_PARALLEL_SIZE=2
+TARGET_PIPELINE_MODEL_PARALLEL_SIZE=2
 
 VOCAB_FILE=bert-vocab.txt
 CHECKPOINT_PATH=checkpoints/bert_345m
@@ -381,6 +382,8 @@ CHECKPOINT_PATH=checkpoints/bert_345m
 WORLD_SIZE=$TENSOR_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
         --model-type BERT \
         --tensor-model-parallel-size $TENSOR_MODEL_PARALLEL_SIZE \
+        --pipeline-model-parallel-size 1 \
+        --target-pipeline-model-parallel-size $TARGET_PIPELINE_MODEL_PARALLEL_SIZE \
         --tokenizer-type BertWordPieceLowerCase \
         --vocab-file $VOCAB_FILE \
         --num-layers 24 \

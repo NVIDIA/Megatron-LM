@@ -16,6 +16,7 @@
 """Merge model parallel partitions."""
 
 import os
+import re
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
@@ -181,6 +182,8 @@ def get_mp_merge_args(parser):
     group.add_argument('--model-type', type=str, required=True,
                        choices=['BERT', 'GPT', 'RACE', 'MNLI', 'QQP'],
                        help='Type of the mdoel.')
+    group.add_argument('--target-pipeline-model-parallel-size', type=int, default=1,
+                       help='Degree of pipeline model parallelism in output model.')
 
     return parser
 
@@ -284,14 +287,55 @@ def main():
         except StopIteration:
             break
 
-    # Save the model.
+    partitions = []
     args.tensor_model_parallel_size = 1
-    args.pipeline_model_parallel_size = 1
-    # And now one last time so proper arguments are set in saved checkpoint
+    args.pipeline_model_parallel_size = args.target_pipeline_model_parallel_size
+
+    assert args.num_layers % args.pipeline_model_parallel_size == 0, \
+        'num_layers must be divisible by target pipeline model parallel size'
+    layers_per_part = args.num_layers // args.pipeline_model_parallel_size
+
     tokenizer = rebuild_tokenizer(args)
+    mpu.initialize.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
     mpu.initialize.set_tensor_model_parallel_rank(0)
-    print('> saving merged model')
-    save_checkpoint(iteration, merged_model, None, None)
+    mpu.initialize.set_pipeline_model_parallel_world_size(args.pipeline_model_parallel_size)
+
+    # regex to parse out layer number from param name
+    layer_re = re.compile('layers\.([0-9]+)')
+
+    if args.pipeline_model_parallel_size > 1:
+        merged_params = {}
+        for name, merged_param in merged_model.named_parameters():
+            merged_params[name] = merged_param
+
+        for rank in range(args.pipeline_model_parallel_size):
+            mpu.initialize.set_pipeline_model_parallel_rank(rank)
+            model = get_model(model_type)
+            def update_layer_num(m):
+                # TODO! This assumes no interleaved pipeline execution
+                layer = int(m.group(1))
+                layer += rank * layers_per_part
+                return f'layers.{layer}'
+
+            for dst_name, partition_param in model.named_parameters():
+                if dst_name == "word_embeddings.weight":
+                    # See comment in MegatronModule.initialize_word_embeddings()
+                    src_name = "language_model.embedding.word_embeddings.weight"
+                else:
+                    # Translate destination layer number (0-N for each partition)
+                    # to source layer number (single-model layer number)
+                    src_name = re.sub(layer_re, update_layer_num, dst_name)
+                print(f" > copying {src_name} to {dst_name} in rank {rank}'s model")
+                partition_param.data.copy_(merged_params[src_name].data)
+
+            partitions.append(model)
+    else:
+        partitions = [merged_model]
+
+    for rank, model in enumerate(partitions):
+        mpu.initialize.set_pipeline_model_parallel_rank(rank)
+        print(f"> saving rank {rank}'s model")
+        save_checkpoint(iteration, model, None, None)
 
     print('done :-)')
 
