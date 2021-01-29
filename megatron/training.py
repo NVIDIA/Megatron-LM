@@ -48,7 +48,7 @@ from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
-from megatron.utils import report_memory
+from megatron.utils import report_memory, params_grad_norm, params_global_norm, print_model, print_grads
 
 
 def print_datetime(string):
@@ -663,10 +663,24 @@ def train_step(forward_step_func, data_iterator,
             optimizer.clip_master_grads(args.clip_grad)
     timers('backward-clip-grad').stop()
 
+    
+    #print_rank_0("after backward")
+    #print_grads(model)
+    print_model(model)
+    print_rank_0(params_global_norm(model))
+    print_rank_0(params_grad_norm(model))
+
+
     # Update parameters.
     timers('optimizer').start()
     optimizer.step()
     timers('optimizer').stop()
+
+    #print_rank_0("after optimizer")
+    #print_model(model)
+    print_rank_0(params_global_norm(model))
+    #print_rank_0(params_grad_norm(model))
+    #sys.exit()
 
     # Update learning rate.
     skipped_iter = 0
@@ -905,9 +919,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Exiting based on iterations        
         if args.exit_interval and iteration % args.exit_interval == 0:
-            if not saved_checkpoint:
-                save_checkpoint_and_time(iteration, model, optimizer,
-                                         lr_scheduler)
+            #if not saved_checkpoint:
+            #    save_checkpoint_and_time(iteration, model, optimizer,
+            #                             lr_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))                
             sys.exit()

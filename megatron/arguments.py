@@ -39,7 +39,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
-    parser = _add_realm_args(parser)
+    parser = _add_biencoder_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -310,6 +310,8 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
+    group.add_argument('--override-checkpoint-version', type=float, default=None,
+                       help='Override checkpoint version')
     group.add_argument('--distribute-checkpointed-activations',
                        action='store_true',
                        help='If set, distribute checkpointed activations '
@@ -567,12 +569,19 @@ def _add_autoresume_args(parser):
     return parser
 
 
-def _add_realm_args(parser):
-    group = parser.add_argument_group(title='realm')
+def _add_biencoder_args(parser):
+    group = parser.add_argument_group(title='biencoder')
 
     # network size
     group.add_argument('--ict-head-size', type=int, default=None,
                        help='Size of block embeddings to be used in ICT and REALM (paper default: 128)')
+    group.add_argument('--projection-dim', type=int, default=0,
+                       help='Size of projection head used in biencoder (paper default: 128)')
+    group.add_argument('--shared-query-context-model', action='store_true',
+                        help='Whether to share the parameters of the query and context models or not')
+    group.add_argument('--pool-type', type=str, default='cls-token',
+                       choices=['avg', 'cls-token', 'max'],
+                       help='different options are: avg | cls-token | max, default=cls-token')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
@@ -589,14 +598,16 @@ def _add_realm_args(parser):
                        help='Whether to use one sentence documents in ICT')
 
     # training
-    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
+    group.add_argument('--report-topk-accuracies', nargs='+', type=int, default=[],
                        help="Which top-k accuracies to report (e.g. '1 5 20')")
+    group.add_argument('--retriever-score-scaling', action='store_true',
+                       help="Whether to scale retriever scores by inverse square root of hidden size")
 
     # faiss index
     group.add_argument('--faiss-use-gpu', action='store_true',
                        help='Whether create the FaissMIPSIndex on GPU')
-    group.add_argument('--block-data-path', type=str, default=None,
-                       help='Where to save/load BlockData to/from')
+    #group.add_argument('--block-data-path', type=str, default=None,
+    #                   help='Where to save/load BlockData to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

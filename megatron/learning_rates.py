@@ -59,6 +59,12 @@ class AnnealingLR(object):
         """Learning rate decay functions from:
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
 
+        #print_rank_0(self.warmup_steps)
+        #print_rank_0(self.num_steps)
+        #print_rank_0(self.warmup_steps)
+        #print_rank_0(self.max_lr)
+        #print_rank_0(self.max_lr * float(self.num_steps) / float(self.warmup_steps))
+
         # Use linear warmup for the initial part.
         if self.warmup_steps > 0 and self.num_steps <= self.warmup_steps:
             return self.max_lr * float(self.num_steps) / \
@@ -97,7 +103,7 @@ class AnnealingLR(object):
         new_lr = self.get_lr()
         for group in self.optimizer.param_groups:
             group['lr'] = new_lr
-
+        #print_rank_0(new_lr)
 
     def state_dict(self):
         state_dict = {

@@ -150,4 +150,40 @@ def get_ltor_masks_and_position_ids(data,
 
     return attention_mask, loss_mask, position_ids
 
+def params_grad_norm(model):
+    print_rank_0("params_grad_norm")
+    norm2 = torch.cuda.FloatTensor([0.0])
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        norm = torch.norm(param.grad.data.float(), 2)
+        norm2 += norm * norm
+    torch.distributed.all_reduce(norm2)
+    norm = norm2 ** 0.5
+    return norm.item()
 
+
+def params_global_norm(model):
+    print_rank_0("params_global_norm")
+    norm2 = torch.cuda.FloatTensor([0.0])
+    for param in model.parameters():
+        norm = torch.norm(param.data.float(), 2)
+        norm2 += norm * norm
+    torch.distributed.all_reduce(norm2)
+    norm = norm2 ** 0.5
+    return norm.item()
+
+def print_model(model):
+    print_rank_0("print-model")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            #print("{} {}".format(name, param.data), flush=True)
+            print_rank_0("{} {}".format(name, param.data))
+            return
+
+def print_grads(model):
+    print_rank_0("print-grads")
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        print_rank_0("{} {}".format(name, param.grad)) 

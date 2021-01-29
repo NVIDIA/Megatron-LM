@@ -374,6 +374,19 @@ class TransformerLanguageModelBase(MegatronModule):
         # Transformer.
         if self._transformer_key in state_dict:
             state_dict_ = state_dict[self._transformer_key]
+        # for compatiability with t5 architecture
+        # this is temporary unless t5_main is merged
+        elif 'encoder' in state_dict:
+            state_dict_ = state_dict['encoder']
+            # for forward compatibility for t5 architecture
+            state_dict_attention = {}
+            for key in state_dict_.keys():
+                if '.self_attention.' in key:
+                    state_dict_attention[key.replace(".self_attention.",
+                        ".attention.")] = state_dict_[key]
+                else:
+                    state_dict_attention[key] = state_dict_[key]
+            state_dict_ = state_dict_attention
         else:
             # for backward compatibility.
             state_dict_ = {}

@@ -214,6 +214,9 @@ class ParallelSelfAttention(MegatronModule):
         mixed_x_layer, _ = self.query_key_value(hidden_states)
 
         checkpoint_version = get_checkpoint_version()
+        if get_args().override_checkpoint_version is not None:
+            checkpoint_version = get_args().override_checkpoint_version
+
         if checkpoint_version is not None:
            if checkpoint_version == 0:
                # [s, b, (3 * np * hn)] --> [s, b, (np * 3 * hn)]
@@ -472,7 +475,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
-        
+
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
