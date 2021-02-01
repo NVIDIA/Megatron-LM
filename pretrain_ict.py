@@ -109,13 +109,13 @@ def forward_step(data_iterator, model, input_tensor):
 
     micro_batch_size = query_logits.shape[0]
     # recall we assert that tensor_model_parallel_size == 1
-    #global_batch_size = dist.get_world_size() * micro_batch_size
-    #all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
-    #all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits)
+    global_batch_size = dist.get_world_size() * micro_batch_size
+    all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
+    all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits)
     
-    global_batch_size = micro_batch_size
-    all_query_logits = query_logits
-    all_context_logits = context_logits
+    #global_batch_size = micro_batch_size
+    #all_query_logits = query_logits
+    #all_context_logits = context_logits
 
     # scores are inner products between query and context embeddings
     retrieval_scores = torch.matmul(all_query_logits,
