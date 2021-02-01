@@ -48,7 +48,7 @@ from megatron.model import get_params_for_weight_decay_optimization
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.data.data_loaders import build_pretraining_data_loader
-from megatron.utils import report_memory, params_grad_norm, params_global_norm, print_model, print_grads
+from megatron.utils import report_memory
 
 
 def print_datetime(string):
@@ -648,7 +648,6 @@ def train_step(forward_step_func, data_iterator,
     if args.fp16:
         optimizer.update_master_grads()
     timers('backward-master-grad').stop()
-    grad_norm_local = None
 
     # Clipping gradients helps prevent the exploding gradient.
     timers('backward-clip-grad').start()
@@ -663,29 +662,13 @@ def train_step(forward_step_func, data_iterator,
             mpu.clip_grad_norm(parameters, args.clip_grad,
                                parameter_names=parameter_names)
         else:
-            grad_norm_local = optimizer.clip_master_grads(args.clip_grad)
+            optimizer.clip_master_grads(args.clip_grad)
     timers('backward-clip-grad').stop()
-
-    #print_rank_0("print-grad_norm_local {}".format(grad_norm_local))
-    
-    #print_rank_0("after backward")
-    #print_grads(model)
-    #print_model(model)
-    #print_rank_0(params_global_norm(model))
-    #print_rank_0(params_grad_norm(model))
 
     # Update parameters.
     timers('optimizer').start()
     optimizer.step()
     timers('optimizer').stop()
-
-    #print_rank_0("after optimizer")
-    #print_model(model)
-    #print_rank_0(params_global_norm(model))
-    #print_rank_0(params_grad_norm(model))
-    #sys.exit()
-    
-    #print_rank_0("print-optimizer.overflow {}".format(optimizer.overflow))
 
     # Update learning rate.
     skipped_iter = 0
@@ -860,10 +843,6 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
     # Iterations.
     iteration = args.iteration
-
-    #print_rank_0("Check betas before iterations")
-    #for group in optimizer.optimizer.param_groups:
-    #    print_rank_0("betas {} lr {} weight_decay {} eps {}".format(group['betas'], group['lr'], group['weight_decay'], group['eps']))
 
     timers('interval time').start()
     print_datetime('before the start of training step')

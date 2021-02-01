@@ -91,31 +91,16 @@ def forward_step(data_iterator, model, input_tensor):
     query_types = torch.cuda.LongTensor(*query_tokens.shape).fill_(0)
     context_types = torch.cuda.LongTensor(*context_tokens.shape).fill_(0)
 
-    #print_rank_0(query_tokens)
-    #print_rank_0(context_tokens)
-    #print_rank_0(torch.sum(query_types))
-    #print_rank_0(torch.sum(query_mask))
-    #print_rank_0(torch.sum(context_types))
-    #print_rank_0(torch.sum(context_mask))
-
-    #print_rank_0(params_global_norm(model))
-    #print_rank_0(params_grad_norm(model))
     # Forward model.
     query_logits, context_logits = model(query_tokens, query_mask,
                                     query_types, context_tokens,
                                     context_mask, context_types)
-    #print_rank_0(query_logits)
-    #print_rank_0(context_logits)
 
     micro_batch_size = query_logits.shape[0]
     # recall we assert that tensor_model_parallel_size == 1
     global_batch_size = dist.get_world_size() * micro_batch_size
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
-    all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits)
-    
-    #global_batch_size = micro_batch_size
-    #all_query_logits = query_logits
-    #all_context_logits = context_logits
+    all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits) 
 
     # scores are inner products between query and context embeddings
     retrieval_scores = torch.matmul(all_query_logits,
@@ -141,17 +126,10 @@ def forward_step(data_iterator, model, input_tensor):
     # Scale the retrieval loss
     loss = loss * mpu.get_data_parallel_world_size()
 
-    #retrieval_loss = torch.nn.CrossEntropyLoss()(retrieval_scores, torch.arange(global_batch_size).long().cuda())
-    #retrieval_loss = retrieval_loss.float()
-    #averaged_losses = average_losses_across_data_parallel_group([retrieval_loss, *topk_accs])
-
     # create stats_dict with retrieval loss and all specified top-k accuracies
     topk_acc_dict = {'top{}_acc'.format(k): v * 100 for k, v in \
                         zip(args.report_topk_accuracies, reduced_losses[1:])}
     stats_dict = dict(loss=reduced_losses[0], **topk_acc_dict)
-    #print_rank_0(loss)
-    #print_rank_0(stats_dict)
-    #sys.exit()
     return loss, stats_dict
 
 

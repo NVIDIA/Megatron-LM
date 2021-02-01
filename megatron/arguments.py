@@ -606,8 +606,8 @@ def _add_biencoder_args(parser):
     # faiss index
     group.add_argument('--faiss-use-gpu', action='store_true',
                        help='Whether create the FaissMIPSIndex on GPU')
-    #group.add_argument('--block-data-path', type=str, default=None,
-    #                   help='Where to save/load BlockData to/from')
+    group.add_argument('--block-data-path', type=str, default=None,
+                       help='Where to save/load BlockData to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

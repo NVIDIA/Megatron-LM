@@ -27,7 +27,7 @@ def biencoder_model_provider(only_query_model=False,
 
     print_rank_0('building BiEncoderModel...')
 
-    # simpler to just keep using 2 tokentypes since 
+    # simpler to just keep using 2 tokentypes since
     # the LM we initialize with has 2 tokentypes
     model = BiEncoderModel(
         num_tokentypes=2,
@@ -78,7 +78,7 @@ class BiEncoderModel(MegatronModule):
 
     def forward(self, query_tokens, query_attention_mask, query_types,
                 context_tokens, context_attention_mask, context_types):
-        """Run a forward pass for each of the models and 
+        """Run a forward pass for each of the models and
         return the respective embeddings."""
 
         if self.use_query_model:
@@ -145,7 +145,7 @@ class BiEncoderModel(MegatronModule):
                     state_dict[self._context_key], strict=strict)
 
     def init_state_dict_from_bert(self):
-        """Initialize the state from a pretrained BERT model 
+        """Initialize the state from a pretrained BERT model
         on iteration zero of ICT pretraining"""
         args = get_args()
 
@@ -159,11 +159,6 @@ class BiEncoderModel(MegatronModule):
         with open(tracker_filename, 'r') as f:
             iteration = int(f.read().strip())
             assert iteration > 0
-
-        #for param in self.query_model.language_model.parameters():
-        #    print(param.data)
-            #break
-            #sys.exit()
 
         checkpoint_name = get_checkpoint_name(args.bert_load, iteration, False)
         if mpu.get_data_parallel_rank() == 0:
@@ -193,17 +188,13 @@ class BiEncoderModel(MegatronModule):
                 if self.query_model is not None and self.projection_dim > 0:
                     self.context_model.projection_enc.load_state_dict\
                         (query_proj_state_dict)
-        #for param in self.query_model.language_model.parameters():
-        #    print(param.data)
-        #    #sys.exit()
-
 
 
 class PretrainedBertModel(MegatronModule):
-    """BERT-based encoder for queries or contexts used for 
+    """BERT-based encoder for queries or contexts used for
     learned information retrieval."""
 
-    def __init__(self, num_tokentypes=2, 
+    def __init__(self, num_tokentypes=2,
             parallel_output=True):
         super(PretrainedBertModel, self).__init__()
 
@@ -242,7 +233,7 @@ class PretrainedBertModel(MegatronModule):
                                         tokentype_ids=tokentype_ids)
         # This mask will be used in average-pooling and max-pooling
         pool_mask = (input_ids == self.pad_id).unsqueeze(2)
-        
+
          # Taking the representation of the [CLS] token of BERT
         if self.pool_type == "cls-token":
             pooled_output = lm_output[:, 0, :]
@@ -256,7 +247,7 @@ class PretrainedBertModel(MegatronModule):
 
         # Converting to float16 dtype
         pooled_output = pooled_output.to(lm_output.dtype)
-        
+
         # Output.
         if self.projection_dim:
             pooled_output = self.projection_enc(pooled_output)
