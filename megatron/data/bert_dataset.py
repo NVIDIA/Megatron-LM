@@ -125,7 +125,7 @@ def get_samples_mapping_(indexed_dataset,
         # Build samples mapping
         verbose = torch.distributed.get_rank() == 0
         start_time = time.time()
-        print_rank_0(' > building sapmles index mapping for {} ...'.format(
+        print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
         # First compile and then import.
         from megatron.data import helpers
@@ -138,7 +138,7 @@ def get_samples_mapping_(indexed_dataset,
             short_seq_prob,
             seed,
             verbose)
-        print_rank_0(' > done building sapmles index maping')
+        print_rank_0(' > done building samples index maping')
         np.save(indexmap_filename, samples_mapping, allow_pickle=True)
         print_rank_0(' > saved the index mapping in {}'.format(
             indexmap_filename))
