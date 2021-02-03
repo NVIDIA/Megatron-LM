@@ -884,9 +884,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Exiting based on iterations        
         if args.exit_interval and iteration % args.exit_interval == 0:
-            #if not saved_checkpoint:
-            #    save_checkpoint_and_time(iteration, model, optimizer,
-            #                             lr_scheduler)
+            if not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))                
             sys.exit()
