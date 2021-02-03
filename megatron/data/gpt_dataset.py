@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPT2 style dataset."""
+"""GPT style dataset."""
 
 import os
 import time
@@ -107,7 +107,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if splits[index + 1] > splits[index]:
             documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
-            dataset = GPT2Dataset(name, data_prefix,
+            dataset = GPTDataset(name, data_prefix,
                                   documents, indexed_dataset,
                                   train_valid_test_num_samples[index],
                                   seq_length, seed)
@@ -136,7 +136,7 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
     return indexed_dataset
 
 
-class GPT2Dataset(torch.utils.data.Dataset):
+class GPTDataset(torch.utils.data.Dataset):
 
     def __init__(self, name, data_prefix, documents, indexed_dataset,
                  num_samples, seq_length, seed):
@@ -269,8 +269,6 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             start_time = time.time()
             # Use C++ implementation for speed.
             # First compile and then import.
-            from megatron.data.dataset_utils import compile_helper
-            compile_helper()
             from megatron.data import helpers
             assert doc_idx.dtype == np.int32
             assert sizes.dtype == np.int32

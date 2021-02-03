@@ -49,7 +49,7 @@ class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length, query_in_block_prob,
-                 seed, use_titles=True, use_one_sent_docs=False):
+                 seed, use_titles=True, use_one_sent_docs=False, binary_head=False):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length

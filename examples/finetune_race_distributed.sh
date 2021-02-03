@@ -28,11 +28,11 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --num-layers 24 \
                --hidden-size 1024 \
                --num-attention-heads 16 \
-               --batch-size 4 \
+               --micro-batch-size 4 \
                --checkpoint-activations \
                --lr 1.0e-5 \
                --lr-decay-style linear \
-               --warmup 0.06 \
+               --lr-warmup-fraction 0.06 \
                --seq-length 512 \
                --max-position-embeddings 512 \
                --save-interval 100000 \

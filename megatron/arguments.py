@@ -40,6 +40,8 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
+    parser = _add_vit_args(parser)
+    parser = _add_logging_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -91,33 +93,6 @@ def parse_args(extra_args_provider=None, defaults={},
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
 
-    # Batch size.
-    assert args.micro_batch_size is not None
-    assert args.micro_batch_size > 0
-    if args.global_batch_size is None:
-        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
-        if args.rank == 0:
-            print('setting global batch size to {}'.format(
-                args.global_batch_size), flush=True)
-    assert args.global_batch_size > 0
-
-    # Fp16 loss scaling.
-    args.dynamic_loss_scale = False
-    if args.loss_scale is None:
-        args.dynamic_loss_scale = True
-
-    # Parameters dtype.
-    args.params_dtype = torch.float
-    if args.fp16:
-        args.params_dtype = torch.half
-    if args.rank == 0:
-        print('using {} for parameters ...'.format(args.params_dtype),
-              flush=True)
-
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.consumed_valid_samples = 0
-
     # Set input defaults.
     for key in defaults:
         # For default to be valid, it should not be provided in the
@@ -131,6 +106,31 @@ def parse_args(extra_args_provider=None, defaults={},
                                                flush=True)
         else:
             setattr(args, key, defaults[key])
+
+    # Batch size.
+    assert args.micro_batch_size is not None
+    assert args.micro_batch_size > 0
+    if args.global_batch_size is None:
+        args.global_batch_size = args.micro_batch_size * args.data_parallel_size
+        if args.rank == 0:
+            print('setting global batch size to {}'.format(
+                args.global_batch_size), flush=True)
+    assert args.global_batch_size > 0
+
+    # Parameters dtype.
+    args.params_dtype = torch.float
+    if args.fp16:
+        args.params_dtype = torch.half
+    if args.rank == 0:
+        print('using {} for parameters ...'.format(args.params_dtype),
+              flush=True)
+
+    if args.dataloader_type is None:
+        args.dataloader_type = 'single'
+
+    # Consumed tokens.
+    args.consumed_train_samples = 0
+    args.consumed_valid_samples = 0
 
     # Iteration-based training.
     if args.train_iters:
@@ -160,7 +160,8 @@ def parse_args(extra_args_provider=None, defaults={},
             'expected sample-based learnig rate warmup'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_samples == 0, \
-                'can only specify one of lr-warmup-fraction and lr-warmup-samples'
+                'can only specify one of lr-warmup-fraction ' \
+                'and lr-warmup-samples'
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -169,6 +170,20 @@ def parse_args(extra_args_provider=None, defaults={},
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    if args.ffn_hidden_size is None:
+        args.ffn_hidden_size = 4 * args.hidden_size
+
+    if args.kv_channels is None:
+        assert args.hidden_size % args.num_attention_heads == 0
+        args.kv_channels = args.hidden_size // args.num_attention_heads
+
+    if args.seq_length is not None:
+        assert args.encoder_seq_length is None
+        args.encoder_seq_length = args.seq_length
+    else:
+        assert args.encoder_seq_length is not None
+        args.seq_length = args.encoder_seq_length
+ 
     assert args.hidden_size % args.num_attention_heads == 0
     if args.seq_length is not None:
         assert args.max_position_embeddings >= args.seq_length
@@ -187,13 +202,10 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-
-    # load scaled_upper_triang_masked_softmax_fusion kernel
-    if args.scaled_upper_triang_masked_softmax_fusion:
+   
+    # Load scaled_masked_softmax_fusion_kernels
+    if args.masked_softmax_fusion:
         fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
-
-    # load scaled_masked_softmax_fusion kernel
-    if args.scaled_masked_softmax_fusion:
         fused_kernels.load_scaled_masked_softmax_fusion_kernel()
 
     # Load mixed precision fused layer norm.
@@ -230,8 +242,16 @@ def _add_network_size_args(parser):
                        help='Number of transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
+    group.add_argument('--ffn-hidden-size', type=int, default=None,
+                       help='Transformer Feed-Forward Network hidden size. '
+                       'This is set to 4*hidden-size if not provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
+    group.add_argument('--kv-channels', type=int, default=None,
+                       help='Projection weights dimension in multi-head '
+                       'attention. This is set to '
+                       '   args.hidden_size // args.num_attention_heads '
+                       'if not provided.')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -249,7 +269,42 @@ def _add_network_size_args(parser):
                        'should not be used unless for backward compatibility'
                        'reasons.')
     group.add_argument('--onnx-safe', type=bool, required=False,
-                       help='Use workarounds for known problems with Torch ONNX exporter')
+                       help='Use workarounds for known problems with '
+                       'Torch ONNX exporter')
+    group.add_argument('--bert-no-binary-head', action='store_false',
+                       help='Disable BERT binary head.',
+                       dest='bert_binary_head')
+
+    return parser
+
+
+def _add_logging_args(parser):
+    group = parser.add_argument_group(title='logging')
+
+    group.add_argument('--log-params-norm', action='store_true',
+                       help='If set, calculate and log parameters norm.')
+    group.add_argument('--tensorboard-log-interval', type=int, default=1,
+                       help='Report to tensorboard interval.')
+    group.add_argument('--tensorboard-queue-size', type=int, default=1000,
+                       help='Size of the tensorboard queue for pending events '
+                       'and summaries before one of the ‘add’ calls forces a '
+                       'flush to disk.')
+    group.add_argument('--log-timers-to-tensorboard', action='store_true',
+                       help='If set, write timers to tensorboard.')
+    group.add_argument('--log-batch-size-to-tensorboard', action='store_true',
+                       help='If set, write batch-size to tensorboard.')
+    group.add_argument('--no-log-learnig-rate-to-tensorboard',
+                       action='store_false',
+                       help='Disable learning rate logging to tensorboard.',
+                       dest='log_learning_rate_to_tensorboard')
+    group.add_argument('--no-log-loss-scale-to-tensorboard',
+                       action='store_false',
+                       help='Disable loss-scale logging to tensorboard.',
+                       dest='log_loss_scale_to_tensorboard')
+    group.add_argument('--log-validation-ppl-to-tensorboard',
+                       action='store_true',
+                       help='If set, write validation perplexity to '
+                       'tensorboard.')
 
     return parser
 
@@ -266,14 +321,16 @@ def _add_regularization_args(parser):
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
-                       help='First coefficient for computing running averages of'
-                       'gradient and its square')
+                       help='First coefficient for computing running averages '
+                       'of gradient and its square')
     group.add_argument('--adam-beta2', type=float, default=0.999,
-                       help='Second coefficient for computing running averages of'
-                       'gradient and its square')
+                       help='Second coefficient for computing running averages '
+                       'of gradient and its square')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
+    group.add_argument('--sgd-momentum', type=float, default=0.9,
+                       help='Momentum factor for sgd')
 
     return parser
 
@@ -310,8 +367,6 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--override-checkpoint-version', type=float, default=None,
-                       help='Override checkpoint version')
     group.add_argument('--distribute-checkpointed-activations',
                        action='store_true',
                        help='If set, distribute checkpointed activations '
@@ -335,19 +390,23 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
-    group.add_argument('--scaled-upper-triang-masked-softmax-fusion',
-                       action='store_true',
-                       help='Enable fusion of query_key_value_scaling '
-                       'time (upper diagonal) masking and softmax.')
-    group.add_argument('--scaled-masked-softmax-fusion',
-                       action='store_true',
-                       help='Enable fusion of query_key_value_scaling '
-                       'general masking and softmax.')
-    group.add_argument('--bias-gelu-fusion', action='store_true',
-                        help='Enable bias and gelu fusion.')
-    group.add_argument('--bias-dropout-fusion', action='store_true',
-                       help='Enable bias and dropout fusion.')
-
+    group.add_argument('--no-masked-softmax-fusion',
+                       action='store_false',
+                       help='Disable fusion of query_key_value scaling, '
+                       'masking, and softmax.',
+                       dest='masked_softmax_fusion')
+    group.add_argument('--no-bias-gelu-fusion', action='store_false',
+                       help='Disable bias and gelu fusion.',
+                       dest='bias_gelu_fusion')
+    group.add_argument('--no-bias-dropout-fusion', action='store_false',
+                       help='Disable bias and dropout fusion.',
+                       dest='bias_dropout_fusion')
+    group.add_argument('--optimizer', type=str, default='adam',
+                       choices=['adam', 'sgd'],
+                       help='Optimizer function')
+    group.add_argument('--dataloader-type', type=str, default=None,
+                       choices=['single', 'cyclic'],
+                       help='Single pass vs multiple pass data loader')
     return parser
 
 
@@ -360,6 +419,8 @@ def _add_initialization_args(parser):
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
+    group.add_argument('--init-method-xavier-uniform', action='store_true',
+                       help='Enable Xavier uniform parameter initialization')
 
     return parser
 
@@ -390,7 +451,7 @@ def _add_learning_rate_args(parser):
                        help='number of samples to linearly warmup '
                        'learning rate over.')
     group.add_argument('--warmup', type=int, default=None,
-                       help='Old lr warmup argument, do not use. Use one of the '
+                       help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
@@ -423,9 +484,9 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
-    group.add_argument('--no-load-optim', action='store_true',
+    group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
-    group.add_argument('--no-load-rng', action='store_true',
+    group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
@@ -440,30 +501,32 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
-    group.add_argument('--fp32-residual-connection', action='store_true',
-                       help='Move residual connections to fp32.')
-    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
-                       help='Scale Q * K^T by 1 / layer-number. If this flag '
-                       'is set, then it will automatically set '
-                       'attention-softmax-in-fp32 to true')
-    group.add_argument('--attention-softmax-in-fp32', action='store_true',
-                       help='Run attention masking and softmax in fp32.')
-    group.add_argument('--fp32-allreduce', action='store_true',
-                       help='All-reduce in fp32')
-    group.add_argument('--hysteresis', type=int, default=2,
-                       help='hysteresis for dynamic loss scaling')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'
                        'loss scaling is used.')
+    group.add_argument('--initial-loss-scale', type=float, default=2**32,
+                       help='Initial loss-scale for dynamic loss scaling.')
+    group.add_argument('--min-loss-scale', type=float, default=1.0,
+                       help='Minimum loss scale for dynamic loss scale.')
     group.add_argument('--loss-scale-window', type=float, default=1000,
                        help='Window over which to raise/lower dynamic scale.')
-    group.add_argument('--min-scale', type=float, default=1,
-                       help='Minimum loss scale for dynamic loss scale.')
+    group.add_argument('--hysteresis', type=int, default=2,
+                       help='hysteresis for dynamic loss scaling')
+    group.add_argument('--fp32-residual-connection', action='store_true',
+                       help='Move residual connections to fp32.')
+    group.add_argument('--no-query-key-layer-scaling', action='store_false',
+                       help='Do not scale Q * K^T by 1 / layer-number.',
+                       dest='apply_query_key_layer_scaling')
+    group.add_argument('--attention-softmax-in-fp32', action='store_true',
+                       help='Run attention masking and softmax in fp32. '
+                       'This flag is ignored unless '
+                       '--no-query-key-layer-scaling is specified.')
+    group.add_argument('--fp32-allreduce', action='store_true',
+                       help='All-reduce in fp32')
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
-
 
     return parser
 
@@ -488,12 +551,14 @@ def _add_distributed_args(parser):
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
-                       help='If set to True, initialize_megatron() skips DDP initialization'
-                       ' and returns function to complete it instead.'
-                       'Also turns on --use-cpu-initialization flag.'
-                       'This is for external DDP manager.' )
+                       help='If set to True, initialize_megatron() '
+                       'skips DDP initialization and returns function to '
+                       'complete it instead.Also turns on '
+                       '--use-cpu-initialization flag. This is for '
+                       'external DDP manager.' )
     group.add_argument('--use-cpu-initialization', action='store_true',
-                       help='If set, affine parallel weights initialization uses CPU' )
+                       default=None, help='If set, affine parallel weights '
+                       'initialization uses CPU' )
     return parser
 
 
@@ -528,7 +593,12 @@ def _add_data_args(parser):
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
     group.add_argument('--seq-length', type=int, default=None,
-                       help="Maximum sequence length to process.")
+                       help='Maximum sequence length to process.')
+    group.add_argument('--encoder-seq-length', type=int, default=None,
+                       help='Maximum encoder sequence length to process.'
+                       'This should be exclusive of --seq-length')
+    group.add_argument('--decoder-seq-length', type=int, default=None,
+                       help="Maximum decoder sequence length to process.")
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
@@ -587,13 +657,15 @@ def _add_biencoder_args(parser):
     group.add_argument('--ict-load', type=str, default=None,
                        help='Directory containing an ICTBertModel checkpoint')
     group.add_argument('--bert-load', type=str, default=None,
-                       help='Directory containing an BertModel checkpoint (needed to start ICT and REALM)')
+                       help='Directory containing an BertModel checkpoint '
+                       '(needed to start ICT and REALM)')
 
     # data
     group.add_argument('--titles-data-path', type=str, default=None,
                        help='Path to titles dataset used for ICT')
     group.add_argument('--query-in-block-prob', type=float, default=0.1,
-                       help='Probability of keeping query in block for ICT dataset')
+                       help='Probability of keeping query in block for '
+                       'ICT dataset')
     group.add_argument('--use-one-sent-docs', action='store_true',
                        help='Whether to use one sentence documents in ICT')
 
@@ -611,7 +683,24 @@ def _add_biencoder_args(parser):
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,
-                       help='How large of batches to use when doing indexing jobs')
+                       help='How large of batches to use when doing indexing '
+                       'jobs')
     group.add_argument('--indexer-log-interval', type=int, default=1000,
-                       help='After how many batches should the indexer report progress')
+                       help='After how many batches should the indexer '
+                       'report progress')
+    return parser
+
+
+def _add_vit_args(parser):
+    group = parser.add_argument_group(title="vit")
+
+    group.add_argument('--num-classes', type=int, default=1000,
+                       help='num of classes in vision classificaiton task')
+    group.add_argument('--img-dim', type=int, default=224,
+                       help='Image size for vision classification task')
+    group.add_argument('--num-channels', type=int, default=3,
+                       help='Number of channels in input image data')
+    group.add_argument('--patch-dim', type=int, default=16,
+                       help='patch dimension used in vit')
+
     return parser

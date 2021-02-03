@@ -3,17 +3,17 @@ import torch
 import sys
 
 from megatron import get_args, print_rank_0
-from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
-from megatron.module import MegatronModule
+from megatron.checkpointing import fix_query_key_value_ordering
+from megatron.checkpointing import get_checkpoint_tracker_filename
+from megatron.checkpointing import get_checkpoint_name
 from megatron import mpu, get_tokenizer
-from megatron.model.bert_model import bert_attention_mask_func
-from megatron.model.bert_model import bert_extended_attention_mask
 from megatron.model.bert_model import bert_position_ids
+from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import get_language_model
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
-
+from .module import MegatronModule
 
 def biencoder_model_provider(only_query_model=False,
                              only_context_model=False,
@@ -165,16 +165,32 @@ class BiEncoderModel(MegatronModule):
             print('global rank {} is loading BERT checkpoint {}'.format(
                 torch.distributed.get_rank(), checkpoint_name))
 
+        # Load the checkpoint.
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu')
+        except ModuleNotFoundError:
+            from megatron.fp16_deprecated import loss_scaler
+            # For backward compatibility.
+            print_rank_0(' > deserializing using the old code structure ...')
+            sys.modules['fp16.loss_scaler'] = sys.modules[
+                'megatron.fp16_deprecated.loss_scaler']
+            sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
+                'megatron.fp16_deprecated.loss_scaler']
+            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            sys.modules.pop('fp16.loss_scaler', None)
+            sys.modules.pop('megatron.fp16.loss_scaler', None)
         except BaseException:
-            raise ValueError("Could not load BERT checkpoint")
+            print_rank_0('could not load the BERT checkpoint')
+            sys.exit()
+
+        checkpoint_version = state_dict.get('checkpoint_version', 0)
 
         # load the LM state dict into each model
         model_dict = state_dict['model']['language_model']
 
         if self.shared_query_context_model:
             self.model.language_model.load_state_dict(model_dict)
+            fix_query_key_value_ordering(self.model, checkpoint_version)
         else:
             if self.use_query_model:
                 self.query_model.language_model.load_state_dict(model_dict)
@@ -183,11 +199,14 @@ class BiEncoderModel(MegatronModule):
                     query_proj_state_dict = \
                         self.state_dict_for_save_checkpoint()\
                         [self._query_key]['projection_enc']
+                fix_query_key_value_ordering(self.query_model, checkpoint_version)
+
             if self.use_context_model:
                 self.context_model.language_model.load_state_dict(model_dict)
                 if self.query_model is not None and self.projection_dim > 0:
                     self.context_model.projection_enc.load_state_dict\
                         (query_proj_state_dict)
+                fix_query_key_value_ordering(self.context_model, checkpoint_version)
 
 
 class PretrainedBertModel(MegatronModule):
@@ -209,9 +228,9 @@ class PretrainedBertModel(MegatronModule):
             args.init_method_std, args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
-            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
+            encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 

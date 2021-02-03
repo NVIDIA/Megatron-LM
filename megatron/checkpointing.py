@@ -23,16 +23,18 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-from megatron import mpu, get_args, update_num_microbatches
-from megatron import get_args
-from megatron import print_rank_0
+from megatron import (get_args,
+                      mpu,
+                      print_rank_0,
+                      update_num_microbatches)
 
 _CHECKPOINT_VERSION = None
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
-    assert _CHECKPOINT_VERSION is None, \
-        "checkpoint version already set"
+    if _CHECKPOINT_VERSION is not None:
+        assert _CHECKPOINT_VERSION == value, \
+            "checkpoint versions do not match"
     _CHECKPOINT_VERSION = value
 
 def get_checkpoint_version():
@@ -59,9 +61,10 @@ def check_checkpoint_args(checkpoint_args):
     _compare('hidden_size')
     _compare('num_attention_heads')
     _compare('max_position_embeddings')
-    _compare('make_vocab_size_divisible_by')
-    _compare('padded_vocab_size')
-    _compare('tokenizer_type')
+    if args.vocab_file:
+        _compare('make_vocab_size_divisible_by')
+        _compare('padded_vocab_size')
+        _compare('tokenizer_type')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
@@ -111,11 +114,10 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     if isinstance(model, torchDDP):
         model = model.module
 
-    if torch.distributed.get_rank() == 0:
-        print('saving checkpoint at iteration {:7d} to {}'.format(
-            iteration, args.save), flush=True)
+    print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
+        iteration, args.save))
 
-    if mpu.get_data_parallel_rank() == 0:
+    if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -146,21 +148,93 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         torch.save(state_dict, checkpoint_name)
 
     # Wait so everyone is done (necessary)
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print('  successfully saved checkpoint at iteration {:7d} to {}'.format(
-            iteration, args.save), flush=True)
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}'.format(
+        iteration, args.save))
+
     # And update the latest iteration
-    if torch.distributed.get_rank() == 0:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
+
     # Wait so everyone is done (not necessary)
-    torch.distributed.barrier()
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
+def _transpose_first_dim(t, num_splits, num_splits_first, model):
+    input_shape = t.size()
+    # We use a self_attention module but the values extracted aren't
+    # specific to self attention so should work for cross attention as well
+    while hasattr(model, 'module'):
+        model = model.module
+    attention_module = model.language_model.encoder.layers[0].self_attention
+    hidden_size_per_attention_head = attention_module.hidden_size_per_attention_head
+    num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
+    if num_splits_first:
+        """[num_splits * np * hn, h]
+        -->(view) [num_splits, np, hn, h]
+        -->(tranpose) [np, num_splits, hn, h]
+        -->(view) [np * num_splits * hn, h] """
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
-    """Load a model checkpoint and return the iteration."""
+        intermediate_shape = \
+            (num_splits, num_attention_heads_per_partition,
+             hidden_size_per_attention_head) + input_shape[1:]
+
+        t = t.view(*intermediate_shape)
+        t = t.transpose(0, 1).contiguous()
+    else:
+        """[np * hn * num_splits, h]
+        -->(view) [np, hn, num_splits, h]
+        -->(tranpose) [np, num_splits, hn, h]
+        -->(view) [np * num_splits * hn, h] """
+
+        intermediate_shape = \
+            (num_attention_heads_per_partition,
+             hidden_size_per_attention_head, num_splits) +\
+             input_shape[1:]
+
+        t = t.view(*intermediate_shape)
+        t = t.transpose(1, 2).contiguous()
+    t = t.view(*input_shape)
+
+    return t
+
+def fix_query_key_value_ordering(model, checkpoint_version):
+    """Fix up query/key/value matrix ordering if checkpoint
+    version is smaller than 2.0
+    """
+    if checkpoint_version < 2.0:
+        for name, param in model.named_parameters():
+            if name.endswith(('.query_key_value.weight', '.query_key_value.bias')):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 3, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 3, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
+            if name.endswith(('.key_value.weight', '.key_value.bias')):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 2, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 2, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
+        print_rank_0(" succesfully fixed query-key-values ordering for"
+                    " checkpoint version {}".format(checkpoint_version))
+
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
+    """Load a model checkpoint and return the iteration.
+    strict (bool): whether to strictly enforce that the keys in
+        :attr:`state_dict` of the checkpoint match the names of
+        parameters and buffers in model.
+    """
     args = get_args()
     load_dir = getattr(args, load_arg)
 
@@ -197,20 +271,22 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-    if torch.distributed.get_rank() == 0:
-        print(' loading checkpoint from {} at iteration {}'.format(
-            args.load, iteration), flush=True)
+    print_rank_0(f' loading checkpoint from {args.load} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
         state_dict = torch.load(checkpoint_name, map_location='cpu')
     except ModuleNotFoundError:
+        from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
         print_rank_0(' > deserializing using the old code structure ...')
         sys.modules['fp16.loss_scaler'] = sys.modules[
-            'megatron.fp16.loss_scaler']
+            'megatron.fp16_deprecated.loss_scaler']
+        sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
+            'megatron.fp16_deprecated.loss_scaler']
         state_dict = torch.load(checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
+        sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException:
         print_rank_0('could not load the checkpoint')
         sys.exit()
@@ -248,7 +324,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    model.load_state_dict(state_dict['model'])
+    model.load_state_dict(state_dict['model'], strict=strict)
+
+    # Fix up query/key/value matrix ordering if needed
+    checkpoint_version = get_checkpoint_version()
+    print_rank_0(f' checkpoint version {checkpoint_version}')
+    fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
@@ -280,10 +361,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
-    torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        print('  successfully loaded checkpoint from {} at iteration {}'.format(
-            args.load, iteration), flush=True)
+    # Some utilities want to load a checkpoint without distributed being initialized
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    print_rank_0(f'  successfully loaded checkpoint from {args.load} '
+                 f'at iteration {iteration}')
 
     return iteration
 

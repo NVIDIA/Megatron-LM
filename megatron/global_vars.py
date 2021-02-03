@@ -83,7 +83,8 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
                        defaults=args_defaults,
                        ignore_unknown_args=ignore_unknown_args)
     _build_num_microbatches_calculator(args)
-    _ = _build_tokenizer(args)
+    if args.vocab_file:
+        _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers()
@@ -131,12 +132,13 @@ def _set_tensorboard_writer(args):
                                    'tensorboard writer')
 
     if hasattr(args, 'tensorboard_dir') and \
-       args.tensorboard_dir and args.rank == (args.world_size -1):
+       args.tensorboard_dir and args.rank == (args.world_size - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
             print('> setting tensorboard ...')
             _GLOBAL_TENSORBOARD_WRITER = SummaryWriter(
-                log_dir=args.tensorboard_dir)
+                log_dir=args.tensorboard_dir,
+                max_queue=args.tensorboard_queue_size)
         except ModuleNotFoundError:
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '

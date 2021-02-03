@@ -85,7 +85,7 @@ class Encoder(object):
                 sentence_ids = Encoder.tokenizer.tokenize(sentence)
                 if len(sentence_ids) > 0:
                     doc_ids.append(sentence_ids)
-            if self.args.append_eod:
+            if len(doc_ids) > 0 and self.args.append_eod:
                 doc_ids[-1].append(Encoder.tokenizer.eod)
             ids[key] = doc_ids
         return ids, len(json_line)
@@ -182,6 +182,8 @@ def main():
     for i, (doc, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         for key, sentences in doc.items():
+            if len(sentences) == 0:
+                continue
             for sentence in sentences:
                 builders[key].add_item(torch.IntTensor(sentence))
             builders[key].end_document()

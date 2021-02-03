@@ -30,10 +30,17 @@ def import_layernorm(fp32_residual_connection):
 
 
 from .distributed import *
-from .bert_model import BertModel, BertModelFirstStage, BertModelIntermediateStage, BertModelLastStage
+from .bert_model import (BertModel,
+                         BertModelFirstStage,
+                         BertModelIntermediateStage,
+                         BertModelLastStage)
 from .realm_model import ICTBertModel
-from .gpt2_model import GPT2Model, GPT2ModelFirstStage, GPT2ModelIntermediateStage, GPT2ModelLastStage
-from .utils import get_params_for_weight_decay_optimization
+from .gpt_model import (GPTModel,
+                        GPTModelFirstStage,
+                        GPTModelIntermediateStage,
+                        GPTModelLastStage)
 from .language_model import get_language_model
+from .module import FP16Module
+from .realm_model import ICTBertModel
 
 

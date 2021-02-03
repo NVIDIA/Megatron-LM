@@ -12,19 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .fp16util import (
-    BN_convert_float,
-    network_to_half,
-    prep_param_lists,
-    model_grads_to_master_grads,
-    master_params_to_model_params,
-    tofp16,
-    to_python_float,
-    clip_grad_norm,
-    convert_module,
-    convert_network,
-    FP16Model,
-)
 
-from .fp16 import *
-from .loss_scaler import *
+import enum
+
+class LayerType(enum.Enum):
+    encoder = 1
+    decoder = 2
+ 
+class AttnType(enum.Enum):
+    self_attn = 1
+    cross_attn = 2
+
+class AttnMaskType(enum.Enum):
+    padding = 1
+    causal = 2

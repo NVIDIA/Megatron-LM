@@ -78,6 +78,13 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         
         # Autoresume.
         _init_autoresume()
+
+        # Compile dataset C++ code.
+        if torch.distributed.get_rank() == 0:
+            from megatron.data.dataset_utils import compile_helper
+            compile_helper()
+        # Simple barrier
+        torch.distributed.barrier()
         
         # No continuation function
         return None

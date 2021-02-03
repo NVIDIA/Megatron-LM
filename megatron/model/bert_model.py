@@ -19,6 +19,7 @@ import torch
 
 from megatron import get_args
 from megatron import mpu
+from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
 from megatron.model import import_layernorm
@@ -26,11 +27,7 @@ from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
-from megatron.module import MegatronModule, PipelinedMegatronModule
-
-def bert_attention_mask_func(attention_scores, attention_mask):
-    attention_scores.masked_fill_(attention_mask, -10000.0)
-    return attention_scores
+from .module import MegatronModule
 
 def bert_extended_attention_mask(attention_mask):
     # We create a 3D attention mask from a 2D tensor mask.
@@ -77,9 +74,7 @@ class BertLMHead(MegatronModule):
         args = get_args()
 
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        self.bias.tensor_model_parallel = True
-        self.bias.partition_dim = 0
-        self.bias.stride = 1
+        mpu.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
@@ -127,7 +122,7 @@ def post_language_model_processing(lm_output, pooled_output,
         return lm_loss, binary_logits
 
 
-class BertModelBase(PipelinedMegatronModule):
+class BertModelBase(MegatronModule):
     """Bert Language model."""
 
     def __init__(self, num_tokentypes=2, add_binary_head=True,
@@ -144,9 +139,9 @@ class BertModelBase(PipelinedMegatronModule):
                                                        args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
-            attention_mask_func=bert_attention_mask_func,
             num_tokentypes=num_tokentypes,
             add_pooler=self.add_binary_head,
+            encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
