@@ -37,8 +37,7 @@ def pretrain_ict_model_provider():
     model = biencoder_model_provider(
                 only_context_model=False,
                 only_query_model=False,
-                shared_query_context_model=args.shared_query_context_model
-                )
+                shared_query_context_model=args.shared_query_context_model)
     return model
 
 def get_group_world_size_rank():
