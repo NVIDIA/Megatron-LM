@@ -675,11 +675,11 @@ def _add_biencoder_args(parser):
 
     # training
     group.add_argument('--report-topk-accuracies', nargs='+', type=int, 
-                        default=[], help="Which top-k accuracies to report '
-                        '(e.g. '1 5 20')")
+                        default=[], help='Which top-k accuracies to report '
+                        '(e.g. '1 5 20')')
     group.add_argument('--retriever-score-scaling', action='store_true',
-                       help="Whether to scale retriever scores by inverse '
-                        'square root of hidden size")
+                       help='Whether to scale retriever scores by inverse '
+                        'square root of hidden size')
 
     # faiss index
     group.add_argument('--faiss-use-gpu', action='store_true',
