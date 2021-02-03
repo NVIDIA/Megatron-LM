@@ -34,9 +34,11 @@ from megatron.data.biencoder_dataset_utils import get_ict_batch
 
 def pretrain_ict_model_provider():
     args = get_args()
-    model = biencoder_model_provider(only_context_model=False,
-                                     only_query_model=False,
-                                     shared_query_context_model=args.shared_query_context_model)
+    model = biencoder_model_provider(
+                only_context_model=False,
+                only_query_model=False,
+                shared_query_context_model=args.shared_query_context_model
+                )
     return model
 
 def get_group_world_size_rank():
