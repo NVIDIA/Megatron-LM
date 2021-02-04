@@ -304,7 +304,7 @@ def setup_model_and_optimizer(model_provider_func):
         print_rank_0("Initializing ICT from pretrained BERT model")
         unwrapped_model.init_state_dict_from_bert()
         if args.fp16:
-            optimizer._copy_model_params_to_main_params()
+            optimizer.reload_model_params()
 
     return model, optimizer, lr_scheduler
 
