@@ -22,13 +22,13 @@ python pretrain_ict.py \
         --train-iters 100000 \
         --vocab-file bert-vocab.txt \
         --tokenizer-type BertWordPieceLowerCase \
-	    --DDP-impl torch \
-	    --bert-load ${PRETRAINED_BERT_PATH} \
+        --DDP-impl torch \
+        --bert-load ${PRETRAINED_BERT_PATH} \
         --log-interval 100 \
-	    --eval-interval 1000 \
-	    --eval-iters 10 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
         --report-topk-accuracies 1 5 10 20 100 \
-	    --retriever-score-scaling \
+        --retriever-score-scaling \
         --load $CHECKPOINT_PATH \
         --save $CHECKPOINT_PATH \
         --data-path ${TEXT_DATA_PATH} \
