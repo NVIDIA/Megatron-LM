@@ -14,7 +14,6 @@
 # limitations under the License.
 
 """Pretrain BERT for Inverse Cloze Task"""
-import sys
 import math
 
 import torch
@@ -25,11 +24,11 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
+from megatron.data.biencoder_dataset_utils import get_ict_batch
 from megatron.data.dataset_utils import build_train_valid_test_datasets
+from megatron.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
-from megatron.model.biencoder_model import biencoder_model_provider
-from megatron.data.biencoder_dataset_utils import get_ict_batch
 
 
 def pretrain_ict_model_provider():
