@@ -99,6 +99,9 @@ def forward_step(data_iterator, model, input_tensor):
 
     micro_batch_size = query_logits.shape[0]
     # recall we assert that tensor_model_parallel_size == 1
+    assert mpu.get_tensor_model_parallel_world_size() == 1, \
+        "Model parallel size > 1 not supported for ICT"
+
     global_batch_size = dist.get_world_size() * micro_batch_size
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
     all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits) 
