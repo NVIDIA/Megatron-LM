@@ -113,20 +113,23 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
         assert (
             self.scale is None or softmax_in_fp32
         ), "softmax should be in fp32 when scaled"
-
+ 
     def forward(self, input, mask):
         # [b, np, sq, sk]
+        assert input.dim() == 4
         data_size = input.size()
         query_seq_len = data_size[-2]
         key_seq_len = data_size[-1]
         attn_batch_size = data_size[0] * data_size[1]
-        assert input.dim() == 4
+
+        # constraints on various tensor dimensions to enable warp based
+        # optimization and upper triangular optimization (for causal mask)
+        custom_kernel_constraint = key_seq_len > 16 and key_seq_len <= 2048 and \
+            query_seq_len % 4 == 0 and attn_batch_size % 4 == 0
 
         # invoke custom kernel
-        if self.input_in_fp16 and key_seq_len <= 2048 and mask is not None and \
-           query_seq_len % 4 == 0 and key_seq_len > 16 and \
-           attn_batch_size % 4 == 0 and self.scaled_masked_softmax_fusion:
-
+        if self.input_in_fp16 and mask is not None and \
+           custom_kernel_constraint and self.scaled_masked_softmax_fusion:
             scale = self.scale if self.scale is not None else 1.0
 
             if self.attn_mask_type == AttnMaskType.causal:
