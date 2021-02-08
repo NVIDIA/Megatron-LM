@@ -92,7 +92,9 @@ def main():
     """Main program."""
 
     initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+                                       'no_load_rng': True,
+                                       'no_load_optim': True})
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)

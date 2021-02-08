@@ -343,12 +343,15 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             np.random.set_state(state_dict['np_rng_state'])
             torch.set_rng_state(state_dict['torch_rng_state'])
             torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+            # Check for empty states array
+            if not state_dict['rng_tracker_states']:
+                raise KeyError
             mpu.get_cuda_rng_tracker().set_states(
                 state_dict['rng_tracker_states'])
         except KeyError:
-            print_rank_0('Unable to load optimizer from checkpoint {}. '
+            print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
-                         'attempting to load the optimizer state, '
+                         'attempting to load the rng state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
 
