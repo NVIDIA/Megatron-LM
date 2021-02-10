@@ -46,6 +46,7 @@ from megatron.learning_rates import AnnealingLR
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model.realm_model import ICTBertModel
 from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
@@ -288,9 +289,8 @@ def setup_model_and_optimizer(model_provider_func):
 
     model = get_model(model_provider_func)
 
-    unwrapped_model = model
-    while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
-        unwrapped_model = unwrapped_model.module
+    unwrapped_model = unwrap_model(model,
+                                   (torchDDP, LocalDDP, FP16Module))
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
@@ -370,8 +370,8 @@ def train_step(forward_step_func, data_iterator,
             unwrapped_model = model[0]
         elif mpu.is_pipeline_last_stage(ignore_virtual=True):
             unwrapped_model = model[-1]
-        while isinstance(unwrapped_model, (torchDDP, LocalDDP, FP16Module)):
-            unwrapped_model = unwrapped_model.module
+        unwrapped_model = unwrap_model(
+            unwrapped_model, (torchDDP, LocalDDP, FP16Module))
 
         if unwrapped_model.share_word_embeddings:
             word_embeddings_weight = unwrapped_model.word_embeddings_weight()

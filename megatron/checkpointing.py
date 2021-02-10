@@ -21,12 +21,12 @@ import sys
 import numpy as np
 
 import torch
-from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from megatron import (get_args,
                       mpu,
                       print_rank_0,
-                      update_num_microbatches)
+                      update_num_microbatches,
+                      utils)
 
 _CHECKPOINT_VERSION = None
 
@@ -111,12 +111,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
-    unwrapped_model = []
-    for model_module in model:
-        if isinstance(model_module, torchDDP):
-            model_module = model_module.module
-        unwrapped_model.append(model_module)
-    model = unwrapped_model
+    model = utils.unwrap_model(model)
 
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
@@ -220,12 +215,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    unwrapped_model = []
-    for model_module in model:
-        if isinstance(model_module, torchDDP):
-            model_module = model_module.module
-        unwrapped_model.append(model_module)
-    model = unwrapped_model
+    model = utils.unwrap_model(model)
 
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
@@ -389,8 +379,7 @@ def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, f
 
     args = get_args()
 
-    if isinstance(model, torchDDP):
-        model = model.module
+    model = utils.unwrap_model(model)
 
     load_path = args.load if from_realm_chkpt else args.ict_load
 
