@@ -599,6 +599,9 @@ def _add_data_args(parser):
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
+    group.add_argument('--retriever-seq-length', type=int, default=256,
+                       help='Maximum sequence length for the biencoder model '
+                        ' for retriever') 
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
@@ -686,6 +689,9 @@ def _add_biencoder_args(parser):
                        help='Whether create the FaissMIPSIndex on GPU')
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
+    group.add_argument('--embedding-path', type=str, default=None,
+                       help='Where to save/load Open-Retrieval Embedding'
+                        ' data to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,
