@@ -120,13 +120,13 @@ def pretrain(train_valid_test_dataset_provider,
     # Data stuff.
     timers('train/valid/test-data-iterators-setup').start()
     if args.virtual_pipeline_model_parallel_size is not None:
-        data_iterators = [
+        all_data_iterators = [
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             for _ in range(len(model))
         ]
-        train_data_iterator = [x[0] for x in data_iterators]
-        valid_data_iterator = [x[1] for x in data_iterators]
-        test_data_iterator = [x[2] for x in data_iterators]
+        train_data_iterator = [data_iterators[0] for data_iterators in all_data_iterators]
+        valid_data_iterator = [data_iterators[1] for data_iterators in all_data_iterators]
+        test_data_iterator = [data_iterators[2] for data_iterators in all_data_iterators]
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
@@ -311,17 +311,18 @@ def setup_model_and_optimizer(model_provider_func):
     # We only support local DDP with multiple micro-batches.
     if get_num_microbatches() > 1:
         assert args.DDP_impl == 'local'
+    if len(model) == 1:
+        assert args.DDP_impl == 'local'
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        assert args.DDP_impl == 'local'
 
     # get model without FP16 and/or TorchDDP wrappers
+    model = unwrap_model(model)
     for module in model:
-        unwrapped_module = module
-        while hasattr(unwrapped_module, 'module'):
-            unwrapped_module = unwrapped_module.module
-
-        if args.iteration == 0 and hasattr(unwrapped_module,
+        if args.iteration == 0 and hasattr(module,
                                            'init_state_dict_from_bert'):
             print("Initializing ICT from pretrained BERT model", flush=True)
-            unwrapped_module.init_state_dict_from_bert()
+            module.init_state_dict_from_bert()
 
     return model, optimizer, lr_scheduler
 
@@ -364,7 +365,8 @@ def train_step(forward_step_func, data_iterator,
     # This should only run for models that support pipelined model parallelism
     # (BERT and GPT-2).
     timers('backward-embedding-all-reduce').start()
-    if (mpu.is_pipeline_first_stage(ignore_virtual=True) or mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
+    if (mpu.is_pipeline_first_stage(ignore_virtual=True) or
+        mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
             mpu.get_pipeline_model_parallel_world_size() > 1:
         if mpu.is_pipeline_first_stage(ignore_virtual=True):
             unwrapped_model = model[0]
