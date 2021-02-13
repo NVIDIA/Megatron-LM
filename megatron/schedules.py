@@ -136,19 +136,19 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
     num_microbatches_remaining = \
         num_microbatches - num_warmup_microbatches
 
-    def get_model_chunk_id(k, forward):
+    def get_model_chunk_id(microbatch_id, forward):
         """Helper method to get the model chunk ID given the iteration number."""
-        k_in_group = k % (pipeline_parallel_size * num_model_chunks)
-        i = k_in_group // pipeline_parallel_size
+        microbatch_id_in_group = microbatch_id % (pipeline_parallel_size * num_model_chunks)
+        model_chunk_id = microbatch_id_in_group // pipeline_parallel_size
         if not forward:
-            i = (num_model_chunks - i - 1)
-        return i
+            model_chunk_id = (num_model_chunks - model_chunk_id - 1)
+        return model_chunk_id
 
-    def forward_step_helper(k):
+    def forward_step_helper(microbatch_id):
         """Helper method to run forward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         forward_step())."""
-        model_chunk_id = get_model_chunk_id(k, forward=True)
+        model_chunk_id = get_model_chunk_id(microbatch_id, forward=True)
         mpu.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
         if mpu.is_pipeline_first_stage():
@@ -164,11 +164,11 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
 
         return output_tensor
 
-    def backward_step_helper(k):
+    def backward_step_helper(microbatch_id):
         """Helper method to run backward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         backward_step())."""
-        model_chunk_id = get_model_chunk_id(k, forward=False)
+        model_chunk_id = get_model_chunk_id(microbatch_id, forward=False)
         mpu.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
         if mpu.is_pipeline_last_stage():
@@ -317,8 +317,9 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
     return losses_reduced
 
 
-def forward_backward_pipelining(forward_step_func, data_iterator, model,
-                                optimizer, timers, forward_only):
+def forward_backward_pipelining_without_interleaving(forward_step_func, data_iterator,
+                                                     model, optimizer, timers,
+                                                     forward_only):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 

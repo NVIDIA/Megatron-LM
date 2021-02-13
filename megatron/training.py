@@ -50,7 +50,7 @@ from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
-from megatron.schedules import forward_backward_pipelining
+from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory
 
@@ -340,7 +340,7 @@ def train_step(forward_step_func, data_iterator,
         if args.virtual_pipeline_model_parallel_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
         else:
-            forward_backward_func = forward_backward_pipelining
+            forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = forward_backward_no_pipelining
     losses_reduced = forward_backward_func(
@@ -681,7 +681,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 if args.virtual_pipeline_model_parallel_size is not None:
                     forward_backward_func = forward_backward_pipelining_with_interleaving
                 else:
-                    forward_backward_func = forward_backward_pipelining
+                    forward_backward_func = forward_backward_pipelining_without_interleaving
             else:
                 forward_backward_func = forward_backward_no_pipelining
             loss_dicts = forward_backward_func(
@@ -692,8 +692,8 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
-                        total_loss_dict[key] = total_loss_dict.get(key, torch.cuda.FloatTensor([0.0])) + \
-                            loss_dict[key]
+                        total_loss_dict[key] = total_loss_dict.get(
+                            key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \

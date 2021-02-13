@@ -271,10 +271,8 @@ def get_pipeline_model_parallel_rank():
 def is_pipeline_first_stage(ignore_virtual=False):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-        if _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None and \
-            _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK != 0:
+        if get_virtual_pipeline_model_parallel_world_size() is not None and \
+            get_virtual_pipeline_model_parallel_rank() != 0:
             return False
     return get_pipeline_model_parallel_rank() == 0
 
@@ -282,11 +280,11 @@ def is_pipeline_first_stage(ignore_virtual=False):
 def is_pipeline_last_stage(ignore_virtual=False):
     """Return True if in the last pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
-        global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-        if _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None and \
-            _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK != (
-                _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE - 1):
+        virtual_pipeline_model_parallel_world_size = \
+            get_virtual_pipeline_model_parallel_world_size()
+        if virtual_pipeline_model_parallel_world_size is not None and \
+            get_virtual_pipeline_model_parallel_rank() != (
+                virtual_pipeline_model_parallel_world_size - 1):
             return False
     return get_pipeline_model_parallel_rank() == (
         get_pipeline_model_parallel_world_size() - 1)
@@ -302,6 +300,12 @@ def set_virtual_pipeline_model_parallel_rank(rank):
     """Set the virtual pipeline-parallel rank."""
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank
+
+
+def get_virtual_pipeline_model_parallel_world_size():
+    """Return the virtual pipeline-parallel world size."""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
 
 
 def get_tensor_model_parallel_src_rank():
