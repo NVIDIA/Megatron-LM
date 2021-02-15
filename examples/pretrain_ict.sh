@@ -27,7 +27,7 @@ python pretrain_ict.py \
         --log-interval 100 \
         --eval-interval 1000 \
         --eval-iters 10 \
-        --report-topk-accuracies 1 5 10 20 100 \
+        --retriever-report-topk-accuracies 1 5 10 20 100 \
         --retriever-score-scaling \
         --load $CHECKPOINT_PATH \
         --save $CHECKPOINT_PATH \
