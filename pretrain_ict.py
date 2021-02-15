@@ -36,7 +36,8 @@ def pretrain_ict_model_provider():
     model = biencoder_model_provider(
                 only_context_model=False,
                 only_query_model=False,
-                shared_query_context_model=args.shared_query_context_model)
+                biencoder_shared_query_context_model=\
+                    args.biencoder_shared_query_context_model)
     return model
 
 def get_group_world_size_rank():
@@ -120,7 +121,7 @@ def forward_step(data_iterator, model, input_tensor):
         return torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :k]) \
             for i in range(global_batch_size)]) / global_batch_size])
 
-    topk_accs = [topk_accuracy(int(k)) for k in args.report_topk_accuracies]
+    topk_accs = [topk_accuracy(int(k)) for k in args.retriever_report_topk_accuracies]
 
     labels = torch.arange(global_batch_size).long().cuda()
     loss = F.nll_loss(softmax_scores, labels, reduction='mean')
@@ -131,7 +132,7 @@ def forward_step(data_iterator, model, input_tensor):
 
     # create stats_dict with retrieval loss and all specified top-k accuracies
     topk_acc_dict = {'top{}_acc'.format(k): v * 100 for k, v in \
-                        zip(args.report_topk_accuracies, reduced_losses[1:])}
+                        zip(args.retriever_report_topk_accuracies, reduced_losses[1:])}
     stats_dict = dict(loss=reduced_losses[0], **topk_acc_dict)
     return loss, stats_dict
 

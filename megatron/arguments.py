@@ -646,16 +646,12 @@ def _add_biencoder_args(parser):
     group.add_argument('--ict-head-size', type=int, default=None,
                        help='Size of block embeddings to be used in ICT and '
                         'REALM (paper default: 128)')
-    group.add_argument('--projection-dim', type=int, default=0,
+    group.add_argument('--biencoder-projection-dim', type=int, default=0,
                        help='Size of projection head used in biencoder (paper'
                         ' default: 128)')
-    group.add_argument('--shared-query-context-model', action='store_true',
+    group.add_argument('--biencoder-shared-query-context-model', action='store_true',
                         help='Whether to share the parameters of the query '
                         'and context models or not')
-    group.add_argument('--pool-type', type=str, default='cls-token',
-                       choices=['avg', 'cls-token', 'max'],
-                       help='different options are: avg | cls-token | max, '
-                        'default=cls-token')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
@@ -674,7 +670,7 @@ def _add_biencoder_args(parser):
                        help='Whether to use one sentence documents in ICT')
 
     # training
-    group.add_argument('--report-topk-accuracies', nargs='+', type=int, 
+    group.add_argument('--retriever-report-topk-accuracies', nargs='+', type=int,
                         default=[], help="Which top-k accuracies to report "
                         "(e.g. '1 5 20')")
     group.add_argument('--retriever-score-scaling', action='store_true',
