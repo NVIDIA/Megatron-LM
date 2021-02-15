@@ -601,7 +601,7 @@ def _add_data_args(parser):
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--retriever-seq-length', type=int, default=256,
                        help='Maximum sequence length for the biencoder model '
-                        ' for retriever') 
+                        ' for retriever')
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
