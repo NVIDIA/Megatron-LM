@@ -578,8 +578,9 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
-    group.add_argument('--scatter-gather-tensors-in-pipeline', action='store_true',
-                       help='Use scatter/gather to optimize communication of tensors in pipeline')
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
