@@ -311,7 +311,7 @@ def setup_model_and_optimizer(model_provider_func):
     # We only support local DDP with multiple micro-batches.
     if get_num_microbatches() > 1:
         assert args.DDP_impl == 'local'
-    if len(model) == 1:
+    if len(model) > 1:
         assert args.DDP_impl == 'local'
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         assert args.DDP_impl == 'local'
@@ -323,6 +323,8 @@ def setup_model_and_optimizer(model_provider_func):
                                            'init_state_dict_from_bert'):
             print("Initializing ICT from pretrained BERT model", flush=True)
             module.init_state_dict_from_bert()
+            if args.fp16:
+                optimizer.reload_model_params()
 
     return model, optimizer, lr_scheduler
 

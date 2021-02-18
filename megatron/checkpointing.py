@@ -206,6 +206,33 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
 
     return t
 
+def fix_query_key_value_ordering(model, checkpoint_version):
+    """Fix up query/key/value matrix ordering if checkpoint
+    version is smaller than 2.0
+    """
+    if checkpoint_version < 2.0:
+        for name, param in model.named_parameters():
+            if name.endswith(('.query_key_value.weight', '.query_key_value.bias')):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 3, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 3, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
+            if name.endswith(('.key_value.weight', '.key_value.bias')):
+                if checkpoint_version == 0:
+                    fixed_param = _transpose_first_dim(param.data, 2, True, model)
+                elif checkpoint_version == 1.0:
+                    fixed_param = _transpose_first_dim(param.data, 2, False, model)
+                else:
+                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
+                    sys.exit()
+                param.data.copy_(fixed_param)
+        print_rank_0(" succesfully fixed query-key-values ordering for"
+                    " checkpoint version {}".format(checkpoint_version))
+
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -308,28 +335,10 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             mpu.set_virtual_pipeline_model_parallel_rank(i)
             model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
-    # Fix up query/key/value matrix ordering
-    if get_checkpoint_version() < 2.0:
-        checkpoint_version = get_checkpoint_version()
-        for name, param in model.named_parameters():
-            if name.endswith(('.query_key_value.weight', '.query_key_value.bias')):
-                if checkpoint_version == 0:
-                    fixed_param = _transpose_first_dim(param.data, 3, True, model)
-                elif checkpoint_version == 1.0:
-                    fixed_param = _transpose_first_dim(param.data, 3, False, model)
-                else:
-                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
-                    sys.exit()
-                param.data.copy_(fixed_param)
-            if name.endswith(('.key_value.weight', '.key_value.bias')):
-                if checkpoint_version == 0:
-                    fixed_param = _transpose_first_dim(param.data, 2, True, model)
-                elif checkpoint_version == 1.0:
-                    fixed_param = _transpose_first_dim(param.data, 2, False, model)
-                else:
-                    print_rank_0(f"Invalid checkpoint version {checkpoint_version}.")
-                    sys.exit()
-                param.data.copy_(fixed_param)
+    # Fix up query/key/value matrix ordering if needed
+    checkpoint_version = get_checkpoint_version()
+    print_rank_0(f' checkpoint version {checkpoint_version}')
+    fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:

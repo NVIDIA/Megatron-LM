@@ -9,6 +9,16 @@ from megatron import get_args
 from megatron.data.dataset_utils import get_indexed_dataset_
 from megatron.data.realm_dataset_utils import get_block_samples_mapping
 
+def make_attention_mask(source_block, target_block):
+    """
+    Returns a 2-dimensional (2-D) attention mask
+    :param source_block: 1-D array
+    :param target_block: 1-D array
+    """
+    mask = (target_block[None, :] >= 1) * (source_block[:, None] >= 1)
+    mask = mask.astype(np.int64)
+    # (source_length, target_length)
+    return mask
 
 def get_ict_dataset(use_titles=True, query_in_block_prob=1):
     """Get a dataset which uses block samples mappings to get ICT/block indexing data (via get_block())
@@ -39,7 +49,7 @@ class ICTDataset(Dataset):
     """Dataset containing sentences and their blocks for an inverse cloze task."""
     def __init__(self, name, block_dataset, title_dataset, data_prefix,
                  num_epochs, max_num_samples, max_seq_length, query_in_block_prob,
-                 seed, use_titles=True, use_one_sent_docs=False):
+                 seed, use_titles=True, use_one_sent_docs=False, binary_head=False):
         self.name = name
         self.seed = seed
         self.max_seq_length = max_seq_length
@@ -93,14 +103,20 @@ class ICTDataset(Dataset):
         block = list(itertools.chain(*block))[:self.max_seq_length - title_pad_offset]
 
         query_tokens, query_pad_mask = self.concat_and_pad_tokens(query)
-        block_tokens, block_pad_mask = self.concat_and_pad_tokens(block, title)
+        context_tokens, context_pad_mask = self.concat_and_pad_tokens(block, title)
+
+        query_mask = make_attention_mask(query_tokens, query_tokens)
+        context_mask = make_attention_mask(context_tokens, context_tokens)
+
         block_data = sample_data.as_array()
 
         sample = {
             'query_tokens': query_tokens,
+            'query_mask': query_mask,
             'query_pad_mask': query_pad_mask,
-            'block_tokens': block_tokens,
-            'block_pad_mask': block_pad_mask,
+            'context_tokens': context_tokens,
+            'context_mask': context_mask,
+            'context_pad_mask': context_pad_mask,
             'block_data': block_data,
         }
 
