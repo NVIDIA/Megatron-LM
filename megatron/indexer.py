@@ -1,3 +1,4 @@
+import sys
 import torch
 import torch.distributed as dist
 
@@ -5,10 +6,11 @@ from megatron import get_args
 from megatron import mpu
 from megatron.checkpointing import load_ict_checkpoint
 from megatron.data.ict_dataset import get_ict_dataset
-from megatron.data.realm_dataset_utils import get_one_epoch_dataloader
-from megatron.data.realm_index import detach, BlockData
-from megatron.data.realm_dataset_utils import get_ict_batch
-from megatron.model.realm_model import general_ict_model_provider
+from megatron.data.biencoder_dataset_utils import get_one_epoch_dataloader
+from megatron.data.realm_index import detach, OpenRetreivalDataStore
+from megatron.data.biencoder_dataset_utils import get_ict_batch
+from megatron.model.biencoder_model import biencoder_model_provider
+#from megatron.model.realm_model import general_ict_model_provider
 from megatron.training import get_model
 
 
@@ -34,13 +36,16 @@ class IndexBuilder(object):
 
     def load_attributes(self):
         """Load the necessary attributes: model, dataloader and empty BlockData"""
-        model = get_model(lambda: general_ict_model_provider(only_block_model=True))
-        self.model = load_ict_checkpoint(model, only_block_model=True, from_realm_chkpt=self.using_realm_chkpt)
+        model = get_model(lambda: biencoder_model_provider(only_context_model=True))
+        self.model = load_ict_checkpoint(model, only_context_model=True, from_realm_chkpt=self.using_realm_chkpt)
+        sys.exit()
         self.model.eval()
         self.dataset = get_ict_dataset()
         self.dataloader = iter(get_one_epoch_dataloader(self.dataset, self.batch_size))
-        self.block_data = BlockData(load_from_path=False)
-
+        self.block_data = OpenRetreivalDataStore(load_from_path=False)
+        print("load_attributes is done", flush=True)
+        sys.exit()
+ 
     def track_and_report_progress(self, batch_size):
         """Utility function for tracking progress"""
         self.iteration += 1

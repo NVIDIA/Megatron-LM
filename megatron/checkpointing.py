@@ -371,7 +371,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     return iteration
 
 
-def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, from_realm_chkpt=False):
+def load_ict_checkpoint(model, only_query_model=False, only_context_model=False, from_realm_chkpt=False):
     """selectively load ICT models for indexing/retrieving from ICT or REALM checkpoints"""
 
     args = get_args()
@@ -393,14 +393,16 @@ def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, f
 
     state_dict = torch.load(checkpoint_name, map_location='cpu')
     ict_state_dict = state_dict['model']
+    print(ict_state_dict)
+    sys.exit()
     if from_realm_chkpt and mpu.get_data_parallel_rank() == 0:
         print(" loading ICT state dict from REALM", flush=True)
         ict_state_dict = ict_state_dict['retriever']['ict_model']
 
     if only_query_model:
         ict_state_dict.pop('context_model')
-    if only_block_model:
-        ict_state_dict.pop('question_model')
+    if only_context_model:
+        ict_state_dict.pop('query_model')
 
     model.load_state_dict(ict_state_dict)
     torch.distributed.barrier()

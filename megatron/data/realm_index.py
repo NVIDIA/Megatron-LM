@@ -14,28 +14,29 @@ def detach(tensor):
     return tensor.detach().cpu().numpy()
 
 
-class BlockData(object):
-    """Serializable data structure for holding data for blocks -- embeddings and necessary metadata for REALM"""
-    def __init__(self, block_data_path=None, load_from_path=True, rank=None):
+class OpenRetreivalDataStore(object):
+    """Serializable data structure for holding data for blocks -- embeddings 
+    and necessary metadata for Retriever"""
+    def __init__(self, embedding_path=None, load_from_path=True, rank=None):
         self.embed_data = dict()
-        self.meta_data = dict()
-        if block_data_path is None:
+        #self.meta_data = dict()
+        if embedding_path is None:
             args = get_args()
-            block_data_path = args.block_data_path
+            embedding_path = args.embedding_path
             rank = args.rank
-        self.block_data_path = block_data_path
+        self.embedding_path = embedding_path
         self.rank = rank
 
         if load_from_path:
             self.load_from_file()
 
-        block_data_name = os.path.splitext(self.block_data_path)[0]
+        block_data_name = os.path.splitext(self.embedding_path)[0]
         self.temp_dir_name = block_data_name + '_tmp'
 
     def state(self):
         return {
             'embed_data': self.embed_data,
-            'meta_data': self.meta_data,
+            #'meta_data': self.meta_data,
         }
 
     def clear(self):
@@ -50,26 +51,28 @@ class BlockData(object):
 
         if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
             print("\n> Unpickling BlockData", flush=True)
-        state_dict = pickle.load(open(self.block_data_path, 'rb'))
+        state_dict = pickle.load(open(self.embedding_path, 'rb'))
         if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
             print(">> Finished unpickling BlockData\n", flush=True)
 
         self.embed_data = state_dict['embed_data']
-        self.meta_data = state_dict['meta_data']
+        #self.meta_data = state_dict['meta_data']
 
-    def add_block_data(self, block_indices, block_embeds, block_metas, allow_overwrite=False):
+    #def add_block_data(self, block_indices, block_embeds, block_metas, allow_overwrite=False):
+    def add_block_data(self, row_id, block_embeds, allow_overwrite=False):
         """Add data for set of blocks
-        :param block_indices: 1D array of unique int ids for the blocks
+        :param row_id: 1D array of unique int ids for the blocks
         :param block_embeds: 2D array of embeddings of the blocks
-        :param block_metas: 2D array of metadata for the blocks.
+        #:param block_metas: 2D array of metadata for the blocks.
             In the case of REALM this will be [start_idx, end_idx, doc_idx]
         """
-        for idx, embed, meta in zip(block_indices, block_embeds, block_metas):
+        #for idx, embed, meta in zip(block_indices, block_embeds, block_metas):
+        for idx, embed in zip(row_id, block_embeds):
             if not allow_overwrite and idx in self.embed_data:
                 raise ValueError("Unexpectedly tried to overwrite block data")
 
             self.embed_data[idx] = np.float16(embed)
-            self.meta_data[idx] = meta
+            #self.meta_data[idx] = meta
 
     def save_shard(self):
         """Save the block data that was created this in this process"""
@@ -77,8 +80,8 @@ class BlockData(object):
             os.makedirs(self.temp_dir_name, exist_ok=True)
 
         # save the data for each shard
-        with open('{}/{}.pkl'.format(self.temp_dir_name, self.rank), 'wb') as data_file:
-            pickle.dump(self.state(), data_file)
+        with open('{}/{}.pkl'.format(self.temp_dir_name, self.rank), 'wb') as writer:
+            pickle.dump(self.state(), writer)
 
     def merge_shards_and_save(self):
         """Combine all the shards made using self.save_shard()"""
@@ -98,13 +101,13 @@ class BlockData(object):
 
                 # add the shard's data and check to make sure there is no overlap
                 self.embed_data.update(data['embed_data'])
-                self.meta_data.update(data['meta_data'])
+                #self.meta_data.update(data['meta_data'])
                 assert len(self.embed_data) == old_size + shard_size
 
         assert seen_own_shard
 
         # save the consolidated shards and remove temporary directory
-        with open(self.block_data_path, 'wb') as final_file:
+        with open(self.embedding_path, 'wb') as final_file:
             pickle.dump(self.state(), final_file)
         shutil.rmtree(self.temp_dir_name, ignore_errors=True)
 
