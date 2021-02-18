@@ -13,6 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Deduplicate downstream tasks from training dataset. 13-grams have been used.
+All split documents with less than 200 characters got filtered. Any document
+with more than 10 splits got filtered as well.
+"""
+
 from functools import partial
 import json
 import multiprocessing
@@ -23,6 +29,7 @@ import sys
 import time
 
 def get_words(text):
+    # get all the lowercase words from text
     words, positions = [], []
     for match in re.finditer(r'\w+', text.lower()):
         words.append(match.group(0))
@@ -31,6 +38,8 @@ def get_words(text):
 
 def free_ngram(line, ngrams, ngram_size, filter_text_len, 
     splits_count, split_window_each_size):
+    # remove all the ngrams
+
     try:
         myjson = json.loads(line)
         text_buf = [myjson['text']]
