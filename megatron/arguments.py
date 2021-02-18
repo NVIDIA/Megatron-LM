@@ -70,7 +70,7 @@ def parse_args(extra_args_provider=None, defaults={},
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
-        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
@@ -116,6 +116,18 @@ def parse_args(extra_args_provider=None, defaults={},
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
+            'number of layers is not divisible by number of layers per virtual ' \
+            'pipeline stage'
+        args.virtual_pipeline_model_parallel_size = \
+            (args.num_layers // args.pipeline_model_parallel_size) // \
+            args.num_layers_per_virtual_pipeline_stage
+        assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+            'global batch size is not divisible by pipeline parallel size when ' \
+            'using interleaved schedule'
+    else:
+        args.virtual_pipeline_model_parallel_size = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -202,7 +214,23 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-   
+
+    # custom kernel constraints check
+    seq_len = args.seq_length
+    attn_batch_size = \
+        (args.num_attention_heads / args.tensor_model_parallel_size) * \
+        args.micro_batch_size
+
+    # constraints on sequence length and attn_batch_size to enable warp based
+    # optimization and upper triangular optimization (for causal mask)
+    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
+        seq_len % 4 == 0 and attn_batch_size % 4 == 0
+
+    if args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion:
+        print('WARNING: constraints for invoking optimized'
+            ' fused softmax kernel are not met. We default back to unfused'
+            ' kernel invocations.')
+
     # Load scaled_masked_softmax_fusion_kernels
     if args.masked_softmax_fusion:
         fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
@@ -478,9 +506,9 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', type=int, default=None,
                        help='Number of iterations between checkpoint saves.')
-    group.add_argument('--no-save-optim', action='store_true',
+    group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
-    group.add_argument('--no-save-rng', action='store_true',
+    group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
@@ -541,6 +569,8 @@ def _add_distributed_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
+    group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of layers per virtual pipeline stage')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -548,6 +578,9 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
