@@ -21,12 +21,12 @@ import sys
 import numpy as np
 
 import torch
-from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from megatron import (get_args,
                       mpu,
                       print_rank_0,
-                      update_num_microbatches)
+                      update_num_microbatches,
+                      utils)
 
 _CHECKPOINT_VERSION = None
 
@@ -111,8 +111,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
-    if isinstance(model, torchDDP):
-        model = model.module
+    model = utils.unwrap_model(model)
 
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
@@ -124,7 +123,12 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
-        state_dict['model'] = model.state_dict_for_save_checkpoint()
+        if len(model) == 1:
+            state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+        else:
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
 
         # Optimizer stuff.
         if not args.no_save_optim:
@@ -211,8 +215,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    if isinstance(model, torchDDP):
-        model = model.module
+    model = utils.unwrap_model(model)
+
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
@@ -297,7 +301,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
-    model.load_state_dict(state_dict['model'], strict=strict)
+    if len(model) == 1:
+        model[0].load_state_dict(state_dict['model'], strict=strict)
+    else:
+        for i in range(len(model)):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering
     if get_checkpoint_version() < 2.0:
@@ -370,8 +379,7 @@ def load_ict_checkpoint(model, only_query_model=False, only_block_model=False, f
 
     args = get_args()
 
-    if isinstance(model, torchDDP):
-        model = model.module
+    model = utils.unwrap_model(model)
 
     load_path = args.load if from_realm_chkpt else args.ict_load
 

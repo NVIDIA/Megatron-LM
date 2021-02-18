@@ -70,7 +70,7 @@ def parse_args(extra_args_provider=None, defaults={},
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
-        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
@@ -116,6 +116,18 @@ def parse_args(extra_args_provider=None, defaults={},
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
+            'number of layers is not divisible by number of layers per virtual ' \
+            'pipeline stage'
+        args.virtual_pipeline_model_parallel_size = \
+            (args.num_layers // args.pipeline_model_parallel_size) // \
+            args.num_layers_per_virtual_pipeline_stage
+        assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
+            'global batch size is not divisible by pipeline parallel size when ' \
+            'using interleaved schedule'
+    else:
+        args.virtual_pipeline_model_parallel_size = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -557,6 +569,8 @@ def _add_distributed_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
+    group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of layers per virtual pipeline stage')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -564,6 +578,9 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,

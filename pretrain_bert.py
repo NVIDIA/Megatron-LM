@@ -38,7 +38,7 @@ def model_provider():
 
     args = get_args()
     num_tokentypes = 2 if args.bert_binary_head else 0
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
+    def model_provider_pipelined():
         # Determine model based on position of stage in pipeline.
         if mpu.is_pipeline_first_stage():
             model = BertModelFirstStage(
@@ -51,6 +51,17 @@ def model_provider():
         else:
             model = BertModelIntermediateStage(
                 num_tokentypes=num_tokentypes)
+        return model
+
+    args = get_args()
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if args.virtual_pipeline_model_parallel_size is not None:
+            model = []
+            for i in range(args.virtual_pipeline_model_parallel_size):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                model.append(model_provider_pipelined())
+        else:
+            model = model_provider_pipelined()
     else:
         model = BertModel(
             num_tokentypes=num_tokentypes,
@@ -92,8 +103,8 @@ def forward_step(data_iterator, model, input_tensor):
 
     # Get the batch.
     timers('batch-generator').start()
-    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask \
-        = get_batch(data_iterator)
+    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
+        data_iterator)
     timers('batch-generator').stop()
 
     if not args.bert_binary_head:
