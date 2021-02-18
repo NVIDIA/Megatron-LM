@@ -19,7 +19,7 @@ import sys
 
 
 def is_similar(jaccard_similarity):
-    return (js >= 0.9)
+    return (jaccard_similarity >= 0.7)
 
 
 if __name__ == '__main__':

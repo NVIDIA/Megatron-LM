@@ -44,3 +44,12 @@ python remove_group_duplicates.py <file containing simialr documents> <cleaned d
 shuf <cleaned deduped data file> -o train_data.json
 ```
 
+# Deduplicating ngrams
+
+To deduplicate the downstream tasks from the training dataset, we run the following command.
+
+```
+python filter_ngrams.py <down stream task dataset> <training dataset to deduplicate> <output training dataset>
+```
+
+We use 13-grams for the deduplication. When we find a 13-gram match in a training document, we split the document into two pieces and remove the 13-gram along with 200 characters from the both side of the 13-gram. We also remove any splitted document with less than 200 characters or if a document got splitted more than 10 times.
