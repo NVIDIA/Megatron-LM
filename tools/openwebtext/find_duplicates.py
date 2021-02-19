@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+import argparse
 import itertools
 import json
 from lsh import cache, minhash
 import time
+import pickle
 import sys
 
 
@@ -38,36 +39,73 @@ def jaccard(set_a, set_b):
 
 if __name__ == '__main__':
 
-    print('finding possible duplicate content ...')
+    print('parsing the inputs ...')
 
-    input = sys.argv[1]
-    output = sys.argv[2]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--inputs', nargs = '*', default=None, help = 'List of '
+                        'the input files')
+    parser.add_argument('--load-fingerprints', type=str, default=None,
+                       help='Load the fingerprints from pickle file.')
+    parser.add_argument('--save-fingerprints', type=str, default=None,
+                       help='Save the fingerprints of the inputs.')
+    parser.add_argument('--output', type=str,
+                       help='Output file name.')
+    args = parser.parse_args()
+
+    print('finding possible duplicate content ...')
 
     hasher = minhash.MinHasher(seeds=100, char_ngram=5, hashbytes=4)
     lshcache = cache.Cache(bands=10, hasher=hasher)
 
-    counter = 0
     url_doc = {}
+
+    # load fingerprints from pickle file if needed
+    if args.load_fingerprints is not None:
+        print("Loading fingerprints from pickle file {}".format(
+            args.load_fingerprints), flush=True)
+        with open(args.load_fingerprints, "rb") as f:
+            lshcache = pickle.load(f)
+            url_doc = pickle.load(f)
+
+    counter = 0
     start_time = time.time()
-    with open(input, 'r') as f:
-        for line in f:
-            try:
-                myjson = json.loads(line)
-                url = myjson['url']
-                text = myjson['text']
-                counter += 1
-                url_doc[url] = text
-                lshcache.add_fingerprint(hasher.fingerprint(text), url)
-            except Exception as e:
-                print('Error:', e)
-            if counter % 10000 == 0:
-                print(' [read]> processed {} documents in {:.2f} seconds ...'.
-                      format(counter, time.time() - start_time), flush=True)
+
+    print("Computing fingerprints", flush=True)
+
+    input_pairs = 0 if args.inputs is None else int(len(args.inputs)/2)
+    for i in range(input_pairs):
+        input_file = args.inputs[2 * i]
+        key = args.inputs[2 * i + 1]
+        print(' document processing {} with key {}'.format(input_file, key),
+            flush=True)
+        with open(input_file, 'r') as f:
+            for line in f:
+                try:
+                    myjson = json.loads(line)
+                    url = myjson[key]
+                    text = myjson['text']
+                    counter += 1
+                    url_doc[url] = text
+                    lshcache.add_fingerprint(hasher.fingerprint(text), url)
+                except Exception as e:
+                    print('Error:', e)
+                if counter % 10000 == 0:
+                    print(' [read]> processed {} documents in {:.2f} '
+                        'seconds ...'.format(counter, time.time() - \
+                        start_time), flush=True)
+
+    # Save the fingerprints if needed
+    if args.save_fingerprints is not None:
+        print("Saving fingerprints to pickle file {}".format(
+            args.save_fingerprints), flush=True)
+        with open(args.save_fingerprints, 'wb') as f:
+            pickle.dump(lshcache, f)
+            pickle.dump(url_doc, f)
 
     counter = 0
     start_time = time.time()
     deduped = 0
-    with open(output, 'wb') as f:
+    with open(args.output, 'wb') as f:
         for b in lshcache.bins:
             for bucket_id in b:
                 if len(b[bucket_id]) > 1:
