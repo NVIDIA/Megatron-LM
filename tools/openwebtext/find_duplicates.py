@@ -17,10 +17,10 @@ import argparse
 import itertools
 import json
 from lsh import cache, minhash
+import numpy as np
 import time
 import pickle
 import sys
-
 
 # This function is adapted from:
 #   https://github.com/mattilyra/LSH/blob/master/examples/Introduction.ipynb
@@ -42,45 +42,68 @@ if __name__ == '__main__':
     print('parsing the inputs ...')
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--inputs', nargs = '*', default=None, help = 'Pairwise'
-                        ' list of the input files and keys, e.g. --inputs '
-                        ' cc.json cc_id news.json news_id')
-    parser.add_argument('--load-fingerprints', type=str, default=None,
-                       help='Load the fingerprints from pickle file.')
+    parser.add_argument('--inputs', nargs = '*', default=None, help = \
+                        'Pairwise list of the input files and keys, '
+                        'e.g. --inputs cc.json cc_id news.json news_id')
+    parser.add_argument('--load-fingerprints', nargs = '*', default=None,
+                       help='Load fingerprints from a list of pickle files,'
+                        ' e.g. cc.pkl news.pkl')
     parser.add_argument('--save-fingerprints', type=str, default=None,
                        help='Save the fingerprints of the inputs.')
-    parser.add_argument('--output', type=str,
-                       help='Output file name.')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output file name that consists of all ids'
+                        ' with matching similarities')
     args = parser.parse_args()
 
     print('finding possible duplicate content ...')
 
-    hasher = minhash.MinHasher(seeds=100, char_ngram=5, hashbytes=4)
+    # set seed and get an array of seeds of 100 integers
+    np.random.seed(1234)
+    seeds = np.random.randint(0, 1e6, size=100)
+
+    # initialize minhash and lsh cache
+    hasher = minhash.MinHasher(seeds=seeds, char_ngram=5, hashbytes=4)
     lshcache = cache.Cache(bands=10, hasher=hasher)
 
     url_doc = {}
 
     # load fingerprints from pickle file if needed
     if args.load_fingerprints is not None:
-        print("Loading fingerprints from pickle file {}".format(
-            args.load_fingerprints), flush=True)
-        with open(args.load_fingerprints, "rb") as f:
-            lshcache = pickle.load(f)
-            url_doc = pickle.load(f)
+        count_fingerprints = len(args.load_fingerprints)
+
+        for count_fp in range(count_fingerprints):
+            fp_file_name = args.load_fingerprints[count_fp]
+            print("Loading fingerprints from pickle file {}".format(
+                fp_file_name), flush=True)
+            fp = open(fp_file_name, "rb")
+            if count_fp == 0:
+                # assign directory for the first pkl
+                lshcache = pickle.load(fp)
+                url_doc = pickle.load(fp)
+            else:
+                # append these to lshcache and url_doc
+                local_lshcache = pickle.load(fp)
+                local_url_doc = pickle.load(fp)
+                for url in local_lshcache.fingerprints.keys():
+                    url_doc[url] = local_url_doc[url]
+                    lshcache.add_fingerprint(local_lshcache.fingerprints[url], url)
 
     counter = 0
     start_time = time.time()
 
     print("Computing fingerprints", flush=True)
 
+    # compute finger prints of the inputs if any
     input_pairs = 0 if args.inputs is None else int(len(args.inputs)/2)
-    for i in range(input_pairs):
-        input_file = args.inputs[2 * i]
-        key = args.inputs[2 * i + 1]
+    for input_pair in range(input_pairs):
+        # input file and the key to use as id
+        input_file = args.inputs[2 * input_pair]
+        key = args.inputs[2 * input_pair + 1]
         print(' document processing {} with key {}'.format(input_file, key),
             flush=True)
-        with open(input_file, 'r') as f:
-            for line in f:
+        # traverse all the texts and add fingerprints
+        with open(input_file, 'r') as f_input:
+            for line in f_input:
                 try:
                     myjson = json.loads(line)
                     url = myjson[key]
@@ -99,14 +122,16 @@ if __name__ == '__main__':
     if args.save_fingerprints is not None:
         print("Saving fingerprints to pickle file {}".format(
             args.save_fingerprints), flush=True)
-        with open(args.save_fingerprints, 'wb') as f:
-            pickle.dump(lshcache, f)
-            pickle.dump(url_doc, f)
+        with open(args.save_fingerprints, 'wb') as f_save:
+            pickle.dump(lshcache, f_save)
+            pickle.dump(url_doc, f_save)
 
     counter = 0
     start_time = time.time()
     deduped = 0
-    with open(args.output, 'wb') as f:
+    # compute jaccard index of the input texts and write to file if needed
+    if args.output is not None:
+        f_out = open(args.output, 'wb')
         for b in lshcache.bins:
             for bucket_id in b:
                 if len(b[bucket_id]) > 1:
@@ -133,7 +158,7 @@ if __name__ == '__main__':
                     if len(remove_urls) > 0:
                         myjson = json.dumps({main_url: remove_urls},
                                             ensure_ascii=False)
-                        f.write(myjson.encode('utf-8'))
-                        f.write('\n'.encode('utf-8'))
+                        f_out.write(myjson.encode('utf-8'))
+                        f_out.write('\n'.encode('utf-8'))
 
     print('done :-)')
