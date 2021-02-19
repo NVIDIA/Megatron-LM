@@ -18,6 +18,7 @@
 import sys
 
 import torch
+from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
@@ -26,9 +27,23 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
-from megatron.checkpointing import save_checkpoint
 from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+
+
+def unwrap_model(model, module_instances=(torchDDP)):
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model
 
 
 def calc_params_l2_norm(model):
@@ -106,6 +121,8 @@ def print_params_min_max_norm(optimizer, iteration):
 def check_adlr_autoresume_termination(iteration, model,
                                       optimizer, lr_scheduler):
     """Check for autoresume signal and exit if it is received."""
+    from megatron.checkpointing import save_checkpoint
+
     args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
