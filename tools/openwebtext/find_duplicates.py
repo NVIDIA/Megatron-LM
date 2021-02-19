@@ -42,8 +42,9 @@ if __name__ == '__main__':
     print('parsing the inputs ...')
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--inputs', nargs = '*', default=None, help = 'List of '
-                        'the input files')
+    parser.add_argument('--inputs', nargs = '*', default=None, help = 'Pairwise'
+                        ' list of the input files and keys, e.g. --inputs '
+                        ' cc.json cc_id news.json news_id')
     parser.add_argument('--load-fingerprints', type=str, default=None,
                        help='Load the fingerprints from pickle file.')
     parser.add_argument('--save-fingerprints', type=str, default=None,
