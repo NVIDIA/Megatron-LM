@@ -383,42 +383,42 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     return iteration
 
 
-def load_ict_checkpoint(model, only_query_model=False, only_context_model=False, from_realm_chkpt=False):
-    """selectively load ICT models for indexing/retrieving from ICT or REALM checkpoints"""
+def load_biencoder_checkpoint(model, only_query_model=False,
+        only_context_model=False, custom_load_path=None):
+    """
+    selectively load retrieval models for indexing/retrieving 
+    from saved checkpoints
+    """
 
     args = get_args()
 
     model = utils.unwrap_model(model)
 
-    load_path = args.load if from_realm_chkpt else args.ict_load
+    load_path = custom_load_path if custom_load_path is not None else args.load
 
     tracker_filename = get_checkpoint_tracker_filename(load_path)
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
-    # assert iteration > 0
     checkpoint_name = get_checkpoint_name(load_path, iteration, False)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
     state_dict = torch.load(checkpoint_name, map_location='cpu')
-    ict_state_dict = state_dict['model']
-    print(ict_state_dict)
-    sys.exit()
-    if from_realm_chkpt and mpu.get_data_parallel_rank() == 0:
-        print(" loading ICT state dict from REALM", flush=True)
-        ict_state_dict = ict_state_dict['retriever']['ict_model']
+    ret_state_dict = state_dict['model']
 
     if only_query_model:
-        ict_state_dict.pop('context_model')
+        ret_state_dict.pop('context_model')
     if only_context_model:
-        ict_state_dict.pop('query_model')
+        ret_state_dict.pop('query_model')
 
-    model.load_state_dict(ict_state_dict)
+    assert len(model) == 1
+    model[0].load_state_dict(ret_state_dict)
     torch.distributed.barrier()
 
     if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
+

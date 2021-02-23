@@ -15,11 +15,12 @@ def detach(tensor):
 
 
 class OpenRetreivalDataStore(object):
-    """Serializable data structure for holding data for blocks -- embeddings 
-    and necessary metadata for Retriever"""
+    """
+    Serializable data structure for holding data for blocks --
+    embeddings and necessary metadata for Retriever
+    """
     def __init__(self, embedding_path=None, load_from_path=True, rank=None):
         self.embed_data = dict()
-        #self.meta_data = dict()
         if embedding_path is None:
             args = get_args()
             embedding_path = args.embedding_path
@@ -36,13 +37,13 @@ class OpenRetreivalDataStore(object):
     def state(self):
         return {
             'embed_data': self.embed_data,
-            #'meta_data': self.meta_data,
         }
 
     def clear(self):
-        """Clear the embedding data structures to save memory.
-        The metadata ends up getting used, and is also much smaller in dimensionality
-        so it isn't really worth clearing.
+        """
+        Clear the embedding data structures to save memory.
+        The metadata ends up getting used, and is also much smaller in
+        dimensionality so it isn't really worth clearing.
         """
         self.embed_data = dict()
 
@@ -56,35 +57,34 @@ class OpenRetreivalDataStore(object):
             print(">> Finished unpickling BlockData\n", flush=True)
 
         self.embed_data = state_dict['embed_data']
-        #self.meta_data = state_dict['meta_data']
 
-    #def add_block_data(self, block_indices, block_embeds, block_metas, allow_overwrite=False):
     def add_block_data(self, row_id, block_embeds, allow_overwrite=False):
-        """Add data for set of blocks
+        """
+        Add data for set of blocks
         :param row_id: 1D array of unique int ids for the blocks
         :param block_embeds: 2D array of embeddings of the blocks
-        #:param block_metas: 2D array of metadata for the blocks.
-            In the case of REALM this will be [start_idx, end_idx, doc_idx]
+            In the case of retriever this will be [start_idx, end_idx, doc_idx]
         """
-        #for idx, embed, meta in zip(block_indices, block_embeds, block_metas):
         for idx, embed in zip(row_id, block_embeds):
             if not allow_overwrite and idx in self.embed_data:
                 raise ValueError("Unexpectedly tried to overwrite block data")
 
             self.embed_data[idx] = np.float16(embed)
-            #self.meta_data[idx] = meta
 
     def save_shard(self):
-        """Save the block data that was created this in this process"""
+        """
+        Save the block data that was created this in this process
+        """
         if not os.path.isdir(self.temp_dir_name):
             os.makedirs(self.temp_dir_name, exist_ok=True)
 
         # save the data for each shard
-        with open('{}/{}.pkl'.format(self.temp_dir_name, self.rank), 'wb') as writer:
+        with open('{}/{}.pkl'.format(self.temp_dir_name, self.rank), 'wb') \
+            as writer:
             pickle.dump(self.state(), writer)
 
     def merge_shards_and_save(self):
-        """Combine all the shards made using self.save_shard()"""
+        #Combine all the shards made using save_shard
         shard_names = os.listdir(self.temp_dir_name)
         seen_own_shard = False
 
@@ -99,9 +99,9 @@ class OpenRetreivalDataStore(object):
                 old_size = len(self.embed_data)
                 shard_size = len(data['embed_data'])
 
-                # add the shard's data and check to make sure there is no overlap
+                # add the shard's data and check to make sure there
+                # is no overlap
                 self.embed_data.update(data['embed_data'])
-                #self.meta_data.update(data['meta_data'])
                 assert len(self.embed_data) == old_size + shard_size
 
         assert seen_own_shard
