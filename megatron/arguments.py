@@ -123,9 +123,6 @@ def parse_args(extra_args_provider=None, defaults={},
         args.virtual_pipeline_model_parallel_size = \
             (args.num_layers // args.pipeline_model_parallel_size) // \
             args.num_layers_per_virtual_pipeline_stage
-        assert args.global_batch_size % args.pipeline_model_parallel_size == 0, \
-            'global batch size is not divisible by pipeline parallel size when ' \
-            'using interleaved schedule'
     else:
         args.virtual_pipeline_model_parallel_size = None
 
