@@ -34,13 +34,11 @@ from .bert_model import (BertModel,
                          BertModelFirstStage,
                          BertModelIntermediateStage,
                          BertModelLastStage)
-from .realm_model import ICTBertModel
 from .gpt_model import (GPTModel,
                         GPTModelFirstStage,
                         GPTModelIntermediateStage,
                         GPTModelLastStage)
 from .language_model import get_language_model
 from .module import FP16Module
-from .realm_model import ICTBertModel
 
 
