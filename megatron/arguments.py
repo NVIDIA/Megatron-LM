@@ -223,7 +223,7 @@ def parse_args(extra_args_provider=None, defaults={},
     custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
         seq_len % 4 == 0 and attn_batch_size % 4 == 0
 
-    if args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion:
+    if not (args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion):
         print('WARNING: constraints for invoking optimized'
             ' fused softmax kernel are not met. We default back to unfused'
             ' kernel invocations.')
