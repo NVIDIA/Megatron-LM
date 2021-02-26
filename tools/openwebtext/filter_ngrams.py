@@ -284,7 +284,7 @@ if __name__ == '__main__':
     dedup_key = args.dedup_dataset[1]
 
     # Setup multi-processing.
-    num_workers = 1 #40
+    num_workers = 40
     fin = open(dedup_file, 'r', encoding='utf-8')
     pool = multiprocessing.Pool(num_workers)
     free_ngram_x=partial(free_ngram, args=args, key=dedup_key, ngrams=ngrams, \
