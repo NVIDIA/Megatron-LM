@@ -362,11 +362,6 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
     num_microbatches_remaining = \
         num_microbatches - num_warmup_microbatches
 
-    # Measure pipeline stall only if there are enough microbatches
-    # to have every worker in a warmup and steady state phase.
-    measure_pipeline_stall = get_num_microbatches() >= \
-        mpu.get_pipeline_model_parallel_world_size()
-
     input_tensors = []
     output_tensors = []
     losses_reduced = []
@@ -376,21 +371,10 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
         input_tensor = p2p_communication.recv_forward(timers)
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
-        # Barrier before first receive to measure forward stall.
-        if i == (num_warmup_microbatches - 1) and measure_pipeline_stall:
-            timers('forward-pipeline-stall').start()
-            torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-            timers('forward-pipeline-stall').stop()
         p2p_communication.send_forward(output_tensor, timers)
 
         input_tensors.append(input_tensor)
         output_tensors.append(output_tensor)
-
-    # Barrier before first receive to measure forward stall.
-    if num_warmup_microbatches == 0 and measure_pipeline_stall:
-        timers('forward-pipeline-stall').start()
-        torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-        timers('forward-pipeline-stall').stop()
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to

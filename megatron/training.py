@@ -356,11 +356,6 @@ def train_step(forward_step_func, data_iterator,
                                           fp32_allreduce=args.fp32_allreduce)
         timers('backward-params-all-reduce').stop()
 
-    # Barrier to measure backward stall.
-    timers('backward-pipeline-stall').start()
-    torch.distributed.barrier(group=mpu.get_pipeline_model_parallel_group())
-    timers('backward-pipeline-stall').stop()
-
     # All-reduce word_embeddings' grad across first and last stages to ensure
     # that word_embeddings parameters stay in sync.
     # This should only run for models that support pipelined model parallelism
@@ -451,12 +446,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if name in timers.timers:
             timers_to_log.append(name)
     add_to_logging('forward-compute')
-    add_to_logging('forward-pipeline-stall')
     add_to_logging('forward-recv')
     add_to_logging('forward-send')
     add_to_logging('forward-backward-send-forward-backward-recv')
     add_to_logging('backward-compute')
-    add_to_logging('backward-pipeline-stall')
     add_to_logging('backward-recv')
     add_to_logging('backward-send')
     add_to_logging('backward-send-forward-recv')
