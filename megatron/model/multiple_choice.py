@@ -28,13 +28,18 @@ from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
 
-class MultipleChoiceBase(MegatronModule):
+class MultipleChoice(MegatronModule):
 
-    def __init__(self, num_tokentypes=2):
-        super(MultipleChoiceBase, self).__init__(share_word_embeddings=False)
+    def __init__(self, 
+                 num_tokentypes=2,
+                 pre_process=True,
+                 post_process=True):
+        super(MultipleChoice, self).__init__(share_word_embeddings=False)
         args = get_args()
 
         init_method = init_method_normal(args.init_method_std)
+        self.pre_process = pre_process
+        self.post_process = post_process
 
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
@@ -42,14 +47,19 @@ class MultipleChoiceBase(MegatronModule):
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers))
+                                                         args.num_layers),
+            pre_process=self.pre_process,
+            post_process=self.post_process)
 
         # Multi-choice head.
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             self.multichoice_dropout = torch.nn.Dropout(args.hidden_dropout)
             self.multichoice_head = get_linear_layer(args.hidden_size, 1,
                                                      init_method)
             self._multichoice_head_key = 'multichoice_head'
+
+    def set_input_tensor(self, input_tensor)
+        self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, model_input, attention_mask, tokentype_ids=None):
 
@@ -64,22 +74,21 @@ class MultipleChoiceBase(MegatronModule):
         attention_mask = attention_mask.view(-1, attention_mask.size(-1))
         extended_attention_mask = bert_extended_attention_mask(attention_mask)
 
-        kwargs = {}
-        if mpu.is_pipeline_first_stage():
-            input_ids = model_input
-            # Do the same as attention_mask for input_ids, tokentype_ids
-            assert len(input_ids.shape) == 3
-            assert len(tokentype_ids.shape) == 3
-            input_ids = input_ids.view(-1, input_ids.size(-1))
-            tokentype_ids = tokentype_ids.view(-1, tokentype_ids.size(-1))
+        input_ids = model_input
+        # Do the same as attention_mask for input_ids, tokentype_ids
+        assert len(input_ids.shape) == 3
+        assert len(tokentype_ids.shape) == 3
+        input_ids = input_ids.view(-1, input_ids.size(-1))
+        tokentype_ids = tokentype_ids.view(-1, tokentype_ids.size(-1))
+        position_ids = bert_position_ids(input_ids)
 
-            position_ids = bert_position_ids(input_ids)
-            args = [input_ids, position_ids, extended_attention_mask]
-            kwargs['tokentype_ids'] = tokentype_ids
-        else:
-            args = [model_input, extended_attention_mask]
-        lm_output = self.language_model(*args, **kwargs)
-        if mpu.is_pipeline_last_stage():
+        lm_output = self.language_model(
+            input_ids,
+            position_ids,
+            extended_attention_mask,
+            tokentype_ids=tokentype_ids
+        )
+        if self.post_process:
             _, pooled_output = lm_output
             multichoice_output = self.multichoice_dropout(pooled_output)
             multichoice_logits = self.multichoice_head(multichoice_output)
@@ -99,7 +108,7 @@ class MultipleChoiceBase(MegatronModule):
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             state_dict_[self._multichoice_head_key] \
                 = self.multichoice_head.state_dict(
                     destination, prefix, keep_vars)
@@ -110,7 +119,7 @@ class MultipleChoiceBase(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             if self._multichoice_head_key in state_dict:
                 self.multichoice_head.load_state_dict(
                     state_dict[self._multichoice_head_key], strict=strict)
@@ -119,53 +128,3 @@ class MultipleChoiceBase(MegatronModule):
                                 'initializing to random'.format(
                                     self._multichoice_head_key))
 
-class MultipleChoice(MultipleChoiceBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(MultipleChoice, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
-        return super(MultipleChoice, self).forward(
-            input_ids,
-            attention_mask,
-            tokentype_ids=tokentype_ids)
-
-
-class MultipleChoiceFirstStage(MultipleChoiceBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(MultipleChoiceFirstStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
-        return super(MultipleChoiceFirstStage, self).forward(
-            input_ids,
-            attention_mask,
-            tokentype_ids=tokentype_ids)
-
-
-class MultipleChoiceIntermediateStage(MultipleChoiceBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(MultipleChoiceIntermediateStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, hidden_state, attention_mask):
-        return super(MultipleChoiceIntermediateStage, self).forward(
-            hidden_state,
-            attention_mask)
-
-
-class MultipleChoiceLastStage(MultipleChoiceBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(MultipleChoiceLastStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, hidden_state, attention_mask):
-        return super(MultipleChoiceLastStage, self).forward(
-            hidden_state,
-            attention_mask)

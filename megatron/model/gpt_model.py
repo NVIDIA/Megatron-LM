@@ -57,14 +57,20 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         return loss
 
 
-class GPTModelBase(MegatronModule):
+class GPTModel(MegatronModule):
     """GPT-2 Language model."""
 
-    def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPTModelBase, self).__init__()
+    def __init__(self,
+                 num_tokentypes=0,
+                 parallel_output=True,
+                 pre_process=True,
+                 post_process=True):
+        super(GPTModel, self).__init__()
         args = get_args()
 
         self.parallel_output = parallel_output
+        self.pre_process = pre_process
+        self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
 
         self.language_model, self._language_model_key = get_language_model(
@@ -73,24 +79,27 @@ class GPTModelBase(MegatronModule):
             encoder_attn_mask_type=AttnMaskType.causal,
             init_method=init_method_normal(args.init_method_std),
             scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers))
+                                                         args.num_layers),
+            pre_process=self.pre_process,
+            post_process=self.post_process)
 
         self.initialize_word_embeddings(init_method_normal)
 
-    def forward(self, gpt_model_input, attention_mask, labels=None,
+    def set_input_tensor(self, input_tensor):
+        self.language_model.set_input_tensor(input_tensor)
+
+    def forward(self, input_ids, position_ids, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None):
 
-        kwargs = {'layer_past': layer_past, 'get_key_value': get_key_value}
-        if mpu.is_pipeline_first_stage():
-            (input_ids, position_ids) = gpt_model_input
-            args = [input_ids, position_ids, attention_mask]
-            kwargs['tokentype_ids'] = tokentype_ids
-        else:
-            args = [gpt_model_input, attention_mask]
-        lm_output = self.language_model(*args, **kwargs)
+        lm_output = self.language_model(
+            input_ids,
+            position_ids,
+            attention_mask,
+            layer_past=layer_past,
+            get_key_value=get_key_value)
 
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
                 self.word_embeddings_weight(),
@@ -109,7 +118,7 @@ class GPTModelBase(MegatronModule):
             = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
         # Save word_embeddings.
-        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
+        if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
                 = self.word_embeddings.state_dict(destination, prefix, keep_vars)
         return state_dict_
@@ -118,79 +127,9 @@ class GPTModelBase(MegatronModule):
         """Customized load."""
 
         # Load word_embeddings.
-        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
+        if self.post_process and not self.pre_process:
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
         self.language_model.load_state_dict(state_dict, strict=strict)
-
-
-class GPTModel(GPTModelBase):
-
-    def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPTModel, self).__init__(
-            num_tokentypes=num_tokentypes,
-            parallel_output=parallel_output)
-
-    def forward(self, input_ids, position_ids, attention_mask, labels=None,
-                tokentype_ids=None, layer_past=None, get_key_value=False,
-                forward_method_parallel_output=None):
-        return super(GPTModel, self).forward(
-            (input_ids, position_ids),
-            attention_mask,
-            labels=labels,
-            tokentype_ids=tokentype_ids,
-            layer_past=layer_past,
-            get_key_value=get_key_value,
-            forward_method_parallel_output=forward_method_parallel_output)
-
-
-class GPTModelFirstStage(GPTModelBase):
-
-    def __init__(self, num_tokentypes=0):
-        super(GPTModelFirstStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, input_ids, position_ids, attention_mask,
-                tokentype_ids=None, layer_past=None, get_key_value=False):
-        return super(GPTModelFirstStage, self).forward(
-            (input_ids, position_ids),
-            attention_mask,
-            tokentype_ids=tokentype_ids,
-            layer_past=layer_past,
-            get_key_value=get_key_value)
-
-
-class GPTModelIntermediateStage(GPTModelBase):
-
-    def __init__(self, num_tokentypes=0):
-        super(GPTModelIntermediateStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, hidden_state, attention_mask,
-                layer_past=None, get_key_value=False):
-        return super(GPTModelIntermediateStage, self).forward(
-            hidden_state,
-            attention_mask,
-            layer_past=layer_past,
-            get_key_value=get_key_value)
-
-
-class GPTModelLastStage(GPTModelBase):
-
-    def __init__(self, num_tokentypes=0, parallel_output=True):
-        super(GPTModelLastStage, self).__init__(
-            num_tokentypes=num_tokentypes,
-            parallel_output=parallel_output)
-
-    def forward(self, hidden_state, attention_mask, labels=None,
-                layer_past=None, get_key_value=False,
-                forward_method_parallel_output=None):
-        return super(GPTModelLastStage, self).forward(
-            hidden_state,
-            attention_mask,
-            labels=labels,
-            layer_past=layer_past,
-            get_key_value=get_key_value,
-            forward_method_parallel_output=forward_method_parallel_output)

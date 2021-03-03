@@ -532,12 +532,16 @@ class ParallelTransformer(MegatronModule):
 
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding):
+                 self_attn_mask_type=AttnMaskType.padding,
+                 pre_process=True, post_process=True):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.input_tensor = None
 
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
@@ -580,7 +584,7 @@ class ParallelTransformer(MegatronModule):
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
@@ -615,6 +619,9 @@ class ParallelTransformer(MegatronModule):
 
         return hidden_states
 
+    def set_input_tensor(self, input_tensor):
+        self.input_tensor = input_tensor
+
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False, encoder_output=None, enc_dec_attn_mask=None):
 
@@ -628,7 +635,7 @@ class ParallelTransformer(MegatronModule):
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
-        if mpu.is_pipeline_first_stage():
+        if self.pre_process:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             # If the input flag for fp32 residual connection is set, convert for float.
             if self.fp32_residual_connection:
@@ -636,10 +643,12 @@ class ParallelTransformer(MegatronModule):
             # Otherwise, leave it as is.
             else:
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
+        else:
+            hidden_states = self.input_tensor
 
         if encoder_output is not None:
              encoder_output = encoder_output.transpose(0, 1).contiguous()
-          
+
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,
                                                        attention_mask,
@@ -664,7 +673,7 @@ class ParallelTransformer(MegatronModule):
                     presents.append(present)
 
         # Final layer norm.
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)

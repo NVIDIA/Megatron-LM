@@ -16,50 +16,28 @@
 """Pretrain GPT"""
 
 import torch
-
+from functools import partial
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import (GPTModel,
-                            GPTModelFirstStage,
-                            GPTModelIntermediateStage,
-                            GPTModelLastStage)
+from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
-def model_provider():
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
-
-    def model_provider_pipelined():
-        # Determine model based on position of stage in pipeline.
-        if mpu.is_pipeline_first_stage():
-            model = GPTModelFirstStage(num_tokentypes=0)
-        elif mpu.is_pipeline_last_stage():
-            model = GPTModelLastStage(
-                num_tokentypes=0, parallel_output=True)
-        else:
-            model = GPTModelIntermediateStage(
-                num_tokentypes=0)
-        return model
-
-    args = get_args()
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        if args.virtual_pipeline_model_parallel_size is not None:
-            model = []
-            for i in range(args.virtual_pipeline_model_parallel_size):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
-                model.append(model_provider_pipelined())
-        else:
-            model = model_provider_pipelined()
-    else:
-        model = GPTModel(num_tokentypes=0, parallel_output=True)
-
+    model = GPTModel(
+        num_tokentypes=0,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process
+    )
     return model
 
 
@@ -94,8 +72,18 @@ def get_batch(data_iterator):
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
+def loss_func(loss_mask, output_tensor):
+    losses = output_tensor.float()
+    loss_mask = loss_mask.view(-1).float()
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
-def forward_step(data_iterator, model, input_tensor):
+    # Reduce loss for logging.
+    averaged_loss = average_losses_across_data_parallel_group([loss])
+
+    return loss, {'lm loss': averaged_loss[0]}
+
+
+def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -106,31 +94,10 @@ def forward_step(data_iterator, model, input_tensor):
         data_iterator)
     timers('batch-generator').stop()
 
-    # Forward pass through the model.
-    if mpu.is_pipeline_first_stage():
-        assert input_tensor is None
-        if mpu.is_pipeline_last_stage():
-            output_tensor = model(tokens, position_ids, attention_mask,
-                                  labels=labels)
-        else:
-            output_tensor = model(tokens, position_ids, attention_mask)
-    elif mpu.is_pipeline_last_stage():
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, attention_mask, labels=labels)
-    else:
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, attention_mask)
+    output_tensor = model(tokens, position_ids, attention_mask,
+                          labels=labels)
 
-    if mpu.is_pipeline_last_stage():
-        losses = output_tensor.float()
-        loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
-        # Reduce loss for logging.
-        averaged_loss = average_losses_across_data_parallel_group([loss])
-
-        return loss, {'lm loss': averaged_loss[0]}
-    return output_tensor
+    return output_tensor, partial(loss_func, loss_mask)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
