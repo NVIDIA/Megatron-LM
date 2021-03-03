@@ -4,9 +4,49 @@ import time
 import numpy as np
 import torch
 
-from megatron import mpu, print_rank_0
-from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
-from megatron import get_args, get_tokenizer, print_rank_0, mpu
+from megatron import get_args, get_tokenizer, mpu, print_rank_0
+from megatron.data.dataset_utils import create_masked_lm_predictions, \
+                                            pad_and_convert_to_numpy
+from megatron.data.data_samplers import MegatronPretrainingSampler
+
+def make_attention_mask(source_block, target_block):
+    """
+    Returns a 2-dimensional (2-D) attention mask
+    :param source_block: 1-D array
+    :param target_block: 1-D array
+    """
+    mask = (target_block[None, :] >= 1) * (source_block[:, None] >= 1)
+    mask = mask.astype(np.int64)
+    # (source_length, target_length)
+    return mask
+
+def get_one_epoch_dataloader(dataset, micro_batch_size=None):
+    """Specifically one epoch to be used in an indexing job."""
+    args = get_args()
+
+    world_size = mpu.get_data_parallel_world_size()
+    rank = mpu.get_data_parallel_rank()
+    if micro_batch_size is None:
+        micro_batch_size = args.micro_batch_size
+    global_batch_size = micro_batch_size * world_size
+    num_workers = args.num_workers
+
+    # Use megatron's sampler with consumed samples set to 0 as
+    # this is only for evaluation and don't intend to resume half way.
+    # Also, set the drop last to false as don't intend to remove
+    # the last batch
+    batch_sampler = MegatronPretrainingSampler(
+        total_samples=len(dataset),
+        consumed_samples=0,
+        micro_batch_size=args.micro_batch_size,
+        data_parallel_rank=mpu.get_data_parallel_rank(),
+        data_parallel_size=mpu.get_data_parallel_world_size(),
+        drop_last=False)
+
+    return torch.utils.data.DataLoader(dataset,
+                                       batch_sampler=batch_sampler,
+                                       num_workers=num_workers,
+                                       pin_memory=True)
 
 
 def get_ict_batch(data_iterator):

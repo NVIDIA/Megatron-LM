@@ -57,7 +57,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 class MegatronPretrainingSampler:
 
     def __init__(self, total_samples, consumed_samples, micro_batch_size,
-                 data_parallel_rank, data_parallel_size):
+                 data_parallel_rank, data_parallel_size, drop_last=True):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
         self.consumed_samples = consumed_samples
@@ -65,6 +65,7 @@ class MegatronPretrainingSampler:
         self.data_parallel_rank = data_parallel_rank
         self.micro_batch_times_data_parallel_size = \
             self.micro_batch_size * data_parallel_size
+        self.drop_last = drop_last
 
         # Sanity checks.
         assert self.total_samples > 0, \
@@ -81,16 +82,25 @@ class MegatronPretrainingSampler:
     def __len__(self):
         return self.total_samples
 
+    def get_start_end_idx(self):
+        start_idx = self.data_parallel_rank * self.micro_batch_size
+        end_idx = start_idx + self.micro_batch_size
+        return start_idx, end_idx
+
     def __iter__(self):
         batch = []
-        # Last batch if not complete will be dropped.
+        # Last batch will be dropped if drop_last is not set False
         for idx in range(self.consumed_samples, self.total_samples):
             batch.append(idx)
             if len(batch) == self.micro_batch_times_data_parallel_size:
-                start_idx = self.data_parallel_rank * self.micro_batch_size
-                end_idx = start_idx + self.micro_batch_size
+                start_idx, end_idx = self.get_start_end_idx()
                 yield batch[start_idx:end_idx]
                 batch = []
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            start_idx, end_idx = self.get_start_end_idx()
+            yield batch[start_idx:end_idx]
 
 
 class MegatronPretrainingRandomSampler:
