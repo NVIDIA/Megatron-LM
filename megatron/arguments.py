@@ -308,6 +308,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-num-zeros-in-grad', action='store_true',
+                       help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,

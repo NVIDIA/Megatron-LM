@@ -27,7 +27,7 @@ from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
 
-from .clip_grads import clip_grad_norm_fp32
+from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
 
 def _zero_grad_group_helper(group, set_to_none):
@@ -65,12 +65,20 @@ class MegatronOptimizer(ABC):
         self.optimizer = optimizer
         assert self.optimizer, 'no optimizer is provided.'
 
-    def clip_grad_norm(self, clip_grad):
+    def get_parameters(self):
         params = []
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 params.append(param)
+        return params
+
+    def clip_grad_norm(self, clip_grad):
+        params = self.get_parameters()
         return clip_grad_norm_fp32(params, clip_grad)
+
+    def count_zeros(self):
+        params = self.get_parameters()
+        return count_zeros_fp32(params)
 
     @abstractmethod
     def zero_grad(self, set_to_none=True):
@@ -131,11 +139,12 @@ class MegatronOptimizer(ABC):
 
 class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
-    def __init__(self, optimizer, grad_scaler, clip_grad):
+    def __init__(self, optimizer, grad_scaler, clip_grad, log_num_zeros_in_grad):
         super(FP16OptimizerWithFP16Params, self).__init__(optimizer)
 
         self.grad_scaler = grad_scaler
         self.clip_grad = clip_grad
+        self.log_num_zeros_in_grad = log_num_zeros_in_grad
 
         # Tensor used to determine if a nan/if has happend.
         # Any non-zero value indicates inf/nan.
@@ -289,7 +298,6 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
     def reload_model_params(self):
         self._copy_model_params_to_main_params()
 
-
     @torch.no_grad()
     def step(self):
 
@@ -311,7 +319,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
         # If we found inf/nan, skip the update.
         if found_inf_flag:
-            return False, None
+            return False, None, None
 
         # Clip the main gradients.
         timers('optimizer-clip-main-grad').start()
@@ -319,6 +327,9 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
+
+        # count the zeros in the grads
+        num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
 
         # Step the optimizer.
         self.optimizer.step()
@@ -329,7 +340,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         timers('optimizer-copy-main-to-model-params').stop()
 
         # Successful update.
-        return True, grad_norm
+        return True, grad_norm, num_zeros_in_grad
 
 
     def state_dict(self):
@@ -370,10 +381,11 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
 class FP32Optimizer(MegatronOptimizer):
 
-    def __init__(self, optimizer, clip_grad):
+    def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad):
 
         super(FP32Optimizer, self).__init__(optimizer)
         self.clip_grad = clip_grad
+        self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self._scale = torch.cuda.FloatTensor([1.0])
 
 
@@ -398,11 +410,14 @@ class FP32Optimizer(MegatronOptimizer):
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
 
+        # count the zeros in the grads
+        num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
+
         # Update parameters.
         self.optimizer.step()
 
         # No overflow for FP32 optimizer.
-        return True, grad_norm
+        return True, grad_norm, num_zeros_in_grad
 
 
     def reload_model_params(self):

@@ -378,7 +378,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer').start()
-    update_successful, grad_norm = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
     # Update learning rate.
@@ -397,13 +397,13 @@ def train_step(forward_step_func, data_iterator,
         for key in losses_reduced[0]:
             losses_reduced_for_key = [x[key] for x in losses_reduced]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-        return loss_reduced, skipped_iter, grad_norm
-    return {}, skipped_iter, grad_norm
+        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm):
+                 grad_norm, params_norm, num_zeros_in_grad):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -492,6 +492,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
+        if num_zeros_in_grad is not None:
+            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
+            writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
+                              args.consumed_train_samples)
         if params_norm is not None:
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
@@ -526,6 +530,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
+        if num_zeros_in_grad is not None:
+            log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
             log_string += ' params norm: {:.3f} |'.format(params_norm)
         log_string += ' number of skipped iterations: {:3d} |'.format(
@@ -581,11 +587,12 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     report_memory_flag = True
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
-        loss_dict, skipped_iter, grad_norm = train_step(forward_step_func,
-                                                        train_data_iterator,
-                                                        model,
-                                                        optimizer,
-                                                        lr_scheduler)
+        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+            train_step(forward_step_func,
+                       train_data_iterator,
+                       model,
+                       optimizer,
+                       lr_scheduler)
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -600,7 +607,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm)
+                                          grad_norm, params_norm, num_zeros_in_grad)
 
         # Autoresume
         if args.adlr_autoresume and \
