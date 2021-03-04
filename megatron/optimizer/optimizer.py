@@ -139,12 +139,12 @@ class MegatronOptimizer(ABC):
 
 class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
-    def __init__(self, optimizer, grad_scaler, clip_grad, log_zeros):
+    def __init__(self, optimizer, grad_scaler, clip_grad, log_num_zeros_in_grad):
         super(FP16OptimizerWithFP16Params, self).__init__(optimizer)
 
         self.grad_scaler = grad_scaler
         self.clip_grad = clip_grad
-        self.log_zeros = log_zeros
+        self.log_num_zeros_in_grad = log_num_zeros_in_grad
 
         # Tensor used to determine if a nan/if has happend.
         # Any non-zero value indicates inf/nan.
@@ -329,7 +329,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
-        num_zeros = self.count_zeros() if self.log_zeros else None
+        num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
 
         # Step the optimizer.
         self.optimizer.step()
@@ -340,7 +340,7 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
         timers('optimizer-copy-main-to-model-params').stop()
 
         # Successful update.
-        return True, grad_norm, num_zeros
+        return True, grad_norm, num_zeros_in_grad
 
 
     def state_dict(self):
@@ -381,11 +381,11 @@ class FP16OptimizerWithFP16Params(MegatronOptimizer):
 
 class FP32Optimizer(MegatronOptimizer):
 
-    def __init__(self, optimizer, clip_grad, log_zeros):
+    def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad):
 
         super(FP32Optimizer, self).__init__(optimizer)
         self.clip_grad = clip_grad
-        self.log_zeros = log_zeros
+        self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self._scale = torch.cuda.FloatTensor([1.0])
 
 
@@ -411,13 +411,13 @@ class FP32Optimizer(MegatronOptimizer):
             grad_norm = self.clip_grad_norm(self.clip_grad)
 
         # count the zeros in the grads
-        num_zeros = self.count_zeros() if self.log_zeros else None
+        num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
 
         # Update parameters.
         self.optimizer.step()
 
         # No overflow for FP32 optimizer.
-        return True, grad_norm, num_zeros
+        return True, grad_norm, num_zeros_in_grad
 
 
     def reload_model_params(self):

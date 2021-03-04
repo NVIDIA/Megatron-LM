@@ -84,7 +84,7 @@ def get_megatron_optimizer(model):
                 hysteresis=args.hysteresis)
         # Megatron optimizer.
         return FP16OptimizerWithFP16Params(optimizer, grad_scaler,
-                                           args.clip_grad, args.log_zeros)
+                                           args.clip_grad, args.log_num_zeros_in_grad)
 
     # FP32.
-    return FP32Optimizer(optimizer, args.clip_grad, args.log_zeros)
+    return FP32Optimizer(optimizer, args.clip_grad, args.log_num_zeros_in_grad)
