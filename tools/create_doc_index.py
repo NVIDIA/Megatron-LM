@@ -1,6 +1,9 @@
+import os
 import sys
-sys.path.append('../')
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                             os.path.pardir)))
 
+from megatron import print_rank_0
 from megatron.indexer import IndexBuilder
 from megatron.initialize import initialize_megatron
 
@@ -23,7 +26,7 @@ def main():
                         args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     index_builder = IndexBuilder()
     index_builder.build_and_save_index()
-
+    print_rank_0("Build and save indices: done!")
 
 if __name__ == "__main__":
     main()

@@ -50,9 +50,9 @@ class MegatronModule(torch.nn.Module):
 
 
     def word_embeddings_weight(self):
-        if mpu.is_pipeline_first_stage():
+        if mpu.is_pipeline_first_stage(ignore_virtual=True):
             return self.language_model.embedding.word_embeddings.weight
-        if mpu.is_pipeline_last_stage():
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
             if not self.share_word_embeddings:
                 raise Exception('word_embeddings_weight() called for last '
                                 'stage, but share_word_embeddings is false')

@@ -39,7 +39,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
-    parser = _add_realm_args(parser)
+    parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
 
@@ -70,7 +70,7 @@ def parse_args(extra_args_provider=None, defaults={},
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
-        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
@@ -116,6 +116,15 @@ def parse_args(extra_args_provider=None, defaults={},
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
+            'number of layers is not divisible by number of layers per virtual ' \
+            'pipeline stage'
+        args.virtual_pipeline_model_parallel_size = \
+            (args.num_layers // args.pipeline_model_parallel_size) // \
+            args.num_layers_per_virtual_pipeline_stage
+    else:
+        args.virtual_pipeline_model_parallel_size = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -214,7 +223,7 @@ def parse_args(extra_args_provider=None, defaults={},
     custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
         seq_len % 4 == 0 and attn_batch_size % 4 == 0
 
-    if args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion:
+    if not (args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion):
         print('WARNING: constraints for invoking optimized'
             ' fused softmax kernel are not met. We default back to unfused'
             ' kernel invocations.')
@@ -559,6 +568,8 @@ def _add_distributed_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
+    group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of layers per virtual pipeline stage')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -566,6 +577,9 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -617,6 +631,12 @@ def _add_data_args(parser):
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
+    group.add_argument('--retriever-seq-length', type=int, default=256,
+                       help='Maximum sequence length for the biencoder model '
+                        ' for retriever')
+    group.add_argument('--sample-rate', type=float, default=1.0,
+                       help='sample rate for training data. Supposed to be 0 '
+                            ' < sample_rate < 1')
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
@@ -657,13 +677,19 @@ def _add_autoresume_args(parser):
     return parser
 
 
-def _add_realm_args(parser):
-    group = parser.add_argument_group(title='realm')
+def _add_biencoder_args(parser):
+    group = parser.add_argument_group(title='biencoder')
 
     # network size
     group.add_argument('--ict-head-size', type=int, default=None,
                        help='Size of block embeddings to be used in ICT and '
-                       'REALM (paper default: 128)')
+                        'REALM (paper default: 128)')
+    group.add_argument('--biencoder-projection-dim', type=int, default=0,
+                       help='Size of projection head used in biencoder (paper'
+                        ' default: 128)')
+    group.add_argument('--biencoder-shared-query-context-model', action='store_true',
+                        help='Whether to share the parameters of the query '
+                        'and context models or not')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
@@ -680,16 +706,25 @@ def _add_realm_args(parser):
                        'ICT dataset')
     group.add_argument('--use-one-sent-docs', action='store_true',
                        help='Whether to use one sentence documents in ICT')
+    group.add_argument('--evidence-data-path', type=str, default=None,
+                       help='Path to Wikipedia Evidence frm DPR paper')
 
     # training
-    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
-                       help="Which top-k accuracies to report (e.g. '1 5 20')")
+    group.add_argument('--retriever-report-topk-accuracies', nargs='+', type=int,
+                        default=[], help="Which top-k accuracies to report "
+                        "(e.g. '1 5 20')")
+    group.add_argument('--retriever-score-scaling', action='store_true',
+                       help='Whether to scale retriever scores by inverse '
+                        'square root of hidden size')
 
     # faiss index
     group.add_argument('--faiss-use-gpu', action='store_true',
                        help='Whether create the FaissMIPSIndex on GPU')
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
+    group.add_argument('--embedding-path', type=str, default=None,
+                       help='Where to save/load Open-Retrieval Embedding'
+                        ' data to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

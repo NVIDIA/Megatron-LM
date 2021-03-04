@@ -35,8 +35,8 @@ def model_provider():
     """Build the model."""
 
     print_rank_0('building GPT model ...')
-    args = get_args()
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
+
+    def model_provider_pipelined():
         # Determine model based on position of stage in pipeline.
         if mpu.is_pipeline_first_stage():
             model = GPTModelFirstStage(num_tokentypes=0)
@@ -46,6 +46,17 @@ def model_provider():
         else:
             model = GPTModelIntermediateStage(
                 num_tokentypes=0)
+        return model
+
+    args = get_args()
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if args.virtual_pipeline_model_parallel_size is not None:
+            model = []
+            for i in range(args.virtual_pipeline_model_parallel_size):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                model.append(model_provider_pipelined())
+        else:
+            model = model_provider_pipelined()
     else:
         model = GPTModel(num_tokentypes=0, parallel_output=True)
 
