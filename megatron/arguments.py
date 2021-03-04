@@ -202,7 +202,23 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-   
+
+    # custom kernel constraints check
+    seq_len = args.seq_length
+    attn_batch_size = \
+        (args.num_attention_heads / args.tensor_model_parallel_size) * \
+        args.micro_batch_size
+
+    # constraints on sequence length and attn_batch_size to enable warp based
+    # optimization and upper triangular optimization (for causal mask)
+    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
+        seq_len % 4 == 0 and attn_batch_size % 4 == 0
+
+    if args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion:
+        print('WARNING: constraints for invoking optimized'
+            ' fused softmax kernel are not met. We default back to unfused'
+            ' kernel invocations.')
+
     # Load scaled_masked_softmax_fusion_kernels
     if args.masked_softmax_fusion:
         fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
@@ -480,9 +496,9 @@ def _add_checkpointing_args(parser):
                        help='Output directory to save checkpoints to.')
     group.add_argument('--save-interval', type=int, default=None,
                        help='Number of iterations between checkpoint saves.')
-    group.add_argument('--no-save-optim', action='store_true',
+    group.add_argument('--no-save-optim', action='store_true', default=None,
                        help='Do not save current optimizer.')
-    group.add_argument('--no-save-rng', action='store_true',
+    group.add_argument('--no-save-rng', action='store_true', default=None,
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
