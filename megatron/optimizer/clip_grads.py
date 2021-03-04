@@ -138,10 +138,8 @@ def count_zeros_fp32(parameters):
             grad = param.grad.detach()
             grads_to_count.append(grad)
 
-    # Norm parameters.
     total_num_zeros = 0.0
 
-    # Calculate norm.
     for grad in grads_to_count:
         num_zeros = grad.numel() - torch.count_nonzero(grad)
         total_num_zeros = num_zeros + total_num_zeros
