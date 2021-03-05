@@ -54,3 +54,5 @@ python filter_ngrams.py --tasks <name of he task, e.g. lambada, squad> --dedup-d
 We use 13-grams for the deduplication. When we find a 13-gram match in a training document, we split the document into two pieces and remove the 13-gram along with 200 characters from the both side of the 13-gram. We also remove any splitted document with less than 200 characters or if a document got splitted more than 10 times.
 
 Only for the lambada task, we need to provide the path, `--lambada-path <path of the lambada test data>`.
+
+Several other features (e.g. save and load dictionary) have been added, look at the arguments for details.
