@@ -66,7 +66,7 @@ def check_and_clean_text(args, words, ngrams, text, start_position, \
 
     seq = " ".join(words)
     if seq in ngrams:
-        #print(" [matched]: {}".format(seq), flush=True)
+        print(" [matched]: {}".format(seq), flush=True)
 
         if args.get_ngram_freq_only:
             # increase freq of this seq and then only consider the later part
@@ -296,7 +296,7 @@ def compute_ngram_freq_sorted(args, ngrams):
             ngrams_freq_sorted) -1 ][0]), flush=True)
     return ngrams_freq_sorted
 
-def get_ngrams_above_threshold(args, ngrams, ngrams_above_threshold, \
+def get_ngrams_below_threshold(args, ngrams, ngrams_below_threshold, \
     dedup_file, dedup_key, ngrams_freq_sorted):
 
     start_time = time.time()
@@ -329,17 +329,17 @@ def get_ngrams_above_threshold(args, ngrams, ngrams_above_threshold, \
 
     start_time = time.time()
     counter_threshold = 0
-    # Get ngram above theadhold
+    # Get ngram below theadhold
     for local_key, local_val in ngrams.items():
-        if ngrams[local_key] > args.key_threshold:
+        if ngrams[local_key] < args.key_threshold:
             print(" [threshold] {} {}".format(local_key, local_val), flush=True)
             counter_threshold += 1
-            ngrams_above_threshold[local_key] = 1
+            ngrams_below_threshold[local_key] = 1
             
-    print(' Ngrams above threshold {}'.format(counter_threshold), flush=True)
+    print(' Ngrams below threshold {}'.format(counter_threshold), flush=True)
     fin.close()
 
-def clean_ngrams_above_threshold(args, ngrams_above_threshold, dedup_file, \
+def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, \
     dedup_key):
 
     start_time = time.time()
@@ -348,19 +348,19 @@ def clean_ngrams_above_threshold(args, ngrams_above_threshold, dedup_file, \
     id_prefix = '-'.join(args.tasks[::2])
 
     # get the range of the size of the ngrams
-    ngrams_freq_sorted = compute_ngram_freq_sorted(args, ngrams_above_threshold)
+    ngrams_freq_sorted = compute_ngram_freq_sorted(args, ngrams_below_threshold)
 
     # Open the large file to process in parallel
+    counter = splitted = ignored = split_mt_thld = trimmed_count = 0
     num_workers = 40
     pool = multiprocessing.Pool(num_workers)
     fin = open(dedup_file, 'r', encoding='utf-8')
     free_ngram_clean_partial=partial(free_ngram, args=args, key=dedup_key, \
-        ngrams=ngrams_above_threshold, ngrams_freq_sorted=ngrams_freq_sorted)
+        ngrams=ngrams_below_threshold, ngrams_freq_sorted=ngrams_freq_sorted)
     free_ngrams_clean = pool.imap(free_ngram_clean_partial, fin, 500)
  
     out_f = open(args.output, 'wb')
 
-    counter = splitted = ignored = split_mt_thld = trimmed_count = 0
     for text_buf_ngram_free, trimmed, _ in free_ngrams_clean:
         counter += 1
         try:
@@ -460,22 +460,22 @@ if __name__ == '__main__':
         ngrams_freq_sorted = compute_ngram_freq_sorted(args, ngrams)
 
         # get ngram freq from large file in parallel
-        # get ngrams above threshold
-        ngrams_above_threshold = {}
-        get_ngrams_above_threshold(args, ngrams, ngrams_above_threshold, \
+        # get ngrams below threshold
+        ngrams_below_threshold = {}
+        get_ngrams_below_threshold(args, ngrams, ngrams_below_threshold, \
             dedup_file, dedup_key, ngrams_freq_sorted)
 
         # save the dictionary if needed
         if args.save_dictionary is not None:
             with open(args.save_dictionary, 'wb') as save_dict_handle:
-                pickle.dump(ngrams_above_threshold, save_dict_handle)
+                pickle.dump(ngrams_below_threshold, save_dict_handle)
     else:
         with open(args.load_dictionary, 'rb') as load_dict_handle:
-            ngrams_above_threshold = pickle.load(load_dict_handle)
+            ngrams_below_threshold = pickle.load(load_dict_handle)
 
     # filter the large file
     if args.output is not None:
-        clean_ngrams_above_threshold(args, ngrams_above_threshold, \
+        clean_ngrams_below_threshold(args, ngrams_below_threshold, \
             dedup_file, dedup_key)
 
     print('done :-)')
