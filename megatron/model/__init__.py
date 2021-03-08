@@ -16,11 +16,13 @@
 _LAYER_NORM = None
 
 
-def import_layernorm(fp32_residual_connection):
+def import_layernorm(fp32_residual_connection, bf16):
 
     global _LAYER_NORM
     if not _LAYER_NORM:
-        if fp32_residual_connection:
+        if bf16:
+            from torch.nn import LayerNorm
+        elif fp32_residual_connection:
             from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
         else:
             from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
@@ -39,6 +41,6 @@ from .gpt_model import (GPTModel,
                         GPTModelIntermediateStage,
                         GPTModelLastStage)
 from .language_model import get_language_model
-from .module import FP16Module
+from .module import Float16Module
 
 

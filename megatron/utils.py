@@ -48,13 +48,20 @@ def unwrap_model(model, module_instances=(torchDDP)):
 
 def calc_params_l2_norm(model):
     """Calculate l2 norm of parameters """
+    args = get_args()
+    if not isinstance(model, list):
+        model = [model]
     # Remove duplicate params.
     params_data = []
-    for param in model.parameters():
-        is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-        if is_not_shared and is_not_tp_duplicate:
-            params_data.append(param.data)
+    for model_ in model:
+        for param in model_.parameters():
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            if is_not_shared and is_not_tp_duplicate:
+                if args.bf16:
+                    params_data.append(param.data.float())
+                else:
+                    params_data.append(param.data)
     # Calculate norm
     dummy_overflow_buf = torch.cuda.IntTensor([0])
     norm, _ = multi_tensor_applier(
