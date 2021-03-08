@@ -181,7 +181,7 @@ def free_ngram(line, args, key, ngrams, ngrams_freq_sorted):
         len(text_buf_ngram_free[0]) < len(myjson[key]):
         trimmed = 1
 
-    return text_buf_ngram_free, trimmed, local_ngram
+    return text_buf_ngram_free, trimmed, myjson, local_ngram
 
 # insert word sequence into dictionary
 def insert_dict(words, ngrams, pos):
@@ -312,7 +312,7 @@ def get_ngrams_below_threshold(args, ngrams, ngrams_below_threshold, \
     free_ngrams_abt = pool.imap(free_ngram_abt_partial, fin, 500)
  
     counter = 0
-    for _, _, local_ngram in free_ngrams_abt:
+    for _, _, _, local_ngram in free_ngrams_abt:
         counter += 1
         if counter % 1000 == 0:
             print(' [compute_stat]> processed {} documents in {:.2f} seconds ...'.
@@ -361,7 +361,7 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, \
  
     out_f = open(args.output, 'wb')
 
-    for text_buf_ngram_free, trimmed, _ in free_ngrams_clean:
+    for text_buf_ngram_free, trimmed, myjson, _ in free_ngrams_clean:
         counter += 1
         try:
 
@@ -380,9 +380,11 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, \
                 for i in range(len(text_buf_ngram_free)):
                     split_id_string = id_prefix + '-{:010d}'.format(int(\
                         counter)) + '-{:010d}'.format(int(i))
-                    outjson = json.dumps({"text":text_buf_ngram_free[i],
-                        id_prefix+"_split_id":split_id_string},
-                        ensure_ascii=False)
+                    myjson[dedup_key] = text_buf_ngram_free[i]
+                    outjson = json.dumps(myjson, ensure_ascii=False)
+                    #outjson = json.dumps({"text":text_buf_ngram_free[i],
+                    #    id_prefix+"_split_id":split_id_string},
+                    #    ensure_ascii=False)
                     out_f.write(outjson.encode('utf-8'))
                     out_f.write('\n'.encode('utf-8'))
 
