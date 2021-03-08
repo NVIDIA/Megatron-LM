@@ -78,7 +78,7 @@ class BertLMHead(MegatronModule):
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        LayerNorm = import_layernorm(args.fp32_residual_connection)
+        LayerNorm = import_layernorm(args.fp32_residual_connection, args.bf16)
         self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:

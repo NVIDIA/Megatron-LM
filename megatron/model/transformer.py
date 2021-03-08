@@ -397,8 +397,11 @@ class ParallelTransformerLayer(MegatronModule):
         self.apply_residual_connection_post_layernorm \
             = args.apply_residual_connection_post_layernorm
 
+        self.bf16 = args.bf16
+        self.fp32_residual_connection = args.fp32_residual_connection
+
         # Layernorm on the input data.
-        LayerNorm = import_layernorm(args.fp32_residual_connection)
+        LayerNorm = import_layernorm(self.fp32_residual_connection, self.bf16)
         self.input_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon)
@@ -440,6 +443,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
+        if self.bf16 and self.fp32_residual_connection:
+            layernorm_output = layernorm_output.bfloat16()
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(layernorm_output,
@@ -478,6 +483,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm post the self attention.
         layernorm_output = self.post_attention_layernorm(layernorm_input)
+        if self.bf16 and self.fp32_residual_connection:
+            layernorm_output = layernorm_output.bfloat16()
 
         if self.layer_type == LayerType.decoder:
             attention_output, attention_bias = \
@@ -500,6 +507,8 @@ class ParallelTransformerLayer(MegatronModule):
 
             # Layer norm post the decoder attention
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
+            if self.bf16 and self.fp32_residual_connection:
+                layernorm_output = layernorm_output.bfloat16()
 
         # MLP.
         mlp_output, mlp_bias = self.mlp(layernorm_output)
@@ -533,6 +542,7 @@ class ParallelTransformer(MegatronModule):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
+        self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
 
         # Store activation checkpoiting flag.
@@ -578,7 +588,8 @@ class ParallelTransformer(MegatronModule):
 
         if mpu.is_pipeline_last_stage():
             # Final layer norm before output.
-            LayerNorm = import_layernorm(args.fp32_residual_connection)
+            LayerNorm = import_layernorm(self.fp32_residual_connection,
+                                         self.bf16)
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
@@ -665,6 +676,8 @@ class ParallelTransformer(MegatronModule):
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)
+            if self.bf16 and self.fp32_residual_connection:
+                output = output.bfloat16()
         else:
             output = hidden_states
         if get_key_value:

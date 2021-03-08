@@ -129,11 +129,26 @@ def parse_args(extra_args_provider=None, defaults={},
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
+        assert not args.bf16
         args.params_dtype = torch.half
+    if args.bf16:
+        assert not args.fp16
+        args.params_dtype = torch.bfloat16
+        # No fusion is support for bfloat for now
+        assert not args.masked_softmax_fusion
+        assert not args.bias_gelu_fusion
+        assert not args.bias_dropout_fusion
+
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
+    # If we do accumulation and all-reduces in fp32, we need to have
+    # local DDP and we should set the use-contiguous-buffers-in-ddp. 
+    if args.accumulate_allreduce_grads_in_fp32:
+        assert args.DDP_impl == 'local'
+        args.use_contiguous_buffers_in_ddp = True
+        
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
@@ -204,8 +219,8 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
     if args.fp32_residual_connection:
-        assert args.fp16, \
-            'residual connection in fp32 only supported when using fp16.'
+        assert args.fp16 or args.bf16, \
+            'residual connection in fp32 only supported when using fp16 or bf16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.checkpoint_activations, \
@@ -528,6 +543,8 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
+    group.add_argument('--bf16', action='store_true',
+                       help='Run model in bfloat16 mode.')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'
@@ -549,8 +566,9 @@ def _add_mixed_precision_args(parser):
                        help='Run attention masking and softmax in fp32. '
                        'This flag is ignored unless '
                        '--no-query-key-layer-scaling is specified.')
-    group.add_argument('--fp32-allreduce', action='store_true',
-                       help='All-reduce in fp32')
+    group.add_argument('--accumulate-allreduce-grads-in-fp32',
+                       action='store_true',
+                       help='Gradient accumulation and all-reduce in fp32.')
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
@@ -577,6 +595,9 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--use-contiguous-buffers-in-ddp', action='store_true',
+                       help='If set, use contiguous buffer in DDP. Note that '
+                       'this option only works woth local DDP.' )
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')

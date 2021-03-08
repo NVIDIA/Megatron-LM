@@ -37,9 +37,8 @@ from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
-from megatron.model import FP16Module
+from megatron.model import Float16Module
 from megatron.optimizer import get_megatron_optimizer
-
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.learning_rates import AnnealingLR
@@ -52,6 +51,7 @@ from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory
+
 
 
 def print_datetime(string):
@@ -222,8 +222,18 @@ def get_model(model_provider_func):
         model_module.cuda(torch.cuda.current_device())
 
     # Fp16 conversion.
-    if args.fp16:
-        model = [FP16Module(model_module) for model_module in model]
+    if args.fp16 or args.bf16:
+        model = [Float16Module(model_module, args) for model_module in model]
+        # For now, the layer norm does not support input float32 and outut bf16.
+        # For this, we move layernorm parameters to fp32 and cast output of the
+        # layernorm operation back to bf16.
+        if args.bf16 and args.fp32_residual_connection:
+            from megatron.model import import_layernorm
+            LayerNorm = import_layernorm(args.fp32_residual_connection, args.bf16)
+            for model_ in model:
+                for module_ in model_.modules():
+                    if isinstance(module_, LayerNorm):
+                        module_.float()
 
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
@@ -231,8 +241,12 @@ def get_model(model_provider_func):
                           process_group=mpu.get_data_parallel_group())
                  for model_module in model]
         return model
+    
     if args.DDP_impl == 'local':
-        model = [LocalDDP(model_module) for model_module in model]
+        model = [LocalDDP(model_module,
+                          args.accumulate_allreduce_grads_in_fp32,
+                          args.use_contiguous_buffers_in_ddp)
+                 for model_module in model]
         return model
 
     raise NotImplementedError('Unknown DDP implementation specified: {}. '
@@ -289,7 +303,7 @@ def setup_model_and_optimizer(model_provider_func):
     model = get_model(model_provider_func)
 
     unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, FP16Module))
+                                   (torchDDP, LocalDDP, Float16Module))
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
@@ -308,9 +322,7 @@ def setup_model_and_optimizer(model_provider_func):
         args.iteration = 0
 
     # We only support local DDP with multiple micro-batches.
-    if len(model) > 1:
-        assert args.DDP_impl == 'local'
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
+    if len(model) > 1 or mpu.get_pipeline_model_parallel_world_size() > 1:
         assert args.DDP_impl == 'local'
 
     # get model without FP16 and/or TorchDDP wrappers
@@ -331,7 +343,11 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    optimizer.zero_grad()
+    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
+        for partition in model:
+            partition.zero_grad_buffer()
+    else:
+        optimizer.zero_grad()
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
@@ -351,8 +367,7 @@ def train_step(forward_step_func, data_iterator,
     if args.DDP_impl == 'local':
         timers('backward-params-all-reduce').start()
         for model_module in model:
-            model_module.allreduce_params(reduce_after=False,
-                                          fp32_allreduce=args.fp32_allreduce)
+            model_module.allreduce_gradients()
         timers('backward-params-all-reduce').stop()
 
     # All-reduce word_embeddings' grad across first and last stages to ensure
@@ -368,12 +383,15 @@ def train_step(forward_step_func, data_iterator,
         elif mpu.is_pipeline_last_stage(ignore_virtual=True):
             unwrapped_model = model[-1]
         unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, FP16Module))
+            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 
         if unwrapped_model.share_word_embeddings:
             word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-            torch.distributed.all_reduce(word_embeddings_weight.grad,
-                                         group=mpu.get_embedding_group())
+            if args.DDP_impl == 'local':
+                grad = word_embeddings_weight.main_grad
+            else:
+                grad = word_embeddings_weight.grad
+            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
     # Update parameters.
