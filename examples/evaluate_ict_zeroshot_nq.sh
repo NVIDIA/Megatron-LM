@@ -12,7 +12,9 @@ CHECKPOINT_PATH=<Specify path of pretrained ICT model>
 
 QA_FILE=<Path of the natural question test dataset>
 
-python tasks/orqa/evaluate_orqa.py \
+python tasks/main.py \
+    --task ICT-ZEROSHOT-NQ \
+    --tokenizer-type BertWordPieceLowerCase \
     --num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \

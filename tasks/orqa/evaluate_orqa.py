@@ -18,9 +18,6 @@
 import os
 import sys
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-    os.path.join(os.path.pardir, os.path.pardir))))
-
 from megatron import get_args
 from megatron.initialize import initialize_megatron
 
@@ -30,8 +27,7 @@ def main():
     """
     Main program
     """
-    initialize_megatron(extra_args_provider=None,
-                        args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+
     args = get_args()
 
     # Set up the model and evaluator
