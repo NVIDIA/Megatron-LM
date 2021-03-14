@@ -542,6 +542,7 @@ class MMapIndexedDatasetBuilder(object):
         self._dtype = dtype
         self._sizes = []
         self._doc_idx = [0]
+        self._merge_idx = 0
 
     def add_item(self, tensor):
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
@@ -556,8 +557,21 @@ class MMapIndexedDatasetBuilder(object):
         index = MMapIndexedDataset.Index(index_file_path(another_file))
         assert index.dtype == self._dtype
 
-        for size in index.sizes:
-            self._sizes.append(size)
+        # update the old index sizes to the merged one
+        self._sizes.extend(index.sizes)
+        
+        # update the old doc idx to the merged doc idx
+        # if merge 1 file or the first file, it is just a copy of old doc idx
+        # if merge more than 1 file, then doc idx will be recalculated
+        if self._merge_idx == 0:
+            self._doc_idx = []
+            self._doc_idx.extend(index.doc_idx)
+        else:
+            start_pt = self._doc_idx[-1]
+            for each in index.doc_idx:
+                new_doc_idx = start_pt + each
+                self._doc_idx.append(new_doc_idx)
+        self._merge_idx += 1
 
         # Concatenate data
         with open(data_file_path(another_file), 'rb') as f:
@@ -565,6 +579,10 @@ class MMapIndexedDatasetBuilder(object):
 
     def finalize(self, index_file):
         self._data_file.close()
+
+        # convert list to numpy array
+        self._sizes = np.array(self._sizes)
+        self._doc_idx = np.array(self._doc_idx)
 
         with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
             index.write(self._sizes, self._doc_idx)
