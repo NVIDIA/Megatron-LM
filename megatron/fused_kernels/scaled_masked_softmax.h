@@ -33,10 +33,8 @@ template <>
 __device__ __inline__ void copy_vector<__half, 1>(__half *dst, const __half *src) { *dst = *src; }
 
 template <>
-__device__ __inline__ void copy_vector<float, 1>(float *dst, const float *src) { *dst = *src; }
-
-template <>
 __device__ __inline__ void copy_vector<__half, 4>(__half *dst, const __half *src) { *((float2*) dst) = *((float2*) src); }
+
 template <>
 __device__ __inline__ void copy_vector<uint8_t, 1>(uint8_t *dst, const uint8_t *src) { *dst = *src; }
 
@@ -250,6 +248,8 @@ __global__ void scaled_masked_softmax_warp_backward(
     // load data from global memory
     acc_t grad_reg[WARP_BATCH][WARP_ITERATIONS] { 0.0f };
     acc_t output_reg[WARP_BATCH][WARP_ITERATIONS] { 0.0f };
+    input_t temp_grad[ELEMENTS_PER_LDG_STG];
+    input_t temp_output[ELEMENTS_PER_LDG_STG];
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         int batch_element_count = (i >= local_batches) ? 0 : element_count;
