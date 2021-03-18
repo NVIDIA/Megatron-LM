@@ -19,7 +19,6 @@ import argparse
 import os
 
 import torch
-from megatron import fused_kernels
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -226,31 +225,6 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-
-    # custom kernel constraints check
-    seq_len = args.seq_length
-    attn_batch_size = \
-        (args.num_attention_heads / args.tensor_model_parallel_size) * \
-        args.micro_batch_size
-
-    # constraints on sequence length and attn_batch_size to enable warp based
-    # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
-        seq_len % 4 == 0 and attn_batch_size % 4 == 0
-
-    if not (args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion):
-        print('WARNING: constraints for invoking optimized'
-            ' fused softmax kernel are not met. We default back to unfused'
-            ' kernel invocations.')
-
-    # Load scaled_masked_softmax_fusion_kernels
-    if args.masked_softmax_fusion:
-        fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
-        fused_kernels.load_scaled_masked_softmax_fusion_kernel()
-
-    # Load mixed precision fused layer norm.
-    if args.fp32_residual_connection:
-        fused_kernels.load_fused_mix_prec_layer_norm_kernel()
 
     _print_args(args)
     return args
