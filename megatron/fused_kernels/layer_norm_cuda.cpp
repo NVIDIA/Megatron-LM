@@ -26,11 +26,7 @@
 namespace {
 void compute_n1_n2(
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     int& n1,
     int& n2)
 {
@@ -47,11 +43,7 @@ void compute_n1_n2(
 }
 
 void check_args(
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor gamma,
     at::Tensor beta
     )
@@ -62,11 +54,7 @@ void check_args(
 
 void check_args(
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     int& n1,
     int& n2
     )
@@ -102,11 +90,7 @@ void check_args(
 
 void check_args(
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor gamma,
     at::Tensor beta,
     int& n1,
@@ -125,26 +109,18 @@ void cuda_layer_norm(
     at::Tensor* input,
     int n1,
     int n2,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor* gamma,
     at::Tensor* beta,
     double epsilon);
 
-#define CHECK_CUDA(x) TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+#define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
 std::vector<at::Tensor> layer_norm(
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     double epsilon) {
   CHECK_INPUT(input);
   int n1,n2;
@@ -158,11 +134,7 @@ std::vector<at::Tensor> layer_norm(
 }
 std::vector<at::Tensor> layer_norm_affine(
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor gamma,
     at::Tensor beta,
     double epsilon) {
@@ -186,11 +158,7 @@ void cuda_layer_norm_gradient(
     at::Tensor* input,
     int n1,
     int n2,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor* gamma,
     at::Tensor* beta,
     double epsilon,
@@ -204,11 +172,7 @@ at::Tensor layer_norm_gradient(
     at::Tensor mean,
     at::Tensor invvar,
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     double epsilon) {
   CHECK_INPUT(dout);
   CHECK_INPUT(mean);
@@ -227,11 +191,7 @@ std::vector<at::Tensor> layer_norm_gradient_affine(
     at::Tensor mean,
     at::Tensor invvar,
     at::Tensor input,
-    #ifdef VERSION_GE_1_1
     at::IntArrayRef normalized_shape,
-    #else
-    at::IntList normalized_shape,
-    #endif
     at::Tensor gamma,
     at::Tensor beta,
     double epsilon) {
