@@ -22,6 +22,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include "scaled_masked_softmax.h"
+#include "type_shim.h"
 
 namespace multihead_attn {
 namespace fused_softmax {
@@ -55,16 +56,20 @@ torch::Tensor fwd_cuda(
   void* mask_ptr = static_cast<void*>(mask.data_ptr());
   void* softmax_results_ptr = static_cast<void*>(softmax_results.data_ptr());
 
-  dispatch_scaled_masked_softmax_forward<half, half, float>(
-      reinterpret_cast<half*>(softmax_results_ptr),
-      reinterpret_cast<const half*>(input_ptr),
-      reinterpret_cast<const uint8_t*>(mask_ptr),
-      scale_factor,
-      query_seq_len,
-      key_seq_len,
-      batches,
-      attn_heads,
-      pad_batches);
+  DISPATCH_HALF_AND_BFLOAT(
+      input.scalar_type(),
+      "dispatch_scaled_masked_softmax_forward",
+      dispatch_scaled_masked_softmax_forward<scalar_t, scalar_t, float>(
+          reinterpret_cast<scalar_t*>(softmax_results_ptr),
+	  reinterpret_cast<const scalar_t*>(input_ptr),
+	  reinterpret_cast<const uint8_t*>(mask_ptr),
+	  scale_factor,
+	  query_seq_len,
+	  key_seq_len,
+	  batches,
+	  attn_heads,
+	  pad_batches);
+      );
   return softmax_results;
 }
 
@@ -85,15 +90,19 @@ torch::Tensor bwd_cuda(
   void* output_grads_ptr = static_cast<void*>(output_grads.data_ptr());
 
   //Softmax Grad
-  dispatch_scaled_masked_softmax_backward<half, half, float>(
-      reinterpret_cast<half*>(output_grads_ptr), 
-      reinterpret_cast<half*>(output_grads_ptr), 
-      reinterpret_cast<half const*>(softmax_results.data_ptr()),
-      scale_factor,
-      query_seq_len,
-      key_seq_len,
-      batches,
-      attn_heads);
+  DISPATCH_HALF_AND_BFLOAT(
+      output_grads_.scalar_type(),
+      "dispatch_scaled_masked_softmax_backward",
+      dispatch_scaled_masked_softmax_backward<scalar_t, scalar_t, float>(
+          reinterpret_cast<scalar_t*>(output_grads_ptr), 
+	  reinterpret_cast<scalar_t*>(output_grads_ptr), 
+	  reinterpret_cast<scalar_t const*>(softmax_results.data_ptr()),
+	  scale_factor,
+	  query_seq_len,
+	  key_seq_len,
+	  batches,
+	  attn_heads);
+			   );
   
   //backward pass is completely in-place
   return output_grads;

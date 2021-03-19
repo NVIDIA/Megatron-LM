@@ -82,12 +82,11 @@ def load(args):
     # Mixed precision fused layer norm.
     # =================================
 
-    if args.fp32_residual_connection:
-        extra_cuda_flags = ['-maxrregcount=50']
-        sources=[srcpath / 'layer_norm_cuda.cpp',
-                 srcpath / 'layer_norm_cuda_kernel.cu']
-        fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
-            "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags)
+    extra_cuda_flags = ['-maxrregcount=50']
+    sources=[srcpath / 'layer_norm_cuda.cpp',
+             srcpath / 'layer_norm_cuda_kernel.cu']
+    fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
+        "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags)
 
 
 def _get_cuda_bare_metal_version(cuda_dir):

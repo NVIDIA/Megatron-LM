@@ -37,8 +37,9 @@ torch::Tensor fwd(
     torch::Tensor const& mask,
     float scale_factor) {
   AT_ASSERTM(input.dim() == 4, "expected 4D tensor");
-  AT_ASSERTM(input.scalar_type() == at::ScalarType::Half, 
-      "Only HALF is supported");
+  AT_ASSERTM((input.scalar_type() == at::ScalarType::Half) ||
+	     (input.scalar_type() == at::ScalarType::BFloat16), 
+      "Only fp16 and bf16 are supported");
   AT_ASSERTM(mask.dim() == 4, "expected 4D tensor");
 
   return fwd_cuda(input, mask, scale_factor);
@@ -52,10 +53,12 @@ torch::Tensor bwd(
   AT_ASSERTM(output_grads.dim() == 4, "expected 3D tensor");
   AT_ASSERTM(softmax_results.dim() == 4, "expected 3D tensor");
 
-  AT_ASSERTM(output_grads.scalar_type() == at::ScalarType::Half, 
-      "Only HALF is supported");
-  AT_ASSERTM(softmax_results.scalar_type() == at::ScalarType::Half, 
-      "Only HALF is supported");
+  AT_ASSERTM((output_grads.scalar_type() == at::ScalarType::Half) ||
+	     (output_grads.scalar_type() == at::ScalarType::BFloat16), 
+      "Only fp16 and bf16 are supported");
+  AT_ASSERTM((softmax_results.scalar_type() == at::ScalarType::Half) ||
+	     (softmax_results.scalar_type() == at::ScalarType::BFloat16), 
+      "Only fp16 and bf16 are supported");
 
   return bwd_cuda(output_grads, softmax_results, scale_factor);
 }

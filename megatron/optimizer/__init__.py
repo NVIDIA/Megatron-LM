@@ -17,7 +17,7 @@ from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
-from megatron.model import import_layernorm
+from megatron.model import LayerNorm
 
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
@@ -27,8 +27,6 @@ def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
     Layernorms and baises will have no weight decay but the rest will.
     """
-    args = get_args()
-    LayerNorm = import_layernorm(args.fp32_residual_connection, args.bf16)
 
     weight_decay_params = {'params': []}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0}
