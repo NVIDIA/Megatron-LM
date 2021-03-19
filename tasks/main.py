@@ -47,6 +47,20 @@ def get_tasks_args(parser):
                        help='Sliding window for overlapping evaluation.')
     group.add_argument('--strict-lambada', action='store_true',
                        help='Use more difficult formulation of lambada.')
+    # Retriever args
+    group.add_argument('--qa-data-dev', type=str, default=None,
+                       help='Path to the QA dataset dev file.')
+    group.add_argument('--qa-data-test', type=str, default=None,
+                       help='Path to the QA dataset test file.')
+
+    # Faiss arguments for retriever
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--faiss-match', type=str, default='string', \
+                        choices=['regex', 'string'], help="Answer matching '\
+                        'logic type")
+    group.add_argument('--faiss-topk-retrievals', type=int, default=100,
+                       help='Number of blocks to use as top-k during retrieval')
 
     return parser
 

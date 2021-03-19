@@ -636,10 +636,6 @@ def _add_data_args(parser):
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
-    group.add_argument('--qa-data-dev', type=str, default=None,
-                       help='Path to the QA dataset dev file.')
-    group.add_argument('--qa-data-test', type=str, default=None,
-                       help='Path to the QA dataset test file.')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -743,18 +739,11 @@ def _add_biencoder_args(parser):
                         'square root of hidden size')
 
     # faiss index
-    group.add_argument('--faiss-use-gpu', action='store_true',
-                       help='Whether create the FaissMIPSIndex on GPU')
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
     group.add_argument('--embedding-path', type=str, default=None,
                        help='Where to save/load Open-Retrieval Embedding'
                         ' data to/from')
-    group.add_argument('--faiss-match', type=str, default='string', \
-                        choices=['regex', 'string'], help="Answer matching '\
-                        'logic type")
-    group.add_argument('--faiss-topk-retrievals', type=int, default=100,
-                       help='Number of blocks to use as top-k during retrieval')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

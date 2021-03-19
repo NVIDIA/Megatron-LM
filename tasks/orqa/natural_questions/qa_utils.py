@@ -2,8 +2,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
 #
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+
+# The following code has been taken from
+# https://github.com/facebookresearch/DPR, which is CC-BY-NC 4.0
+# licensed as of now. More details on the license can be found
+# at https://github.com/facebookresearch/DPR/blob/master/LICENSE
 
 """
  Set of utilities for Q&A results validation tasks - Retriver passage

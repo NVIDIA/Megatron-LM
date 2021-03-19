@@ -19,8 +19,6 @@ import os
 import sys
 
 from megatron import get_args
-from megatron.initialize import initialize_megatron
-
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 def main():
