@@ -38,6 +38,3 @@ def main():
     if args.qa_data_test is not None:
         evaluator.evaluate(args.qa_data_test, "TEST")
 
-if __name__ == "__main__":
-    main()
-
