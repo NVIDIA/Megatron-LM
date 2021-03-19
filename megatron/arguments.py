@@ -133,8 +133,7 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
-        # No fusion is support for bfloat for now
-        assert not args.masked_softmax_fusion
+        # Jitting fusion is not supported for bfloat for now
         assert not args.bias_gelu_fusion
         assert not args.bias_dropout_fusion
 

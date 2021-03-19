@@ -21,7 +21,6 @@
 #include <cfloat>
 #include <limits>
 #include <stdint.h>
-#include <cuda_fp16.h>
 #include <c10/macros/Macros.h>
 
 namespace {
@@ -30,10 +29,16 @@ template <typename Datatype, int ELEMENTS_PER_LDG>
 __device__ __inline__ void copy_vector(Datatype *dst, const Datatype *src);
 
 template <>
-__device__ __inline__ void copy_vector<__half, 1>(__half *dst, const __half *src) { *dst = *src; }
+__device__ __inline__ void copy_vector<c10::BFloat16, 1>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *dst = *src; }
 
 template <>
-__device__ __inline__ void copy_vector<__half, 4>(__half *dst, const __half *src) { *((float2*) dst) = *((float2*) src); }
+__device__ __inline__ void copy_vector<c10::BFloat16, 4>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *((float2*) dst) = *((float2*) src); }
+  
+template <>
+__device__ __inline__ void copy_vector<c10::Half, 1>(c10::Half *dst, const c10::Half *src) { *dst = *src; }
+
+template <>
+__device__ __inline__ void copy_vector<c10::Half, 4>(c10::Half *dst, const c10::Half *src) { *((float2*) dst) = *((float2*) src); }
 
 template <>
 __device__ __inline__ void copy_vector<uint8_t, 1>(uint8_t *dst, const uint8_t *src) { *dst = *src; }
@@ -45,10 +50,16 @@ template <typename Datatype, int ELEMENTS_PER_LDG>
 __device__ __inline__ void copy_zero_vector(Datatype *dst);
 
 template <>
-__device__ __inline__ void copy_zero_vector<__half, 1>(__half *dst) { *dst = 0.0; }
+__device__ __inline__ void copy_zero_vector<c10::BFloat16, 1>(c10::BFloat16 *dst) { *dst = 0.0; }
 
 template <>
-__device__ __inline__ void copy_zero_vector<__half, 4>(__half *dst) { *((float2*) dst) = make_float2(0.0f, 0.0f); }
+__device__ __inline__ void copy_zero_vector<c10::BFloat16, 4>(c10::BFloat16 *dst) { *((float2*) dst) = make_float2(0.0f, 0.0f); }
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::Half, 1>(c10::Half *dst) { *dst = 0.0; }
+
+template <>
+__device__ __inline__ void copy_zero_vector<c10::Half, 4>(c10::Half *dst) { *((float2*) dst) = make_float2(0.0f, 0.0f); }
 
 
 int log2_ceil(int value) {

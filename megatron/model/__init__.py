@@ -13,23 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-_LAYER_NORM = None
-
-
-def import_layernorm(fp32_residual_connection, bf16):
-
-    global _LAYER_NORM
-    if not _LAYER_NORM:
-        if bf16:
-            from torch.nn import LayerNorm
-        elif fp32_residual_connection:
-            from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
-        else:
-            from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
-        _LAYER_NORM = LayerNorm
-            
-    return _LAYER_NORM
-
+from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 
 from .distributed import *
 from .bert_model import (BertModel,

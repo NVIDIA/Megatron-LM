@@ -22,6 +22,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include "scaled_upper_triang_masked_softmax.h"
+#include "type_shim.h"
 
 namespace multihead_attn {
 namespace fused_softmax {
@@ -45,15 +46,20 @@ torch::Tensor fwd_cuda(
   void* input_ptr = static_cast<void*>(input.data_ptr());
   void* softmax_results_ptr = static_cast<void*>(softmax_results.data_ptr());
 
-  dispatch_scaled_upper_triang_masked_softmax_forward<half, half, float>(
-      reinterpret_cast<half*>(softmax_results_ptr),
-      reinterpret_cast<const half*>(input_ptr),
-      scale_factor,
-      seq_len,
-      seq_len,
-      attn_batches);
+  DISPATCH_HALF_AND_BFLOAT(
+      input.scalar_type(),
+      "dispatch_scaled_upper_triang_masked_softmax_forward",
+      dispatch_scaled_upper_triang_masked_softmax_forward<scalar_t, scalar_t, float>(
+	  reinterpret_cast<scalar_t*>(softmax_results_ptr),
+	  reinterpret_cast<const scalar_t*>(input_ptr),
+	  scale_factor,
+	  seq_len,
+	  seq_len,
+	  attn_batches);
+      );
   return softmax_results;
 }
+				      
 
 torch::Tensor bwd_cuda(
     torch::Tensor const& output_grads_, 
@@ -71,14 +77,18 @@ torch::Tensor bwd_cuda(
   void* output_grads_ptr = static_cast<void*>(output_grads.data_ptr());
 
   //Softmax Grad
-  dispatch_scaled_upper_triang_masked_softmax_backward<half, half, float>(
-      reinterpret_cast<half*>(output_grads_ptr), 
-      reinterpret_cast<half*>(output_grads_ptr), 
-      reinterpret_cast<half const*>(softmax_results.data_ptr()),
-      scale_factor,
-      seq_len,
-      seq_len,
-      attn_batches);
+  DISPATCH_HALF_AND_BFLOAT(
+      output_grads_.scalar_type(),
+      "dispatch_scaled_upper_triang_masked_softmax_backward",
+      dispatch_scaled_upper_triang_masked_softmax_backward<scalar_t, scalar_t, float>(
+          reinterpret_cast<scalar_t*>(output_grads_ptr), 
+	  reinterpret_cast<scalar_t*>(output_grads_ptr), 
+	  reinterpret_cast<scalar_t const*>(softmax_results.data_ptr()),
+	  scale_factor,
+	  seq_len,
+	  seq_len,
+	  attn_batches);
+      );
   
   //backward pass is completely in-place
   return output_grads;

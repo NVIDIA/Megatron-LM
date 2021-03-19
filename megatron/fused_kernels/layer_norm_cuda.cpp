@@ -24,12 +24,12 @@
 #include "compat.h"
 
 namespace {
+
 void compute_n1_n2(
     at::Tensor input,
     at::IntArrayRef normalized_shape,
     int& n1,
-    int& n2)
-{
+    int& n2) {
     int idiff = input.ndimension() - normalized_shape.size();
     n2 = 1;
     for (int i = 0;  i < (int)normalized_shape.size();  ++i) {
@@ -118,38 +118,32 @@ void cuda_layer_norm(
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x)
 
-std::vector<at::Tensor> layer_norm(
-    at::Tensor input,
-    at::IntArrayRef normalized_shape,
-    double epsilon) {
-  CHECK_INPUT(input);
-  int n1,n2;
-  check_args(input,normalized_shape,n1,n2);
-  at::Tensor output = at::empty_like(input);
-  at::Tensor mean = at::empty({n1}, input.options().dtype(input.scalar_type()==at::ScalarType::Half ? at::ScalarType::Float : input.scalar_type()));
-  at::Tensor invvar = at::empty_like(mean);
-  cuda_layer_norm(&output,&mean,&invvar,&input,n1,n2,
-      normalized_shape,NULL,NULL,epsilon);
-  return {output, mean, invvar};
-}
 std::vector<at::Tensor> layer_norm_affine(
     at::Tensor input,
     at::IntArrayRef normalized_shape,
     at::Tensor gamma,
     at::Tensor beta,
     double epsilon) {
+  
   CHECK_INPUT(input);
   CHECK_INPUT(gamma);
   CHECK_INPUT(beta);
-  int n1,n2;
-  check_args(input,normalized_shape,gamma,beta,n1,n2);
-  at::Tensor output = at::empty_like(input, input.options().dtype(at::ScalarType::Half));
-  at::Tensor mean = at::empty({n1}, input.options().dtype(input.scalar_type()==at::ScalarType::Half ? at::ScalarType::Float : input.scalar_type()));
+  int n1, n2;
+  check_args(input, normalized_shape, gamma, beta, n1, n2);
+
+  at::Tensor output = at::empty_like(
+      input, gamma.options().dtype(gamma.scalar_type()));
+  at::Tensor mean = at::empty(
+      {n1}, input.options().dtype(at::ScalarType::Float));
   at::Tensor invvar = at::empty_like(mean);
-  cuda_layer_norm(&output,&mean,&invvar,&input,n1,n2,
-      normalized_shape,&gamma,&beta,epsilon);
+
+  cuda_layer_norm(&output, &mean, &invvar, &input, n1, n2,
+      normalized_shape, &gamma, &beta, epsilon);
+
   return {output, mean, invvar};
+
 }
+
 
 void cuda_layer_norm_gradient(
     at::Tensor* dout,
@@ -167,25 +161,6 @@ void cuda_layer_norm_gradient(
     at::Tensor* grad_beta
     );
 
-at::Tensor layer_norm_gradient(
-    at::Tensor dout,
-    at::Tensor mean,
-    at::Tensor invvar,
-    at::Tensor input,
-    at::IntArrayRef normalized_shape,
-    double epsilon) {
-  CHECK_INPUT(dout);
-  CHECK_INPUT(mean);
-  CHECK_INPUT(invvar);
-  CHECK_INPUT(input);
-  int n1,n2;
-  check_args(input,normalized_shape,n1,n2);
-  at::Tensor grad_input = at::empty_like(input);
-  cuda_layer_norm_gradient(&dout,&mean,&invvar,&input,n1,n2,
-      normalized_shape,NULL,NULL,epsilon,
-      &grad_input,NULL,NULL);
-  return grad_input;
-}
 std::vector<at::Tensor> layer_norm_gradient_affine(
     at::Tensor dout,
     at::Tensor mean,
@@ -195,26 +170,32 @@ std::vector<at::Tensor> layer_norm_gradient_affine(
     at::Tensor gamma,
     at::Tensor beta,
     double epsilon) {
+
   CHECK_INPUT(dout);
   CHECK_INPUT(mean);
   CHECK_INPUT(invvar);
   CHECK_INPUT(input);
   CHECK_INPUT(gamma);
   CHECK_INPUT(beta);
-  int n1,n2;
-  check_args(input,normalized_shape,gamma,beta,n1,n2);
+  int n1, n2;
+  check_args(input, normalized_shape, gamma, beta, n1, n2);
+
   at::Tensor grad_input = at::empty_like(input);
   at::Tensor grad_gamma = at::empty_like(gamma);
   at::Tensor grad_beta = at::empty_like(beta);
-  cuda_layer_norm_gradient(&dout,&mean,&invvar,&input,n1,n2,
-      normalized_shape,&gamma,&beta,epsilon,
-      &grad_input,&grad_gamma,&grad_beta);
+
+  cuda_layer_norm_gradient(&dout, &mean, &invvar, &input, n1, n2,
+      normalized_shape, &gamma, &beta, epsilon,
+      &grad_input, &grad_gamma, &grad_beta);
+
   return {grad_input, grad_gamma, grad_beta};
+
 }
 
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward_affine", &layer_norm_affine, "LayerNorm forward (CUDA)");
-  m.def("forward", &layer_norm, "LayerNorm forward (CUDA)");
-  m.def("backward_affine", &layer_norm_gradient_affine, "LayerNorm backward (CUDA)");
-  m.def("backward", &layer_norm_gradient, "LayerNorm backward (CUDA)");
+  m.def("forward_affine", &layer_norm_affine,
+	"LayerNorm forward (CUDA)");
+  m.def("backward_affine", &layer_norm_gradient_affine,
+	"LayerNorm backward (CUDA)");
 }
