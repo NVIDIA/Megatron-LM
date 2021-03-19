@@ -24,11 +24,8 @@ def get_one_epoch_dataloader(dataset, micro_batch_size=None):
     """Specifically one epoch to be used in an indexing job."""
     args = get_args()
 
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
     if micro_batch_size is None:
         micro_batch_size = args.micro_batch_size
-    global_batch_size = micro_batch_size * world_size
     num_workers = args.num_workers
 
     # Use megatron's sampler with consumed samples set to 0 as
