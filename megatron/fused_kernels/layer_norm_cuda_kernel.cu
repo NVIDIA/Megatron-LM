@@ -285,15 +285,6 @@ struct SharedMemory <float>
     }
 };
 
-template <>
-struct SharedMemory <double>
-{
-    __device__ double *getPointer()
-    {
-        extern __shared__ double s_double[];
-        return s_double;
-    }
-};
 }
 
 template<typename T, typename U, typename V> __global__
@@ -656,6 +647,9 @@ void cuComputeGradInput(
   }
 }
 
+
+
+
 template<typename T, typename U, typename V> 
 void HostApplyLayerNorm(
     V* output,
@@ -671,7 +665,8 @@ void HostApplyLayerNorm(
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const dim3 threads(32,4,1);
-    const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+    const uint64_t maxGridY =
+      at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
     int nshared = 
         threads.y > 1 ? 
@@ -686,6 +681,7 @@ void HostApplyLayerNorm(
 		    U(epsilon),
             gamma,beta);
 }
+
 
 void cuda_layer_norm(
     at::Tensor* output,
@@ -704,20 +700,20 @@ void cuda_layer_norm(
     double epsilon)
 {
     using namespace at;
-    DISPATCH_DOUBLE_FLOAT_AND_HALF(input->scalar_type(), 0, "layer_norm_cuda_kernel",
-        using accscalar_t = at::acc_type<scalar_t_0, true>;
-        using output_t = at::Half;
+    DISPATCH_FLOAT_HALF_AND_BFLOAT_INOUT_TYPES(
+        input->scalar_type(), output->scalar_type(), "cuda_layer_norm_kernel",
         HostApplyLayerNorm(
-        output->DATA_PTR<output_t>(),
-	    mean->DATA_PTR<accscalar_t>(),
-	    invvar->DATA_PTR<accscalar_t>(),
-	    input->DATA_PTR<scalar_t_0>(),
+	    output->DATA_PTR<scalar_t_out>(),
+	    mean->DATA_PTR<float>(),
+	    invvar->DATA_PTR<float>(),
+	    input->DATA_PTR<scalar_t_in>(),
 	    n1,n2,
 	    epsilon,
-	    gamma != NULL ? gamma->DATA_PTR<output_t>() : NULL,
-	    beta != NULL ? beta->DATA_PTR<output_t>() : NULL);
+	    gamma != NULL ? gamma->DATA_PTR<scalar_t_out>() : NULL,
+	    beta != NULL ? beta->DATA_PTR<scalar_t_out>() : NULL);
       )
 }
+
 
 template<typename T, typename U, typename V>
 void HostLayerNormGradient(
@@ -742,10 +738,12 @@ void HostLayerNormGradient(
       const int part_size = 16;
       const dim3 threads2(32,4,1);
       const dim3 blocks2((n2+threads2.x-1)/threads2.x,part_size,1);
-      const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y * (threads2.x + 1);
+      const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y *
+	(threads2.x + 1);
       const int nshared2_b = threads2.x * threads2.y * sizeof(U);
       const int nshared2 = nshared2_a > nshared2_b ? nshared2_a : nshared2_b;
-      at::Tensor part_grad_gamma = at::empty({part_size,n2}, input->options().dtype(input->scalar_type()==at::ScalarType::Half ? at::ScalarType::Float : input->scalar_type()));
+      at::Tensor part_grad_gamma = at::empty(
+	  {part_size,n2}, input->options().dtype(at::ScalarType::Float));
       at::Tensor part_grad_beta = at::empty_like(part_grad_gamma);
       cuComputePartGradGammaBeta<<<blocks2, threads2, nshared2, stream>>>(
 		      dout,
@@ -770,7 +768,8 @@ void HostLayerNormGradient(
     }
 
     // compute grad_input
-    const uint64_t maxGridY = at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
+    const uint64_t maxGridY =
+      at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
     const dim3 threads1(32,4,1);
     int nshared =
@@ -787,6 +786,7 @@ void HostLayerNormGradient(
             gamma,
             grad_input);
 }
+
 
 void cuda_layer_norm_gradient(
     at::Tensor* dout,
@@ -808,22 +808,22 @@ void cuda_layer_norm_gradient(
     at::Tensor* grad_beta)
 {
     using namespace at;
-    DISPATCH_FLOAT_AND_HALF(input->scalar_type(), 0, "cuComputeGradInput",
-        using accscalar_t = at::acc_type<scalar_t_0, true>;
-        using output_t = at::Half;
+    DISPATCH_FLOAT_HALF_AND_BFLOAT_INOUT_TYPES(
+        input->scalar_type(), gamma->scalar_type(),
+	"cuda_layer_norm_gradient_kernel",
         HostLayerNormGradient(
-	    dout->DATA_PTR<output_t>(),
-	    mean->DATA_PTR<accscalar_t>(),
-	    invvar->DATA_PTR<accscalar_t>(),
+	    dout->DATA_PTR<scalar_t_out>(),
+	    mean->DATA_PTR<float>(),
+	    invvar->DATA_PTR<float>(),
 	    input,
 	    n1,n2,
             // TMJ pass NULL argument for gamma, beta, grad_gamma and grad_beta
             // if gamma Tensor is NULL on input.
-	    gamma != NULL ? gamma->DATA_PTR<output_t>() : NULL,
-	    gamma != NULL ? beta->DATA_PTR<output_t>() : NULL,
+	    gamma != NULL ? gamma->DATA_PTR<scalar_t_out>() : NULL,
+	    gamma != NULL ? beta->DATA_PTR<scalar_t_out>() : NULL,
 	    epsilon,
-	    grad_input->DATA_PTR<scalar_t_0>(),
-	    gamma != NULL ? grad_gamma->DATA_PTR<output_t>() : NULL,
-	    gamma != NULL ? grad_beta->DATA_PTR<output_t>() : NULL);
+	    grad_input->DATA_PTR<scalar_t_in>(),
+	    gamma != NULL ? grad_gamma->DATA_PTR<scalar_t_out>() : NULL,
+	    gamma != NULL ? grad_beta->DATA_PTR<scalar_t_out>() : NULL);
       )
 }

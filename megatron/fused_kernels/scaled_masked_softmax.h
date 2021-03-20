@@ -26,6 +26,27 @@
 
 namespace {
 
+template <typename Datatype, int ELEMENTS_PER_LDG>
+__device__ __inline__ void copy_vector(Datatype *dst, const Datatype *src);
+
+template <>
+__device__ __inline__ void copy_vector<c10::BFloat16, 1>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *dst = *src; }
+
+template <>
+__device__ __inline__ void copy_vector<c10::BFloat16, 4>(c10::BFloat16 *dst, const c10::BFloat16 *src) { *((float2*) dst) = *((float2*) src); }
+
+template <>
+__device__ __inline__ void copy_vector<c10::Half, 1>(c10::Half *dst, const c10::Half *src) { *dst = *src; }
+
+template <>
+__device__ __inline__ void copy_vector<c10::Half, 4>(c10::Half *dst, const c10::Half *src) { *((float2*) dst) = *((float2*) src); }
+
+template <>
+__device__ __inline__ void copy_vector<uint8_t, 1>(uint8_t *dst, const uint8_t *src) { *dst = *src; }
+
+template <>
+__device__ __inline__ void copy_vector<uint8_t, 4>(uint8_t *dst, const uint8_t *src) {*((half2*) dst) = *((half2*) src); }
+
 int log2_ceil(int value) {
     int log2_value = 0;
     while ((1 << log2_value) < value) ++log2_value;
@@ -90,13 +111,14 @@ __global__ void scaled_masked_softmax_warp_forward(
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
     constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
+    constexpr int ELEMENTS_PER_LDG_STG = 4;
 
     // blockDim/threadIdx = (WARP_SIZE, WARPS_PER_BLOCK, )
     // gridDim/blockIdx = (seq_len, attn_heads, batches) 
     int first_batch = (blockDim.y * (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z))+ threadIdx.y) * WARP_BATCH;
     int pad_first_batch = 0;
     if (pad_batches != 1) { // bert style
-    	pad_first_batch = (blockDim.y * (blockIdx.x + gridDim.x * blockIdx.z) + threadIdx.y) * WARP_BATCH;
+        pad_first_batch = (blockDim.y * (blockIdx.x + gridDim.x * blockIdx.z) + threadIdx.y) * WARP_BATCH;
     } else { // gpt2 style
         pad_first_batch = (blockDim.y * blockIdx.x + threadIdx.y) * WARP_BATCH;
     }
@@ -110,29 +132,40 @@ __global__ void scaled_masked_softmax_warp_forward(
     // there might be multiple batches per warp. compute the index within the batch
     int local_idx = threadIdx.x;
 
-    src += first_batch * element_count + local_idx;
-    dst += first_batch * element_count + local_idx;
-    mask += pad_first_batch * element_count + local_idx;
+    src += first_batch * element_count + ELEMENTS_PER_LDG_STG * local_idx;
+    dst += first_batch * element_count + ELEMENTS_PER_LDG_STG * local_idx;
+    mask += pad_first_batch * element_count + ELEMENTS_PER_LDG_STG * local_idx;
 
     // load data from global memory
     acc_t elements[WARP_BATCH][WARP_ITERATIONS];
+    input_t temp_data[ELEMENTS_PER_LDG_STG];
+    uint8_t temp_mask[ELEMENTS_PER_LDG_STG];
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         int batch_element_count = (i >= local_batches) ? 0 : element_count;
 
-	#pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            int element_index = local_idx + it * WARP_SIZE;
-            int itr_idx = i*element_count+it*WARP_SIZE;
+        #pragma unroll
+        for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
+            int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
 
             if (element_index < batch_element_count) {
-	        if (mask[itr_idx] != 1) {
-		    elements[i][it] = (acc_t)src[itr_idx] * scale;
-		} else {
-                    elements[i][it] = -10000.0;
-		} 
+                int itr_idx = i*element_count+it*WARP_SIZE;
+                copy_vector<input_t, ELEMENTS_PER_LDG_STG>(temp_data, src + itr_idx);
+                copy_vector<uint8_t, ELEMENTS_PER_LDG_STG>(temp_mask, mask + itr_idx);
+
+                #pragma unroll
+                  for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                      if (temp_mask[element] != 1) {
+                          elements[i][it + element] = (acc_t)temp_data[element] * scale;
+                      } else {
+                          elements[i][it + element] = -10000.0;
+                      }
+                  }
             } else {
-                elements[i][it] = -std::numeric_limits<acc_t>::infinity();
+                #pragma unroll
+                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                    elements[i][it + element] = -std::numeric_limits<acc_t>::infinity();
+                }
             }
         }
     }
@@ -161,15 +194,20 @@ __global__ void scaled_masked_softmax_warp_forward(
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Add>(sum);
 
     // store result
+    output_t out[ELEMENTS_PER_LDG_STG];
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         if (i >= local_batches)
             break;
         #pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            int element_index = local_idx + it * WARP_SIZE;
+        for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
+            int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
             if (element_index < element_count) {
-                dst[i*element_count+it*WARP_SIZE] = (output_t)(elements[i][it] / sum[i]);
+                #pragma unroll
+                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                    out[element] = elements[i][it + element] / sum[i];
+                }
+                copy_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE, out);  
             } else {
                 break;
             } 
@@ -192,6 +230,7 @@ __global__ void scaled_masked_softmax_warp_backward(
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
     constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
+    constexpr int ELEMENTS_PER_LDG_STG = 4;
 
     // blockDim/threadIdx = (WARP_SIZE, WARPS_PER_BLOCK, )
     // gridDim/blockIdx = (seq_len, attn_heads, batches) 
@@ -207,36 +246,36 @@ __global__ void scaled_masked_softmax_warp_backward(
     int local_idx = threadIdx.x;
 
     // the first element to process by the current thread
-    int thread_offset = first_batch * element_count + local_idx;
+    int thread_offset = first_batch * element_count + ELEMENTS_PER_LDG_STG * local_idx;
     grad += thread_offset;
     output += thread_offset;
     gradInput += thread_offset;
 
     // load data from global memory
     acc_t grad_reg[WARP_BATCH][WARP_ITERATIONS] { 0.0f };
-    acc_t output_reg[WARP_BATCH][WARP_ITERATIONS];
+    acc_t output_reg[WARP_BATCH][WARP_ITERATIONS] { 0.0f };
+    input_t temp_grad[ELEMENTS_PER_LDG_STG];
+    input_t temp_output[ELEMENTS_PER_LDG_STG];
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
         int batch_element_count = (i >= local_batches) ? 0 : element_count;
 
         #pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            int element_index = local_idx + it * WARP_SIZE;
-	    if (element_index < batch_element_count) {
-                output_reg[i][it] = output[i*element_count+it*WARP_SIZE];
-	    } else {
-                output_reg[i][it] = acc_t(0);
-            }
-        }
+        for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
+            int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
+            if (element_index < batch_element_count) {
+                copy_vector<input_t, ELEMENTS_PER_LDG_STG>(temp_grad, grad + i * element_count + it * WARP_SIZE);
+                copy_vector<input_t, ELEMENTS_PER_LDG_STG>(temp_output, output + i * element_count + it * WARP_SIZE);
 
-       #pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            int element_index = local_idx + it * WARP_SIZE;
-	    if (element_index < batch_element_count) {
-                grad_reg[i][it] = (acc_t)grad[i*element_count+it*WARP_SIZE] * output_reg[i][it];
-	    } else {
-                grad_reg[i][it] = acc_t(0);
-	    }
+                #pragma unroll
+                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                    output_reg[i][it + element] = (acc_t)temp_output[element];
+                }
+                #pragma unroll
+                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                    grad_reg[i][it + element] = (acc_t)temp_grad[element] * output_reg[i][it + element];
+                }
+            } 
         }
     }
    
@@ -257,11 +296,16 @@ __global__ void scaled_masked_softmax_warp_backward(
         if (i >= local_batches)
             break;
         #pragma unroll
-        for (int it = 0;  it < WARP_ITERATIONS;  ++it) {
-            int element_index = local_idx + it * WARP_SIZE;
+        for (int it = 0;  it < WARP_ITERATIONS;  it+=ELEMENTS_PER_LDG_STG) {
+            int element_index = ELEMENTS_PER_LDG_STG * local_idx + it * WARP_SIZE;
             if (element_index < element_count) {
                 // compute gradients
-                gradInput[i*element_count+it*WARP_SIZE] = (output_t)(scale * (grad_reg[i][it] - output_reg[i][it] * sum[i]));
+                output_t out[ELEMENTS_PER_LDG_STG];
+                #pragma unroll
+                for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
+                    out[element] = (output_t)(scale * (grad_reg[i][it + element] - output_reg[i][it + element] * sum[i]));
+                }
+                copy_vector<output_t, ELEMENTS_PER_LDG_STG>(gradInput + i * element_count + it * WARP_SIZE, out);
             } 
         }
     }
@@ -299,8 +343,8 @@ void dispatch_scaled_masked_softmax_forward(
         constexpr int threads_per_block = 128;
 
         int warps_per_block = (threads_per_block / warp_size);
-	    int batches_per_block = warps_per_block * batches_per_warp;
-	    TORCH_INTERNAL_ASSERT(query_seq_len%batches_per_block == 0);
+        int batches_per_block = warps_per_block * batches_per_warp;
+        TORCH_INTERNAL_ASSERT(query_seq_len%batches_per_block == 0);
         dim3 blocks(query_seq_len/batches_per_block, attn_heads, batches);
         dim3 threads(warp_size, warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
@@ -388,7 +432,7 @@ void dispatch_scaled_masked_softmax_backward(
         constexpr int threads_per_block = 128;
 
         int warps_per_block = (threads_per_block / warp_size);
-	int batches_per_block = warps_per_block * batches_per_warp;
+        int batches_per_block = warps_per_block * batches_per_warp;
         int blocks = batch_count/batches_per_block;
         dim3 threads(warp_size, warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR

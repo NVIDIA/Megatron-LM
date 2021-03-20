@@ -224,16 +224,6 @@ def get_model(model_provider_func):
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
-        # For now, the layer norm does not support input float32 and outut bf16.
-        # For this, we move layernorm parameters to fp32 and cast output of the
-        # layernorm operation back to bf16.
-        if args.bf16 and args.fp32_residual_connection:
-            from megatron.model import import_layernorm
-            LayerNorm = import_layernorm(args.fp32_residual_connection, args.bf16)
-            for model_ in model:
-                for module_ in model_.modules():
-                    if isinstance(module_, LayerNorm):
-                        module_.float()
 
     if args.DDP_impl == 'torch':
         i = torch.cuda.current_device()
