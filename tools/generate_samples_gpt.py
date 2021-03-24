@@ -26,33 +26,19 @@ from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
-from megatron.model import (GPTModel,
-                            GPTModelFirstStage,
-                            GPTModelLastStage,
-                            GPTModelIntermediateStage)
+from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
 
 
-def model_provider():
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
-    args = get_args()
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        # Determine model based on position of stage in pipeline.
-        if mpu.is_pipeline_first_stage():
-            model = GPTModelFirstStage(num_tokentypes=0)
-        elif mpu.is_pipeline_last_stage():
-            model = GPTModelLastStage(
-                num_tokentypes=0, parallel_output=False)
-        else:
-            model = GPTModelIntermediateStage(
-                num_tokentypes=0)
-    else:
-        model = GPTModel(num_tokentypes=0, parallel_output=False)
+    model = GPTModel(num_tokentypes=0, parallel_output=False,
+                     pre_process=pre_process, post_process=post_process)
 
     return model
 

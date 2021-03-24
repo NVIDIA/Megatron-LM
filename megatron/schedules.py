@@ -22,7 +22,9 @@ from megatron import get_num_microbatches
 from megatron import get_timers
 from megatron import mpu
 from megatron import p2p_communication
-
+from megatron.utils import unwrap_model
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
 
 def get_forward_backward_func():
     args = get_args()
@@ -46,8 +48,9 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     timers = get_timers()
 
     timers('forward-compute').start()
-    # TODO
-    model.module.module.set_input_tensor(input_tensor)
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)

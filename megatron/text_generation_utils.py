@@ -26,8 +26,13 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
+
+# These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
 
 def get_batch(context_tokens):
     """Generate batch from context tokens."""
@@ -403,7 +408,9 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     input_tensor = recv_forward()
 
     # Forward pass through the model.
-    model.set_input_tensor(input_tensor)
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model.set_input_tensor(input_tensor)
     output_tensor = model(tokens, position_ids, attention_mask,
                           tokentype_ids=tokentype_ids,
                           layer_past=layer_past,
