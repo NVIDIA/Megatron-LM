@@ -30,7 +30,7 @@ from .module import MegatronModule
 
 class MultipleChoice(MegatronModule):
 
-    def __init__(self, 
+    def __init__(self,
                  num_tokentypes=2,
                  pre_process=True,
                  post_process=True):
@@ -58,7 +58,7 @@ class MultipleChoice(MegatronModule):
                                                      init_method)
             self._multichoice_head_key = 'multichoice_head'
 
-    def set_input_tensor(self, input_tensor)
+    def set_input_tensor(self, input_tensor):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, model_input, attention_mask, tokentype_ids=None):
@@ -127,4 +127,3 @@ class MultipleChoice(MegatronModule):
                 print_rank_last('***WARNING*** could not find {} in the checkpoint, '
                                 'initializing to random'.format(
                                     self._multichoice_head_key))
-

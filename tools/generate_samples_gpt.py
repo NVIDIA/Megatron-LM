@@ -96,11 +96,19 @@ def main():
                                        'no_load_rng': True,
                                        'no_load_optim': True})
 
+    args = get_args()
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        print("Interleaved pipeline schedule is not yet supported for text generation.")
+        exit()
+
     # Set up model and load checkpoint.
     model = get_model(model_provider)
-    args = get_args()
+
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
+
+    assert len(model) == 1, "Above condition should have caught this"
+    model = model[0]
 
     # Generate samples.
     if args.num_samples == 0:

@@ -17,13 +17,14 @@
 
 import os
 import time
+from functools import partial
 
 import torch
 
 from megatron import get_args
 from megatron import print_rank_last, is_last_rank
 from megatron import mpu
-from megatron.training import communicate
+from megatron.schedules import get_forward_backward_func
 from tasks.finetune_utils import build_data_loader
 from tasks.finetune_utils import process_batch
 
@@ -38,7 +39,7 @@ def accuracy_func_provider(single_dataset_provider):
     for datapath in datapaths:
         dataset = single_dataset_provider(datapath)
         dataloader = build_data_loader(
-            dataset, args.micro_batch_size, num_workers=args.num_workers,
+            dataset, args.orig_micro_batch_size, num_workers=args.num_workers,
             drop_last=(mpu.get_data_parallel_world_size() > 1))
         dataloaders.append((dataset.dataset_name, dataloader))
 
@@ -73,14 +74,61 @@ def accuracy_func_provider(single_dataset_provider):
 
     return metrics_func
 
+
 def calculate_correct_answers(name, model, dataloader,
                               epoch, output_predictions):
     """Calculate correct over total answers and return prediction if the
     `output_predictions` is true."""
     args = get_args()
+    forward_backward_func = get_forward_backward_func()
     start_time = time.time()
-    model.eval()
-    saved_batch_size = args.micro_batch_size
+    for m in model:
+        m.eval()
+    saved_micro_batch_size = args.micro_batch_size
+    saved_global_batch_size = args.global_batch_size
+
+    ds = dataloader.dataset
+    if hasattr(ds, 'sample_multiplier'):
+        sample_multiplier = ds.sample_multiplier
+    else:
+        sample_multiplier = 1
+    micro_batch_size_times_data_parallel = args.orig_micro_batch_size * args.data_parallel_size
+    num_micro_batches = args.orig_global_batch_size // micro_batch_size_times_data_parallel
+
+    def loss_func(output_predictions, labels, output_tensor):
+        logits = output_tensor
+
+        loss_dict = {}
+        # Add output predictions.
+        if output_predictions:
+            assert False
+            loss_dict['softmaxes'] = torch.nn.Softmax(dim=-1)(
+                logits.float()).data.cpu().numpy().tolist()
+            loss_dict['labels'] = labels.data.cpu().numpy().tolist()
+            loss_dict['ids'] = batch['uid'].cpu().numpy().tolist()
+        # Compute the correct answers.
+        predicted = torch.argmax(logits, dim=-1)
+        corrects = (predicted == labels)
+        # Add to the counters.
+        loss_dict['total'] = labels.size(0)
+        loss_dict['correct'] = corrects.sum().item()
+
+        return 0, loss_dict
+
+    # defined inside to capture output_predictions
+    def correct_answers_forward_step(batch, model):
+        try:
+            batch_ = next(batch)
+        except BaseException:
+            batch_ = batch
+        tokens, types, labels, attention_mask = process_batch(batch_)
+
+        # Forward model.
+        args = get_args()
+        output_tensor = model(tokens, attention_mask, tokentype_ids=types)
+
+        return output_tensor, partial(loss_func, output_predictions, labels)
+
     with torch.no_grad():
         # For all the batches in the dataset.
         total = 0
@@ -92,60 +140,30 @@ def calculate_correct_answers(name, model, dataloader,
             labels = []
             ids = []
         for _, batch in enumerate(dataloader):
-            # Run the model forward.
-            tokens, types, labels_, attention_mask = process_batch(batch)
-
             # For evaluation only mode we use drop_last = False to get all the
             # samples, which means we might not have a full batch, so we
             # adjust batch_size here to actual batch size of data
-            actual_batch_size = len(labels_)
+            actual_batch_size = len(batch['label'])
             # ... applying sample_multiplier if necessary
-            ds = dataloader.dataset
-            if hasattr(ds, 'sample_multiplier'):
-                actual_batch_size *= ds.sample_multiplier
-            args.micro_batch_size = actual_batch_size
+            args.micro_batch_size = actual_batch_size * sample_multiplier
+            args.global_batch_size = actual_batch_size * sample_multiplier * num_micro_batches
 
-            if not mpu.is_pipeline_first_stage():
-                input_tensor, _ = communicate(
-                    tensor_send_next=None,
-                    tensor_send_prev=None,
-                    recv_forward=True,
-                    recv_backward=False)
-            else:
-                input_tensor = None
+            loss_dicts = forward_backward_func(correct_answers_forward_step, batch, model,
+                                               optimizer=None, timers=None, forward_only=True)
 
-            # Forward model.
-            if mpu.is_pipeline_first_stage():
-                assert input_tensor is None
-                output_tensor = model(tokens, attention_mask, tokentype_ids=types)
-            else:
-                assert input_tensor is not None
-                output_tensor = model(input_tensor, attention_mask)
-
-            if mpu.is_pipeline_last_stage():
-                logits = output_tensor
-
-                # Add output predictions.
+            for loss_dict in loss_dicts:
                 if output_predictions:
-                    softmaxes.extend(torch.nn.Softmax(dim=-1)(
-                        logits.float()).data.cpu().numpy().tolist())
-                    labels.extend(labels_.data.cpu().numpy().tolist())
-                    ids.extend(batch['uid'].cpu().numpy().tolist())
-                # Compute the correct answers.
-                predicted = torch.argmax(logits, dim=-1)
-                corrects = (predicted == labels_)
-                # Add to the counters.
-                total += labels_.size(0)
-                correct += corrects.sum().item()
-            else:
-                communicate(
-                    tensor_send_next=output_tensor,
-                    tensor_send_prev=None,
-                    recv_forward=False,
-                    recv_backward=False)
+                    softmaxes.extend(loss_dict['softmaxes'])
+                    labels.extend(loss_dict['labels'])
+                    ids.extend(loss_dict['ids'])
+                total += loss_dict['total']
+                correct += loss_dict['correct']
 
-    model.train()
-    args.micro_batch_size = saved_batch_size
+
+    for m in model:
+        m.train()
+    args.micro_batch_size = saved_micro_batch_size
+    args.global_batch_size = saved_global_batch_size
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
