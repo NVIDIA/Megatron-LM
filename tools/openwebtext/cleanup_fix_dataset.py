@@ -75,7 +75,7 @@ def process_doc(json_line, args):
     except Exception as e:
         print('Error: *************************\n{}\ntext: {}'.format(e, \
             text), flush=True)
-        return output, text, True
+        return output, text, document, True
 
     # don't remove
     return output, text, document, False
