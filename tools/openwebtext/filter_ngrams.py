@@ -304,7 +304,7 @@ def get_ngrams_below_threshold(args, ngrams, ngrams_below_threshold, \
     args.get_ngram_freq_only = True
  
     # Open the large file to process in parallel
-    num_workers = 40
+    num_workers = args.num_threads 
     pool = multiprocessing.Pool(num_workers)
     fin = open(dedup_file, 'r', encoding='utf-8')
     free_ngram_abt_partial=partial(free_ngram, args=args, key=dedup_key, \
@@ -345,14 +345,15 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, \
     start_time = time.time()
     # Now actually filter the dataset
     args.get_ngram_freq_only = False
-    id_prefix = '-'.join(args.tasks[::2])
+    #id_prefix = '-'.join(args.tasks[::2])
+    id_prefix = '-'.join(args.tasks[::1])
 
     # get the range of the size of the ngrams
     ngrams_freq_sorted = compute_ngram_freq_sorted(args, ngrams_below_threshold)
 
     # Open the large file to process in parallel
     counter = splitted = ignored = split_mt_thld = trimmed_count = 0
-    num_workers = 40
+    num_workers = args.num_threads
     pool = multiprocessing.Pool(num_workers)
     fin = open(dedup_file, 'r', encoding='utf-8')
     free_ngram_clean_partial=partial(free_ngram, args=args, key=dedup_key, \
@@ -377,10 +378,16 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, \
                 split_mt_thld += 1
 
             if args.output is not None:
+                if "split_id" in myjson:
+                    use_prefix = myjson["split_id"] + "-"
+                else:
+                    use_prefix = ""
+
                 for i in range(len(text_buf_ngram_free)):
                     split_id_string = id_prefix + '-{:010d}'.format(int(\
-                        counter)) + '-{:010d}'.format(int(i))
+                        counter)) + '-{:04d}'.format(int(i))
                     myjson[dedup_key] = text_buf_ngram_free[i]
+                    myjson["split_id"] = use_prefix + split_id_string
                     outjson = json.dumps(myjson, ensure_ascii=False)
                     #outjson = json.dumps({"text":text_buf_ngram_free[i],
                     #    id_prefix+"_split_id":split_id_string},
@@ -426,6 +433,8 @@ if __name__ == '__main__':
                         ' e.g. cc.json text')
     parser.add_argument('--output', type=str, default=None,
                        help='Output file name to save dedup dataset')
+    parser.add_argument('--num-threads', type=int, default=40,
+                       help='Number of threads to use')
     # Default dedup values
     parser.add_argument('--max-ngram-size', type=int, default=13,
                        help='Maximum size of ngram to use.')
@@ -451,7 +460,7 @@ if __name__ == '__main__':
     dedup_key = args.dedup_dataset[1]
 
     # Setup multi-processing
-    num_workers = 40
+    num_workers = args.num_threads
     if args.load_dictionary is None:
 
         # Build ngrams
