@@ -329,6 +329,7 @@ class TransformerLanguageModel(MegatronModule):
                 self._pooler_key = 'pooler'
 
     def set_input_tensor(self, input_tensor):
+        """ See megatron.model.transformer.set_input_tensor()"""
         self.encoder.set_input_tensor(input_tensor)
 
     def forward(self, enc_input_ids, enc_position_ids, enc_attn_mask,

@@ -86,6 +86,7 @@ class GPTModel(MegatronModule):
         self.initialize_word_embeddings(init_method_normal)
 
     def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask, labels=None,

@@ -59,6 +59,7 @@ class MultipleChoice(MegatronModule):
             self._multichoice_head_key = 'multichoice_head'
 
     def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, model_input, attention_mask, tokentype_ids=None):

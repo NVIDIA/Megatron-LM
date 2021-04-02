@@ -576,11 +576,12 @@ class ParallelTransformer(MegatronModule):
             # Stage 0: [0, 1]  [4, 5]
             # Stage 1: [2, 3]  [6, 7]
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
-                    args.num_layers // args.virtual_pipeline_model_parallel_size) + \
+                args.num_layers // args.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
             offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
@@ -620,6 +621,13 @@ class ParallelTransformer(MegatronModule):
         return hidden_states
 
     def set_input_tensor(self, input_tensor):
+        """Set input tensor to be used instead of forward()'s input.
+
+        When doing pipeline parallelism the input from the previous
+        stage comes from communication, not from the input, so the
+        model's forward_step_func won't have it. This function is thus
+        used by internal code to bypass the input provided by the
+        forward_step_func"""
         self.input_tensor = input_tensor
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
@@ -644,6 +652,7 @@ class ParallelTransformer(MegatronModule):
             else:
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
         else:
+            # See set_input_tensor()
             hidden_states = self.input_tensor
 
         if encoder_output is not None:

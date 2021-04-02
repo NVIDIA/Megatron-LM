@@ -30,8 +30,8 @@ from .module import MegatronModule
 
 class Classification(MegatronModule):
 
-    def __init__(self, 
-                 num_classes, 
+    def __init__(self,
+                 num_classes,
                  num_tokentypes=2,
                  pre_process=True,
                  post_process=True):
@@ -62,6 +62,7 @@ class Classification(MegatronModule):
             self._classification_head_key = 'classification_head'
 
     def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, model_input, attention_mask, tokentype_ids=None):

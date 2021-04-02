@@ -89,6 +89,11 @@ def calculate_correct_answers(name, model, dataloader,
 
     ds = dataloader.dataset
     if hasattr(ds, 'sample_multiplier'):
+        # If our dataset as a sample_multiplier attribute that means
+        # each "sample" from the dataset actually has multiple samples
+        # that will collapse into the batch dimension (for example in
+        # the RACE dataset that has several options), we need to
+        # account for that when setting the micro batch size.
         sample_multiplier = ds.sample_multiplier
     else:
         sample_multiplier = 1

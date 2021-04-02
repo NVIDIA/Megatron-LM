@@ -137,6 +137,11 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
     args.orig_micro_batch_size = args.micro_batch_size
     args.orig_global_batch_size = args.global_batch_size
     if hasattr(train_dataset, 'sample_multiplier'):
+        # If our dataset as a sample_multiplier attribute that means
+        # each "sample" from the dataset actually has multiple samples
+        # that will collapse into the batch dimension (for example in
+        # the RACE dataset that has several options), we need to
+        # account for that when setting the micro batch size.
         args.micro_batch_size *= train_dataset.sample_multiplier
         args.global_batch_size *= train_dataset.sample_multiplier
 

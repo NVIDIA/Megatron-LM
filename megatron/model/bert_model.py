@@ -124,8 +124,8 @@ def post_language_model_processing(lm_output, pooled_output,
 class BertModel(MegatronModule):
     """Bert Language model."""
 
-    def __init__(self, 
-                 num_tokentypes=2, 
+    def __init__(self,
+                 num_tokentypes=2,
                  add_binary_head=True,
                  parallel_output=True,
                  pre_process=True,
@@ -165,6 +165,7 @@ class BertModel(MegatronModule):
                 self._binary_head_key = 'binary_head'
 
     def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, bert_model_input, attention_mask,

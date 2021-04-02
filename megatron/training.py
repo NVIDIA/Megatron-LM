@@ -204,11 +204,11 @@ def get_model(model_provider_func):
         model = []
         for i in range(args.virtual_pipeline_model_parallel_size):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
-            m = model_provider_func(
+            this_model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process
             )
-            model.append(m)
+            model.append(this_model)
     else:
         model = model_provider_func(
             pre_process=pre_process,
@@ -249,7 +249,7 @@ def get_model(model_provider_func):
                           process_group=mpu.get_data_parallel_group())
                  for model_module in model]
         return model
-    
+
     if args.DDP_impl == 'local':
         model = [LocalDDP(model_module,
                           args.accumulate_allreduce_grads_in_fp32,
