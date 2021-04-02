@@ -96,6 +96,7 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
     def __init__(
         self,
         input_in_fp16,
+        input_in_bf16,
         attn_mask_type,
         scaled_masked_softmax_fusion,
         mask_func,
@@ -104,6 +105,10 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
     ):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
+        self.input_in_bf16 = input_in_bf16
+        assert not (self.input_in_fp16 and self.input_in_bf16),\
+            'both fp16 and bf16 flags cannot be active at the same time.'
+        self.input_in_float16 = self.input_in_fp16 or self.input_in_bf16
         self.attn_mask_type = attn_mask_type
         self.scaled_masked_softmax_fusion = scaled_masked_softmax_fusion
         self.mask_func = mask_func
@@ -128,8 +133,8 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
             query_seq_len % 4 == 0 and attn_batch_size % 4 == 0
 
         # invoke custom kernel
-        if self.input_in_fp16 and mask is not None and \
-           custom_kernel_constraint and self.scaled_masked_softmax_fusion:
+        if self.input_in_float16 and mask is not None and \
+            custom_kernel_constraint and self.scaled_masked_softmax_fusion:
             scale = self.scale if self.scale is not None else 1.0
 
             if self.attn_mask_type == AttnMaskType.causal:
@@ -142,7 +147,7 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
                 assert self.attn_mask_type == AttnMaskType.padding
                 probs = ScaledMaskedSoftmax.apply(input, mask, scale)
         else:
-            if self.input_in_fp16 and self.softmax_in_fp32:
+            if self.input_in_float16 and self.softmax_in_fp32:
                 input = input.float()
 
             if self.scale is not None:
@@ -150,7 +155,10 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
             mask_output = self.mask_func(input, mask) if mask is not None else input
             probs = torch.nn.Softmax(dim=-1)(mask_output)
 
-            if self.input_in_fp16 and self.softmax_in_fp32:
-                probs = probs.half()
+            if self.input_in_float16 and self.softmax_in_fp32:
+                if self.input_in_fp16:
+                    probs = probs.half()
+                else:
+                    probs = probs.bfloat16()
 
         return probs

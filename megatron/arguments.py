@@ -19,7 +19,6 @@ import argparse
 import os
 
 import torch
-from megatron import fused_kernels
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -39,7 +38,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
-    parser = _add_realm_args(parser)
+    parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
 
@@ -70,7 +69,7 @@ def parse_args(extra_args_provider=None, defaults={},
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
-        ' divisible by tensor parallel size ({}) times pipeline paralle ' \
+        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
     args.data_parallel_size = args.world_size // model_parallel_size
@@ -116,15 +115,38 @@ def parse_args(extra_args_provider=None, defaults={},
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        assert args.pipeline_model_parallel_size > 2, \
+            'pipeline-model-parallel size should be greater than 2 with ' \
+            'interleaved schedule'
+        assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
+            'number of layers is not divisible by number of layers per virtual ' \
+            'pipeline stage'
+        args.virtual_pipeline_model_parallel_size = \
+            (args.num_layers // args.pipeline_model_parallel_size) // \
+            args.num_layers_per_virtual_pipeline_stage
+    else:
+        args.virtual_pipeline_model_parallel_size = None
 
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
+        assert not args.bf16
         args.params_dtype = torch.half
+    if args.bf16:
+        assert not args.fp16
+        args.params_dtype = torch.bfloat16
+
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
+    # If we do accumulation and all-reduces in fp32, we need to have
+    # local DDP and we should set the use-contiguous-buffers-in-ddp. 
+    if args.accumulate_allreduce_grads_in_fp32:
+        assert args.DDP_impl == 'local'
+        args.use_contiguous_buffers_in_ddp = True
+        
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
@@ -195,38 +217,13 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
     if args.fp32_residual_connection:
-        assert args.fp16, \
-            'residual connection in fp32 only supported when using fp16.'
+        assert args.fp16 or args.bf16, \
+            'residual connection in fp32 only supported when using fp16 or bf16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
-
-    # custom kernel constraints check
-    seq_len = args.seq_length
-    attn_batch_size = \
-        (args.num_attention_heads / args.tensor_model_parallel_size) * \
-        args.micro_batch_size
-
-    # constraints on sequence length and attn_batch_size to enable warp based
-    # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
-        seq_len % 4 == 0 and attn_batch_size % 4 == 0
-
-    if args.fp16 and custom_kernel_constraint and args.masked_softmax_fusion:
-        print('WARNING: constraints for invoking optimized'
-            ' fused softmax kernel are not met. We default back to unfused'
-            ' kernel invocations.')
-
-    # Load scaled_masked_softmax_fusion_kernels
-    if args.masked_softmax_fusion:
-        fused_kernels.load_scaled_upper_triang_masked_softmax_fusion_kernel()
-        fused_kernels.load_scaled_masked_softmax_fusion_kernel()
-
-    # Load mixed precision fused layer norm.
-    if args.fp32_residual_connection:
-        fused_kernels.load_fused_mix_prec_layer_norm_kernel()
 
     _print_args(args)
     return args
@@ -299,6 +296,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-num-zeros-in-grad', action='store_true',
+                       help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
@@ -517,6 +516,8 @@ def _add_mixed_precision_args(parser):
 
     group.add_argument('--fp16', action='store_true',
                        help='Run model in fp16 mode.')
+    group.add_argument('--bf16', action='store_true',
+                       help='Run model in bfloat16 mode.')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'
@@ -538,8 +539,9 @@ def _add_mixed_precision_args(parser):
                        help='Run attention masking and softmax in fp32. '
                        'This flag is ignored unless '
                        '--no-query-key-layer-scaling is specified.')
-    group.add_argument('--fp32-allreduce', action='store_true',
-                       help='All-reduce in fp32')
+    group.add_argument('--accumulate-allreduce-grads-in-fp32',
+                       action='store_true',
+                       help='Gradient accumulation and all-reduce in fp32.')
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
@@ -557,6 +559,8 @@ def _add_distributed_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
+    group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
+                       help='Number of layers per virtual pipeline stage')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -564,6 +568,12 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--use-contiguous-buffers-in-ddp', action='store_true',
+                       help='If set, use contiguous buffer in DDP. Note that '
+                       'this option only works woth local DDP.' )
+    group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
+                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -615,6 +625,12 @@ def _add_data_args(parser):
                        'This should be exclusive of --seq-length')
     group.add_argument('--decoder-seq-length', type=int, default=None,
                        help="Maximum decoder sequence length to process.")
+    group.add_argument('--retriever-seq-length', type=int, default=256,
+                       help='Maximum sequence length for the biencoder model '
+                        ' for retriever')
+    group.add_argument('--sample-rate', type=float, default=1.0,
+                       help='sample rate for training data. Supposed to be 0 '
+                            ' < sample_rate < 1')
     group.add_argument('--mask-prob', type=float, default=0.15,
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
@@ -655,13 +671,19 @@ def _add_autoresume_args(parser):
     return parser
 
 
-def _add_realm_args(parser):
-    group = parser.add_argument_group(title='realm')
+def _add_biencoder_args(parser):
+    group = parser.add_argument_group(title='biencoder')
 
     # network size
     group.add_argument('--ict-head-size', type=int, default=None,
                        help='Size of block embeddings to be used in ICT and '
-                       'REALM (paper default: 128)')
+                        'REALM (paper default: 128)')
+    group.add_argument('--biencoder-projection-dim', type=int, default=0,
+                       help='Size of projection head used in biencoder (paper'
+                        ' default: 128)')
+    group.add_argument('--biencoder-shared-query-context-model', action='store_true',
+                        help='Whether to share the parameters of the query '
+                        'and context models or not')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
@@ -678,16 +700,23 @@ def _add_realm_args(parser):
                        'ICT dataset')
     group.add_argument('--use-one-sent-docs', action='store_true',
                        help='Whether to use one sentence documents in ICT')
+    group.add_argument('--evidence-data-path', type=str, default=None,
+                       help='Path to Wikipedia Evidence frm DPR paper')
 
     # training
-    group.add_argument('--report-topk-accuracies', nargs='+', default=[],
-                       help="Which top-k accuracies to report (e.g. '1 5 20')")
+    group.add_argument('--retriever-report-topk-accuracies', nargs='+', type=int,
+                        default=[], help="Which top-k accuracies to report "
+                        "(e.g. '1 5 20')")
+    group.add_argument('--retriever-score-scaling', action='store_true',
+                       help='Whether to scale retriever scores by inverse '
+                        'square root of hidden size')
 
     # faiss index
-    group.add_argument('--faiss-use-gpu', action='store_true',
-                       help='Whether create the FaissMIPSIndex on GPU')
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
+    group.add_argument('--embedding-path', type=str, default=None,
+                       help='Where to save/load Open-Retrieval Embedding'
+                        ' data to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

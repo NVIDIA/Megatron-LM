@@ -22,7 +22,7 @@ from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
-from megatron.model import import_layernorm
+from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
@@ -116,6 +116,7 @@ class ParallelAttention(MegatronModule):
         super(ParallelAttention, self).__init__()
         args = get_args()
         self.fp16 = args.fp16
+        self.bf16 = args.bf16
 
         self.apply_query_key_layer_scaling = args.apply_query_key_layer_scaling
         self.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
@@ -164,7 +165,7 @@ class ParallelAttention(MegatronModule):
             self.norm_factor *= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            self.fp16,
+            self.fp16, self.bf16,
             self.attn_mask_type,
             args.masked_softmax_fusion,
             attention_mask_func,
@@ -397,8 +398,10 @@ class ParallelTransformerLayer(MegatronModule):
         self.apply_residual_connection_post_layernorm \
             = args.apply_residual_connection_post_layernorm
 
+        self.bf16 = args.bf16
+        self.fp32_residual_connection = args.fp32_residual_connection
+
         # Layernorm on the input data.
-        LayerNorm = import_layernorm(args.fp32_residual_connection)
         self.input_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon)
@@ -533,6 +536,7 @@ class ParallelTransformer(MegatronModule):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
+        self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
 
         # Store activation checkpoiting flag.
@@ -552,13 +556,32 @@ class ParallelTransformer(MegatronModule):
                 layer_number,
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type)
-        offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+        if args.virtual_pipeline_model_parallel_size is not None:
+            assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
+                'num_layers_per_stage must be divisible by ' \
+                'virtual_pipeline_model_parallel_size'
+            # Number of layers in each model chunk is the number of layers in the stage,
+            # divided by the number of model chunks in a stage.
+            self.num_layers = self.num_layers // args.virtual_pipeline_model_parallel_size
+            # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0]  [2]  [4]  [6]
+            # Stage 1: [1]  [3]  [5]  [7]
+            # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0, 1]  [4, 5]
+            # Stage 1: [2, 3]  [6, 7]
+            offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
+                    args.num_layers // args.virtual_pipeline_model_parallel_size) + \
+                (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
+        else:
+            # Each stage gets a contiguous set of layers.
+            offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if mpu.is_pipeline_last_stage():
             # Final layer norm before output.
-            LayerNorm = import_layernorm(args.fp32_residual_connection)
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)

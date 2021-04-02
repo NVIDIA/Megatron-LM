@@ -17,16 +17,20 @@
 
 import random
 import os
+import time
 
 import numpy as np
 import torch
 
+from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron import mpu
 from megatron.global_vars import set_global_variables
-from megatron.mpu import set_tensor_model_parallel_rank, set_tensor_model_parallel_world_size
+from megatron.mpu import (set_tensor_model_parallel_rank,
+                          set_tensor_model_parallel_world_size)
+
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -37,8 +41,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     what you are doing.
     Returns a function to finalize distributed env initialization 
     (optionally, only when args.lazy_mpu_init == True)
-
-"""
+    """
     if not allow_no_cuda:
         # Make sure cuda is available.
         assert torch.cuda.is_available(), 'Megatron requires CUDA.'
@@ -66,7 +69,8 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals    
         set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-        # and return function for external DDP manager to call when it has DDP initialized
+        # and return function for external DDP manager
+        # to call when it has DDP initialized
         set_tensor_model_parallel_rank(args.rank)    
         return finish_mpu_init
     else:
@@ -79,16 +83,71 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Autoresume.
         _init_autoresume()
 
-        # Compile dataset C++ code.
-        if torch.distributed.get_rank() == 0:
-            from megatron.data.dataset_utils import compile_helper
-            compile_helper()
-        # Simple barrier
-        torch.distributed.barrier()
-        
+        # Compile dependencies.
+        _compile_dependencies()
+
         # No continuation function
         return None
-        
+
+
+def _compile_dependencies():
+
+    args = get_args()
+
+    # =========================
+    # Compile dataset C++ code.
+    # =========================
+    # TODO: move this to ninja
+    if torch.distributed.get_rank() == 0:
+        start_time = time.time()
+        print('> compiling dataset index builder ...')
+        from megatron.data.dataset_utils import compile_helper
+        compile_helper()
+        print('>>> done with dataset index builder. Compilation time: {:.3f} '
+              'seconds'.format(time.time() - start_time), flush=True)
+
+    # ==================
+    # Load fused kernels
+    # ==================
+
+    # Custom kernel constraints check.
+    seq_len = args.seq_length
+    attn_batch_size = \
+        (args.num_attention_heads / args.tensor_model_parallel_size) * \
+        args.micro_batch_size
+    # Constraints on sequence length and attn_batch_size to enable warp based
+    # optimization and upper triangular optimization (for causal mask)
+    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
+        seq_len % 4 == 0 and attn_batch_size % 4 == 0
+    # Print a warning.
+    if not ((args.fp16 or args.bf16) and
+            custom_kernel_constraint and
+            args.masked_softmax_fusion):
+        if args.rank == 0:
+            print('WARNING: constraints for invoking optimized'
+                  ' fused softmax kernel are not met. We default'
+                  ' back to unfused kernel invocations.', flush=True)
+    
+    # Always build on rank zero first.
+    if torch.distributed.get_rank() == 0:
+        start_time = time.time()
+        print('> compiling and loading fused kernels ...', flush=True)
+        fused_kernels.load(args)
+        torch.distributed.barrier()
+    else:
+        torch.distributed.barrier()
+        fused_kernels.load(args)
+    # Simple barrier to make sure all ranks have passed the
+    # compilation phase successfully before moving on to the
+    # rest of the program. We think this might ensure that
+    # the lock is released.
+    torch.distributed.barrier()
+    if torch.distributed.get_rank() == 0:
+        print('>>> done with compiling and loading fused kernels. '
+              'Compilation time: {:.3f} seconds'.format(
+                  time.time() - start_time), flush=True)
+
+
 
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
@@ -133,7 +192,8 @@ def _initialize_distributed():
             print('model parallel is already initialized')
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
-                                          args.pipeline_model_parallel_size)
+                                          args.pipeline_model_parallel_size,
+                                          args.virtual_pipeline_model_parallel_size)
 
 
 def _init_autoresume():

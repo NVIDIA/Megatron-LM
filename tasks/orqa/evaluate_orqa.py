@@ -13,18 +13,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+"""Main tasks functionality."""
 
-from .distributed import *
-from .bert_model import (BertModel,
-                         BertModelFirstStage,
-                         BertModelIntermediateStage,
-                         BertModelLastStage)
-from .gpt_model import (GPTModel,
-                        GPTModelFirstStage,
-                        GPTModelIntermediateStage,
-                        GPTModelLastStage)
-from .language_model import get_language_model
-from .module import Float16Module
+import os
+import sys
 
+from megatron import get_args
+from tasks.orqa.evaluate_utils import ORQAEvaluator
+
+def main():
+    """
+    Main program
+    """
+
+    args = get_args()
+
+    # Set up the model and evaluator
+    evaluator = ORQAEvaluator()
+
+    # Run evaluation
+    if args.qa_data_dev is not None:
+        evaluator.evaluate(args.qa_data_dev, "DEV")
+
+    if args.qa_data_test is not None:
+        evaluator.evaluate(args.qa_data_test, "TEST")
 
