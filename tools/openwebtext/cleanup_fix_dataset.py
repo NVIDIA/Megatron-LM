@@ -69,6 +69,18 @@ def process_doc(json_line, args):
         # Cleaning extra spaces and newlines
         if "general_cleaning" in args.tasks:
             cleaned_text = re.sub(r"  +|\b\n+ |\b\n+", " ", text)
+            #cleaned_text = re.sub(r"\n\n+", "\n\n", text) # used this for Gutenberg dataset
+            #cleaned_text = re.sub(r"\n", "\n\n", text) # Used this for realnews
+
+            # stories datasets
+            #cleaned_text = re.sub(r" \'", "'", text)
+            #cleaned_text = re.sub(r" \!", "!", cleaned_text)
+            #cleaned_text = re.sub(r" \.", ".", cleaned_text)
+            #cleaned_text = re.sub(r" \?", "?", cleaned_text)
+            #cleaned_text = re.sub(r" - ", "-", cleaned_text)
+            ##cleaned_text = re.sub(r"\" ", "\"", cleaned_text)
+            #cleaned_text = re.sub(r" @ ", "@", cleaned_text)
+
             output['general_cleaning'] = True
             return output, cleaned_text, document, False
 
@@ -110,7 +122,7 @@ def process_set(args, input_file, output_f_cleaned, output_f_filtered):
         num_remove_512_non_english += 1 if output['remove_512_non_english'] \
             else 0
         num_ftfy_fix_text += 1 if output['ftfy_fix_text'] else 0
-        num_general_cleaning +1 if output['general_cleaning'] else 0
+        num_general_cleaning += 1 if output['general_cleaning'] else 0
 
         document['text'] = text
         myjson = json.dumps(document, ensure_ascii=False)
