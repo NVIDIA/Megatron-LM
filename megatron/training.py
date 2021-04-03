@@ -61,10 +61,10 @@ def print_datetime(string):
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def pretrain(train_valid_test_dataset_provider, 
+def pretrain(train_valid_test_dataset_provider,
              model_provider,
-             forward_step_func, 
-             extra_args_provider=None, 
+             forward_step_func,
+             extra_args_provider=None,
              args_defaults={}):
     """Main training program.
 
@@ -196,7 +196,25 @@ def get_model(model_provider_func):
     args = get_args()
 
     # Build model on cpu.
-    model = model_provider_func()
+    pre_process = mpu.is_pipeline_first_stage()
+    post_process = mpu.is_pipeline_last_stage()
+
+    if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+       args.virtual_pipeline_model_parallel_size is not None:
+        model = []
+        for i in range(args.virtual_pipeline_model_parallel_size):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            this_model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process
+            )
+            model.append(this_model)
+    else:
+        model = model_provider_func(
+            pre_process=pre_process,
+            post_process=post_process
+        )
+
     if not isinstance(model, list):
         model = [model]
 
@@ -231,7 +249,7 @@ def get_model(model_provider_func):
                           process_group=mpu.get_data_parallel_group())
                  for model_module in model]
         return model
-    
+
     if args.DDP_impl == 'local':
         model = [LocalDDP(model_module,
                           args.accumulate_allreduce_grads_in_fp32,
@@ -651,16 +669,16 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              lr_scheduler)
-                print_datetime('exiting program after {} minutes'.format(train_time))                
+                print_datetime('exiting program after {} minutes'.format(train_time))
                 sys.exit()
 
-        # Exiting based on iterations        
+        # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
             if not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          lr_scheduler)
             torch.distributed.barrier()
-            print_datetime('exiting program at iteration {}'.format(iteration))                
+            print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()
 
 

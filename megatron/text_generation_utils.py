@@ -26,9 +26,13 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.training import communicate
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
+from megatron.p2p_communication import recv_forward, send_forward
 
+# These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
 
 def get_batch(context_tokens):
     """Generate batch from context tokens."""
@@ -395,55 +399,28 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
                  layer_past=None, get_key_value=None,
                  forward_method_parallel_output=None):
 
-    # Hidden size changes when not using recompute, need to tell communicate()
-    # the correct size
+    # Hidden size changes when not using recompute, need to tell p2p_communicate
+    # functions the correct size
     args = get_args()
     orig_seq_length = args.seq_length
     args.seq_length = tokens.shape[1]
 
-    if not mpu.is_pipeline_first_stage():
-        input_tensor, _ = communicate(
-            tensor_send_next=None,
-            tensor_send_prev=None,
-            recv_forward=True,
-            recv_backward=False)
-    else:
-        input_tensor = None
+    input_tensor = recv_forward()
 
     # Forward pass through the model.
-    if mpu.is_pipeline_first_stage():
-        assert input_tensor is None
-        if mpu.is_pipeline_last_stage():
-            output_tensor = model(tokens, position_ids, attention_mask,
-                                  tokentype_ids=tokentype_ids,
-                                  layer_past=layer_past,
-                                  get_key_value=get_key_value,
-                                  forward_method_parallel_output=forward_method_parallel_output)
-        else:
-            output_tensor = model(tokens, position_ids, attention_mask,
-                                  tokentype_ids=tokentype_ids,
-                                  layer_past=layer_past,
-                                  get_key_value=get_key_value)
-    elif mpu.is_pipeline_last_stage():
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, attention_mask,
-                              layer_past=layer_past,
-                              get_key_value=get_key_value,
-                              forward_method_parallel_output=forward_method_parallel_output)
-    else:
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, attention_mask,
-                              layer_past=layer_past,
-                              get_key_value=get_key_value)
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model.set_input_tensor(input_tensor)
+    output_tensor = model(tokens, position_ids, attention_mask,
+                          tokentype_ids=tokentype_ids,
+                          layer_past=layer_past,
+                          get_key_value=get_key_value,
+                          forward_method_parallel_output=forward_method_parallel_output)
 
     if get_key_value:
         output_tensor, layer_past = output_tensor
 
-    if not mpu.is_pipeline_last_stage():
-        communicate(tensor_send_next=output_tensor,
-                    tensor_send_prev=None,
-                    recv_forward=False,
-                    recv_backward=False)
+    send_forward(output_tensor)
 
     args.seq_length = orig_seq_length
     if get_key_value:
