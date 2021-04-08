@@ -149,7 +149,7 @@ def _train(
     report_memory_flag = True
 
     # For each remaining epoch
-    timers("interval time").start()
+    timers("interval-time").start()
     for epoch in range(start_epoch, args.epochs):
         print_rank_0("working on epoch {} ...".format(epoch + 1))
 
