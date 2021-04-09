@@ -62,6 +62,35 @@ def get_tasks_args(parser):
     group.add_argument('--faiss-topk-retrievals', type=int, default=100,
                        help='Number of blocks to use as top-k during retrieval')
 
+    # finetune for retriever
+    group.add_argument('--eval-micro-batch-size', type=int, default=None,
+                       help='Eval Batch size per model instance (local batch '
+                            'size). Global batch size is local batch size '
+                            'times data parallel size.')
+    group.add_argument('--train-with-neg', action='store_true',
+                       help='Whether to use negative examples during model '
+                        'training')
+    group.add_argument('--train-hard-neg', type=int, default=0,
+                       help='Number of hard negative exmaples to use during '
+                        'training')
+
+
+    # parameters for Av.rank validation method
+    # Following options/arguments have been taken directly from DPR codebase
+    #group.add_argument("--val-av-rank-start-epoch", type=int, default=10000,
+    #                    help="Av.rank validation: the epoch from which to enable this validation")
+    group.add_argument('--val-av-rank-hard-neg', type=int, default=30,
+                        help='Av.rank validation: how many hard negatives to'
+                        ' take from each question pool')
+    group.add_argument('--val-av-rank-other-neg', type=int, default=30,
+                        help='Av.rank validation: how many other negatives to'
+                        ' take from each question pool')
+    #group.add_argument("--val-av-rank-bsz", type=int, default=128,
+    #                    help="Av.rank validation: batch size to process passages")
+    #group.add_argument("--val-av-rank-max-qs", type=int, default=10000,
+    #                    help="Av.rank validation: max num of questions")
+ 
+ 
     return parser
 
 
@@ -78,6 +107,8 @@ if __name__ == '__main__':
         from zeroshot_gpt.evaluate import main
     elif args.task in ['ICT-ZEROSHOT-NQ']:
         from orqa.evaluate_orqa import main
+    elif args.task in ['RET-FINETUNE-NQ']:
+        from orqa.supervised.finetune import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

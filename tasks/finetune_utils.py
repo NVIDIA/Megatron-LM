@@ -248,6 +248,8 @@ def finetune(train_valid_datasets_provider, model_provider,
         end_of_epoch_callback = end_of_epoch_callback_provider()
     timers('callback function').stop()
 
+    exit()
+
     # Build model, optimizer and learning rate scheduler.
     timers('model and optimizer').start()
     model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
