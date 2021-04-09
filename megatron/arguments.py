@@ -116,6 +116,9 @@ def parse_args(extra_args_provider=None, defaults={},
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
+        assert args.pipeline_model_parallel_size > 2, \
+            'pipeline-model-parallel size should be greater than 2 with ' \
+            'interleaved schedule'
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
@@ -133,9 +136,13 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
-        # Jitting fusion is not supported for bfloat for now
-        assert not args.bias_gelu_fusion
-        assert not args.bias_dropout_fusion
+        # bfloat16 requires gradient accumulation and all-reduce to
+        # be done in fp32.
+        if not args.accumulate_allreduce_grads_in_fp32:
+            args.accumulate_allreduce_grads_in_fp32 = True
+            if args.rank == 0:
+                print('accumulate and all-reduce gradients in fp32 for '
+                      'bfloat16 data type.', flush=True)
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),

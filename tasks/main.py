@@ -99,6 +99,11 @@ if __name__ == '__main__':
     initialize_megatron(extra_args_provider=get_tasks_args)
 
     args = get_args()
+
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        print("Interleaved pipeline schedule is not yet supported for downstream tasks.")
+        exit()
+
     if args.task == 'RACE':
         from race.finetune import main
     elif args.task in ['MNLI', 'QQP']:
