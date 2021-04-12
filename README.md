@@ -1,4 +1,4 @@
-[Megatron](https://arxiv.org/pdf/1909.08053.pdf) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel (tensor and pipeline), and multi-node pre-training of [GPT](https://arxiv.org/abs/2005.14165) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
+Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf) and [2](https://arxiv.org/pdf/2104.04473.pdf)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel (tensor and pipeline), and multi-node pre-training of [GPT](https://arxiv.org/abs/2005.14165) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
 * [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
@@ -8,15 +8,15 @@ Below are some of the projects where we have directly used Megatron:
 * [Local Knowledge Powered Conversational Agents](https://arxiv.org/abs/2010.10150)
 * [MEGATRON-CNTRL: Controllable Story Generation with External Knowledge Using Large-Scale Language Models](https://www.aclweb.org/anthology/2020.emnlp-main.226.pdf)
 * [RACE Reading Comprehension Dataset Leaderboard](http://www.qizhexie.com/data/RACE_leaderboard.html)
+* [Scaling Language Model Training to a Trillion Parameters Using Megatron](https://arxiv.org/pdf/2104.04473.pdf)
 * [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
 
-Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specifc model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. The table below shows the model configurations along with the achieved FLOPs per second (both per GPU and aggregate over all GPUs). Note that the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
+Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specifc model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. The table below shows the model configurations along with the achieved FLOPs (both per GPU and aggregate over all GPUs). Note that the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
 
-![Cases](images/cases_jan2021.png)
+![Cases](images/cases_april2021.png)
 
-The following figures show achieved percentage of theoretical peak FLOPs and achieved aggregate petaFLOPs per second as a function of number of GPUs. All the cases from 1 billion to 1 trillion achieve more than 41% half precision utilization, which is high for an end-to-end application. We observe that initially as the model parallel size increases, utilization slightly decreases; as hidden size increases for larger models, utilization starts increasing and reaches 49% for the largest model. We also note that achieved aggregate petaFLOPs per second across all GPUs increases almost linearly with number of GPUs, demonstrating good weak scaling.
+All the cases from 1 billion to 1 trillion parameters achieve more than 43% half precision utilization, which is high for an end-to-end application. We observe that initially the utilization remains constant but as hidden size increases for larger models, utilization starts increasing and reaches 52% for the largest model. We also note that achieved aggregate petaFLOPs across all GPUs increases almost linearly with number of GPUs, demonstrating good weak scaling.
 
-![Model Parallel Scaling](images/scaling.png)
 
 # Contents
    * [Contents](#contents)
@@ -370,11 +370,11 @@ python tools/create_doc_index.py \
 
 We provide several command line arguments, detailed in the scripts listed below, to handle various zero-shot and fine-tuned downstream tasks. However, you can also finetune your model from a pretrained checkpoint on other corpora as desired. To do so, simply add the `--finetune` flag and adjust the input files and training parameters within the original training script. The iteration count will be reset to zero, and the optimizer and internal state will be reinitialized. If the fine-tuning is interrupted for any reason, be sure to remove the `--finetune` flag before continuing, otherwise the training will start again from the beginning.
 
-<!--
-Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this.
+Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this. Currently only tensor model parallelism is supported on input and pipeline model parallelsim on the output. This example reads in a model with 2-way tensor model parallelism and writes out a model with 2-way pipeline model parallelism.
 
 <pre>
 TENSOR_MODEL_PARALLEL_SIZE=2
+TARGET_PIPELINE_MODEL_PARALLEL_SIZE=2
 
 VOCAB_FILE=bert-vocab.txt
 CHECKPOINT_PATH=checkpoints/bert_345m
@@ -382,6 +382,8 @@ CHECKPOINT_PATH=checkpoints/bert_345m
 WORLD_SIZE=$TENSOR_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
         --model-type BERT \
         --tensor-model-parallel-size $TENSOR_MODEL_PARALLEL_SIZE \
+        --pipeline-model-parallel-size 1 \
+        --target-pipeline-model-parallel-size $TARGET_PIPELINE_MODEL_PARALLEL_SIZE \
         --tokenizer-type BertWordPieceLowerCase \
         --vocab-file $VOCAB_FILE \
         --num-layers 24 \
@@ -390,9 +392,10 @@ WORLD_SIZE=$TENSOR_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
         --seq-length 512 \
         --max-position-embeddings 512 \
         --load $CHECKPOINT_PATH
+        --save $CHECKPOINT_PATH/merged
 
 </pre>
--->
+
 Several downstream tasks are described for both GPT and BERT models below. They can be run in distributed and model parallel modes with the same changes used in the training scripts.
 
 ## GPT Text Generation

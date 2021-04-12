@@ -39,6 +39,11 @@ def scaled_init_method_normal(sigma, num_layers):
     return init_
 
 
+def attention_mask_func(attention_scores, attention_mask):
+    attention_scores.masked_fill_(attention_mask, -10000.0)
+    return attention_scores
+
+
 def get_linear_layer(rows, columns, init_method):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)

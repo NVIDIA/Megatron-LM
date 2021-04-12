@@ -38,13 +38,15 @@ from .initialize import get_pipeline_model_parallel_next_rank
 from .initialize import get_pipeline_model_parallel_prev_rank
 from .initialize import get_tensor_model_parallel_world_size, set_tensor_model_parallel_world_size
 from .initialize import get_pipeline_model_parallel_world_size, set_pipeline_model_parallel_world_size
+from .initialize import get_virtual_pipeline_model_parallel_rank, set_virtual_pipeline_model_parallel_rank
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
 
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding
-from .layers import (set_defaults_if_not_set_tensor_model_parallel_attributes,
+from .layers import (set_tensor_model_parallel_attributes,
+                     set_defaults_if_not_set_tensor_model_parallel_attributes,
                      copy_tensor_model_parallel_attributes)
                      
 from .mappings import copy_to_tensor_model_parallel_region
@@ -57,6 +59,8 @@ from .random import get_cuda_rng_tracker
 from .random import init_checkpointed_activations_memory_buffer
 from .random import model_parallel_cuda_manual_seed
 from .random import reset_checkpointed_activations_memory_buffer
+from .random import gather_split_1d_tensor
+from .random import split_tensor_into_1d_equal_chunks
 
 from .utils import divide
 from .utils import split_tensor_along_last_dim

@@ -189,6 +189,9 @@ inline int32_t get_target_sample_len(const int32_t short_seq_ratio,
 				     const int32_t max_length,
 				     std::mt19937& rand32_gen) {
     /* Training sample length. */
+    if (short_seq_ratio == 0) {
+      return max_length;
+    }
     const auto random_number = rand32_gen();
     if ((random_number % short_seq_ratio) == 0) {
       return 2 + random_number % (max_length - 1);
@@ -205,7 +208,8 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
                              const int32_t max_seq_length,
                              const double short_seq_prob,
                              const int32_t seed,
-			     const bool verbose) {
+			     const bool verbose,
+			     const int32_t min_num_sent) {
     /* Build a mapping of (start-index, end-index, sequence-length) where
        start and end index are the indices of the sentences in the sample
        and sequence-length is the target sequence length.
@@ -214,7 +218,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
     // Consistency checks.
     assert(num_epochs > 0);
     assert(max_seq_length > 1);
-    assert(short_seq_prob > 0.0);
+    assert(short_seq_prob >= 0.0);
     assert(short_seq_prob <= 1.0);
     assert(seed > 0);
 
@@ -223,7 +227,10 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
     auto sizes = sizes_.unchecked<1>();
 
     // For efficiency, convert probability to ratio. Note: rand() generates int.
-    const auto short_seq_ratio = static_cast<int32_t>(round(1.0 / short_seq_prob));
+    int32_t short_seq_ratio = 0;
+    if (short_seq_prob > 0) {
+      short_seq_ratio = static_cast<int32_t>(round(1.0 / short_seq_prob));
+    }
 
     if (verbose) {
         const auto sent_start_index = docs[0];
@@ -322,7 +329,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
 		}
 
                 // If we have more than two sentences.
-                if ((num_remain_sent > 1) && (!contains_long_sentence)) {
+                if ((num_remain_sent >= min_num_sent) && (!contains_long_sentence)) {
 
                     // Set values.
                     auto seq_len = int32_t{0};
@@ -346,7 +353,7 @@ py::array build_mapping_impl(const py::array_t<int64_t>& docs_,
 			// and if we have reached end of the document.
 			if (((seq_len >= target_seq_len) &&
 			     (num_remain_sent > 1) &&
-			     (num_sent > 1) ) || (num_remain_sent == 0)) {
+			     (num_sent >= min_num_sent) ) || (num_remain_sent == 0)) {
 
 			    // Check for overflow.
 			    if ((3 * map_index + 2) >
@@ -437,7 +444,8 @@ py::array build_mapping(const py::array_t<int64_t>& docs_,
                         const int max_seq_length,
                         const double short_seq_prob,
                         const int seed,
-			const bool verbose) {
+			const bool verbose,
+			const int32_t min_num_sent) {
 
     if (sizes_.size() > std::numeric_limits<uint32_t>::max()) {
         if (verbose) {
@@ -445,14 +453,16 @@ py::array build_mapping(const py::array_t<int64_t>& docs_,
 	}
 	return build_mapping_impl<uint64_t>(docs_, sizes_, num_epochs,
 					    max_num_samples, max_seq_length,
-					    short_seq_prob, seed, verbose);
+					    short_seq_prob, seed, verbose,
+					    min_num_sent);
     } else {
        if (verbose) {
 	   cout << "    using uint32 for data mapping..." << endl << std::flush;
        }
        return build_mapping_impl<uint32_t>(docs_, sizes_, num_epochs,
 					   max_num_samples, max_seq_length,
-					   short_seq_prob, seed, verbose);
+					   short_seq_prob, seed, verbose,
+					   min_num_sent);
     }
 }
 

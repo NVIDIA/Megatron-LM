@@ -47,6 +47,20 @@ def get_tasks_args(parser):
                        help='Sliding window for overlapping evaluation.')
     group.add_argument('--strict-lambada', action='store_true',
                        help='Use more difficult formulation of lambada.')
+    # Retriever args
+    group.add_argument('--qa-data-dev', type=str, default=None,
+                       help='Path to the QA dataset dev file.')
+    group.add_argument('--qa-data-test', type=str, default=None,
+                       help='Path to the QA dataset test file.')
+
+    # Faiss arguments for retriever
+    group.add_argument('--faiss-use-gpu', action='store_true',
+                       help='Whether create the FaissMIPSIndex on GPU')
+    group.add_argument('--faiss-match', type=str, default='string', \
+                        choices=['regex', 'string'], help="Answer matching '\
+                        'logic type")
+    group.add_argument('--faiss-topk-retrievals', type=int, default=100,
+                       help='Number of blocks to use as top-k during retrieval')
 
     return parser
 
@@ -56,12 +70,19 @@ if __name__ == '__main__':
     initialize_megatron(extra_args_provider=get_tasks_args)
 
     args = get_args()
+
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        print("Interleaved pipeline schedule is not yet supported for downstream tasks.")
+        exit()
+
     if args.task == 'RACE':
         from race.finetune import main
     elif args.task in ['MNLI', 'QQP']:
         from glue.finetune import main
     elif args.task in ['LAMBADA', 'WIKITEXT103']:
-        from zeroshot_gpt2.evaluate import main
+        from zeroshot_gpt.evaluate import main
+    elif args.task in ['ICT-ZEROSHOT-NQ']:
+        from orqa.evaluate_orqa import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

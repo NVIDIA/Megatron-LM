@@ -17,41 +17,30 @@
 
 import torch
 import torch.nn.functional as F
-
+from functools import partial
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import BertModel, BertModelFirstStage, BertModelIntermediateStage, BertModelLastStage
+from megatron.model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
 
-def model_provider():
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building BERT model ...')
 
     args = get_args()
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        # Determine model based on position of stage in pipeline.
-        if mpu.is_pipeline_first_stage():
-            model = BertModelFirstStage(
-                num_tokentypes=2)
-        elif mpu.is_pipeline_last_stage():
-            model = BertModelLastStage(
-                num_tokentypes=2,
-                add_binary_head=True,
-                parallel_output=True)
-        else:
-            model = BertModelIntermediateStage(
-                num_tokentypes=2)
-    else:
-        model = BertModel(
-            num_tokentypes=2,
-            add_binary_head=True,
-            parallel_output=True)
+    num_tokentypes = 2 if args.bert_binary_head else 0
+    model = BertModel(
+        num_tokentypes=num_tokentypes,
+        add_binary_head=args.bert_binary_head,
+        parallel_output=True,
+        pre_process=pre_process,
+        post_process=post_process)
 
     return model
 
@@ -81,51 +70,51 @@ def get_batch(data_iterator):
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
 
-def forward_step(data_iterator, model, input_tensor):
+def loss_func(loss_mask, sentence_order, output_tensor):
+    lm_loss_, sop_logits = output_tensor
+
+    lm_loss_ = lm_loss_.float()
+    loss_mask = loss_mask.float()
+    lm_loss = torch.sum(
+        lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
+
+    if sop_logits is not None:
+        sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
+                                   sentence_order.view(-1),
+                                   ignore_index=-1)
+        sop_loss = sop_loss.float()
+        loss = lm_loss + sop_loss
+        averaged_losses = average_losses_across_data_parallel_group(
+            [lm_loss, sop_loss])
+        return loss, {'lm loss': averaged_losses[0],
+                      'sop loss': averaged_losses[1]}
+
+    else:
+        loss = lm_loss
+        averaged_losses = average_losses_across_data_parallel_group(
+            [lm_loss])
+        return loss, {'lm loss': averaged_losses[0]}
+
+
+def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
     timers = get_timers()
 
     # Get the batch.
     timers('batch-generator').start()
-    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask \
-        = get_batch(data_iterator)
+    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
+        data_iterator)
     timers('batch-generator').stop()
 
+    if not args.bert_binary_head:
+        types = None
+
     # Forward pass through the model.
-    if mpu.is_pipeline_first_stage():
-        assert input_tensor is None
-        if mpu.is_pipeline_last_stage():
-            output_tensor = model(tokens, padding_mask, tokentype_ids=types,
-                                  lm_labels=lm_labels)
-        else:
-            output_tensor = model(tokens, padding_mask, tokentype_ids=types)
-    elif mpu.is_pipeline_last_stage():
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, padding_mask, lm_labels=lm_labels)
-    else:
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, padding_mask)
+    output_tensor = model(tokens, padding_mask, tokentype_ids=types,
+                          lm_labels=lm_labels)
 
-    if mpu.is_pipeline_last_stage():
-        lm_loss_, sop_logits = output_tensor
-
-        sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
-                                   sentence_order.view(-1),
-                                   ignore_index=-1)
-        sop_loss = sop_loss.float()
-
-        lm_loss_ = lm_loss_.float()
-        loss_mask = loss_mask.float()
-        lm_loss = torch.sum(
-            lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
-
-        loss = lm_loss + sop_loss
-
-        averaged_losses = average_losses_across_data_parallel_group([lm_loss, sop_loss])
-
-        return loss, {'lm loss': averaged_losses[0], 'sop loss': averaged_losses[1]}
-    return output_tensor
+    return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -143,7 +132,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup))
+        skip_warmup=(not args.mmap_warmup),
+        binary_head=args.bert_binary_head)
     print_rank_0("> finished creating BERT datasets ...")
 
     return train_ds, valid_ds, test_ds

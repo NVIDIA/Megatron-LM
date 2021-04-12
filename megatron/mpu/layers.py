@@ -43,6 +43,12 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_stride': 1}
 
 
+def param_is_not_tensor_parallel_duplicate(param):
+    return (hasattr(param, 'tensor_model_parallel') and
+            param.tensor_model_parallel) or (
+                get_tensor_model_parallel_rank() == 0)
+
+
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
     # Make sure the attributes are not set.
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
@@ -260,9 +266,7 @@ class ColumnParallelLinear(torch.nn.Module):
                     self.output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=args.params_dtype))
-            self.bias.tensor_model_parallel = True
-            self.bias.partition_dim = 0
-            self.bias.stride = stride
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()

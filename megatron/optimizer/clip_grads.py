@@ -22,6 +22,8 @@ from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
 from megatron import mpu
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 
 def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
@@ -54,9 +56,8 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     grads_for_norm = []
     for param in parameters:
         grad_not_none = param.grad is not None
-        is_not_shared = not hasattr(param, 'shared') or not param.shared
-        is_not_tp_duplicate = param.tensor_model_parallel or \
-                              (mpu.get_tensor_model_parallel_rank() == 0)
+        is_not_shared = param_is_not_shared(param)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
         grad = param.grad.detach()
         if grad_not_none:
             # Make sure the grads are in fp32
@@ -117,3 +118,31 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
                              clip_coeff)
 
     return total_norm
+
+
+def count_zeros_fp32(parameters):
+
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+
+    # Filter parameters based on:
+    #   - grad should not be none
+    #   - parameter should not be shared
+    #   - should not be a replica due to tensor model parallelism
+    total_num_zeros = 0.0
+    for param in parameters:
+        grad_not_none = param.grad is not None
+        is_not_shared = param_is_not_shared(param)
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+        if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            grad = param.grad.detach()
+            num_zeros = grad.numel() - torch.count_nonzero(grad)
+            total_num_zeros = num_zeros + total_num_zeros
+
+    # Sum across all model-parallel GPUs.
+    torch.distributed.all_reduce(total_num_zeros,
+                                 op=torch.distributed.ReduceOp.SUM,
+                                 group=mpu.get_model_parallel_group())
+    total_num_zeros = total_num_zeros.item()
+
+    return total_num_zeros
