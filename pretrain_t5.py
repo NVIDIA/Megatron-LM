@@ -13,45 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pretrain BERT"""
+"""Pretrain T5"""
 
 from functools import partial
 
 import torch
-import torch.nn.functional as F
 
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import mpu
+from megatron import (
+    get_args,
+    get_timers,
+    mpu,
+    print_rank_0
+)
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import BertModel
+from megatron.model import T5Model
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
+    assert pre_process and post_process, "T5 doesn't yet support pipelining"
 
-    print_rank_0('building BERT model ...')
-
-    args = get_args()
-    num_tokentypes = 2 if args.bert_binary_head else 0
-    model = BertModel(
-        num_tokentypes=num_tokentypes,
-        add_binary_head=args.bert_binary_head,
-        parallel_output=True,
-        pre_process=pre_process,
-        post_process=post_process)
-
+    print_rank_0('building T5 model ...')
+    model = T5Model(num_tokentypes=0,
+                    parallel_output=True)
     return model
 
 
 def get_batch(data_iterator):
     """Build the batch."""
 
-    # Items and their type.
-    keys = ['text', 'types', 'labels', 'is_random', 'loss_mask', 'padding_mask']
+    keys = ['text_enc', 'text_dec', 'labels', 'loss_mask',
+            'enc_mask', 'dec_mask', 'enc_dec_mask']
     datatype = torch.int64
 
     # Broadcast data.
@@ -62,40 +56,30 @@ def get_batch(data_iterator):
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
-    tokens = data_b['text'].long()
-    types = data_b['types'].long()
-    sentence_order = data_b['is_random'].long()
+    tokens_enc = data_b['text_enc'].long()
+    tokens_dec = data_b['text_dec'].long()
+    labels = data_b['labels'].long()
     loss_mask = data_b['loss_mask'].float()
-    lm_labels = data_b['labels'].long()
-    padding_mask = data_b['padding_mask'].long()
 
-    return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
+    enc_mask = (data_b['enc_mask'] < 0.5)
+    dec_mask = (data_b['dec_mask'] < 0.5)
+    enc_dec_mask = (data_b['enc_dec_mask'] < 0.5)
+
+    return tokens_enc, tokens_dec, loss_mask, labels, \
+           enc_mask, dec_mask, enc_dec_mask
 
 
-def loss_func(loss_mask, sentence_order, output_tensor):
-    lm_loss_, sop_logits = output_tensor
+def loss_func(loss_mask, output_tensor):
+    lm_loss_, _ = output_tensor
 
     lm_loss_ = lm_loss_.float()
-    loss_mask = loss_mask.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
-    if sop_logits is not None:
-        sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(),
-                                   sentence_order.view(-1),
-                                   ignore_index=-1)
-        sop_loss = sop_loss.float()
-        loss = lm_loss + sop_loss
-        averaged_losses = average_losses_across_data_parallel_group(
-            [lm_loss, sop_loss])
-        return loss, {'lm loss': averaged_losses[0],
-                      'sop loss': averaged_losses[1]}
+    loss = lm_loss
+    averaged_losses = average_losses_across_data_parallel_group([lm_loss])
 
-    else:
-        loss = lm_loss
-        averaged_losses = average_losses_across_data_parallel_group(
-            [lm_loss])
-        return loss, {'lm loss': averaged_losses[0]}
+    return loss, {'lm loss': averaged_losses[0]}
 
 
 def forward_step(data_iterator, model):
@@ -104,19 +88,21 @@ def forward_step(data_iterator, model):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator').start()
-    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
-        data_iterator)
-    timers('batch-generator').stop()
+    timers('batch generator').start()
+    tokens_enc, tokens_dec, loss_mask, lm_labels, enc_mask, dec_mask, enc_dec_mask \
+        = get_batch(data_iterator)
+    timers('batch generator').stop()
 
-    if not args.bert_binary_head:
-        types = None
-
-    # Forward pass through the model.
-    output_tensor = model(tokens, padding_mask, tokentype_ids=types,
+    # Forward model lm_labels
+    output_tensor = model(tokens_enc,
+                          tokens_dec,
+                          enc_mask,
+                          dec_mask,
+                          enc_dec_mask,
+                          tokentype_ids=None,
                           lm_labels=lm_labels)
 
-    return output_tensor, partial(loss_func, loss_mask, sentence_order)
+    return output_tensor, partial(loss_func, loss_mask)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -124,19 +110,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     print_rank_0('> building train, validation, and test datasets '
-                 'for BERT ...')
+                 'for T5 ...')
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
         data_impl=args.data_impl,
         splits_string=args.split,
         train_valid_test_num_samples=train_val_test_num_samples,
-        max_seq_length=args.seq_length,
+        max_seq_length=args.encoder_seq_length,
+        max_seq_length_dec=args.decoder_seq_length,
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
         skip_warmup=(not args.mmap_warmup),
-        binary_head=args.bert_binary_head)
-    print_rank_0("> finished creating BERT datasets ...")
+        dataset_type='t5')
+    print_rank_0("> finished creating T5 datasets ...")
 
     return train_ds, valid_ds, test_ds
 
