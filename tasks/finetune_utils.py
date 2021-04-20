@@ -15,6 +15,8 @@
 
 """Finetune utilities."""
 
+from functools import partial
+
 import torch
 
 from megatron import get_args
@@ -46,7 +48,20 @@ def process_batch(batch):
     return tokens, types, labels, attention_mask
 
 
-def _cross_entropy_forward_step(batch, model, input_tensor):
+def cross_entropy_loss_func(labels, output_tensor):
+    logits = output_tensor
+
+    # Cross-entropy loss.
+    loss_func = torch.nn.CrossEntropyLoss()
+    loss = loss_func(logits.contiguous().float(), labels)
+
+    # Reduce loss for logging.
+    averaged_loss = average_losses_across_data_parallel_group([loss])
+
+    return loss, {'lm loss': averaged_loss[0]}
+
+
+def _cross_entropy_forward_step(batch, model):
     """Simple forward step with cross-entropy loss."""
     timers = get_timers()
 
@@ -60,25 +75,9 @@ def _cross_entropy_forward_step(batch, model, input_tensor):
     timers('batch-generator').stop()
 
     # Forward model.
-    if mpu.is_pipeline_first_stage():
-        assert input_tensor is None
-        output_tensor = model(tokens, attention_mask, tokentype_ids=types)
-    else:
-        assert input_tensor is not None
-        output_tensor = model(input_tensor, attention_mask)
+    output_tensor = model(tokens, attention_mask, tokentype_ids=types)
 
-    if mpu.is_pipeline_last_stage():
-        logits = output_tensor
-
-        # Cross-entropy loss.
-        loss_func = torch.nn.CrossEntropyLoss()
-        loss = loss_func(logits.contiguous().float(), labels)
-
-        # Reduce loss for logging.
-        averaged_loss = average_losses_across_data_parallel_group([loss])
-
-        return loss, {'lm loss': averaged_loss[0]}
-    return output_tensor
+    return output_tensor, partial(cross_entropy_loss_func, labels)
 
 
 def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
@@ -135,7 +134,14 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
     # This is necessary so pipeline transfers know what size they are
     # and the LR schedule, which is based on samples seen, gets set
     # correctly.
+    args.orig_micro_batch_size = args.micro_batch_size
+    args.orig_global_batch_size = args.global_batch_size
     if hasattr(train_dataset, 'sample_multiplier'):
+        # If our dataset as a sample_multiplier attribute that means
+        # each "sample" from the dataset actually has multiple samples
+        # that will collapse into the batch dimension (for example in
+        # the RACE dataset that has several options), we need to
+        # account for that when setting the micro batch size.
         args.micro_batch_size *= train_dataset.sample_multiplier
         args.global_batch_size *= train_dataset.sample_multiplier
 
@@ -149,7 +155,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
     timers = get_timers()
 
     # Turn on training mode which enables dropout.
-    model.train()
+    for m in model:
+        m.train()
 
     # Tracking loss.
     losses_dict_sum = {}
@@ -163,7 +170,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
     report_memory_flag = True
 
     # For each remaining epoch
-    timers('interval time').start()
+    timers('interval-time').start()
     for epoch in range(start_epoch, args.epochs):
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
@@ -180,10 +187,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             start_iteration = 0
 
             # Train for one step.
-            losses_dict, skipped_iter, grad_norm = train_step(forward_step,
-                                                              batch, model,
-                                                              optimizer,
-                                                              lr_scheduler)
+            out = train_step(forward_step, batch, model, optimizer, lr_scheduler)
+            losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
 
             # Logging.
@@ -195,7 +200,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                                               iteration,
                                               optimizer.get_loss_scale().item(),
                                               report_memory_flag, skipped_iter,
-                                              grad_norm, params_norm)
+                                              grad_norm, params_norm, num_zeros_in_grad)
 
             # Autoresume
             if args.adlr_autoresume and \
@@ -230,6 +235,9 @@ def finetune(train_valid_datasets_provider, model_provider,
     """Main finetune function used across all tasks."""
     args = get_args()
     timers = get_timers()
+
+    assert args.rampup_batch_size is None, \
+        'batch size scaling is not supported for finetuning'
 
     # Train and validation data loaders.
     timers('train/valid/test dataset/dataloder').start()

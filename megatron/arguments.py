@@ -136,6 +136,13 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.bf16:
         assert not args.fp16
         args.params_dtype = torch.bfloat16
+        # bfloat16 requires gradient accumulation and all-reduce to
+        # be done in fp32.
+        if not args.accumulate_allreduce_grads_in_fp32:
+            args.accumulate_allreduce_grads_in_fp32 = True
+            if args.rank == 0:
+                print('accumulate and all-reduce gradients in fp32 for '
+                      'bfloat16 data type.', flush=True)
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),

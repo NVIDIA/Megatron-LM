@@ -121,17 +121,23 @@ def post_language_model_processing(lm_output, pooled_output,
         return lm_loss, binary_logits
 
 
-class BertModelBase(MegatronModule):
+class BertModel(MegatronModule):
     """Bert Language model."""
 
-    def __init__(self, num_tokentypes=2, add_binary_head=True,
-                 parallel_output=True):
-        super(BertModelBase, self).__init__()
+    def __init__(self,
+                 num_tokentypes=2,
+                 add_binary_head=True,
+                 parallel_output=True,
+                 pre_process=True,
+                 post_process=True):
+        super(BertModel, self).__init__()
         args = get_args()
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.add_binary_head = add_binary_head
         self.parallel_output = parallel_output
+        self.pre_process = pre_process
+        self.post_process = post_process
 
         init_method = init_method_normal(args.init_method_std)
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
@@ -142,10 +148,12 @@ class BertModelBase(MegatronModule):
             add_pooler=self.add_binary_head,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method)
+            scaled_init_method=scaled_init_method,
+            pre_process=self.pre_process,
+            post_process=self.post_process)
 
         self.initialize_word_embeddings(init_method_normal)
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             self.lm_head = BertLMHead(
                 self.word_embeddings_weight().size(0),
                 args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
@@ -156,26 +164,30 @@ class BertModelBase(MegatronModule):
                                                     init_method)
                 self._binary_head_key = 'binary_head'
 
+    def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
+        self.language_model.set_input_tensor(input_tensor)
+
     def forward(self, bert_model_input, attention_mask,
                 tokentype_ids=None, lm_labels=None):
 
         extended_attention_mask = bert_extended_attention_mask(attention_mask)
+        input_ids = bert_model_input
+        position_ids = bert_position_ids(input_ids)
 
-        kwargs = {}
-        if mpu.is_pipeline_first_stage():
-            input_ids = bert_model_input
-            position_ids = bert_position_ids(input_ids)
-            args = [input_ids, position_ids, extended_attention_mask]
-            kwargs['tokentype_ids'] = tokentype_ids
-        else:
-            args = [bert_model_input, extended_attention_mask]
-        lm_output = self.language_model(*args, **kwargs)
-        if mpu.is_pipeline_last_stage() and self.add_binary_head:
+        lm_output = self.language_model(
+            input_ids,
+            position_ids,
+            extended_attention_mask,
+            tokentype_ids=tokentype_ids
+        )
+
+        if self.post_process and self.add_binary_head:
             lm_output, pooled_output = lm_output
         else:
             pooled_output = None
 
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             return post_language_model_processing(lm_output, pooled_output,
                                                   self.lm_head, self.binary_head,
                                                   lm_labels,
@@ -194,15 +206,15 @@ class BertModelBase(MegatronModule):
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
             destination, prefix, keep_vars)
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             state_dict_[self._lm_head_key] \
                 = self.lm_head.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
-        if mpu.is_pipeline_last_stage() and self.add_binary_head:
+        if self.post_process and self.add_binary_head:
             state_dict_[self._binary_head_key] \
                 = self.binary_head.state_dict(destination, prefix, keep_vars)
         # Save word_embeddings.
-        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
+        if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
                 = self.word_embeddings.state_dict(destination, prefix, keep_vars)
         return state_dict_
@@ -212,74 +224,13 @@ class BertModelBase(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        if mpu.is_pipeline_last_stage():
+        if self.post_process:
             self.lm_head.load_state_dict(
                 state_dict[self._lm_head_key], strict=strict)
-        if mpu.is_pipeline_last_stage() and self.add_binary_head:
+        if self.post_process and self.add_binary_head:
             self.binary_head.load_state_dict(
                 state_dict[self._binary_head_key], strict=strict)
         # Load word_embeddings.
-        if mpu.is_pipeline_last_stage() and not mpu.is_pipeline_first_stage():
+        if self.post_process and not self.pre_process:
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
-
-
-class BertModel(BertModelBase):
-
-    def __init__(self, num_tokentypes=2, add_binary_head=True,
-                 parallel_output=True):
-        super(BertModel, self).__init__(
-            num_tokentypes=num_tokentypes,
-            add_binary_head=add_binary_head,
-            parallel_output=parallel_output)
-
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None, lm_labels=None):
-        return super(BertModel, self).forward(
-            input_ids,
-            attention_mask,
-            tokentype_ids=tokentype_ids,
-            lm_labels=lm_labels)
-
-
-class BertModelFirstStage(BertModelBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(BertModelFirstStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, input_ids, attention_mask,
-                tokentype_ids=None):
-        return super(BertModelFirstStage, self).forward(
-            input_ids,
-            attention_mask,
-            tokentype_ids=tokentype_ids)
-
-
-class BertModelIntermediateStage(BertModelBase):
-
-    def __init__(self, num_tokentypes=2):
-        super(BertModelIntermediateStage, self).__init__(
-            num_tokentypes=num_tokentypes)
-
-    def forward(self, hidden_state, attention_mask):
-        return super(BertModelIntermediateStage, self).forward(
-            hidden_state,
-            attention_mask)
-
-
-class BertModelLastStage(BertModelBase):
-
-    def __init__(self, num_tokentypes=2, add_binary_head=True,
-                 parallel_output=True):
-        super(BertModelLastStage, self).__init__(
-            num_tokentypes=num_tokentypes,
-            add_binary_head=add_binary_head,
-            parallel_output=parallel_output)
-
-    def forward(self, hidden_state, attention_mask,
-                lm_labels=None):
-        return super(BertModelLastStage, self).forward(
-            hidden_state,
-            attention_mask,
-            lm_labels=lm_labels)

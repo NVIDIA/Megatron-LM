@@ -24,19 +24,24 @@ from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
-from megatron.model import GPTModel, GPTModelFirstStage, GPTModelLastStage, GPTModelIntermediateStage
-from megatron.training import get_model, communicate
-from megatron.utils import get_ltor_masks_and_position_ids
+from megatron.model import GPTModel
+from megatron.training import get_model
+from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
+from megatron.p2p_communication import recv_forward, send_forward
 from tasks.finetune_utils import build_data_loader
 
 from .datasets import build_dataset
 
+# These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
 
 def get_model_provider(eval_metric):
     """Based on evaluation metric set the parallel-output flag and
     return the model provider."""
 
-    def model_provider():
+    def model_provider(pre_process=True, post_process=True):
         """Build the model."""
 
         if eval_metric == 'loss':
@@ -48,17 +53,8 @@ def get_model_provider(eval_metric):
                                       'is not supported.'.format(eval_metric))
 
         print_rank_0('building GPT model ...')
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
-            # Determine model based on position of stage in pipeline.
-            if mpu.is_pipeline_first_stage():
-                model = GPTModelFirstStage(num_tokentypes=0)
-            elif mpu.is_pipeline_last_stage():
-                model = GPTModelLastStage(
-                    parallel_output=parallel_output, num_tokentypes=0)
-            else:
-                model = GPTModelIntermediateStage(num_tokentypes=0)
-        else:
-            model = GPTModel(num_tokentypes=0, parallel_output=parallel_output)
+        model = GPTModel(num_tokentypes=0, parallel_output=parallel_output,
+                         pre_process=pre_process, post_process=post_process)
 
         return model
 
@@ -97,33 +93,15 @@ def forward_step(batch, model, eval_metric):
     args = get_args()
     args.micro_batch_size = len(labels)
 
-    # Forward model.
-    if not mpu.is_pipeline_first_stage():
-        input_tensor, _ = communicate(
-            tensor_send_next=None,
-            tensor_send_prev=None,
-            recv_forward=True,
-            recv_backward=False)
-    else:
-        input_tensor = None
+    input_tensor = recv_forward()
 
     # Forward pass through the model.
-    if mpu.is_pipeline_first_stage():
-        assert input_tensor is None
-        if mpu.is_pipeline_last_stage():
-            output = model(tokens, position_ids, attention_mask)
-        else:
-            output = model(tokens, position_ids, attention_mask)
-    else:
-        assert input_tensor is not None
-        output = model(input_tensor, attention_mask)
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model.set_input_tensor(input_tensor)
+    output = model(tokens, position_ids, attention_mask)
 
-    if not mpu.is_pipeline_last_stage():
-        communicate(tensor_send_next=output,
-                    tensor_send_prev=None,
-                    recv_forward=False,
-                    recv_backward=False)
-        return None
+    send_forward(output)
 
     if mpu.is_pipeline_last_stage():
         # For loss, return the unreduced loss.
@@ -214,6 +192,10 @@ def main():
     """Main program."""
     args = get_args()
 
+    if args.num_layers_per_virtual_pipeline_stage is not None:
+        print("Interleaved pipeline schedule is not yet supported for text generation.")
+        exit()
+
     if args.task == 'LAMBADA':
         eval_metric = 'accuracy'
     elif args.task == 'WIKITEXT103':
@@ -226,6 +208,9 @@ def main():
     model = get_model(get_model_provider(eval_metric))
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
+
+    assert len(model) == 1, "Above condition should have caught this"
+    model = model[0]
 
     # Data stuff.
     dataset = build_dataset(args.task)
