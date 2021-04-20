@@ -3,6 +3,10 @@ import json
 import os
 import time
 
+"""
+This code adds id to each json object in a json file. User can add prefix
+to the ids.
+"""
 
 if __name__ == '__main__':
 

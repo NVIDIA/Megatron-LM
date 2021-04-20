@@ -31,6 +31,12 @@ from pathlib import Path
 import re
 import time
 
+"""
+This code does additional cleanup, for example, remove documents less than 512
+characters or dataset specific cleaning like stories, realnews datasets.
+Program arguments have the details.
+"""
+
 def process_doc(json_line, args):
 
     # Read the line.
