@@ -26,8 +26,8 @@ python blacklist_urls.py <path to the dowloaded deduplicated URLs> <filename for
 ```
 python cleanup_dataset.py <input data file> <output cleaned data filename>
 ```
-Addingtional cleanup (e.g. remove documents less than 512 characters or dataset specific cleaning like stories, realnews datasets) can be done using `cleanup_fix_dataset.py`. Program arguments have the details.
-2. Using LSH, find possible duplicates and store then in a file for later processing. The code supports saving and loading fingerprints for recurrent deduplications, and is also multithreaded for faster processing. More details are can be found at the arguments.
+Additional cleanup (e.g. remove documents less than 512 characters or dataset specific cleaning like stories, realnews datasets) can be done using `cleanup_fix_dataset.py`. More details can be found by running `python cleanup_fix_dataset.py --help`.
+2. Using LSH, find possible duplicates and store then in a file for later processing. The code supports saving and loading fingerprints for recurrent deduplications, and is also multithreaded for faster processing. More details are can be found by `python find_duplicate.py --help`.
 ```
 python find_duplicates.py --inputs <pairlist list of input cleaned data files and keys, e.g. cc.json cc_id news.json news_id> --output <output possible duplicate urls filename>
 ```
@@ -56,4 +56,4 @@ We use 13-grams by default for the deduplication. When we find a 13-gram match i
 
 Only for the lambada task, we need to provide the path, `--lambada-path <path of the lambada test data>`.
 
-Several other features (e.g. save and load dictionary) have been added, look at the arguments for details.
+Several other features (e.g. save and load dictionary) have been added, look at `python filter_ngrams.py --help` for details.

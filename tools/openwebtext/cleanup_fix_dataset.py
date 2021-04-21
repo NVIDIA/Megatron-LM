@@ -16,7 +16,9 @@
 """
 Filter and clean documents:
 Capable to clean docs with less than 512 characters, less than
-256 characters and contains javascript, fix text and clean text
+256 characters and contains javascript, fix text and dataset specific
+cleaning like stories and realnews datasets.
+Program arguments have the details.
 """
 
 import argparse
@@ -30,12 +32,6 @@ import os
 from pathlib import Path
 import re
 import time
-
-"""
-This code does additional cleanup, for example, remove documents less than 512
-characters or dataset specific cleaning like stories, realnews datasets.
-Program arguments have the details.
-"""
 
 def process_doc(json_line, args):
 
@@ -164,9 +160,14 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--input-files', nargs = '*', required=True, default=\
                         None, help = 'Input json files that needs to be'\
-                        ' creaned')
+                        ' cleaned')
     parser.add_argument('--tasks', nargs = '*', required=True, default=None,\
-                        help = 'Tasks to perform on the input files')
+                        help = 'Tasks to perform on the input files, ' \
+                        'such as remove_512, remove_256_javascript, ' \
+                        'remove_512_non_english, ftfy_fix_text, and ' \
+                        'general_cleaning. 256 or 512 means the number' \
+                        ' of characters.')
+
     parser.add_argument('--output-path', type=str, default=None,
                        help='Directory where the output should go')
     parser.add_argument('--log-interval', type=int, default=100,
