@@ -190,6 +190,10 @@ def generate_samples_input_from_file(model):
             raw_text = None
             context_count += 1
 
+# We added this function to support the tasks evaluation such as squad
+# and drop in the https://github.com/EleutherAI/lm-evaluation-harness 
+# codebase. The lm-evaluation-harness code can now call this function
+# similar to their current generate function call used for gpt style models.
 def generate_samples_eval(model, context, max_gen_length, eos_token_id):
     # Generate samples for lm evaluation
     # NEED TO THINK ABOUT eos token
