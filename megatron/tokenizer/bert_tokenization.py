@@ -181,6 +181,35 @@ class FullTokenizer(object):
     def convert_ids_to_tokens(self, ids):
         return convert_by_vocab(self.inv_vocab, ids)
 
+    @staticmethod
+    def convert_tokens_to_string(tokens, clean_up_tokenization_spaces=True):
+        """ Converts a sequence of tokens (string) in a single string. """
+
+        def clean_up_tokenization(out_string):
+            """ Clean up a list of simple English tokenization artifacts
+            like spaces before punctuations and abreviated forms.
+            """
+            out_string = (
+                out_string.replace(" .", ".")
+                    .replace(" ?", "?")
+                    .replace(" !", "!")
+                    .replace(" ,", ",")
+                    .replace(" ' ", "'")
+                    .replace(" n't", "n't")
+                    .replace(" 'm", "'m")
+                    .replace(" 's", "'s")
+                    .replace(" 've", "'ve")
+                    .replace(" 're", "'re")
+            )
+            return out_string
+
+        text = ' '.join(tokens).replace(' ##', '').strip()
+        if clean_up_tokenization_spaces:
+            clean_text = clean_up_tokenization(text)
+            return clean_text
+        else:
+            return text
+
     def vocab_size(self):
         return len(self.vocab)
 

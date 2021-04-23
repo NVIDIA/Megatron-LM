@@ -17,7 +17,9 @@ from .module import MegatronModule
 
 def biencoder_model_provider(only_query_model=False,
                              only_context_model=False,
-                             biencoder_shared_query_context_model=False):
+                             biencoder_shared_query_context_model=False,
+                             pre_process=True, 
+                             post_process=True):
     """Build the model."""
     args = get_args()
 
@@ -35,7 +37,9 @@ def biencoder_model_provider(only_query_model=False,
         only_query_model=only_query_model,
         only_context_model=only_context_model,
         biencoder_shared_query_context_model=\
-            biencoder_shared_query_context_model)
+            biencoder_shared_query_context_model,
+        pre_process=pre_process,
+        post_process=post_process)
 
     return model
 
@@ -48,13 +52,17 @@ class BiEncoderModel(MegatronModule):
                  parallel_output=True,
                  only_query_model=False,
                  only_context_model=False,
-                 biencoder_shared_query_context_model=False):
+                 biencoder_shared_query_context_model=False,
+                 pre_process=True,
+                 post_process=True):
         super(BiEncoderModel, self).__init__()
         args = get_args()
 
         bert_kwargs = dict(
             num_tokentypes=num_tokentypes,
-            parallel_output=parallel_output)
+            parallel_output=parallel_output,
+            pre_process=pre_process,
+            post_process=post_process)
 
         self.biencoder_shared_query_context_model = \
             biencoder_shared_query_context_model
@@ -77,6 +85,19 @@ class BiEncoderModel(MegatronModule):
                 # this model embeds evidence blocks - Embed_doc in the paper
                 self.context_model = PretrainedBertModel(**bert_kwargs)
                 self._context_key = 'context_model'
+
+    def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
+        #self.language_model.set_input_tensor(input_tensor)
+        return
+    #    #if self._model_key is not None:
+    #    #    print("_model_key {}".format(self._model_key), flush=True)
+    #    print(input_tensor)
+    #    if self._query_key is not None:
+    #        print("_query_key {}".format(self._query_key), flush=True)
+    #    if self._context_key is not None:
+    #        print("_context_key {}".format(self._context_key), flush=True)
+    #    exit()
 
     def forward(self, query_tokens, query_attention_mask, query_types,
                 context_tokens, context_attention_mask, context_types):
@@ -217,7 +238,7 @@ class PretrainedBertModel(MegatronModule):
     learned information retrieval."""
 
     def __init__(self, num_tokentypes=2,
-            parallel_output=True):
+            parallel_output=True, pre_process=True, post_process=True):
         super(PretrainedBertModel, self).__init__()
 
         args = get_args()
@@ -225,6 +246,8 @@ class PretrainedBertModel(MegatronModule):
         self.pad_id = tokenizer.pad
         self.biencoder_projection_dim = args.biencoder_projection_dim
         self.parallel_output = parallel_output
+        self.pre_process = pre_process
+        self.post_process = post_process
         init_method = init_method_normal(args.init_method_std)
         scaled_init_method = scaled_init_method_normal(
             args.init_method_std, args.num_layers)
@@ -234,7 +257,9 @@ class PretrainedBertModel(MegatronModule):
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method)
+            scaled_init_method=scaled_init_method,
+            pre_process=self.pre_process,
+            post_process=self.post_process)
 
         if args.biencoder_projection_dim > 0:
             self.projection_enc = get_linear_layer(args.hidden_size,

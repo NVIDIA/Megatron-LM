@@ -155,6 +155,10 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         text_tokens = self.tokenizer.tokenize(text)
         return self.tokenizer.convert_tokens_to_ids(text_tokens)
 
+    def decode(self, ids):
+        tokens = self.tokenizer.convert_ids_to_tokens(ids)
+        return self.tokenizer.convert_tokens_to_string(tokens)
+
     def decode_token_ids(self, token_ids):
         tokens = self.tokenizer.convert_ids_to_tokens(token_ids)
         exclude_list = ['[PAD]', '[CLS]']
