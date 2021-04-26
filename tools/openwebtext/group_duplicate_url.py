@@ -18,10 +18,6 @@ import time
 import sys
 
 
-def is_similar(jaccard_similarity):
-    return (jaccard_similarity >= 0.7)
-
-
 if __name__ == '__main__':
 
 
@@ -29,6 +25,10 @@ if __name__ == '__main__':
 
     input = sys.argv[1]
     output = sys.argv[2]
+    if len(sys.argv) > 3:
+        jaccard_similarity_threshold = float(sys.argv[3])
+    else:
+        jaccard_similarity_threshold = 0.7
 
     url_to_index = {}
     index_to_urls = []
@@ -43,7 +43,7 @@ if __name__ == '__main__':
                 urls.append(main_url)
                 for value in myjson[main_url]:
                     for other_url, js in value.items():
-                        if is_similar(js):
+                        if js >= jaccard_similarity_threshold:
                             urls.append(other_url)
             current_index = -1
             other_indices = set()

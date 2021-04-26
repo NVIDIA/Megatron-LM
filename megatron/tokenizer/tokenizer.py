@@ -32,10 +32,12 @@ def build_tokenizer(args):
     assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=True)
+                                            lower_case=True,
+                                            vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'BertWordPieceCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=False)
+                                            lower_case=False,
+                                            vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
@@ -127,7 +129,7 @@ class AbstractTokenizer(ABC):
 class _BertWordPieceTokenizer(AbstractTokenizer):
     """Original BERT wordpiece tokenizer."""
 
-    def __init__(self, vocab_file, lower_case=True):
+    def __init__(self, vocab_file, lower_case=True, vocab_extra_ids=0):
         if lower_case:
             name = 'BERT Lower Case'
         else:
@@ -138,6 +140,37 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         self.sep_id = self.tokenizer.vocab['[SEP]']
         self.pad_id = self.tokenizer.vocab['[PAD]']
         self.mask_id = self.tokenizer.vocab['[MASK]']
+        self._additional_special_tokens = []
+
+        # (dsachan) Add BOS and EOS tokens
+        SPECIAL_TOKENS = {'eos_token': '[EOS]',
+                          'bos_token': '[BOS]'}
+        self._bos_token = '[BOS]'
+        self.add_token(self._bos_token)
+        self._bos_token_id = self.vocab.get(self._bos_token)
+
+        self._eos_token = '[EOS]'
+        self.add_token(self._eos_token)
+        self._eos_token_id = self.vocab.get(self._eos_token)
+
+        # (dsachan) Add additional special tokens
+        # These can be used as sentinel tokens in T5 model inputs
+        additional_special_tokens = []
+        additional_special_tokens.extend(
+            ["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)])
+        self.add_additional_special_tokens(additional_special_tokens)
+
+    def add_token(self, token):
+        if token not in self.vocab:
+            self.inv_vocab[self.vocab_size] = token
+            # self.vocab_size comes from len(vocab)
+            # and it will increase as we add elements
+            self.vocab[token] = self.vocab_size
+
+    def add_additional_special_tokens(self, tokens_list):
+        setattr(self, "additional_special_tokens", tokens_list)
+        for value in tokens_list:
+            self.add_token(value)
 
     @property
     def vocab_size(self):
@@ -188,6 +221,40 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     @property
     def mask(self):
         return self.mask_id
+
+    @property
+    def bos_token(self):
+        """ Beginning of sentence token id """
+        return self._bos_token
+
+    @property
+    def eos_token(self):
+        """ End of sentence token id """
+        return self._eos_token
+
+    @property
+    def additional_special_tokens(self):
+        """ All the additional special tokens you may want to use (list of strings)."""
+        return self._additional_special_tokens
+
+    @property
+    def bos_token_id(self):
+        """ Id of the beginning of sentence token in the vocabulary."""
+        return self._bos_token_id
+
+    @property
+    def eos_token_id(self):
+        """ Id of the end of sentence token in the vocabulary."""
+        return self._eos_token_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        """ Ids of all the additional special tokens in the vocabulary (list of integers)."""
+        return [self.vocab.get(token) for token in self._additional_special_tokens]
+
+    @additional_special_tokens.setter
+    def additional_special_tokens(self, value):
+        self._additional_special_tokens = value
 
 
 class _GPT2BPETokenizer(AbstractTokenizer):
