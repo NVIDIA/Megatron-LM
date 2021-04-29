@@ -225,10 +225,6 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                                            valid_dataloader, model,
                                            iteration, False)
 
-            #if iteration == 1000:
-            #    exit()
-            #break
-
         # Checkpointing at the end of each epoch.
         if args.save:
             save_checkpoint(iteration, model, optimizer, lr_scheduler)
