@@ -88,16 +88,10 @@ class BiEncoderModel(MegatronModule):
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
+        #this is just a placeholder and will be needed when model
+        #parallelism will be used
         #self.language_model.set_input_tensor(input_tensor)
         return
-    #    #if self._model_key is not None:
-    #    #    print("_model_key {}".format(self._model_key), flush=True)
-    #    print(input_tensor)
-    #    if self._query_key is not None:
-    #        print("_query_key {}".format(self._query_key), flush=True)
-    #    if self._context_key is not None:
-    #        print("_context_key {}".format(self._context_key), flush=True)
-    #    exit()
 
     def forward(self, query_tokens, query_attention_mask, query_types,
                 context_tokens, context_attention_mask, context_types):
