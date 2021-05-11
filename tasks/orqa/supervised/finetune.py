@@ -34,6 +34,8 @@ from pretrain_ict import get_group_world_size_rank
 from tasks.finetune_utils import finetune
 from tasks.orqa.supervised.eval_utils import accuracy_func_provider
 from tasks.orqa.supervised.eval_utils import process_batch, task_collate_fn
+from tasks.orqa.evaluate_utils import ORQAEvaluator
+from megatron.indexer import IndexBuilder
 
 def orqa(Dataset): # , name_from_datapath_func):
 
@@ -226,14 +228,29 @@ def orqa(Dataset): # , name_from_datapath_func):
 def main():
     args = get_args()
 
-    if args.task == 'RET-FINETUNE-NQ':
-        from tasks.orqa.supervised.data import NQSupervisedDataset as Dataset
+    #if args.task == 'RET-FINETUNE-NQ':
+    #    from tasks.orqa.supervised.data import NQSupervisedDataset as Dataset
 
         #def name_from_datapath(datapath):
         #    return datapath[0].split('/')[-1].split('.')[0]
 
-    else:
-        raise NotImplementedError('ORQA task {} is not implemented.'.format(
-            args.task))
+    #else:
+    #    raise NotImplementedError('ORQA task {} is not implemented.'.format(
+    #        args.task))
 
-    orqa(Dataset) #, name_from_datapath)
+    #orqa(Dataset) #, name_from_datapath)
+
+    index_builder = IndexBuilder()
+    index_builder.build_and_save_index()
+    print_rank_0("Build and save indices: done!")
+
+    # Set up the model and evaluator
+    #evaluator = ORQAEvaluator()
+    
+    # Run evaluation
+    #if args.qa_data_dev is not None:
+    #    evaluator.evaluate(args.qa_data_dev, "DEV")
+    #if args.qa_data_test is not None:
+    #    evaluator.evaluate(args.qa_data_test, "TEST")
+
+

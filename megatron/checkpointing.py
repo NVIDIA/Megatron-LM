@@ -413,8 +413,11 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     if only_context_model:
         ret_state_dict.pop('query_model')
 
-    assert len(model) == 1
-    model[0].load_state_dict(ret_state_dict)
+    #print_rank_0(len(model))
+    #sys.exit()
+    #assert len(model) == 1
+    #model[0].load_state_dict(ret_state_dict)
+    model.load_state_dict(ret_state_dict)
     torch.distributed.barrier()
 
     if mpu.get_data_parallel_rank() == 0:

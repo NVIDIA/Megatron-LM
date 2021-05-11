@@ -266,6 +266,10 @@ class PretrainedBertModel(MegatronModule):
         #extended_attention_mask = bert_extended_attention_mask(attention_mask)
         position_ids = bert_position_ids(input_ids)
 
+        print_rank_0(input_ids.device)
+        print_rank_0(position_ids.device)
+        print_rank_0(extended_attention_mask.device)
+        print_rank_0(tokentype_ids.device)
 
         lm_output = self.language_model(input_ids,
                                         position_ids,

@@ -16,6 +16,7 @@
 """Finetune utilities."""
 
 from functools import partial
+import sys
 
 import torch
 
@@ -224,6 +225,9 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
                                            iteration, False)
+
+            #if iteration == 600:
+            #    sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:

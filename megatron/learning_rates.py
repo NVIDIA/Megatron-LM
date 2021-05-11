@@ -18,6 +18,7 @@
 import math
 
 from megatron import print_rank_0
+from megatron import get_args
 
 class AnnealingLR(object):
     """Anneals the learning rate."""
@@ -59,6 +60,7 @@ class AnnealingLR(object):
         """Learning rate decay functions from:
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
 
+        #print_rank_0("self.warmup_steps {} self.num_steps {} self.decay_steps {} self.min_lr {} self.maxlr {}".format(self.warmup_steps, self.num_steps, self.decay_steps, self.min_lr, self.max_lr))
         # Use linear warmup for the initial part.
         if self.warmup_steps > 0 and self.num_steps <= self.warmup_steps:
             return self.max_lr * float(self.num_steps) / \
@@ -87,7 +89,21 @@ class AnnealingLR(object):
         else:
             raise Exception('{} decay style is not supported.'.format(
                 self.decay_style))
-       
+
+        args = get_args()
+
+        if args.override_lr_new:
+            mod_num_steps_ = min(self.num_steps, self.decay_steps - self.warmup_steps)
+            mod_num_steps_ = mod_num_steps_ - self.warmup_steps
+            use_lr = delta_lr * float(self.decay_steps - mod_num_steps_) / float(self.decay_steps)
+            should_use_lr = self.min_lr + coeff * delta_lr
+            print_rank_0("num_steps {} decay_steps {} decay_ratio {} coeff {} delta_lr {} use lr {} should_use_lr {} self.warmup_steps {} self.num_steps {} self.decay_steps {}".format(num_steps_, decay_steps_, decay_ratio, coeff, delta_lr, use_lr, should_use_lr, self.warmup_steps, self.num_steps, self.decay_steps))
+        else:
+            use_lr = self.min_lr + coeff * delta_lr
+            print_rank_0("num_steps {} decay_steps {} decay_ratio {} coeff {} delta_lr {} use lr {} self.warmup_steps {} self.num_steps {} self.decay_steps {}".format(num_steps_, decay_steps_, decay_ratio, coeff, delta_lr, use_lr, self.warmup_steps, self.num_steps, self.decay_steps))
+
+        return use_lr
+
         return self.min_lr + coeff * delta_lr
 
 

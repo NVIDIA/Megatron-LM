@@ -2,7 +2,7 @@ import sys
 import torch
 import torch.distributed as dist
 
-from megatron import get_args
+from megatron import get_args, print_rank_0
 from megatron import mpu
 from megatron.checkpointing import load_biencoder_checkpoint
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_wiki_dataset
@@ -25,6 +25,8 @@ class IndexBuilder(object):
         self.evidence_embedder_obj = None
         self.biencoder_shared_query_context_model = \
             args.biencoder_shared_query_context_model
+        self.pre_process = True
+        self.post_process = True
 
         # need to know whether we're using a REALM checkpoint (args.load)
         # or ICT checkpoint
@@ -47,15 +49,22 @@ class IndexBuilder(object):
         if self.biencoder_shared_query_context_model:
             only_context_model = False
 
-        model = get_model(lambda: biencoder_model_provider(only_context_model \
+        #model = get_model(lambda: biencoder_model_provider(only_context_model \
+        #    = only_context_model, biencoder_shared_query_context_model = \
+        #    self.biencoder_shared_query_context_model, \
+        #    pre_process=self.pre_process, post_process=self.post_process))
+
+        model = biencoder_model_provider(only_context_model \
             = only_context_model, biencoder_shared_query_context_model = \
-            self.biencoder_shared_query_context_model))
+            self.biencoder_shared_query_context_model, \
+            pre_process=self.pre_process, post_process=self.post_process)
 
         self.model = load_biencoder_checkpoint(model,
                 only_context_model=only_context_model)
 
-        assert len(self.model) == 1
-        self.model[0].eval()
+        #assert len(self.model) == 1
+        #self.model[0].eval()
+        self.model.eval()
 
         self.dataset = get_open_retrieval_wiki_dataset()
         self.dataloader = iter(get_one_epoch_dataloader(self.dataset, \
@@ -83,10 +92,12 @@ class IndexBuilder(object):
         distributed setting will be consolidated by the rank 0 process
         and saved as a final pickled BlockData.
         """
-        assert len(self.model) == 1
-        unwrapped_model = self.model[0]
+        #assert len(self.model) == 1
+        #unwrapped_model = self.model[0]
+        unwrapped_model = self.model
         while not hasattr(unwrapped_model, 'embed_text'):
             unwrapped_model = unwrapped_model.module
+            print_rank_0("hasattr")
 
         while True:
             try:
@@ -97,12 +108,26 @@ class IndexBuilder(object):
             except (StopIteration, IndexError):
                 break
 
+            print_rank_0(context_tokens)
+            print_rank_0(context_mask)
+            print_rank_0(context_types)
+            #if torch.cuda.is_available():
+            #    print_rank_0("cuda available")
+            #print_rank_0(torch.cuda.current_device())
+            #print_rank_0(torch.cuda.get_device_name())
+            print_rank_0(next(unwrapped_model.parameters()).device)
+            print_rank_0(next(unwrapped_model.context_model.parameters()).device)
+            #print_rank_0("After get_open_retrieval_batch")
+
             # TODO: can we add with torch.no_grad() to reduce memory usage
             # detach, separate fields and add to BlockData
             assert context_mask.dtype == torch.bool
             context_logits = unwrapped_model.embed_text(
                 unwrapped_model.context_model, context_tokens, context_mask,
                 context_types)
+
+            sys.exit()
+
             context_logits = detach(context_logits)
             row_id = detach(row_id)
 
