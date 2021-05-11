@@ -49,15 +49,15 @@ class IndexBuilder(object):
         if self.biencoder_shared_query_context_model:
             only_context_model = False
 
-        #model = get_model(lambda: biencoder_model_provider(only_context_model \
-        #    = only_context_model, biencoder_shared_query_context_model = \
-        #    self.biencoder_shared_query_context_model, \
-        #    pre_process=self.pre_process, post_process=self.post_process))
-
-        model = biencoder_model_provider(only_context_model \
+        model = get_model(lambda: biencoder_model_provider(only_context_model \
             = only_context_model, biencoder_shared_query_context_model = \
             self.biencoder_shared_query_context_model, \
-            pre_process=self.pre_process, post_process=self.post_process)
+            pre_process=self.pre_process, post_process=self.post_process))
+
+        #model = biencoder_model_provider(only_context_model \
+        #    = only_context_model, biencoder_shared_query_context_model = \
+        #    self.biencoder_shared_query_context_model, \
+        #    pre_process=self.pre_process, post_process=self.post_process)
 
         self.model = load_biencoder_checkpoint(model,
                 only_context_model=only_context_model)
