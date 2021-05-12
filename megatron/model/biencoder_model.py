@@ -15,20 +15,20 @@ from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
-#def biencoder_model_provider(only_query_model=False,
-#                             only_context_model=False,
-#                             biencoder_shared_query_context_model=False,
-#                             pre_process=True,
+#def biencoder_model_provider(pre_process=True, 
 #                             post_process=True):
-
-def biencoder_model_provider(pre_process=True, 
+ 
+def biencoder_model_provider(only_query_model=False,
+                             only_context_model=False,
+                             biencoder_shared_query_context_model=False,
+                             pre_process=True,
                              post_process=True):
     """Build the model."""
-    args = get_args()
+    #args = get_args()
 
-    biencoder_shared_query_context_model = args.biencoder_shared_query_context_model
-    only_context_model = args.only_context_model
-    only_query_model = args.only_query_model
+    #biencoder_shared_query_context_model = args.biencoder_shared_query_context_model
+    #only_context_model = args.only_context_model
+    #only_query_model = args.only_query_model
 
     assert mpu.get_tensor_model_parallel_world_size() == 1 and \
         mpu.get_pipeline_model_parallel_world_size() == 1, \

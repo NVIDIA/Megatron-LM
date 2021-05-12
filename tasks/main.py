@@ -110,7 +110,7 @@ if __name__ == '__main__':
         from glue.finetune import main
     elif args.task in ['LAMBADA', 'WIKITEXT103']:
         from zeroshot_gpt.evaluate import main
-    elif args.task in ['ICT-ZEROSHOT-NQ']:
+    elif args.task in ['ICT-ZEROSHOT-NQ', 'RETRIEVER-EVAL']:
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main

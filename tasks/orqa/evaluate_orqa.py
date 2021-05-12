@@ -18,6 +18,15 @@
 import os
 import sys
 
+#sys.path.append(
+#    os.path.abspath(
+#        os.path.join(
+#            os.path.join(os.path.dirname(__file__), os.path.pardir),
+#            os.path.pardir,
+#        )
+#    )
+#)
+
 from megatron import get_args
 from megatron.indexer import IndexBuilder
 from tasks.orqa.evaluate_utils import ORQAEvaluator
@@ -26,6 +35,8 @@ def main():
     """
     Main program
     """
+    #initialize_megatron(extra_args_provider=None,
+    #                    args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
 
     args = get_args()
 
@@ -41,6 +52,8 @@ def main():
 
     Check README.md for example script
     """
+
+    #print_rank_0("Starting index builder!")
 
     index_builder = IndexBuilder()
     index_builder.build_and_save_index()

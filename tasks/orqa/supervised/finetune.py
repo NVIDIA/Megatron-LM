@@ -184,15 +184,16 @@ def orqa(Dataset): # , name_from_datapath_func):
         """Build the model."""
         args = get_args()
         print_rank_0('building retriever model for {} ...'.format(args.task))
-        args.only_context_model=False
-        args.only_query_model=False
-        model = biencoder_model_provider()
+        #args.only_context_model=False
+        #args.only_query_model=False
+        #model = biencoder_model_provider()
         
-        #model = biencoder_model_provider(only_context_model=False,
-        #            only_query_model=False, 
-        #            biencoder_shared_query_context_model=\
-        #            args.biencoder_shared_query_context_model,
-        #            pre_process=pre_process, post_process=post_process)
+        model = biencoder_model_provider(only_context_model=False,
+                    only_query_model=False, 
+                    biencoder_shared_query_context_model=\
+                    args.biencoder_shared_query_context_model,
+                    pre_process=pre_process, post_process=post_process)
+
         return model
 
     def single_dataset_provider(datapath):
