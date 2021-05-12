@@ -338,11 +338,6 @@ class TransformerLanguageModel(MegatronModule):
                 get_key_value=False, pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
-        print_rank_0("before self.embedding")
-        print_rank_0(enc_input_ids.device)
-        print_rank_0(enc_position_ids.device)
-        print_rank_0(tokentype_ids.device)
-
         # Embeddings.
         if self.pre_process:
             embedding_output = self.embedding(enc_input_ids, enc_position_ids,

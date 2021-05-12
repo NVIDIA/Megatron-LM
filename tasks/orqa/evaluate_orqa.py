@@ -19,6 +19,7 @@ import os
 import sys
 
 from megatron import get_args
+from megatron.indexer import IndexBuilder
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 def main():
@@ -27,6 +28,23 @@ def main():
     """
 
     args = get_args()
+
+    """Create a BlockData data structure by running an IndexBuilder over an ICT Dataset
+    - Include all args needed for initial model specification
+
+    Other key args:
+        --block-data-path: path to write to
+        --ict-load or --realm-load: path to checkpoint with which to embed
+        --data-path and --titles-data-path: paths for dataset
+        --indexer-log-interval: reporting interval
+        --indexer-batch-size: size specific for indexer jobs
+
+    Check README.md for example script
+    """
+
+    index_builder = IndexBuilder()
+    index_builder.build_and_save_index()
+    print_rank_0("Build and save indices: done!")
 
     # Set up the model and evaluator
     evaluator = ORQAEvaluator()
@@ -37,4 +55,4 @@ def main():
 
     if args.qa_data_test is not None:
         evaluator.evaluate(args.qa_data_test, "TEST")
-
+    

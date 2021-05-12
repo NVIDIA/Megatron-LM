@@ -45,26 +45,25 @@ class IndexBuilder(object):
         """
         Load the necessary attributes: model, dataloader and empty BlockData
         """
+        args = get_args()
         only_context_model = True
         if self.biencoder_shared_query_context_model:
             only_context_model = False
 
-        model = get_model(lambda: biencoder_model_provider(only_context_model \
-            = only_context_model, biencoder_shared_query_context_model = \
-            self.biencoder_shared_query_context_model, \
-            pre_process=self.pre_process, post_process=self.post_process))
+        args.only_context_model = only_context_model
+        args.only_query_model = False
 
-        #model = biencoder_model_provider(only_context_model \
+        model = get_model(biencoder_model_provider)
+
+        #model = get_model(lambda: biencoder_model_provider(only_context_model \
         #    = only_context_model, biencoder_shared_query_context_model = \
-        #    self.biencoder_shared_query_context_model, \
-        #    pre_process=self.pre_process, post_process=self.post_process)
+        #    self.biencoder_shared_query_context_model))
 
         self.model = load_biencoder_checkpoint(model,
                 only_context_model=only_context_model)
 
-        #assert len(self.model) == 1
-        #self.model[0].eval()
-        self.model.eval()
+        assert len(self.model) == 1
+        self.model[0].eval()
 
         self.dataset = get_open_retrieval_wiki_dataset()
         self.dataloader = iter(get_one_epoch_dataloader(self.dataset, \
@@ -92,12 +91,11 @@ class IndexBuilder(object):
         distributed setting will be consolidated by the rank 0 process
         and saved as a final pickled BlockData.
         """
-        #assert len(self.model) == 1
-        #unwrapped_model = self.model[0]
-        unwrapped_model = self.model
+        assert len(self.model) == 1
+        unwrapped_model = self.model[0]
+
         while not hasattr(unwrapped_model, 'embed_text'):
             unwrapped_model = unwrapped_model.module
-            print_rank_0("hasattr")
 
         while True:
             try:
@@ -108,25 +106,12 @@ class IndexBuilder(object):
             except (StopIteration, IndexError):
                 break
 
-            print_rank_0(context_tokens)
-            print_rank_0(context_mask)
-            print_rank_0(context_types)
-            #if torch.cuda.is_available():
-            #    print_rank_0("cuda available")
-            #print_rank_0(torch.cuda.current_device())
-            #print_rank_0(torch.cuda.get_device_name())
-            print_rank_0(next(unwrapped_model.parameters()).device)
-            print_rank_0(next(unwrapped_model.context_model.parameters()).device)
-            #print_rank_0("After get_open_retrieval_batch")
-
             # TODO: can we add with torch.no_grad() to reduce memory usage
             # detach, separate fields and add to BlockData
             assert context_mask.dtype == torch.bool
             context_logits = unwrapped_model.embed_text(
                 unwrapped_model.context_model, context_tokens, context_mask,
                 context_types)
-
-            sys.exit()
 
             context_logits = detach(context_logits)
             row_id = detach(row_id)

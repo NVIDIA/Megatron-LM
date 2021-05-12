@@ -16,6 +16,7 @@
 """ORQA finetuning/evaluation."""
 
 from functools import partial
+import sys
 
 import math
 import torch
@@ -183,11 +184,15 @@ def orqa(Dataset): # , name_from_datapath_func):
         """Build the model."""
         args = get_args()
         print_rank_0('building retriever model for {} ...'.format(args.task))
-        model = biencoder_model_provider(only_context_model=False,
-                    only_query_model=False, 
-                    biencoder_shared_query_context_model=\
-                    args.biencoder_shared_query_context_model,
-                    pre_process=pre_process, post_process=post_process)
+        args.only_context_model=False
+        args.only_query_model=False
+        model = biencoder_model_provider()
+        
+        #model = biencoder_model_provider(only_context_model=False,
+        #            only_query_model=False, 
+        #            biencoder_shared_query_context_model=\
+        #            args.biencoder_shared_query_context_model,
+        #            pre_process=pre_process, post_process=post_process)
         return model
 
     def single_dataset_provider(datapath):
@@ -228,29 +233,15 @@ def orqa(Dataset): # , name_from_datapath_func):
 def main():
     args = get_args()
 
-    #if args.task == 'RET-FINETUNE-NQ':
-    #    from tasks.orqa.supervised.data import NQSupervisedDataset as Dataset
+    if args.task == 'RET-FINETUNE-NQ':
+        from tasks.orqa.supervised.data import NQSupervisedDataset as Dataset
 
         #def name_from_datapath(datapath):
         #    return datapath[0].split('/')[-1].split('.')[0]
 
-    #else:
-    #    raise NotImplementedError('ORQA task {} is not implemented.'.format(
-    #        args.task))
+    else:
+        raise NotImplementedError('ORQA task {} is not implemented.'.format(
+            args.task))
 
-    #orqa(Dataset) #, name_from_datapath)
-
-    index_builder = IndexBuilder()
-    index_builder.build_and_save_index()
-    print_rank_0("Build and save indices: done!")
-
-    # Set up the model and evaluator
-    #evaluator = ORQAEvaluator()
-    
-    # Run evaluation
-    #if args.qa_data_dev is not None:
-    #    evaluator.evaluate(args.qa_data_dev, "DEV")
-    #if args.qa_data_test is not None:
-    #    evaluator.evaluate(args.qa_data_test, "TEST")
-
+    orqa(Dataset) #, name_from_datapath)
 
