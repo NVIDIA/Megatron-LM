@@ -15,6 +15,25 @@ from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
+def get_model_provider(only_query_model=False, only_context_model=False, 
+        biencoder_shared_query_context_model=False):
+
+    def model_provider(pre_process=True, post_process=True):
+        """Build the model."""
+
+        print_rank_0('building Bienoder model ...')
+        model = biencoder_model_provider(only_query_model=only_query_model, 
+                only_context_model = only_context_model, 
+                biencoder_shared_query_context_model = \
+                biencoder_shared_query_context_model, 
+                pre_process=True, post_process=True)
+
+        return model
+
+    return model_provider
+
+
+
 #def biencoder_model_provider(pre_process=True, 
 #                             post_process=True):
  

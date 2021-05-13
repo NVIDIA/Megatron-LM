@@ -23,7 +23,7 @@ from tasks.orqa.natural_questions.nq import get_one_epoch_nq_dataloader
 from tasks.orqa.natural_questions.nq import process_nq_batch
 from tasks.orqa.natural_questions.qa_utils import calculate_matches
 from megatron.data.realm_index import OpenRetreivalDataStore, FaissMIPSIndex
-from megatron.model.biencoder_model import biencoder_model_provider
+from megatron.model.biencoder_model import get_model_provider
 from megatron.training import get_model
 
 class ORQAEvaluator(object):
@@ -47,11 +47,15 @@ class ORQAEvaluator(object):
         #args.only_query_model = only_query_model
         #args.only_context_model = False
 
+        model = get_model(get_model_provider(only_query_model=only_query_model, 
+            biencoder_shared_query_context_model=args.biencoder_shared_query_context_model))
+
+
         #model = get_model(lambda: biencoder_model_provider(only_query_model=\
-        model = get_model(lambda: biencoder_model_provider(only_query_model=\
-            only_query_model, biencoder_shared_query_context_model=\
-            args.biencoder_shared_query_context_model,
-            pre_process=True, post_process=True))
+        #model = get_model(lambda: biencoder_model_provider(only_query_model=\
+        #    only_query_model, biencoder_shared_query_context_model=\
+        #    args.biencoder_shared_query_context_model,
+        #    pre_process=True, post_process=True))
 
         #model = get_model(biencoder_model_provider)
 
