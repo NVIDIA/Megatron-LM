@@ -1,4 +1,4 @@
-Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf) and [2](https://arxiv.org/pdf/2104.04473.pdf)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel (tensor and pipeline), and multi-node pre-training of [GPT](https://arxiv.org/abs/2005.14165) and [BERT](https://arxiv.org/pdf/1810.04805.pdf) using mixed precision.
+Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf) and [2](https://arxiv.org/pdf/2104.04473.pdf)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel (tensor and pipeline), and multi-node pre-training oftransformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
 * [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
@@ -27,7 +27,9 @@ All the cases from 1 billion to 1 trillion parameters achieve more than 43% half
       * [Data Preprocessing](#data-preprocessing)
       * [BERT Pretraining](#bert-pretraining)
       * [GPT Pretraining](#gpt-pretraining)
-      * [Distributed BERT or GPT Pretraining](#distributed-bert-or-gpt-pretraining)
+      * [GPT Pretraining](#gpt-pretraining)
+      * [T5 Pretraining](#t5-pretraining)
+      * [Distributed Pretraining](#distributed-pretraining)
       * [GPT-3 Example](#gpt-3-example)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
@@ -64,7 +66,7 @@ BERT-345M-cased: wget --content-disposition https://api.ngc.nvidia.com/v2/models
 GPT-345M: wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia/megatron_lm_345m/versions/v0.0/zip -O megatron_lm_345m_v0.0.zip
 </pre>
 
-The models require vocabulary files to run. The BERT  WordPiece vocab file can be extracted from Google's pretrained BERT models: [uncased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt), [cased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt). The GPT [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly. 
+The models require vocabulary files to run. The BERT  WordPiece vocab file can be extracted from Google's pretrained BERT models: [uncased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt), [cased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt). The GPT [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
 
 # Usage
 
@@ -118,9 +120,9 @@ Here the output files are named `my-gpt2_text_document.bin` and `my-gpt2_text_do
 Further command line arguments are described in the source file [`preprocess_data.py`](./tools/preprocess_data.py).
 
 ## BERT Pretraining
-`bash examples/pretrain_bert.sh`
 
-This script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` whcih is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
+
+The `examples/pretrain_bert.sh` script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` whcih is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
 
 The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
@@ -139,7 +141,7 @@ BERT_ARGS="--num-layers 24 \
            --train-iters 2000000 \
            --min-lr 0.00001 \
            --lr-warmup-fraction 0.01 \
-	   --micro-batch-size 4 \	   
+	   --micro-batch-size 4 \
            --global-batch-size 8 \
            --vocab-file $VOCAB_FILE \
            --split 949,50,1 \
@@ -163,9 +165,8 @@ Further command line arguments are described in the source file [`arguments.py`]
 
 
 ## GPT Pretraining
-`bash examples/pretrain_gpt.sh`
 
-This script runs single GPU 345M parameter GPT pretraining. As mentioned above, single GPU training is primarily intended for debugging purposes, as the code is optimized for distributed training.
+The `examples/pretrain_gpt.sh` script runs single GPU 345M parameter GPT pretraining. As mentioned above, single GPU training is primarily intended for debugging purposes, as the code is optimized for distributed training.
 
 It follows largely the same format as the previous BERT script with a few notable differences: the tokenization scheme used is BPE (which requires a merge table and a `json` vocabulary file) instead of WordPiece, the model architecture allows for longer sequences (note that the max position embedding must be greater than or equal to the maximum sequence length), and the `--lr-decay-style` has been set to cosine decay.  Note that the `--data-path` now includes the additional `_text_document` suffix added in preprocessing, but does not include the file extensions.
 
@@ -203,12 +204,56 @@ python pretrain_gpt.py \
 
 Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
 
-## Distributed BERT or GPT Pretraining
-`bash examples/pretrain_bert_distributed.sh`
+## T5 Pretraining
 
-`bash examples/pretrain_gpt_distributed.sh`
+Very similar to BERT and GPT, the `examples/pretrain_t5.sh` script runs single GPU "base" (~220M parameter) T5 pretraining. The primary difference from BERT and GPT is the addition of the following arguments to accomodate the T5 architecture:
 
-These scripts use the PyTorch distributed launcher for distributed training. As such, multi-node training can be achieved by properly setting environment variables and using `init_method='env://'` in the launcher. See the official PyTorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default, multi-node training uses the [nccl](https://developer.nvidia.com/nccl) distributed backend. A simple set of additional arguments and the use of the PyTorch distributed module with the Python flag `-m torch.distributed.launch`, detailed below, are the only additional requirements to adopt distributed training.
+* `--kv-channels` sets the inner dimension of the "key" and "value" matrices of all attention mechanisms in the model. For BERT and GPT this defaults to the hidden size divided by the number of attention heads, but can be configured for T5.
+
+* `--ffn-hidden-size` sets the hidden size in the feed-forward networks within a transformer layer. For BERT and GPT this defaults to 4 times the transformer hidden size, but can be configured for T5.
+
+* `--encoder-seq-length` and `--decoder-seq-length` set the sequence length for the encoder and decoder separately.
+
+All of the other arguments remain as they were for BERT and GPT pretraining.
+
+<pre>
+CHECKPOINT_PATH=checkpoints/bert_345m
+VOCAB_FILE=bert-vocab.txt
+DATA_PATH=my-t5_text_sentence
+
+T5_ARGS="--num-layers 24 \
+         --hidden-size 1024 \
+         --num-attention-heads 16 \
+         --kv-channels 64 \
+         --ffn-hidden-size 3072 \
+         --encoder-seq-length 512 \
+         --decoder-seq-length 128 \
+         --max-position-embeddings 512 \
+         --lr 0.0001 \
+         --lr-decay-iters 990000 \
+         --train-iters 2000000 \
+         --min-lr 0.00001 \
+         --lr-warmup-fraction 0.01 \
+         --micro-batch-size 16 \
+         --global-batch-size 2048 \
+         --vocab-file $VOCAB_FILE \
+         --split 949,50,1 \
+         --fp16"
+
+OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+
+python pretrain_t5.py \
+       $BERT_ARGS \
+       $OUTPUT_ARGS \
+       --save $CHECKPOINT_PATH \
+       --load $CHECKPOINT_PATH \
+       --data-path $DATA_PATH
+</pre>
+
+
+## Distributed Pretraining
+
+The `examples/pretrain_{bert,gpt,t5}_distributed.sh` scripts use the PyTorch distributed launcher for distributed training. As such, multi-node training can be achieved by properly setting environment variables and using `init_method='env://'` in the launcher. See the official PyTorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default, multi-node training uses the [nccl](https://developer.nvidia.com/nccl) distributed backend. A simple set of additional arguments and the use of the PyTorch distributed module with the Python flag `-m torch.distributed.launch`, detailed below, are the only additional requirements to adopt distributed training.
 
 We use two types of parallelism: data and model parallelism. We facilitate two distributed data parallel implementations: a simple one of our own that performs gradient all-reduce at the end of back propagation step, and Torch's distributed data parallel wrapper that overlaps gradient reduction with back propagation computation. To switch between these two options use `--DDP-impl local` or `--DDP-impl torch`, respectively. As expected, Torch distributed data parallelism is more efficient at larger model sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 76% when Torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
 
@@ -216,18 +261,15 @@ Second, we developed a simple and efficient two-dimensional model-parallel appro
 
 <!-- The number of microbatches in a per-pipeline minibatch is controlled by the `--num-microbatches-in-minibatch` argument. With `WORLD_SIZE` GPUs, `TENSOR_MP_SIZE` tensor-model-parallel size, `PIPELINE_MP_SIZE` pipeline-model-parallel-size, `WORLD_SIZE`/(`TENSOR_MP_SIZE` * `PIPELINE_MP_SIZE`) GPUs will be used for data parallelism. The default values for `--tensor-model-parallel-size` and `--pipeline-model-parallel-size` is 1, which will not implement either form of model parallelism. -->
 
-We have examples of how to use these two different forms of model parallelism in these scripts:
-
-`bash examples/pretrain_bert_distributed_with_mp.sh`
-
-`bash examples/pretrain_gpt_distributed_with_mp.sh`
+We have examples of how to use these two different forms of model parallelism the example scripts ending in `distributed_with_mp.sh`, note that pipeline parallelism is not currently supported in the T5 model:
 
 Other than these minor changes, the distributed training is identical to the training on a single GPU.
 
-Distributed BERT training:
+Distributed training:
 <pre>
 WORLD_SIZE=8
-MP_SIZE=2
+TENSOR_MP_SIZE=2
+PIPELINE_MP_SIZE=2
 
 DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --nnodes 1 \
@@ -235,51 +277,26 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
 
-CHECKPOINT_PATH=checkpoints/bert_345m
-VOCAB_FILE=bert-vocab.txt
-DATA_PATH=my-bert_text_sentence
-BERT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
+CHECKPOINT_PATH=&#60;same as above&#62;
+VOCAB_FILE=&#60;same as above&#62;
+DATA_PATH=&#60;same as above&#62;
+MODEL_ARGS=&#60;same as above&#62;
+OUTPUT_ARGS=&#60;same as above&#62;
 
-python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_bert.py \
-                $BERT_ARGS \
+python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_<model>.py \
+                $MODEL_ARGS \
                 $OUTPUT_ARGS \
                 --save $CHECKPOINT_PATH \
                 --load $CHECKPOINT_PATH \
                 --data-path $DATA_PATH \
-                --tensor-model-parallel-size $MP_SIZE \
+                --tensor-model-parallel-size $TENSOR_MP_SIZE \
+                --pipeline-model-parallel-size $PIPELINE_MP_SIZE \
                 --DDP-impl torch
-</pre>
-
-Distributed GPT training:
-<pre>
-WORLD_SIZE=8
-MP_SIZE=2
-
-DISTRIBUTED_ARGS=&#60;same as those directly above&#62;
-
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
-DATA_PATH=my-gpt2_text_document
-GPT_ARGS=&#60;same as those in <a href="#gpt-pretraining">GPT pretraining</a> above&#62;
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-
-python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_gpt.py \
-                $GPT_ARGS \
-                $OUTPUT_ARGS \
-                --save $CHECKPOINT_PATH \
-                --load $CHECKPOINT_PATH \
-                --data-path $DATA_PATH \
-                --tensor-model-parallel-size $MP_SIZE \
-                --DDP-impl torch
-
 </pre>
 
 ## GPT-3 Example
-`bash examples/pretrain_gpt3_175B.sh`
 
-We have provided an example of how to configure Megatron to run [GPT-3](https://arxiv.org/abs/2005.14165) with 175 billion parameters on 1024 GPUs. The script is designed for [slurm](https://slurm.schedmd.com/documentation.html) with [pyxis](https://github.com/NVIDIA/pyxis) plugin but can be easily adopted to any other scheduler. It uses 8-way and 16-way tensor and pipeline parallelism, respectively. With options `global-batch-size 1536` and `rampup-batch-size 16 16 5859375`, the training will start with global batch size 16 and linearly increase the global batch size to 1536 over 5,859,375 samples with incrmeental steps 16. The training dataset can be either a single set or a multiple datasets combined with a set of weights.
+In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to configure Megatron to run [GPT-3](https://arxiv.org/abs/2005.14165) with 175 billion parameters on 1024 GPUs. The script is designed for [slurm](https://slurm.schedmd.com/documentation.html) with [pyxis](https://github.com/NVIDIA/pyxis) plugin but can be easily adopted to any other scheduler. It uses 8-way and 16-way tensor and pipeline parallelism, respectively. With options `global-batch-size 1536` and `rampup-batch-size 16 16 5859375`, the training will start with global batch size 16 and linearly increase the global batch size to 1536 over 5,859,375 samples with incrmeental steps 16. The training dataset can be either a single set or a multiple datasets combined with a set of weights.
 
 With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes around 32 seconds resulting in 138 teraFLOPs per GPU which is 44% of the theoretical peak FLOPs.
 
