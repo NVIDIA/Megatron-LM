@@ -137,6 +137,7 @@ def get_args():
     args.rank = 0
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
+    args.vocab_extra_ids = 0
 
     return args
 
