@@ -217,8 +217,8 @@ Very similar to BERT and GPT, the `examples/pretrain_t5.sh` script runs single G
 All of the other arguments remain as they were for BERT and GPT pretraining.
 
 <pre>
-CHECKPOINT_PATH=checkpoints/bert_345m
-VOCAB_FILE=bert-vocab.txt
+CHECKPOINT_PATH=checkpoints/t5_345m
+VOCAB_FILE=t5-vocab.txt
 DATA_PATH=my-t5_text_sentence
 
 T5_ARGS="--num-layers 24 \
