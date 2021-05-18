@@ -20,12 +20,6 @@ def make_attention_mask(source_block, target_block):
     # (source_length, target_length)
     return mask
 
-def make_history_mask(block):
-    length = block.shape[0]
-    arange = np.arange(length)
-    history_mask = (arange[None, ] <= arange[:, None])
-    history_mask = history_mask.astype(np.int64)
-    return history_mask
 
 def get_one_epoch_dataloader(dataset, micro_batch_size=None):
     """Specifically one epoch to be used in an indexing job."""
