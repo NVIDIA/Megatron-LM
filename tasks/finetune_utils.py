@@ -16,7 +16,6 @@
 """Finetune utilities."""
 
 from functools import partial
-import sys
 
 import torch
 
@@ -81,7 +80,7 @@ def _cross_entropy_forward_step(batch, model):
     return output_tensor, partial(cross_entropy_loss_func, labels)
 
 
-def build_data_loader(dataset, micro_batch_size, num_workers, drop_last, 
+def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
         task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
@@ -190,7 +189,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                 continue
             # Set to zero so the next epoch does not skip any batches.
             start_iteration = 0
-    
+
             # Train for one step.
             out = train_step(forward_step, batch, model, optimizer, lr_scheduler)
 
@@ -225,9 +224,6 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
                                            iteration, False)
-
-            #if iteration == 600:
-            #    sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:

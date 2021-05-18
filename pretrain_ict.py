@@ -36,7 +36,7 @@ def pretrain_ict_model_provider():
     #args.only_context_model = False
     #args.only_query_model = False
     #model = biencoder_model_provider()
- 
+
     model = biencoder_model_provider(
                 only_context_model=False,
                 only_query_model=False,

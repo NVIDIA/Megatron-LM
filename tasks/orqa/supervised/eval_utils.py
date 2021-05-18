@@ -34,7 +34,6 @@ def task_collate_fn(batch_data):
     for d in batch_data:
         for k, v in d.items():
             tensorized.setdefault(k, []).append(v)
-    # assert len(tensorized) == 12
 
     tensorized['query'] = torch.LongTensor(tensorized['query'])
     tensorized['query_mask'] = torch.LongTensor(tensorized['query_mask'])
@@ -90,8 +89,6 @@ def process_batch(batch):
            neg_context_tokens, neg_context_mask, neg_context_types, reference
 
 def accuracy_func_provider(single_dataset_provider, rank0sampler=False):
-#, datapath, 
-#    rank0sampler=False):
     """Provide function that calculates accuracies."""
     args = get_args()
 
@@ -112,9 +109,7 @@ def accuracy_func_provider(single_dataset_provider, rank0sampler=False):
                                    args.eval_micro_batch_size,
                                    num_workers=args.num_workers,
                                    drop_last=drop_last,
-                                   task_collate_fn=task_collate_fn) 
-                                   #shuffle=False,
-                                   #rank0sampler=rank0sampler)
+                                   task_collate_fn=task_collate_fn)
     dataloaders = (dataset.dataset_name, dataloader)
 
     def metrics_func(model, epoch, output_predictions=False):
@@ -197,7 +192,7 @@ def retrieval_loss(model, dataloader):
             losses = average_losses_across_data_parallel_group([rank, \
                 *topk_accs])
 
-            # create stats_dict with retrieval loss and all specified 
+            # create stats_dict with retrieval loss and all specified
             # top-k accuracies
             topk_acc_dict = {'top{}_acc'.format(k): v * 100 for k, v in \
                 zip(args.retriever_report_topk_accuracies, losses[1:])}

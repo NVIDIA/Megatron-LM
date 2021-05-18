@@ -26,8 +26,8 @@ class IndexBuilder(object):
         self.evidence_embedder_obj = None
         self.biencoder_shared_query_context_model = \
             args.biencoder_shared_query_context_model
-        self.pre_process = True
-        self.post_process = True
+        #self.pre_process = True
+        #self.post_process = True
 
         # need to know whether we're using a REALM checkpoint (args.load)
         # or ICT checkpoint
@@ -46,7 +46,7 @@ class IndexBuilder(object):
         """
         Load the necessary attributes: model, dataloader and empty BlockData
         """
-        args = get_args()
+        #args = get_args()
         only_context_model = True
         if self.biencoder_shared_query_context_model:
             only_context_model = False
@@ -56,7 +56,7 @@ class IndexBuilder(object):
 
         #model = get_model(biencoder_model_provider)
 
-        model = get_model(get_model_provider(only_context_model=only_context_model, 
+        model = get_model(get_model_provider(only_context_model=only_context_model,
             biencoder_shared_query_context_model=self.biencoder_shared_query_context_model))
 
         #model = get_model(lambda: biencoder_model_provider(only_context_model \
@@ -103,12 +103,12 @@ class IndexBuilder(object):
         while not hasattr(unwrapped_model, 'embed_text'):
             unwrapped_model = unwrapped_model.module
 
-        counter = 0
-        start_time = time.time()
-        cur_time = start_time
+        #counter = 0
+        #start_time = time.time()
+        #cur_time = start_time
         while True:
             #start_time = time.time()
-            t1 = time.time()
+            #t1 = time.time()
             try:
                 # batch also has query_tokens and query_pad_data
                 row_id, context_tokens, context_mask, context_types, \
@@ -118,7 +118,7 @@ class IndexBuilder(object):
                 break
 
             #print_rank_0("get batch time {}".format(cur_time - time.time()))
-            t2 = time.time()
+            #t2 = time.time()
             # TODO: can we add with torch.no_grad() to reduce memory usage
             # detach, separate fields and add to BlockData
             assert context_mask.dtype == torch.bool
@@ -129,17 +129,17 @@ class IndexBuilder(object):
             context_logits = detach(context_logits)
             row_id = detach(row_id)
             #print_rank_0("embed text {}".format(cur_time - time.time()))
-            t3 = time.time()
+            #t3 = time.time()
  
             self.evidence_embedder_obj.add_block_data(row_id, context_logits)
             self.track_and_report_progress(batch_size=len(row_id))
             #print_rank_0("add block time {}".format(cur_time - time.time()))
-            t4 = time.time()
-            counter += 1
-            if counter % 1000 == 0:
-                print_rank_0("total time {} 1000 iter time {}".format(time.time() - start_time, time.time() - cur_time))
-                print_rank_0("breakdown batch {} model {} block {}".format(t2 - t1, t3 - t2, t4 -t3))
-                cur_time = time.time()
+            #t4 = time.time()
+            #counter += 1
+            #if counter % 1000 == 0:
+            #    print_rank_0("total time {} 1000 iter time {}".format(time.time() - start_time, time.time() - cur_time))
+            #    print_rank_0("breakdown batch {} model {} block {}".format(t2 - t1, t3 - t2, t4 -t3))
+            #    cur_time = time.time()
         # This process signals to finalize its shard and then synchronize with
         # the other processes
         self.evidence_embedder_obj.save_shard()

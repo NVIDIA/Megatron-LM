@@ -22,27 +22,21 @@ import math
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args
-from megatron import get_timers
-from megatron import get_tokenizer
-from megatron import mpu
-from megatron import print_rank_0
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron import get_args, get_timers, get_tokenizer
+from megatron import mpu, print_rank_0
+from megatron.indexer import IndexBuilder
 from megatron.model.biencoder_model import biencoder_model_provider
-#from tasks.t5_model_utils.finetune_utils_open_retrieval import accuracy_func_provider
-#from tasks.t5_model_utils.finetune_utils_open_retrieval import finetune
+from megatron.utils import average_losses_across_data_parallel_group
 from pretrain_ict import get_group_world_size_rank
 from tasks.finetune_utils import finetune
 from tasks.orqa.supervised.eval_utils import accuracy_func_provider
 from tasks.orqa.supervised.eval_utils import process_batch, task_collate_fn
 from tasks.orqa.evaluate_utils import ORQAEvaluator
-from megatron.indexer import IndexBuilder
 
-def orqa(Dataset): # , name_from_datapath_func):
+def orqa(Dataset):
 
     def cross_entropy_forward_step(batch, model):
         """Simple forward step with cross-entropy loss."""
-        args = get_args()
         timers = get_timers()
         tokenizer = get_tokenizer()
 
@@ -73,17 +67,15 @@ def orqa(Dataset): # , name_from_datapath_func):
             context_types = torch.cat([context_types, neg_context_types])
 
         # Forward model.
-        #query_logits, context_logits = model(query_tokens, query_mask, 
-        output_tensor = model(query_tokens, query_mask, 
-                                        query_types, context_tokens, 
+        output_tensor = model(query_tokens, query_mask,
+                                        query_types, context_tokens,
                                         context_mask, context_types)
 
-        return output_tensor, partial(cross_entropy_loss_func_, query_tokens, context_tokens)
+        return output_tensor, partial(cross_entropy_loss_func, query_tokens, context_tokens)
 
 
-    #def cross_entropy_loss_func(labels, output_tensor):
-    def cross_entropy_loss_func_(query_tokens, context_tokens, output_tensor):
-        args = get_args() 
+    def cross_entropy_loss_func(query_tokens, context_tokens, output_tensor):
+        args = get_args()
 
         local_batch_size = query_tokens.shape[0]
         group, rank, world_size = get_group_world_size_rank()
@@ -184,12 +176,9 @@ def orqa(Dataset): # , name_from_datapath_func):
         """Build the model."""
         args = get_args()
         print_rank_0('building retriever model for {} ...'.format(args.task))
-        #args.only_context_model=False
-        #args.only_query_model=False
-        #model = biencoder_model_provider()
-        
+
         model = biencoder_model_provider(only_context_model=False,
-                    only_query_model=False, 
+                    only_query_model=False,
                     biencoder_shared_query_context_model=\
                     args.biencoder_shared_query_context_model,
                     pre_process=pre_process, post_process=post_process)
@@ -200,7 +189,6 @@ def orqa(Dataset): # , name_from_datapath_func):
         args = get_args()
         tokenizer = get_tokenizer()
 
-        #name = name_from_datapath_func(datapath)
         name = datapath[0].split('/')[-1].split('.')[0]
         return Dataset(name,
                        datapath,
@@ -208,19 +196,9 @@ def orqa(Dataset): # , name_from_datapath_func):
                        args.retriever_seq_length,
                        evaluate=True)
 
-    #def distributed_metrics_func_provider():
     def metrics_func_provider():
         """Provide metrics callback function."""
-
-        #def name_from_datapath(datapath):
-        #    return datapath[0].split('/')[-1].split('.')[0]
-        
         return accuracy_func_provider(single_dataset_provider)
-
-    #def rank0_metrics_func_provider(datapath):
-    #    """Provide metrics callback function."""
-    #    return accuracy_func_provider(single_dataset_provider, datapath,
-    #                                  rank0sampler=True)
 
     """Finetune/evaluate."""
     finetune(train_valid_datasets_provider,
@@ -228,21 +206,15 @@ def orqa(Dataset): # , name_from_datapath_func):
              forward_step=cross_entropy_forward_step,
              end_of_epoch_callback_provider=metrics_func_provider,
              task_collate_fn=task_collate_fn)
-            #,end_of_training_callback_provider=rank0_metrics_func_provider)
-
 
 def main():
     args = get_args()
 
     if args.task == 'RET-FINETUNE-NQ':
         from tasks.orqa.supervised.data import NQSupervisedDataset as Dataset
-
-        #def name_from_datapath(datapath):
-        #    return datapath[0].split('/')[-1].split('.')[0]
-
     else:
         raise NotImplementedError('ORQA task {} is not implemented.'.format(
             args.task))
 
-    orqa(Dataset) #, name_from_datapath)
+    orqa(Dataset)
 

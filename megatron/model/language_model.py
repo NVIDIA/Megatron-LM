@@ -18,7 +18,7 @@
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, print_rank_0
+from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import LayerType, AttnMaskType

@@ -47,9 +47,8 @@ class ORQAEvaluator(object):
         #args.only_query_model = only_query_model
         #args.only_context_model = False
 
-        model = get_model(get_model_provider(only_query_model=only_query_model, 
+        model = get_model(get_model_provider(only_query_model=only_query_model,
             biencoder_shared_query_context_model=args.biencoder_shared_query_context_model))
-
 
         #model = get_model(lambda: biencoder_model_provider(only_query_model=\
         #model = get_model(lambda: biencoder_model_provider(only_query_model=\

@@ -15,17 +15,17 @@ from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
-def get_model_provider(only_query_model=False, only_context_model=False, 
+def get_model_provider(only_query_model=False, only_context_model=False,
         biencoder_shared_query_context_model=False):
 
     def model_provider(pre_process=True, post_process=True):
         """Build the model."""
 
         print_rank_0('building Bienoder model ...')
-        model = biencoder_model_provider(only_query_model=only_query_model, 
-                only_context_model = only_context_model, 
+        model = biencoder_model_provider(only_query_model=only_query_model,
+                only_context_model = only_context_model,
                 biencoder_shared_query_context_model = \
-                biencoder_shared_query_context_model, 
+                biencoder_shared_query_context_model,
                 pre_process=True, post_process=True)
 
         return model
@@ -33,21 +33,12 @@ def get_model_provider(only_query_model=False, only_context_model=False,
     return model_provider
 
 
-
-#def biencoder_model_provider(pre_process=True, 
-#                             post_process=True):
- 
 def biencoder_model_provider(only_query_model=False,
                              only_context_model=False,
                              biencoder_shared_query_context_model=False,
                              pre_process=True,
                              post_process=True):
     """Build the model."""
-    #args = get_args()
-
-    #biencoder_shared_query_context_model = args.biencoder_shared_query_context_model
-    #only_context_model = args.only_context_model
-    #only_query_model = args.only_query_model
 
     assert mpu.get_tensor_model_parallel_world_size() == 1 and \
         mpu.get_pipeline_model_parallel_world_size() == 1, \
@@ -63,7 +54,7 @@ def biencoder_model_provider(only_query_model=False,
         only_query_model=only_query_model,
         only_context_model=only_context_model,
         biencoder_shared_query_context_model=\
-            biencoder_shared_query_context_model,
+        biencoder_shared_query_context_model,
         pre_process=pre_process,
         post_process=post_process)
 
@@ -114,9 +105,9 @@ class BiEncoderModel(MegatronModule):
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
-        #this is just a placeholder and will be needed when model
-        #parallelism will be used
-        #self.language_model.set_input_tensor(input_tensor)
+        # this is just a placeholder and will be needed when model
+        # parallelism will be used
+        # self.language_model.set_input_tensor(input_tensor)
         return
 
     def forward(self, query_tokens, query_attention_mask, query_types,

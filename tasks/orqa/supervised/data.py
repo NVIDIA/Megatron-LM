@@ -104,9 +104,9 @@ def build_tokens_types_paddings_from_ids(text_ids, max_seq_length,
     return enc_ids, tokentypes_enc, pad_mask
 
 
-def build_sample(query_ids, query_types, query_pad_mask, 
+def build_sample(query_ids, query_types, query_pad_mask,
                 ctx_ids, ctx_types, ctx_pad_mask, answers,
-                neg_ctx_id_list=None, neg_ctx_types_list=None, 
+                neg_ctx_id_list=None, neg_ctx_types_list=None,
                 include_neg=False):
     """Convert to numpy and return a sample consumed by the batch producer."""
 
@@ -294,6 +294,4 @@ class NQSupervisedDataset(OpenRetrievalAbstractDataset):
 
         print_rank_0(' >> processed {} samples.'.format(len(samples)))
         return samples
-
-
 
