@@ -211,6 +211,9 @@ def fix_query_key_value_ordering(model, checkpoint_version):
     version is smaller than 2.0
     """
     if checkpoint_version < 2.0:
+        if isinstance(model, list):
+            assert len(model)==1
+            model = model[0]
         for name, param in model.named_parameters():
             if name.endswith(('.query_key_value.weight', '.query_key_value.bias')):
                 if checkpoint_version == 0:
@@ -291,8 +294,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         state_dict = torch.load(checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
-    except BaseException:
+    except BaseException as e:
         print_rank_0('could not load the checkpoint')
+        print_rank_0(e)
         sys.exit()
 
     # set checkpoint version

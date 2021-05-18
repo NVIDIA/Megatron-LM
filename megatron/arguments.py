@@ -213,9 +213,10 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    assert args.hidden_size % args.num_attention_heads == 0
     if args.seq_length is not None:
         assert args.max_position_embeddings >= args.seq_length
+    if args.decoder_seq_length is not None:
+        assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
