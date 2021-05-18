@@ -34,13 +34,14 @@ def classification():
         )
         return train_ds, valid_ds
 
-    def model_provider():
+    def model_provider(pre_process=True, post_process=True):
         """Build the model."""
         args = get_args()
 
         print_rank_0("building classification model for ImageNet ...")
 
-        return VitModel(num_classes=args.num_classes, finetune=True)
+        return VitModel(num_classes=args.num_classes, finetune=True,
+                        pre_process=pre_process, post_process=post_process)
 
     """Finetune/evaluate."""
     finetune(
