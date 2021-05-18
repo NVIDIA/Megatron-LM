@@ -243,7 +243,7 @@ T5_ARGS="--num-layers 24 \
 OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
 
 python pretrain_t5.py \
-       $BERT_ARGS \
+       $T5_ARGS \
        $OUTPUT_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
