@@ -26,7 +26,7 @@ def get_model_provider(only_query_model=False, only_context_model=False,
                 only_context_model = only_context_model,
                 biencoder_shared_query_context_model = \
                 biencoder_shared_query_context_model,
-                pre_process=True, post_process=True)
+                pre_process=pre_process, post_process=post_process)
 
         return model
 
