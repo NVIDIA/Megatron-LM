@@ -22,7 +22,7 @@ from multiprocessing import Pool as ProcessPool
 from typing import Tuple, List, Dict
 
 import regex as re
-from tasks.orqa.natural_questions.tokenizers import SimpleTokenizer
+from tasks.orqa.unsupervised.tokenizers import SimpleTokenizer
 
 logger = logging.getLogger(__name__)
 

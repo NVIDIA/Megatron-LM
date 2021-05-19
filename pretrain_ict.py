@@ -33,15 +33,13 @@ from megatron.utils import average_losses_across_data_parallel_group
 
 def pretrain_ict_model_provider():
     args = get_args()
-    #args.only_context_model = False
-    #args.only_query_model = False
-    #model = biencoder_model_provider()
 
     model = biencoder_model_provider(
                 only_context_model=False,
                 only_query_model=False,
                 biencoder_shared_query_context_model=\
-                    args.biencoder_shared_query_context_model)
+                args.biencoder_shared_query_context_model)
+
     return model
 
 def get_group_world_size_rank():
