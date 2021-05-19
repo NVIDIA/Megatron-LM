@@ -19,7 +19,7 @@ from functools import partial
 
 import torch
 
-from megatron import get_args
+from megatron import get_args, get_num_microbatches
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import mpu
@@ -153,6 +153,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
     """Train the model."""
     args = get_args()
     timers = get_timers()
+
+    assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
 
     # Turn on training mode which enables dropout.
     for m in model:
