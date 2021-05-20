@@ -32,5 +32,8 @@ python tasks/main.py \
     --num-workers 2 \
     --faiss-use-gpu \
     --retriever-report-topk-accuracies 1 5 20 100 \
-    --fp16
+    --fp16 \
+    --indexer-log-interval 1000 \
+    --indexer-batch-size 128
+
 

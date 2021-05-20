@@ -320,7 +320,7 @@ class PretrainedBertModel(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
-        print_rank_0("loading BERT weights")
+        print_rank_0("loading pretrained weights")
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
 
