@@ -50,11 +50,11 @@ class VitMlpHead(MegatronModule):
     def forward(self, hidden_states, sequence_index=0):
         # hidden_states: [b, s, h]
         # sequence_index: index of the token to pool.
-        x = hidden_states[:, sequence_index, :]
-        x = self.dense_in(x)
-        x = torch.tanh(x)
-        x = self.dense_out(x)
-        return x
+        hidden_state = hidden_states[:, sequence_index, :]
+        dense_in_result = self.dense_in(hidden_state)
+        tanh_result = torch.tanh(dense_in_result)
+        dense_out_result = self.dense_out(tanh_result)
+        return dense_out_result
 
 
 def twod_interpolate_position_embeddings_hook(
@@ -122,8 +122,12 @@ def twod_interpolate_position_embeddings_hook(
 class VitModel(MegatronModule):
     """Vision Transformer Model."""
 
-    def __init__(self, num_classes, finetune=False):
-        super(VitModel, self).__init__()
+    def __init__(self, 
+                 num_classes,
+                 finetune=False,
+                 pre_process=True,
+                 post_process=True):
+        super(VitModel, self).__init__(share_word_embeddings=False)
         args = get_args()
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
@@ -136,6 +140,8 @@ class VitModel(MegatronModule):
                 args.init_method_std, args.num_layers
             )
 
+        self.pre_process = pre_process
+        self.post_process = post_process
         self.hidden_size = args.hidden_size
         self.num_classes = num_classes
         self.patch_dim = args.patch_dim
@@ -148,63 +154,81 @@ class VitModel(MegatronModule):
         self.seq_length = self.num_patches + 1
         self.flatten_dim = self.patch_dim * self.patch_dim * args.num_channels
 
-        # cls_token
-        self.cls_token = torch.nn.Parameter(torch.randn(1, 1, self.hidden_size))
-        torch.nn.init.zeros_(self.cls_token)
+        if self.pre_process:
+            # cls_token
+            self.cls_token = torch.nn.Parameter(
+                torch.randn(1, 1, self.hidden_size)
+            )
+            torch.nn.init.zeros_(self.cls_token)
 
-        # Linear encoder
-        self.linear_encoder = torch.nn.Linear(
-            self.flatten_dim, self.hidden_size
-        )
+            # Linear encoder
+            self.linear_encoder = torch.nn.Linear(
+                self.flatten_dim, self.hidden_size
+            )
 
-        # embedding
-        self.position_embeddings = torch.nn.Embedding(
-            self.seq_length, self.hidden_size
-        )
-        init_method_normal(args.init_method_std)(
-            self.position_embeddings.weight
-        )
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+            # embedding
+            self.position_embeddings = torch.nn.Embedding(
+                self.seq_length, self.hidden_size
+            )
+            init_method_normal(args.init_method_std)(
+                self.position_embeddings.weight
+            )
+            self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
-        self.position_embeddings._register_load_state_dict_pre_hook(
-            twod_interpolate_position_embeddings_hook
-        )
+            self.position_embeddings._register_load_state_dict_pre_hook(
+                twod_interpolate_position_embeddings_hook
+            )
 
-        self.embedding_dropout = torch.nn.Dropout(args.hidden_dropout)
+            self.embedding_dropout = torch.nn.Dropout(args.hidden_dropout)
 
         # Transformer
         self.transformer = ParallelTransformer(
-            self.init_method, self.scaled_init_method
+            self.init_method, 
+            self.scaled_init_method,
+            pre_process=self.pre_process,
+            post_process=self.post_process
         )
 
-        # MLP head
-        if not self.finetune:
-            self.mlp_head = VitMlpHead(self.hidden_size, self.num_classes)
-        else:
-            self.class_head = get_linear_layer(
-                self.hidden_size, num_classes, torch.nn.init.zeros_
+        if self.post_process:
+            # MLP head
+            if not self.finetune:
+                self.mlp_head = VitMlpHead(self.hidden_size, self.num_classes)
+            else:
+                self.class_head = get_linear_layer(
+                    self.hidden_size, num_classes, torch.nn.init.zeros_
+                )
+
+    def set_input_tensor(self, input_tensor):
+        """See megatron.model.transformer.set_input_tensor()"""
+        self.transformer.set_input_tensor(input_tensor)
+
+    def forward(self, input):
+
+        if self.pre_process:
+            rearranged_input = einops.rearrange(
+                input,
+                "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
+                p1=self.patch_dim,
+                p2=self.patch_dim,
             )
 
-    def forward(self, x):
-        x = einops.rearrange(
-            x,
-            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-            p1=self.patch_dim,
-            p2=self.patch_dim,
-        )
+            assert rearranged_input.dtype == torch.half
+            encoder_output = self.linear_encoder(rearranged_input)
+            cls_tokens = self.cls_token.expand(encoder_output.shape[0], -1, -1)
+            concatenated_tokens = torch.cat((cls_tokens, encoder_output), dim=1)
 
-        assert x.dtype == torch.half
-        x = self.linear_encoder(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        x = x + self.position_embeddings(self.position_ids)
-        x = self.embedding_dropout(x)
-        x = self.transformer(x, None)
-
-        if not self.finetune:
-            x = self.mlp_head(x)
+            token_embeddings = concatenated_tokens + \
+                self.position_embeddings(self.position_ids)
+            hidden_states = self.embedding_dropout(token_embeddings)
         else:
-            x = self.class_head(x[:, 0, :])
+            hidden_states = input
 
-        return x
+        hidden_states = self.transformer(hidden_states, None)
+
+        if self.post_process:
+            if not self.finetune:
+                hidden_states = self.mlp_head(hidden_states)
+            else:
+                hidden_states = self.class_head(hidden_states[:, 0, :])
+
+        return hidden_states
