@@ -1,15 +1,16 @@
 import sys
+import time
 import torch
 import torch.distributed as dist
 
-from megatron import get_args
+from megatron import get_args, print_rank_0
 from megatron import mpu
 from megatron.checkpointing import load_biencoder_checkpoint
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_wiki_dataset
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_batch
 from megatron.data.biencoder_dataset_utils import get_one_epoch_dataloader
 from megatron.data.realm_index import detach, OpenRetreivalDataStore
-from megatron.model.biencoder_model import biencoder_model_provider
+from megatron.model.biencoder_model import get_model_provider
 from megatron.training import get_model
 
 
@@ -29,7 +30,6 @@ class IndexBuilder(object):
         # need to know whether we're using a REALM checkpoint (args.load)
         # or ICT checkpoint
         assert not (args.load and args.ict_load)
-        #self.using_realm_chkpt = args.ict_load is None
 
         self.log_interval = args.indexer_log_interval
         self.batch_size = args.indexer_batch_size
@@ -47,8 +47,8 @@ class IndexBuilder(object):
         if self.biencoder_shared_query_context_model:
             only_context_model = False
 
-        model = get_model(lambda: biencoder_model_provider(only_context_model \
-            = only_context_model, biencoder_shared_query_context_model = \
+        model = get_model(get_model_provider(only_context_model=\
+            only_context_model, biencoder_shared_query_context_model=\
             self.biencoder_shared_query_context_model))
 
         self.model = load_biencoder_checkpoint(model,
@@ -85,6 +85,7 @@ class IndexBuilder(object):
         """
         assert len(self.model) == 1
         unwrapped_model = self.model[0]
+
         while not hasattr(unwrapped_model, 'embed_text'):
             unwrapped_model = unwrapped_model.module
 
@@ -103,6 +104,7 @@ class IndexBuilder(object):
             context_logits = unwrapped_model.embed_text(
                 unwrapped_model.context_model, context_tokens, context_mask,
                 context_types)
+
             context_logits = detach(context_logits)
             row_id = detach(row_id)
 

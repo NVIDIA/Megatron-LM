@@ -87,7 +87,7 @@ class AnnealingLR(object):
         else:
             raise Exception('{} decay style is not supported.'.format(
                 self.decay_style))
-       
+
         return self.min_lr + coeff * delta_lr
 
 

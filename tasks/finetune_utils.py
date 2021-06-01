@@ -16,7 +16,7 @@
 """Finetune utilities."""
 
 from functools import partial
-
+import sys
 import torch
 
 from megatron import get_args, get_num_microbatches
@@ -80,7 +80,8 @@ def _cross_entropy_forward_step(batch, model):
     return output_tensor, partial(cross_entropy_loss_func, labels)
 
 
-def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
+def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
+        task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
     # Sampler.
@@ -96,7 +97,8 @@ def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
                                               shuffle=False,
                                               num_workers=num_workers,
                                               drop_last=drop_last,
-                                              pin_memory=True)
+                                              pin_memory=True,
+                                              collate_fn=task_collate_fn)
 
     return data_loader
 
@@ -112,21 +114,24 @@ def _build_infinite_size_dataloader(dataloader):
             iterator = dataloader.__iter__()
 
 
-def _build_train_valid_dataloaders(train_dataset, valid_dataset):
+def _build_train_valid_dataloaders(train_dataset, valid_dataset, 
+    task_collate_fn=None):
     """Traing and validation dataloaders."""
     args = get_args()
 
     print_rank_0('building train and validation dataloaders ...')
     # Training dataset.
     train_dataloader = build_data_loader(train_dataset, args.micro_batch_size,
-                                         args.num_workers, not args.keep_last)
+                                         args.num_workers, not args.keep_last,
+                                         task_collate_fn)
     # Set the training iterations.
     args.train_iters_per_epoch = len(train_dataloader)
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
     valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
-                                          args.num_workers, not args.keep_last)
+                                          args.num_workers, not args.keep_last,
+                                          task_collate_fn)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
     # Now that we've built the data loaders, set batch_size arguments
@@ -190,6 +195,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
 
             # Train for one step.
             out = train_step(forward_step, batch, model, optimizer, lr_scheduler)
+
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
 
@@ -211,9 +217,11 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                                                   optimizer, lr_scheduler)
 
             # Checkpointing
+            saved_checkpoint = False
             if args.save and args.save_interval and \
                iteration % args.save_interval == 0:
                 save_checkpoint(iteration, model, optimizer, lr_scheduler)
+                saved_checkpoint = True
 
             # Evaluation
             if args.eval_interval and iteration % args.eval_interval == 0:
@@ -221,6 +229,14 @@ def _train(model, optimizer, lr_scheduler, forward_step,
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
                                            iteration, False)
+
+            # Exiting based on iterations
+            if args.exit_interval and iteration % args.exit_interval == 0:
+                if not saved_checkpoint:
+                    save_checkpoint(iteration, model, optimizer, lr_scheduler)
+                torch.distributed.barrier()
+                print_rank_0('exiting program at iteration {}'.format(iteration))
+                sys.exit()
 
         # Checkpointing at the end of each epoch.
         if args.save:
@@ -233,7 +249,8 @@ def _train(model, optimizer, lr_scheduler, forward_step,
 
 def finetune(train_valid_datasets_provider, model_provider,
              forward_step=_cross_entropy_forward_step,
-             end_of_epoch_callback_provider=None):
+             end_of_epoch_callback_provider=None,
+             task_collate_fn=None):
     """Main finetune function used across all tasks."""
     args = get_args()
     timers = get_timers()
@@ -246,7 +263,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     if args.epochs > 0:
         train_dataset, valid_dataset = train_valid_datasets_provider()
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
-            train_dataset, valid_dataset)
+            train_dataset, valid_dataset, task_collate_fn)
     else:
         args.train_iters = 0
     timers('train/valid/test dataset/dataloder').stop()
@@ -270,8 +287,11 @@ def finetune(train_valid_datasets_provider, model_provider,
     if args.iteration == 0 and args.pretrained_checkpoint is not None:
         original_load = args.load
         args.load = args.pretrained_checkpoint
+        original_rng = args.no_load_rng
+        args.no_load_rng = True
         _ = load_checkpoint(model, None, None)
         args.load = original_load
+        args.no_load_rng = original_rng
         # This is critical when only model is loaded. We should make sure
         # main parameters are also updated.
         optimizer.reload_model_params()

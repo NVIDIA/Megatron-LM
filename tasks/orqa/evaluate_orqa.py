@@ -15,10 +15,8 @@
 
 """Main tasks functionality."""
 
-import os
-import sys
-
-from megatron import get_args
+from megatron import get_args, print_rank_0
+from megatron.indexer import IndexBuilder
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 def main():
@@ -27,6 +25,20 @@ def main():
     """
 
     args = get_args()
+
+    """
+    Create a BlockData data structure by running an IndexBuilder over an
+    ICT Dataset and then evaluate on NQ task
+    """
+
+    print_rank_0("Starting index builder!")
+
+    index_builder = IndexBuilder()
+    index_builder.build_and_save_index()
+    print_rank_0("Build and save indices: done!")
+
+
+    print_rank_0("Starting evaluations!")
 
     # Set up the model and evaluator
     evaluator = ORQAEvaluator()
