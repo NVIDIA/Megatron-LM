@@ -36,6 +36,7 @@ from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args
+import deepspeed.runtime.activation_checkpointing.checkpointing as ds_checkpointing
 
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
@@ -84,6 +85,10 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          is_parallel=True,
                                          dim=partition_dim,
                                          stride=stride)
+
+    if ds_checkpointing.is_configured():
+        global get_cuda_rng_tracker
+        get_cuda_rng_tracker = ds_checkpointing.get_cuda_rng_tracker
 
     with get_cuda_rng_tracker().fork():
         init_method(weight)
