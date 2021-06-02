@@ -28,16 +28,28 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
+import deepspeed
+from deepspeed.runtime.utils import see_memory_usage
+
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
-    model = GPTModel(
-        num_tokentypes=0,
-        parallel_output=True,
-        pre_process=pre_process,
-        post_process=post_process
-    )
+    see_memory_usage(f"Before Building Model", force=True)
+
+    args = get_args()
+    with deepspeed.zero.Init(data_parallel_group=mpu.get_data_parallel_group(),
+                             remote_device=None if args.remote_device=='none' else args.remote_device,
+                             config=args.deepspeed_config,
+                             enabled=args.zero_stage==3):
+        model = GPTModel(
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process
+        )
+    see_memory_usage(f"After Building Model", force=True)
     return model
 
 
