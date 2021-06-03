@@ -42,13 +42,15 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_zero_args(parser)
+    parser = _add_memoryopt_args(parser)
+    parser = _add_activation_checkpoint_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
 
     parser = deepspeed.add_config_arguments(parser)
-    parser = _add_extra_deepspeed_args(parser)
 
     # Parse.
     if ignore_unknown_args:
@@ -434,6 +436,11 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--cpu-optimizer', action='store_true',
+                       help='Run optimizer on CPU')
+    group.add_argument('--cpu_torch_adam', action='store_true',
+                       help='Use Torch Adam as optimizer on CPU.')
+
     return parser
 
 
@@ -757,14 +764,48 @@ def _add_vit_args(parser):
 
     return parser
 
-def _add_extra_deepspeed_args(parser):
-    group = parser.add_argument_group(title="deepspeed-extras")
-    group.add_argument('--cpu-optimizer', action='store_true',
-                       help='Run optimizer on CPU')
+
+def _add_zero_args(parser):
+    """Text generate arguments."""
+
+    group = parser.add_argument_group('ZeRO configurations', 'configurations')
+    group.add_argument("--zero-stage", type=int, default=1.0)
+    group.add_argument('--zero-reduce-scatter', action='store_true',
+                       help='Use reduce scatter if specified')
+    group.add_argument('--zero-contigious-gradients', action='store_true',
+                       help='Use contigious memory optimizaiton if specified')
+    group.add_argument("--zero-reduce-bucket-size", type=int, default=0.0)
+    group.add_argument("--zero-allgather-bucket-size", type=int, default=0.0)
     group.add_argument('--remote-device', type=str, default='none', choices=['none', 'cpu', 'nvme'],
                       help='Remote device for ZeRO-3 initialized parameters.')
-    group.add_argument("--zero-stage", type=int, default=1)
+    group.add_argument('--use-pin-memory', action='store_true',
+                     help='Use pinned CPU memory for ZeRO-3 initialized model parameters.')
+    return parser
 
+def _add_memoryopt_args(parser):
+    """Memory optimization arguments."""
+
+    group = parser.add_argument_group('Memory optimizations', 'configurations')
+    group.add_argument("--scattered-embeddings", action='store_true',
+                       help='Save memory by scattering embedding activations. '
+                            'Introduces dropout differences across MP configurations.')
+    group.add_argument("--split-transformers", action='store_true',
+                       help='Save memory by splitting transformer layers into two parts, '
+                       'allowing for more frequent activation checkpoint savings.')
+    group.add_argument("--memory-centric-tiled-linear", action="store_true",
+                       help='Save memory by tiling with deepspeed.zero.TiledLinear.')
+    group.add_argument("--tile-factor", type=int, default=1,
+                       help='Make all linear layers the same size of [hidden/tile_factor, hidden/tile_factor]. '
+                            'Must be enabled with --memory-centric-tiled-linear. '
+                            'Example A: if tile_factor=1, the qkv layer [hidden, 3* hidden] would be converted into [1,3] tiles of size [hidden,hidden]. '
+                            'Example B: if tile_factor=2, the intermediate layer [4*hidden, hidden] will be converted into [8, 2] tiles of size [hidden/2, hidden/2]. '
+                            'Default is 1.')
+
+    return parser
+
+def _add_activation_checkpoint_args(parser):
+    group = parser.add_argument_group('Activation Checkpointing',
+                                      'Checkpointing Configurations')
     group.add_argument('--deepspeed-activation-checkpointing', action='store_true',
                        help='uses activation checkpointing from deepspeed')
     group.add_argument('--partition-activations', action='store_true',
