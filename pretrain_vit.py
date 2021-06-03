@@ -17,19 +17,22 @@
 
 import torch
 import torch.nn.functional as F
+from functools import partial
 from megatron import get_args, get_timers, mpu, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model.vit_model import VitModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
-def model_provider():
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0("building VIT model ...")
     args = get_args()
 
-    model = VitModel(num_classes=args.num_classes)
+    model = VitModel(num_classes=args.num_classes,
+                     pre_process=pre_process,
+                     post_process=post_process)
     return model
 
 def get_batch(data_iterator):
@@ -42,21 +45,8 @@ def get_batch(data_iterator):
 
     return images, labels
 
-def forward_step(data_iterator, model, input_tensor):
-    """Forward step."""
-    timers = get_timers()
-    assert input_tensor is None
-
-    # Get the batch.
-    timers("batch-generator").start()
-    (
-        images,
-        labels,
-    ) = get_batch(data_iterator)
-    timers("batch-generator").stop()
-
-    # Forward model. lm_labels
-    logits = model(images).contiguous().float()
+def loss_func(labels, output_tensor):
+    logits = output_tensor.contiguous().float()
     loss = F.cross_entropy(logits, labels)
 
     outputs = torch.argmax(logits, -1)
@@ -67,6 +57,22 @@ def forward_step(data_iterator, model, input_tensor):
 
     return loss, {"loss": averaged_loss[0], "accuracy": averaged_loss[1]}
 
+def forward_step(data_iterator, model):
+    """Forward step."""
+    timers = get_timers()
+
+    # Get the batch.
+    timers("batch-generator").start()
+    (
+        images,
+        labels,
+    ) = get_batch(data_iterator)
+    timers("batch-generator").stop()
+
+    # Forward model. lm_labels
+    output_tensor = model(images)
+
+    return output_tensor, partial(loss_func, labels)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""

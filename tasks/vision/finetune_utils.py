@@ -17,6 +17,7 @@
 
 import torch
 import torch.nn.functional as F
+from functools import partial
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
@@ -38,10 +39,21 @@ def process_batch(batch):
     return images, labels
 
 
-def _cross_entropy_forward_step(batch, model, input_tensor):
+def cross_entropy_loss_func(labels, output_tensor):
+    logits = output_tensor
+
+    # Cross-entropy loss.
+    loss = F.cross_entropy(logits.contiguous().float(), labels)
+
+    # Reduce loss for logging.
+    averaged_loss = average_losses_across_data_parallel_group([loss])
+
+    return loss, {'lm loss': averaged_loss[0]}
+
+
+def _cross_entropy_forward_step(batch, model):
     """Simple forward step with cross-entropy loss."""
     timers = get_timers()
-    assert input_tensor is None
 
     # Get the batch.
     timers("batch generator").start()
@@ -52,16 +64,10 @@ def _cross_entropy_forward_step(batch, model, input_tensor):
     images, labels = process_batch(batch_)
     timers("batch generator").stop()
 
-    # Forward model.
-    logits = model(images).contiguous().float()
-
-    # Cross-entropy loss.
-    loss = F.cross_entropy(logits, labels)
-
-    # Reduce loss for logging.
-    average_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss, {"lm loss": average_loss[0]}
+   # Forward model.
+    output_tensor = model(images)
+  
+    return output_tensor, partial(cross_entropy_loss_func, labels)
 
 
 def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
@@ -103,23 +109,28 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
     """Traing and validation dataloaders."""
     args = get_args()
 
-    print_rank_0("building train and validation dataloaders ...")
+    print_rank_0('building train and validation dataloaders ...')
     # Training dataset.
-    train_dataloader = build_data_loader(
-        train_dataset, args.micro_batch_size, args.num_workers, not args.keep_last
-    )
+    train_dataloader = build_data_loader(train_dataset, args.micro_batch_size,
+                                           args.num_workers, not args.keep_last)
     # Set the training iterations.
     args.train_iters_per_epoch = len(train_dataloader)
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
-    valid_dataloader_ = build_data_loader(
-        valid_dataset, args.micro_batch_size, args.num_workers, not args.keep_last
-    )
+    valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
+                                            args.num_workers, not args.keep_last)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
-    return train_dataloader, valid_dataloader
+    # Now that we've built the data loaders, set batch_size arguments
+    # to the actual batch size the model will see for this dataset.
+    # This is necessary so pipeline transfers know what size they are
+    # and the LR schedule, which is based on samples seen, gets set
+    # correctly.
+    args.orig_micro_batch_size = args.micro_batch_size
+    args.orig_global_batch_size = args.global_batch_size
 
+    return train_dataloader, valid_dataloader
 
 def _train(
     model,
@@ -135,7 +146,8 @@ def _train(
     timers = get_timers()
 
     # Turn on training mode which enables dropout.
-    model.train()
+    for m in model:
+        m.train()
 
     # Tracking loss.
     losses_dict_sum = {}
@@ -166,12 +178,16 @@ def _train(
             start_iteration = 0
 
             # Train for one step.
-            losses_dict, skipped_iter = train_step(
+            losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
                 forward_step, batch, model, optimizer, lr_scheduler
             )
             iteration += 1
 
             # Logging.
+            params_norm = None
+            if args.log_params_norm:
+                params_norm = calc_params_l2_norm(model)
+
             report_memory_flag = training_log(
                 losses_dict,
                 losses_dict_sum,
@@ -180,6 +196,9 @@ def _train(
                 optimizer.get_loss_scale().item(),
                 report_memory_flag,
                 skipped_iter,
+                grad_norm,
+                params_norm,
+                num_zeros_in_grad
             )
 
             # Autoresume
