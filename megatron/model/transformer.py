@@ -533,6 +533,23 @@ class ParallelTransformerLayer(MegatronModule):
 
         return output
 
+class ParallelTransformerLayerPipe(ParallelTransformerLayer):
+    """Extends ParallelTransformerLayer to forward attention_mask through the pipeline. """
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if torch.is_tensor(inputs) or len(inputs) == 1:
+            # No attention mask forwarded, search for args.attn_mask
+            if not hasattr(self, '_args'):
+                self._args = get_args()
+            hidden_states, attention_mask = inputs, self._args.attn_mask
+            return super().forward(hidden_states, attention_mask, **kwargs)
+        elif len(inputs) == 2:
+            # Attention mask is an activation.
+            hidden_states, attention_mask = inputs[0], inputs[1]
+            return super().forward(*inputs, **kwargs), attention_mask
+        else:
+            raise RuntimeError('Received more inputs than understood.')
+
 
 class ParallelTransformer(MegatronModule):
     """Transformer class."""

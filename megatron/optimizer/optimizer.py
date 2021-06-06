@@ -402,6 +402,9 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
+        assert False
+        print('grad norm: ', grad_norm)
+
         # count the zeros in the grads
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None

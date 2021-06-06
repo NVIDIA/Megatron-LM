@@ -240,7 +240,6 @@ def get_model(model_provider_func):
                  for model_module in model])), flush=True)
 
     if args.deepspeed:
-        assert mpu.get_pipeline_model_parallel_world_size() == 1, 'deepspeed does not support megatron PP'
         return model
 
     # GPU allocation.
@@ -320,19 +319,28 @@ def setup_model_and_optimizer(model_provider_func):
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
+
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
     if args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
+        pp = mpu.get_pipeline_model_parallel_world_size()
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model[0],
             optimizer=optimizer,
             args=args,
             lr_scheduler=lr_scheduler,
-            mpu=mpu
+            mpu=mpu if pp == 1 else None,
         )
+        if isinstance(model, deepspeed.PipelineEngine):
+            # hack to get batch_fn from pretrain_gpt.py
+            model.set_batch_fn(model.module._megatron_batch_fn)
+
+            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
+            assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
+            assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
         model = [model]
 
     if args.load is not None:
@@ -368,6 +376,14 @@ def train_step(forward_step_func, data_iterator,
     """Single training step."""
     args = get_args()
     timers = get_timers()
+
+    if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+        assert isinstance(model[0], deepspeed.PipelineEngine), model
+        loss = model[0].train_batch(data_iter=data_iterator)
+        skipped_iter = 0
+        grad_norm = 0.
+        num_zeros_in_grad = 0
+        return {'lm-loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:

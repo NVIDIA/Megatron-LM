@@ -23,7 +23,7 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel
+from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -43,12 +43,38 @@ def model_provider(pre_process=True, post_process=True):
                              remote_device=None if args.remote_device=='none' else args.remote_device,
                              config=args.deepspeed_config,
                              enabled=args.zero_stage==3):
-        model = GPTModel(
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process
-        )
+        if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+            model = GPTModelPipe(
+                num_tokentypes=0,
+                parallel_output=True
+            )
+            # This is a hack to give us a reference to get_batch_pipe from within training.py
+            # We need to call model.set_batch_fn after deepspeed.initialize
+            model._megatron_batch_fn = get_batch_pipe
+
+            # Predompute the attention mask and store it in args. This avoids having to
+            # pipeline it as an activation during training. The mask is constant, and thus
+            # we can reuse it.
+            attention_mask = torch.tril(torch.ones(
+                (1, args.seq_length, args.seq_length), device=torch.cuda.current_device())).view(
+                    1, 1, args.seq_length, args.seq_length)
+            
+            # Convert attention mask to binary:
+            attention_mask = (attention_mask < 0.5)
+            if args.fp16:
+                attention_mask = attention_mask.half()
+            elif args.bf16:
+                attention_mask = attention_mask.bfloat16()
+            
+            args.attn_mask = attention_mask
+
+        else:
+            model = GPTModel(
+                num_tokentypes=0,
+                parallel_output=True,
+                pre_process=pre_process,
+                post_process=post_process
+            )
     see_memory_usage(f"After Building Model", force=True)
     return model
 
@@ -83,6 +109,33 @@ def get_batch(data_iterator):
         args.eod_mask_loss)
 
     return tokens, labels, loss_mask, attention_mask, position_ids
+
+def get_batch_pipe(data):
+    """Modification of `get_batch` to work on `next(data_iterator)` instead of `data_iterator`"""
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    # Items and their type.
+    keys = ['text']
+    datatype = torch.int64
+
+    # Broadcast data.
+    data_b = mpu.broadcast_data(keys, data, datatype)
+
+    # Unpack.
+    tokens_ = data_b['text'].long()
+    labels = tokens_[:, 1:].contiguous()
+    tokens = tokens_[:, :-1].contiguous()
+
+    # Get the masks and postition ids.
+    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        tokens,
+        tokenizer.eod,
+        args.reset_position_ids,
+        args.reset_attention_mask,
+        args.eod_mask_loss)
+
+    return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 def loss_func(loss_mask, output_tensor):
     losses = output_tensor.float()

@@ -68,7 +68,7 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     return output_tensor
 
 
-def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model):
+def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model=None):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -77,6 +77,9 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, mo
     Returns gradient of loss with respect to input tensor (None if first
     stage)."""
     args = get_args()
+
+    if args.deepspeed:
+        assert model is not None
 
     timers = get_timers()
     timers('backward-compute').start()
