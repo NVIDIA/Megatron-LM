@@ -4,7 +4,7 @@ Below we present the steps to run unsupervised and supervised trainining and eva
 
 ## Retriever Training
 
-#### Unsupervised pretraining by ICT
+#### Unsupervised pretraining
 1. Use `tools/preprocess_data.py` to preprocess the dataset for Inverse Cloze Task (ICT), which we call unsupervised pretraining. This script takes as input a corpus in loose JSON format and creates fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block and multiple blocks per document. Run [`tools/preprocess_data.py`](../../tools/preprocess_data.py) to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. We construct two datasets, one with the title of every document and another with the body.
 
 <pre>
