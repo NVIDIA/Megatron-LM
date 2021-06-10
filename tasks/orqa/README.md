@@ -20,43 +20,16 @@ python tools/preprocess_data.py \
 
 2. The `examples/pretrain_ict.sh` script runs single GPU 217M parameter biencoder model for ICT retriever training. Single GPU training is primarily intended for debugging purposes, as the code is developed for distributed training. The script uses pretrained BERT model with batch size of 4096 (hence need data parallel world size of 32).
 
-<pre>
+3. Evaluate the pretrained ICT model using `examples/evaluate_retriever_nq.sh` for natural question answering dataset.
 
-PRETRAINED_BERT_PATH="Specify path of pretrained BERT model"
-TEXT_DATA_PATH="Specify path and file prefix of the text data"
-TITLE_DATA_PATH="Specify path and file prefix od the titles"
-CHECKPOINT_PATH="Specify path"
+### Supervised finetuning
 
-python pretrain_ict.py \
-        --num-layers 12 \
-        --hidden-size 768 \
-        --num-attention-heads 12 \
-        --tensor-model-parallel-size 1 \
-        --micro-batch-size 32 \
-        --seq-length 256 \
-        --max-position-embeddings 512 \
-        --train-iters 100000 \
-        --vocab-file bert-vocab.txt \
-        --tokenizer-type BertWordPieceLowerCase \
-        --DDP-impl torch \
-        --bert-load ${PRETRAINED_BERT_PATH} \
-        --log-interval 100 \
-        --eval-interval 1000 \
-        --eval-iters 10 \
-        --retriever-report-topk-accuracies 1 5 10 20 100 \
-        --retriever-score-scaling \
-        --load $CHECKPOINT_PATH \
-        --save $CHECKPOINT_PATH \
-        --data-path ${TEXT_DATA_PATH} \
-        --titles-data-path ${TITLE_DATA_PATH} \
-        --lr 0.0001 \
-        --lr-decay-style linear \
-        --weight-decay 1e-2 \
-        --clip-grad 1.0 \
-        --lr-warmup-fraction 0.01 \
-        --save-interval 4000 \
-        --exit-interval 8000 \
-        --query-in-block-prob 0.1 \
-        --fp16
-</pre>
+1. We use the above pretrained ICT model to finetune using [Google's natural question answering dataset](https://ai.google.com/research/NaturalQuestions/). We use the script `examples/finetune_retriever_distributed.sh` for this purpose. Our finetuning consists of score scaling, longer training (80 epochs), and hard negative examples.
 
+2. We evaluate the finetuned model using the same evaluation script as mentioned above for the unsupervised model.
+
+
+More details on the retriever are available in [our paper](https://arxiv.org/abs/2101.00408).
+
+The reader component will be available soon.
+ 
