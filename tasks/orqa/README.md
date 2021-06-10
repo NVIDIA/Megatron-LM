@@ -1,11 +1,10 @@
-We present below the steps on show how to run unsupervised and supervised trainining and evaluation for retriever for [open domain question answering](https://arxiv.org/abs/2101.00408).
 
 ## End-to-End Training of Neural Retrievers for Open-Domain Question Answering
 
-We use two stages for retriever pretraining and finetuning, (i) unsupervised pretraining, and (ii) supervised finetuning. 
+We present below the steps on show how to run unsupervised and supervised trainining and evaluation for retriever for [open domain question answering](https://arxiv.org/abs/2101.00408).
 
 ### Unsupervised pretraining
-1. We use the following to preprocess dataset for Inverse Cloze Task (ICT) task, we call unsupervised pretraining. Having a corpus in loose JSON format with the intension of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document. Run `tools/preprocess_data.py` to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. We construct two datasets, one with the title of every document, and another with the body.
+1. We use the following to preprocess dataset for Inverse Cloze Task (ICT) task, we call unsupervised pretraining. Having a corpus in loose JSON format with the intension of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document. Run [`tools/preprocess_data.py`](../../tools/preprocess_data.py) to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. We construct two datasets, one with the title of every document, and another with the body.
 
 <pre>
 python tools/preprocess_data.py \
