@@ -17,13 +17,13 @@ python tools/preprocess_data.py \
     --workers 10
 </pre>
 
-2. The `examples/pretrain_ict.sh` script runs single GPU 217M parameter biencoder model for ICT retriever training. Single GPU training is primarily intended for debugging purposes, as the code is developed for distributed training. The script uses pretrained BERT model with batch size of 4096 (hence need data parallel world size of 32).
+2. The [`examples/pretrain_ict.sh`](../../examples/pretrain_ict.sh) script runs single GPU 217M parameter biencoder model for ICT retriever training. Single GPU training is primarily intended for debugging purposes, as the code is developed for distributed training. The script uses pretrained BERT model with batch size of 4096 (hence need data parallel world size of 32).
 
-3. Evaluate the pretrained ICT model using `examples/evaluate_retriever_nq.sh` for natural question answering dataset.
+3. Evaluate the pretrained ICT model using [`examples/evaluate_retriever_nq.sh`](../../examples/evaluate_retriever_nq.sh) for natural question answering dataset.
 
 ### Supervised finetuning
 
-1. We use the above pretrained ICT model to finetune using [Google's natural question answering dataset](https://ai.google.com/research/NaturalQuestions/). We use the script `examples/finetune_retriever_distributed.sh` for this purpose. Our finetuning consists of score scaling, longer training (80 epochs), and hard negative examples.
+1. We use the above pretrained ICT model to finetune using [Google's natural question answering dataset](https://ai.google.com/research/NaturalQuestions/). We use the script [`examples/finetune_retriever_distributed.sh`](../../examples/finetune_retriever_distributed.sh) for this purpose. Our finetuning consists of score scaling, longer training (80 epochs), and hard negative examples.
 
 2. We evaluate the finetuned model using the same evaluation script as mentioned above for the unsupervised model.
 
