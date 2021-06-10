@@ -1,57 +1,62 @@
-The following steps show how to run unsupervised and supervised trainining and evaluation for retriever for open domain question answering.
+We present below the steps on show how to run unsupervised and supervised trainining and evaluation for retriever for [open domain question answering](https://arxiv.org/abs/2101.00408).
 
-<a id="realm"></a>
-## REALM Pipeline
-The following sections (will) reflect the three stages of training a REALM system. For now it's just the ICT code.
-Loosely, they are pretraining the retriever modules, then jointly training the language model and the retriever, and then finetuning a question answering head on the language model with fixed retriever.
+## End-to-End Training of Neural Retrievers for Open-Domain Question Answering
 
-### Inverse Cloze Task (ICT) Pretraining
-1. Have a corpus in loose JSON format with the intention of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document.
-Run `tools/preprocess_data.py` to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. For the original REALM system, we construct two datasets, one with the title of every document, and another with the body.
-Refer to the following script
+We use two stages for retriever pretraining and finetuning, (i) unsupervised pretraining, and (ii) supervised finetuning. 
+
+### Unsupervised pretraining
+1. We use the following to preprocess dataset for Inverse Cloze Task (ICT) task, we call unsupervised pretraining. Having a corpus in loose JSON format with the intension of creating a collection of fixed-size blocks of text as the fundamental units of data. For a corpus like Wikipedia, this will mean multiple sentences per block but also multiple blocks per document. Run `tools/preprocess_data.py` to construct one or more indexed datasets with the `--split-sentences` argument to make sentences the basic unit. We construct two datasets, one with the title of every document, and another with the body.
+
 <pre>
-python preprocess_data.py \
+python tools/preprocess_data.py \
     --input /path/to/corpus.json \
     --json-keys text title \
     --split-sentences \
     --tokenizer-type BertWordPieceLowerCase \
     --vocab-file /path/to/vocab.txt \
     --output-prefix corpus_indexed \
-    --workers 5  # works well for 10 CPU cores. Scale up accordingly.
+    --workers 10
 </pre>
 
-2. Use a custom samples mapping function in place of `megatron/data/realm_dataset_utils.get_block_samples_mapping` if required. To do this, you will need to implement a new function in C++ inside of `megatron/data/helpers.cpp`. The samples mapping data structure is used to select the data that will constitute every training sample in advance of the training loop.
- The samples mapping is responsible for holding all of the required metadata needed to construct the sample from one or more indexed datasets. In REALM, the samples mapping contains the start and end sentence indices, as well as the document index (to find the correct title for a body) and a unique ID for every block.
-3. Pretrain a BERT language model using `pretrain_bert.py`, with the sequence length equal to the block size in token ids. This model should be trained on the same indexed dataset that is used to supply the blocks for the information retrieval task.
-In REALM, this is an uncased bert base model trained with the standard hyperparameters.
-4. Use `pretrain_ict.py` to train an `ICTBertModel` which uses two BERT-based encoders to encode queries and blocks to perform retrieval with.
-The script below trains the ICT model from REALM. It refrences a pretrained BERT model (step 3) in the `--bert-load` argument. The batch size used in the paper is 4096, so this would need to be run with data parallel world size 32.
-<pre>
-python pretrain_ict.py \
-    --num-layers 12 \
-    --num-attention-heads 12 \
-    --hidden-size 768 \
-    --batch-size 128 \
-    --seq-length 256 \
-    --max-position-embeddings 256 \
-    --ict-head-size 128 \
-    --train-iters 100000 \
-    --checkpoint-activations \
-    --bert-load /path/to/pretrained_bert \
-    --load checkpoints \
-    --save checkpoints \
-    --data-path /path/to/indexed_dataset \
-    --titles-data-path /path/to/titles_indexed_dataset \
-    --vocab-file /path/to/vocab.txt \
-    --lr 0.0001 \
-    --num-workers 2 \
-    --lr-decay-style linear \
-    --weight-decay 1e-2 \
-    --clip-grad 1.0 \
-    --warmup .01 \
-    --save-interval 3000 \
-    --query-in-block-prob 0.1 \
-    --fp16
+2. The `examples/pretrain_ict.sh` script runs single GPU 217M parameter biencoder model for ICT retriever training. Single GPU training is primarily intended for debugging purposes, as the code is developed for distributed training. The script uses pretrained BERT model with batch size of 4096 (hence need data parallel world size of 32).
 
+<pre>
+
+PRETRAINED_BERT_PATH=<Specify path of pretrained BERT model>
+TEXT_DATA_PATH=<Specify path and file prefix of the text data>
+TITLE_DATA_PATH=<Specify path and file prefix od the titles>
+CHECKPOINT_PATH=<Specify path>
+
+python pretrain_ict.py \
+        --num-layers 12 \
+        --hidden-size 768 \
+        --num-attention-heads 12 \
+        --tensor-model-parallel-size 1 \
+        --micro-batch-size 32 \
+        --seq-length 256 \
+        --max-position-embeddings 512 \
+        --train-iters 100000 \
+        --vocab-file bert-vocab.txt \
+        --tokenizer-type BertWordPieceLowerCase \
+        --DDP-impl torch \
+        --bert-load ${PRETRAINED_BERT_PATH} \
+        --log-interval 100 \
+        --eval-interval 1000 \
+        --eval-iters 10 \
+        --retriever-report-topk-accuracies 1 5 10 20 100 \
+        --retriever-score-scaling \
+        --load $CHECKPOINT_PATH \
+        --save $CHECKPOINT_PATH \
+        --data-path ${TEXT_DATA_PATH} \
+        --titles-data-path ${TITLE_DATA_PATH} \
+        --lr 0.0001 \
+        --lr-decay-style linear \
+        --weight-decay 1e-2 \
+        --clip-grad 1.0 \
+        --lr-warmup-fraction 0.01 \
+        --save-interval 4000 \
+        --exit-interval 8000 \
+        --query-in-block-prob 0.1 \
+        --fp16
 </pre>
 
