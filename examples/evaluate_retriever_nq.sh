@@ -29,7 +29,6 @@ python tasks/main.py \
     --retriever-seq-length 256 \
     --vocab-file  bert-vocab.txt\
     --qa-data-test ${QA_FILE} \
-    --num-workers 2 \
     --faiss-use-gpu \
     --retriever-report-topk-accuracies 1 5 20 100 \
     --fp16 \
