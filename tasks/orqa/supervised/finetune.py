@@ -45,7 +45,6 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_):
     torch.distributed.all_gather(input_list, first_dim, group=group)
     all_input_list = torch.cat(input_list, dim=0).contiguous()
     max_length = torch.max(all_input_list)
-    min_length = torch.min(all_input_list)
 
     # if the size are different than the max, extend the tensor
     # accordingly
