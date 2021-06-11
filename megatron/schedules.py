@@ -435,7 +435,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, model)
 
             if last_iteration:
                 input_tensor = None
@@ -455,7 +455,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
-                              output_tensor_grad)
+                              output_tensor_grad, model)
 
             p2p_communication.send_backward(input_tensor_grad, timers)
 

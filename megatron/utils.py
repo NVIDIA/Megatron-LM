@@ -210,10 +210,11 @@ def get_parameters_in_billions(model):
     approx_parameters_in_billions = sum([sum([p.ds_numel if hasattr(p,'ds_id') else  p.nelement() for p in model_module.parameters()])
                                         for model_module in model])
 
-    return approx_parameters_in_billions/(1e9)
+    return approx_parameters_in_billions*gpus_per_model/(1e9)
 
 
 def flops_calculator(model, args, iteration_time):
+    return # currently broken
     gpus_per_model = torch.distributed.get_world_size(group = mpu.get_model_parallel_group())
 
     approx_parameters_in_billions = get_parameters_in_billions(model)
