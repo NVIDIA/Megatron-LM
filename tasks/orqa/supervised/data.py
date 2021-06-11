@@ -244,6 +244,9 @@ def normalize_question(question):
         question = question[:-1]
     return question
 
+# The following class reads the datasets for training retriever as
+# prepared by the DPR codebase (https://github.com/facebookresearch/DPR)
+
 class NQSupervisedDataset(OpenRetrievalAbstractDataset):
 
     def __init__(self, name, datapaths, tokenizer, max_seq_length, \
