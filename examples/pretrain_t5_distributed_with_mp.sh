@@ -25,7 +25,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --decoder-seq-length 128 \
        --micro-batch-size 16 \
        --global-batch-size 128 \
-       --seq-length 512 \
        --max-position-embeddings 512 \
        --train-iters 1000000 \
        --lr-decay-iters 1000000 \
