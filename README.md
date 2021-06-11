@@ -103,6 +103,11 @@ python tools/preprocess_data.py \
 
 The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
 
+For T5 use the same preprocessing as BERT, perhaps renaming it to:
+<pre>
+       --output-prefix my-t5 \
+</pre>
+
 Some minor modifications are required for GPT data preprocessing, namely, the addition of a merge table, an end-of-document token, removal of sentence splitting, and a change to the tokenizer type:
 <pre>
 python tools/preprocess_data.py \
@@ -237,13 +242,14 @@ T5_ARGS="--num-layers 24 \
          --micro-batch-size 16 \
          --global-batch-size 2048 \
          --vocab-file $VOCAB_FILE \
+         --vocab-extra-ids 100 \
          --split 949,50,1 \
          --fp16"
 
 OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
 
 python pretrain_t5.py \
-       $BERT_ARGS \
+       $T5_ARGS \
        $OUTPUT_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
