@@ -29,7 +29,7 @@ from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
-
+from megatron import get_num_microbatches
 
 def unwrap_model(model, module_instances=(torchDDP)):
     return_list = True
@@ -204,3 +204,25 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
+def get_parameters_in_billions(model):
+    gpus_per_model = torch.distributed.get_world_size(group=mpu.get_model_parallel_group())
+
+    approx_parameters_in_billions = sum([sum([p.ds_numel if hasattr(p,'ds_id') else  p.nelement() for p in model_module.parameters()])
+                                        for model_module in model])
+
+    return approx_parameters_in_billions*gpus_per_model/(1e9)
+
+
+def flops_calculator(model, args, iteration_time):
+    return # currently broken
+    gpus_per_model = torch.distributed.get_world_size(group = mpu.get_model_parallel_group())
+
+    approx_parameters_in_billions = get_parameters_in_billions(model)
+
+    batch_size = args.micro_batch_size * get_num_microbatches()
+
+    giga_flops_per_model_per_train_step = approx_parameters_in_billions * batch_size * args.seq_length * 2.0 * 4.0
+
+    effective_tera_flops_per_gpu = giga_flops_per_model_per_train_step / (iteration_time * 1000.0 * gpus_per_model)
+
+    print_rank_0(f"Effective Tera Flops per GPU: {round(effective_tera_flops_per_gpu, 2)} and total parameters {round(approx_parameters_in_billions, 3)} B")

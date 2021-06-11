@@ -50,7 +50,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
-from megatron.utils import report_memory
+from megatron.utils import report_memory, flops_calculator
 
 import deepspeed
 
@@ -236,7 +236,7 @@ def get_model(model_provider_func):
               'model parallel rank ({}, {}): {}'.format(
             mpu.get_tensor_model_parallel_rank(),
             mpu.get_pipeline_model_parallel_rank(),
-            sum([sum([p.nelement() for p in model_module.parameters()])
+            sum([sum([p.ds_numel if hasattr(p,'ds_id') else p.nelement() for p in model_module.parameters()])
                  for model_module in model])), flush=True)
 
     if args.deepspeed:
@@ -429,7 +429,7 @@ def train_step(forward_step_func, data_iterator,
                 unwrapped_model = model[-1]
             unwrapped_model = unwrap_model(
                 unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-    
+
             if unwrapped_model.share_word_embeddings:
                 word_embeddings_weight = unwrapped_model.word_embeddings_weight()
                 if args.DDP_impl == 'local':
@@ -464,7 +464,7 @@ def train_step(forward_step_func, data_iterator,
             skipped_iter = 0
         else:
             skipped_iter = 1
-    
+
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
             loss_reduced = {}
@@ -477,7 +477,8 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad,
+                 model=None):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -621,6 +622,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
+        flops_calculator(model, args, elapsed_time)
 
     return report_memory_flag
 
@@ -684,7 +686,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad,
+                                          model)
 
         # Autoresume
         if args.adlr_autoresume and \
