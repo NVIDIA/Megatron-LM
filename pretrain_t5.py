@@ -26,18 +26,22 @@ from megatron import (
     print_rank_0
 )
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import T5Model
+from megatron.model import T5Model, ModelType
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
 
-def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True,
+                   add_encoder=True, add_decoder=True):
     """Build the model."""
-    assert pre_process and post_process, "T5 doesn't yet support pipelining"
 
     print_rank_0('building T5 model ...')
     model = T5Model(num_tokentypes=0,
-                    parallel_output=True)
+                    parallel_output=True,
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    add_encoder=add_encoder,
+                    add_decoder=add_decoder)
     return model
 
 
@@ -70,9 +74,7 @@ def get_batch(data_iterator):
 
 
 def loss_func(loss_mask, output_tensor):
-    lm_loss_, _ = output_tensor
-
-    lm_loss_ = lm_loss_.float()
+    lm_loss_ = output_tensor.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
@@ -130,5 +132,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
-             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    pretrain(train_valid_test_datasets_provider, model_provider, ModelType.encoder_and_decoder,
+             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

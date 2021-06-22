@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-from megatron.model.enums import AttnMaskType, LayerType, AttnType
+from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -548,9 +548,8 @@ class ParallelTransformer(MegatronModule):
         self.checkpoint_num_layers = args.checkpoint_num_layers
 
         # Number of layers.
-        assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
-            'num_layers must be divisible by pipeline_model_parallel_size'
-        self.num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
+        self.num_layers = mpu.get_num_layers(
+            args, args.model_type == ModelType.encoder_and_decoder)
 
         # Transformer layers.
         def build_layer(layer_number):

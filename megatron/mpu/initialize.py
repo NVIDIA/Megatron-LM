@@ -34,6 +34,7 @@ _DATA_PARALLEL_GROUP = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+_PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
@@ -41,8 +42,11 @@ _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_TENSOR_MODEL_PARALLEL_RANK = None
 _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
+# A list of ranks that have a copy of the embedding.
+_EMBEDDING_GLOBAL_RANKS = None
+
 # A list of global ranks for each pipeline group to ease calculation of the source
-# rank when broadcasting from the first or last pipeline stage
+# rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
 
 def is_unitialized():
@@ -52,13 +56,19 @@ def is_unitialized():
 
 def initialize_model_parallel(tensor_model_parallel_size_=1,
                               pipeline_model_parallel_size_=1,
-                              virtual_pipeline_model_parallel_size_=None):
+                              virtual_pipeline_model_parallel_size_=None,
+                              pipeline_model_parallel_split_rank_=None):
     """
     Initialize model data parallel groups.
 
     Arguments:
-        tensor_model_parallel_size: number of GPUs used to parallelize model tensor.
-        pipeline_model_parallel_size: number of GPUs used to parallelize model pipeline.
+        tensor_model_parallel_size: number of GPUs used for tensor model parallelism.
+        pipeline_model_parallel_size: number of GPUs used for pipeline model parallelism.
+        virtual_pipeline_model_parallel_size: number of virtual stages (interleaved
+                                              pipeline).
+        pipeline_model_parallel_split_rank: for models with both encoder and decoder,
+                                            rank in pipeline with split point.
+
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -100,6 +110,10 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size_
+
+    if pipeline_model_parallel_split_rank_ is not None:
+        global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+        _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank_
 
     rank = torch.distributed.get_rank()
 
@@ -148,6 +162,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
     assert _PIPELINE_MODEL_PARALLEL_GROUP is None, \
         'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
+    global _EMBEDDING_GLOBAL_RANKS
     assert _EMBEDDING_GROUP is None, \
         'embedding group is already initialized'
     for i in range(num_pipeline_model_parallel_groups):
@@ -161,11 +176,18 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         # first and last stages).
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
+            if pipeline_model_parallel_split_rank_ is not None and \
+                    pipeline_model_parallel_split_rank_ not in embedding_ranks:
+                embedding_ranks = [ranks[0],
+                                   ranks[pipeline_model_parallel_split_rank_],
+                                   ranks[-1]]
         else:
             embedding_ranks = ranks
         group = torch.distributed.new_group(embedding_ranks)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
+        if rank in ranks:
+            _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
 
 def model_parallel_is_initialized():
@@ -268,6 +290,30 @@ def get_pipeline_model_parallel_rank():
     return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
 
 
+def get_num_layers(args, is_encoder_and_decoder_model):
+    """Compute the number of transformer layers resident on the current rank."""
+    if get_pipeline_model_parallel_world_size() > 1:
+        if is_encoder_and_decoder_model:
+            assert args.pipeline_model_parallel_split_rank is not None
+            num_ranks_in_encoder = args.pipeline_model_parallel_split_rank
+            num_ranks_in_decoder = get_pipeline_model_parallel_world_size() - num_ranks_in_encoder
+            assert args.num_layers % num_ranks_in_encoder == 0, \
+                    'num_layers must be divisible by number of ranks given to encoder'
+            assert args.num_layers % num_ranks_in_decoder == 0, \
+                    'num_layers must be divisible by number of ranks given to decoder'
+            if is_pipeline_stage_before_split():
+                num_layers = args.num_layers // num_ranks_in_encoder
+            else:
+                num_layers = args.num_layers // num_ranks_in_decoder
+        else:
+            assert args.num_layers % get_pipeline_model_parallel_world_size() == 0, \
+                'num_layers must be divisible by pipeline_model_parallel_size'
+            num_layers = args.num_layers // get_pipeline_model_parallel_world_size()
+    else:
+        num_layers = args.num_layers
+    return num_layers
+
+
 def is_pipeline_first_stage(ignore_virtual=False):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
@@ -288,6 +334,61 @@ def is_pipeline_last_stage(ignore_virtual=False):
             return False
     return get_pipeline_model_parallel_rank() == (
         get_pipeline_model_parallel_world_size() - 1)
+
+
+def is_rank_in_embedding_group(ignore_virtual=False):
+    """Return true if current rank is in embedding group, False otherwise."""
+    rank = torch.distributed.get_rank()
+    global _EMBEDDING_GLOBAL_RANKS
+    if ignore_virtual:
+        return rank in _EMBEDDING_GLOBAL_RANKS
+    if rank in _EMBEDDING_GLOBAL_RANKS:
+        if rank == _EMBEDDING_GLOBAL_RANKS[0]:
+            return is_pipeline_first_stage(ignore_virtual=False)
+        elif rank == _EMBEDDING_GLOBAL_RANKS[-1]:
+            return is_pipeline_last_stage(ignore_virtual=False)
+        else:
+            return True
+    return False
+
+
+def is_pipeline_stage_before_split(rank=None):
+    """Return True if pipeline stage executes encoder block for a model
+    with both encoder and decoder."""
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
+        return True
+    if rank < _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
+        return True
+    return False
+
+
+def is_pipeline_stage_after_split(rank=None):
+    """Return True if pipeline stage executes decoder block for a model
+    with both encoder and decoder."""
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
+        return True
+    if rank >= _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
+        return True
+    return False
+
+
+def is_pipeline_stage_at_split():
+    """Return true if pipeline stage executes decoder block and next
+    stage executes encoder block for a model with both encoder and
+    decoder."""
+    rank = get_pipeline_model_parallel_rank()
+    return is_pipeline_stage_before_split(rank) and \
+            is_pipeline_stage_after_split(rank+1)
 
 
 def get_virtual_pipeline_model_parallel_rank():

@@ -193,7 +193,8 @@ def _initialize_distributed():
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                           args.pipeline_model_parallel_size,
-                                          args.virtual_pipeline_model_parallel_size)
+                                          args.virtual_pipeline_model_parallel_size,
+                                          args.pipeline_model_parallel_split_rank)
 
 
 def _init_autoresume():

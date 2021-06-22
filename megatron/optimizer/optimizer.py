@@ -173,7 +173,7 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
             field instead of the typical `grad` field. This happens
-            for the DDP cases where there is a contihuous buffer
+            for the DDP cases where there is a continuous buffer
             holding the gradients. For example for bfloat16, we want
             to do gradient accumulation and all-reduces in float32
             and as a result we store those gradients in the main_grad.
@@ -305,7 +305,7 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         for model_group, main_group in zip(self.float16_groups,
                                            self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
-                if self.params_have_main_grad:
+                if self.params_have_main_grad and hasattr(model_param, 'main_grad'):
                     main_param.grad = model_param.main_grad.float()
                 else:
                     if model_param.grad is not None:

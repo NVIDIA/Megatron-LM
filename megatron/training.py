@@ -38,6 +38,7 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
+from megatron.model import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -61,6 +62,7 @@ def print_datetime(string):
 
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
+             model_type,
              forward_step_func,
              extra_args_provider=None,
              args_defaults={}):
@@ -77,6 +79,7 @@ def pretrain(train_valid_test_dataset_provider,
             train/valid/test dataset and returns `train, valid, test` datasets.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
+        model_type: an enum that specifies the type of model being trained.
         forward_step_func: a function that takes a `data iterator` and `model`,
             and returns a `loss` scalar with a dictionary with key:values being
             the info we would like to monitor during training, for example
@@ -109,7 +112,8 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup').start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider,
+                                                               model_type)
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
@@ -189,13 +193,16 @@ def update_train_iters(args):
     print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
 
-def get_model(model_provider_func):
+def get_model(model_provider_func, model_type):
     """Build the model."""
     args = get_args()
+    args.model_type = model_type
 
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and \
        args.virtual_pipeline_model_parallel_size is not None:
+        assert model_type != ModelType.encoder_and_decoder, \
+            "Interleaved schedule not supported for model with both encoder and decoder"
         model = []
         for i in range(args.virtual_pipeline_model_parallel_size):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
@@ -206,14 +213,36 @@ def get_model(model_provider_func):
                 pre_process=pre_process,
                 post_process=post_process
             )
+            this_model.model_type = model_type
             model.append(this_model)
     else:
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
-        model = model_provider_func(
-            pre_process=pre_process,
-            post_process=post_process
-        )
+        add_encoder = True
+        add_decoder = True
+        if model_type == ModelType.encoder_and_decoder:
+            if mpu.get_pipeline_model_parallel_world_size() > 1:
+                assert args.pipeline_model_parallel_split_rank is not None, \
+                    "Split rank needs to be specified for model with both encoder and decoder"
+                rank = mpu.get_pipeline_model_parallel_rank()
+                split_rank = args.pipeline_model_parallel_split_rank
+                world_size = mpu.get_pipeline_model_parallel_world_size()
+                pre_process = rank == 0 or rank == split_rank
+                post_process = (rank == (split_rank - 1)) or (
+                        rank == (world_size - 1))
+                add_encoder = mpu.is_pipeline_stage_before_split()
+                add_decoder = mpu.is_pipeline_stage_after_split()
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process,
+                add_encoder=add_encoder,
+                add_decoder=add_decoder)
+        else:
+            model = model_provider_func(
+                pre_process=pre_process,
+                post_process=post_process
+            )
+        model.model_type = model_type
 
     if not isinstance(model, list):
         model = [model]
@@ -304,11 +333,11 @@ def get_learning_rate_scheduler(optimizer):
     return lr_scheduler
 
 
-def setup_model_and_optimizer(model_provider_func):
+def setup_model_and_optimizer(model_provider_func, model_type):
     """Setup model and optimizer."""
     args = get_args()
 
-    model = get_model(model_provider_func)
+    model = get_model(model_provider_func, model_type)
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
@@ -374,13 +403,14 @@ def train_step(forward_step_func, data_iterator,
     # This should only run for models that support pipelined model parallelism
     # (BERT and GPT-2).
     timers('backward-embedding-all-reduce').start()
-    if (mpu.is_pipeline_first_stage(ignore_virtual=True) or
-        mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
+    if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
             mpu.get_pipeline_model_parallel_world_size() > 1:
         if mpu.is_pipeline_first_stage(ignore_virtual=True):
             unwrapped_model = model[0]
         elif mpu.is_pipeline_last_stage(ignore_virtual=True):
             unwrapped_model = model[-1]
+        else:  # We do not support the interleaved schedule for T5 yet.
+            unwrapped_model = model[0]
         unwrapped_model = unwrap_model(
             unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 

@@ -31,6 +31,10 @@ from .initialize import get_pipeline_model_parallel_group
 from .initialize import get_tensor_model_parallel_rank, set_tensor_model_parallel_rank
 from .initialize import get_pipeline_model_parallel_rank, set_pipeline_model_parallel_rank
 from .initialize import is_pipeline_first_stage, is_pipeline_last_stage
+from .initialize import is_rank_in_embedding_group
+from .initialize import is_pipeline_stage_before_split, is_pipeline_stage_after_split
+from .initialize import is_pipeline_stage_at_split
+from .initialize import get_num_layers
 from .initialize import get_tensor_model_parallel_src_rank
 from .initialize import get_pipeline_model_parallel_first_rank
 from .initialize import get_pipeline_model_parallel_last_rank
