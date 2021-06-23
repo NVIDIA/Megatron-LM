@@ -69,11 +69,11 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals
+        # We only set basic DDP globals    
         set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        set_tensor_model_parallel_rank(args.rank)
+        set_tensor_model_parallel_rank(args.rank)    
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -81,7 +81,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
         # Initialize memory buffers.
         _initialize_mem_buffs()
-
+        
         # Autoresume.
         _init_autoresume()
 
@@ -129,7 +129,7 @@ def _compile_dependencies():
             print('WARNING: constraints for invoking optimized'
                   ' fused softmax kernel are not met. We default'
                   ' back to unfused kernel invocations.', flush=True)
-
+    
     # Always build on rank zero first.
     if torch.distributed.get_rank() == 0:
         start_time = time.time()
