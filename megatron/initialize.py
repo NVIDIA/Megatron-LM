@@ -38,10 +38,10 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
-    `allow_no_cuda` should not be set unless using megatron for cpu only
-    data processing. In general this arg should not be set unless you know
+    `allow_no_cuda` should not be set unless using megatron for cpu only 
+    data processing. In general this arg should not be set unless you know 
     what you are doing.
-    Returns a function to finalize distributed env initialization
+    Returns a function to finalize distributed env initialization 
     (optionally, only when args.lazy_mpu_init == True)
     """
     if not allow_no_cuda:
@@ -59,7 +59,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed()
-
+        
         # Random seeds for reproducibility.
         if args.rank == 0:
             print('> setting random seeds to {} ...'.format(args.seed))
