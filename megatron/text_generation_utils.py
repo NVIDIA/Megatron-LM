@@ -387,6 +387,19 @@ def pad_batch(batch, pad_id, args):
         context_lengths.append(context_length)
     return batch, context_lengths
 
+def get_token_stream2(model, context_tokens_tensor, context_length_tensor):
+    context_length = context_length_tensor.min().item()
+    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
+
+    batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
+                                                 context_length_tensor,
+                                                 attention_mask, position_ids)
+    for tokens, lengths in batch_token_iterator:
+        context_length += 1
+        if tokens is not None:
+            yield tokens[:, :context_length], lengths
+        else:
+            yield None, None
 
 def get_token_stream(model, context_tokens):
 
@@ -406,18 +419,7 @@ def get_token_stream(model, context_tokens):
                                 mpu.get_tensor_model_parallel_src_rank(),
                                 group=mpu.get_tensor_model_parallel_group())
 
-    context_length = context_length_tensor.min().item()
-    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
-
-    batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
-                                                 context_length_tensor,
-                                                 attention_mask, position_ids)
-    for tokens, lengths in batch_token_iterator:
-        context_length += 1
-        if tokens is not None:
-            yield tokens[:, :context_length], lengths
-        else:
-            yield None, None
+    return get_token_stream2(model, context_tokens_tensor, context_length_tensor)
 
 
 def switch(val1, val2, boolean):
