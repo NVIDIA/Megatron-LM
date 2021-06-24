@@ -4,7 +4,7 @@ __pycache__
 build/
 dist/
 *.egg-info/
-tensorboard/
+tensorboard
 commands
 *.log
 logs
