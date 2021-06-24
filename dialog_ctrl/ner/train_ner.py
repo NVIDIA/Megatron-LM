@@ -7,7 +7,6 @@ from src.trainer import NERTrainer
 
 import torch
 import numpy as np
-from tqdm import tqdm
 import random
 
 def random_seed(seed):

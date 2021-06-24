@@ -23,6 +23,12 @@ def get_params():
     parser.add_argument("--data_folder", type=str, default="/gpfs/fs1/projects/gpu_adlr/datasets/zihanl/conll2003", help="NER data folder")
     parser.add_argument("--saved_folder", type=str, default="/gpfs/fs1/projects/gpu_adlr/datasets/zihanl/checkpoints/ner_model", help="NER data folder")
 
+    parser.add_argument("--default_folder", type=str, default="/gpfs/fs1/projects/gpu_adlr/datasets/zihanl")
+    parser.add_argument("--infer_datafolder", type=str, default="dialog_datasets/wizard_of_wikipedia/processed")
+    parser.add_argument("--infer_dataname", type=str, default="train.txt")
+    parser.add_argument("--output_dataname", type=str, default="train_entity_based_control.txt")
+    
+
     params = parser.parse_args()
 
     return params
