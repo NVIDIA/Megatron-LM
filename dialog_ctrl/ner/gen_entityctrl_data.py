@@ -18,8 +18,10 @@ punctuations = list(string.punctuation)
 punctuations.append("``")
 punctuations.append("''")
 
-stop_words_and_punctuations = stop_words + punctuations
-stop_words_and_punctuations_table = {word: True for word in stop_words_and_punctuations}
+stopwords_table = {word: True for word in stop_words}
+punctuations_table = {punc: True for punc in punctuations}
+# stop_words_and_punctuations = stop_words + punctuations
+# stop_words_and_punctuations_table = {word: True for word in stop_words_and_punctuations}
 
 label_set = ["O", "B", "I"]
 
@@ -99,9 +101,8 @@ def generate_entity_control_data(tokenizer, ner_model, input_data):
     # dialog context + entity control code (optional) + relevant control sentence (contain entity) + response
     
     output_data = []
-    ## TODO
     n_skip, n_skip_no_overlap, n_skip_one_contain_another = 0, 0, 0
-    n_control, n_entity_control, n_overlap_control = 0, 0, 0
+    n_control, n_entity_control, n_overlap_control, n_control_without_code = 0, 0, 0, 0
     total_num_control_code = 0
     for sample_idx, data_item in enumerate(tqdm(input_data)):
         # # Debug only
@@ -137,7 +138,6 @@ def generate_entity_control_data(tokenizer, ner_model, input_data):
 
         # TODO
         # In general, need to trim the control sentence when it is too long.
-        # Need to lowercase to match?
 
         # calculate common entity between control sentence and response
         common_entity_list = []
@@ -154,19 +154,30 @@ def generate_entity_control_data(tokenizer, ner_model, input_data):
             # calculate overlap between control sentence and response
             control_word_list = control_sent.split()
             response_word_list = response.split()
-            response_word_table = {wn_lemma.lemmatize(word): True for word in response_word_list}
+            # response_word_table = {wn_lemma.lemmatize(word): True for word in response_word_list}
+            response_word_table = {}
+            for word in response_word_list:
+                response_word_table[wn_lemma.lemmatize(word)] = True
+                if "/" in word and len(word) > 0:
+                    tokens = word.split("/")
+                    for tok in tokens:
+                        if len(tok) > 0:
+                            response_word_table[wn_lemma.lemmatize(tok)] = True
+
             overlap_phrases = []
             temp = []
             for word in control_word_list:
-                if word.lower() in stop_words_and_punctuations_table:
+                if word in punctuations_table:
+                    continue
+                if word.lower() in stopwords_table and len(temp) == 0:
                     continue
                 
                 if wn_lemma.lemmatize(word) in response_word_table:
                     temp.append(word)
                 else:
                     if len(temp) > 0:
-                        if len(temp) > 4:
-                            temp = temp[:4]
+                        if len(temp) > 5:
+                            temp = temp[:5]
                         overlap_phrases.append(" ".join(temp))
                         temp = []
 
@@ -182,7 +193,7 @@ def generate_entity_control_data(tokenizer, ner_model, input_data):
             if len(control_sent_entities) > 0:
                 n_entity_control += 1
                 # reorder control_sent_entities based on the length of the entities (in a reverse order)
-                control_sent_entities = sorted(control_sent_entities, key=len, reverse=True)
+                control_sent_entities = sorted(control_sent_entities, key=len, reverse=True)[:3]
                 for entity in control_sent_entities:
                     if entity not in last_turn:
                         add_flag = True
@@ -228,13 +239,14 @@ def generate_entity_control_data(tokenizer, ner_model, input_data):
         if len(control_code_list) > 0:
             output_data.append(splits[0] + "\t" + " [CTRL] ".join(control_code_list) + "\t" + control_sent + "\t" + response)
         else:
+            n_control_without_code += 1
             output_data.append(splits[0] + "\t" + control_sent + "\t" + response)
 
     avg_num_control_code = total_num_control_code * 1.0 / n_control
 
     print("number of skip sentences: %d (one contain another: %d + no overlap: %d)" % (n_skip, n_skip_one_contain_another, n_skip_no_overlap))
     print("Total data size: %d. Number of control case: %d (entity control: %d + overlap control: %d)" % (len(output_data), n_control, n_entity_control, n_overlap_control))
-    print("Number of control code: %d vs. number of control case: %d (averaged control code per case: %.4f)" % (total_num_control_code, n_control, avg_num_control_code))
+    print("Number of control code: %d; number of control case: %d; number of control case without control code: %d (averaged control code per case: %.4f)" % (total_num_control_code, n_control, n_control_without_code, avg_num_control_code))
 
     return output_data
 

@@ -8,3 +8,4 @@ tensorboard
 commands
 *.log
 logs
+*.so
