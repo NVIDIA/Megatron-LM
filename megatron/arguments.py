@@ -752,3 +752,20 @@ def _add_vit_args(parser):
                        help='patch dimension used in vit')
 
     return parser
+
+
+def _add_dialog_ctrl_args(parser):
+    group = parser.add_argument_group(title="dialog control")
+
+    group.add_argument('--train-module', type=str, default="",
+                       help='either control module or dialogue model (control or dialog)')
+    group.add_argument('--data-folder', type=str, default="",
+                       help='data folder (path of the data folder)')
+    group.add_argument('--dataset-name', type=str, default="",
+                       help='dataset name (e.g., wizard_of_wikipedia)')
+    group.add_argument('--max-seq-len', type=int, default=1024,
+                       help='maximum sequence length')
+    group.add_argument('--spec_toks', type=str, default="[SEP],[CTRL],[PAD]",
+                       help='additional special tokens')
+
+    return parser

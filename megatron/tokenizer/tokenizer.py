@@ -40,7 +40,7 @@ def build_tokenizer(args):
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=args.spec_toks)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -260,13 +260,25 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""
 
-    def __init__(self, vocab_file, merge_file):
+    def __init__(self, vocab_file, merge_file, special_tokens=None):
         name = 'GPT2 BPE'
         super().__init__(name)
 
+        if special_tokens is not None:
+            # for controllable dialog, special_tokens: "[SEP],[CTRL],[PAD]"
+            special_tokens = special_tokens.split(",")
+        else:
+            special_tokens = []
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
-                                       special_tokens=[], max_len=None)
+                                       special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+        if len(special_tokens) > 0:
+            if "[PAD]" in special_tokens:
+                self.pad_id = self.tokenizer.encoder['[PAD]']
+            if "[SEP]" in special_tokens:
+                self.sep_id = self.tokenizer.encoder['[SEP]']
+            if "[CTRL]" in special_tokens:
+                self.ctrl_id = self.tokenizer.encoder['[CTRL]']
 
     @property
     def vocab_size(self):
