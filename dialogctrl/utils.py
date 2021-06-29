@@ -16,20 +16,20 @@ def get_ltor_attention_masks_and_position_ids(data, eod_token_id):
 
     # reset attentino mask and position ids
     # Loop through the batches:
-    for b in range(micro_batch_size):
-        # Find indecies where EOD token is.
-        eod_index = position_ids[b, data[b] == eod_token_id]
-        eod_index = eod_index.clone()
+    # for b in range(micro_batch_size):
+    #     # Find indecies where EOD token is.
+    #     eod_index = position_ids[b, data[b] == eod_token_id]
+    #     eod_index = eod_index.clone()
 
-        # Loop through EOD indecies:
-        prev_index = 0
-        for j in range(eod_index.size()[0]):
-            i = eod_index[j]
-            # Mask attention loss.
-            attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
-            # Reset positions.
-            position_ids[b, (i + 1):] -= (i + 1 - prev_index)
-            prev_index = i + 1
+    #     # Loop through EOD indecies:
+    #     prev_index = 0
+    #     for j in range(eod_index.size()[0]):
+    #         i = eod_index[j]
+    #         # Mask attention loss.
+    #         attention_mask[b, 0, (i + 1):, :(i + 1)] = 0
+    #         # Reset positions.
+    #         position_ids[b, (i + 1):] -= (i + 1 - prev_index)
+    #         prev_index = i + 1
     
     # Convert attention mask to binary:
     attention_mask = (attention_mask < 0.5)

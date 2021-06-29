@@ -41,6 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_dialog_ctrl_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -757,6 +758,8 @@ def _add_vit_args(parser):
 def _add_dialog_ctrl_args(parser):
     group = parser.add_argument_group(title="dialog control")
 
+    group.add_argument('--run-dialog', action='store_true',
+                       help='run dialog modeling')
     group.add_argument('--train-module', type=str, default="",
                        help='either control module or dialogue model (control or dialog)')
     group.add_argument('--data-folder', type=str, default="",
@@ -765,7 +768,7 @@ def _add_dialog_ctrl_args(parser):
                        help='dataset name (e.g., wizard_of_wikipedia)')
     group.add_argument('--max-seq-len', type=int, default=1024,
                        help='maximum sequence length')
-    group.add_argument('--spec_toks', type=str, default="[SEP],[CTRL],[PAD]",
+    group.add_argument('--spec-toks', type=str, default="[SEP],[CTRL],[PAD]",
                        help='additional special tokens')
 
     return parser

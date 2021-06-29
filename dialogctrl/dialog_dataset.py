@@ -6,6 +6,7 @@ import torch
 import numpy as np
 
 from megatron import get_tokenizer
+from megatron import print_rank_0
 
 def read_data(tokenizer, data_path, train_module):
     """read and tokenize dialog data"""
@@ -24,10 +25,17 @@ def read_data(tokenizer, data_path, train_module):
                 # only take the last three turns in the dialog context
                 turns = dialog_context.split(" [SEP] ")
                 turns = turns[-3:]
-                context = " [SEP] ".join(turns)
 
-                input_ids = tokenizer.tokenize(context)
+                # input_ids
+                for idx, turn in enumerate(turns):
+                    if idx == 0:
+                        input_ids = tokenizer.tokenize(turn)
+                    else:
+                        input_ids.extend([tokenizer.sep_id] + tokenizer.tokenize(turn))
+                
+                # output_ids
                 output_ids = tokenizer.tokenize(response)
+
                 data_list.append({"input_ids": input_ids, "output_ids": output_ids})
 
             elif train_module == "control":
@@ -40,14 +48,19 @@ def read_data(tokenizer, data_path, train_module):
                 turns = dialog_context.split(" [SEP] ")
                 last_turn = turns[-1]
                 
+                # input_ids
                 if ctrl_code:
-                    inputs = last_turn + " [CTRL] " + ctrl_code
+                    input_ids = tokenizer.tokenize(last_turn)
+                    ctrl_code_list = ctrl_code.split(" [CTRL] ")
+                    for code in ctrl_code_list:
+                        input_ids.extend([tokenizer.ctrl_id] + tokenizer.tokenize(code))
                 else:
-                    inputs = last_turn
-                outputs = ctrl_sent
+                    input_ids = tokenizer.tokenize(last_turn)
 
-                input_ids = tokenizer.tokenize(inputs)
+                # output_ids
+                outputs = ctrl_sent
                 output_ids = tokenizer.tokenize(outputs)
+
                 data_list.append({"input_ids": input_ids, "output_ids": output_ids})
 
             else:
@@ -68,7 +81,7 @@ class ControlDialogDataset(torch.utils.data.Dataset):
     def __init__(self, data, max_seq_len, pad_id, eod_id):
         # need to deal with padding, label masking
         self.data = data
-        self.max_seq_len
+        self.max_seq_len = max_seq_len
         self.pad_id = pad_id
         self.eod_id = eod_id
 
@@ -79,7 +92,7 @@ class ControlDialogDataset(torch.utils.data.Dataset):
         data_dict = self.data[idx]
         input_ids, output_ids = data_dict["input_ids"], data_dict["output_ids"]
         
-        assert len(input_ids) < self.max_seq_len, "Set a larger max_seq_len!"
+        assert len(input_ids) < self.max_seq_len, "Set a larger max-seq-len!"
 
         # length_of_loss_mask == length_of_text - 1
         text = input_ids + [self.pad_id] + output_ids + [self.eod_id]
@@ -118,4 +131,4 @@ def build_train_valid_test_datasets(data_folder, dataset_name, train_module, max
     valid_dataset = ControlDialogDataset(valid_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
     test_dataset = ControlDialogDataset(test_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
 
-    return (train_dataset, valid_dataset, test_dataset)
+    return train_dataset, valid_dataset, test_dataset

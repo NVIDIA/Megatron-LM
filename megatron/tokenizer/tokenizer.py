@@ -272,13 +272,14 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
                                        special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+
         if len(special_tokens) > 0:
-            if "[PAD]" in special_tokens:
-                self.pad_id = self.tokenizer.encoder['[PAD]']
             if "[SEP]" in special_tokens:
-                self.sep_id = self.tokenizer.encoder['[SEP]']
+                self.sep_id = self.tokenizer.special_tokens['[SEP]']
             if "[CTRL]" in special_tokens:
-                self.ctrl_id = self.tokenizer.encoder['[CTRL]']
+                self.ctrl_id = self.tokenizer.special_tokens['[CTRL]']
+            if "[PAD]" in special_tokens:
+                self.pad_id = self.tokenizer.special_tokens['[PAD]']
 
     @property
     def vocab_size(self):

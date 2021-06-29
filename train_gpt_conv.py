@@ -9,11 +9,11 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import mpu
 # from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from dialog_ctrl.dialog_dataset import build_train_valid_test_datasets
+from dialogctrl.dialog_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel
 from megatron.training import pretrain
 # from megatron.utils import get_ltor_masks_and_position_ids
-from dialog_ctrl.utils import get_ltor_attention_masks_and_position_ids
+from dialogctrl.utils import get_ltor_attention_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 
 def model_provider(pre_process=True, post_process=True):
@@ -52,7 +52,7 @@ def get_batch(data_iterator):
     loss_mask = data_b['loss_mask'].float()
 
     # Get the attention_mask and postition ids.
-    attention_masks, position_ids = get_ltor_attention_masks_and_position_ids(tokens, tokenizer.eod_id)
+    attention_mask, position_ids = get_ltor_attention_masks_and_position_ids(tokens, tokenizer.eod_id)
     
     return tokens, labels, loss_mask, attention_mask, position_ids
 
@@ -86,7 +86,7 @@ def forward_step(data_iterator, model):
 
 
 def train_valid_test_datasets_provider():
-    """Build train, valid, and test datasets for control module"""
+    """Build train, valid, and test datasets for dialog/control module"""
     args = get_args()
 
     print_rank_0('> building train, validation, and test datasets for %s module ...' % args.train_module)
@@ -98,6 +98,8 @@ def train_valid_test_datasets_provider():
         max_seq_len=args.max_seq_len,
         seed=args.seed)
     print_rank_0("> finished creating datasets for %s module ..." % args.train_module)
+
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":

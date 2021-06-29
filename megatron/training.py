@@ -53,7 +53,6 @@ from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory
 
 
-
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
     torch.distributed.barrier()
@@ -325,6 +324,8 @@ def setup_model_and_optimizer(model_provider_func):
         torch.distributed.barrier()
         timers('load-checkpoint').start()
         args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        # need to set train_samples to None
+        args.train_samples = None
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
@@ -792,28 +793,50 @@ def build_train_valid_test_data_iterators(
         args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
             args.eval_iters * args.global_batch_size
 
+    if args.run_dialog:
+        args.consumed_train_samples = 0
+        args.consumed_valid_samples = 0
+        args.iteration = 0
+
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:
+        
+        if args.run_dialog:
+            # Build the datasets.
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider()
 
-        # Number of train/valid/test samples.
-        if args.train_samples:
-            train_samples = args.train_samples
+            print_rank_0(' > datasets target sizes:')
+            train_size = len(train_ds)
+            valid_size = len(valid_ds)
+            test_size = len(test_ds)
+            print_rank_0('    train:      {}'.format(train_size))
+            print_rank_0('    validation: {}'.format(valid_size))
+            print_rank_0('    test:       {}'.format(test_size))
+
+            args.train_iters = train_size // args.global_batch_size
+            args.eval_iters = valid_size // args.global_batch_size
+            args.test_iters = test_size // args.global_batch_size
+
         else:
-            train_samples = args.train_iters * args.global_batch_size
-        eval_iters = (args.train_iters // args.eval_interval + 1) * \
-                     args.eval_iters
-        test_iters = args.eval_iters
-        train_val_test_num_samples = [train_samples,
-                                      eval_iters * args.global_batch_size,
-                                      test_iters * args.global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+            # Number of train/valid/test samples.
+            if args.train_samples:
+                train_samples = args.train_samples
+            else:
+                train_samples = args.train_iters * args.global_batch_size
+            eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                        args.eval_iters
+            test_iters = args.eval_iters
+            train_val_test_num_samples = [train_samples,
+                                        eval_iters * args.global_batch_size,
+                                        test_iters * args.global_batch_size]
+            print_rank_0(' > datasets target sizes (minimum size):')
+            print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+            print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+            print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
 
-        # Build the datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
-            train_val_test_num_samples)
+            # Build the datasets.
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
+                train_val_test_num_samples)
 
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
