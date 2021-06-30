@@ -80,27 +80,56 @@ def ensure_directory_exists(filename):
         os.makedirs(dirname)
 
 
-def get_checkpoint_name(checkpoints_path, iteration,
-                        release=False):
+def get_checkpoint_name(checkpoints_path, iteration, release=False,
+                        pipeline_parallel_size=None, tensor_rank=None, pipeline_rank=None):
     """A unified checkpoint name."""
     if release:
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
     # Use both the tensor and pipeline MP rank.
-    if mpu.get_pipeline_model_parallel_world_size() == 1:
+    if pipeline_parallel_size is None:
+        parallel_size = mpu.get_pipeline_model_parallel_world_size()
+    if tensor_rank is None:
+        tensor_rank = mpu.get_tensor_model_parallel_rank()
+    if pipeline_rank is None:
+        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+    if pipeline_parallel_size == 1:
         return os.path.join(checkpoints_path, directory,
-                            'mp_rank_{:02d}'.format(
-                                mpu.get_tensor_model_parallel_rank()),
+                            f'mp_rank_{tensor_rank:02d}',
                             'model_optim_rng.pt')
     return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}_{:03d}'.format(
-                            mpu.get_tensor_model_parallel_rank(),
-                            mpu.get_pipeline_model_parallel_rank()),
+                        f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}',
                         'model_optim_rng.pt')
 
+def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
+    """Finds the checkpoint for rank 0 without knowing if we are using
+    pipeline parallelism or not.
+
+    Since the checkpoint naming scheme changes if pipeline parallelism
+    is present, we need to look for both naming schemes if we don't
+    know if the checkpoint has pipeline parallelism.
+
+    """
+
+    # Look for checkpoint with no pipelining
+    filename = get_checkpoint_name(checkpoints_path, iteration, release,
+                                   pipeline_parallel_size=1,
+                                   tensor_rank=0, pipeline_rank=0)
+    if os.path.isfile(filename):
+        return filename
+
+    # Look for checkpoint with pipelining
+    filename = get_checkpoint_name(checkpoints_path, iteration, release,
+                                   pipeline_parallel_size=2,
+                                   tensor_rank=0, pipeline_rank=0)
+    if os.path.isfile(filename):
+        return filename
+
+    return None
 
 def get_checkpoint_tracker_filename(checkpoints_path):
+
     """Tracker file rescords the latest chckpoint during
     training to restart from."""
     return os.path.join(checkpoints_path, 'latest_checkpointed_iteration.txt')
@@ -125,18 +154,24 @@ def read_metadata(tracker_filename):
         tracker_filename)
 
     # Get the max iteration retrieved across the ranks.
-    iters_cuda = torch.cuda.LongTensor([iteration])
-    torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
-    max_iter = iters_cuda[0].item()
+    if torch.distributed.is_initialized():
+        iters_cuda = torch.cuda.LongTensor([iteration])
+        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
+        max_iter = iters_cuda[0].item()
 
-    # We should now have all the same iteration.
-    # If not, print a warning and chose the maximum
-    # iteration across all ranks.
-    if iteration != max_iter:
-        print('WARNING: on rank {} found iteration {} in the '
-              'metadata while max iteration across the ranks '
-              'is {}, replacing it with max iteration.'.format(
-                  rank, iteration, max_iter), flush=True)
+        # We should now have all the same iteration.
+        # If not, print a warning and chose the maximum
+        # iteration across all ranks.
+        if iteration != max_iter:
+            print('WARNING: on rank {} found iteration {} in the '
+                  'metadata while max iteration across the ranks '
+                  'is {}, replacing it with max iteration.'.format(
+                      rank, iteration, max_iter), flush=True)
+    else:
+        # When loading a checkpoint outside of training (for example,
+        # when editing it), we might not have torch distributed
+        # initialized, in this case, just assume we have the latest
+        max_iter = iteration
     return max_iter, release
 
 
@@ -270,35 +305,38 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
-    """Load a model checkpoint and return the iteration.
-    strict (bool): whether to strictly enforce that the keys in
-        :attr:`state_dict` of the checkpoint match the names of
-        parameters and buffers in model.
-    """
-    args = get_args()
-    load_dir = getattr(args, load_arg)
+def _load_base_checkpoint(load_dir, rank0=False):
+    """ Load the base state_dict from the given directory
 
-    model = utils.unwrap_model(model)
+    If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
+    """
+
 
     # Read the tracker file and set the iteration.
     tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
-    # If no tracker file, return iretation zero.
+    # If no tracker file, return nothing
     if not os.path.isfile(tracker_filename):
-        print_rank_0('WARNING: could not find the metadata file {} '.format(
-            tracker_filename))
-        print_rank_0('    will not load any checkpoints and will start from '
-                     'random')
-        return 0
+        if not rank0:
+            print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+            print_rank_0('    will not load any checkpoints and will start from '
+                         'random')
+        return None, False
 
     # Otherwise, read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
     iteration, release = read_metadata(tracker_filename)
 
     # Checkpoint.
-    checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-    print_rank_0(f' loading checkpoint from {args.load} at iteration {iteration}')
+    if rank0:
+        checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+    else:
+        checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+        if release:
+            print_rank_0(f' loading release checkpoint from {load_dir}')
+        else:
+            print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
@@ -306,7 +344,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     except ModuleNotFoundError:
         from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
-        print_rank_0(' > deserializing using the old code structure ...')
+        if not rank0:
+            print_rank_0(' > deserializing using the old code structure ...')
         sys.modules['fp16.loss_scaler'] = sys.modules[
             'megatron.fp16_deprecated.loss_scaler']
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
@@ -318,6 +357,79 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         print_rank_0('could not load the checkpoint')
         print_rank_0(e)
         sys.exit()
+
+    return state_dict, release
+
+def load_args_from_checkpoint(args, load_arg='load'):
+    """Set any arguments that are not currently set from the checkpoint
+    specified in the arguments.
+
+    Returns the same args NameSpace with the new values added/updated.
+
+    If no checkpoint is specified in args, or if the checkpoint is
+    there but invalid, the arguments will not be modified
+
+    """
+    load_dir = getattr(args, load_arg)
+
+    if load_dir is None:
+        return args
+
+    state_dict, release = _load_base_checkpoint(load_dir, True)
+
+    if not state_dict:
+        return args
+
+    if 'args' not in state_dict:
+        return args
+
+    checkpoint_args = state_dict['args']
+    checkpoint_version = state_dict.get('checkpoint_version', 0)
+    args.iteration = state_dict['iteration']
+
+    def _set_arg(arg_name, old_arg_name=None, force=False):
+        if not force and getattr(args, arg_name, None) is not None:
+            return
+
+        if old_arg_name is not None:
+            checkpoint_value = getattr(checkpoint_args, old_arg_name, None)
+        else:
+            checkpoint_value = getattr(checkpoint_args, arg_name, None)
+
+        if checkpoint_value is not None:
+            print(f"Setting {arg_name} to {checkpoint_value}")
+            setattr(args, arg_name, checkpoint_value)
+
+    _set_arg('num_layers')
+    _set_arg('hidden_size')
+    _set_arg('ffn_hidden_size')
+    _set_arg('seq_length')
+    _set_arg('num_attention_heads')
+    _set_arg('kv_channels')
+    _set_arg('max_position_embeddings')
+    _set_arg('tokenizer_type')
+    _set_arg('padded_vocab_size')
+    if checkpoint_version < 3.0:
+        _set_arg('tensor_model_parallel_size',
+                 'model_parallel_size')
+    else:
+        _set_arg('tensor_model_parallel_size', force=True)
+        _set_arg('pipeline_model_parallel_size', force=True)
+        _set_arg('num_layers_per_virtual_pipeline_stage')
+    return args
+
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
+    """Load a model checkpoint and return the iteration.
+    strict (bool): whether to strictly enforce that the keys in
+        :attr:`state_dict` of the checkpoint match the names of
+        parameters and buffers in model.
+    """
+    args = get_args()
+    load_dir = getattr(args, load_arg)
+
+    model = utils.unwrap_model(model)
+
+    state_dict, release = _load_base_checkpoint(load_dir, False)
 
     # set checkpoint version
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -410,7 +522,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
 def load_biencoder_checkpoint(model, only_query_model=False,
         only_context_model=False, custom_load_path=None):
     """
-    selectively load retrieval models for indexing/retrieving 
+    selectively load retrieval models for indexing/retrieving
     from saved checkpoints
     """
 
@@ -445,4 +557,3 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model
-

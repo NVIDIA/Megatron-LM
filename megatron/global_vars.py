@@ -77,11 +77,15 @@ def get_timers():
 
 
 def set_global_variables(extra_args_provider=None, args_defaults={},
-                         ignore_unknown_args=False):
+                         ignore_unknown_args=False, parse_args=True):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
-    args = _parse_args(extra_args_provider=extra_args_provider,
-                       defaults=args_defaults,
-                       ignore_unknown_args=ignore_unknown_args)
+    if parse_args:
+        args = _parse_args(extra_args_provider=extra_args_provider,
+                           defaults=args_defaults,
+                           ignore_unknown_args=ignore_unknown_args)
+    else:
+        _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
+        args = get_args()
     _build_num_microbatches_calculator(args)
     if args.vocab_file:
         _ = _build_tokenizer(args)
@@ -89,6 +93,9 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
     _set_adlr_autoresume(args)
     _set_timers()
 
+def set_args(args):
+    global _GLOBAL_ARGS
+    _GLOBAL_ARGS = args
 
 def _parse_args(extra_args_provider=None, defaults={},
                 ignore_unknown_args=False):
@@ -97,7 +104,8 @@ def _parse_args(extra_args_provider=None, defaults={},
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
                               defaults=defaults,
-                              ignore_unknown_args=ignore_unknown_args)
+                              ignore_unknown_args=ignore_unknown_args,
+                              validate=True)
     return _GLOBAL_ARGS
 
 

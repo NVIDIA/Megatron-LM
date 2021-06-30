@@ -21,7 +21,7 @@ import os
 import torch
 
 def parse_args(extra_args_provider=None, defaults={},
-               ignore_unknown_args=False):
+               ignore_unknown_args=False, validate=True):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -52,6 +52,11 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    if validate:
+        return validate_args(args, defaults)
+    return args
+
+def validate_args(args, defaults={}):
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
@@ -547,6 +552,11 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--no-initialization', action='store_false',
+                       help='Do not perform initialization when building model, '
+                       'can reduce startup time when definitely loading from a '
+                       'checkpoint',
+                       dest='perform_initialization')
 
     return parser
 
