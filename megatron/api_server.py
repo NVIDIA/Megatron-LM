@@ -19,21 +19,9 @@ from flask_restful import Resource, Api
 from megatron import get_args
 from megatron import get_tokenizer
 from megatron import mpu
-from megatron.text_generation_utils import pad_batch
-from megatron.text_generation_utils import get_token_stream2
+from megatron.text_generation_utils import tokenize_batch, get_token_stream
 
 GENERATE_NUM = 0
-
-def tokenize_batch(sentences):
-    args = get_args()
-    tokenizer = get_tokenizer()
-    context_tokens = [tokenizer.tokenize(s) for s in sentences]
-    context_tokens, context_lengths = pad_batch(context_tokens,
-                                                tokenizer.eod, args)
-    context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
-    context_length_tensor = torch.cuda.LongTensor(context_lengths)
-    return context_tokens_tensor, context_length_tensor 
-
 
 class MegatronGenerate(Resource):
     def __init__(self, model):
@@ -82,7 +70,7 @@ class MegatronGenerate(Resource):
     
     @staticmethod
     def do_generate(model, context_length_tensor, context_tokens_tensor, max_len):
-        token_stream = get_token_stream2(model, context_tokens_tensor, context_length_tensor)
+        token_stream = get_token_stream(model, context_tokens_tensor, context_length_tensor)
         for i, decode_tokens in enumerate(token_stream):
             if i == max_len-1:
                 break

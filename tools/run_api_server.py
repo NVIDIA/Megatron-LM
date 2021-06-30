@@ -27,15 +27,12 @@ from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
-from megatron.text_generation_utils import generate_samples_interactive
-from megatron.api_server import MegatronServer
-from megatron.api_server import MegatronGenerate
+from megatron.api_server import MegatronServer, MegatronGenerate
 import torch
 
 def do_generate(model):
     context_length_tensor, context_tokens_tensor, max_len = MegatronGenerate.receive_generate_info()
     MegatronGenerate.do_generate(model, context_length_tensor, context_tokens_tensor, max_len) 
-
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -46,7 +43,6 @@ def model_provider(pre_process=True, post_process=True):
     return model
 
 def add_text_generate_args(parser):
-    """Text generation arguments."""
     group = parser.add_argument_group(title='text generation')
 
     group.add_argument("--temperature", type=float, default=1.0,
@@ -59,16 +55,6 @@ def add_text_generate_args(parser):
                        help='Top k sampling.')
     group.add_argument("--out-seq-length", type=int, default=1024,
                        help='Size of the output generated text.')
-    group.add_argument("--sample-input-file", type=str, default=None,
-                       help='Get input from file instead of interactive mode, '
-                       'each line is an input.')
-    group.add_argument("--sample-output-file", type=str, default=None,
-                       help='Output file got from --sample-input-file')
-    group.add_argument("--num-samples", type=int, default=0,
-                       help='Number of samples to generate unconditionally, '
-                       'defaults to 0 and interactive conditional sampling')
-    group.add_argument("--genfile", type=str,
-                       help='Output file when generating unconditionally')
     group.add_argument("--recompute", action='store_true',
                        help='During generation recompute all attention '
                        'instead of using previously computed keys/values.')
@@ -103,6 +89,5 @@ if __name__ == "__main__":
         torch.distributed.broadcast(choice,
                                     mpu.get_tensor_model_parallel_src_rank(),
                                     group=mpu.get_tensor_model_parallel_group())
-        print("got: "+str(choice[0].item()))
         if choice[0].item() == 0:
             do_generate(model)

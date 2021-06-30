@@ -25,8 +25,5 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS tools/run_api_server.py \
        --temperature 1.0 \
        --vocab-file $VOCAB_FILE \
        --merge-file $MERGE_FILE \
-       --genfile unconditional_samples.json \
-       --num-samples 1 \
        --top_p 0.9 \
-	   --seed 42 \
-	   --recompute
+	   --seed 42
