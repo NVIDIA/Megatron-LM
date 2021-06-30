@@ -55,10 +55,6 @@ def add_text_generate_args(parser):
                        help='Top k sampling.')
     group.add_argument("--out-seq-length", type=int, default=1024,
                        help='Size of the output generated text.')
-    group.add_argument("--recompute", action='store_true',
-                       help='During generation recompute all attention '
-                       'instead of using previously computed keys/values.')
-
     return parser
 
 

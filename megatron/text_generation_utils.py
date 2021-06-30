@@ -189,40 +189,30 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
 
         while context_length <= (maxlen):
-            if args.recompute:
-                output = forward_step(model, tokens,
-                                      position_ids,
-                                      attention_mask,
-                                      tokentype_ids=type_ids,
-                                      forward_method_parallel_output=False)
-                if mpu.is_pipeline_last_stage():
-                    assert output is not None
-                    logits = output[:, context_length - 1, :]
+            types2use = None
+            if counter == 0:
+                tokens2use = tokens[:, :context_length]
+                positions2use = position_ids[:, :context_length]
+                if type_ids is not None:
+                    types2use = type_ids[:, :context_length]
             else:
-                types2use = None
-                if counter == 0:
-                    tokens2use = tokens[:, :context_length]
-                    positions2use = position_ids[:, :context_length]
-                    if type_ids is not None:
-                        types2use = type_ids[:, :context_length]
-                else:
-                    tokens2use = tokens[:, context_length - 1].view(
+                tokens2use = tokens[:, context_length - 1].view(
+                    batch_size, -1)
+                positions2use = position_ids[:, context_length - 1].view(
+                    batch_size, -1)
+                if type_ids is not None:
+                    types2use = type_ids[:, context_length - 1].view(
                         batch_size, -1)
-                    positions2use = position_ids[:, context_length - 1].view(
-                        batch_size, -1)
-                    if type_ids is not None:
-                        types2use = type_ids[:, context_length - 1].view(
-                            batch_size, -1)
-                output, layer_past = forward_step(model, tokens2use,
-                                                  positions2use,
-                                                  attention_mask,
-                                                  layer_past=layer_past,
-                                                  get_key_value=True,
-                                                  tokentype_ids=types2use,
-                                                  forward_method_parallel_output=False)
-                if mpu.is_pipeline_last_stage():
-                    assert output is not None
-                    logits = output[:, -1].view(batch_size, -1).contiguous()
+            output, layer_past = forward_step(model, tokens2use,
+                                              positions2use,
+                                              attention_mask,
+                                              layer_past=layer_past,
+                                              get_key_value=True,
+                                              tokentype_ids=types2use,
+                                              forward_method_parallel_output=False)
+            if mpu.is_pipeline_last_stage():
+                assert output is not None
+                logits = output[:, -1].view(batch_size, -1).contiguous()
 
             if mpu.is_pipeline_last_stage():
                 if args.greedy:
