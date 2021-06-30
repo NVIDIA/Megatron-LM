@@ -40,7 +40,8 @@ def get_batch(context_tokens):
     tokenizer = get_tokenizer()
 
     # Move to GPU.
-    tokens = context_tokens.view(args.micro_batch_size, -1).contiguous().cuda()
+    tokens = context_tokens.contiguous().cuda()
+    
     # Get the attention mask and postition ids.
     attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
@@ -464,7 +465,6 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
                           maxlen=None, type_ids=None):
-
     args = get_args()
     tokenizer = get_tokenizer()
 
