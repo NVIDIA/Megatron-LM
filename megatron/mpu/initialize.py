@@ -232,6 +232,11 @@ def get_tensor_model_parallel_world_size():
     return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
 
 
+def get_model_parallel_world_size():
+    assert get_pipeline_model_parallel_world_size() == 1, "legacy get_model_parallel_world_size is only supported if PP is disabled"
+    return get_tensor_model_parallel_world_size()
+
+
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
@@ -258,6 +263,11 @@ def get_tensor_model_parallel_rank():
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+
+
+def get_model_parallel_rank():
+    assert get_pipeline_model_parallel_world_size() == 1, "legacy get_model_parallel_rank is only supported if PP is disabled"
+    return get_tensor_model_parallel_rank()
 
 
 def get_pipeline_model_parallel_rank():

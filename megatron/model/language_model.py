@@ -255,6 +255,40 @@ class Embedding(MegatronModule):
                       'checkpoint but could not find it', flush=True)
 
 
+class EmbeddingPipe(Embedding):
+
+    def forward(self, inputs, **kwargs):
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        input_ids = inputs[0]
+        position_ids = inputs[1]
+        if hasattr(self._args, 'attn_mask'):
+            attention_mask = None
+        else:
+            attention_mask = inputs[2]
+
+        if len(inputs) == 4:
+            tokentype_ids = inputs[3]
+        else:
+            tokentype_ids = None
+        
+        embeddings = super().forward(input_ids, position_ids, tokentype_ids=tokentype_ids)
+
+        # If cmd args has attn_mask, we don't forward it as an activation.
+        if hasattr(self._args, 'attn_mask'):
+            return embeddings
+        else:
+            assert False
+            return embeddings, attention_mask
+
+
+    @property
+    def word_embeddings_weight(self):
+        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
+        return self.word_embeddings.weight
+
+
 class TransformerLanguageModel(MegatronModule):
     """Transformer language model.
 

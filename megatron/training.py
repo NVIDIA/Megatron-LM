@@ -50,8 +50,9 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
-from megatron.utils import report_memory
+from megatron.utils import report_memory, flops_calculator
 
+import deepspeed
 
 
 def print_datetime(string):
@@ -217,6 +218,7 @@ def get_model(model_provider_func):
             post_process=post_process
         )
 
+
     if not isinstance(model, list):
         model = [model]
 
@@ -234,8 +236,11 @@ def get_model(model_provider_func):
               'model parallel rank ({}, {}): {}'.format(
             mpu.get_tensor_model_parallel_rank(),
             mpu.get_pipeline_model_parallel_rank(),
-            sum([sum([p.nelement() for p in model_module.parameters()])
+            sum([sum([p.ds_numel if hasattr(p,'ds_id') else p.nelement() for p in model_module.parameters()])
                  for model_module in model])), flush=True)
+
+    if args.deepspeed:
+        return model
 
     # GPU allocation.
     for model_module in model:
@@ -314,9 +319,29 @@ def setup_model_and_optimizer(model_provider_func):
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
+
     optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
+
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+        pp = mpu.get_pipeline_model_parallel_world_size()
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model[0],
+            optimizer=optimizer,
+            args=args,
+            lr_scheduler=lr_scheduler,
+            mpu=mpu if pp == 1 else None,
+        )
+        if isinstance(model, deepspeed.PipelineEngine):
+            # hack to get batch_fn from pretrain_gpt.py
+            model.set_batch_fn(model.module._megatron_batch_fn)
+
+            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
+            assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
+            assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
+        model = [model]
 
     if args.load is not None:
         timers = get_timers()
@@ -352,12 +377,21 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
+    if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+        assert isinstance(model[0], deepspeed.PipelineEngine), model
+        loss = model[0].train_batch(data_iter=data_iterator)
+        skipped_iter = 0
+        grad_norm = 0.
+        num_zeros_in_grad = 0
+        return {'lm-loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
-        for partition in model:
-            partition.zero_grad_buffer()
-    else:
-        optimizer.zero_grad()
+    if not args.deepspeed:
+        if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
+            for partition in model:
+                partition.zero_grad_buffer()
+        else:
+            optimizer.zero_grad()
 
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
@@ -374,7 +408,7 @@ def train_step(forward_step_func, data_iterator,
         optimizer, timers, forward_only=False)
 
     # All-reduce if needed.
-    if args.DDP_impl == 'local':
+    if not args.deepspeed and args.DDP_impl == 'local':
         timers('backward-params-all-reduce').start()
         for model_module in model:
             model_module.allreduce_gradients()
@@ -385,53 +419,66 @@ def train_step(forward_step_func, data_iterator,
     # This should only run for models that support pipelined model parallelism
     # (BERT and GPT-2).
     timers('backward-embedding-all-reduce').start()
-    if (mpu.is_pipeline_first_stage(ignore_virtual=True) or
-        mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
-            mpu.get_pipeline_model_parallel_world_size() > 1:
-        if mpu.is_pipeline_first_stage(ignore_virtual=True):
-            unwrapped_model = model[0]
-        elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-            unwrapped_model = model[-1]
-        unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+    if not args.deepspeed:
+        if (mpu.is_pipeline_first_stage(ignore_virtual=True) or
+            mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
+                mpu.get_pipeline_model_parallel_world_size() > 1:
+            if mpu.is_pipeline_first_stage(ignore_virtual=True):
+                unwrapped_model = model[0]
+            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
+                unwrapped_model = model[-1]
+            unwrapped_model = unwrap_model(
+                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 
-        if unwrapped_model.share_word_embeddings:
-            word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-            if args.DDP_impl == 'local':
-                grad = word_embeddings_weight.main_grad
-            else:
-                grad = word_embeddings_weight.grad
-            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+            if unwrapped_model.share_word_embeddings:
+                word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+                if args.DDP_impl == 'local':
+                    grad = word_embeddings_weight.main_grad
+                else:
+                    grad = word_embeddings_weight.grad
+                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
     # Update parameters.
     timers('optimizer').start()
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-    timers('optimizer').stop()
-
-    # Update learning rate.
-    if update_successful:
+    if args.deepspeed:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
-        lr_scheduler.step(increment=increment)
-        skipped_iter = 0
+        model[0].step(lr_kwargs={'increment': increment})
     else:
-        skipped_iter = 1
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    timers('optimizer').stop()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-        # Average loss across microbatches.
-        loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
-            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
-        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
+    # Update learning rate.
+    if args.deepspeed:
+        skipped_iter = 0
+        grad_norm = None
+        num_zeros_in_grad = None
+    else:
+        if update_successful:
+            increment = get_num_microbatches() * \
+                        args.micro_batch_size * \
+                        args.data_parallel_size
+            lr_scheduler.step(increment=increment)
+            skipped_iter = 0
+        else:
+            skipped_iter = 1
+
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            # Average loss across microbatches.
+            loss_reduced = {}
+            for key in losses_reduced[0]:
+                losses_reduced_for_key = [x[key] for x in losses_reduced]
+                loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+            return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad,
+                 model=None):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -575,6 +622,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
+        flops_calculator(model, args, elapsed_time)
 
     return report_memory_flag
 
@@ -627,7 +675,10 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                        get_num_microbatches()
 
         # Logging.
-        loss_scale = optimizer.get_loss_scale().item()
+        if args.deepspeed:
+            loss_scale = -1
+        else:
+            loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
@@ -635,7 +686,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad,
+                                          model)
 
         # Autoresume
         if args.adlr_autoresume and \

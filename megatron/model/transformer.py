@@ -27,6 +27,8 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
+import deepspeed
+
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -184,6 +186,11 @@ class ParallelAttention(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True)
+
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False, encoder_output=None):
@@ -526,6 +533,23 @@ class ParallelTransformerLayer(MegatronModule):
 
         return output
 
+class ParallelTransformerLayerPipe(ParallelTransformerLayer):
+    """Extends ParallelTransformerLayer to forward attention_mask through the pipeline. """
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if torch.is_tensor(inputs) or len(inputs) == 1:
+            # No attention mask forwarded, search for args.attn_mask
+            if not hasattr(self, '_args'):
+                self._args = get_args()
+            hidden_states, attention_mask = inputs, self._args.attn_mask
+            return super().forward(hidden_states, attention_mask, **kwargs)
+        elif len(inputs) == 2:
+            # Attention mask is an activation.
+            hidden_states, attention_mask = inputs[0], inputs[1]
+            return super().forward(*inputs, **kwargs), attention_mask
+        else:
+            raise RuntimeError('Received more inputs than understood.')
+
 
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
@@ -590,6 +614,11 @@ class ParallelTransformer(MegatronModule):
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
+
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
