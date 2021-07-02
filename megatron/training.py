@@ -138,27 +138,57 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     iteration = 0
-    if args.do_train and args.train_iters > 0:
-        iteration = train(forward_step_func,
-                          model, optimizer, lr_scheduler,
-                          train_data_iterator, valid_data_iterator)
-    print_datetime('after training is done')
+    if not args.run_dialog:
+        # original pre-training for GPT
+        if args.do_train and args.train_iters > 0:
+            iteration = train(forward_step_func,
+                            model, optimizer, lr_scheduler,
+                            train_data_iterator, valid_data_iterator)
+        print_datetime('after training is done')
 
-    if args.do_valid:
-        prefix = 'the end of training for val data'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   valid_data_iterator, model,
-                                   iteration, False)
+        if args.do_valid:
+            prefix = 'the end of training for val data'
+            evaluate_and_print_results(prefix, forward_step_func,
+                                    valid_data_iterator, model,
+                                    iteration, False)
 
-    if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler)
+        if args.save and iteration != 0:
+            save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
-    if args.do_test:
-        # Run on test data.
-        prefix = 'the end of training for test data'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   test_data_iterator, model,
-                                   0, True)
+        if args.do_test:
+            # Run on test data.
+            prefix = 'the end of training for test data'
+            evaluate_and_print_results(prefix, forward_step_func,
+                                    test_data_iterator, model,
+                                    0, True)
+    
+    else:
+        # training for dialog/control model
+        timers('interval-time').start() # start timers('interval-time') here to avoid it from starting multiple times
+        for e in range(args.num_epoch):
+            print_rank_0('> training on epoch %d' % (e+1))
+
+            if args.do_train and args.train_iters > 0:
+                iteration += train(forward_step_func,
+                                model, optimizer, lr_scheduler,
+                                train_data_iterator, valid_data_iterator)
+            print_datetime('after training is done')
+
+            if args.do_valid:
+                prefix = 'the end of training for val data'
+                evaluate_and_print_results(prefix, forward_step_func,
+                                        valid_data_iterator, model,
+                                        iteration, False)
+
+            if e >= 8 and e <= 13 and args.save and iteration != 0:
+                save_checkpoint(iteration, model, optimizer, lr_scheduler)
+
+            if args.do_test:
+                # Run on test data.
+                prefix = 'the end of training for test data'
+                evaluate_and_print_results(prefix, forward_step_func,
+                                        test_data_iterator, model,
+                                        0, True)
 
 def update_train_iters(args):
 
@@ -611,7 +641,9 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     # Iterations.
     iteration = args.iteration
 
-    timers('interval-time').start()
+    if not args.run_dialog:
+        timers('interval-time').start()
+
     print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:
@@ -813,9 +845,10 @@ def build_train_valid_test_data_iterators(
             print_rank_0('    validation: {}'.format(valid_size))
             print_rank_0('    test:       {}'.format(test_size))
 
-            args.train_iters = train_size // args.global_batch_size
-            args.eval_iters = valid_size // args.global_batch_size
-            args.test_iters = test_size // args.global_batch_size
+            batch_size = args.micro_batch_size * args.data_parallel_size
+            args.train_iters = train_size // batch_size + 1
+            args.eval_iters = valid_size // batch_size + 1
+            args.test_iters = test_size // batch_size + 1
 
         else:
             # Number of train/valid/test samples.

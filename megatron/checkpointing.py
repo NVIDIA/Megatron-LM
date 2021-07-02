@@ -344,19 +344,21 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     print_rank_0(f' checkpoint version {checkpoint_version}')
     fix_query_key_value_ordering(model, checkpoint_version)
 
-    # Optimizer.
-    if not release and not args.finetune and not args.no_load_optim:
-        try:
-            if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
-            if lr_scheduler is not None:
-                lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
-        except KeyError:
-            print_rank_0('Unable to load optimizer from checkpoint {}. '
-                         'Specify --no-load-optim or --finetune to prevent '
-                         'attempting to load the optimizer state, '
-                         'exiting ...'.format(checkpoint_name))
-            sys.exit()
+    if not args.run_dialog:
+        # Original pre-train GPT setting
+        # Optimizer.
+        if not release and not args.finetune and not args.no_load_optim:
+            try:
+                if optimizer is not None:
+                    optimizer.load_state_dict(state_dict['optimizer'])
+                if lr_scheduler is not None:
+                    lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+            except KeyError:
+                print_rank_0('Unable to load optimizer from checkpoint {}. '
+                            'Specify --no-load-optim or --finetune to prevent '
+                            'attempting to load the optimizer state, '
+                            'exiting ...'.format(checkpoint_name))
+                sys.exit()
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:

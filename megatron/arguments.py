@@ -760,6 +760,8 @@ def _add_dialog_ctrl_args(parser):
 
     group.add_argument('--run-dialog', action='store_true',
                        help='run dialog modeling')
+    group.add_argument('--num-epoch', type=int, default=30,
+                       help='number of epoches to train the model')
     group.add_argument('--train-module', type=str, default="",
                        help='either control module or dialogue model (control or dialog)')
     group.add_argument('--data-folder', type=str, default="",

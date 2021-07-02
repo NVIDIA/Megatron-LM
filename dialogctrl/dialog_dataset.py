@@ -20,11 +20,16 @@ def read_data(tokenizer, data_path, train_module):
             assert length_split == 2 or length_split == 3 or length_split == 4
 
             if train_module == "dialog":
+                # if length_split == 2:
+                #     continue
+
                 dialog_context = splits[0]
+                if length_split > 2:
+                    ctrl_sent = splits[-2]
                 response = splits[-1]
                 # only take the last three turns in the dialog context
                 turns = dialog_context.split(" [SEP] ")
-                turns = turns[-3:]
+                # turns = turns[-3:]
 
                 # input_ids
                 for idx, turn in enumerate(turns):
@@ -33,6 +38,10 @@ def read_data(tokenizer, data_path, train_module):
                     else:
                         input_ids.extend([tokenizer.sep_id] + tokenizer.tokenize(turn))
                 
+                if length_split > 2:
+                    # when there is control sentence, add it into the input_ids
+                    input_ids.extend([tokenizer.ctrl_id] + tokenizer.tokenize(ctrl_sent))
+
                 # output_ids
                 output_ids = tokenizer.tokenize(response)
 
@@ -65,7 +74,7 @@ def read_data(tokenizer, data_path, train_module):
 
             else:
                 raise ValueError("Please input a correct train-module name! (either dialog or cnotrol))")
-    
+                
     return data_list
 
 
@@ -78,10 +87,11 @@ def data_shuffle(data, seed):
 
 class ControlDialogDataset(torch.utils.data.Dataset):
 
-    def __init__(self, data, max_seq_len, pad_id, eod_id):
+    def __init__(self, data, max_seq_len, sep_id, pad_id, eod_id):
         # need to deal with padding, label masking
         self.data = data
         self.max_seq_len = max_seq_len
+        self.sep_id = sep_id
         self.pad_id = pad_id
         self.eod_id = eod_id
 
@@ -95,16 +105,16 @@ class ControlDialogDataset(torch.utils.data.Dataset):
         assert len(input_ids) < self.max_seq_len, "Set a larger max-seq-len!"
 
         # length_of_loss_mask == length_of_text - 1
-        text = input_ids + [self.pad_id] + output_ids + [self.eod_id]
+        text = input_ids + [self.sep_id] + output_ids + [self.eod_id]
         loss_mask = [0]*len(input_ids) + [1]*(len(output_ids)+1)
 
         text_len = len(text)
-        if text_len > self.max_seq_len:
-            text = text[:self.max_seq_len]
-            loss_mask = loss_mask[:self.max_seq_len-1]
+        if text_len > self.max_seq_len+1:
+            text = text[:self.max_seq_len+1]
+            loss_mask = loss_mask[:self.max_seq_len]
         else:
-            text += [self.pad_id] * (self.max_seq_len - text_len)
-            loss_mask += [0] * (self.max_seq_len - text_len)
+            text += [self.pad_id] * (self.max_seq_len+1 - text_len)
+            loss_mask += [0] * (self.max_seq_len+1 - text_len)
 
         return {"text": np.array(text, dtype=np.int64), "loss_mask": np.array(loss_mask, dtype=np.int64)}
 
@@ -127,8 +137,8 @@ def build_train_valid_test_datasets(data_folder, dataset_name, train_module, max
     train_data_list = data_shuffle(train_data_list, seed)
 
     # build train, valid, and test datasets
-    train_dataset = ControlDialogDataset(train_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
-    valid_dataset = ControlDialogDataset(valid_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
-    test_dataset = ControlDialogDataset(test_data_list, max_seq_len, tokenizer.pad_id, tokenizer.eod_id)
+    train_dataset = ControlDialogDataset(train_data_list, max_seq_len, sep_id=tokenizer.sep_id, pad_id=tokenizer.pad_id, eod_id=tokenizer.eod_id)
+    valid_dataset = ControlDialogDataset(valid_data_list, max_seq_len, sep_id=tokenizer.sep_id, pad_id=tokenizer.pad_id, eod_id=tokenizer.eod_id)
+    test_dataset = ControlDialogDataset(test_data_list, max_seq_len, sep_id=tokenizer.sep_id, pad_id=tokenizer.pad_id, eod_id=tokenizer.eod_id)
 
     return train_dataset, valid_dataset, test_dataset
