@@ -133,6 +133,7 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     args = get_args()
     orig_seq_length = args.seq_length
     args.seq_length = tokens.shape[1]
+    args.micro_batch_size = tokens.shape[0]
 
     input_tensor = recv_forward()
 

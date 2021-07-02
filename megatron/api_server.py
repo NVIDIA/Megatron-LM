@@ -80,7 +80,10 @@ class MegatronGenerate(Resource):
     def put(self):
         args = get_args()
         sentences = request.get_json()["sentences"]
-        max_len = args.seq_length
+        if len(sentences) > 128:
+            return "Maximum number of sentences is 128", 400
+
+        max_len = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "max_len" in request.get_json():
             input_max_len = request.get_json()["max_len"]
             if input_max_len < args.seq_length:
