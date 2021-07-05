@@ -177,6 +177,7 @@ def _train(model, optimizer, lr_scheduler, forward_step,
     report_memory_flag = True
 
     # For each remaining epoch
+    args.consumed_train_samples = 0
     timers('interval-time').start()
     for epoch in range(start_epoch, args.epochs):
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
@@ -195,6 +196,10 @@ def _train(model, optimizer, lr_scheduler, forward_step,
 
             # Train for one step.
             out = train_step(forward_step, batch, model, optimizer, lr_scheduler)
+
+            args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
+                                           args.micro_batch_size * \
+                                           get_num_microbatches()
 
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = out
             iteration += 1
