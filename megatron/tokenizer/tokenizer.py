@@ -41,6 +41,7 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=args.spec_toks)
+        # tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -273,7 +274,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
                                        special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
-        if len(special_tokens) > 0:
+        if special_tokens is not None and len(special_tokens) > 0:
             if "[SEP]" in special_tokens:
                 self.sep_id = self.tokenizer.special_tokens['[SEP]']
             if "[CTRL]" in special_tokens:

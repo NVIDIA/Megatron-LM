@@ -84,6 +84,18 @@ def get_tasks_args(parser):
                         help='Av.rank validation: how many other negatives to'
                         ' take from each question pool')
 
+    # finetune for controllable dialogue
+    group.add_argument('--train-module', type=str, default="",
+                       help='either control module or dialogue model (control or dialog)')
+    group.add_argument('--data-folder', type=str, default="",
+                       help='data folder (path of the data folder)')
+    group.add_argument('--dataset-name', type=str, default="",
+                       help='dataset name (e.g., wizard_of_wikipedia)')
+    group.add_argument('--max-seq-len', type=int, default=1024,
+                       help='maximum sequence length')
+    group.add_argument('--spec-toks', type=str, default="[SEP],[CTRL],[PAD]",
+                       help='additional special tokens')
+
 
     return parser
 
@@ -108,6 +120,8 @@ if __name__ == '__main__':
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main
+    elif args.task == 'dialctrl':
+        from dialctrl.finetune import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

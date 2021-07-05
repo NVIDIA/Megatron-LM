@@ -247,6 +247,7 @@ def generate_samples_interactive(model, print_frequency=24):
                     terminate_runs = 1
                 else:
                     context_tokens = tokenizer.tokenize(raw_text)
+                    # context_tokens = context_tokens + [tokenizer.sep_id]
                     context_length = len(context_tokens)
 
                     if context_length >= (args.seq_length // 2):
@@ -299,9 +300,14 @@ def generate_samples_interactive(model, print_frequency=24):
                 print("\nContext:", raw_text, flush=True)
 
                 decode_tokens, _ = decode_tokens
+                # print("tokenzied inputs:", tokenizer.tokenize(raw_text))
+                # print("decode_tokens:", decode_tokens)
+
                 decode_tokens = decode_tokens[0].cpu().numpy().tolist()
                 trim_decode_tokens = tokenizer.detokenize(
                     decode_tokens)[raw_text_len:]
+                # trim_decode_tokens = tokenizer.detokenize(
+                #     decode_tokens[context_length:])
                 print("\nMegatron-LM:", trim_decode_tokens, flush=True)
 
             if mpu.is_pipeline_first_stage() \
@@ -314,6 +320,9 @@ def generate_samples_interactive(model, print_frequency=24):
                     decode_tokens = decode_tokens[0].cpu().numpy().tolist()
                 trim_decode_tokens = tokenizer.detokenize(
                     decode_tokens)[raw_text_len:]
+                # print("decode_tokens:", decode_tokens)
+                # trim_decode_tokens = tokenizer.detokenize(
+                #     decode_tokens[context_length:])
                 print("\nMegatron-LM:", trim_decode_tokens, flush=True)
 
                 input("\nPress Enter to continue >>>")

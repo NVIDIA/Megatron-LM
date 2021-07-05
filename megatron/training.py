@@ -180,8 +180,12 @@ def pretrain(train_valid_test_dataset_provider,
                                         valid_data_iterator, model,
                                         iteration, False)
 
-            if e >= 8 and e <= 13 and args.save and iteration != 0:
-                save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            # if args.train_module == "dialog":
+            #     if (e+1) >= 6 and (e+1) <= 15 and args.save and iteration != 0:
+            #         save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            if args.train_module == "control":
+                if (e+1) >= 5 and (e+1) <= 9 and args.save and iteration != 0:
+                    save_checkpoint(iteration, model, optimizer, lr_scheduler)
 
             if args.do_test:
                 # Run on test data.
@@ -845,7 +849,7 @@ def build_train_valid_test_data_iterators(
             print_rank_0('    validation: {}'.format(valid_size))
             print_rank_0('    test:       {}'.format(test_size))
 
-            batch_size = args.micro_batch_size * args.data_parallel_size
+            batch_size = args.global_batch_size
             args.train_iters = train_size // batch_size + 1
             args.eval_iters = valid_size // batch_size + 1
             args.test_iters = test_size // batch_size + 1
