@@ -4,7 +4,7 @@ DATA_PATH="/home/universal-lm-data.cosmos549/scratch/mshoeybi/data/gpt2"
 VOCAB_FILE="${DATA_PATH}/bpe/gpt2-vocab.json"
 MERGE_FILE="${DATA_PATH}/bpe/gpt2-merges.txt"
 RUN_CMD=(
-python -m cProfile -s cumtime tools/run_api_server.py 
+python tools/run_api_server.py 
        --tensor-model-parallel-size 16 
        --pipeline-model-parallel-size 3 
        --num-layers 105 

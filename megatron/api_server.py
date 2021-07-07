@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import torch
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, current_app
 from flask_restful import Resource, Api
 
 from megatron import get_args
@@ -103,9 +103,13 @@ class MegatronGenerate(Resource):
         return jsonify({"sentences": resp_sentences})
     
 
+def index():
+    return current_app.send_static_file('index.html')
+
 class MegatronServer(object):
     def __init__(self, model):
         self.app = Flask(__name__)
+        self.app.add_url_rule('/', 'index', index)
         api = Api(self.app)
         api.add_resource(MegatronGenerate, '/generate', resource_class_args=[model])
 
