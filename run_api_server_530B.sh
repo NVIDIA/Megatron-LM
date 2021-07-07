@@ -24,4 +24,4 @@ python tools/run_api_server.py
 	   --seed 42
 )
 
-submit_job --nodes 3 --gpu 16 --reservation adlr-530b --partition batch_UN_dgx2_singlenode --mounts /home/universal-lm-data.cosmos549,/home/dcg-adlr-rprenger-source.cosmos352,/home/dcg-adlr-sgodil-data.cosmos233,/home/dcg-adlr-rprenger-output.cosmos349,/home/dcg-adlr-mchrzanowski-chidesign-data --image gitlab-master.nvidia.com/adlr/rprenger/megatron:latest --skip_ib_check --tasks_per_node 16 -c "${RUN_CMD[*]}"
+submit_job --duration 168 --nodes 3 --gpu 16 --reservation adlr-530b --partition batch_UN_dgx2_singlenode --mounts /home/universal-lm-data.cosmos549,/home/dcg-adlr-rprenger-source.cosmos352,/home/dcg-adlr-sgodil-data.cosmos233,/home/dcg-adlr-rprenger-output.cosmos349,/home/dcg-adlr-mchrzanowski-chidesign-data --image gitlab-master.nvidia.com/adlr/rprenger/megatron:latest --skip_ib_check --tasks_per_node 16 -c "${RUN_CMD[*]}"
