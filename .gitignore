@@ -4,11 +4,3 @@ __pycache__
 build/
 dist/
 *.egg-info/
-tensorboard
-commands
-*.log
-logs
-*.so
-*.out
-train_gpt_conv.py
-dialogctrl/
