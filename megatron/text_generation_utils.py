@@ -118,8 +118,67 @@ def get_token_stream(model, context_tokens_tensor, context_length_tensor):
         else:
             yield None, None
 
-def switch(val1, val2, boolean):
 
+def send_generate_info(context_tokens_tensor, context_length_tensor, max_len):
+    """
+    Needs to be synced up with receive_generate_info
+    """
+    # Send the sizes of the tensors
+    input_info = [context_tokens_tensor.size(0), context_tokens_tensor.size(1), max_len]
+    input_info_tensor = torch.cuda.LongTensor(input_info)
+    torch.distributed.broadcast(input_info_tensor, 0)
+
+    # Send variables to all ranks 
+    torch.distributed.broadcast(context_length_tensor, 0)
+    torch.distributed.broadcast(context_tokens_tensor, 0)
+
+def receive_generate_info():
+    """
+    Needs to be synced up with send_generate_info
+    """
+    input_info_tensor = torch.empty(3, dtype=torch.int64, device=torch.device("cuda"))
+    torch.distributed.broadcast(input_info_tensor, 0)
+    batch_size = input_info_tensor[0].item()
+    seq_len = input_info_tensor[1].item()
+    max_len = input_info_tensor[2].item()
+    
+    context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.device("cuda"))
+    context_tokens_tensor = torch.empty(batch_size, seq_len, dtype=torch.int64, device=torch.device("cuda"))
+    
+    # Send variables to all ranks 
+    torch.distributed.broadcast(context_length_tensor, 0)
+    torch.distributed.broadcast(context_tokens_tensor, 0)
+    
+    return context_length_tensor, context_tokens_tensor, max_len
+
+def synced_generate(model, context_length_tensor, context_tokens_tensor, max_len):
+    token_stream = get_token_stream(model, context_tokens_tensor, context_length_tensor)
+    for i, decode_tokens in enumerate(token_stream):
+        if i == max_len-1:
+            break
+        pass
+    return decode_tokens
+
+def generate(model, sentences=None, max_len=0):
+    if torch.distributed.get_rank() == 0:
+        context_tokens_tensor, context_length_tensor = tokenize_batch(sentences)
+        send_generate_info(context_tokens_tensor, context_length_tensor, max_len)
+    else:
+        context_length_tensor, context_tokens_tensor, max_len = receive_generate_info()
+    
+    decode_tokens = synced_generate(model, context_length_tensor, context_tokens_tensor, max_len)
+    
+    if torch.distributed.get_rank() == 0:
+        args = get_args()
+        tokenizer = get_tokenizer()
+        decode_tokens, _ = decode_tokens
+        resp_sentences = []
+        for i in range(decode_tokens.size(0)):
+            decode_token = decode_tokens[i,:].cpu().numpy().tolist()
+            resp_sentences.append(tokenizer.detokenize(decode_token))
+        return resp_sentences
+
+def switch(val1, val2, boolean):
     boolean = boolean.type_as(val1)
     return (1 - boolean) * val1 + boolean * val2
 

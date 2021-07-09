@@ -21,18 +21,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import socket
 from megatron import get_args
 from megatron import print_rank_0
-from megatron import get_tokenizer
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
-from megatron.api_server import MegatronServer, MegatronGenerate
+from megatron.api_server import MegatronServer
+from megatron.text_generation_utils import generate
 import torch
-
-def do_generate(model):
-    context_length_tensor, context_tokens_tensor, max_len = MegatronGenerate.receive_generate_info()
-    MegatronGenerate.do_generate(model, context_length_tensor, context_tokens_tensor, max_len) 
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -86,4 +82,4 @@ if __name__ == "__main__":
                                     mpu.get_tensor_model_parallel_src_rank(),
                                     group=mpu.get_tensor_model_parallel_group())
         if choice[0].item() == 0:
-            do_generate(model)
+            generate(model)
