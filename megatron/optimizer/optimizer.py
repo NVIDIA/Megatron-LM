@@ -285,6 +285,8 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                 float16_groups & fp32_from_fp32_groups."""
         for group in self.float16_groups:
             _zero_grad_group_helper(group, set_to_none)
+        for group in self.fp32_from_float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
 
