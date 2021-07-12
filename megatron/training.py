@@ -531,6 +531,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration,
                          normalizer=total_iterations)
+        if args.log_memory_to_tensorboard:
+            mem_stats = torch.cuda.memory_stats()
+            writer.add_scalar(
+                "mem-reserved-bytes",
+                mem_stats["reserved_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-bytes",
+                mem_stats["allocated_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-count",
+                mem_stats["allocation.all.current"],
+                iteration,
+            )
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
