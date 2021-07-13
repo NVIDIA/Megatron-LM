@@ -330,8 +330,7 @@ def _add_logging_args(parser):
                        'tensorboard.')
     group.add_argument('--log-memory-to-tensorboard',
                        action='store_true',
-                       help='Disable memory logging to tensorboard.',
-                       dest='log_memory_to_tensorboard')
+                       help='Enable memory logging to tensorboard.')
 
     return parser
 
