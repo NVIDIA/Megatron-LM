@@ -328,6 +328,9 @@ def _add_logging_args(parser):
                        action='store_true',
                        help='If set, write validation perplexity to '
                        'tensorboard.')
+    group.add_argument('--log-memory-to-tensorboard',
+                       action='store_true',
+                       help='Enable memory logging to tensorboard.')
 
     return parser
 
