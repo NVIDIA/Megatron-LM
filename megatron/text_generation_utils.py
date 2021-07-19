@@ -162,6 +162,9 @@ def synced_generate(model, context_length_tensor, context_tokens_tensor, max_len
 def generate(model, sentences=None, max_len=0):
     if torch.distributed.get_rank() == 0:
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences)
+        c = context_length_tensor[0]
+        b = context_tokens_tensor.size(0)
+        start = time.time()
         send_generate_info(context_tokens_tensor, context_length_tensor, max_len)
     else:
         context_length_tensor, context_tokens_tensor, max_len = receive_generate_info()
@@ -176,6 +179,8 @@ def generate(model, sentences=None, max_len=0):
         for i in range(decode_tokens.size(0)):
             decode_token = decode_tokens[i,:].cpu().numpy().tolist()
             resp_sentences.append(tokenizer.detokenize(decode_token))
+        end = time.time()
+        print(str(b)+","+str(c)+","+str(decode_tokens.size(1))+","+str(end-start), flush=True)
         return resp_sentences
 
 def switch(val1, val2, boolean):

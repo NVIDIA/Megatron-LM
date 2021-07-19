@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import sys
 import urllib2
 class PutRequest(urllib2.Request):
     '''class to handling putting with urllib2'''
@@ -21,11 +22,12 @@ class PutRequest(urllib2.Request):
         return 'PUT'
 
 if __name__ == "__main__":
+    url = sys.argv[1]
     while True:
         sentence = raw_input("Enter prompt: ")
         max_len = int(input("Enter number tokens output: "))
         data = json.dumps({"sentences": [sentence], "max_len":max_len})
-        req = PutRequest("http://sc-sdgx2-484:5000/generate", data, {'Content-Type': 'application/json'})
+        req = PutRequest(url, data, {'Content-Type': 'application/json'})
         response = urllib2.urlopen(req)
         resp_sentences = json.load(response)
         print("Megatron Response: ")

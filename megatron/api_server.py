@@ -61,4 +61,4 @@ class MegatronServer(object):
         api.add_resource(MegatronGenerate, '/generate', resource_class_args=[model])
 
     def run(self, url):
-        self.app.run(url, debug=False)
+        self.app.run(url, threaded=False, debug=False)
