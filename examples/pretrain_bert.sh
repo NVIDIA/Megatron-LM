@@ -1,9 +1,10 @@
 #!/bin/bash
 
-RANK=0
-WORLD_SIZE=1
-DATA_PATH=<Specify path and file prefix>_text_sentence
-CHECKPOINT_PATH=<Specify path>
+RANK=${RANK:-0}
+WORLD_SIZE=${WORLD_SIZE:-1}
+DATA_PATH=${DATA_PATH:-<Specify path and file prefix>_text_sentence}
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-<Specify path>}
+VOCAB_FILE=${VOCAB_FILE:-bert-vocab.txt}
 
 python pretrain_bert.py \
        --num-layers 24 \
@@ -18,7 +19,7 @@ python pretrain_bert.py \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file bert-vocab.txt \
+       --vocab-file $VOCAB_FILE \
        --data-impl mmap \
        --split 949,50,1 \
        --lr 0.0001 \

@@ -1,8 +1,8 @@
 #!/bin/bash
 
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
+CHECKPOINT_PATH=${CHECKPOINT_PATH:-checkpoints/gpt2_345m}
+VOCAB_FILE=${VOCAB_FILE:-gpt2-vocab.json}
+MERGE_FILE=${MERGE_FILE:-gpt2-merges.txt}
 
 python tools/generate_samples_gpt2.py \
        --tensor-model-parallel-size 1 \
