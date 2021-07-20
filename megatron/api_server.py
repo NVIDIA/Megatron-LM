@@ -41,9 +41,11 @@ class MegatronGenerate(Resource):
 
         max_len = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "max_len" in request.get_json():
-            input_max_len = request.get_json()["max_len"]
-            if input_max_len < args.seq_length:
-                max_len = input_max_len
+            max_len = request.get_json()["max_len"]
+            if not isinstance(max_len, int):
+                return "max_len must be an integer greater than 0"
+            if max_len < 1:
+                return "max_len must be an integer greater than 0"
 
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
         resp_sentences = generate(self.model, sentences, max_len) 
