@@ -48,9 +48,10 @@ class MegatronGenerate(Resource):
                 return "max_len must be an integer greater than 0"
 
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-        resp_sentences = generate(self.model, sentences, max_len) 
-        return jsonify({"sentences": resp_sentences})
-
+        resp_sentences, resp_sentences_seg, output_logits = generate(self.model, sentences, max_len) 
+        return jsonify({"sentences": resp_sentences,
+            "segments": resp_sentences_seg,
+            "logits": output_logits})
 
 def index():
     return current_app.send_static_file('index.html')
