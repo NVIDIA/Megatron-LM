@@ -44,7 +44,7 @@ def model_provider(pre_process=True, post_process=True):
                              remote_device=None if args.remote_device=='none' else args.remote_device,
                              config=args.deepspeed_config,
                              enabled=args.zero_stage==3):
-        if args.deepspeed and mpu.get_pipeline_model_parallel_world_size() > 1:
+        if args.deepspeed:
             model = GPTModelPipe(
                 num_tokentypes=0,
                 parallel_output=True
