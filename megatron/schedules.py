@@ -71,6 +71,9 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
 
+    # If T5 model (or other model with encoder and decoder)
+    # and in decoder stack, then send encoder_hidden_state
+    # downstream as well.
     if mpu.is_pipeline_stage_after_split() and \
             args.model_type == ModelType.encoder_and_decoder:
         return [output_tensor, input_tensor[-1]]
