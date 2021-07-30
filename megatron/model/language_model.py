@@ -331,6 +331,10 @@ class TransformerLanguageModel(MegatronModule):
         # Decoder (usually set to False, True if part of an encoder-decoder
         # architecture and in decoder-only stage).
         if self.add_decoder:
+            # Temporary assertion until we verify correctness of pipeline parallelism
+            # implementation of T5.
+            assert args.pipeline_model_parallel_size == 1, \
+                'pipeline parallelism is not supported in the presence of decoder'
             self.decoder = ParallelTransformer(
                 self.init_method,
                 output_layer_init_method,
