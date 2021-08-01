@@ -52,7 +52,7 @@ def _split(input_):
 
 
 def _gather(input_):
-    """Gather tensors and concatinate along the last dimension."""
+    """Gather tensors and concatenate along the last dimension."""
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
