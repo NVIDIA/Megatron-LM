@@ -47,9 +47,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.schedules import forward_backward_no_pipelining
-from megatron.schedules import forward_backward_pipelining_without_interleaving
-from megatron.schedules import forward_backward_pipelining_with_interleaving
+from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
 
 
@@ -359,16 +357,7 @@ def train_step(forward_step_func, data_iterator,
     else:
         optimizer.zero_grad()
 
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
-        if args.virtual_pipeline_model_parallel_size is not None:
-            forward_backward_func = forward_backward_pipelining_with_interleaving
-            assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
-                'number of microbatches is not divisible by pipeline-parallel ' \
-                'size when using interleaved schedule'
-        else:
-            forward_backward_func = forward_backward_pipelining_without_interleaving
-    else:
-        forward_backward_func = forward_backward_no_pipelining
+    forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
         optimizer, timers, forward_only=False)
@@ -531,6 +520,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration,
                          normalizer=total_iterations)
+        if args.log_memory_to_tensorboard:
+            mem_stats = torch.cuda.memory_stats()
+            writer.add_scalar(
+                "mem-reserved-bytes",
+                mem_stats["reserved_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-bytes",
+                mem_stats["allocated_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-count",
+                mem_stats["allocation.all.current"],
+                iteration,
+            )
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
@@ -705,13 +711,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 print_rank_0('Evaluating iter {}/{}'.format(iteration,
                                                             args.eval_iters))
 
-            if mpu.get_pipeline_model_parallel_world_size() > 1:
-                if args.virtual_pipeline_model_parallel_size is not None:
-                    forward_backward_func = forward_backward_pipelining_with_interleaving
-                else:
-                    forward_backward_func = forward_backward_pipelining_without_interleaving
-            else:
-                forward_backward_func = forward_backward_no_pipelining
+            forward_backward_func = get_forward_backward_func()
             loss_dicts = forward_backward_func(
                 forward_step_func, data_iterator, model, optimizer=None,
                 timers=None, forward_only=True)
