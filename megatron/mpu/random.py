@@ -47,9 +47,18 @@ def init_checkpointed_activations_memory_buffer():
 
     per_layer = args.micro_batch_size * args.max_position_embeddings * \
                 args.hidden_size // args.tensor_model_parallel_size
-    assert args.num_layers % args.checkpoint_num_layers == 0, \
-        'number of layers is not divisible by checkpoint-num-layers'
-    num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
+    num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
+    if args.virtual_pipeline_model_parallel_size is not None:
+        num_layers = num_layers // args.virtual_pipeline_model_parallel_size
+
+    if args.activations_checkpoint_method == 'uniform':
+        assert num_layers % args.activations_checkpoint_num_layers == 0, \
+            'total number of layers is not divisible by checkpoint-chunk_size'
+        num_checkpointer_layers = args.num_layers // args.activations_checkpoint_num_layers
+    elif args.activations_checkpoint_method == 'block':
+        assert args.activations_checkpoint_num_layers <= num_layers, \
+            'total number of layers is fewer than the number of layers to checkpoint'
+        num_checkpointer_layers = args.activations_checkpoint_num_layers
     numel = per_layer * num_checkpointer_layers
     dtype = torch.half
     if not args.fp16:
