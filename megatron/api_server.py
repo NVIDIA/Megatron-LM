@@ -47,8 +47,20 @@ class MegatronGenerate(Resource):
             if max_len < 1:
                 return "max_len must be an integer greater than 0"
 
+        all_probs = False
+        if "all_probs" in request.get_json():
+            all_probs = request.get_json()["all_probs"]
+            if not isinstance(all_probs, bool):
+                return "all_probs must be a boolean value"
+
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-        resp_sentences, resp_sentences_seg, output_logits = generate(self.model, sentences, max_len) 
+        resp_sentences, resp_sentences_seg, output_logits, full_logits = generate(self.model, sentences, max_len, all_probs) 
+        if all_probs:
+            return jsonify({"sentences": resp_sentences,
+                "segments": resp_sentences_seg,
+                "logits": output_logits,
+                "all_logits": full_logits})
+        
         return jsonify({"sentences": resp_sentences,
             "segments": resp_sentences_seg,
             "logits": output_logits})
