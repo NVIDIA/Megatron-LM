@@ -80,6 +80,9 @@ class MegatronOptimizer(ABC):
         self.params_have_main_grad = params_have_main_grad
         self.use_contiguous_buffers_in_ddp = use_contiguous_buffers_in_ddp
 
+        if self.use_contiguous_buffers_in_ddp:
+            assert self.params_have_main_grad, \
+                "use of contiguous buffer requires that params have main grad"
 
     def get_parameters(self):
         params = []
@@ -319,7 +322,8 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                 # (If using contiguous buffers, main_grad's memory should
                 # persist and therefore should not be deallocated.)
                 model_param.grad = None
-                if not self.use_contiguous_buffers_in_ddp:
+                if self.params_have_main_grad and \
+                   not self.use_contiguous_buffers_in_ddp:
                     model_param.main_grad = None
 
         # For fp32 grads, we need to reset the grads to main grad.
