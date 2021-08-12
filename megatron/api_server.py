@@ -54,12 +54,13 @@ class MegatronGenerate(Resource):
                 return "all_probs must be a boolean value"
 
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-        resp_sentences, resp_sentences_seg, output_logits, full_logits = generate(self.model, sentences, max_len, all_probs) 
+        resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, max_len, all_probs) 
         if all_probs:
             return jsonify({"sentences": resp_sentences,
                 "segments": resp_sentences_seg,
                 "logits": output_logits,
-                "all_logits": full_logits})
+                "all_logits": full_logits,
+                "tokens": tokens})
         
         return jsonify({"sentences": resp_sentences,
             "segments": resp_sentences_seg,
