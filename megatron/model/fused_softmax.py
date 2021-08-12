@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
+import torch.nn as nn
 from megatron.model.enums import AttnMaskType
 
 
@@ -30,10 +32,10 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
         import scaled_upper_triang_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
-
         softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
             inputs, scale_t[0]
         )
+
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
 
@@ -42,10 +44,10 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
         import scaled_upper_triang_masked_softmax_cuda
 
         softmax_results, scale_t = ctx.saved_tensors
-
         input_grads = scaled_upper_triang_masked_softmax_cuda.backward(
             output_grads, softmax_results, scale_t[0]
         )
+
         return input_grads, None
 
 
@@ -63,9 +65,7 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
         scale_t = torch.tensor([scale])
 
-        softmax_results = scaled_masked_softmax_cuda.forward(
-            inputs, mask, scale_t[0]
-        )
+        softmax_results = scaled_masked_softmax_cuda.forward(inputs, mask, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
 
@@ -81,16 +81,18 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
         return input_grads, None, None
 
 
-class FusedScaleMaskSoftmax(torch.nn.Module):
+class FusedScaleMaskSoftmax(nn.Module):
     """
     fused operation: scaling + mask + softmax
+
     Arguments:
         input_in_fp16: flag to indicate if input in fp16 data format.
+        input_in_bf16: flag to indicate if input in bf16 data format.
         attn_mask_type: attention mask type (pad or causal)
+        scaled_masked_softmax_fusion: flag to indicate user want to use softmax fusion
         mask_func: mask function to be applied.
         softmax_in_fp32: if true, softmax in performed at fp32 precision.
         scale: scaling factor used in input tensor scaling.
-
     """
 
     def __init__(
@@ -106,8 +108,9 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
         super(FusedScaleMaskSoftmax, self).__init__()
         self.input_in_fp16 = input_in_fp16
         self.input_in_bf16 = input_in_bf16
-        assert not (self.input_in_fp16 and self.input_in_bf16),\
-            'both fp16 and bf16 flags cannot be active at the same time.'
+        assert not (
+            self.input_in_fp16 and self.input_in_bf16
+        ), "both fp16 and bf16 flags cannot be active at the same time."
         self.input_in_float16 = self.input_in_fp16 or self.input_in_bf16
         self.attn_mask_type = attn_mask_type
         self.scaled_masked_softmax_fusion = scaled_masked_softmax_fusion
@@ -118,47 +121,72 @@ class FusedScaleMaskSoftmax(torch.nn.Module):
         assert (
             self.scale is None or softmax_in_fp32
         ), "softmax should be in fp32 when scaled"
- 
+
     def forward(self, input, mask):
         # [b, np, sq, sk]
         assert input.dim() == 4
-        data_size = input.size()
-        query_seq_len = data_size[-2]
-        key_seq_len = data_size[-1]
-        attn_batch_size = data_size[0] * data_size[1]
 
-        # constraints on various tensor dimensions to enable warp based
-        # optimization and upper triangular optimization (for causal mask)
-        custom_kernel_constraint = key_seq_len > 16 and key_seq_len <= 2048 and \
-            query_seq_len % 4 == 0 and attn_batch_size % 4 == 0
-
-        # invoke custom kernel
-        if self.input_in_float16 and mask is not None and \
-            custom_kernel_constraint and self.scaled_masked_softmax_fusion:
-            scale = self.scale if self.scale is not None else 1.0
-
-            if self.attn_mask_type == AttnMaskType.causal:
-                assert query_seq_len == key_seq_len, \
-                    "causal mask is only for self attention"
-                input = input.view(-1, query_seq_len, key_seq_len)
-                probs = ScaledUpperTriangMaskedSoftmax.apply(input, scale)
-                probs = probs.view(*data_size)
-            else:
-                assert self.attn_mask_type == AttnMaskType.padding
-                probs = ScaledMaskedSoftmax.apply(input, mask, scale)
+        if self.is_kernel_available(mask, *input.size()):
+            return self.forward_fused_softmax(input, mask)
         else:
-            if self.input_in_float16 and self.softmax_in_fp32:
-                input = input.float()
+            return self.forward_torch_softmax(input, mask)
 
-            if self.scale is not None:
-                input = input * self.scale
-            mask_output = self.mask_func(input, mask) if mask is not None else input
-            probs = torch.nn.Softmax(dim=-1)(mask_output)
+    def is_kernel_available(self, mask, b, np, sq, sk):
+        attn_batches = b * np
 
-            if self.input_in_float16 and self.softmax_in_fp32:
-                if self.input_in_fp16:
-                    probs = probs.half()
+        if (
+            self.scaled_masked_softmax_fusion  # user want to fuse
+            and self.input_in_float16  # input must be fp16
+            and mask is not None  # mask tensor must not be None
+            and 16 < sq <= 2048  # sq must be 16 ~ 2048
+            and sk % 4 == 0  # sk must be divisor of 4
+            and attn_batches % 4 == 0  # np * b must be divisor of 4
+        ):
+            if 0 <= sk <= 2048:
+                batch_per_block = self.get_batch_per_block(sq, sk, b, np)
+
+                if self.attn_mask_type == AttnMaskType.causal:
+                    if attn_batches % batch_per_block == 0:
+                        return True
                 else:
-                    probs = probs.bfloat16()
+                    if sq % batch_per_block == 0:
+                        return True
+        return False
+
+    def forward_fused_softmax(self, input, mask):
+        b, np, sq, sk = input.size()
+        scale = self.scale if self.scale is not None else 1.0
+
+        if self.attn_mask_type == AttnMaskType.causal:
+            assert sq == sk, "causal mask is only for self attention"
+
+            # input is 3D tensor (attn_batches, sq, sk)
+            input = input.view(-1, sq, sk)
+            probs = ScaledUpperTriangMaskedSoftmax.apply(input, scale)
+            return probs.view(b, np, sq, sk)
+        else:
+            # input is 4D tensor (b, np, sq, sk)
+            return ScaledMaskedSoftmax.apply(input, mask, scale)
+
+    def forward_torch_softmax(self, input, mask):
+        if self.input_in_float16 and self.softmax_in_fp32:
+            input = input.float()
+
+        if self.scale is not None:
+            input = input * self.scale
+        mask_output = self.mask_func(input, mask) if mask is not None else input
+        probs = torch.nn.Softmax(dim=-1)(mask_output)
+
+        if self.input_in_float16 and self.softmax_in_fp32:
+            if self.input_in_fp16:
+                probs = probs.half()
+            else:
+                probs = probs.bfloat16()
 
         return probs
+
+    @staticmethod
+    def get_batch_per_block(b, np, sq, sk):
+        import scaled_masked_softmax_cuda
+
+        return scaled_masked_softmax_cuda.get_batch_per_block(sq, sk, b, np)
