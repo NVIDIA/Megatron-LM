@@ -340,7 +340,6 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 2048 );
     if (softmax_elements == 0) {
         return;
     } else {
@@ -360,7 +359,6 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
-        TORCH_INTERNAL_ASSERT(attn_batches % batches_per_block == 0);
         int blocks_per_seq = attn_batches / batches_per_block;
         dim3 blocks(seq_len, blocks_per_seq, 1);
         dim3 threads(warp_size, warps_per_block, 1);
@@ -430,7 +428,6 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 2048 );
     if (softmax_elements == 0) {
        return;
     } else {
@@ -450,7 +447,6 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
-        TORCH_INTERNAL_ASSERT(attn_batches % batches_per_block == 0);
         int blocks_per_seq = attn_batches / batches_per_block;
         dim3 blocks(seq_len, blocks_per_seq, 1);
         dim3 threads(warp_size, warps_per_block, 1);
