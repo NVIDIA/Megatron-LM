@@ -154,6 +154,11 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.DDP_impl == 'local'
         args.use_contiguous_buffers_in_ddp = True
 
+    # If we use a contiguous buffer to hold main grads, we need to have
+    # local DDP.
+    if args.use_contiguous_buffers_in_ddp:
+        assert args.DDP_impl == 'local'
+
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
