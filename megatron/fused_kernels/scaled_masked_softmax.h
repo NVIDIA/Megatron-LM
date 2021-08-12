@@ -16,7 +16,6 @@
 
 #pragma once
 
-#include <stdio.h>
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cfloat>
