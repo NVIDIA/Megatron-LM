@@ -363,8 +363,7 @@ def train_step(forward_step_func, data_iterator,
         optimizer, timers, forward_only=False)
 
     # Empty unused memory
-    if args.empty_unused_memory_each_iter >= 2:
-        raise Exception("hi.")
+    if args.empty_unused_memory_each_iter >= 1:
         torch.cuda.empty_cache()
 
     # All-reduce if needed.
@@ -414,7 +413,7 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 1
 
     # Empty unused memory
-    if args.empty_unused_memory_each_iter >= 1:
+    if args.empty_unused_memory_each_iter >= 2:
         torch.cuda.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -724,6 +723,10 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             loss_dicts = forward_backward_func(
                 forward_step_func, data_iterator, model, optimizer=None,
                 timers=None, forward_only=True)
+
+            # Empty unused memory
+            if args.empty_unused_memory_each_iter >= 1:
+                torch.cuda.empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
                 # Reduce across processes.

@@ -601,10 +601,6 @@ def _add_distributed_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None, help='If set, affine parallel weights '
                        'initialization uses CPU' )
-    # group.add_argument('--empty-unused-memory-each-iter', action='store_true',
-    #                    help='Call torch.cuda.empty_cache() each iteration '
-    #                    '(training and eval), to reduce fragmentation',
-    #                    default=False)
     group.add_argument('--empty-unused-memory-each-iter', default=0, type=int,
                        choices=[0, 1, 2],
                        help='Call torch.cuda.empty_cache() each iteration '
