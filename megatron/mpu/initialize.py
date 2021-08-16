@@ -356,9 +356,13 @@ def get_data_parallel_rank():
 
 def destroy_model_parallel():
     """Set the groups to none."""
+    global _MODEL_PARALLEL_GROUP
+    _MODEL_PARALLEL_GROUP = None
     global _TENSOR_MODEL_PARALLEL_GROUP
     _TENSOR_MODEL_PARALLEL_GROUP = None
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None
+    global _EMBEDDING_GROUP
+    _EMBEDDING_GROUP = None
