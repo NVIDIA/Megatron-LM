@@ -362,6 +362,11 @@ def train_step(forward_step_func, data_iterator,
         forward_step_func, data_iterator, model,
         optimizer, timers, forward_only=False)
 
+    # Empty unused memory
+    if args.empty_unused_memory_each_iter >= 2:
+        raise Exception("hi.")
+        torch.cuda.empty_cache()
+
     # All-reduce if needed.
     if args.DDP_impl == 'local':
         timers('backward-params-all-reduce').start()
@@ -407,6 +412,10 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 0
     else:
         skipped_iter = 1
+
+    # Empty unused memory
+    if args.empty_unused_memory_each_iter >= 1:
+        torch.cuda.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
