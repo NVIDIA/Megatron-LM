@@ -96,7 +96,7 @@ def pretrain(train_valid_test_dataset_provider,
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
     global _TRAIN_START_TIME
-    start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
+    start_time_tensor = torch.cuda.DoubleTensor([_TRAIN_START_TIME])
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -787,10 +787,9 @@ def build_train_valid_test_data_iterators(
             'only backward compatiblity support for iteration-based training'
         args.consumed_train_samples = args.iteration * args.global_batch_size
     if args.iteration > 0 and args.consumed_valid_samples == 0:
-        assert args.train_samples is None, \
-            'only backward compatiblity support for iteration-based training'
-        args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
-            args.eval_iters * args.global_batch_size
+        if args.train_samples is None:
+            args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
+                args.eval_iters * args.global_batch_size
 
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:
