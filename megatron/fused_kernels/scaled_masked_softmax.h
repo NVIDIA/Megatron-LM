@@ -339,6 +339,7 @@ void dispatch_scaled_masked_softmax_forward(
     int attn_heads,
     int pad_batches)
 {
+    TORCH_INTERNAL_ASSERT(key_seq_len >= 0 && key_seq_len <= 2048 );
     if (key_seq_len == 0) {
         return;
     } else {
@@ -357,6 +358,7 @@ void dispatch_scaled_masked_softmax_forward(
 
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
+        TORCH_INTERNAL_ASSERT(query_seq_len%batches_per_block == 0);
         dim3 blocks(query_seq_len/batches_per_block, attn_heads, batches);
         dim3 threads(warp_size, warps_per_block, 1);
         // Launch code would be more elegant if C++ supported FOR CONSTEXPR
@@ -426,6 +428,7 @@ void dispatch_scaled_masked_softmax_backward(
     int batches,
     int attn_heads)
 {
+    TORCH_INTERNAL_ASSERT( key_seq_len >= 0 && key_seq_len <= 2048 );
     if (key_seq_len == 0) {
        return;
     } else {
