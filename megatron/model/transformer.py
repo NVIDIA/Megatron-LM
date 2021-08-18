@@ -53,8 +53,7 @@ class ParallelMLP(MegatronModule):
 
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension. At the end, dropout is also
-    applied.
+    state back into h hidden dimension.
     """
 
     def __init__(self, init_method, output_layer_init_method):
@@ -83,7 +82,6 @@ class ParallelMLP(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True)
-
 
     def forward(self, hidden_states):
 

@@ -243,6 +243,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
         model_chunk_id = get_model_chunk_id(microbatch_id, forward=True)
         mpu.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
+        # forward step
         if mpu.is_pipeline_first_stage():
             if len(input_tensors[model_chunk_id]) == \
                     len(output_tensors[model_chunk_id]):
@@ -253,6 +254,11 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                                      model[model_chunk_id],
                                      input_tensor, losses_reduced)
         output_tensors[model_chunk_id].append(output_tensor)
+
+        # if forward-only, no need to save tensors for a backward pass
+        if forward_only:
+            input_tensors[model_chunk_id].pop()
+            output_tensors[model_chunk_id].pop()
 
         return output_tensor
 
@@ -538,8 +544,12 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
     recv_tensor_shapes = get_tensor_shapes(rank-1, model_type)
     send_tensor_shapes = get_tensor_shapes(rank, model_type)
 
-    input_tensors = []
-    output_tensors = []
+    # Input, output tensors only need to be saved when doing backward passes
+    input_tensors = None
+    output_tensors = None
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
     losses_reduced = []
 
     # Run warmup forward passes.
@@ -549,8 +559,9 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
                                      input_tensor, losses_reduced)
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -566,21 +577,24 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
                                      input_tensor, losses_reduced)
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, timers=timers)
+
+            if not last_iteration:
+                input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
+
         else:
             output_tensor_grad = \
                 send_forward_recv_backward(output_tensor,
                                            send_tensor_shapes,
                                            timers=timers)
-        # Add input_tensor and output_tensor to end of list, then pop from the
-        # start of the list for backward pass.
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
 
-        if forward_only:
-            if not last_iteration:
-                input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
-        else:
-            input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+            # Add input_tensor and output_tensor to end of list.
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
+
+            # Pop input_tensor and output_tensor from the start of the list for
+            # the backward pass.
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,

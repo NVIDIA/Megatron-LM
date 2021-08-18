@@ -160,6 +160,11 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.DDP_impl == 'local'
         args.use_contiguous_buffers_in_ddp = True
 
+    # If we use a contiguous buffer to hold main grads, we need to have
+    # local DDP.
+    if args.use_contiguous_buffers_in_ddp:
+        assert args.DDP_impl == 'local'
+
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
@@ -605,6 +610,11 @@ def _add_distributed_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None, help='If set, affine parallel weights '
                        'initialization uses CPU' )
+    group.add_argument('--empty-unused-memory-level', default=0, type=int,
+                       choices=[0, 1, 2],
+                       help='Call torch.cuda.empty_cache() each iteration '
+                       '(training and eval), to reduce fragmentation.'
+                       '0=off, 1=moderate, 2=aggressive.')
     return parser
 
 
