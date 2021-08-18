@@ -354,8 +354,7 @@ def train_step(forward_step_func, data_iterator,
     if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
         for partition in model:
             partition.zero_grad_buffer()
-    else:
-        optimizer.zero_grad()
+    optimizer.zero_grad()
 
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
