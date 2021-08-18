@@ -100,10 +100,12 @@ def get_megatron_optimizer(model):
                                                  args.clip_grad,
                                                  args.log_num_zeros_in_grad,
                                                  params_have_main_grad,
+                                                 args.use_contiguous_buffers_in_ddp,
                                                  args.bf16,
                                                  grad_scaler)
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,
                          args.log_num_zeros_in_grad,
-                         params_have_main_grad)
+                         params_have_main_grad,
+                         args.use_contiguous_buffers_in_ddp)

@@ -68,7 +68,9 @@ class MegatronOptimizer(ABC):
 
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
-                 params_have_main_grad):
+                 params_have_main_grad,
+                 use_contiguous_buffers_in_ddp):
+
         """Input optimizer is the base optimizer for example Adam."""
         self.optimizer = optimizer
         assert self.optimizer, 'no optimizer is provided.'
@@ -76,7 +78,11 @@ class MegatronOptimizer(ABC):
         self.clip_grad = clip_grad
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.params_have_main_grad = params_have_main_grad
+        self.use_contiguous_buffers_in_ddp = use_contiguous_buffers_in_ddp
 
+        if self.use_contiguous_buffers_in_ddp:
+            assert self.params_have_main_grad, \
+                "use of contiguous buffer requires that params have main grad"
 
     def get_parameters(self):
         params = []
@@ -187,11 +193,12 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
     """
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
-                 params_have_main_grad, bf16, grad_scaler):
+                 params_have_main_grad, use_contiguous_buffers_in_ddp,
+                 bf16, grad_scaler):
 
         super(Float16OptimizerWithFloat16Params, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad)
+            params_have_main_grad, use_contiguous_buffers_in_ddp)
 
         self.bf16 = bf16
         self.grad_scaler = grad_scaler
@@ -310,12 +317,26 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                 else:
                     if model_param.grad is not None:
                         main_param.grad = model_param.grad.float()
+
+                # Safe to deallocate model's grad/main_grad after copying.
+                # (If using contiguous buffers, main_grad's memory should
+                # persist and therefore should not be deallocated.)
+                model_param.grad = None
+                if self.params_have_main_grad and \
+                   not self.use_contiguous_buffers_in_ddp:
+                    model_param.main_grad = None
+
         # For fp32 grads, we need to reset the grads to main grad.
         if self.params_have_main_grad:
             for model_group in self.fp32_from_fp32_groups:
                 for model_param in model_group:
                     model_param.grad = model_param.main_grad
 
+                    # Safe to de-reference model's main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    if not self.use_contiguous_buffers_in_ddp:
+                        model_param.main_grad = None
 
     def _unscale_main_grads_and_check_for_nan(self):
         main_grads = []
@@ -469,11 +490,12 @@ class FP32Optimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
-                 params_have_main_grad):
+                 params_have_main_grad,
+                 use_contiguous_buffers_in_ddp):
 
         super(FP32Optimizer, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad)
+            params_have_main_grad, use_contiguous_buffers_in_ddp)
 
         self._scale = torch.cuda.FloatTensor([1.0])
 
@@ -499,6 +521,12 @@ class FP32Optimizer(MegatronOptimizer):
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
                     param.grad = param.main_grad
+
+                    # Safe to de-reference model's main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    if not self.use_contiguous_buffers_in_ddp:
+                        param.main_grad = None
 
         # Clip gradients.
         grad_norm = None
