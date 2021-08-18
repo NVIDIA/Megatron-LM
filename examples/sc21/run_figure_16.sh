@@ -21,7 +21,7 @@ NLS=32
 HS=15360
 NAH=128
 DDP=local
-MEGATRON_EXTRA_PARAMS="--checkpoint-activations "
+MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform "
 NNODES=8
 
 

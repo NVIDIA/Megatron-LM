@@ -25,7 +25,7 @@ MBS=1
 HS=20480
 NAH=128
 DDP=local
-MEGATRON_EXTRA_PARAMS="--checkpoint-activations "
+MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform "
 
 
 # Name of the job.
