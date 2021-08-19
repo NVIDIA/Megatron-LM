@@ -92,10 +92,11 @@ def parse_args(extra_args_provider=None, defaults={},
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
     if args.checkpoint_activations:
-        print('--checkpoint-activations is no longer valid, '
-              'use --activation-checkpoint-method instead. '
-              'Defaulting to activation-checkpoint-method=uniform.')
         args.activations_checkpoint_method = 'uniform'
+        if args.rank == 0:
+            print('--checkpoint-activations is no longer valid, '
+                  'use --activation-checkpoint-method instead. '
+                  'Defaulting to activation-checkpoint-method=uniform.')
     del args.checkpoint_activations
 
     # Set input defaults.
@@ -413,9 +414,10 @@ def _add_training_args(parser):
                        help='1) uniform: uniformly divide the total number of '
                        'Transformer layers and checkpoint the input activation of '
                        'each divided chunk, '
-                       '2) block: checkpoint the input activation of only a set '
-                       'number of individual Transformer layers and skip the rest, '
-                       'default) checkpoint the inputs of every Transformer layer')
+                       '2) checkpoint the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any checkpointing'
+                       'default) do not apply activations checkpoint to any layers')
     group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
                        help='1) uniform: the number of Transformer layers in each '
                        'uniformly divided checkpoint unit, '
