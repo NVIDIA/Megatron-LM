@@ -154,6 +154,10 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
+    # For torch DDP, we do not use contiguous buffer
+    if args.DDP_impl == 'torch':
+        args.use_contiguous_buffers_in_local_ddp = False
+
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
