@@ -148,16 +148,15 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # If we do accumulation and all-reduces in fp32, we need to have
-    # local DDP and we should set the use-contiguous-buffers-in-ddp.
+    # If we do accumulation and all-reduces in fp32, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
-        args.use_contiguous_buffers_in_ddp = True
+        assert args.use_contiguous_buffers_in_local_ddp
 
-    # If we use a contiguous buffer to hold main grads, we need to have
-    # local DDP.
-    if args.use_contiguous_buffers_in_ddp:
-        assert args.DDP_impl == 'local'
+    # For torch DDP, we do not use contiguous buffer
+    if args.DDP_impl == 'torch':
+        args.use_contiguous_buffers_in_local_ddp = False
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -584,9 +583,10 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
-    group.add_argument('--use-contiguous-buffers-in-ddp', action='store_true',
-                       help='If set, use contiguous buffer in DDP. Note that '
-                       'this option only works woth local DDP.' )
+    group.add_argument('--no-contiguous-buffers-in-local-ddp',
+                       action='store_false', help='If set, dont use '
+                       'contiguous buffer in local DDP.',
+                       dest='use_contiguous_buffers_in_local_ddp')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
