@@ -16,9 +16,9 @@ GBS=12
 
 # Set scatter-gather communication optimization options.
 if [ ${SCATTER_GATHER} == "YES" ]; then
-    MEGATRON_EXTRA_PARAMS="--checkpoint-activations --num-layers-per-virtual-pipeline-stage 2 "
+    MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform --num-layers-per-virtual-pipeline-stage 2 "
 elif [ ${SCATTER_GATHER} == "NO" ]; then
-    MEGATRON_EXTRA_PARAMS="--checkpoint-activations --num-layers-per-virtual-pipeline-stage 2 --no-scatter-gather-tensors-in-pipeline "
+    MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform --num-layers-per-virtual-pipeline-stage 2 --no-scatter-gather-tensors-in-pipeline "
 else
     echo "Invalid configuration"
     exit 1
