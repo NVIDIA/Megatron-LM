@@ -544,6 +544,8 @@ class ParallelTransformer(MegatronModule):
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
         self.checkpoint_num_layers = args.checkpoint_num_layers
+        self.distribute_checkpointed_activations \
+            = args.distribute_checkpointed_activations
 
         # Number of layers.
         assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
@@ -607,12 +609,11 @@ class ParallelTransformer(MegatronModule):
                 return x_
             return custom_forward
 
-        # Make sure memory is freed.
-        mpu.reset_checkpointed_activations_memory_buffer()
         l = 0
         while l < self.num_layers:
             hidden_states = mpu.checkpoint(
                 custom(l, l + self.checkpoint_num_layers),
+                self.distribute_checkpointed_activations,
                 hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
             l += self.checkpoint_num_layers
 

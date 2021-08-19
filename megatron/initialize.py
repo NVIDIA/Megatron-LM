@@ -77,9 +77,6 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Megatron's MPU is the master. Complete initialization right away.
         finish_mpu_init()
 
-        # Initialize memory buffers.
-        _initialize_mem_buffs()
-        
         # Autoresume.
         _init_autoresume()
 
@@ -224,11 +221,3 @@ def write_args_to_tensorboard():
             writer.add_text(arg, str(getattr(args, arg)),
                             global_step=args.iteration)
 
-
-def _initialize_mem_buffs():
-    """Initialize manually allocated static memory."""
-    args = get_args()
-
-    # Initialize memory for checkpointed activations.
-    if args.distribute_checkpointed_activations:
-        mpu.init_checkpointed_activations_memory_buffer()
