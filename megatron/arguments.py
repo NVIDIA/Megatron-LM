@@ -236,6 +236,7 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.checkpoint_activations, \
             'for distribute-checkpointed-activations to work you '\
             'need to enable checkpoint-activations'
+        assert args.pipeline_model_parallel_size == 1
 
     _print_args(args)
     return args
