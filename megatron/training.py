@@ -253,7 +253,7 @@ def get_model(model_provider_func):
     if args.DDP_impl == 'local':
         model = [LocalDDP(model_module,
                           args.accumulate_allreduce_grads_in_fp32,
-                          args.use_contiguous_buffers_in_ddp)
+                          args.use_contiguous_buffers_in_local_ddp)
                  for model_module in model]
         return model
 
@@ -351,7 +351,7 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
+    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
         for partition in model:
             partition.zero_grad_buffer()
     optimizer.zero_grad()
