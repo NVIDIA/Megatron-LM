@@ -542,7 +542,6 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = None
 
         # Store activation checkpoiting flag.
-
         self.activations_checkpoint_method = args.activations_checkpoint_method
         self.activations_checkpoint_num_layers = args.activations_checkpoint_num_layers
         self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
