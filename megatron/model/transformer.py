@@ -616,7 +616,7 @@ class ParallelTransformer(MegatronModule):
             while l < self.num_layers:
                 hidden_states = mpu.checkpoint(
                     custom(l, l + self.activations_checkpoint_num_layers),
-                    self.distribute_checkpointed_activations,
+                    self.distribute_checkpointed_activations and ( (l > 0) or (mpu.get_pipeline_model_parallel_rank() == 0)),
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 l += self.activations_checkpoint_num_layers
         elif self.activations_checkpoint_method == 'block':
@@ -627,7 +627,7 @@ class ParallelTransformer(MegatronModule):
                 if l < self.activations_checkpoint_num_layers:
                     hidden_states = mpu.checkpoint(
                         custom(l, l + 1),
-                        self.distribute_checkpointed_activations,
+                        self.distribute_checkpointed_activations and ( (l > 0) or (mpu.get_pipeline_model_parallel_rank() == 0)),
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 else:
                     hidden_states = custom(l, l + 1)(
