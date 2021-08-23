@@ -316,7 +316,6 @@ int get_batch_per_block(int query_seq_len, int key_seq_len, int batches, int att
     int log2_elements = log2_ceil(key_seq_len);
     const int next_power_of_two = 1 << log2_elements;
 
-    int batch_count = batches * attn_heads * query_seq_len;
     int warp_size = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     int batches_per_warp = (next_power_of_two <= 128) ? 2 : 1;
 
