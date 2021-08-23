@@ -246,6 +246,9 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.activations_checkpoint_method is not None, \
             'for distribute-checkpointed-activations to work you '\
             'need to use a activation-checkpoint method '
+        assert args.num_layers_per_virtual_pipeline_stage is None, \
+            'currently distrobuted checkpoint activations only supported for ' \
+            'nointerleaved pipeline parallelism'
 
     _print_args(args)
     return args
