@@ -26,7 +26,7 @@ from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
-from megatron.api_server import MegatronServer
+from megatron.text_generation_server import MegatronServer
 from megatron.text_generation_utils import generate
 import torch
 
