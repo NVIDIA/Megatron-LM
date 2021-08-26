@@ -103,6 +103,11 @@ python tools/preprocess_data.py \
 
 The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
 
+For T5 use the same preprocessing as BERT, perhaps renaming it to:
+<pre>
+       --output-prefix my-t5 \
+</pre>
+
 Some minor modifications are required for GPT data preprocessing, namely, the addition of a merge table, an end-of-document token, removal of sentence splitting, and a change to the tokenizer type:
 <pre>
 python tools/preprocess_data.py \
@@ -122,7 +127,7 @@ Further command line arguments are described in the source file [`preprocess_dat
 ## BERT Pretraining
 
 
-The `examples/pretrain_bert.sh` script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` whcih is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
+The `examples/pretrain_bert.sh` script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
 
 The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
@@ -151,7 +156,7 @@ OUTPUT_ARGS="--log-interval 10 \
              --save-interval 500 \
              --eval-interval 100 \
              --eval-iters 10 \
-             --checkpoint-activations"
+             --activations-checkpoint-method uniform"
 
 python pretrain_bert.py \
        $BERT_ARGS \
@@ -237,13 +242,14 @@ T5_ARGS="--num-layers 24 \
          --micro-batch-size 16 \
          --global-batch-size 2048 \
          --vocab-file $VOCAB_FILE \
+         --vocab-extra-ids 100 \
          --split 949,50,1 \
          --fp16"
 
 OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
 
 python pretrain_t5.py \
-       $BERT_ARGS \
+       $T5_ARGS \
        $OUTPUT_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
@@ -294,6 +300,17 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_<model>.py \
                 --DDP-impl torch
 </pre>
 
+The interleaved pipelining schedule (more details in Section 2.2.2 of [our paper](https://arxiv.org/pdf/2104.04473.pdf)) can be enabled using the `--num-layers-per-virtual-pipeline-stage` argument, which controls the number of transformer layers in a virtual stage (by default with the non-interleaved schedule, each GPU will execute a single virtual stage with `NUM_LAYERS / PIPELINE_MP_SIZE` transformer layers). The total number of layers in the transformer model should be divisible by this argument value. Additionally, the number of microbatches in the pipeline (computed as `GLOBAL_BATCH_SIZE / (DATA_PARALLEL_SIZE * MICRO_BATCH_SIZE)`) should be divisible by the `PIPELINE_MP_SIZE` when using this schedule (this condition is checked in an assertion in the code). The interleaved schedule is not supported for pipelines with 2 stages (`PIPELINE_MP_SIZE=2`).
+
+## Activation Checkpointing and Recomputation
+
+To reduce GPU memory usage so deploy a large model to a training system, we support activation checkpointing and recomputation. We use a Transformer layer as the unit of checkpointing because the activation size bloats in the middle of a Transformer layer so checkpointing the input of a Transformer layer is storage-efficient. We support two activation checkpointing methods: `uniform` and `block`.
+
+Uniform method uniformly divides the Transformer layers into groups of layers and stores the input activations of each group in the memory. The baseline group size is 1 and, in this case, the input activation of each Transformer layer is checkpointed. When the GPU memory is insufficient, increasing the number of layers per group reduces the memory usage thus enables running a bigger model. For example, when using the number of layers per group of 4, the input activation of each group of 4 Transformer layers is checkpointed.
+
+Block method checkpoints the input activations of a set number of individual Transformer layers per pipeline stage and do the rest of layers without any checkpointing. This method can be used to skip checkpointing some Transformer layers until the GPU memory is fully used, which is applicable only when there is unused GPU memory. Checkpointing fewer transformer layers avoids unnecessary activation recomputation in the backprop thus improves training performance. For example, when we specify 5 layers to checkpoint of 8 layers per pipeline stage, the input activations of only the first 5 Transformer layers are checkpointed and activation recomputation for the rest 3 layers is not needed in the backprop.
+
+
 ## GPT-3 Example
 
 In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to configure Megatron to run [GPT-3](https://arxiv.org/abs/2005.14165) with 175 billion parameters on 1024 GPUs. The script is designed for [slurm](https://slurm.schedmd.com/documentation.html) with [pyxis](https://github.com/NVIDIA/pyxis) plugin but can be easily adopted to any other scheduler. It uses 8-way and 16-way tensor and pipeline parallelism, respectively. With options `global-batch-size 1536` and `rampup-batch-size 16 16 5859375`, the training will start with global batch size 16 and linearly increase the global batch size to 1536 over 5,859,375 samples with incrmeental steps 16. The training dataset can be either a single set or a multiple datasets combined with a set of weights.
@@ -337,7 +354,7 @@ python pretrain_ict.py \
     --max-position-embeddings 256 \
     --ict-head-size 128 \
     --train-iters 100000 \
-    --checkpoint-activations \
+    --activations-checkpoint-method uniform \
     --bert-load /path/to/pretrained_bert \
     --load checkpoints \
     --save checkpoints \
@@ -367,7 +384,7 @@ python tools/create_doc_index.py \
     --ict-head-size 128 \
     --num-attention-heads 12 \
     --batch-size 128 \
-    --checkpoint-activations \
+    --activations-checkpoint-method uniform \
     --seq-length 256 \
     --max-position-embeddings 256 \
     --ict-load /path/to/pretrained_ict \
@@ -474,7 +491,7 @@ python tasks/main.py \
        --merge-file $MERGE_FILE \
        --load $CHECKPOINT_PATH \
        --micro-batch-size 8 \
-       --checkpoint-activations \
+       --activations-checkpoint-method uniform \
        --log-interval 10 \
        --no-load-optim \
        --no-load-rng
@@ -504,7 +521,7 @@ python tasks/main.py \
        --merge-file $MERGE_FILE \
        --load $CHECKPOINT_PATH \
        --micro-batch-size 8 \
-       --checkpoint-activations \
+       --activations-checkpoint-method uniform \
        --log-interval 10 \
        --no-load-optim \
        --no-load-rng
@@ -534,7 +551,7 @@ COMMON_TASK_ARGS="--num-layers 24 \
 COMMON_TASK_ARGS_EXT="--train-data $TRAIN_DATA \
                       --valid-data $VALID_DATA \
                       --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
-                      --checkpoint-activations \
+                      --activations-checkpoint-method uniform \
                       --save-interval 10000 \
                       --save $CHECKPOINT_PATH \
                       --log-interval 100 \

@@ -20,7 +20,7 @@ python tasks/main.py \
     --num-attention-heads 12 \
     --tensor-model-parallel-size 1 \
     --micro-batch-size 128 \
-    --checkpoint-activations \
+    --activations-checkpoint-method uniform \
     --seq-length 512 \
     --max-position-embeddings 512 \
     --load ${CHECKPOINT_PATH} \
@@ -29,7 +29,6 @@ python tasks/main.py \
     --retriever-seq-length 256 \
     --vocab-file  bert-vocab.txt\
     --qa-data-test ${QA_FILE} \
-    --num-workers 2 \
     --faiss-use-gpu \
     --retriever-report-topk-accuracies 1 5 20 100 \
     --fp16 \

@@ -53,8 +53,7 @@ class ParallelMLP(MegatronModule):
 
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the
-    state back into h hidden dimension. At the end, dropout is also
-    applied.
+    state back into h hidden dimension.
     """
 
     def __init__(self, init_method, output_layer_init_method):
@@ -83,7 +82,6 @@ class ParallelMLP(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True)
-
 
     def forward(self, hidden_states):
 
@@ -544,8 +542,8 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = None
 
         # Store activation checkpoiting flag.
-        self.checkpoint_activations = args.checkpoint_activations
-        self.checkpoint_num_layers = args.checkpoint_num_layers
+        self.activations_checkpoint_method = args.activations_checkpoint_method
+        self.activations_checkpoint_num_layers = args.activations_checkpoint_num_layers
 
         # Number of layers.
         assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
@@ -611,12 +609,31 @@ class ParallelTransformer(MegatronModule):
 
         # Make sure memory is freed.
         mpu.reset_checkpointed_activations_memory_buffer()
-        l = 0
-        while l < self.num_layers:
-            hidden_states = mpu.checkpoint(
-                custom(l, l + self.checkpoint_num_layers),
-                hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
-            l += self.checkpoint_num_layers
+
+        if self.activations_checkpoint_method == 'uniform':
+            # Uniformly divide the total number of Transformer layers and checkpoint
+            # the input activation of each divided chunk.
+            # A method to further reduce memory usage reducing checkpoints.
+            l = 0
+            while l < self.num_layers:
+                hidden_states = mpu.checkpoint(
+                    custom(l, l + self.activations_checkpoint_num_layers),
+                    hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                l += self.activations_checkpoint_num_layers
+        elif self.activations_checkpoint_method == 'block':
+            # Checkpoint the input activation of only a set number of individual
+            # Transformer layers and skip the rest.
+            # A method fully use the device memory removing redundant re-computation.
+            for l in range(self.num_layers):
+                if l < self.activations_checkpoint_num_layers:
+                    hidden_states = mpu.checkpoint(
+                        custom(l, l + 1),
+                        hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                else:
+                    hidden_states = custom(l, l + 1)(
+                        hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+        else:
+            raise ValueError("Invalid activation checkpoint method.")
 
         return hidden_states
 
@@ -639,7 +656,7 @@ class ParallelTransformer(MegatronModule):
                 'for not None values in layer_past, ' \
                 'expected get_key_value to be set'
         if get_key_value:
-            assert not self.checkpoint_activations, \
+            assert self.activations_checkpoint_method is None, \
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
@@ -658,7 +675,7 @@ class ParallelTransformer(MegatronModule):
         if encoder_output is not None:
              encoder_output = encoder_output.transpose(0, 1).contiguous()
 
-        if self.checkpoint_activations:
+        if self.activations_checkpoint_method is not None:
             hidden_states = self._checkpointed_forward(hidden_states,
                                                        attention_mask,
                                                        encoder_output,

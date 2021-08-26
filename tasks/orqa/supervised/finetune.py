@@ -33,6 +33,28 @@ from tasks.orqa.supervised.eval_utils import accuracy_func_provider
 from tasks.orqa.supervised.eval_utils import process_batch, task_collate_fn
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
+# input_ is a 2D tensor
+def check_and_append_tensor_for_gather(group, rank, world_size, input_):
+
+    # gather the size of the first dimension of the tensor from all ranks
+    current_length = input_.size()[0]
+    first_dim = torch.tensor([[current_length]], 
+        device=torch.cuda.current_device())
+    input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
+    input_list[rank].copy_(first_dim)
+    torch.distributed.all_gather(input_list, first_dim, group=group)
+    all_input_list = torch.cat(input_list, dim=0).contiguous()
+    max_length = torch.max(all_input_list)
+
+    # if the size are different than the max, extend the tensor
+    # accordingly
+    if max_length > current_length:
+        padding=tuple([0] * (input_.dim() * 2 - 1)) + \
+            tuple([max_length - current_length])
+        input_ = F.pad(input=input_, pad=padding)
+
+    return input_
+
 def orqa(Dataset):
 
     def cross_entropy_forward_step(batch, model):
@@ -46,6 +68,8 @@ def orqa(Dataset):
             batch_ = next(batch)
         except BaseException:
             batch_ = batch
+
+        group, rank, world_size = get_group_world_size_rank()
 
         query_tokens, query_mask, query_types, query_pad_mask, \
         context_tokens, context_mask, context_types, context_pad_mask, \
@@ -62,6 +86,14 @@ def orqa(Dataset):
             context_list.append(tokenizer.decode(context_tokens[i].tolist()))
 
         if neg_context_tokens is not None:
+            neg_context_tokens = check_and_append_tensor_for_gather(group,
+                rank, world_size, neg_context_tokens)
+            neg_context_mask = check_and_append_tensor_for_gather(group,
+                rank, world_size, neg_context_mask)
+            neg_context_types = check_and_append_tensor_for_gather(group,
+                rank, world_size, neg_context_types)
+
+        if neg_context_tokens is not None:
             context_tokens = torch.cat([context_tokens, neg_context_tokens])
             context_mask = torch.cat([context_mask, neg_context_mask])
             context_types = torch.cat([context_types, neg_context_types])
@@ -70,7 +102,6 @@ def orqa(Dataset):
         output_tensor = model(query_tokens, query_mask,
                                         query_types, context_tokens,
                                         context_mask, context_types)
-
         return output_tensor, partial(cross_entropy_loss_func, query_tokens, context_tokens)
 
 

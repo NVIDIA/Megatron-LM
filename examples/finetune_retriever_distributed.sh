@@ -36,7 +36,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --bert-load ${BERT_LOAD_PATH} \
         --save-interval 5000 \
         --log-interval 10 \
-        --eval-interval 25000 \
+        --eval-interval 20000 \
         --eval-iters 100 \
         --indexer-log-interval 1000 \
         --faiss-use-gpu \
