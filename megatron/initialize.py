@@ -180,7 +180,6 @@ def _initialize_distributed():
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
-            init_method=init_method,
             timeout=timedelta(days=7))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
