@@ -241,7 +241,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
 
-        while context_length <= (maxlen):
+        while context_length < maxlen:
             types2use = None
             if counter == 0:
                 tokens2use = tokens[:, :context_length]
