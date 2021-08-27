@@ -240,9 +240,15 @@ def parse_args(extra_args_provider=None, defaults={},
             'residual connection in fp32 only supported when using fp16 or bf16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
+        assert args.tensor_model_parallel_size > 1, 'can distribute ' \
+            'checkpointed activations only across tensor model ' \
+            'parallel groups'
         assert args.activations_checkpoint_method is not None, \
             'for distribute-checkpointed-activations to work you '\
-            'need to use a valid checkpoint-activation method (\'uniform\' or \'block\')'
+            'need to use a activation-checkpoint method '
+        assert args.num_layers_per_virtual_pipeline_stage is None, \
+            'currently distrobuted checkpoint activations only supported for ' \
+            'nointerleaved pipeline parallelism'
 
     _print_args(args)
     return args
