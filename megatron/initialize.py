@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 import torch
+from datetime import timedelta
 
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
@@ -175,8 +176,8 @@ def _initialize_distributed():
         # Call the init process
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank)
-
+            world_size=args.world_size, rank=args.rank,
+            timeout=timedelta(days=7))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
