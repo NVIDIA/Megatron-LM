@@ -29,4 +29,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS tools/run_text_generation_s
        --vocab-file $VOCAB_FILE  /
        --merge-file $MERGE_FILE  /
        --top_p 0.9  /
-	   --seed 42
+       --seed 42
