@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
+from megatron import print_rank_0
 from megatron import get_tokenizer
 from megatron import mpu
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
@@ -189,6 +190,362 @@ def generate_samples_input_from_file(model):
 
             raw_text = None
             context_count += 1
+
+
+def generate_samples_line_by_line_input_from_file(model):
+
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    # Read the sample file and open the output file.
+    assert args.sample_input_file is not None, \
+        'sample input file is not provided.'
+    if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+        fname = open(args.sample_input_file, "r")
+        all_raw_text = fname.readlines()
+        input_count = len(all_raw_text)
+        input_pos = 0
+        if args.sample_output_file is None:
+            sample_output_file = args.sample_input_file + ".out"
+            print('`sample-output-file` not specified, setting '
+                    'it to {}'.format(sample_output_file))
+        else:
+            sample_output_file = args.sample_output_file
+
+        fname_out = open(sample_output_file, "w")
+
+    context_count = 0
+    model.eval()
+    with torch.no_grad():
+        while True:
+            raw_text_len = 0
+
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
+                raw_text = all_raw_text[input_pos]
+                input_pos += 1
+                raw_text_len = len(raw_text)
+                context_tokens = tokenizer.tokenize(raw_text)
+            
+            else:
+                context_tokens = tokenizer.tokenize("EMPTY TEXT")
+
+            if input_pos % 100 == 0:
+                print_rank_0("input_pos: %d" % input_pos)
+
+            token_stream = get_token_stream(model, [context_tokens])
+            for _, decode_tokens in enumerate(token_stream):
+                pass
+
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    trim_decode_tokens = tokenizer.detokenize(
+                        decode_tokens)[raw_text_len:]
+
+                    if "\r" in trim_decode_tokens:
+                        trim_decode_tokens = trim_decode_tokens.replace("\r", "")
+                    if "\n" in trim_decode_tokens:
+                        trim_decode_tokens = trim_decode_tokens.replace("\n", "")
+                    fname_out.write(trim_decode_tokens)
+                    fname_out.write("\n")
+
+            raw_text = None
+            context_count += 1
+
+            if input_pos == input_count:
+                return
+
+
+def generate_samples_prompt_input_from_file(model):
+
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    # Read the sample file and open the output file.
+    assert args.sample_input_file is not None, \
+        'sample input file is not provided.'
+    if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
+        fname = open(args.sample_input_file, "r")
+        all_raw_text = fname.readlines()
+        input_count = len(all_raw_text)
+        input_pos = 0
+        if args.sample_output_file is None:
+            sample_output_file = args.sample_input_file + ".out"
+            print('`sample-output-file` not specified, setting '
+                    'it to {}'.format(sample_output_file))
+        else:
+            sample_output_file = args.sample_output_file
+
+        fname_out = open(sample_output_file, "w")
+
+    # Read the prompt file
+    with open(args.prompt_file, "r") as f:
+        prompt_examples = f.readlines()
+
+    prompt_examples = prompt_examples[:args.num_prompt_examples]
+    prompt = ""
+    for instance in prompt_examples:
+        instance = instance.strip()
+        prompt += instance + " \n"
+
+    assert args.prompt_type in ["context", "keyphrase"]
+    context_count = 0
+    model.eval()
+    with torch.no_grad():
+        while True:
+            raw_text_len = 0
+
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
+                input_str = all_raw_text[input_pos]
+                input_str = input_str.strip()
+                splits = input_str.split("\t")
+                control_codes = splits[0].split(" [CTRL] ")
+                topic = control_codes[0]
+
+                raw_text = prompt
+                if args.prompt_type == "context":
+                    turns = splits[1].split(" [SEP] ")
+                    context = turns[-1]
+                    raw_text += "( " + context + " ) " + topic + " :"
+
+                else:
+                    keyphrase_list = control_codes[1:]
+
+                    for i, keyphrase in enumerate(keyphrase_list):
+                        if i == 0:
+                            raw_text += "( "
+                        else:
+                            raw_text += "; "
+                        raw_text += keyphrase
+
+                    if len(keyphrase_list) > 0:
+                        raw_text += " ) "
+                    raw_text += topic + " :"
+
+                input_pos += 1
+                raw_text_len = len(raw_text)
+                context_tokens = tokenizer.tokenize(raw_text)
+            
+            else:
+                context_tokens = tokenizer.tokenize("EMPTY TEXT")
+
+            if input_pos % 100 == 0:
+                print_rank_0("input_pos: %d" % input_pos)
+
+            token_stream = get_token_stream(model, [context_tokens])
+            for _, decode_tokens in enumerate(token_stream):
+                pass
+            
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    trim_decode_tokens = tokenizer.detokenize(
+                        decode_tokens)[raw_text_len:]
+                    
+                    generated_output = trim_decode_tokens.split("\n")[0]
+                    generated_output = generated_output.strip()
+
+                    fname_out.write(generated_output)
+                    fname_out.write("\n")
+
+            raw_text = None
+            context_count += 1
+
+            if input_pos == input_count:
+                return
+
+
+def dialog_with_gpt_control_interactive(conv_model, ctrl_model, add_separtor):
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    conv_model.eval()
+    ctrl_model.eval()
+    dialog_history = []
+    with torch.no_grad():
+        while True:
+            ctrl_model_input_text_len = 0
+
+            if mpu.is_pipeline_first_stage() \
+               and mpu.get_tensor_model_parallel_rank() == 0:
+                # input @@ to separate the control code and current turn
+                input_text = input(">>> ")
+                while not input_text:
+                    print("Input should not be empty!")
+                    input_text = input(">>> ")
+                
+                assert " @@ " in input_text, "Please input with a correct template"
+                splits = input_text.split(" @@ ")
+                ctrl_code = splits[0]
+                curr_turn = splits[1]
+                prev_two_turns = ""
+                if add_separtor:
+                    for i, turn in enumerate(dialog_history[-2:]):
+                        if i == 0:
+                            prev_two_turns = "<< " + turn + " >>"
+                        else:
+                            prev_two_turns += " "
+                            prev_two_turns += "<< " + turn + " >>"
+                else:
+                    prev_two_turns = " ".join(dialog_history[-2:])
+                dialog_history.append(curr_turn)
+
+                print("\nHistory:", prev_two_turns)
+                print("User:", curr_turn)
+
+                if add_separtor:
+                    curr_turn = "<< " + curr_turn + " >>"
+
+                if prev_two_turns != "":
+                    dialog_context = prev_two_turns + " " + curr_turn
+                else:
+                    dialog_context = curr_turn
+                ctrl_input = ctrl_code + " " + dialog_context
+                
+                if add_separtor:
+                    ctrl_input += " :"
+
+                ctrl_input_text_len = len(ctrl_input)
+                ctrl_context_tokens = tokenizer.tokenize(ctrl_input)
+
+            else:
+                ctrl_context_tokens = tokenizer.tokenize("EMPTY TEXT")
+            
+            token_stream = get_token_stream(ctrl_model, [ctrl_context_tokens])
+            for _, decode_tokens in enumerate(token_stream):
+                pass
+
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+                    
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    control_sent = tokenizer.detokenize(
+                        decode_tokens)[ctrl_input_text_len:]
+            
+            control_sent = control_sent.replace("<|endoftext|>", "")
+            print("\nControl Sentence:", control_sent)
+            
+            if control_sent != "":
+                control_sent = "( " + control_sent + " )"
+                conv_input = control_sent + " " + dialog_context
+            else:
+                conv_input = dialog_context
+            
+            conv_input_text_len = len(conv_input)
+            
+            conv_context_tokens = tokenizer.tokenize(conv_input)
+            token_stream = get_token_stream(conv_model, [conv_context_tokens])
+            for _, decode_tokens in enumerate(token_stream):
+                pass
+
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+                    
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    response = tokenizer.detokenize(
+                        decode_tokens)[conv_input_text_len:]
+
+            response = response.replace("<|endoftext|>", "")
+            print("\nChatbot:", response)
+            dialog_history.append(response)
+
+
+def dialog_with_dpr_control_interactive(conv_model, ctrl_model, ctrl_tokenizer,
+                        knowledge_corpus, knowledge_corpus_emb, add_separtor):
+    args = get_args()
+    tokenizer = get_tokenizer()
+    
+    conv_model.eval()
+    ctrl_model.eval()
+    dialog_history = []
+    with torch.no_grad():
+        while True:
+            input_text = input(">>> ")
+            while not input_text:
+                print("Input should not be empty!")
+                input_text = input(">>> ")
+
+            assert " @@ " in input_text, "Please input with a correct template"
+            splits = input_text.split(" @@ ")
+            ctrl_code = splits[0]
+            curr_turn = splits[1]
+            prev_two_turns = " ".join(dialog_history[-2:])
+
+            prev_two_turns_v2 = ""
+            if add_separtor:
+                for i, turn in enumerate(dialog_history[-2:]):
+                    if i == 0:
+                        prev_two_turns_v2 = "<< " + turn + " >>"
+                    else:
+                        prev_two_turns_v2 += " "
+                        prev_two_turns_v2 += "<< " + turn + " >>"
+            else:
+                prev_two_turns_v2 = prev_two_turns
+            dialog_history.append(curr_turn)
+
+            print("\nHistory:", prev_two_turns_v2)
+            print("\nUser:", curr_turn)
+
+            if prev_two_turns != "":
+                dialog_context = prev_two_turns + " " + curr_turn
+            else:
+                dialog_context = curr_turn
+
+            if add_separtor:
+                curr_turn = "<< " + curr_turn + " >>"
+                dialog_context_v2 = prev_two_turns_v2 + curr_turn
+            else:
+                dialog_context_v2 = dialog_context
+
+            ctrl_input = ctrl_code + " " + dialog_context
+
+            ctrl_input_ids = ctrl_tokenizer.encode(ctrl_input)
+            ctrl_input_ids = torch.LongTensor([ctrl_input_ids]).cuda()
+            attn_masks = torch.ones(1, ctrl_input_ids.size()[-1]).cuda()
+
+            query_emb = ctrl_model(input_ids=ctrl_input_ids,
+                                   attention_mask=attn_masks).pooler_output # (1,768)
+
+            logits = knowledge_corpus_emb.matmul(query_emb[0])
+            retrieved_idx = torch.argmax(logits).item()
+            control_sent = knowledge_corpus[retrieved_idx].strip()
+            
+            print("\nControl Sentence:", control_sent)
+
+            if control_sent != "":
+                control_sent = "( " + control_sent + " )"
+                conv_input = control_sent + " " + dialog_context_v2
+            else:
+                conv_input = dialog_context_v2
+
+            conv_input_text_len = len(conv_input)
+            
+            conv_context_tokens = tokenizer.tokenize(conv_input)
+            token_stream = get_token_stream(conv_model, [conv_context_tokens])
+            for _, decode_tokens in enumerate(token_stream):
+                pass
+
+            if mpu.get_tensor_model_parallel_rank() == 0:
+                if mpu.is_pipeline_first_stage():
+                    
+                    decode_tokens, _ = decode_tokens
+                    decode_tokens = decode_tokens[0].cpu().numpy().tolist()
+                    response = tokenizer.detokenize(
+                        decode_tokens)[conv_input_text_len:]
+
+            response = response.replace("<|endoftext|>", "")
+            print("\nChatbot:", response)
+            dialog_history.append(response)
+
+
 
 # We added this function to support the tasks evaluation such as squad
 # and drop in the https://github.com/EleutherAI/lm-evaluation-harness 

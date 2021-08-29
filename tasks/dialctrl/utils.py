@@ -8,7 +8,9 @@ def get_ltor_attention_masks_and_position_ids(data, eod_token_id):
     micro_batch_size, seq_length = data.size()
 
     # Attention mask
-    attention_mask = torch.tril(torch.ones((micro_batch_size, seq_length, seq_length), device=data.device)).view(micro_batch_size, 1, seq_length, seq_length)
+    attention_mask = torch.tril(torch.ones(
+        (micro_batch_size, seq_length, seq_length), device=data.device)).view(
+            micro_batch_size, 1, seq_length, seq_length)
 
     # mask padded tokens
     for b in range(micro_batch_size):

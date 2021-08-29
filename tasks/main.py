@@ -87,15 +87,41 @@ def get_tasks_args(parser):
     # finetune for controllable dialogue
     group.add_argument('--train-module', type=str, default="",
                        help='either control module or dialogue model (control or dialog)')
-    group.add_argument('--data-folder', type=str, default="",
-                       help='data folder (path of the data folder)')
-    group.add_argument('--dataset-name', type=str, default="",
-                       help='dataset name (e.g., wizard_of_wikipedia)')
+    group.add_argument('--train-data-path', type=str, default="",
+                       help='datapath for training set')
+    group.add_argument('--test-data-path', type=str, default="",
+                       help='datapath for test set')
+    group.add_argument('--guess-file', type=str, default="",
+                       help='datapath for generated sentences')
+    group.add_argument('--answer-file', type=str, default="",
+                       help='datapath for golden sentences')
     group.add_argument('--max-seq-len', type=int, default=1024,
                        help='maximum sequence length')
-    group.add_argument('--spec-toks', type=str, default="[SEP],[CTRL],[PAD]",
+    group.add_argument('--spec-toks', type=str, default=None,
                        help='additional special tokens')
+    group.add_argument('--last-turn', action='store_true',
+                       help='only use last turn for control model')
+    group.add_argument('--no-control-code', action='store_true',
+                       help='removing control code in the training for control model')
+    group.add_argument('--remove-stopwords', action='store_true',
+                       help='removing stopwords when evaluating F1-score')
+    group.add_argument('--add-separator', action='store_true', 
+                       help='add separator between turns and add colon before generation')
+    group.add_argument('--add-ctrl-code-to-dialog', action='store_true', 
+                       help='add control code in the dialog modeling')
+    group.add_argument('--remove-ctrl-sent', action='store_true', 
+                       help='dont use control sentence in dialog modeling')
 
+
+    # finetune for controllable generation
+    group.add_argument('--wiki-path', type=str, default="",
+                       help='data path for the wikipedia corpus')
+    group.add_argument('--tokenized-path', type=str, default="",
+                       help='data path for the tokenized file')
+    group.add_argument('--prop', type=float, default=1.0,
+                       help='Proportion of data used for training')
+    group.add_argument('--max-instance', type=int, default=10000000,
+                       help='Proportion of data used for training')
 
     return parser
 
@@ -120,8 +146,12 @@ if __name__ == '__main__':
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main
+    elif args.task == 'control-gen':
+        from control_gen.finetune import main
     elif args.task == 'dialctrl':
         from dialctrl.finetune import main
+    elif args.task in ['dialctrl-eval-ppl', 'dialctrl-eval-f1']:
+        from dialctrl.evaluate import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

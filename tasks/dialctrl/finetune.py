@@ -12,7 +12,7 @@ from megatron.model import GPTModel
 from megatron.training import evaluate_and_print_results
 from megatron.utils import average_losses_across_data_parallel_group
 from tasks.finetune_utils import finetune
-from tasks.dialctrl.data import build_train_valid_test_datasets
+from tasks.dialctrl.data import build_train_valid_datasets
 from tasks.dialctrl.utils import get_ltor_attention_masks_and_position_ids
 
 
@@ -35,16 +35,27 @@ def train_valid_datasets_provider():
 
     print_rank_0('> building train, validation, and test datasets for %s module ...' % args.train_module)
     
-    train_ds, valid_ds, _ = build_train_valid_test_datasets(
-        data_folder=args.data_folder,
-        dataset_name=args.dataset_name,
+    train_ds, valid_ds = build_train_valid_datasets(
+        train_data_path=args.train_data_path,
+        valid_data_path=args.test_data_path,
         train_module=args.train_module,
         max_seq_len=args.max_seq_len,
-        seed=args.seed)
+        seed=args.seed,
+        last_turn=args.last_turn,
+        no_control_code=args.no_control_code,
+        add_separator=args.add_separator,
+        add_ctrl_code_to_dialog=args.add_ctrl_code_to_dialog,
+        remove_ctrl_sent=args.remove_ctrl_sent)
+        
     print_rank_0("> finished creating datasets for %s module ..." % args.train_module)
+    print_rank_0('> Train size: %d' % len(train_ds))
+    print_rank_0('> Validation size: %d' % len(valid_ds))
 
     args.eval_interval = len(train_ds) // args.global_batch_size
-    print_rank_0(' > evaluation interval: %d' % args.eval_interval)
+    print_rank_0('> evaluation interval: %d' % args.eval_interval)
+
+    args.eval_iters = len(valid_ds) // args.global_batch_size
+    print_rank_0('> evaluation iteration: %d' % args.eval_iters)
 
     return train_ds, valid_ds
 

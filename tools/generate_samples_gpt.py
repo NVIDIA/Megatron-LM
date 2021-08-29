@@ -30,6 +30,8 @@ from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
+from megatron.text_generation_utils import generate_samples_prompt_input_from_file
+from megatron.text_generation_utils import generate_samples_line_by_line_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
 
 
@@ -70,6 +72,18 @@ def add_text_generate_args(parser):
     group.add_argument("--recompute", action='store_true',
                        help='During generation recompute all attention '
                        'instead of using previously computed keys/values.')
+    group.add_argument('--spec-toks', type=str, default=None,
+                       help='additional special tokens')
+    group.add_argument('--line-by-line', action="store_true",
+                       help='generate samples line by line')
+    group.add_argument('--prompt', action="store_true",
+                       help='generate samples based on prompting')
+    group.add_argument('--prompt-file', type=str, default="",
+                       help='prompting file')
+    group.add_argument('--prompt-type', type=str, default="",
+                       help='prompt type (context or keyphrase)')
+    group.add_argument('--num-prompt-examples', type=int, default=10,
+                       help='number of prompt examples')
 
     return parser
 
@@ -98,9 +112,15 @@ def main():
 
     # Generate samples.
     if args.num_samples == 0:
-        args.micro_batch_size = 1
         if args.sample_input_file != None:
-            generate_samples_input_from_file(model)
+            args.micro_batch_size = 1
+            if args.line_by_line:
+                if args.prompt:
+                    generate_samples_prompt_input_from_file(model)
+                else:
+                    generate_samples_line_by_line_input_from_file(model)
+            else:
+                generate_samples_input_from_file(model)
         else:
             generate_samples_interactive(model)
     else:
