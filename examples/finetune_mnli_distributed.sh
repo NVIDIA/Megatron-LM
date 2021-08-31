@@ -29,7 +29,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --hidden-size 1024 \
                --num-attention-heads 16 \
                --micro-batch-size 8 \
-               --checkpoint-activations \
+               --activations-checkpoint-method uniform \
                --lr 5.0e-5 \
                --lr-decay-style linear \
                --lr-warmup-fraction 0.065 \

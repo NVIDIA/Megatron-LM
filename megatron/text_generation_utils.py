@@ -121,15 +121,15 @@ def receive_generate_info():
     """
     Needs to be synced up with send_generate_info
     """
-    input_info_tensor = torch.empty(4, dtype=torch.int64, device=torch.device("cuda"))
+    input_info_tensor = torch.empty(3, dtype=torch.int64, device=torch.cuda.current_device())
     torch.distributed.broadcast(input_info_tensor, 0)
     batch_size = input_info_tensor[0].item()
     seq_len = input_info_tensor[1].item()
     max_len = input_info_tensor[2].item()
     all_probs = input_info_tensor[3].item()
     
-    context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.device("cuda"))
-    context_tokens_tensor = torch.empty(batch_size, seq_len, dtype=torch.int64, device=torch.device("cuda"))
+    context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.cuda.current_device())
+    context_tokens_tensor = torch.empty(batch_size, seq_len, dtype=torch.int64, device=torch.cuda.current_device())
     
     # Send variables to all ranks 
     torch.distributed.broadcast(context_length_tensor, 0)
@@ -175,6 +175,7 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, max_len
     if tokens is not None:
         return tokens[:, :context_length], output_logits, full_logits 
 
+<<<<<<< HEAD
 def generate(model, sentences=None, max_len=0, all_probs=False):
     if torch.distributed.get_rank() == 0:
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences)
@@ -182,6 +183,13 @@ def generate(model, sentences=None, max_len=0, all_probs=False):
         b = context_tokens_tensor.size(0)
         start = time.time()
         send_generate_info(context_tokens_tensor, context_length_tensor, max_len, all_probs)
+=======
+def generate(model, sentences=None, max_len=0):
+    model.eval()
+    if torch.distributed.get_rank() == 0:
+        context_tokens_tensor, context_length_tensor = tokenize_batch(sentences)
+        send_generate_info(context_tokens_tensor, context_length_tensor, max_len)
+>>>>>>> server
     else:
         context_length_tensor, context_tokens_tensor, max_len, all_probs = receive_generate_info()
     
@@ -198,6 +206,7 @@ def generate(model, sentences=None, max_len=0, all_probs=False):
         decode_tokens = decode_tokens.cpu().numpy().tolist()
         for decode_token in decode_tokens:
             resp_sentences.append(tokenizer.detokenize(decode_token))
+<<<<<<< HEAD
             words = []
             for token in decode_token:
                 word = tokenizer.tokenizer.decoder[token]
@@ -212,6 +221,21 @@ def generate(model, sentences=None, max_len=0, all_probs=False):
         end = time.time()
         print(str(b)+","+str(c)+","+str(len(decode_tokens[0]))+","+str(end-start), flush=True)
         return resp_sentences, resp_sentences_seg, output_logits, full_logits, decode_tokens 
+=======
+        return resp_sentences
+>>>>>>> server
+
+def generate_samples_eval(model, context, max_gen_length, eos_token_id):
+    """
+    This function is here to provide an a matching API for a legacy task
+    This implementation hasn't been tested yet to make sure it matches
+    """
+    assert False, "Implementation untested"
+    args = get_args()
+    args.eos_id = eos_token_id
+    raw_text_len = len(context)
+    resp_sentences = generate(model, [context], max_gen_length)
+    return resp_sentences[0][raw_text_len:]
 
 def switch(val1, val2, boolean):
     boolean = boolean.type_as(val1)

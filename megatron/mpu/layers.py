@@ -256,7 +256,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=stride)
-            
+
         if bias:
             if args.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(
@@ -286,7 +286,7 @@ class ColumnParallelLinear(torch.nn.Module):
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
-            output = output_parallel 
+            output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -316,8 +316,8 @@ class RowParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: This was added for testing and should be
                                      set to False. It returns the master weights
                                      used for initialization.
-        skip_bias_add: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip 
+        skip_bias_add: This was added to enable performance optimization where bias
+                       can be fused with other elementwise operations. We skip
                        adding bias but instead return it.
     """
 

@@ -91,6 +91,13 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+    if args.checkpoint_activations:
+        args.activations_checkpoint_method = 'uniform'
+        if args.rank == 0:
+            print('--checkpoint-activations is no longer valid, '
+                  'use --activation-checkpoint-method instead. '
+                  'Defaulting to activation-checkpoint-method=uniform.')
+    del args.checkpoint_activations
 
     # Set input defaults.
     for key in defaults:
@@ -148,11 +155,15 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # If we do accumulation and all-reduces in fp32, we need to have
-    # local DDP and we should set the use-contiguous-buffers-in-ddp.
+    # If we do accumulation and all-reduces in fp32, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
-        args.use_contiguous_buffers_in_ddp = True
+        assert args.use_contiguous_buffers_in_local_ddp
+
+    # For torch DDP, we do not use contiguous buffer
+    if args.DDP_impl == 'torch':
+        args.use_contiguous_buffers_in_local_ddp = False
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -229,9 +240,9 @@ def parse_args(extra_args_provider=None, defaults={},
             'residual connection in fp32 only supported when using fp16 or bf16.'
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
-        assert args.checkpoint_activations, \
+        assert args.activations_checkpoint_method is not None, \
             'for distribute-checkpointed-activations to work you '\
-            'need to enable checkpoint-activations'
+            'need to use a valid checkpoint-activation method (\'uniform\' or \'block\')'
 
     _print_args(args)
     return args
@@ -328,6 +339,9 @@ def _add_logging_args(parser):
                        action='store_true',
                        help='If set, write validation perplexity to '
                        'tensorboard.')
+    group.add_argument('--log-memory-to-tensorboard',
+                       action='store_true',
+                       help='Enable memory logging to tensorboard.')
 
     return parser
 
@@ -394,8 +408,20 @@ def _add_training_args(parser):
                        action='store_true',
                        help='If set, distribute checkpointed activations '
                        'across model parallel group.')
-    group.add_argument('--checkpoint-num-layers', type=int, default=1,
-                       help='chunk size (number of layers) for checkpointing.')
+    group.add_argument('--activations-checkpoint-method', type=str, default=None,
+                       choices=['uniform', 'block'],
+                       help='1) uniform: uniformly divide the total number of '
+                       'Transformer layers and checkpoint the input activation of '
+                       'each divided chunk, '
+                       '2) checkpoint the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any checkpointing'
+                       'default) do not apply activations checkpoint to any layers')
+    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
+                       help='1) uniform: the number of Transformer layers in each '
+                       'uniformly divided checkpoint unit, '
+                       '2) block: the number of individual Transformer layers '
+                       'to checkpoint within each pipeline stage.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -576,9 +602,10 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
-    group.add_argument('--use-contiguous-buffers-in-ddp', action='store_true',
-                       help='If set, use contiguous buffer in DDP. Note that '
-                       'this option only works woth local DDP.' )
+    group.add_argument('--no-contiguous-buffers-in-local-ddp',
+                       action='store_false', help='If set, dont use '
+                       'contiguous buffer in local DDP.',
+                       dest='use_contiguous_buffers_in_local_ddp')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -593,6 +620,11 @@ def _add_distributed_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None, help='If set, affine parallel weights '
                        'initialization uses CPU' )
+    group.add_argument('--empty-unused-memory-level', default=0, type=int,
+                       choices=[0, 1, 2],
+                       help='Call torch.cuda.empty_cache() each iteration '
+                       '(training and eval), to reduce fragmentation.'
+                       '0=off, 1=moderate, 2=aggressive.')
     return parser
 
 

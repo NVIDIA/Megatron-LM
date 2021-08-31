@@ -24,7 +24,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --encoder-seq-length 512 \
        --decoder-seq-length 128 \
        --micro-batch-size 16 \
-       --global-batch-size 2048 \
+       --global-batch-size 128 \
        --max-position-embeddings 512 \
        --train-iters 1000000 \
        --lr-decay-iters 1000000 \
@@ -44,4 +44,5 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
-       --fp16
+       --fp16 \
+       --vocab-extra-ids 100
