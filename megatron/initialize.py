@@ -176,11 +176,22 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
+        # Increase cuda stream priority of NCCL ops when overlapping with other ops
+        if (args.async_tensor_parallel_allreduce and 
+                args.tensor_model_parallel_size > 1):
+            from torch._C._distributed_c10d import ProcessGroupNCCL
+
+            pg_options = ProcessGroupNCCL.Options()
+            pg_options.is_high_priority_stream = True
+            pg_options._timeout = timedelta(days=7)
+        else:
+            pg_options = None
         # Call the init process
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(days=7))
+            timeout=timedelta(days=7),
+            pg_options=pg_options)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

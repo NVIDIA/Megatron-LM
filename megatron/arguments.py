@@ -462,6 +462,10 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--async-tensor-parallel-allreduce', action='store_true',
+                       help='Enable asynchronous excution of tensor-parallel allreduce '
+                       'with other GPU operators',
+                       dest='async_tensor_parallel_allreduce')
     return parser
 
 
