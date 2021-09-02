@@ -69,7 +69,8 @@ def model_provider(pre_process=True, post_process=True):
             elif args.bf16:
                 attention_mask = attention_mask.bfloat16()
 
-            args.attn_mask = attention_mask
+            # Attention mask must be bool.
+            args.attn_mask = attention_mask.to(torch.bool)
 
         else:
             model = GPTModel(
