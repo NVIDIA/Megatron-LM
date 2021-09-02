@@ -199,7 +199,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
-class ColumnParallelLinearFunction(torch.autograd.Function):
+class ColumnParallelLinearWithAsyncAllreduce(torch.autograd.Function):
     """
     Column-parallel linear layer execution with asynchronous all-reduce
     execution in backprop.
@@ -304,19 +304,19 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-        self.async_tensor_parallel_allreduce = (args.async_tensor_parallel_allreduce
-                                                and world_size > 1)
+        self.async_tensor_model_parallel_allreduce = (
+                args.async_tensor_model_parallel_allreduce and world_size > 1)
 
 
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
-        if self.async_tensor_parallel_allreduce:
+        if self.async_tensor_model_parallel_allreduce:
             input_shape = input_.shape
             input_ = input_.view(input_shape[0] * input_shape[1],input_shape[2])
-            # Maxtrix multiply with asynchronouse tensor-parallel all-reduce execution
-            output_parallel = ColumnParallelLinearFunction.apply(
+            # Maxtrix multiply with asynchronouse all-reduce execution
+            output_parallel = ColumnParallelLinearWithAsyncAllreduce.apply(
                     input_, self.weight, bias, bias is not None)
             output_parallel = output_parallel.view(
                     input_shape[0], input_shape[1], output_parallel.shape[1])
