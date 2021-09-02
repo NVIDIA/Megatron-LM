@@ -177,7 +177,7 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
         # Increase cuda stream priority of NCCL ops when overlapping with other ops
-        if (args.async_tensor_model_parallel_allreduce and
+        if (not args.no_async_tensor_model_parallel_allreduce and
                 args.tensor_model_parallel_size > 1):
             from torch._C._distributed_c10d import ProcessGroupNCCL
 

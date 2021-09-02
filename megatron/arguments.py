@@ -462,8 +462,11 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
-    group.add_argument('--async-tensor-model-parallel-allreduce',
-                       action='store_true')
+    group.add_argument('--no-async-tensor-model-parallel-allreduce',
+                       action='store_true',
+                       help='Disable asynchronous execution of '
+                       'tensor-model-parallel all-reduce with weight '
+                       'gradient compuation of a column-linear layer.')
     return parser
 
 

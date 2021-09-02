@@ -305,7 +305,8 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
         self.async_tensor_model_parallel_allreduce = (
-                args.async_tensor_model_parallel_allreduce and world_size > 1)
+                not args.no_async_tensor_model_parallel_allreduce and
+                world_size > 1)
 
 
 
