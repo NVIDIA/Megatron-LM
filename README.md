@@ -27,7 +27,6 @@ All the cases from 1 billion to 1 trillion parameters achieve more than 43% half
       * [Data Preprocessing](#data-preprocessing)
       * [BERT Pretraining](#bert-pretraining)
       * [GPT Pretraining](#gpt-pretraining)
-      * [GPT Pretraining](#gpt-pretraining)
       * [T5 Pretraining](#t5-pretraining)
       * [Distributed Pretraining](#distributed-pretraining)
       * [GPT-3 Example](#gpt-3-example)
