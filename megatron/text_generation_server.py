@@ -55,8 +55,15 @@ class MegatronGenerate(Resource):
             if not isinstance(all_probs, bool):
                 return "all_probs must be a boolean value"
 
+        temperature = args.temperature
+        if "temperature" in request.get_json():
+            temperature = request.get_json()["temperature"]
+            if not isinstance(temperature, float) or not \
+               0.0 < temperature <= 100.0:
+                return "temperature must be a positive float less than or equal to 100.0"
+
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-        resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs) 
+        resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs, temperature)
         if all_probs:
             return jsonify({"sentences": resp_sentences,
                 "segments": resp_sentences_seg,
