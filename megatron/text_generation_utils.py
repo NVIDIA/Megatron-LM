@@ -222,8 +222,6 @@ def generate_samples_eval(model, context, max_gen_length, eos_token_id):
     resp_sentences = generate(model, [context], max_gen_length)
     if resp_sentences:
         return resp_sentences[0][raw_text_len:]
-    else:
-        return [None]  # This is horrible
 
 def switch(val1, val2, boolean):
     boolean = boolean.type_as(val1)
