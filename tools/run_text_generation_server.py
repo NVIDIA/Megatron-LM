@@ -78,8 +78,6 @@ if __name__ == "__main__":
 
     while True:
         choice = torch.cuda.LongTensor(1)
-        torch.distributed.broadcast(choice,
-                                    mpu.get_tensor_model_parallel_src_rank(),
-                                    group=mpu.get_tensor_model_parallel_group())
+        torch.distributed.broadcast(choice, 0)
         if choice[0].item() == 0:
             generate(model)

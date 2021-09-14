@@ -30,9 +30,7 @@ class MegatronGenerate(Resource):
     @staticmethod
     def send_do_generate():
         choice = torch.cuda.LongTensor([GENERATE_NUM])
-        torch.distributed.broadcast(choice,
-                                    mpu.get_tensor_model_parallel_src_rank(),
-                                    group=mpu.get_tensor_model_parallel_group())
+        torch.distributed.broadcast(choice, 0)
      
     def put(self):
         args = get_args()
