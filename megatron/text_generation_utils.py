@@ -104,12 +104,12 @@ def tokenize_batch(sentences):
     context_length_tensor = torch.cuda.LongTensor(context_lengths)
     return context_tokens_tensor, context_length_tensor 
 
-def send_generate_info(context_tokens_tensor, context_length_tensor, max_len, all_probs):
+def send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs):
     """
     Needs to be synced up with receive_generate_info
     """
     # Send the sizes of the tensors
-    input_info = [context_tokens_tensor.size(0), context_tokens_tensor.size(1), max_len, all_probs]
+    input_info = [context_tokens_tensor.size(0), context_tokens_tensor.size(1), tokens_to_generate, all_probs]
     input_info_tensor = torch.cuda.LongTensor(input_info)
     torch.distributed.broadcast(input_info_tensor, 0)
 
@@ -125,7 +125,7 @@ def receive_generate_info():
     torch.distributed.broadcast(input_info_tensor, 0)
     batch_size = input_info_tensor[0].item()
     seq_len = input_info_tensor[1].item()
-    max_len = input_info_tensor[2].item()
+    tokens_to_generate = input_info_tensor[2].item()
     all_probs = input_info_tensor[3].item()
     
     context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.cuda.current_device())
@@ -135,16 +135,16 @@ def receive_generate_info():
     torch.distributed.broadcast(context_length_tensor, 0)
     torch.distributed.broadcast(context_tokens_tensor, 0)
     
-    return context_length_tensor, context_tokens_tensor, max_len, all_probs
+    return context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs
 
-def synced_generate(model, context_tokens_tensor, context_length_tensor, max_len, all_probs):
+def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs):
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
 
     batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
                                                  context_length_tensor,
                                                  attention_mask, position_ids,
-                                                 max_len,
+                                                 tokens_to_generate,
                                                  all_probs)
     for tokens, lengths, output_logits, full_logits in batch_token_iterator:
         context_length += 1
@@ -175,15 +175,15 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, max_len
     if tokens is not None:
         return tokens[:, :context_length], output_logits, full_logits 
 
-def generate(model, sentences=None, max_len=0, all_probs=False):
+def generate(model, sentences=None, tokens_to_generate=0, all_probs=False):
     model.eval()
     if torch.distributed.get_rank() == 0:
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences)
-        send_generate_info(context_tokens_tensor, context_length_tensor, max_len, all_probs)
+        send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
     else:
-        context_length_tensor, context_tokens_tensor, max_len, all_probs = receive_generate_info()
+        context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs = receive_generate_info()
     
-    output = synced_generate(model, context_tokens_tensor, context_length_tensor, max_len, all_probs)
+    output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
     if output is not None:
         decode_tokens, output_logits, full_logits = output
         
@@ -264,7 +264,7 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
-                          maxlen, all_probs=False, type_ids=None):
+                          tokens_to_generate, all_probs=False, type_ids=None):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -280,7 +280,6 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
             eos_id = tokenizer.eod
 
         counter = 0
-        org_context_length = context_length
 
         layer_past = None
         batch_size = context_tokens.size(0)
@@ -288,8 +287,8 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         tokens = context_tokens
         output_logits = None
        
-        # TODO(rprenger) maxlen should be named a different parameter
-        maxlen = maxlen + org_context_length
+        # Generate enough tokens for the longest sequence
+        maxlen = tokens_to_generate + context_lengths.max().item() 
        
         # TODO(rprenger) Need a better understanding of what args.seq_length vs args.out_seq_length (shouldn't be "args")
         if maxlen > args.seq_length:
@@ -357,7 +356,6 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                     if all_probs:
                         full_logits = torch.cat([full_logits, output_context], 1)
                 
-                #output_logits = torch.cat([output_logits, output[:,context_length,new_tokens]], 1)
                 src = mpu.get_pipeline_model_parallel_last_rank()
                 group = mpu.get_embedding_group()
                 torch.distributed.broadcast(new_tokens, src, group)
