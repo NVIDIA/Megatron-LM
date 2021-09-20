@@ -65,7 +65,7 @@ if __name__ == "__main__":
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
     # Set up model and load checkpoint
-    model = get_model(model_provider)
+    model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)

@@ -189,7 +189,7 @@ def update_train_iters(args):
     print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
 
-def get_model(model_provider_func):
+def get_model(model_provider_func, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
 
@@ -243,22 +243,24 @@ def get_model(model_provider_func):
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
-    if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
-        model = [torchDDP(model_module, device_ids=[i], output_device=i,
-                          process_group=mpu.get_data_parallel_group())
-                 for model_module in model]
-        return model
+    if wrap_with_ddp:
+        if args.DDP_impl == 'torch':
+            i = torch.cuda.current_device()
+            model = [torchDDP(model_module, device_ids=[i], output_device=i,
+                              process_group=mpu.get_data_parallel_group())
+                     for model_module in model]
 
-    if args.DDP_impl == 'local':
-        model = [LocalDDP(model_module,
-                          args.accumulate_allreduce_grads_in_fp32,
-                          args.use_contiguous_buffers_in_local_ddp)
-                 for model_module in model]
-        return model
+        elif args.DDP_impl == 'local':
+            model = [LocalDDP(model_module,
+                              args.accumulate_allreduce_grads_in_fp32,
+                              args.use_contiguous_buffers_in_local_ddp)
+                     for model_module in model]
 
-    raise NotImplementedError('Unknown DDP implementation specified: {}. '
-                              'Exiting.'.format(args.DDP_impl))
+        else:
+            raise NotImplementedError('Unknown DDP implementation specified: '
+                                      '{}. Exiting.'.format(args.DDP_impl))
+
+    return model
 
 
 def get_learning_rate_scheduler(optimizer):
