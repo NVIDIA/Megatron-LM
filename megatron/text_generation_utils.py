@@ -141,14 +141,15 @@ def receive_generate_info():
     
     return context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs
 
-def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs):
+def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature):
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
     batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
                                                  context_length_tensor,
                                                  attention_mask, position_ids,
                                                  tokens_to_generate,
-                                                 all_probs)
+                                                 all_probs,
+                                                 temperature=temperature)
     for tokens, lengths, output_logits, full_logits in batch_token_iterator:
         context_length += 1
                 
@@ -177,16 +178,15 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_
     if tokens is not None:
         return tokens[:, :context_length], output_logits, full_logits 
 
-def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, add_BOS=False):
+def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, temperature=1.0, add_BOS=False):
     model.eval()
     if torch.distributed.get_rank() == 0:
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences, tokens_to_generate, add_BOS)
         send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
     else:
         context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs = receive_generate_info()
-    
-    output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
-    
+
+    output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature)
     if output is not None:
         decode_tokens, output_logits, full_logits = output
         
@@ -230,8 +230,8 @@ def switch(val1, val2, boolean):
 
 
 def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
-                 layer_past=None, get_key_value=None,
-                 forward_method_parallel_output=None):
+                 set_inference_key_value_memory=False,
+                 inference_max_sequence_len=None):
 
     # Hidden size changes when not using recompute, need to tell p2p_communicate
     # functions the correct size
@@ -246,26 +246,22 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          tokentype_ids=tokentype_ids,
-                          layer_past=layer_past,
-                          get_key_value=get_key_value,
-                          forward_method_parallel_output=forward_method_parallel_output)
-
-    if get_key_value:
-        output_tensor, layer_past = output_tensor
+    output_tensor = model(
+        tokens, position_ids, attention_mask,
+        tokentype_ids=tokentype_ids,
+        set_inference_key_value_memory=set_inference_key_value_memory,
+        inference_max_sequence_len=inference_max_sequence_len)
 
     send_forward(output_tensor)
 
     args.seq_length = orig_seq_length
-    if get_key_value:
-        return output_tensor, layer_past
+
     return output_tensor
 
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
-                          tokens_to_generate, all_probs=False, type_ids=None):
+                          tokens_to_generate, all_probs=False, type_ids=None, temperature=None):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -282,7 +278,6 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
 
         counter = 0
 
-        layer_past = None
         batch_size = context_tokens.size(0)
         is_done = torch.zeros([batch_size]).byte().cuda()
         tokens = context_tokens
@@ -299,11 +294,15 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         while context_length < maxlen:
             types2use = None
             if counter == 0:
+                # Allocate memory for the entire context.
+                set_inference_key_value_memory = True
                 tokens2use = tokens[:, :context_length]
                 positions2use = position_ids[:, :context_length]
                 if type_ids is not None:
                     types2use = type_ids[:, :context_length]
             else:
+                # Set this to false so the memory is not reallocated.
+                set_inference_key_value_memory = False
                 tokens2use = tokens[:, context_length - 1].view(
                     batch_size, -1)
                 positions2use = position_ids[:, context_length - 1].view(
@@ -311,28 +310,34 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 if type_ids is not None:
                     types2use = type_ids[:, context_length - 1].view(
                         batch_size, -1)
-            output, layer_past = forward_step(model, tokens2use,
-                                              positions2use,
-                                              attention_mask,
-                                              layer_past=layer_past,
-                                              get_key_value=True,
-                                              tokentype_ids=types2use,
-                                              forward_method_parallel_output=False)
-            if mpu.is_pipeline_last_stage():
-                assert output is not None
-                logits = output[:, -1].view(batch_size, -1).contiguous()
+            
+            output = forward_step(
+                model, tokens2use,
+                positions2use,
+                attention_mask,
+                set_inference_key_value_memory=set_inference_key_value_memory,
+                inference_max_sequence_len=maxlen,
+                tokentype_ids=types2use)
 
             if mpu.is_pipeline_last_stage():
+                assert output is not None
+                output = output.float()
+                logits = output[:, -1].view(batch_size, -1).contiguous()
+
                 if args.greedy:
                     prev = torch.argmax(logits, dim=-1).view(-1)
                 else:
                     logits = logits.float()
-                    logits /= args.temperature
+                    logits /= temperature
                     logits = top_k_logits(logits, top_k=args.top_k,
                                           top_p=args.top_p)
                     log_probs = F.softmax(logits, dim=-1)
                     prev = torch.multinomial(log_probs, num_samples=1).view(-1)
                 started = context_lengths <= context_length
+
+                # Clamp the out of vocabulary tokens.
+                tokenizer = get_tokenizer()
+                prev = torch.clamp(prev, max=tokenizer.vocab_size - 1)
 
                 new_tokens = switch(
                     tokens[:, context_length].view(-1), prev, started)

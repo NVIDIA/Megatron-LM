@@ -58,6 +58,13 @@ class MegatronGenerate(Resource):
             if not isinstance(all_probs, bool):
                 return "all_probs must be a boolean value"
         
+        temperature = args.temperature
+        if "temperature" in request.get_json():
+            temperature = request.get_json()["temperature"]
+            if not isinstance(temperature, float) or not \
+               0.0 < temperature <= 100.0:
+                return "temperature must be a positive float less than or equal to 100.0"
+        
         add_BOS = False
         if "add_BOS" in request.get_json():
             add_BOS = request.get_json()["add_BOS"]
@@ -66,7 +73,7 @@ class MegatronGenerate(Resource):
 
         sem.acquire()  # Need to get lock to keep multiple threads from hitting code
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-        resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs, add_BOS) 
+        resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs, temperature, add_BOS) 
         sem.release()
         
         if all_probs:
