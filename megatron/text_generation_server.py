@@ -82,7 +82,7 @@ class MegatronGenerate(Resource):
 
 class MegatronServer(object):
     def __init__(self, model):
-        self.app = Flask(__name__)
+        self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
         api.add_resource(MegatronGenerate, '/generate', resource_class_args=[model])
         
