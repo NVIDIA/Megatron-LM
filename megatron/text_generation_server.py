@@ -23,7 +23,7 @@ from megatron import mpu
 from megatron.text_generation_utils import generate
 
 GENERATE_NUM = 0
-sem = threading.Semaphore()
+lock = threading.Semaphore()
 
 class MegatronGenerate(Resource):
     def __init__(self, model):
@@ -71,10 +71,10 @@ class MegatronGenerate(Resource):
             if not isinstance(add_BOS, bool):
                 return "add_BOS must be a boolean value"
 
-        sem.acquire()  # Need to get lock to keep multiple threads from hitting code
+        lock.acquire()  # Need to get lock to keep multiple threads from hitting code
         MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
         resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs, temperature, add_BOS) 
-        sem.release()
+        lock.release()
         
         if all_probs:
             return jsonify({"sentences": resp_sentences,
