@@ -185,7 +185,7 @@ def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, tempe
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences, tokens_to_generate, add_BOS)
         send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature)
     else:
-        context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs = receive_generate_info()
+        context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs, temperature = receive_generate_info()
 
     output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature)
     if output is not None:
