@@ -18,6 +18,51 @@
 
 import torch
 
+from megatron import mpu
+
+
+def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
+    """Broadcast a tensor from last pipeline stage to all ranks."""
+
+    if mpu.is_pipeline_last_stage():
+        assert tensor is not None
+        assert tensor.is_cuda
+        assert tensor.is_contiguous()
+    else:
+        tensor = torch.empty(size,
+                             dtype=dtype,
+                             device=torch.cuda.current_device())
+    # Get the group and corresponding source rank.
+    src = mpu.get_pipeline_model_parallel_last_rank()
+    group = mpu.get_pipeline_model_parallel_group()
+    torch.distributed.broadcast(tensor, src, group)
+
+    return tensor
+
+
+def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
+    """Copy tensor values from last stage into the first stage.
+    Note that the input tensor is updated in place."""
+
+    # Only first and last stage pipeline stages need to be involved.
+    is_last_stage = mpu.is_pipeline_last_stage()
+    is_first_stage = mpu.is_pipeline_first_stage()
+    if is_last_stage or is_first_stage:
+        src = mpu.get_pipeline_model_parallel_last_rank()
+        group = mpu.get_embedding_group()
+        if is_last_stage:
+            assert tensor is not None
+            assert tensor.is_cuda
+            tensor_ = tensor.contiguous()
+        else:
+            tensor_ = torch.empty(size,
+                                  dtype=dtype,
+                                  device=torch.cuda.current_device())
+        # Broadcast from last stage into the first stage.
+        torch.distributed.broadcast(tensor_, src, group)
+        # Update the first stage tensor
+        if is_first_stage:
+            tensor[...] = tensor_
 
 
 def broadcast_tensor(size, dtype, tensor=None, rank=0):

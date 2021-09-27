@@ -297,6 +297,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 positions2use = position_ids[:, :context_length]
                 if type_ids is not None:
                     types2use = type_ids[:, :context_length]
+                attention_mask2use = attention_mask[..., :context_length, :context_length]
             else:
                 # Set this to false so the memory is not reallocated.
                 set_inference_key_value_memory = False
@@ -307,11 +308,12 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 if type_ids is not None:
                     types2use = type_ids[:, context_length - 1].view(
                         batch_size, -1)
+                attention_mask2use = attention_mask[..., (context_length-1):context_length, :context_length]
             
             output = forward_step(
                 model, tokens2use,
                 positions2use,
-                attention_mask,
+                attention_mask2use,
                 set_inference_key_value_memory=set_inference_key_value_memory,
                 inference_max_sequence_len=maxlen,
                 tokentype_ids=types2use)

@@ -281,8 +281,6 @@ class ParallelAttention(MegatronModule):
             self.inference_value_memory[start:end, ...] = value_layer
             key_layer = self.inference_key_memory[:end, ...]
             value_layer = self.inference_value_memory[:end, ...]
-            # Adjust attention mask
-            attention_mask = attention_mask[..., start:end, :end]
 
 
         # ===================================
