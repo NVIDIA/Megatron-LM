@@ -180,9 +180,9 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
         # Inference key-value memory
-        self.inference_key_memory = None
-        self.inference_value_memory = None
-        self.inference_current_sequence_len = 0
+        self.inference_key_memory_list = None
+        self.inference_value_memory_list = None
+        self.inference_current_sequence_len_list = None
 
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size):
@@ -196,35 +196,32 @@ class ParallelAttention(MegatronModule):
         
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, inference_params=None):
         # hidden_states: [sq, b, h]
 
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        if set_inference_key_value_memory:
-            assert inference_max_sequence_len and inference_max_sequence_len > 0
-            self.inference_key_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1))
-            self.inference_value_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1))
-            self.inference_current_sequence_len = 0
-        # Some consistency check.
-        if inference_max_sequence_len:
-            assert self.inference_current_sequence_len < \
-                self.inference_key_memory.size(0)
-            assert inference_max_sequence_len == \
-                self.inference_key_memory.size(0)
-        # This is added for safety. In case inference_max_sequence_len
+        if inference_params:
+            if inference_params.allocate_key_value_memory:
+                inf_max_seq_len = inference_params.max_sequence_len
+                inf_batch_sizes = inference_params.micro_batch_size_list
+                self.inference_key_memory_list = [
+                    self._allocate_memory(inf_max_seq_len, inf_batch_size)
+                    for inf_batch_size in inf_batch_sizes]
+                self.inference_value_memory_list = [
+                    self._allocate_memory(inf_max_seq_len, inf_batch_size)
+                    for inf_batch_size in inf_batch_sizes]
+                self.inference_current_sequence_len_list = [
+                    0 for _ in inf_batch_sizes]
+        # This is added for safety. In case inference_params
         # is not provided, make sure there is no potential memory left
         # from previous inference.
-        if not inference_max_sequence_len:
-            self.inference_key_memory = None
-            self.inference_value_memory = None
-        
+        else:
+            self.inference_key_memory_list = None
+            self.inference_value_memory_list = None
+            self.inference_current_sequence_len_list = None
 
         # =====================
         # Query, Key, and Value
@@ -267,20 +264,27 @@ class ParallelAttention(MegatronModule):
             query_layer = query_layer.view(*new_tensor_shape)
 
 
-        # ===================================================
-        # Adjust key, value, and attention mask for inference
-        # ===================================================
+        # ==================================
+        # Adjust key and value for inference
+        # ==================================
 
-        if inference_max_sequence_len:
+        if inference_params:
+            inf_batch_index = inference_params.micro_batch_size_index
+            assert key_layer.size(1) == \
+                inference_params.micro_batch_size_list[inf_batch_index]
             # Adjust the range variables.
-            start = self.inference_current_sequence_len
-            self.inference_current_sequence_len += key_layer.size(0)
-            end = self.inference_current_sequence_len
+            start = self.inference_current_sequence_len_list[inf_batch_index]
+            end = start + key_layer.size(0)
+            self.inference_current_sequence_len_list[inf_batch_index] = end
             # Copy key and values.
-            self.inference_key_memory[start:end, ...] = key_layer
-            self.inference_value_memory[start:end, ...] = value_layer
-            key_layer = self.inference_key_memory[:end, ...]
-            value_layer = self.inference_value_memory[:end, ...]
+            self.inference_key_memory_list[inf_batch_index][start:end, ...] =\
+                key_layer
+            self.inference_value_memory_list[inf_batch_index][start:end, ...] =\
+                value_layer
+            key_layer = \
+                self.inference_key_memory_list[inf_batch_index][:end, ...]
+            value_layer = \
+                self.inference_value_memory_list[inf_batch_index][:end, ...]
 
 
         # ===================================
@@ -459,10 +463,8 @@ class ParallelTransformerLayer(MegatronModule):
                                output_layer_init_method)
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                enc_dec_attn_mask=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
         # hidden_states: [b, s, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -472,8 +474,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.self_attention(
                 layernorm_output,
                 attention_mask,
-                set_inference_key_value_memory=set_inference_key_value_memory,
-                inference_max_sequence_len=inference_max_sequence_len)
+                inference_params=inference_params)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -686,13 +687,11 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = input_tensor
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                enc_dec_attn_mask=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
 
         # Checks.
-        if inference_max_sequence_len:
+        if inference_params:
             assert self.activations_checkpoint_method is None, \
                 'inference does not work with activation checkpointing'
 
@@ -724,8 +723,8 @@ class ParallelTransformer(MegatronModule):
                     attention_mask,
                     encoder_output=encoder_output,
                     enc_dec_attn_mask=enc_dec_attn_mask,
-                    set_inference_key_value_memory=set_inference_key_value_memory,
-                    inference_max_sequence_len=inference_max_sequence_len)
+                    inference_params=inference_params)
+
 
         # Final layer norm.
         if self.post_process:

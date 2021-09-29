@@ -25,7 +25,7 @@ from .communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage)
-from .forward_step import forward_step
+from .forward_step import forward_step, InferenceParams
 from .sampling import sample
 
 
@@ -109,6 +109,9 @@ def generate_tokens_probs_and_return_on_first_stage(
     attention_mask, position_ids = _build_attention_mask_and_position_ids(
         tokens)
 
+    # Set inference params
+    inference_params = InferenceParams([batch_size], max_sequence_length)
+    
     model.eval()
     with torch.no_grad():
         prev_context_length = 0
@@ -117,7 +120,8 @@ def generate_tokens_probs_and_return_on_first_stage(
             # If we are starting from scratch, allocate memory for the entire
             # context, otherwise  set this to false so the memory is not
             # reallocated.
-            set_inference_key_value_memory = (prev_context_length == 0)
+            inference_params.allocate_key_value_memory = \
+                (prev_context_length == 0)
 
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
@@ -126,10 +130,8 @@ def generate_tokens_probs_and_return_on_first_stage(
                 ..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
-            logits = forward_step(
-                model, tokens2use, positions2use, attention_mask2use,
-                set_inference_key_value_memory=set_inference_key_value_memory,
-                inference_max_sequence_len=max_sequence_length)
+            logits = forward_step(model, tokens2use, positions2use,
+                                  attention_mask2use, inference_params)
 
             if mpu.is_pipeline_last_stage():
                 # Always the last stage should have an output.

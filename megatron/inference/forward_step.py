@@ -22,9 +22,20 @@ from megatron.p2p_communication import recv_forward, send_forward
 from megatron import get_args
 
 
-def forward_step(model, tokens, position_ids, attention_mask,
-                 set_inference_key_value_memory=False,
-                 inference_max_sequence_len=None):
+class InferenceParams:
+    
+    def __init__(self, micro_batch_size_list, max_sequence_len):
+
+        assert isinstance(micro_batch_size_list, list)
+        assert max_sequence_len > 0
+
+        self.micro_batch_size_list = micro_batch_size_list
+        self.max_sequence_len = max_sequence_len
+        self.allocate_key_value_memory = False
+        self.micro_batch_size_index = 0
+
+
+def forward_step(model, tokens, position_ids, attention_mask, inference_params):
 
     # Hidden size changes when not using recompute, need to tell p2p_communicate
     # functions the correct size
@@ -37,10 +48,8 @@ def forward_step(model, tokens, position_ids, attention_mask,
 
     # Forward pass through the model.
     model.set_input_tensor(input_tensor)
-    output_tensor = model(
-        tokens, position_ids, attention_mask,
-        set_inference_key_value_memory=set_inference_key_value_memory,
-        inference_max_sequence_len=inference_max_sequence_len)
+    output_tensor = model(tokens, position_ids, attention_mask,
+                          inference_params=inference_params)
 
     send_forward(output_tensor)
 
