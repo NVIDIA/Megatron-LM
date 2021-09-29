@@ -40,6 +40,33 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     return tensor
 
 
+
+def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
+    """Broadcast tensor values from last stage into the first stage."""
+
+    # Only first and last stage pipeline stages need to be involved.
+    is_last_stage = mpu.is_pipeline_last_stage()
+    is_first_stage = mpu.is_pipeline_first_stage()
+    if is_last_stage or is_first_stage:
+        if is_last_stage:
+            assert tensor is not None
+            assert tensor.is_cuda
+            assert tensor.is_contiguous()
+        else:
+            tensor = torch.empty(size,
+                                 dtype=dtype,
+                                 device=torch.cuda.current_device())
+        src = mpu.get_pipeline_model_parallel_last_rank()
+        group = mpu.get_embedding_group()
+        # Broadcast from last stage into the first stage.
+        torch.distributed.broadcast(tensor, src, group)
+    else:
+        tensor = None
+
+    return tensor
+
+
+
 def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
     """Copy tensor values from last stage into the first stage.
     Note that the input tensor is updated in place."""
@@ -48,20 +75,24 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
     is_last_stage = mpu.is_pipeline_last_stage()
     is_first_stage = mpu.is_pipeline_first_stage()
     if is_last_stage or is_first_stage:
+        assert tensor is not None
+        assert tensor.is_cuda
+        is_contiguous = tensor.is_contiguous()
         src = mpu.get_pipeline_model_parallel_last_rank()
         group = mpu.get_embedding_group()
-        if is_last_stage:
-            assert tensor is not None
-            assert tensor.is_cuda
-            tensor_ = tensor.contiguous()
+        if is_contiguous:
+            tensor_ = tensor
         else:
-            tensor_ = torch.empty(size,
-                                  dtype=dtype,
-                                  device=torch.cuda.current_device())
+            if is_last_stage:
+                tensor_ = tensor.contiguous()
+            else:
+                tensor_ = torch.empty(size,
+                                      dtype=dtype,
+                                      device=torch.cuda.current_device())
         # Broadcast from last stage into the first stage.
         torch.distributed.broadcast(tensor_, src, group)
         # Update the first stage tensor
-        if is_first_stage:
+        if is_first_stage and not is_contiguous:
             tensor[...] = tensor_
 
 

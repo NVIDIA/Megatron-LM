@@ -153,8 +153,12 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_
     if mpu.is_pipeline_last_stage():
         src = mpu.get_pipeline_model_parallel_last_rank()
         group = mpu.get_embedding_group()
+        print('last rank output size {} {} | \n'.format(output_logits.size(0), output_logits.size(1)))
         torch.distributed.broadcast(output_logits, src, group)
         if all_probs:
+            print('last rank full size {} {} | \n'.format(full_logits.size(0),
+                                                        full_logits.size(1),
+                                                        full_logits.size(2)))
             src = mpu.get_pipeline_model_parallel_last_rank()
             group = mpu.get_embedding_group()
             torch.distributed.broadcast(full_logits, src, group)
@@ -164,13 +168,18 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_
             src = mpu.get_pipeline_model_parallel_last_rank()
             group = mpu.get_embedding_group()
             output_logits = torch.empty(tokens.size(0), context_length-1, dtype=torch.float32, device=torch.device("cuda"))
+            print('first rank output size {} {} | \n'.format(output_logits.size(0), output_logits.size(1)))
             torch.distributed.broadcast(output_logits, src, group)
             
             if all_probs:
                 args = get_args()
                 src = mpu.get_pipeline_model_parallel_last_rank()
                 group = mpu.get_embedding_group()
-                full_logits = torch.empty(tokens.size(0), context_length, args.padded_vocab_size, dtype=torch.float32, device=torch.device("cuda"))
+                full_logits = torch.empty(tokens.size(0), context_length-1, args.padded_vocab_size, dtype=torch.float32, device=torch.device("cuda"))
+                print('first rank full size {} {} | \n'.format(full_logits.size(0),
+                                                            full_logits.size(1),
+                                                            full_logits.size(2)))
+                
                 torch.distributed.broadcast(full_logits, src, group)
     if tokens is not None:
         return tokens[:, :context_length], output_logits, full_logits 
@@ -204,7 +213,7 @@ def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, tempe
 
         output_logits = output_logits.cpu().numpy().tolist()
         if all_probs:
-            full_logits = full_logits.cpu().numpy().tolist()
+            full_logits = full_logits.cpu().numpy() #.tolist()
        
         return resp_sentences, resp_sentences_seg, output_logits, full_logits, decode_tokens 
 

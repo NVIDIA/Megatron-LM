@@ -23,6 +23,39 @@ from megatron import get_tokenizer
 from .communication import broadcast_int_list, broadcast_tensor
 
 
+def detokenize_generations(tokens_gpu_tensor,
+                           lengths_gpu_tensor,
+                           return_segments):
+    """Detokenize the generated tokens."""
+
+    tokenizer = get_tokenizer()
+
+    prompts_plus_generations = []
+    if return_segments:
+        prompts_plus_generations_segments = []
+
+    tokens = tokens_gpu_tensor.cpu().numpy().tolist()
+    lengths = lengths_gpu_tensor.cpu().numpy().tolist()
+    for sequence_tokens, length in zip(tokens, lengths):
+        sequence_tokens = sequence_tokens[:length]
+        prompts_plus_generations.append(
+            tokenizer.detokenize(sequence_tokens))
+        if return_segments:
+            words = []
+            for token in sequence_tokens:
+                word = tokenizer.tokenizer.decoder[token]
+                word = bytearray(
+                    [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                        'utf-8', errors='replace')
+                words.append(word)
+            prompts_plus_generations_segments.append(words)
+
+    if return_segments:
+        return tokens, prompts_plus_generations, \
+            prompts_plus_generations_segments
+
+    return tokens, prompts_plus_generations
+
 
 def tokenize_prompts(prompts=None, tokens_to_generate=None, rank=0):
     """Tokenize prompts and make them avaiable on all ranks."""
