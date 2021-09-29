@@ -16,7 +16,7 @@ GBS=1
 
 # Set activation recomputation.
 if [ ${ACTIVATION_RECOMPUTATION} == "YES" ]; then
-    MEGATRON_EXTRA_PARAMS="--checkpoint-activations "
+    MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform "
 elif [ ${ACTIVATION_RECOMPUTATION} == "NO" ]; then
     MEGATRON_EXTRA_PARAMS=""
 else

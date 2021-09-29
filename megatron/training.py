@@ -193,7 +193,7 @@ def update_train_iters(args):
     print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
 
-def get_model(model_provider_func, model_type):
+def get_model(model_provider_func, model_type, wrap_with_ddp=True):
     """Build the model."""
     args = get_args()
     args.model_type = model_type
@@ -272,22 +272,24 @@ def get_model(model_provider_func, model_type):
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
-    if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
-        model = [torchDDP(model_module, device_ids=[i], output_device=i,
-                          process_group=mpu.get_data_parallel_group())
-                 for model_module in model]
-        return model
+    if wrap_with_ddp:
+        if args.DDP_impl == 'torch':
+            i = torch.cuda.current_device()
+            model = [torchDDP(model_module, device_ids=[i], output_device=i,
+                              process_group=mpu.get_data_parallel_group())
+                     for model_module in model]
 
-    if args.DDP_impl == 'local':
-        model = [LocalDDP(model_module,
-                          args.accumulate_allreduce_grads_in_fp32,
-                          args.use_contiguous_buffers_in_ddp)
-                 for model_module in model]
-        return model
+        elif args.DDP_impl == 'local':
+            model = [LocalDDP(model_module,
+                              args.accumulate_allreduce_grads_in_fp32,
+                              args.use_contiguous_buffers_in_local_ddp)
+                     for model_module in model]
 
-    raise NotImplementedError('Unknown DDP implementation specified: {}. '
-                              'Exiting.'.format(args.DDP_impl))
+        else:
+            raise NotImplementedError('Unknown DDP implementation specified: '
+                                      '{}. Exiting.'.format(args.DDP_impl))
+
+    return model
 
 
 def get_learning_rate_scheduler(optimizer):
@@ -380,11 +382,10 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_ddp:
+    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
         for partition in model:
             partition.zero_grad_buffer()
-    else:
-        optimizer.zero_grad()
+    optimizer.zero_grad()
 
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
@@ -392,7 +393,7 @@ def train_step(forward_step_func, data_iterator,
         optimizer, timers, forward_only=False)
 
     # Empty unused memory
-    if args.empty_unused_memory_each_iter >= 1:
+    if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
     # All-reduce if needed.
@@ -443,7 +444,7 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 1
 
     # Empty unused memory
-    if args.empty_unused_memory_each_iter >= 2:
+    if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -755,7 +756,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 timers=None, forward_only=True)
 
             # Empty unused memory
-            if args.empty_unused_memory_each_iter >= 1:
+            if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):

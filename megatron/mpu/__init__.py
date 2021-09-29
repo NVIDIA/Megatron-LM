@@ -60,9 +60,7 @@ from .mappings import scatter_to_tensor_model_parallel_region
 
 from .random import checkpoint
 from .random import get_cuda_rng_tracker
-from .random import init_checkpointed_activations_memory_buffer
 from .random import model_parallel_cuda_manual_seed
-from .random import reset_checkpointed_activations_memory_buffer
 from .random import gather_split_1d_tensor
 from .random import split_tensor_into_1d_equal_chunks
 
