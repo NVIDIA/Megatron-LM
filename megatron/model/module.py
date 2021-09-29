@@ -166,6 +166,10 @@ class Float16Module(MegatronModule):
         self.float16_convertor = float16_convertor
 
 
+    def set_input_tensor(self, input_tensor):
+        return self.module.set_input_tensor(input_tensor)
+
+
     def forward(self, *inputs, **kwargs):
         if mpu.is_pipeline_first_stage():
             inputs = fp32_to_float16(inputs, self.float16_convertor)
