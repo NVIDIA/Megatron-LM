@@ -57,7 +57,8 @@ def detokenize_generations(tokens_gpu_tensor,
     return tokens, prompts_plus_generations
 
 
-def tokenize_prompts(prompts=None, tokens_to_generate=None, rank=0):
+def tokenize_prompts(prompts=None, tokens_to_generate=None,
+                     add_BOS=None, rank=0):
     """Tokenize prompts and make them avaiable on all ranks."""
 
     # On all ranks set to None so we can pass them to functions
@@ -71,7 +72,7 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None, rank=0):
         assert tokens_to_generate is not None
         # Tensor of tokens padded and their unpadded length.
         prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor = \
-            _tokenize_prompts_and_batch(prompts, tokens_to_generate)
+            _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS)
         # We need the sizes of these tensors for the boradcast
         sizes_list = [prompts_tokens_cuda_long_tensor.size(0), # Batch size
                       prompts_tokens_cuda_long_tensor.size(1)] # Sequence lenght
@@ -91,7 +92,7 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None, rank=0):
     return prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor
 
 
-def _tokenize_prompts_and_batch(prompts, tokens_to_generate):
+def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     """Given a set of prompts and number of tokens to generate:
         - tokenize prompts
         - set the sequence length to be the max of length of prompts
@@ -102,7 +103,11 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate):
 
     # Tokenize all the prompts.
     tokenizer = get_tokenizer()
-    prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
+    if add_BOS:
+        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt)
+                          for prompt in prompts]
+    else:
+        prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
 
     # Now we have a list of list of tokens which each list has a different
     # size. We want to extend this list to:

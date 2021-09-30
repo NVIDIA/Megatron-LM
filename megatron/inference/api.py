@@ -18,9 +18,48 @@
 
 import torch
 
+from megatron import mpu
 from .communication import broadcast_float_list
 from .generation import generate_tokens_probs_and_return_on_first_stage
-from .tokenization import tokenize_prompts
+from .tokenization import (
+    tokenize_prompts,
+    detokenize_generations)
+
+
+def generate_and_post_process(model,
+                              prompts=None,
+                              tokens_to_generate=0,
+                              return_output_log_probs=False,
+                              return_all_log_probs=False,
+                              temperature=1.0,
+                              add_BOS=False):
+    """TO DO ..."""
+
+    # Main inference.
+    tokens, lengths, output_log_probs, all_log_probs = generate(
+        model,
+        prompts=prompts,
+        tokens_to_generate=tokens_to_generate,
+        return_output_log_probs=return_output_log_probs,
+        return_all_log_probs=return_all_log_probs,
+        temperature=temperature,
+        add_BOS=add_BOS)
+
+    # Only post-process on first stage.
+    if mpu.is_pipeline_first_stage():
+
+        tokens, prompts_plus_generations, prompts_plus_generations_segments = \
+            detokenize_generations(tokens, lengths, True)
+
+        if return_output_log_probs:
+            output_log_probs = output_log_probs.cpu().numpy().tolist()
+        if return_all_log_probs:
+            all_log_probs = all_log_probs.cpu().numpy() #.tolist()
+
+        return prompts_plus_generations, prompts_plus_generations_segments, \
+            output_log_probs, all_log_probs, tokens
+
+    return None
 
 
 def generate(model,
@@ -28,24 +67,27 @@ def generate(model,
              tokens_to_generate=0,
              return_output_log_probs=False,
              return_all_log_probs=False,
-             temperature=1.0):
+             temperature=1.0,
+             add_BOS=False):
     """TO DO ..."""
 
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate, return_output_log_probs,
-              return_all_log_probs, temperature]
-    values_float_tensor = broadcast_float_list(4, float_list=values)
+              return_all_log_probs, temperature, add_BOS]
+    values_float_tensor = broadcast_float_list(5, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     return_all_log_probs = bool(values_float_tensor[2].item())
-    temperature = values_float_tensor[2].item()
+    temperature = values_float_tensor[3].item()
+    add_BOS = bool(values_float_tensor[4].item())
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
     if torch.distributed.get_rank() == 0:
         assert prompts is not None
+        assert tokens_to_generate > 0
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
-        prompts=prompts, tokens_to_generate=tokens_to_generate)
+        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
 
     # Main inference function.
     # Note that the outputs are available on the first stage.
