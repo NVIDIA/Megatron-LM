@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from functools import partial
 from megatron import get_args, get_timers, mpu, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
+from megatron.model import ModelType
 from megatron.model.vit_model import VitModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
@@ -92,6 +93,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'dataloader_type': 'cyclic'}
     )
