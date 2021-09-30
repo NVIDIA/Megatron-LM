@@ -15,7 +15,6 @@
 
 """Generation utilities."""
 
-
 import torch
 import torch.nn.functional as F
 
@@ -25,7 +24,7 @@ from .communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage)
-from .forward_step import forward_step, InferenceParams
+from .forward_step import InferenceForwardStep
 from .sampling import sample
 
 
@@ -65,6 +64,9 @@ def generate_tokens_probs_and_return_on_first_stage(
     min_prompt_length = lengths.min().item()
     max_sequence_length = tokens.size(1)
     max_sequence_length = min(max_sequence_length, args.max_position_embeddings)
+
+    # forward step.
+    forward_step = InferenceForwardStep(model, batch_size, max_sequence_length)
 
     # Added termination_id to support the case that we want to terminate the
     # generation once that id is generated.
@@ -109,19 +111,9 @@ def generate_tokens_probs_and_return_on_first_stage(
     attention_mask, position_ids = _build_attention_mask_and_position_ids(
         tokens)
 
-    # Set inference params
-    inference_params = InferenceParams([batch_size], max_sequence_length)
-    
-    model.eval()
     with torch.no_grad():
         prev_context_length = 0
         for context_length in range(min_prompt_length, max_sequence_length):
-
-            # If we are starting from scratch, allocate memory for the entire
-            # context, otherwise  set this to false so the memory is not
-            # reallocated.
-            inference_params.allocate_key_value_memory = \
-                (prev_context_length == 0)
 
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
@@ -130,8 +122,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                 ..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
-            logits = forward_step(model, tokens2use, positions2use,
-                                  attention_mask2use, inference_params)
+            logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
             if mpu.is_pipeline_last_stage():
                 # Always the last stage should have an output.
