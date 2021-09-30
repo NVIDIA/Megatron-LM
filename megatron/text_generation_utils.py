@@ -95,10 +95,13 @@ def pad_batch(batch, pad_id, max_len):
         context_lengths.append(context_length)
     return batch, context_lengths
 
-def tokenize_batch(sentences, max_len):
+def tokenize_batch(sentences, max_len, add_BOS):
     args = get_args()
     tokenizer = get_tokenizer()
-    context_tokens = [tokenizer.tokenize(s) for s in sentences]
+    if add_BOS:
+        context_tokens = [[tokenizer.eod] + tokenizer.tokenize(s) for s in sentences]
+    else:
+        context_tokens = [tokenizer.tokenize(s) for s in sentences]
     context_tokens, context_lengths = pad_batch(context_tokens,
                                                 tokenizer.eod, max_len)
     context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
@@ -184,10 +187,10 @@ def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_
     if tokens is not None:
         return tokens[:, :context_length], output_logits, full_logits 
 
-def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, temperature=1.0):
+def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, temperature=1.0, add_BOS=False):
     model.eval()
     if torch.distributed.get_rank() == 0:
-        context_tokens_tensor, context_length_tensor = tokenize_batch(sentences, tokens_to_generate)
+        context_tokens_tensor, context_length_tensor = tokenize_batch(sentences, tokens_to_generate, add_BOS)
         send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
     else:
         context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs = receive_generate_info()
