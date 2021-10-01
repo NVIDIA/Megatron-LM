@@ -269,18 +269,19 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         if inference_params:
-            inf_batch_index = inference_params.micro_batch_size_index
+            inf_batch_index = inference_params.micro_batch_index
             assert key_layer.size(1) == \
                 inference_params.micro_batch_size_list[inf_batch_index]
             # Adjust the range variables.
             start = self.inference_current_sequence_len_list[inf_batch_index]
             end = start + key_layer.size(0)
+            assert end <= inference_params.max_sequence_len
             self.inference_current_sequence_len_list[inf_batch_index] = end
             # Copy key and values.
-            self.inference_key_memory_list[inf_batch_index][start:end, ...] =\
-                key_layer
-            self.inference_value_memory_list[inf_batch_index][start:end, ...] =\
-                value_layer
+            self.inference_key_memory_list[inf_batch_index][start:end, ...] \
+                = key_layer
+            self.inference_value_memory_list[inf_batch_index][start:end, ...] \
+                = value_layer
             key_layer = \
                 self.inference_key_memory_list[inf_batch_index][:end, ...]
             value_layer = \
