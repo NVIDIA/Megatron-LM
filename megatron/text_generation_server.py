@@ -39,10 +39,19 @@ class MegatronGenerate(Resource):
         print("request IP: " + str(request.remote_addr))
         print(json.dumps(request.get_json()),flush=True)
         print("current time: ", datetime.datetime.now())
+       
+        if not "prompts" in request.get_json():
+            return "prompts argument required", 400
         
-        sentences = request.get_json()["sentences"]
-        if len(sentences) > 128:
-            return "Maximum number of sentences is 128", 400
+        if "max_len" in request.get_json():
+            return "max_len is no longer used.  Replace with tokens_to_generate", 400
+        
+        if "sentences" in request.get_json():
+            return "sentences is no longer used.  Replace with prompts", 400
+
+        prompts = request.get_json()["prompts"]
+        if len(prompts) > 128:
+            return "Maximum number of prompts is 128", 400
 
         tokens_to_generate = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "tokens_to_generate" in request.get_json():
@@ -52,11 +61,11 @@ class MegatronGenerate(Resource):
             if tokens_to_generate < 1:
                 return "tokens_to_generate must be an integer greater than 0"
 
-        all_probs = False
-        if "all_probs" in request.get_json():
-            all_probs = request.get_json()["all_probs"]
-            if not isinstance(all_probs, bool):
-                return "all_probs must be a boolean value"
+        logprobs = False
+        if "logprobs" in request.get_json():
+            logprobs = request.get_json()["logprobs"]
+            if not isinstance(logprobs, bool):
+                return "logprobs must be a boolean value"
         
         temperature = args.temperature
         if "temperature" in request.get_json():
@@ -64,6 +73,22 @@ class MegatronGenerate(Resource):
             if not isinstance(temperature, float) or not \
                0.0 < temperature <= 100.0:
                 return "temperature must be a positive float less than or equal to 100.0"
+        
+        top_k = args.top_k
+        if "top_k" in request.get_json():
+            top_k = request.get_json()["top_k"]
+            if not (type(top_k) == int):
+                return "top_k must be an integer equal to or greater than 0 and less than or equal to 1000"
+            if not (0 < top_k <= 1000):
+                return "top_k must be equal to or greater than 0 and less than or equal to 1000"
+        
+        top_p = args.top_p
+        if "top_p" in request.get_json():
+            top_p = request.get_json()["top_p"]
+            if not (type(top_p) == float):
+                return "top_p must be a positive float less than or equal to 1.0"
+            if not (0 < top_p <= 1.0):
+                return "top_p must be less than or equal to 1.0"
         
         add_BOS = False
         if "add_BOS" in request.get_json():
@@ -73,24 +98,24 @@ class MegatronGenerate(Resource):
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-            resp_sentences, resp_sentences_seg, output_logits, full_logits, tokens = generate(self.model, sentences, tokens_to_generate, all_probs, temperature, add_BOS) 
+            response, response_seg, response_logprobs = generate(self.model,
+                                                                 prompts,
+                                                                 tokens_to_generate,
+                                                                 logprobs,
+                                                                 temperature,
+                                                                 top_k,
+                                                                 top_p,
+                                                                 add_BOS) 
         
-        if all_probs:
-            return jsonify({"sentences": resp_sentences,
-                "segments": resp_sentences_seg,
-                "logits": output_logits,
-                "all_logits": full_logits,
-                "tokens": tokens})
-        
-        return jsonify({"sentences": resp_sentences,
-            "segments": resp_sentences_seg,
-            "logits": output_logits})
+        return jsonify({"prompts": response,
+            "segments": response_seg,
+            "logprobs": response_logprobs})
 
 class MegatronServer(object):
     def __init__(self, model):
         self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
-        api.add_resource(MegatronGenerate, '/generate', resource_class_args=[model])
+        api.add_resource(MegatronGenerate, '/api', resource_class_args=[model])
         
     def run(self, url): 
         self.app.run(url, threaded=True, debug=False)
