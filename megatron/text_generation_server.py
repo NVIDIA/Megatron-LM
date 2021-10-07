@@ -107,7 +107,7 @@ class MegatronGenerate(Resource):
                                                                  top_p,
                                                                  add_BOS) 
         
-        return jsonify({"prompts": response,
+        return jsonify({"text": response,
             "segments": response_seg,
             "logprobs": response_logprobs})
 
