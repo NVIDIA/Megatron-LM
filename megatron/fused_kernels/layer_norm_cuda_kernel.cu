@@ -329,6 +329,7 @@ void cuApplyLayerNorm(
       mean[i1] = mu;
       invvar[i1] = c_invvar;
     }
+    __syncthreads();
   }
 }
 
