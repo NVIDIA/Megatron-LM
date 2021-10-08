@@ -423,7 +423,8 @@ class ParallelTransformerLayer(MegatronModule):
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon)
+            eps=args.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -438,7 +439,8 @@ class ParallelTransformerLayer(MegatronModule):
         # Layernorm on the attention output
         self.post_attention_layernorm = LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon)
+            eps=args.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -449,7 +451,8 @@ class ParallelTransformerLayer(MegatronModule):
             # Layernorm on the attention output.
             self.post_inter_attention_layernorm = LayerNorm(
                 args.hidden_size,
-                eps=args.layernorm_epsilon)
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
         self.mlp = ParallelMLP(init_method,
@@ -602,7 +605,8 @@ class ParallelTransformer(MegatronModule):
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
-                eps=args.layernorm_epsilon)
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
