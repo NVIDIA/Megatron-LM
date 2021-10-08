@@ -24,7 +24,7 @@ from .communication import (
     copy_from_last_to_first_pipeline_stage,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage)
-from .forward_step import forward_step_provider
+from .forward_step import ForwardStep
 from .sampling import sample
 
 
@@ -66,8 +66,7 @@ def generate_tokens_probs_and_return_on_first_stage(
     max_sequence_length = min(max_sequence_length, args.max_position_embeddings)
 
     # forward step.
-    forward_step = forward_step_provider(model, batch_size, 4,
-                                         max_sequence_length)
+    forward_step = ForwardStep(model, batch_size, max_sequence_length)
 
     # Added termination_id to support the case that we want to terminate the
     # generation once that id is generated.
@@ -190,8 +189,8 @@ def generate_tokens_probs_and_return_on_first_stage(
                 done = torch.all(is_generation_done)
             done = broadcast_from_last_pipeline_stage(1, torch.uint8,
                                                       tensor=done)
-            if done:
-                break
+            #if done:
+            #    break
 
     # ===================================================
     # Update the length of based on max generated length.

@@ -180,9 +180,8 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
         # Inference key-value memory
-        self.inference_key_memory_list = None
-        self.inference_value_memory_list = None
-        self.inference_current_sequence_len_list = None
+        self.inference_key_memory = None
+        self.inference_value_memory = None
 
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size):
@@ -206,22 +205,17 @@ class ParallelAttention(MegatronModule):
         if inference_params:
             if inference_params.allocate_key_value_memory:
                 inf_max_seq_len = inference_params.max_sequence_len
-                inf_batch_sizes = inference_params.micro_batch_size_list
-                self.inference_key_memory_list = [
-                    self._allocate_memory(inf_max_seq_len, inf_batch_size)
-                    for inf_batch_size in inf_batch_sizes]
-                self.inference_value_memory_list = [
-                    self._allocate_memory(inf_max_seq_len, inf_batch_size)
-                    for inf_batch_size in inf_batch_sizes]
-                self.inference_current_sequence_len_list = [
-                    0 for _ in inf_batch_sizes]
+                inf_max_batch_size = inference_params.max_batch_size
+                self.inference_key_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size)
+                self.inference_value_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size)
         # This is added for safety. In case inference_params
         # is not provided, make sure there is no potential memory left
         # from previous inference.
         else:
-            self.inference_key_memory_list = None
-            self.inference_value_memory_list = None
-            self.inference_current_sequence_len_list = None
+            self.inference_value_memory = None
+            self.inference_current_sequence_len = None
 
         # =====================
         # Query, Key, and Value
@@ -269,23 +263,23 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         if inference_params:
-            inf_batch_index = inference_params.micro_batch_index
-            assert key_layer.size(1) == \
-                inference_params.micro_batch_size_list[inf_batch_index]
-            # Adjust the range variables.
-            start = self.inference_current_sequence_len_list[inf_batch_index]
-            end = start + key_layer.size(0)
-            assert end <= inference_params.max_sequence_len
-            self.inference_current_sequence_len_list[inf_batch_index] = end
+            batch_start = inference_params.batch_size_offset
+            batch_end = batch_start + key_layer.size(1)
+            assert batch_end <= self.inference_key_memory.size(1)
+            sequence_start = inference_params.sequence_len_offset
+            sequence_end = sequence_start + key_layer.size(0)
+            assert sequence_end <= self.inference_key_memory.size(0)
             # Copy key and values.
-            self.inference_key_memory_list[inf_batch_index][start:end, ...] \
-                = key_layer
-            self.inference_value_memory_list[inf_batch_index][start:end, ...] \
-                = value_layer
-            key_layer = \
-                self.inference_key_memory_list[inf_batch_index][:end, ...]
-            value_layer = \
-                self.inference_value_memory_list[inf_batch_index][:end, ...]
+            self.inference_key_memory[sequence_start:sequence_end,
+                                      batch_start:batch_end,
+                                      ...] = key_layer
+            self.inference_value_memory[sequence_start:sequence_end,
+                                        batch_start:batch_end,
+                                        ...] = value_layer
+            key_layer = self.inference_key_memory[
+                :sequence_end, batch_start:batch_end, ...]
+            value_layer = self.inference_value_memory[
+                :sequence_end, batch_start:batch_end, ...]
 
 
         # ===================================
