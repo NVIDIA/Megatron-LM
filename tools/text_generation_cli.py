@@ -25,10 +25,10 @@ if __name__ == "__main__":
     url = sys.argv[1]
     while True:
         sentence = raw_input("Enter prompt: ")
-        max_len = int(input("Enter number tokens output: "))
-        data = json.dumps({"sentences": [sentence], "max_len":max_len})
+        tokens_to_generate = int(input("Enter number of tokens to generate: "))
+        data = json.dumps({"prompts": [sentence], "tokens_to_generate":tokens_to_generate})
         req = PutRequest(url, data, {'Content-Type': 'application/json'})
         response = urllib2.urlopen(req)
         resp_sentences = json.load(response)
         print("Megatron Response: ")
-        print(resp_sentences["sentences"][0])
+        print(resp_sentences["text"][0])
