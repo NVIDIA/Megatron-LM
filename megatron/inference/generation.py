@@ -32,10 +32,12 @@ def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
         return_output_log_probs=False,
         return_all_log_probs=False,
-        temperature=1.0):
+        greedy=False, top_k=0, top_p=0.0,
+        temperature=1.0,
+        use_eod_token_for_early_termination=True):
     """Main token generation function.
     Arguments:
-        model: XXX
+        model: no interleaving is supported.
         tokens: prompt tokens extended to be of size [b, max-sequence-length]
         lengths: original prompt length, size: [b]
         return_output_log_probs: flag to calculate the log probability of
@@ -44,7 +46,14 @@ def generate_tokens_probs_and_return_on_first_stage(
         return_all_log_probs: flag to calculate the log probability of across
             all the tokens (vocab size). Note that the log probability is the
             one after logits are modifed for sampling.
+        greedy, top_k, top_p: greedy, top-k, and top-p sampling parameters.
+            Note that these three paramters are exclusive meaning that:
+                if greedy = true then we should have top-k=top-p=0.
+                if top-k > 0 then we expect greedy=false and top-p=0.
+                if top-p > 0 then we check for greedy=false and top-k=0.
         temperature: sampling temperature.
+        use_eod_token_for_early_termination: if True, do early termination if
+            all the sequences have reached this token.
     Note: Outside of model, other parameters only need to be available on
           rank 0.
     Outputs: Note that is size is adjusted to a lower value than
@@ -108,10 +117,9 @@ def generate_tokens_probs_and_return_on_first_stage(
     # Run infernece
     # =============
 
-    attention_mask, position_ids = _build_attention_mask_and_position_ids(
-        tokens)
-
     with torch.no_grad():
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(
+            tokens)
         prev_context_length = 0
         for context_length in range(min_prompt_length, max_sequence_length):
 
@@ -132,9 +140,9 @@ def generate_tokens_probs_and_return_on_first_stage(
                 last_token_logits = logits[:, -1, :]
                 new_sample, updated_last_token_logits = sample(
                     last_token_logits,
-                    greedy=args.greedy,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
+                    greedy=greedy,
+                    top_k=top_k,
+                    top_p=top_p,
                     temperature=temperature,
                     vocab_size=tokenizer.vocab_size)
                 # Now that we have the sample and updated logits,
@@ -189,8 +197,8 @@ def generate_tokens_probs_and_return_on_first_stage(
                 done = torch.all(is_generation_done)
             done = broadcast_from_last_pipeline_stage(1, torch.uint8,
                                                       tensor=done)
-            #if done:
-            #    break
+            if use_eod_token_for_early_termination and done:
+                break
 
     # ===================================================
     # Update the length of based on max generated length.

@@ -26,14 +26,20 @@ from .tokenization import (
     detokenize_generations)
 
 
+
 def generate_and_post_process(model,
                               prompts=None,
                               tokens_to_generate=0,
                               return_output_log_probs=False,
                               return_all_log_probs=False,
+                              greedy_sampling=False,
+                              top_k_sampling=0,
+                              top_p_sampling=0.0,
                               temperature=1.0,
-                              add_BOS=False):
-    """TO DO ..."""
+                              add_BOS=False,
+                              use_eod_token_for_early_termination=True):
+    """Run inferecne and post-process outputs, i.e., detokenize,
+    move to cpu and convert to list."""
 
     # Main inference.
     tokens, lengths, output_log_probs, all_log_probs = generate(
@@ -42,8 +48,12 @@ def generate_and_post_process(model,
         tokens_to_generate=tokens_to_generate,
         return_output_log_probs=return_output_log_probs,
         return_all_log_probs=return_all_log_probs,
+        greedy_sampling=greedy_sampling,
+        top_k_sampling=top_k_sampling,
+        top_p_sampling=top_p_sampling,
         temperature=temperature,
-        add_BOS=add_BOS)
+        add_BOS=add_BOS,
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -62,24 +72,42 @@ def generate_and_post_process(model,
     return None
 
 
+
 def generate(model,
              prompts=None,
              tokens_to_generate=0,
              return_output_log_probs=False,
              return_all_log_probs=False,
+             greedy_sampling=False,
+             top_k_sampling=0,
+             top_p_sampling=0.0,
              temperature=1.0,
-             add_BOS=False):
-    """TO DO ..."""
+             add_BOS=False,
+             use_eod_token_for_early_termination=True):
+    """Given prompts and input parameters, run inference and return:
+       tokens: prompts plus the generated tokens.
+       lengths: length of the prompt + generations. Note that we can
+           discard tokens in the tokens tensor that are after the
+           corresponding length.
+       output_log_probs: log probs of the tokens.
+       all_log_probs: full log probs for all of tokens.
+    """
 
     # Make sure input params are avaialble to all ranks.
-    values = [tokens_to_generate, return_output_log_probs,
-              return_all_log_probs, temperature, add_BOS]
-    values_float_tensor = broadcast_float_list(5, float_list=values)
+    values = [tokens_to_generate,
+              return_output_log_probs, return_all_log_probs,
+              greedy_sampling, top_k_sampling, top_p_sampling,
+              temperature, add_BOS, use_eod_token_for_early_termination]
+    values_float_tensor = broadcast_float_list(9, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     return_all_log_probs = bool(values_float_tensor[2].item())
-    temperature = values_float_tensor[3].item()
-    add_BOS = bool(values_float_tensor[4].item())
+    greedy_sampling = bool(values_float_tensor[3].item())
+    top_k_sampling = int(values_float_tensor[4].item())
+    top_p_sampling = values_float_tensor[5].item()
+    temperature = values_float_tensor[6].item()
+    add_BOS = bool(values_float_tensor[7].item())
+    use_eod_token_for_early_termination = bool(values_float_tensor[8].item())
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -95,4 +123,6 @@ def generate(model,
         model, context_tokens_tensor, context_length_tensor,
         return_output_log_probs=return_output_log_probs,
         return_all_log_probs=return_all_log_probs,
-        temperature=temperature)
+        greedy=greedy_sampling, top_k=top_k_sampling, top_p=top_p_sampling,
+        temperature=temperature,
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination)

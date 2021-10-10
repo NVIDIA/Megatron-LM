@@ -22,14 +22,20 @@ import torch
 from megatron import (
     get_args,
     mpu)
+from .communication import (
+    send_to_next_pipeline_rank,
+    recv_from_prev_pipeline_rank_)
 
 
 
 class InferenceParams:
-
+    """Inference parameters that are passed to the main model in order
+    to efficienly calculate and store the context during inference."""
 
     def __init__(self, max_batch_size, max_sequence_len):
-
+        """Note that offsets are set to zero and we always set the
+        flag to allocate memory. After the first call, make sure to
+        set this flag to False."""
         self.max_sequence_len = max_sequence_len
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0
@@ -39,38 +45,50 @@ class InferenceParams:
 
 
 class ForwardStep:
+    """Forward step function with all the communications.
+    We use a class here to hide the inference parameters
+    from the outside caller."""
 
     def __init__(self, model, max_batch_size, max_sequence_len):
-
+        """Set values so we don't need to do it multiple times."""
         # Make sure model is in eval mode.
-        if isinstance(model, Iterable):
-            for this_model in model:
-                this_model.eval()
-        else:
-            model.eval()
+        assert not isinstance(model, Iterable), \
+            'interleaving schedule is not supported for inference'
+        model.eval()
         self.model = model
-
-        self.constant = 512
-
         # Initialize inference parameters.
         self.inference_params = InferenceParams(max_batch_size,
                                                 max_sequence_len)
+        # Pipelining arguments.
+        args = get_args()
+        self.pipeline_size_larger_than_one = args.pipeline_model_parallel_size
+        # Threshold of pipelining.
+        self.pipelining_batch_x_seqlen = \
+            args.inference_batch_times_seqlen_threshold
 
 
     def __call__(self, tokens, position_ids, attention_mask):
-        if tokens.size(0) * tokens.size(1) >= self.constant:
-            micro_batch_size = max(1, self.constant // tokens.size(1))
-            return _with_pipelining_forward_step(self.model, tokens,
-                                                 position_ids,
-                                                 attention_mask,
-                                                 self.inference_params,
-                                                 micro_batch_size)
-        else:
-            return _no_pipelining_forward_step(self.model, tokens,
-                                               position_ids,
-                                               attention_mask,
-                                               self.inference_params)
-            
+        """Invocation of the forward methods. Note that self.inference_params
+        is being modified by the forward step."""
+        # Pipelining case.
+        if self.pipeline_size_larger_than_one:
+            current_batch_x_seqlen = tokens.size(0) * tokens.size(1)
+            if current_batch_x_seqlen >= self.pipelining_batch_x_seqlen:
+                micro_batch_size = \
+                    max(1, self.pipelining_batch_x_seqlen // tokens.size(1))
+                return _with_pipelining_forward_step(self.model,
+                                                     tokens,
+                                                     position_ids,
+                                                     attention_mask,
+                                                     self.inference_params,
+                                                     micro_batch_size)
+
+        return _no_pipelining_forward_step(self.model,
+                                           tokens,
+                                           position_ids,
+                                           attention_mask,
+                                           self.inference_params)
+
 
 
 def _get_recv_buffer_dtype(args):
@@ -103,9 +121,7 @@ def _forward_step_helper(model, tokens, position_ids, attention_mask,
         recv_buffer = _allocate_recv_buffer(batch_size, sequence_length)
 
     # Receive from previous stage.
-    if not mpu.is_pipeline_first_stage():
-        torch.distributed.recv(recv_buffer,
-                               src=mpu.get_pipeline_model_parallel_prev_rank())
+    recv_from_prev_pipeline_rank_(recv_buffer)
 
     # Forward pass through the model.
     model.set_input_tensor(recv_buffer)
@@ -113,9 +129,7 @@ def _forward_step_helper(model, tokens, position_ids, attention_mask,
                           inference_params=inference_params)
 
     # Send output to the next stage.
-    if not mpu.is_pipeline_last_stage():
-        torch.distributed.send(output_tensor,
-                               mpu.get_pipeline_model_parallel_next_rank())
+    send_to_next_pipeline_rank(output_tensor)
 
     # Make sure we do not allocate context memory anymore.
     if inference_params.allocate_key_value_memory:
@@ -128,7 +142,7 @@ def _forward_step_helper(model, tokens, position_ids, attention_mask,
 
 def _no_pipelining_forward_step(model, tokens, position_ids, attention_mask,
                                 inference_params, recv_buffer=None):
-
+    """If recv_buffer is none, we will allocate one on the fly."""
     # Run a simple forward pass.
     output_tensor = _forward_step_helper(model, tokens, position_ids,
                                          attention_mask, inference_params,
@@ -143,9 +157,10 @@ def _no_pipelining_forward_step(model, tokens, position_ids, attention_mask,
     return logits
 
 
+
 def _with_pipelining_forward_step(model, tokens, position_ids, attention_mask,
                                   inference_params, micro_batch_size):
-
+    """No interleaving is supported."""
     sequence_length = tokens.size(1)
     batch_size = tokens.size(0)
 

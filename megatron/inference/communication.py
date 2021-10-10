@@ -21,6 +21,38 @@ import torch
 from megatron import mpu
 
 
+
+def recv_from_prev_pipeline_rank_(recv_buffer=None):
+    """Receive from previous pipeline stage and update the
+    input buffer inplace."""
+    if not mpu.is_pipeline_first_stage():
+        assert recv_buffer is not None
+        recv_prev_op = torch.distributed.P2POp(
+            torch.distributed.irecv, recv_buffer,
+            mpu.get_pipeline_model_parallel_prev_rank())
+        reqs = torch.distributed.batch_isend_irecv([recv_prev_op])
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv().
+        torch.cuda.synchronize()
+
+
+
+def send_to_next_pipeline_rank(tensor=None):
+    """Send output to the next pipeline stage."""
+    if not mpu.is_pipeline_last_stage():
+        assert tensor is not None
+        send_next_op = torch.distributed.P2POp(
+            torch.distributed.isend, tensor,
+            mpu.get_pipeline_model_parallel_next_rank())
+        reqs = torch.distributed.batch_isend_irecv([send_next_op])
+        for req in reqs:
+            req.wait()
+        # To protect against race condition when using batch_isend_irecv().
+        torch.cuda.synchronize()
+
+
+
 def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     """Broadcast a tensor from last pipeline stage to all ranks."""
 
@@ -96,6 +128,7 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             tensor[...] = tensor_
 
 
+
 def broadcast_tensor(size, dtype, tensor=None, rank=0):
     """ Given size and type of a tensor on all ranks and the tensor value
         only on a specific rank, broadcast from that rank to all other ranks.
@@ -114,6 +147,7 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0):
     return tensor
 
 
+
 def broadcast_list(size, dtype, list_values=None, rank=0):
     """Broadcast a list of values with a given type."""
 
@@ -125,10 +159,12 @@ def broadcast_list(size, dtype, list_values=None, rank=0):
     return broadcast_tensor(size, dtype, tensor=tensor, rank=rank)
 
 
+
 def broadcast_int_list(size, int_list=None, rank=0):
     """Broadcast a list of interger values."""
 
     return broadcast_list(size, torch.int64, list_values=int_list, rank=rank)
+
 
 
 def broadcast_float_list(size, float_list=None, rank=0):
