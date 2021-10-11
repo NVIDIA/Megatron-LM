@@ -64,7 +64,7 @@ def generate_and_post_process(model,
         if return_output_log_probs:
             output_log_probs = output_log_probs.cpu().numpy().tolist()
         if return_all_log_probs:
-            all_log_probs = all_log_probs.cpu().numpy() #.tolist()
+            all_log_probs = all_log_probs.cpu().numpy().tolist()
 
         return prompts_plus_generations, prompts_plus_generations_segments, \
             output_log_probs, all_log_probs, tokens

@@ -27,7 +27,7 @@ from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_server import MegatronServer
-from megatron.text_generation_utils import generate
+from megatron.inference.api import generate_and_post_process
 import torch
 
 def model_provider(pre_process=True, post_process=True):
@@ -80,4 +80,4 @@ if __name__ == "__main__":
         choice = torch.cuda.LongTensor(1)
         torch.distributed.broadcast(choice, 0)
         if choice[0].item() == 0:
-            generate(model)
+            generate_and_post_process(model)
