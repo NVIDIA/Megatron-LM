@@ -108,13 +108,13 @@ def tokenize_batch(sentences, max_len, add_BOS):
     context_length_tensor = torch.cuda.LongTensor(context_lengths)
     return context_tokens_tensor, context_length_tensor 
 
-def send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs):
+def send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p):
     """
     Needs to be synced up with receive_generate_info
     """
     # Send the sizes of the tensors
-    input_info = [context_tokens_tensor.size(0), context_tokens_tensor.size(1), tokens_to_generate, all_probs]
-    input_info_tensor = torch.cuda.LongTensor(input_info)
+    input_info = [context_tokens_tensor.size(0), context_tokens_tensor.size(1), tokens_to_generate, logprobs, temperature, top_k, top_p]
+    input_info_tensor = torch.cuda.FloatTensor(input_info)
     torch.distributed.broadcast(input_info_tensor, 0)
 
     # Send variables to all ranks 
@@ -125,12 +125,15 @@ def receive_generate_info():
     """
     Needs to be synced up with send_generate_info
     """
-    input_info_tensor = torch.empty(4, dtype=torch.int64, device=torch.cuda.current_device())
+    input_info_tensor = torch.empty(7, dtype=torch.float32, device=torch.cuda.current_device())
     torch.distributed.broadcast(input_info_tensor, 0)
-    batch_size = input_info_tensor[0].item()
-    seq_len = input_info_tensor[1].item()
-    tokens_to_generate = input_info_tensor[2].item()
-    all_probs = input_info_tensor[3].item()
+    batch_size = int(input_info_tensor[0].item())
+    seq_len = int(input_info_tensor[1].item())
+    tokens_to_generate = int(input_info_tensor[2].item())
+    logprobs = bool(input_info_tensor[3].item())
+    temperature = float(input_info_tensor[4].item())
+    top_k = int(input_info_tensor[5].item())
+    top_p = float(input_info_tensor[6].item())
     
     context_length_tensor = torch.empty(batch_size, dtype=torch.int64, device=torch.cuda.current_device())
     context_tokens_tensor = torch.empty(batch_size, seq_len, dtype=torch.int64, device=torch.cuda.current_device())
@@ -139,65 +142,52 @@ def receive_generate_info():
     torch.distributed.broadcast(context_length_tensor, 0)
     torch.distributed.broadcast(context_tokens_tensor, 0)
     
-    return context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs
+    return context_length_tensor, context_tokens_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p
 
-def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature):
+def synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p):
     context_length = context_length_tensor.min().item()
     tokens, attention_mask, position_ids = get_batch(context_tokens_tensor)
-    batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
+    batch_token_iterator = sample_sequence_batch(model,
+                                                 context_tokens_tensor,
                                                  context_length_tensor,
-                                                 attention_mask, position_ids,
+                                                 attention_mask,
+                                                 position_ids,
                                                  tokens_to_generate,
-                                                 all_probs,
-                                                 temperature=temperature)
-    for tokens, lengths, output_logits, full_logits in batch_token_iterator:
-        context_length += 1
-                
-    if mpu.is_pipeline_last_stage():
-        src = mpu.get_pipeline_model_parallel_last_rank()
-        group = mpu.get_embedding_group()
-        print('last rank output size {} {} | \n'.format(output_logits.size(0), output_logits.size(1)))
-        torch.distributed.broadcast(output_logits, src, group)
-        if all_probs:
-            print('last rank full size {} {} | \n'.format(full_logits.size(0),
-                                                        full_logits.size(1),
-                                                        full_logits.size(2)))
-            src = mpu.get_pipeline_model_parallel_last_rank()
-            group = mpu.get_embedding_group()
-            torch.distributed.broadcast(full_logits, src, group)
+                                                 logprobs,
+                                                 temperature,
+                                                 top_k,
+                                                 top_p)
 
-    else:
-        if mpu.is_pipeline_first_stage():
+    for tokens, lengths, output_logits in batch_token_iterator:
+        context_length += 1
+
+    if logprobs:
+        if mpu.is_pipeline_last_stage():
             src = mpu.get_pipeline_model_parallel_last_rank()
             group = mpu.get_embedding_group()
-            output_logits = torch.empty(tokens.size(0), context_length-1, dtype=torch.float32, device=torch.device("cuda"))
-            print('first rank output size {} {} | \n'.format(output_logits.size(0), output_logits.size(1)))
             torch.distributed.broadcast(output_logits, src, group)
-            
-            if all_probs:
-                args = get_args()
+
+        else:
+            if mpu.is_pipeline_first_stage():
                 src = mpu.get_pipeline_model_parallel_last_rank()
                 group = mpu.get_embedding_group()
-                full_logits = torch.empty(tokens.size(0), context_length-1, args.padded_vocab_size, dtype=torch.float32, device=torch.device("cuda"))
-                print('first rank full size {} {} | \n'.format(full_logits.size(0),
-                                                            full_logits.size(1),
-                                                            full_logits.size(2)))
-                
-                torch.distributed.broadcast(full_logits, src, group)
+                output_logits = torch.empty(tokens.size(0), context_length-1, dtype=torch.float32, device=torch.device("cuda"))
+                torch.distributed.broadcast(output_logits, src, group)
+            
     if tokens is not None:
-        return tokens[:, :context_length], output_logits, full_logits 
+        return tokens[:, :context_length], output_logits 
 
-def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, temperature=1.0, add_BOS=False):
+def generate(model, sentences=None, tokens_to_generate=0, logprobs=False, temperature=1.0, top_k=0, top_p=0.0, add_BOS=False):
     model.eval()
     if torch.distributed.get_rank() == 0:
         context_tokens_tensor, context_length_tensor = tokenize_batch(sentences, tokens_to_generate, add_BOS)
-        send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs)
+        send_generate_info(context_tokens_tensor, context_length_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p)
     else:
-        context_length_tensor, context_tokens_tensor, tokens_to_generate, all_probs = receive_generate_info()
+        context_length_tensor, context_tokens_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p = receive_generate_info()
 
-    output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, all_probs, temperature)
+    output = synced_generate(model, context_tokens_tensor, context_length_tensor, tokens_to_generate, logprobs, temperature, top_k, top_p)
     if output is not None:
-        decode_tokens, output_logits, full_logits = output
+        decode_tokens, output_logits = output
         
         args = get_args()
         tokenizer = get_tokenizer()
@@ -205,7 +195,8 @@ def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, tempe
         resp_sentences_seg = []
         
         decode_tokens = decode_tokens.cpu().numpy().tolist()
-        for decode_token in decode_tokens:
+        
+        for i, decode_token in enumerate(decode_tokens):
             resp_sentences.append(tokenizer.detokenize(decode_token))
             words = []
             for token in decode_token:
@@ -213,12 +204,10 @@ def generate(model, sentences=None, tokens_to_generate=0, all_probs=False, tempe
                 word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode('utf-8', errors='replace')
                 words.append(word)
             resp_sentences_seg.append(words)
-
-        output_logits = output_logits.cpu().numpy().tolist()
-        if all_probs:
-            full_logits = full_logits.cpu().numpy() #.tolist()
-       
-        return resp_sentences, resp_sentences_seg, output_logits, full_logits, decode_tokens 
+        
+        if logprobs:
+            output_logits = output_logits.cpu().numpy().tolist()
+        return resp_sentences, resp_sentences_seg, output_logits
 
 def generate_samples_eval(model, context, max_gen_length, eos_token_id):
     """
@@ -268,9 +257,17 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     return output_tensor
 
 
-def sample_sequence_batch(model, context_tokens, context_lengths,
-                          attention_mask, position_ids,
-                          tokens_to_generate, all_probs=False, type_ids=None, temperature=None):
+def sample_sequence_batch(model,
+                          context_tokens,
+                          context_lengths,
+                          attention_mask,
+                          position_ids,
+                          tokens_to_generate,
+                          logprobs,
+                          temperature,
+                          top_k,
+                          top_p,
+                          type_ids=None):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -340,8 +337,8 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 else:
                     logits = logits.float()
                     logits /= temperature
-                    logits = top_k_logits(logits, top_k=args.top_k,
-                                          top_p=args.top_p)
+                    logits = top_k_logits(logits, top_k=top_k,
+                                          top_p=top_p)
                     log_probs = F.softmax(logits, dim=-1)
                     prev = torch.multinomial(log_probs, num_samples=1).view(-1)
                 started = context_lengths <= context_length
@@ -353,22 +350,19 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 new_tokens = switch(
                     tokens[:, context_length].view(-1), prev, started)
                 tokens[:, context_length] = new_tokens
-                
-                if output_logits is None:
-                    output_context = F.log_softmax(output[:, :context_length, :], 2)
-                    indices = torch.unsqueeze(tokens[:, 1:context_length+1],2)
-                    output_logits = torch.gather(output_context, 2, indices).squeeze(2)
-                    if all_probs:
-                        full_logits = output_context
-                else:
-                    output_context = F.log_softmax(output, 2)
-                    indices = torch.unsqueeze(new_tokens,1).unsqueeze(2)
-                    new_output_logits = torch.gather(output_context, 2, indices).squeeze(2)
-                    
-                    # TODO(rprenger) we're copying output_logits every time.  Should pre-allocate
-                    output_logits = torch.cat([output_logits, new_output_logits],1)
-                    if all_probs:
-                        full_logits = torch.cat([full_logits, output_context], 1)
+               
+                if logprobs:
+                    if output_logits is None:
+                        output_context = F.log_softmax(output[:, :context_length, :], 2)
+                        indices = torch.unsqueeze(tokens[:, 1:context_length+1],2)
+                        output_logits = torch.gather(output_context, 2, indices).squeeze(2)
+                    else:
+                        output_context = F.log_softmax(output, 2)
+                        indices = torch.unsqueeze(new_tokens,1).unsqueeze(2)
+                        new_output_logits = torch.gather(output_context, 2, indices).squeeze(2)
+                        
+                        # TODO(rprenger) we're copying output_logits every time.  Should pre-allocate
+                        output_logits = torch.cat([output_logits, new_output_logits],1)
                 
                 src = mpu.get_pipeline_model_parallel_last_rank()
                 group = mpu.get_embedding_group()
@@ -383,10 +377,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                 src = mpu.get_pipeline_model_parallel_last_rank()
                 group = mpu.get_pipeline_model_parallel_group()
                 torch.distributed.broadcast(done, src, group)
-                if all_probs:
-                    yield tokens, lengths, output_logits, full_logits
-                else:
-                    yield tokens, lengths, output_logits, None
+                yield tokens, lengths, output_logits
 
             else:
                 if mpu.is_pipeline_first_stage():
@@ -395,9 +386,9 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                     new_tokens = torch.empty_like(tokens[:, context_length])
                     torch.distributed.broadcast(new_tokens, src, group)
                     tokens[:, context_length] = new_tokens
-                    yield tokens, None, None, None
+                    yield tokens, None, None
                 else:
-                    yield None, None, None, None
+                    yield None, None, None
 
                 done = torch.cuda.ByteTensor([0])
                 src = mpu.get_pipeline_model_parallel_last_rank()

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-from megatron.model.enums import AttnMaskType, LayerType, AttnType
+from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -389,14 +389,18 @@ def get_bias_dropout_add(training):
 
 
 @torch.jit.script
-def bias_dropout_add_fused_train(x, bias, residual, prob):
-    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+def bias_dropout_add_fused_train(x: torch.Tensor,
+                                 bias: torch.Tensor,
+                                 residual: torch.Tensor,
+                                 prob: float) -> torch.Tensor:
     return bias_dropout_add(x, bias, residual, prob, True)
 
 
 @torch.jit.script
-def bias_dropout_add_fused_inference(x, bias, residual, prob):
-    # type: (Tensor, Tensor, Tensor, float) -> Tensor
+def bias_dropout_add_fused_inference(x: torch.Tensor,
+                                     bias: torch.Tensor,
+                                     residual: torch.Tensor,
+                                     prob: float) -> torch.Tensor:
     return bias_dropout_add(x, bias, residual, prob, False)
 
 
@@ -564,9 +568,8 @@ class ParallelTransformer(MegatronModule):
         self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
 
         # Number of layers.
-        assert args.num_layers % mpu.get_pipeline_model_parallel_world_size() == 0, \
-            'num_layers must be divisible by pipeline_model_parallel_size'
-        self.num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
+        self.num_layers = mpu.get_num_layers(
+            args, args.model_type == ModelType.encoder_and_decoder)
 
         # Transformer layers.
         def build_layer(layer_number):

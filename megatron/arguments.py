@@ -81,6 +81,12 @@ def parse_args(extra_args_provider=None, defaults={},
                   args.world_size, args.data_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+    if args.pipeline_model_parallel_size > 1:
+        if args.pipeline_model_parallel_split_rank is not None:
+            assert args.pipeline_model_parallel_split_rank < \
+                    args.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.pipeline_model_parallel_size)
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -614,6 +620,9 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--pipeline-model-parallel-split-rank',
+                       type=int, default=None,
+                       help='Rank where encoder and decoder should be split.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

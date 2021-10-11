@@ -28,6 +28,7 @@ from megatron import get_timers
 from megatron import mpu
 from megatron.data.biencoder_dataset_utils import get_ict_batch
 from megatron.data.dataset_utils import build_train_valid_test_datasets
+from megatron.model import ModelType
 from megatron.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
@@ -174,5 +175,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider,
              pretrain_ict_model_provider,
+             ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

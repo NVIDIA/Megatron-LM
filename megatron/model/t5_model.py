@@ -86,7 +86,13 @@ class T5LMHead(MegatronModule):
 class T5Model(MegatronModule):
     """T5 Language model."""
 
-    def __init__(self, num_tokentypes=0, parallel_output=True):
+    def __init__(self,
+                 num_tokentypes=0,
+                 parallel_output=True,
+                 pre_process=True,
+                 post_process=True,
+                 add_encoder=True,
+                 add_decoder=True):
         super(T5Model, self).__init__()
         args = get_args()
 
@@ -95,19 +101,29 @@ class T5Model(MegatronModule):
         init_method = init_method_normal(args.init_method_std)
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
                                                        args.num_layers)
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.add_encoder = add_encoder
+        self.add_decoder = add_decoder
 
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            add_decoder=True,
+            add_encoder=add_encoder,
+            add_decoder=add_decoder,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method)
+            scaled_init_method=scaled_init_method,
+            pre_process=self.pre_process,
+            post_process=self.post_process)
 
-        self.lm_head = T5LMHead(
-            self.language_model.embedding.word_embeddings.weight.size(0),
-            parallel_output)
-        self._lm_head_key = 'lm_head'
+        self.initialize_word_embeddings(init_method_normal)
+
+        if self.post_process and self.add_decoder:
+            self.lm_head = T5LMHead(
+                self.word_embeddings_weight().size(0),
+                parallel_output)
+            self._lm_head_key = 'lm_head'
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
@@ -134,22 +150,28 @@ class T5Model(MegatronModule):
                                         tokentype_ids=tokentype_ids,
                                         enc_hidden_states=enc_hidden_states)
 
-        decoder_output, encoder_output = lm_output
+        if self.post_process and self.add_decoder:
+            decoder_output, encoder_output = lm_output
+            # Output.
+            lm_logits = self.lm_head(decoder_output,
+                                     self.word_embeddings_weight())
 
-        # Output.
-        lm_logits = self.lm_head(decoder_output,
-                                 self.language_model.embedding.word_embeddings.weight)
-
-        if lm_labels is None:
-            return lm_logits, encoder_output
-        else:
-            if self.fp16_lm_cross_entropy:
-                assert lm_logits.dtype == torch.half
-                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            if lm_labels is None:
+                return lm_logits
             else:
-                lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
-                                                           lm_labels)
-            return lm_loss, encoder_output
+                if self.fp16_lm_cross_entropy:
+                    assert lm_logits.dtype == torch.half
+                    lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+                else:
+                    lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                               lm_labels)
+            return lm_loss
+        elif self.add_decoder and not self.add_encoder:
+            decoder_output, encoder_output = lm_output
+            return decoder_output
+        else:
+            encoder_output = lm_output
+            return encoder_output
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
@@ -160,9 +182,14 @@ class T5Model(MegatronModule):
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
             destination, prefix, keep_vars)
-        state_dict_[self._lm_head_key] \
-            = self.lm_head.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+        if self.post_process and self.add_decoder:
+            state_dict_[self._lm_head_key] \
+                = self.lm_head.state_dict_for_save_checkpoint(
+                destination, prefix, keep_vars)
+         # Save word_embeddings.
+        if self.post_process and not self.pre_process and self.add_decoder:
+            state_dict_[self._word_embeddings_for_head_key] \
+                = self.word_embeddings.state_dict(destination, prefix, keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
@@ -170,5 +197,10 @@ class T5Model(MegatronModule):
 
         self.language_model.load_state_dict(
             state_dict[self._language_model_key], strict=strict)
-        self.lm_head.load_state_dict(state_dict[self._lm_head_key],
-                                     strict=strict)
+        if self.post_process and self.add_decoder:
+            self.lm_head.load_state_dict(state_dict[self._lm_head_key],
+                                         strict=strict)
+        # Load word embeddings.
+        if self.post_process and not self.pre_process and self.add_decoder:
+            self.word_embeddings.load_state_dict(
+                state_dict[self._word_embeddings_for_head_key], strict=strict)
