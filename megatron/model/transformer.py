@@ -214,8 +214,9 @@ class ParallelAttention(MegatronModule):
         # is not provided, make sure there is no potential memory left
         # from previous inference.
         else:
+            self.inference_key_memory = None
             self.inference_value_memory = None
-            self.inference_current_sequence_len = None
+
 
         # =====================
         # Query, Key, and Value
