@@ -18,8 +18,8 @@
 from abc import ABC
 from abc import abstractmethod
 
-from .bert_tokenization import FullTokenizer as FullBertTokenizer
-from .gpt2_tokenization import GPT2Tokenizer
+from bert_tokenization import FullTokenizer as FullBertTokenizer
+from gpt2_tokenization import GPT2Tokenizer
 
 
 def build_tokenizer(args):
