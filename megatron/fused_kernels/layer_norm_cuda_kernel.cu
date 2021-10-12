@@ -645,6 +645,8 @@ void cuComputeGradInput(
         k_grad_input[l] = static_cast<T>(f_grad_input);
       }
     }
+    // prevent race where buf is written again before reads are done
+    __syncthreads();
   }
 }
 
