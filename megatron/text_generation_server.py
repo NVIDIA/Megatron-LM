@@ -20,7 +20,7 @@ from flask import Flask, request, jsonify, current_app
 from flask_restful import Resource, Api
 from megatron import get_args
 from megatron import mpu
-from megatron.inference.api import generate_and_post_process
+from megatron.text_generation import generate_and_post_process
 
 
 GENERATE_NUM = 0
