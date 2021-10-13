@@ -61,7 +61,8 @@ class ForwardStep:
                                                 max_sequence_len)
         # Pipelining arguments.
         args = get_args()
-        self.pipeline_size_larger_than_one = args.pipeline_model_parallel_size
+        self.pipeline_size_larger_than_one = (
+            args.pipeline_model_parallel_size > 1)
         # Threshold of pipelining.
         self.pipelining_batch_x_seqlen = \
             args.inference_batch_times_seqlen_threshold

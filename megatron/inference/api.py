@@ -38,7 +38,7 @@ def generate_and_post_process(model,
                               temperature=1.0,
                               add_BOS=False,
                               use_eod_token_for_early_termination=True):
-    """Run inferecne and post-process outputs, i.e., detokenize,
+    """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
     # Main inference.
