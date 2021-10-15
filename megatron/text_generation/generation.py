@@ -34,7 +34,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         return_all_log_probs=False,
         greedy=False, top_k=0, top_p=0.0,
         temperature=1.0,
-        use_eod_token_for_early_termination=True):
+        use_eod_token_for_early_termination=True,
+        just_score=False):
     """Main token generation function.
     Arguments:
         model: no interleaving is supported.
@@ -107,8 +108,9 @@ def generate_tokens_probs_and_return_on_first_stage(
                                         dtype=torch.float32,
                                         device=torch.cuda.current_device())
         generated_sequence_lengths = torch.ones(
-            batch_size, dtype=torch.int64,
-            device=torch.cuda.current_device()) * max_sequence_length
+                batch_size, dtype=torch.int64,
+                device=torch.cuda.current_device()) * max_sequence_length
+    
     # Whether we have reached a termination id.
     is_generation_done = torch.zeros(batch_size, dtype=torch.uint8,
                                      device=torch.cuda.current_device())
@@ -207,7 +209,7 @@ def generate_tokens_probs_and_return_on_first_stage(
     tokens = tokens[:, :(context_length + 1)]
     if mpu.is_pipeline_last_stage():
         if return_output_log_probs:
-            output_log_probs = output_log_probs[:, :context_length]
+            output_log_probs = output_log_probs[:, :context_length].contiguous()
         if return_all_log_probs:
             all_log_probs = all_log_probs[:, :context_length, :]
 

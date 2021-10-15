@@ -54,12 +54,15 @@ class MegatronGenerate(Resource):
             return "Maximum number of prompts is 128", 400
 
         tokens_to_generate = 64  # Choosing hopefully sane default.  Full sequence is slow
+        just_score=False
         if "tokens_to_generate" in request.get_json():
             tokens_to_generate = request.get_json()["tokens_to_generate"]
             if not isinstance(tokens_to_generate, int):
                 return "tokens_to_generate must be an integer greater than 0"
-            if tokens_to_generate < 1:
-                return "tokens_to_generate must be an integer greater than 0"
+            if tokens_to_generate < 0:
+                return "tokens_to_generate must be an integer greater than or equal to 0"
+            if tokens_to_generate == 0:
+                just_score = True
 
         logprobs = False
         if "logprobs" in request.get_json():
@@ -113,7 +116,8 @@ class MegatronGenerate(Resource):
                     top_p_sampling=top_p,
                     temperature=temperature,
                     add_BOS=add_BOS,
-                    use_eod_token_for_early_termination=True)
+                    use_eod_token_for_early_termination=True,
+                    just_score=just_score)
         
         return jsonify({"text": response,
             "segments": response_seg,
