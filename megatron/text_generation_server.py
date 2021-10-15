@@ -19,8 +19,8 @@ import threading
 from flask import Flask, request, jsonify, current_app
 from flask_restful import Resource, Api
 from megatron import get_args
-from megatron import mpu
-from megatron.text_generation_utils import generate
+from megatron.text_generation import generate_and_post_process
+
 
 GENERATE_NUM = 0
 lock = threading.Lock()
@@ -67,7 +67,7 @@ class MegatronGenerate(Resource):
             if not isinstance(logprobs, bool):
                 return "logprobs must be a boolean value"
         
-        temperature = args.temperature
+        temperature = 1.0
         if "temperature" in request.get_json():
             temperature = request.get_json()["temperature"]
             if not (type(temperature) == int or type(temperature) == float):
@@ -75,7 +75,7 @@ class MegatronGenerate(Resource):
             if not (0.0 < temperature <= 100.0):
                 return "temperature must be a positive number less than or equal to 100.0"
         
-        top_k = args.top_k
+        top_k = 0.0
         if "top_k" in request.get_json():
             top_k = request.get_json()["top_k"]
             if not (type(top_k) == int):
@@ -83,11 +83,13 @@ class MegatronGenerate(Resource):
             if not (0 < top_k <= 1000):
                 return "top_k must be equal to or greater than 0 and less than or equal to 1000"
         
-        top_p = args.top_p
+        top_p = 0.0
         if "top_p" in request.get_json():
             top_p = request.get_json()["top_p"]
             if not (type(top_p) == float):
                 return "top_p must be a positive float less than or equal to 1.0"
+            if top_p > 0.0 and top_k > 0.0:
+                return "cannot set both top-k and top-p samplings."
             if not (0 < top_p <= 1.0):
                 return "top_p must be less than or equal to 1.0"
         
@@ -99,14 +101,17 @@ class MegatronGenerate(Resource):
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-            response, response_seg, response_logprobs = generate(self.model,
-                                                                 prompts,
-                                                                 tokens_to_generate,
-                                                                 logprobs,
-                                                                 temperature,
-                                                                 top_k,
-                                                                 top_p,
-                                                                 add_BOS) 
+            response, response_seg, response_logprobs, _ = \
+                generate_and_post_process(
+                    self.model,
+                    prompts=prompts,
+                    tokens_to_generate=tokens_to_generate,
+                    return_output_log_probs=logprobs,
+                    top_k_sampling=top_k,
+                    top_p_sampling=top_p,
+                    temperature=temperature,
+                    add_BOS=add_BOS,
+                    use_eod_token_for_early_termination=True)
         
         return jsonify({"text": response,
             "segments": response_seg,

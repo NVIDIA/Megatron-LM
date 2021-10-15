@@ -41,6 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_inference_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -279,6 +280,18 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _add_inference_args(parser):
+    group = parser.add_argument_group(title='inference')
+
+    group.add_argument('--inference-batch-times-seqlen-threshold',
+                       type=int, default=512,
+                       help='During inference, if batch-size times '
+                       'sequence-length is smaller than this threshold '
+                       'then we will not use pipelining, otherwise we will.')
+
+    return parser
+
+    
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
