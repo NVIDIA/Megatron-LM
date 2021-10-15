@@ -55,8 +55,7 @@ def modify_logits_for_top_p_filtering(logits, top_p):
 
 
 
-def sample(logits, greedy=False, top_k=0, top_p=0.0, temperature=1.0,
-           vocab_size=None):
+def sample(logits, top_k=0, top_p=0.0, temperature=1.0, vocab_size=None):
     """ Sample and generate a token.
     Note: logits has the dimension [b, v] where b is the batch size
           and v is the vocabulary size.
@@ -70,21 +69,21 @@ def sample(logits, greedy=False, top_k=0, top_p=0.0, temperature=1.0,
     assert logits.type() == 'torch.cuda.FloatTensor', \
         'input logits should be floats.'
 
-    # Clone so we do not modify the inputs,
-    logits = logits.clone()
 
     # Greedy is just simple argmax.
-    if greedy:
-        assert top_k == 0, 'cannot set both greedy and top-k samplings.'
+    if top_k == 1:
         assert top_p == 0.0, 'cannot set both greedy and top-p samplings.'
         samples = torch.argmax(logits, dim=-1)
 
     # Top-k or top-p sampling.
     else:
+        # Clone so we do not modify the inputs,
+        logits = logits.clone()
         # Apply temperature in place.
-        logits.div_(temperature)
+        if temperature != 1.0:
+            logits.div_(temperature)
 
-        if top_k > 0:
+        if top_k > 1:
             assert top_p == 0.0, 'cannot set both top-k and top-p samplings.'
             assert top_k <= logits.size(1), 'top-k is larger than logit size.'
             if vocab_size:
@@ -104,4 +103,4 @@ def sample(logits, greedy=False, top_k=0, top_p=0.0, temperature=1.0,
     if vocab_size:
         samples = torch.clamp(samples, min=0, max=(vocab_size - 1))
 
-    return samples, logits
+    return samples

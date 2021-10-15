@@ -107,7 +107,6 @@ class MegatronGenerate(Resource):
                     prompts=prompts,
                     tokens_to_generate=tokens_to_generate,
                     return_output_log_probs=logprobs,
-                    greedy_sampling=args.greedy,
                     top_k_sampling=top_k,
                     top_p_sampling=top_p,
                     temperature=temperature,

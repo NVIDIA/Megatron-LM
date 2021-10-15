@@ -31,7 +31,7 @@ from .sampling import sample
 def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
         return_output_log_probs=False,
-        greedy=False, top_k=0, top_p=0.0,
+        top_k=0, top_p=0.0,
         temperature=1.0,
         use_eod_token_for_early_termination=True):
     """Main token generation function.
@@ -41,12 +41,12 @@ def generate_tokens_probs_and_return_on_first_stage(
         lengths: original prompt length, size: [b]
         return_output_log_probs: flag to calculate the log probability of
             the generated tokens. Note that the log probability is the one
-            after logits are modifed for sampling.
-        greedy, top_k, top_p: greedy, top-k, and top-p sampling parameters.
-            Note that these three paramters are exclusive meaning that:
-                if greedy = true then we should have top-k=top-p=0.
-                if top-k > 0 then we expect greedy=false and top-p=0.
-                if top-p > 0 then we check for greedy=false and top-k=0.
+            from the original logit.
+        top_k, top_p: top-k and top-p sampling parameters.
+            Note that top-k = 1 is gready. Also, these paramters are
+            exclusive meaning that:
+                if top-k > 0 then we expect top-p=0.
+                if top-p > 0 then we check for top-k=0.
         temperature: sampling temperature.
         use_eod_token_for_early_termination: if True, do early termination if
             all the sequences have reached this token.
@@ -124,22 +124,15 @@ def generate_tokens_probs_and_return_on_first_stage(
 
                 # Sample.
                 last_token_logits = logits[:, -1, :]
-                new_sample, updated_last_token_logits = sample(
-                    last_token_logits,
-                    greedy=greedy,
-                    top_k=top_k,
-                    top_p=top_p,
-                    temperature=temperature,
-                    vocab_size=tokenizer.vocab_size)
-                # Now that we have the sample and updated logits,
-                # update the main logits and input tokens.
+                new_sample = sample(last_token_logits,
+                                    top_k=top_k,
+                                    top_p=top_p,
+                                    temperature=temperature,
+                                    vocab_size=tokenizer.vocab_size)
                 # If a prompt length is smaller or equal th current context
                 # length, it means we have started generating tokens
                 started = lengths <= context_length
-                # Update the logits
-                last_token_logits.masked_scatter_(
-                    started.unsqueeze(1), updated_last_token_logits[started])
-                # and the tokens.
+                # Update the tokens.
                 tokens[started, context_length] = new_sample[started]
 
                 # Calculate the log probabilities.
