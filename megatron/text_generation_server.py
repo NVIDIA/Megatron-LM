@@ -101,13 +101,12 @@ class MegatronGenerate(Resource):
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-            response, response_seg, response_logprobs, _, _ = \
+            response, response_seg, response_logprobs, _ = \
                 generate_and_post_process(
                     self.model,
                     prompts=prompts,
                     tokens_to_generate=tokens_to_generate,
                     return_output_log_probs=logprobs,
-                    return_all_log_probs=False,
                     greedy_sampling=args.greedy,
                     top_k_sampling=top_k,
                     top_p_sampling=top_p,
