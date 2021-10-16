@@ -27,15 +27,76 @@ from .communication import (
 from .forward_step import ForwardStep
 from .sampling import sample
 
+def score_and_return_on_first_stage(model, tokens, lengths):
+    """Function for just scoring.
+    Arguments:
+        model: no interleaving is supported.
+        tokens: prompt tokens extended to be of size [b, max_prompt_length]
+        lengths: original prompt length, size: [b]
+    Note: Outside of model, other parameters only need to be available on
+          rank 0.
+    Outputs: 
+        output_log_probs: log probability of the selected tokens. size: [b, s]
+    """
+
+    args = get_args()
+
+    batch_size = tokens.size(0)
+    max_prompt_length = lengths.max().item()
+    assert max_prompt_length == tokens.size(1)
+    max_sequence_length = min(max_prompt_length, args.max_position_embeddings)
+
+    # forward step.
+    forward_step = ForwardStep(model, batch_size, max_sequence_length)
+
+    # ===================
+    # Pre-allocate memory
+    # ===================
+
+    # Log probability of the sequence (prompt + generated tokens).
+    output_log_probs = None
+    output_log_probs_size = (batch_size, max_sequence_length - 1)
+    
+    if mpu.is_pipeline_last_stage():
+        output_log_probs = torch.empty(output_log_probs_size,
+                                       dtype=torch.float32,
+                                       device=torch.cuda.current_device())
+    
+    # =============
+    # Run infernece
+    # =============
+    with torch.no_grad():
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
+        
+        # logits will be meanigful only in the last pipeline stage.
+        logits = forward_step(tokens, position_ids, attention_mask)
+
+        if mpu.is_pipeline_last_stage():
+            # Always the last stage should have an output.
+            assert logits is not None
+            log_probs = F.log_softmax(logits, dim=2)
+            
+            # Pick the tokens that we need to get the log
+            # probabilities for. Note that next input token is
+            # the token which we selected in the current logits,
+            # so shift by 1.
+            indices = torch.unsqueeze(tokens[:, 1:], 2)
+            output_log_probs = torch.gather(log_probs, 2, indices).squeeze(2)
+    
+    # ======================================
+    # Broadcast to the first pipeline stage.
+    # ======================================
+    output_log_probs = broadcast_from_last_to_first_pipeline_stage(
+        output_log_probs_size, torch.float32, output_log_probs)
+    
+    return tokens, lengths, output_log_probs
 
 def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
         return_output_log_probs=False,
-        return_all_log_probs=False,
         greedy=False, top_k=0, top_p=0.0,
         temperature=1.0,
-        use_eod_token_for_early_termination=True,
-        just_score=False):
+        use_eod_token_for_early_termination=True):
     """Main token generation function.
     Arguments:
         model: no interleaving is supported.
@@ -44,9 +105,6 @@ def generate_tokens_probs_and_return_on_first_stage(
         return_output_log_probs: flag to calculate the log probability of
             the generated tokens. Note that the log probability is the one
             after logits are modifed for sampling.
-        return_all_log_probs: flag to calculate the log probability of across
-            all the tokens (vocab size). Note that the log probability is the
-            one after logits are modifed for sampling.
         greedy, top_k, top_p: greedy, top-k, and top-p sampling parameters.
             Note that these three paramters are exclusive meaning that:
                 if greedy = true then we should have top-k=top-p=0.
@@ -63,8 +121,6 @@ def generate_tokens_probs_and_return_on_first_stage(
         generated_sequence_lengths: total length (including prompt) of
             the generated sequence. size: [b]
         output_log_probs: log probability of the selected tokens. size: [b, s]
-        all_log_probs: log probability of all the tokens.
-            size: [b, s, vocab-size]
     """
 
     args = get_args()
@@ -93,9 +149,7 @@ def generate_tokens_probs_and_return_on_first_stage(
     output_log_probs = None
     output_log_probs_size = (batch_size, max_sequence_length - 1)
     # Log probability of all tokens for the sequence.
-    all_log_probs = None
-    all_log_probs_size = (batch_size, max_sequence_length -1,
-                          args.padded_vocab_size)
+    
     # Lengths of generated seuquence including including prompts.
     generated_sequence_lengths = None
     if mpu.is_pipeline_last_stage():
@@ -103,10 +157,6 @@ def generate_tokens_probs_and_return_on_first_stage(
             output_log_probs = torch.empty(output_log_probs_size,
                                            dtype=torch.float32,
                                            device=torch.cuda.current_device())
-        if return_all_log_probs:
-            all_log_probs = torch.empty(all_log_probs_size,
-                                        dtype=torch.float32,
-                                        device=torch.cuda.current_device())
         generated_sequence_lengths = torch.ones(
                 batch_size, dtype=torch.int64,
                 device=torch.cuda.current_device()) * max_sequence_length
@@ -159,12 +209,8 @@ def generate_tokens_probs_and_return_on_first_stage(
                 tokens[started, context_length] = new_sample[started]
 
                 # Calculate the log probabilities.
-                if return_output_log_probs or return_all_log_probs:
+                if return_output_log_probs:
                     log_probs = F.log_softmax(logits, dim=2)
-                    if return_all_log_probs:
-                        all_log_probs[:,
-                                      prev_context_length:context_length,
-                                      :] = log_probs
                     if return_output_log_probs:
                         # Pick the tokens that we need to get the log
                         # probabilities for. Note that next input token is
@@ -210,8 +256,6 @@ def generate_tokens_probs_and_return_on_first_stage(
     if mpu.is_pipeline_last_stage():
         if return_output_log_probs:
             output_log_probs = output_log_probs[:, :context_length].contiguous()
-        if return_all_log_probs:
-            all_log_probs = all_log_probs[:, :context_length, :]
 
     # ======================================
     # Broadcast to the first pipeline stage.
@@ -223,14 +267,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         output_log_probs_size = (batch_size, context_length)
         output_log_probs = broadcast_from_last_to_first_pipeline_stage(
             output_log_probs_size, torch.float32, output_log_probs)
-    if return_all_log_probs:
-        all_log_probs_size = (batch_size, context_length,
-                              args.padded_vocab_size)
-        all_log_probs = broadcast_from_last_to_first_pipeline_stage(
-            all_log_probs_size, torch.float32, all_log_probs)
 
-    return tokens, generated_sequence_lengths, output_log_probs, \
-        all_log_probs
+    return tokens, generated_sequence_lengths, output_log_probs
 
 
 

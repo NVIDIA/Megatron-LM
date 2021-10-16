@@ -20,7 +20,9 @@ import torch
 
 from megatron import mpu
 from .communication import broadcast_float_list
-from .generation import generate_tokens_probs_and_return_on_first_stage
+from .generation import (
+        generate_tokens_probs_and_return_on_first_stage,
+        score_and_return_on_first_stage)
 from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
@@ -31,7 +33,6 @@ def generate_and_post_process(model,
                               prompts=None,
                               tokens_to_generate=0,
                               return_output_log_probs=False,
-                              return_all_log_probs=False,
                               greedy_sampling=False,
                               top_k_sampling=0,
                               top_p_sampling=0.0,
@@ -43,12 +44,11 @@ def generate_and_post_process(model,
     move to cpu and convert to list."""
 
     # Main inference.
-    tokens, lengths, output_log_probs, all_log_probs = generate(
+    tokens, lengths, output_log_probs = generate(
         model,
         prompts=prompts,
         tokens_to_generate=tokens_to_generate,
         return_output_log_probs=return_output_log_probs,
-        return_all_log_probs=return_all_log_probs,
         greedy_sampling=greedy_sampling,
         top_k_sampling=top_k_sampling,
         top_p_sampling=top_p_sampling,
@@ -59,17 +59,16 @@ def generate_and_post_process(model,
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
-
         tokens, prompts_plus_generations, prompts_plus_generations_segments = \
             detokenize_generations(tokens, lengths, True)
 
         if return_output_log_probs:
             output_log_probs = output_log_probs.cpu().numpy().tolist()
-        if return_all_log_probs:
-            all_log_probs = all_log_probs.cpu().numpy().tolist()
+            for i, (prob, seg) in enumerate(zip(output_log_probs, prompts_plus_generations_segments)):
+                output_log_probs[i] = prob[:len(seg)-1]
 
         return prompts_plus_generations, prompts_plus_generations_segments, \
-            output_log_probs, all_log_probs, tokens
+            output_log_probs, tokens
 
     return None
 
@@ -79,7 +78,6 @@ def generate(model,
              prompts=None,
              tokens_to_generate=0,
              return_output_log_probs=False,
-             return_all_log_probs=False,
              greedy_sampling=False,
              top_k_sampling=0,
              top_p_sampling=0.0,
@@ -93,25 +91,23 @@ def generate(model,
            discard tokens in the tokens tensor that are after the
            corresponding length.
        output_log_probs: log probs of the tokens.
-       all_log_probs: full log probs for all of tokens.
     """
 
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
-              return_output_log_probs, return_all_log_probs,
+              return_output_log_probs,
               greedy_sampling, top_k_sampling, top_p_sampling,
               temperature, add_BOS, use_eod_token_for_early_termination, just_score]
-    values_float_tensor = broadcast_float_list(10, float_list=values)
+    values_float_tensor = broadcast_float_list(9, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
-    return_all_log_probs = bool(values_float_tensor[2].item())
-    greedy_sampling = bool(values_float_tensor[3].item())
-    top_k_sampling = int(values_float_tensor[4].item())
-    top_p_sampling = values_float_tensor[5].item()
-    temperature = values_float_tensor[6].item()
-    add_BOS = bool(values_float_tensor[7].item())
-    use_eod_token_for_early_termination = bool(values_float_tensor[8].item())
-    just_score = bool(values_float_tensor[9].item())
+    greedy_sampling = bool(values_float_tensor[2].item())
+    top_k_sampling = int(values_float_tensor[3].item())
+    top_p_sampling = values_float_tensor[4].item()
+    temperature = values_float_tensor[5].item()
+    add_BOS = bool(values_float_tensor[6].item())
+    use_eod_token_for_early_termination = bool(values_float_tensor[7].item())
+    just_score = bool(values_float_tensor[8].item())
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -121,13 +117,15 @@ def generate(model,
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
 
+    if just_score:
+        return score_and_return_on_first_stage(
+            model, context_tokens_tensor, context_length_tensor)
+
     # Main inference function.
     # Note that the outputs are available on the first stage.
     return generate_tokens_probs_and_return_on_first_stage(
         model, context_tokens_tensor, context_length_tensor,
         return_output_log_probs=return_output_log_probs,
-        return_all_log_probs=return_all_log_probs,
         greedy=greedy_sampling, top_k=top_k_sampling, top_p=top_p_sampling,
         temperature=temperature,
-        use_eod_token_for_early_termination=use_eod_token_for_early_termination,
-        just_score=just_score)
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination)
