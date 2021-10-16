@@ -43,8 +43,6 @@ def add_text_generate_args(parser):
 
     group.add_argument("--temperature", type=float, default=1.0,
                        help='Sampling temperature.')
-    group.add_argument("--greedy", action='store_true', default=False,
-                       help='Use greedy sampling.')
     group.add_argument("--top_p", type=float, default=0.0,
                        help='Top p sampling.')
     group.add_argument("--top_k", type=int, default=0,

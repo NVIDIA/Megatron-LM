@@ -55,13 +55,31 @@ def send_to_next_pipeline_rank(tensor=None):
 
 
 
+def _is_cuda(tensor):
+    """Check if a tensor is not none and is cuda."""
+    assert tensor is not None
+    assert tensor.is_cuda
+
+
+
+def _is_cuda_contiguous(tensor):
+    """Check if a tensor is not none, is cuda, and is contiguous."""
+    _is_cuda(tensor)
+    assert tensor.is_contiguous()
+
+
+
 def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     """Broadcast a tensor from last pipeline stage to all ranks."""
 
-    if mpu.is_pipeline_last_stage():
-        assert tensor is not None
-        assert tensor.is_cuda
-        assert tensor.is_contiguous()
+    is_last_stage = mpu.is_pipeline_last_stage()
+    # If first stage and last state are the same, then there is no
+    # pipeline parallelism and no need to communicate.
+    if mpu.is_pipeline_first_stage() and is_last_stage:
+        return tensor
+
+    if is_last_stage:
+        _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size,
                              dtype=dtype,
@@ -78,14 +96,16 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
 def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
     """Broadcast tensor values from last stage into the first stage."""
 
-    # Only first and last stage pipeline stages need to be involved.
     is_last_stage = mpu.is_pipeline_last_stage()
     is_first_stage = mpu.is_pipeline_first_stage()
+    # If first stage and last state are the same, then there is no
+    # pipeline parallelism and no need to communicate.
+    if is_first_stage and is_last_stage:
+        return tensor
+    # Only first and last stage pipeline stages need to be involved.
     if is_last_stage or is_first_stage:
         if is_last_stage:
-            assert tensor is not None
-            assert tensor.is_cuda
-            assert tensor.is_contiguous()
+            _is_cuda_contiguous(tensor)
         else:
             tensor = torch.empty(size,
                                  dtype=dtype,
@@ -105,12 +125,15 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
     """Copy tensor values from last stage into the first stage.
     Note that the input tensor is updated in place."""
 
-    # Only first and last stage pipeline stages need to be involved.
     is_last_stage = mpu.is_pipeline_last_stage()
     is_first_stage = mpu.is_pipeline_first_stage()
+    # If first stage and last state are the same, then there is no
+    # pipeline parallelism and no need to communicate.
+    if is_first_stage and is_last_stage:
+        return
+    # Only first and last stage pipeline stages need to be involved.
     if is_last_stage or is_first_stage:
-        assert tensor is not None
-        assert tensor.is_cuda
+        _is_cuda(tensor)
         is_contiguous = tensor.is_contiguous()
         src = mpu.get_pipeline_model_parallel_last_rank()
         group = mpu.get_embedding_group()
@@ -137,8 +160,7 @@ def broadcast_tensor(size, dtype, tensor=None, rank=0):
     """
 
     if torch.distributed.get_rank() == rank:
-        assert tensor is not None
-        assert tensor.is_cuda
+        _is_cuda_contiguous(tensor)
     else:
         tensor = torch.empty(size,
                              dtype=dtype,

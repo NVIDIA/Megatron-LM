@@ -33,7 +33,6 @@ def generate_and_post_process(model,
                               prompts=None,
                               tokens_to_generate=0,
                               return_output_log_probs=False,
-                              greedy_sampling=False,
                               top_k_sampling=0,
                               top_p_sampling=0.0,
                               temperature=1.0,
@@ -49,7 +48,6 @@ def generate_and_post_process(model,
         prompts=prompts,
         tokens_to_generate=tokens_to_generate,
         return_output_log_probs=return_output_log_probs,
-        greedy_sampling=greedy_sampling,
         top_k_sampling=top_k_sampling,
         top_p_sampling=top_p_sampling,
         temperature=temperature,
@@ -78,7 +76,6 @@ def generate(model,
              prompts=None,
              tokens_to_generate=0,
              return_output_log_probs=False,
-             greedy_sampling=False,
              top_k_sampling=0,
              top_p_sampling=0.0,
              temperature=1.0,
@@ -98,16 +95,15 @@ def generate(model,
               return_output_log_probs,
               greedy_sampling, top_k_sampling, top_p_sampling,
               temperature, add_BOS, use_eod_token_for_early_termination, just_score]
-    values_float_tensor = broadcast_float_list(9, float_list=values)
+    values_float_tensor = broadcast_float_list(8, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
-    greedy_sampling = bool(values_float_tensor[2].item())
-    top_k_sampling = int(values_float_tensor[3].item())
-    top_p_sampling = values_float_tensor[4].item()
-    temperature = values_float_tensor[5].item()
-    add_BOS = bool(values_float_tensor[6].item())
-    use_eod_token_for_early_termination = bool(values_float_tensor[7].item())
-    just_score = bool(values_float_tensor[8].item())
+    top_k_sampling = int(values_float_tensor[2].item())
+    top_p_sampling = values_float_tensor[3].item()
+    temperature = values_float_tensor[4].item()
+    add_BOS = bool(values_float_tensor[5].item())
+    use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
+    just_score = bool(values_float_tensor[7].item())
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -126,6 +122,7 @@ def generate(model,
     return generate_tokens_probs_and_return_on_first_stage(
         model, context_tokens_tensor, context_length_tensor,
         return_output_log_probs=return_output_log_probs,
-        greedy=greedy_sampling, top_k=top_k_sampling, top_p=top_p_sampling,
+        top_k=top_k_sampling,
+        top_p=top_p_sampling,
         temperature=temperature,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination)
