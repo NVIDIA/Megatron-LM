@@ -69,8 +69,9 @@ class MegatronGenerate(Resource):
             logprobs = request.get_json()["logprobs"]
             if not isinstance(logprobs, bool):
                 return "logprobs must be a boolean value"
-            if just_score and not logprobs:
-                return "tokens_to_generate=0 implies logprobs=True"
+        
+        if just_score and not logprobs:
+            return "tokens_to_generate=0 implies logprobs=True"
         
         temperature = 1.0
         if "temperature" in request.get_json():
