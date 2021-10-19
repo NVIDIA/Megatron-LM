@@ -113,10 +113,11 @@ def generate(model,
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
 
+
     if just_score:
         return score_and_return_on_first_stage(
             model, context_tokens_tensor, context_length_tensor)
-
+    
     # Main inference function.
     # Note that the outputs are available on the first stage.
     return generate_tokens_probs_and_return_on_first_stage(

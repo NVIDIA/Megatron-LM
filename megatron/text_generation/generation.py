@@ -130,6 +130,10 @@ def generate_tokens_probs_and_return_on_first_stage(
     min_prompt_length = lengths.min().item()
     max_sequence_length = tokens.size(1)
     max_sequence_length = min(max_sequence_length, args.max_position_embeddings)
+    
+    # If the context is too big, this happens
+    if min_prompt_length >= max_sequence_length:
+        raise ValueError
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_sequence_length)

@@ -36,9 +36,6 @@ class MegatronGenerate(Resource):
      
     def put(self):
         args = get_args()
-        print("request IP: " + str(request.remote_addr))
-        print(json.dumps(request.get_json()),flush=True)
-        print("current time: ", datetime.datetime.now())
        
         if not "prompts" in request.get_json():
             return "prompts argument required", 400
@@ -106,19 +103,26 @@ class MegatronGenerate(Resource):
                 return "add_BOS must be a boolean value"
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
+            print("request IP: " + str(request.remote_addr))
+            print(json.dumps(request.get_json()),flush=True)
+            print("start time: ", datetime.datetime.now())
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-            response, response_seg, response_logprobs, _ = \
-                generate_and_post_process(
-                    self.model,
-                    prompts=prompts,
-                    tokens_to_generate=tokens_to_generate,
-                    return_output_log_probs=logprobs,
-                    top_k_sampling=top_k,
-                    top_p_sampling=top_p,
-                    temperature=temperature,
-                    add_BOS=add_BOS,
-                    use_eod_token_for_early_termination=True,
-                    just_score=just_score)
+            try:
+                response, response_seg, response_logprobs, _ = \
+                    generate_and_post_process(
+                        self.model,
+                        prompts=prompts,
+                        tokens_to_generate=tokens_to_generate,
+                        return_output_log_probs=logprobs,
+                        top_k_sampling=top_k,
+                        top_p_sampling=top_p,
+                        temperature=temperature,
+                        add_BOS=add_BOS,
+                        use_eod_token_for_early_termination=True,
+                        just_score=just_score)
+            except ValueError as ve:
+                return "Length of prompt + tokens_to_generate longer than allowed"
+            print("end time: ", datetime.datetime.now())
         
         return jsonify({"text": response,
             "segments": response_seg,
