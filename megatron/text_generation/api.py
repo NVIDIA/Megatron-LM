@@ -27,8 +27,6 @@ from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
 
-
-
 def generate_and_post_process(model,
                               prompts=None,
                               tokens_to_generate=0,
@@ -37,8 +35,7 @@ def generate_and_post_process(model,
                               top_p_sampling=0.0,
                               temperature=1.0,
                               add_BOS=False,
-                              use_eod_token_for_early_termination=True,
-                              just_score=False):
+                              use_eod_token_for_early_termination=True):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -52,8 +49,7 @@ def generate_and_post_process(model,
         top_p_sampling=top_p_sampling,
         temperature=temperature,
         add_BOS=add_BOS,
-        use_eod_token_for_early_termination=use_eod_token_for_early_termination,
-        just_score=just_score)
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -70,8 +66,6 @@ def generate_and_post_process(model,
 
     return None
 
-
-
 def generate(model,
              prompts=None,
              tokens_to_generate=0,
@@ -80,8 +74,7 @@ def generate(model,
              top_p_sampling=0.0,
              temperature=1.0,
              add_BOS=False,
-             use_eod_token_for_early_termination=True,
-             just_score=False):
+             use_eod_token_for_early_termination=True):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
        lengths: length of the prompt + generations. Note that we can
@@ -94,8 +87,8 @@ def generate(model,
     values = [tokens_to_generate,
               return_output_log_probs,
               top_k_sampling, top_p_sampling,
-              temperature, add_BOS, use_eod_token_for_early_termination, just_score]
-    values_float_tensor = broadcast_float_list(8, float_list=values)
+              temperature, add_BOS, use_eod_token_for_early_termination]
+    values_float_tensor = broadcast_float_list(7, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
@@ -103,7 +96,6 @@ def generate(model,
     temperature = values_float_tensor[4].item()
     add_BOS = bool(values_float_tensor[5].item())
     use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
-    just_score = bool(values_float_tensor[7].item())
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -113,8 +105,7 @@ def generate(model,
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
 
-
-    if just_score:
+    if tokens_to_generate == 0:
         return score_and_return_on_first_stage(
             model, context_tokens_tensor, context_length_tensor)
     
