@@ -101,7 +101,7 @@ def generate(model,
     # Note that these tensors are broadcaseted to all ranks.
     if torch.distributed.get_rank() == 0:
         assert prompts is not None
-        #assert tokens_to_generate > 0
+    
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
 
