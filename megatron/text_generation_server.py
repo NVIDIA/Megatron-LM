@@ -98,6 +98,24 @@ class MegatronGenerate(Resource):
             add_BOS = request.get_json()["add_BOS"]
             if not isinstance(add_BOS, bool):
                 return "add_BOS must be a boolean value"
+        
+        if any([len(prompt) == 0 for prompt in prompts]) and not add_BOS:
+            return "Empty prompts require add_BOS=true"
+
+        stop_on_double_eol = False
+        if "stop_on_double_eol" in request.get_json():
+            stop_on_double_eol = request.get_json()["stop_on_double_eol"]
+            if not isinstance(stop_on_double_eol, bool):
+                return "stop_on_double_eol must be a boolean value"
+        
+        stop_on_eol = False
+        if "stop_on_eol" in request.get_json():
+            stop_on_eol = request.get_json()["stop_on_eol"]
+            if not isinstance(stop_on_eol, bool):
+                return "stop_on_eol must be a boolean value"
+
+        if str(request.remote_addr) == "10.14.68.146":
+            return "Too many tokens requested from this IP address.  Contact Ryan Prenger rprenger@nvidia.com"
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
             print("request IP: " + str(request.remote_addr))
@@ -115,7 +133,9 @@ class MegatronGenerate(Resource):
                         top_p_sampling=top_p,
                         temperature=temperature,
                         add_BOS=add_BOS,
-                        use_eod_token_for_early_termination=True)
+                        use_eod_token_for_early_termination=True,
+                        stop_on_double_eol=stop_on_double_eol,
+                        stop_on_eol=stop_on_eol)
             except ValueError as ve:
                 return "Length of prompt + tokens_to_generate longer than allowed"
             print("end time: ", datetime.datetime.now())

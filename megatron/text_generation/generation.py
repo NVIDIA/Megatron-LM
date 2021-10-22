@@ -96,7 +96,10 @@ def generate_tokens_probs_and_return_on_first_stage(
         return_output_log_probs=False,
         top_k=0, top_p=0.0,
         temperature=1.0,
-        use_eod_token_for_early_termination=True):
+        use_eod_token_for_early_termination=True,
+        stop_on_double_eol=False,
+        stop_on_eol=False
+        ):
     """Main token generation function.
     Arguments:
         model: no interleaving is supported.
@@ -231,8 +234,18 @@ def generate_tokens_probs_and_return_on_first_stage(
             # Check if all the sequences have hit the termination_id.
             done = None
             if mpu.is_pipeline_last_stage():
-                done_token = (new_sample == termination_id).byte() & \
-                    started.byte()
+                if stop_on_double_eol:
+                    hit_double_eol = (new_sample == 628).byte() & started.byte()
+                    hit_two_eols = (new_sample == 198).byte() & (tokens[:, context_length-1] == 198).byte() & started.byte()
+                    done_token = hit_double_eol | hit_two_eols
+                elif stop_on_eol:
+                    hit_double_eol = (new_sample == 628).byte() & started.byte()
+                    hit_eol = (new_sample == 198).byte() & started.byte()
+                    done_token = hit_double_eol | hit_eol
+                else: 
+                    done_token = (new_sample == termination_id).byte() & \
+                        started.byte()
+                
                 just_finished = (done_token & ~is_generation_done).bool()
                 generated_sequence_lengths[just_finished.view(-1)] = \
                     context_length + 1
