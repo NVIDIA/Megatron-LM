@@ -27,6 +27,69 @@ from .communication import (
 from .forward_step import ForwardStep
 from .sampling import sample
 
+def score_and_return_on_first_stage(model, tokens, lengths):
+    """Function for just scoring.
+    Arguments:
+        model: no interleaving is supported.
+        tokens: prompt tokens extended to be of size [b, max_prompt_length]
+        lengths: original prompt length, size: [b]
+    Note: Outside of model, other parameters only need to be available on
+          rank 0.
+    Outputs: 
+        output_log_probs: log probability of the selected tokens. size: [b, s]
+    """
+
+    args = get_args()
+
+    batch_size = tokens.size(0)
+    max_prompt_length = lengths.max().item()
+    assert max_prompt_length == tokens.size(1)
+    max_sequence_length = min(max_prompt_length, args.max_position_embeddings)
+
+    # forward step.
+    forward_step = ForwardStep(model, batch_size, max_sequence_length)
+
+    # ===================
+    # Pre-allocate memory
+    # ===================
+
+    # Log probability of the sequence (prompt + generated tokens).
+    output_log_probs = None
+    output_log_probs_size = (batch_size, max_sequence_length - 1)
+    
+    if mpu.is_pipeline_last_stage():
+        output_log_probs = torch.empty(output_log_probs_size,
+                                       dtype=torch.float32,
+                                       device=torch.cuda.current_device())
+    
+    # =============
+    # Run infernece
+    # =============
+    with torch.no_grad():
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
+        
+        # logits will be meanigful only in the last pipeline stage.
+        logits = forward_step(tokens, position_ids, attention_mask)
+
+        if mpu.is_pipeline_last_stage():
+            # Always the last stage should have an output.
+            assert logits is not None
+            log_probs = F.log_softmax(logits, dim=2)
+            
+            # Pick the tokens that we need to get the log
+            # probabilities for. Note that next input token is
+            # the token which we selected in the current logits,
+            # so shift by 1.
+            indices = torch.unsqueeze(tokens[:, 1:], 2)
+            output_log_probs = torch.gather(log_probs, 2, indices).squeeze(2)
+    
+    # ======================================
+    # Broadcast to the first pipeline stage.
+    # ======================================
+    output_log_probs = broadcast_from_last_to_first_pipeline_stage(
+        output_log_probs_size, torch.float32, output_log_probs)
+    
+    return tokens, lengths, output_log_probs
 
 def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
@@ -93,8 +156,9 @@ def generate_tokens_probs_and_return_on_first_stage(
                                            dtype=torch.float32,
                                            device=torch.cuda.current_device())
         generated_sequence_lengths = torch.ones(
-            batch_size, dtype=torch.int64,
-            device=torch.cuda.current_device()) * max_sequence_length
+                batch_size, dtype=torch.int64,
+                device=torch.cuda.current_device()) * max_sequence_length
+    
     # Whether we have reached a termination id.
     is_generation_done = torch.zeros(batch_size, dtype=torch.uint8,
                                      device=torch.cuda.current_device())

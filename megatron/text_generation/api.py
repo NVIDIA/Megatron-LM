@@ -20,12 +20,12 @@ import torch
 
 from megatron import mpu
 from .communication import broadcast_float_list
-from .generation import generate_tokens_probs_and_return_on_first_stage
+from .generation import (
+        generate_tokens_probs_and_return_on_first_stage,
+        score_and_return_on_first_stage)
 from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
-
-
 
 def generate_and_post_process(model,
                               prompts=None,
@@ -53,19 +53,18 @@ def generate_and_post_process(model,
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
-
         tokens, prompts_plus_generations, prompts_plus_generations_segments = \
             detokenize_generations(tokens, lengths, True)
 
         if return_output_log_probs:
             output_log_probs = output_log_probs.cpu().numpy().tolist()
+            for i, (prob, seg) in enumerate(zip(output_log_probs, prompts_plus_generations_segments)):
+                output_log_probs[i] = prob[:len(seg)-1]
 
         return prompts_plus_generations, prompts_plus_generations_segments, \
             output_log_probs, tokens
 
     return None
-
-
 
 def generate(model,
              prompts=None,
@@ -85,7 +84,8 @@ def generate(model,
     """
 
     # Make sure input params are avaialble to all ranks.
-    values = [tokens_to_generate, return_output_log_probs,
+    values = [tokens_to_generate,
+              return_output_log_probs,
               top_k_sampling, top_p_sampling,
               temperature, add_BOS, use_eod_token_for_early_termination]
     values_float_tensor = broadcast_float_list(7, float_list=values)
@@ -101,9 +101,13 @@ def generate(model,
     # Note that these tensors are broadcaseted to all ranks.
     if torch.distributed.get_rank() == 0:
         assert prompts is not None
-        assert tokens_to_generate > 0
+    
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
+
+    if tokens_to_generate == 0:
+        return score_and_return_on_first_stage(
+            model, context_tokens_tensor, context_length_tensor)
 
     # Main inference function.
     # Note that the outputs are available on the first stage.

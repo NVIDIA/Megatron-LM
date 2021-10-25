@@ -58,14 +58,17 @@ class MegatronGenerate(Resource):
             tokens_to_generate = request.get_json()["tokens_to_generate"]
             if not isinstance(tokens_to_generate, int):
                 return "tokens_to_generate must be an integer greater than 0"
-            if tokens_to_generate < 1:
-                return "tokens_to_generate must be an integer greater than 0"
+            if tokens_to_generate < 0:
+                return "tokens_to_generate must be an integer greater than or equal to 0"
 
         logprobs = False
         if "logprobs" in request.get_json():
             logprobs = request.get_json()["logprobs"]
             if not isinstance(logprobs, bool):
                 return "logprobs must be a boolean value"
+        
+        if tokens_to_generate == 0 and not logprobs:
+            return "tokens_to_generate=0 implies logprobs should be True"
         
         temperature = 1.0
         if "temperature" in request.get_json():
@@ -80,7 +83,7 @@ class MegatronGenerate(Resource):
             top_k = request.get_json()["top_k"]
             if not (type(top_k) == int):
                 return "top_k must be an integer equal to or greater than 0 and less than or equal to 1000"
-            if not (0 < top_k <= 1000):
+            if not (0 <= top_k <= 1000):
                 return "top_k must be equal to or greater than 0 and less than or equal to 1000"
         
         top_p = 0.0
@@ -90,7 +93,7 @@ class MegatronGenerate(Resource):
                 return "top_p must be a positive float less than or equal to 1.0"
             if top_p > 0.0 and top_k > 0.0:
                 return "cannot set both top-k and top-p samplings."
-            if not (0 < top_p <= 1.0):
+            if not (0 <= top_p <= 1.0):
                 return "top_p must be less than or equal to 1.0"
         
         add_BOS = False
