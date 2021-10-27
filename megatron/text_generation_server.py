@@ -114,8 +114,8 @@ class MegatronGenerate(Resource):
             if not isinstance(stop_on_eol, bool):
                 return "stop_on_eol must be a boolean value"
 
-        if str(request.remote_addr) == "10.14.68.146":
-            return "Too many tokens requested from this IP address.  Contact Ryan Prenger rprenger@nvidia.com"
+#        if str(request.remote_addr) == "10.14.68.146":
+#            return "Too many tokens requested from this IP address.  Contact Ryan Prenger rprenger@nvidia.com"
 
         with lock:  # Need to get lock to keep multiple threads from hitting code
             print("request IP: " + str(request.remote_addr))
