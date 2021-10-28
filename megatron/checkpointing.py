@@ -125,6 +125,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         state_dict['args'] = args
         state_dict['checkpoint_version'] = 3.0
         state_dict['iteration'] = iteration
+        state_dict['tokens'] = args.consumed_train_tokens
 
         # DeepSpeed saves the model/optimizer/scheduler
         if not args.deepspeed:
@@ -332,6 +333,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     else:
         try:
             iteration = state_dict['iteration']
+            if 'tokens' in state_dict:
+                args.consumed_train_tokens = state_dict['tokens']
         except KeyError:
             try:  # Backward compatible with older checkpoints
                 iteration = state_dict['total_iters']

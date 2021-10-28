@@ -139,6 +139,13 @@ def get_batch_pipe(data):
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
+    if args.curriculum_learning and args.curriculum_seqlen < tokens.size()[1]:
+        # seqlen-based curriculum learning
+        # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
+        tokens = tokens[:, :args.curriculum_seqlen].contiguous()
+        position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
+        labels = labels[:, :args.curriculum_seqlen].contiguous()
+        loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
@@ -167,6 +174,8 @@ def forward_step(data_iterator, model):
 
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)
+    if args.curriculum_learning and args.curriculum_seqlen < args.seq_length:
+        loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
     return output_tensor, partial(loss_func, loss_mask)
 
