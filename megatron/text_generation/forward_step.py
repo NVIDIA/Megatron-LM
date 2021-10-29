@@ -40,7 +40,7 @@ class InferenceParams:
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
-        self.allocate_key_value_memory = True
+        self.key_value_memory_dict = {}
 
 
 
@@ -131,11 +131,6 @@ def _forward_step_helper(model, tokens, position_ids, attention_mask,
 
     # Send output to the next stage.
     send_to_next_pipeline_rank(output_tensor)
-
-    # Make sure we do not allocate context memory anymore.
-    if inference_params.allocate_key_value_memory:
-        inference_params.allocate_key_value_memory = False
-
 
     return output_tensor
 
