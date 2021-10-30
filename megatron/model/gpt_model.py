@@ -99,8 +99,8 @@ class GPTModel(MegatronModule):
     def forward(self, input_ids, position_ids, attention_mask, labels=None,
                 tokentype_ids=None, layer_past=None, get_key_value=False,
                 forward_method_parallel_output=None, curriculum_seqlen=None):
+        args = get_args()
         if curriculum_seqlen is not None:
-            args = get_args()
             args.curriculum_seqlen = curriculum_seqlen
             if curriculum_seqlen < input_ids.size()[1]:
                 # seqlen-based curriculum learning
@@ -111,6 +111,10 @@ class GPTModel(MegatronModule):
 
                 # attention_mask has size [1, 1, seqlen, seqlen]
                 attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
+        else:
+            if args.curriculum_learning:
+                # If got a None input, need to reset curriculum_seqlen on user side
+                args.curriculum_seqlen = args.seq_length
 
         lm_output = self.language_model(
             input_ids,

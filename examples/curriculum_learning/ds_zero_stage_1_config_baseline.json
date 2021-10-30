@@ -3,7 +3,7 @@
   "gradient_accumulation_steps": 1,
   "steps_per_print": 1,
   "zero_optimization": {
-    "stage": 0
+    "stage": 1
   },
   "optimizer": {
     "type": "Adam",
@@ -22,16 +22,5 @@
     "min_loss_scale": 1
   },
   "wall_clock_breakdown": false,
-  "zero_allow_untested_optimizer": false,
-  "curriculum_learning": {
-    "enabled": true,
-    "curriculum_type": "seqlen",
-    "min_difficulty": 8,
-    "max_difficulty": 1024,
-    "schedule_type": "fixed_linear",
-    "schedule_config": {
-      "total_curriculum_step": 60000,
-      "difficulty_step": 8
-    }
-  }
+  "zero_allow_untested_optimizer": false
 }
