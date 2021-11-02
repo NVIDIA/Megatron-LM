@@ -37,7 +37,8 @@ def generate_and_post_process(model,
                               add_BOS=False,
                               use_eod_token_for_early_termination=True,
                               stop_on_double_eol=False,
-                              stop_on_eol=False):
+                              stop_on_eol=False,
+                              random_seed=-1):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -53,7 +54,8 @@ def generate_and_post_process(model,
         add_BOS=add_BOS,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
-        stop_on_eol=stop_on_eol)
+        stop_on_eol=stop_on_eol,
+        random_seed=random_seed)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -80,7 +82,8 @@ def generate(model,
              add_BOS=False,
              use_eod_token_for_early_termination=True,
              stop_on_double_eol=False,
-             stop_on_eol=False):
+             stop_on_eol=False,
+             random_seed=-1):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
        lengths: length of the prompt + generations. Note that we can
@@ -95,8 +98,9 @@ def generate(model,
               top_k_sampling, top_p_sampling,
               temperature, add_BOS, use_eod_token_for_early_termination,
               stop_on_double_eol,
-              stop_on_eol]
-    values_float_tensor = broadcast_float_list(9, float_list=values)
+              stop_on_eol,
+              random_seed]
+    values_float_tensor = broadcast_float_list(10, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
@@ -106,6 +110,10 @@ def generate(model,
     use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
     stop_on_double_eol = bool(values_float_tensor[7].item())
     stop_on_eol = bool(values_float_tensor[8].item())
+    random_seed = int(values_float_tensor[9].item())
+
+    if random_seed != -1:
+        torch.random.manual_seed(random_seed)
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.

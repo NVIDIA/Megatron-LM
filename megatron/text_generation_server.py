@@ -114,6 +114,14 @@ class MegatronGenerate(Resource):
             if not isinstance(stop_on_eol, bool):
                 return "stop_on_eol must be a boolean value"
 
+        random_seed = -1
+        if "random_seed" in request.get_json():
+            random_seed = request.get_json()["random_seed"]
+            if not isinstance(random_seed, int):
+                return "random_seed must be integer"
+            if random_seed < 0: 
+                return "random_seed must be a positive integer"
+
 #        if str(request.remote_addr) == "10.14.68.146":
 #            return "Too many tokens requested from this IP address.  Contact Ryan Prenger rprenger@nvidia.com"
 
@@ -135,7 +143,8 @@ class MegatronGenerate(Resource):
                         add_BOS=add_BOS,
                         use_eod_token_for_early_termination=True,
                         stop_on_double_eol=stop_on_double_eol,
-                        stop_on_eol=stop_on_eol)
+                        stop_on_eol=stop_on_eol,
+                        random_seed=random_seed)
             except ValueError as ve:
                 return "Length of prompt + tokens_to_generate longer than allowed"
             print("end time: ", datetime.datetime.now())
