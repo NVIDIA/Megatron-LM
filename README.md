@@ -260,7 +260,7 @@ Second, we developed a simple and efficient two-dimensional model-parallel appro
 
 <!-- The number of microbatches in a per-pipeline minibatch is controlled by the `--num-microbatches-in-minibatch` argument. With `WORLD_SIZE` GPUs, `TENSOR_MP_SIZE` tensor-model-parallel size, `PIPELINE_MP_SIZE` pipeline-model-parallel-size, `WORLD_SIZE`/(`TENSOR_MP_SIZE` * `PIPELINE_MP_SIZE`) GPUs will be used for data parallelism. The default values for `--tensor-model-parallel-size` and `--pipeline-model-parallel-size` is 1, which will not implement either form of model parallelism. -->
 
-We have examples of how to use these two different forms of model parallelism the example scripts ending in `distributed_with_mp.sh`, note that pipeline parallelism is not currently supported in the T5 model:
+We have examples of how to use these two different forms of model parallelism the example scripts ending in `distributed_with_mp.sh`:
 
 Other than these minor changes, the distributed training is identical to the training on a single GPU.
 
