@@ -23,33 +23,12 @@ def _load_checkpoint(queue, args):
         from megatron.arguments import parse_args, validate_args
         from megatron.global_vars import set_args, set_global_variables, rebuild_tokenizer
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
+        from megatron.model import ModelType
         from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
         exit(1)
-
-
-    def get_models(count, dtype, pre_process, post_process):
-        if args.model_type == 'GPT':
-            from pretrain_gpt import model_provider
-        elif args.model_type == 'BERT':
-            from pretrain_bert import model_provider
-        else:
-            raise Exception(f'unrecognized model type: {args.model_type}')
-        # with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
-        #     futures = [executor.submit(model_provider, pre_process, post_process) for _ in range(count)]
-        #     models = [f.result().bfloat16() for f in futures]
-        models = []
-        for rank in range(count):
-            mpu.initialize.set_tensor_model_parallel_rank(rank)
-            model_ = [model_provider(pre_process, post_process).to(dtype)]
-            margs.consumed_train_samples = 0
-            margs.consumed_valid_samples = 0
-            load_checkpoint(model_, None, None)
-            assert(len(model_) == 1)
-            models.append(model_[0])
-        return models
 
     # We want all arguments to come from us
     sys.argv = ['script.py',
@@ -94,6 +73,31 @@ def _load_checkpoint(queue, args):
     margs = validate_args(margs)
 
     check_for_arg('params_dtype')
+
+    # Determine how to make our models
+    if args.model_type == 'GPT':
+        from pretrain_gpt import model_provider
+        margs.model_type = ModelType.encoder_or_decoder
+    elif args.model_type == 'BERT':
+        from pretrain_bert import model_provider
+        margs.model_type = ModelType.encoder_or_decoder
+    else:
+        raise Exception(f'unrecognized model type: {args.model_type}')
+
+    def get_models(count, dtype, pre_process, post_process):
+        # with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
+        #     futures = [executor.submit(model_provider, pre_process, post_process) for _ in range(count)]
+        #     models = [f.result().bfloat16() for f in futures]
+        models = []
+        for rank in range(count):
+            mpu.initialize.set_tensor_model_parallel_rank(rank)
+            model_ = [model_provider(pre_process, post_process).to(dtype)]
+            margs.consumed_train_samples = 0
+            margs.consumed_valid_samples = 0
+            load_checkpoint(model_, None, None)
+            assert(len(model_) == 1)
+            models.append(model_[0])
+        return models
 
     set_args(margs)
 

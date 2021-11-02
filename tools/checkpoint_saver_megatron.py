@@ -30,6 +30,7 @@ def save_checkpoint(queue, args):
     try:
         from megatron.checkpointing import save_checkpoint
         from megatron.global_vars import set_global_variables, get_args
+        from megatron.model import ModelType
         from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -44,18 +45,6 @@ def save_checkpoint(queue, args):
 
     md = queue_get()
 
-    def get_models(count, dtype, pre_process, post_process):
-        if md.model_type == 'GPT':
-            from pretrain_gpt import model_provider
-        elif md.model_type == 'BERT':
-            from pretrain_bert import model_provider
-        else:
-            raise Exception(f'unrecognized model type: {md.model_type}')
-        # with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
-        #     futures = [executor.submit(model_provider, pre_process, post_process) for _ in range(count)]
-        #     models = [f.result().bfloat16() for f in futures]
-        models = [model_provider(pre_process, post_process).to(dtype) for _ in range(count)]
-        return models
 
     if args.target_tensor_parallel_size is None:
         if hasattr(md, 'previous_tensor_parallel_size'):
@@ -113,6 +102,20 @@ def save_checkpoint(queue, args):
 
     # margs = megatron args
     margs = get_args()
+
+    # Determine how to make our models
+    if md.model_type == 'GPT':
+        from pretrain_gpt import model_provider
+        margs.model_type = ModelType.encoder_or_decoder
+    elif md.model_type == 'BERT':
+        from pretrain_bert import model_provider
+        margs.model_type = ModelType.encoder_or_decoder
+    else:
+        raise Exception(f'unrecognized model type: {args.model_type}')
+
+    def get_models(count, dtype, pre_process, post_process):
+        models = [model_provider(pre_process, post_process).to(dtype) for _ in range(count)]
+        return models
 
     # fake initializing distributed
     mpu.initialize.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)

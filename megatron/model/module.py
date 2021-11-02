@@ -96,6 +96,16 @@ class MegatronModule(torch.nn.Module):
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 
+        if not torch.distributed.is_initialized():
+            if not getattr(MegatronModule, "embedding_warning_printed", False):
+                print("WARNING! Distributed processes aren't initialized, so "
+                      "word embeddings in the last layer are not initialized. "
+                      "If you are just manipulating a model this is fine, but "
+                      "this needs to be handled manually. If you are training "
+                      "something is definitely wrong.")
+                MegatronModule.embedding_warning_printed = True
+            return
+
         # Zero out initial weights for decoder embedding.
         # NOTE: We don't currently support T5 with the interleaved schedule.
         if not mpu.is_pipeline_first_stage(ignore_virtual=True) and \
@@ -105,31 +115,24 @@ class MegatronModule(torch.nn.Module):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
-        if torch.distributed.is_initialized():
-            if mpu.is_rank_in_embedding_group():
-                torch.distributed.all_reduce(self.word_embeddings_weight().data,
+        if mpu.is_rank_in_embedding_group():
+            torch.distributed.all_reduce(self.word_embeddings_weight().data,
+                                         group=mpu.get_embedding_group())
+            # All-reduce other embeddings as well as necessary. The last stage
+            # does not have these other embeddings, so just create placeholder
+            # tensors of the right shape with all zeros.
+            # NOTE: We don't currently support T5 with the interleaved schedule.
+            if args.pipeline_model_parallel_split_rank is not None:
+                # TODO: Support tokentype embedding.
+                dimensions = (args.max_position_embeddings, args.hidden_size)
+                if mpu.is_pipeline_last_stage(ignore_virtual=True):
+                    position_embeddings = torch.nn.Embedding(*dimensions).cuda()
+                    position_embeddings.weight.data.fill_(0)
+                else:
+                    self.language_model.embedding.cuda()
+                    position_embeddings = self.language_model.embedding.position_embeddings
+                torch.distributed.all_reduce(position_embeddings.weight.data,
                                              group=mpu.get_embedding_group())
-                # All-reduce other embeddings as well as necessary. The last stage
-                # does not have these other embeddings, so just create placeholder
-                # tensors of the right shape with all zeros.
-                # NOTE: We don't currently support T5 with the interleaved schedule.
-                if args.pipeline_model_parallel_split_rank is not None:
-                    # TODO: Support tokentype embedding.
-                    dimensions = (args.max_position_embeddings, args.hidden_size)
-                    if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                        position_embeddings = torch.nn.Embedding(*dimensions).cuda()
-                        position_embeddings.weight.data.fill_(0)
-                    else:
-                        self.language_model.embedding.cuda()
-                        position_embeddings = self.language_model.embedding.position_embeddings
-                    torch.distributed.all_reduce(position_embeddings.weight.data,
-                                                 group=mpu.get_embedding_group())
-        else:
-            print("WARNING! Distributed processes aren't initialized, so "
-                  "word embeddings in the last layer are not initialized. "
-                  "If you are just manipulating a model this is fine, but "
-                  "this needs to be handled manually. If you are training "
-                  "something is definitely wrong.")
 
 
 def conversion_helper(val, conversion):
