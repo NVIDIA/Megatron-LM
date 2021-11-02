@@ -41,6 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_inference_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -85,6 +86,12 @@ def validate_args(args, defaults={}):
                   args.world_size, args.data_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+    if args.pipeline_model_parallel_size > 1:
+        if args.pipeline_model_parallel_split_rank is not None:
+            assert args.pipeline_model_parallel_split_rank < \
+                    args.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.pipeline_model_parallel_size)
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -278,6 +285,18 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _add_inference_args(parser):
+    group = parser.add_argument_group(title='inference')
+
+    group.add_argument('--inference-batch-times-seqlen-threshold',
+                       type=int, default=512,
+                       help='During inference, if batch-size times '
+                       'sequence-length is smaller than this threshold '
+                       'then we will not use pipelining, otherwise we will.')
+
+    return parser
+
+    
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -467,6 +486,11 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--no-async-tensor-model-parallel-allreduce',
+                       action='store_true',
+                       help='Disable asynchronous execution of '
+                       'tensor-model-parallel all-reduce with weight '
+                       'gradient compuation of a column-linear layer.')
     return parser
 
 
@@ -606,6 +630,9 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--pipeline-model-parallel-split-rank',
+                       type=int, default=None,
+                       help='Rank where encoder and decoder should be split.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

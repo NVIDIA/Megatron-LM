@@ -64,6 +64,9 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
             print('> setting random seeds to {} ...'.format(args.seed))
         _set_random_seed(args.seed)
 
+    # Set pytorch JIT layer fusion options.
+    _set_jit_fusion_options()
+
     args = get_args()
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
@@ -173,11 +176,11 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
-        # Call the init process
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(days=7))
+    # Call the init process
+    torch.distributed.init_process_group(
+        backend=args.distributed_backend,
+        world_size=args.world_size, rank=args.rank,
+        timeout=timedelta(days=7))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -187,7 +190,8 @@ def _initialize_distributed():
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                           args.pipeline_model_parallel_size,
-                                          args.virtual_pipeline_model_parallel_size)
+                                          args.virtual_pipeline_model_parallel_size,
+                                          args.pipeline_model_parallel_split_rank)
 
 
 def _init_autoresume():
@@ -221,4 +225,26 @@ def write_args_to_tensorboard():
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)),
                             global_step=args.iteration)
+
+
+def _set_jit_fusion_options():
+    """Set PyTorch JIT layer fusion options."""
+    # flags required to enable jit fusion kernels
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10):
+        # nvfuser
+        torch._C._jit_set_profiling_executor(True)
+        torch._C._jit_set_profiling_mode(True)
+        torch._C._jit_override_can_fuse_on_cpu(False)
+        torch._C._jit_override_can_fuse_on_gpu(False)
+        torch._C._jit_set_texpr_fuser_enabled(False)
+        torch._C._jit_set_nvfuser_enabled(True)
+        torch._C._debug_set_autodiff_subgraph_inlining(False)
+    else:
+        # legacy pytorch fuser
+        torch._C._jit_set_profiling_mode(False)
+        torch._C._jit_set_profiling_executor(False)
+        torch._C._jit_override_can_fuse_on_cpu(True)
+        torch._C._jit_override_can_fuse_on_gpu(True)
 

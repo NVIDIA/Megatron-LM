@@ -27,7 +27,7 @@ from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_server import MegatronServer
-from megatron.text_generation_utils import generate
+from megatron.text_generation import generate_and_post_process
 import torch
 
 def model_provider(pre_process=True, post_process=True):
@@ -43,8 +43,6 @@ def add_text_generate_args(parser):
 
     group.add_argument("--temperature", type=float, default=1.0,
                        help='Sampling temperature.')
-    group.add_argument("--greedy", action='store_true', default=False,
-                       help='Use greedy sampling.')
     group.add_argument("--top_p", type=float, default=0.0,
                        help='Top p sampling.')
     group.add_argument("--top_k", type=int, default=0,
@@ -65,7 +63,7 @@ if __name__ == "__main__":
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
     # Set up model and load checkpoint
-    model = get_model(model_provider)
+    model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
@@ -78,8 +76,6 @@ if __name__ == "__main__":
 
     while True:
         choice = torch.cuda.LongTensor(1)
-        torch.distributed.broadcast(choice,
-                                    mpu.get_tensor_model_parallel_src_rank(),
-                                    group=mpu.get_tensor_model_parallel_group())
+        torch.distributed.broadcast(choice, 0)
         if choice[0].item() == 0:
-            generate(model)
+            generate_and_post_process(model)

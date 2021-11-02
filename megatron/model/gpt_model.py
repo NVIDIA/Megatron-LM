@@ -29,22 +29,14 @@ from .utils import scaled_init_method_normal
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
-                                   get_key_value, parallel_output,
-                                   forward_method_parallel_output,
+                                   parallel_output,
                                    fp16_lm_cross_entropy):
-    if get_key_value:
-        lm_output, presents = lm_output
 
     # Output.
-    if forward_method_parallel_output is not None:
-        parallel_output = forward_method_parallel_output
     output = parallel_lm_logits(
         lm_output,
         logit_weights,
         parallel_output)
-
-    if get_key_value:
-        output = [output, presents]
 
     if labels is None:
         return output
@@ -90,23 +82,19 @@ class GPTModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask, labels=None,
-                tokentype_ids=None, layer_past=None, get_key_value=False,
-                forward_method_parallel_output=None):
+                tokentype_ids=None, inference_params=None):
 
         lm_output = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
-            layer_past=layer_past,
-            get_key_value=get_key_value)
+            inference_params=inference_params)
 
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
                 self.word_embeddings_weight(),
-                get_key_value,
                 self.parallel_output,
-                forward_method_parallel_output,
                 self.fp16_lm_cross_entropy)
         else:
             return lm_output

@@ -21,7 +21,7 @@
 #include "ATen/ATen.h"
 #include "ATen/AccumulateType.h"
 #include "ATen/cuda/CUDAContext.h"
-#include <THC/THCDeviceUtils.cuh>
+#include "ATen/cuda/DeviceUtils.cuh"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -329,6 +329,7 @@ void cuApplyLayerNorm(
       mean[i1] = mu;
       invvar[i1] = c_invvar;
     }
+    __syncthreads();
   }
 }
 
@@ -644,6 +645,8 @@ void cuComputeGradInput(
         k_grad_input[l] = static_cast<T>(f_grad_input);
       }
     }
+    // prevent race where buf is written again before reads are done
+    __syncthreads();
   }
 }
 
