@@ -177,7 +177,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
             if pipeline_model_parallel_split_rank_ is not None and \
-                    pipeline_model_parallel_split_rank_ not in embedding_ranks:
+                    ranks[pipeline_model_parallel_split_rank_] not in embedding_ranks:
                 embedding_ranks = [ranks[0],
                                    ranks[pipeline_model_parallel_split_rank_],
                                    ranks[-1]]
