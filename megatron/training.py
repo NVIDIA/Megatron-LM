@@ -809,6 +809,17 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
     for model_module in model:
         model_module.eval()
 
+    if args.curriculum_learning and \
+        args.pipeline_model_parallel_size >= 1:
+        # When curriculum learning is used with pipeline parallelism, we need
+        # this logic to ensure that the eval data is not truncated. If there
+        # is a seqlen change due to that, we need to call
+        # reset_activation_shape() to reset some buffers in deepspeed pipeline
+        # engine.
+        if args.curriculum_seqlen < args.seq_length:
+            args.curriculum_seqlen = args.seq_length
+            model[0].reset_activation_shape()
+
     total_loss_dict = {}
 
     with torch.no_grad():
@@ -853,6 +864,14 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+
+    if args.curriculum_learning and \
+        args.pipeline_model_parallel_size >= 1:
+        # roll back to actual curriculum seqlen at the end of eval.
+        args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
+            args.iteration + 1)
+        if args.curriculum_seqlen < args.seq_length:
+            model[0].reset_activation_shape()
 
     return total_loss_dict
 
