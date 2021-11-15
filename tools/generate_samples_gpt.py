@@ -31,7 +31,7 @@ from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
-
+import deepspeed
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -90,11 +90,14 @@ def main():
     # Set up model and load checkpoint.
     model = get_model(model_provider)
 
-    if args.load is not None:
-        _ = load_checkpoint(model, None, None)
+    #if args.load is not None:
+    #    _ = load_checkpoint(model, None, None)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
+
+    model = ds_inference(model, args)
+    print('> DeepSpeed Inference initialized')
 
     # Generate samples.
     if args.num_samples == 0:
@@ -106,6 +109,39 @@ def main():
     else:
         generate_and_write_samples_unconditional(model)
 
+def ds_inference(model, args):
+    m = None
+    simple = True
+
+    if simple:
+
+        engine = deepspeed.init_inference(model, mp_size=args.tensor_model_parallel_size, mpu=mpu)
+        m = engine.module
+    else:
+        import deepspeed.module_inject as module_inject
+        policy = module_inject.replace_policy.MegatronLayerPolicy
+        policy.version = 1
+        import torch
+        q_scale = [[torch.randn(2).to(torch.cuda.current_device()) / 100 for _ in range(4)] for _ in range(96)]
+        quantize_settings = (q_scale, #quantization_scales
+                 1, #merge_count
+                 False, #mlp_extra_grouping
+                 1, #quantize_groups
+                )
+        import megatron.model as mm
+        m = module_inject.replace_transformer_layer(orig_layer_impl=mm.transformer.ParallelTransformerLayer,
+                                  model=model,
+                                  policy=policy,
+                                  hidden_size=args.hidden_size,
+                                  num_attention_heads=args.num_attention_heads,
+                                  mp_size=args.tensor_model_parallel_size,
+                                  mp_group=mpu.get_tensor_model_parallel_group(),
+                                  #dp_group=mpu.get_data_parallel_group, 
+                                  fp16=args.fp16,
+                                  training=False,
+                                  quantize=True,
+                                  quantize_settings=quantize_settings)
+    return m
 
 if __name__ == "__main__":
 

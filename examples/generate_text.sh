@@ -4,9 +4,10 @@ CHECKPOINT_PATH=checkpoints/gpt2_345m
 VOCAB_FILE=gpt2-vocab.json
 MERGE_FILE=gpt2-merges.txt
 b=8
+mp=8
 
-python tools/generate_samples_gpt.py \
-       --tensor-model-parallel-size 1 \
+deepspeed --num_nodes=1 tools/generate_samples_gpt.py \
+       --tensor-model-parallel-size $mp \
        --num-layers 24 \
        --hidden-size 1024 \
        --load $CHECKPOINT_PATH \
