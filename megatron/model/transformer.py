@@ -127,7 +127,7 @@ class ParallelAttention(MegatronModule):
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
-
+        self.num_attention_heads = args.num_attention_heads
         projection_size = args.kv_channels * args.num_attention_heads
 
         # Per attention head and per partition values.
@@ -414,7 +414,7 @@ class ParallelTransformerLayer(MegatronModule):
             eps=args.layernorm_epsilon)
 
         # Self attention.
-        self.self_attention = ParallelAttention(
+        self.attention = ParallelAttention(
             init_method,
             output_layer_init_method,
             layer_number,
@@ -690,20 +690,20 @@ class ParallelTransformer(MegatronModule):
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
-        if self.pre_process:
+        #if self.pre_process:
             # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
             # If the input flag for fp32 residual connection is set, convert for float.
-            if self.fp32_residual_connection:
-                hidden_states = hidden_states.transpose(0, 1).contiguous().float()
+        #    if self.fp32_residual_connection:
+        #        hidden_states = hidden_states.transpose(0, 1).contiguous().float()
             # Otherwise, leave it as is.
-            else:
-                hidden_states = hidden_states.transpose(0, 1).contiguous()
-        else:
+        #    else:
+        #        hidden_states = hidden_states.transpose(0, 1).contiguous()
+        #else:
             # See set_input_tensor()
-            hidden_states = self.input_tensor
+        #    hidden_states = self.input_tensor
 
-        if encoder_output is not None:
-             encoder_output = encoder_output.transpose(0, 1).contiguous()
+        #if encoder_output is not None:
+        #     encoder_output = encoder_output.transpose(0, 1).contiguous()
 
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,

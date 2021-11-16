@@ -6,7 +6,7 @@ MERGE_FILE=gpt2-merges.txt
 b=8
 mp=8
 
-deepspeed --num_nodes=1 tools/generate_samples_gpt.py \
+deepspeed --num_gpus=1 --num_nodes=1 tools/generate_samples_gpt.py \
        --tensor-model-parallel-size $mp \
        --num-layers 24 \
        --hidden-size 1024 \

@@ -114,10 +114,19 @@ def ds_inference(model, args):
     simple = True
 
     if simple:
-
-        engine = deepspeed.init_inference(model, mp_size=args.tensor_model_parallel_size, mpu=mpu)
+        import deepspeed.module_inject as module_inject
+        import megatron.model as mm
+        import torch
+        engine = deepspeed.init_inference(model=model,
+                                          mp_size=args.tensor_model_parallel_size, 
+                                          mpu=mpu,
+                                          dtype=torch.half,
+                                          return_tuple=False,
+                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy})
+                                          #replace_method='auto')
         m = engine.module
     else:
+
         import deepspeed.module_inject as module_inject
         policy = module_inject.replace_policy.MegatronLayerPolicy
         policy.version = 1
@@ -128,6 +137,7 @@ def ds_inference(model, args):
                  False, #mlp_extra_grouping
                  1, #quantize_groups
                 )
+
         import megatron.model as mm
         m = module_inject.replace_transformer_layer(orig_layer_impl=mm.transformer.ParallelTransformerLayer,
                                   model=model,
