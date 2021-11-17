@@ -257,6 +257,16 @@ def parse_args(extra_args_provider=None, defaults={},
             'currently distrobuted checkpoint activations only supported for ' \
             'nointerleaved pipeline parallelism'
 
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    # Persistent fused layer norm.
+    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+        args.no_persist_layer_norm = True
+        if args.rank == 0:
+            print('Persistent fused layer norm kernel is supported from '
+                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                  'Defaulting to no_persist_layer_norm=True')
+
     _print_args(args)
     return args
 
@@ -486,6 +496,11 @@ def _add_training_args(parser):
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
                        'gradient compuation of a column-linear layer.')
+    group.add_argument('--no-persist-layer-norm', action='store_true',
+                       help='Disable using persistent fused layer norm kernel. '
+                       'This kernel supports only a set of hidden sizes. Please '
+                       'check persist_ln_hidden_sizes if your hidden '
+                       'size is supported.')
     return parser
 
 
