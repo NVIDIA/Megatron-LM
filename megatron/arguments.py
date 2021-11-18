@@ -270,6 +270,12 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--num-experts', type=int, default=1,
+                           help='number of experts')
+    group.add_argument('--topk', type=int, default=1,
+                           help='Sets the k in TopK gating for MoE layers')
+    group.add_argument('--expert-interval', type=int, default=2,
+                           help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -436,6 +442,15 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--disable-moe-token-dropping', action='store_false',
+                       help='Disable MoE expert token dropping.',
+                       dest='moe_token_dropping')
+    group.add_argument('--moe-train-capacity-factor', type=float, default=1.0,
+                       help='The capacity of the MoE expert at training time')
+    group.add_argument('--moe-eval-capacity-factor', type=float, default=1.0,
+                       help='The capacity of the MoE expert at eval time.')
+    group.add_argument('--moe-min-capacity', type=int, default=4,
+                       help='The minimum capacity per MoE expert regardless of the capacity_factor.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')

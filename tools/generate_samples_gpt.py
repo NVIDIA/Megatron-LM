@@ -40,6 +40,7 @@ def model_provider(pre_process=True, post_process=True):
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
 
+    print(f'model = {model}')
     return model
 
 
@@ -87,6 +88,8 @@ def main():
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
+    deepspeed.utils.groups.initialize(ep_size=1)
+
     # Set up model and load checkpoint.
     model = get_model(model_provider)
 
@@ -117,6 +120,7 @@ def ds_inference(model, args):
         import deepspeed.module_inject as module_inject
         import megatron.model as mm
         import torch
+
         engine = deepspeed.init_inference(model=model,
                                           mp_size=args.tensor_model_parallel_size, 
                                           mpu=mpu,

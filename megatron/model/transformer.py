@@ -28,7 +28,7 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
 import deepspeed
-
+from deepspeed.moe.layer import MoE
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -395,7 +395,7 @@ class ParallelTransformerLayer(MegatronModule):
 
     def __init__(self, init_method, output_layer_init_method,
                  layer_number, layer_type=LayerType.encoder,
-                 self_attn_mask_type=AttnMaskType.padding):
+                 self_attn_mask_type=AttnMaskType.padding, num_experts=1):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -439,9 +439,19 @@ class ParallelTransformerLayer(MegatronModule):
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
 
+        self.num_experts = num_experts
         # MLP
-        self.mlp = ParallelMLP(init_method,
+        if self.num_experts <= 1:
+            self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
+        else:
+            self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+                output_layer_init_method=output_layer_init_method),
+                num_experts=self.num_experts, k=args.topk,
+                capacity_factor=args.moe_train_capacity_factor,
+                eval_capacity_factor=args.moe_eval_capacity_factor,
+                min_capacity=args.moe_min_capacity,
+                drop_tokens=args.moe_token_dropping, use_tutel=True)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
@@ -452,7 +462,7 @@ class ParallelTransformerLayer(MegatronModule):
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
         attention_output, attention_bias = \
-            self.self_attention(layernorm_output,
+            self.attention(layernorm_output,
                                 attention_mask,
                                 layer_past=layer_past,
                                 get_key_value=get_key_value)
@@ -575,7 +585,7 @@ class ParallelTransformer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 pre_process=True, post_process=True):
+                 pre_process=True, post_process=True, num_experts=1):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -601,7 +611,8 @@ class ParallelTransformer(MegatronModule):
                 output_layer_init_method,
                 layer_number,
                 layer_type=layer_type,
-                self_attn_mask_type=self_attn_mask_type)
+                self_attn_mask_type=self_attn_mask_type,
+                num_experts=num_experts if layer_number % args.expert_interval == 0 else 1)
         if args.virtual_pipeline_model_parallel_size is not None:
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \

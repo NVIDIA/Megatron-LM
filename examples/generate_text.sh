@@ -3,18 +3,19 @@
 CHECKPOINT_PATH=checkpoints/gpt2_345m
 VOCAB_FILE=gpt2-vocab.json
 MERGE_FILE=gpt2-merges.txt
-b=8
-mp=8
+b=1
+mp=1
 
-deepspeed --num_gpus=1 --num_nodes=1 tools/generate_samples_gpt.py \
+deepspeed --num_gpus=$(($mp)) --num_nodes=1 tools/generate_samples_gpt.py \
        --tensor-model-parallel-size $mp \
-       --num-layers 24 \
+       --num-layers 4 \
        --hidden-size 1024 \
        --load $CHECKPOINT_PATH \
        --num-attention-heads 16 \
        --max-position-embeddings 1024 \
        --tokenizer-type GPT2BPETokenizer \
        --fp16 \
+       --num-experts 8 \
        --micro-batch-size $b \
        --seq-length 101 \
        --out-seq-length 101 \
@@ -24,5 +25,5 @@ deepspeed --num_gpus=1 --num_nodes=1 tools/generate_samples_gpt.py \
        --genfile unconditional_samples.json \
        --top_p 0.9 \
        --log-interval 1 \
-       --num-samples $((10*$b))
+       --num-samples 1 # $((10*$b))
 #       --recompute
