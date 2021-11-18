@@ -522,8 +522,10 @@ class ParallelTransformerLayer(MegatronModule):
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
 
         # MLP.
-        mlp_output, mlp_bias = self.mlp(layernorm_output)
-
+        if self.num_experts <= 1:
+            mlp_output, mlp_bias = self.mlp(layernorm_output)
+        else:
+            mlp_output, _, _ = self.mlp(layernorm_output)
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -532,11 +534,15 @@ class ParallelTransformerLayer(MegatronModule):
 
         # re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
-            output = bias_dropout_add_func(
-                mlp_output,
-                mlp_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+            
+            if self.num_experts <= 1:
+                output = bias_dropout_add_func(
+                    mlp_output,
+                    mlp_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
+            else:
+                output = mlp_output + residual
 
         if get_key_value:
             output = [output, presents]

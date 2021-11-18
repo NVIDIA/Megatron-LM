@@ -1,9 +1,9 @@
 #!/bin/bash
 
 CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
-b=1
+VOCAB_FILE=/data/megatron-data/gpt2-vocab.json
+MERGE_FILE=/data/megatron-data/gpt2-merges.txt
+b=8
 mp=1
 
 deepspeed --num_gpus=$(($mp)) --num_nodes=1 tools/generate_samples_gpt.py \

@@ -113,6 +113,7 @@ def main():
         generate_and_write_samples_unconditional(model)
 
 def ds_inference(model, args):
+    return model
     m = None
     simple = True
 
@@ -120,12 +121,12 @@ def ds_inference(model, args):
         import deepspeed.module_inject as module_inject
         import megatron.model as mm
         import torch
-
         engine = deepspeed.init_inference(model=model,
                                           mp_size=args.tensor_model_parallel_size, 
                                           mpu=mpu,
                                           dtype=torch.half,
                                           return_tuple=False,
+                                          replace_with_kernel_inject=True,
                                           injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy})
                                           #replace_method='auto')
         m = engine.module

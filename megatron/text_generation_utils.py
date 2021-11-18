@@ -535,7 +535,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                     logits /= args.temperature
                     logits = top_k_logits(logits, top_k=args.top_k,
                                           top_p=args.top_p)
-                    log_probs = F.softmax(logits, dim=-1)
+                    log_probs = torch.ones_like(logits) #F.softmax(logits, dim=-1)
                     prev = torch.multinomial(log_probs, num_samples=1).view(-1)
 
                 started = context_lengths <= context_length
