@@ -87,8 +87,9 @@ def main():
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-
-    deepspeed.utils.groups.initialize(ep_size=1)
+    
+    import torch
+    deepspeed.utils.groups.initialize(ep_size=torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
@@ -99,8 +100,9 @@ def main():
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
-    model = ds_inference(model, args)
-    print('> DeepSpeed Inference initialized')
+    if args.ds_inference:
+        model = ds_inference(model, args)
+        print('> DeepSpeed Inference initialized')
 
     # Generate samples.
     if args.num_samples == 0:
@@ -113,7 +115,6 @@ def main():
         generate_and_write_samples_unconditional(model)
 
 def ds_inference(model, args):
-    return model
     m = None
     simple = True
 

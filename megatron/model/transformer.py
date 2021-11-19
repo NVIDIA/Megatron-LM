@@ -522,10 +522,14 @@ class ParallelTransformerLayer(MegatronModule):
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
 
         # MLP.
-        if self.num_experts <= 1:
+        moe_loss = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
+        mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
+
+        if self.num_experts == 1:
             mlp_output, mlp_bias = self.mlp(layernorm_output)
         else:
-            mlp_output, _, _ = self.mlp(layernorm_output)
+            mlp_output, moe_loss, _ = self.mlp(layernorm_output)
+        
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -534,15 +538,14 @@ class ParallelTransformerLayer(MegatronModule):
 
         # re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
-            
-            if self.num_experts <= 1:
-                output = bias_dropout_add_func(
+            #if self.num_experts <= 1:
+            output = bias_dropout_add_func(
                     mlp_output,
                     mlp_bias.expand_as(residual),
                     residual,
                     self.hidden_dropout)
-            else:
-                output = mlp_output + residual
+            #else:
+            #    output = mlp_output + residual
 
         if get_key_value:
             output = [output, presents]
@@ -600,6 +603,7 @@ class ParallelTransformer(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.input_tensor = None
+        self.ds_inference = args.ds_inference
 
         # Store activation checkpoiting flag.
         self.checkpoint_activations = args.checkpoint_activations
@@ -707,20 +711,22 @@ class ParallelTransformer(MegatronModule):
                 'get_key_value does not work with ' \
                 'activation checkpointing'
 
-        #if self.pre_process:
-            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            # If the input flag for fp32 residual connection is set, convert for float.
-        #    if self.fp32_residual_connection:
-        #        hidden_states = hidden_states.transpose(0, 1).contiguous().float()
-            # Otherwise, leave it as is.
-        #    else:
-        #        hidden_states = hidden_states.transpose(0, 1).contiguous()
-        #else:
-            # See set_input_tensor()
-        #    hidden_states = self.input_tensor
+        # Reza's note: DeepSpeed inference does not support transposes
+        if not self.ds_inference:
+            if self.pre_process:
+                # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+                # If the input flag for fp32 residual connection is set, convert for float.
+                if self.fp32_residual_connection:
+                    hidden_states = hidden_states.transpose(0, 1).contiguous().float()
+                # Otherwise, leave it as is.
+                else:
+                    hidden_states = hidden_states.transpose(0, 1).contiguous()
+            else:
+                # See set_input_tensor()
+                hidden_states = self.input_tensor
 
-        #if encoder_output is not None:
-        #     encoder_output = encoder_output.transpose(0, 1).contiguous()
+            if encoder_output is not None:
+                 encoder_output = encoder_output.transpose(0, 1).contiguous()
 
         if self.checkpoint_activations:
             hidden_states = self._checkpointed_forward(hidden_states,
