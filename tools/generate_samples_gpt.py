@@ -40,7 +40,7 @@ def model_provider(pre_process=True, post_process=True):
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
 
-    print(f'model = {model}')
+    #print(f'model = {model}')
     return model
 
 
@@ -125,10 +125,12 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           mp_size=args.tensor_model_parallel_size, 
                                           mpu=mpu,
+                                          #ep_group=#WORLD_GROUP,
                                           dtype=torch.half,
                                           return_tuple=False,
                                           replace_with_kernel_inject=True,
-                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy})
+                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy},
+                                          moe_experts=args.num_experts)
                                           #replace_method='auto')
         m = engine.module
     else:
