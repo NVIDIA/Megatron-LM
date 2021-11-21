@@ -7,9 +7,13 @@ from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
 from megatron.checkpointing import load_checkpoint
 from tasks.finetune_utils import build_data_loader
-from tasks.dialctrl.data import build_test_dataset
-from tasks.dialctrl.finetune import model_provider, process_batch, loss_func, forward_step
-from tasks.dialctrl.metrics import F1Metric
+from tasks.knwl_dialo.data import build_test_dataset
+from tasks.knwl_dialo.data import build_test_dataset_for_prompting
+from tasks.knwl_dialo.finetune import model_provider 
+from tasks.knwl_dialo.finetune import process_batch 
+from tasks.knwl_dialo.finetune import loss_func 
+from tasks.knwl_dialo.finetune import forward_step 
+from tasks.knwl_dialo.metrics import F1Metric
 from tqdm import tqdm
 
 def test_dataset_provider():
@@ -18,15 +22,27 @@ def test_dataset_provider():
     print_rank_0('> building the test dataset for %s module ...' \
                     % args.train_module)
 
-    test_ds = build_test_dataset(
-        test_data_path=args.test_data_path,
-        train_module=args.train_module,
-        max_seq_len=args.max_seq_len,
-        last_turn=args.last_turn,
-        no_control_code=args.no_control_code,
-        add_separator=args.add_separator,
-        add_ctrl_code_to_dialog=args.add_ctrl_code_to_dialog,
-        remove_ctrl_sent=args.remove_ctrl_sent)
+    if args.eval_prompting:
+        print_rank_0('> evaluating ppl for prompting')
+        test_ds = build_test_dataset_for_prompting(
+            test_data_path=args.test_data_path,
+            prompt_file=args.prompt_file,
+            train_module=args.train_module,
+            max_seq_len=args.max_seq_len,
+            num_prompt_examples=args.num_prompt_examples,
+            three_turns=args.three_turns,
+            dynamic_prompt=args.dynamic_prompt)
+
+    else:
+        test_ds = build_test_dataset(
+            test_data_path=args.test_data_path,
+            train_module=args.train_module,
+            max_seq_len=args.max_seq_len,
+            last_turn=args.last_turn,
+            no_control_code=args.no_control_code,
+            add_separator=args.add_separator,
+            add_ctrl_code_to_dialog=args.add_ctrl_code_to_dialog,
+            remove_ctrl_sent=args.remove_ctrl_sent)
 
     print_rank_0("> finished creating the test dataset for %s module ..." \
                     % args.train_module)
@@ -93,7 +109,7 @@ def evaluate_ppl(test_dataset_provider, model_provider, forward_step):
     print_rank_0('done :-)')
 
 
-def evaluate_f1(guess_file, answer_file, remove_stopwords):
+def evaluate_f1(guess_file, answer_file):
 
     guess_list = []
     print_rank_0('reading %s' % guess_file)
@@ -116,7 +132,7 @@ def evaluate_f1(guess_file, answer_file, remove_stopwords):
     assert len(guess_list) == len(answer_list), \
         "lengths of guess and answer are different!"
 
-    precision, recall, f1 = F1Metric.compute_all_pairs(guess_list, answer_list, remove_stopwords)
+    precision, recall, f1 = F1Metric.compute_all_pairs(guess_list, answer_list)
     print_rank_0('Precision: %.4f; recall: %.4f; f1: %.4f' % (precision, recall, f1))
 
     print_rank_0('done :-)')
@@ -124,10 +140,10 @@ def evaluate_f1(guess_file, answer_file, remove_stopwords):
 
 def main():
     args = get_args()
-
+    
     if 'ppl' in args.task: 
         evaluate_ppl(test_dataset_provider, model_provider, forward_step)
     
     elif 'f1' in args.task:
-        evaluate_f1(args.guess_file, args.answer_file, args.remove_stopwords)
+        evaluate_f1(args.guess_file, args.answer_file)
 

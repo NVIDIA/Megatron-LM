@@ -61,7 +61,7 @@ class F1Metric:
         return precision, recall, f1
 
     @staticmethod
-    def compute_each_pair(guess: str, answer: str, rm_sw: bool):
+    def compute_each_pair(guess: str, answer: str):
         if answer == "":
             return None, None, None
         if guess == "":
@@ -69,26 +69,17 @@ class F1Metric:
         g_tokens = normalize_answer(guess).split()
         a_tokens = normalize_answer(answer).split()
 
-        if rm_sw:
-            g_tokens = remove_stopwords(g_tokens)
-            a_tokens = remove_stopwords(a_tokens)
-            if len(a_tokens) == 0:
-                return None, None, None
-            if len(g_tokens) == 0:
-                return 0, 0, 0
-
         precision, recall, f1 = F1Metric._prec_recall_f1_score(g_tokens, a_tokens)
         return precision, recall, f1
         
     @staticmethod
-    def compute_all_pairs(guesses: List[str], answers: List[str], rm_sw=False):
+    def compute_all_pairs(guesses: List[str], answers: List[str]):
         # additional augment:
-        # rm_sw: whether to remove stopwords
         assert len(guesses) == len(answers)
         
         precision_list, recall_list, f1_list = [], [], []
         for guess, answer in zip(guesses, answers):
-            precision, recall, f1 = F1Metric.compute_each_pair(guess, answer, rm_sw)
+            precision, recall, f1 = F1Metric.compute_each_pair(guess, answer)
             if precision is None or recall is None or f1 is None:
                 continue
             precision_list.append(precision)

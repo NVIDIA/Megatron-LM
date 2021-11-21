@@ -76,6 +76,7 @@ def add_text_generate_args(parser):
                        help='additional special tokens')
     group.add_argument('--line-by-line', action="store_true",
                        help='generate samples line by line')
+                       
     group.add_argument('--prompt', action="store_true",
                        help='generate samples based on prompting')
     group.add_argument('--prompt-file', type=str, default="",
@@ -84,6 +85,10 @@ def add_text_generate_args(parser):
                        help='prompt type (context or keyphrase)')
     group.add_argument('--num-prompt-examples', type=int, default=10,
                        help='number of prompt examples')
+    group.add_argument("--noknowledge", action='store_true', default=False,
+                       help='Do not use knowledge in prompting')
+    group.add_argument('--dynamic-prompt', action='store_true', default=False,
+                       help='using different prompts for different test samples')
 
     return parser
 
@@ -114,13 +119,7 @@ def main():
     if args.num_samples == 0:
         if args.sample_input_file != None:
             args.micro_batch_size = 1
-            if args.line_by_line:
-                if args.prompt:
-                    generate_samples_prompt_input_from_file(model)
-                else:
-                    generate_samples_line_by_line_input_from_file(model)
-            else:
-                generate_samples_input_from_file(model)
+            generate_samples_input_from_file(model)
         else:
             generate_samples_interactive(model)
     else:

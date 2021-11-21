@@ -263,6 +263,7 @@ def generate_samples_prompt_input_from_file(model):
 
     args = get_args()
     tokenizer = get_tokenizer()
+    from nltk import word_tokenize
 
     # Read the sample file and open the output file.
     assert args.sample_input_file is not None, \
@@ -282,16 +283,35 @@ def generate_samples_prompt_input_from_file(model):
         fname_out = open(sample_output_file, "w")
 
     # Read the prompt file
-    with open(args.prompt_file, "r") as f:
-        prompt_examples = f.readlines()
+    if args.dynamic_prompt:
+        prompt_examples_dict = {}
+        with open(args.prompt_file, "r") as f:
+            for i, line in enumerate(f):
+                line = line.strip()
+                line_dict = json.loads(line)
+                key = list(line_dict.keys())[0]
+                
+                if key not in prompt_examples_dict:
+                    prompt_examples = line_dict[key]
 
-    prompt_examples = prompt_examples[:args.num_prompt_examples]
-    prompt = ""
-    for instance in prompt_examples:
-        instance = instance.strip()
-        prompt += instance + " \n"
+                    prompt = ""
+                    for instance in prompt_examples:
+                        instance = instance.strip()
+                        prompt += instance + " \n"
 
-    assert args.prompt_type in ["context", "keyphrase"]
+                    prompt_examples_dict[key] = prompt
+
+    else:
+        with open(args.prompt_file, "r") as f:
+            prompt_examples = f.readlines()
+            prompt_examples = prompt_examples[:args.num_prompt_examples]
+
+            prompt = ""
+            for instance in prompt_examples:
+                instance = instance.strip()
+                prompt += instance + " \n"
+
+    assert args.prompt_type in ["knowledge", "knowledge_notopic", "dialogue", "dialogue_notopic"]
     context_count = 0
     model.eval()
     with torch.no_grad():
@@ -306,25 +326,77 @@ def generate_samples_prompt_input_from_file(model):
                 control_codes = splits[0].split(" [CTRL] ")
                 topic = control_codes[0]
 
-                raw_text = prompt
-                if args.prompt_type == "context":
+                if args.dynamic_prompt:
                     turns = splits[1].split(" [SEP] ")
-                    context = turns[-1]
-                    raw_text += "( " + context + " ) " + topic + " :"
+                    last_turn = turns[-1]
+                    key = topic + " " + last_turn
+                    raw_text = prompt_examples_dict[key]
 
                 else:
-                    keyphrase_list = control_codes[1:]
+                    raw_text = prompt
 
-                    for i, keyphrase in enumerate(keyphrase_list):
-                        if i == 0:
-                            raw_text += "( "
+                if args.prompt_type == "knowledge":
+                    turns = splits[1].split(" [SEP] ")
+                    context = turns[-1]
+                    raw_text += "( " + context + " ) " + topic + " =>"
+                    # raw_text += "( " + context + " ) " + topic + ":"
+                    # raw_text += "( " + context + " ) " + topic + " ->"
+                
+                elif args.prompt_type == "knowledge_notopic":
+                    turns = splits[1].split(" [SEP] ")[-3:]
+                    for j, turn in enumerate(turns):
+                        if j != 0:
+                            raw_text += " "
                         else:
-                            raw_text += "; "
-                        raw_text += keyphrase
+                            raw_text += "( " + turn + " )"
+                    raw_text += " =>"
+                
+                elif args.prompt_type == "dialogue":
+                    turns = splits[1].split(" [SEP] ")
+                    # context = turns[-1]
+                    ctrl_sent = splits[2]
+                    ctrl_sent = " ".join(word_tokenize(ctrl_sent))
 
-                    if len(keyphrase_list) > 0:
-                        raw_text += " ) "
-                    raw_text += topic + " :"
+                    # ## version one
+                    # turns = turns[-3:]
+                    # raw_text += "Topic: " + topic + ". "
+                    # if len(turns) == 2:
+                    #     for idx, turn in enumerate(turns):
+                    #         if idx % 2 == 0:
+                    #             raw_text += "System: " + turn + " "
+                    #         else:
+                    #             raw_text += "User: " + turn + " "
+                    # else:
+                    #     for idx, turn in enumerate(turns):
+                    #         if idx % 2 == 0:
+                    #             raw_text += "User: " + turn + " "
+                    #         else:
+                    #             raw_text += "System: " + turn + " "
+                    # raw_text += "We know that: " + ctrl_sent + " "
+                    # raw_text += "Therefore, the System will say:"
+
+                    ## version two
+                    last_turn = turns[-1]
+                    ctrl_sent = ctrl_sent.strip()
+                    last_turn = last_turn.strip()
+                    raw_text += "Topic: " + topic + ". "
+                    raw_text += "User says: " + last_turn + " "
+                    raw_text += "We know that: " + ctrl_sent + " "
+                    raw_text += "System replies:"
+
+                else:
+                    turns = splits[1].split(" [SEP] ")
+                    # context = turns[-1]
+                    ctrl_sent = splits[2]
+                    ctrl_sent = " ".join(word_tokenize(ctrl_sent))
+
+                    ## version two
+                    last_turn = turns[-1]
+                    ctrl_sent = ctrl_sent.strip()
+                    last_turn = last_turn.strip()
+                    raw_text += "User says: " + last_turn + " "
+                    raw_text += "We know that: " + ctrl_sent + " "
+                    raw_text += "System replies:"
 
                 input_pos += 1
                 raw_text_len = len(raw_text)

@@ -84,9 +84,24 @@ def get_tasks_args(parser):
                         help='Av.rank validation: how many other negatives to'
                         ' take from each question pool')
 
-    # finetune for controllable dialogue
-    group.add_argument('--train-module', type=str, default="",
-                       help='either control module or dialogue model (control or dialog)')
+    # parameters for the knowledgeable dialogue generation
+    group.add_argument("--out-seq-length", type=int, default=1024,
+                       help='Size of the output generated text.')
+    group.add_argument("--sample-input-file", type=str, default=None,
+                       help='Get input from file instead of interactive mode, '
+                       'each line is an input.')
+    group.add_argument("--sample-output-file", type=str, default=None,
+                       help='Output file got from --sample-input-file')
+    group.add_argument('--prompt-file', type=str, default="",
+                       help='prompting file')
+    group.add_argument('--prompt-type', type=str, default="",
+                       help='prompt type (knowledge or response)')
+    group.add_argument('--num-prompt-examples', type=int, default=10,
+                       help='number of prompt examples')
+    group.add_argument('--dynamic-prompt', action='store_true', default=False,
+                       help='using different prompts for different test samples')
+    group.add_argument('--module', type=str, default="",
+                       help='either knowledge generation (knowledge) or response generation (response)')
     group.add_argument('--train-data-path', type=str, default="",
                        help='datapath for training set')
     group.add_argument('--test-data-path', type=str, default="",
@@ -99,29 +114,8 @@ def get_tasks_args(parser):
                        help='maximum sequence length')
     group.add_argument('--spec-toks', type=str, default=None,
                        help='additional special tokens')
-    group.add_argument('--last-turn', action='store_true',
-                       help='only use last turn for control model')
-    group.add_argument('--no-control-code', action='store_true',
-                       help='removing control code in the training for control model')
-    group.add_argument('--remove-stopwords', action='store_true',
-                       help='removing stopwords when evaluating F1-score')
-    group.add_argument('--add-separator', action='store_true', 
-                       help='add separator between turns and add colon before generation')
-    group.add_argument('--add-ctrl-code-to-dialog', action='store_true', 
-                       help='add control code in the dialog modeling')
-    group.add_argument('--remove-ctrl-sent', action='store_true', 
-                       help='dont use control sentence in dialog modeling')
-
-
-    # finetune for controllable generation
-    group.add_argument('--wiki-path', type=str, default="",
-                       help='data path for the wikipedia corpus')
-    group.add_argument('--tokenized-path', type=str, default="",
-                       help='data path for the tokenized file')
-    group.add_argument('--prop', type=float, default=1.0,
-                       help='Proportion of data used for training')
-    group.add_argument('--max-instance', type=int, default=10000000,
-                       help='Proportion of data used for training')
+    group.add_argument('--eval-prompting', action='store_true', 
+                       help='Whether to evaluate prompting')
 
     return parser
 
@@ -146,12 +140,12 @@ if __name__ == '__main__':
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main
-    elif args.task == 'control-gen':
-        from control_gen.finetune import main
-    elif args.task == 'dialctrl':
-        from dialctrl.finetune import main
-    elif args.task in ['dialctrl-eval-ppl', 'dialctrl-eval-f1']:
-        from dialctrl.evaluate import main
+    elif args.task == 'knwl-dialo-prompt':
+        from knwl_dialo.prompt import main
+    elif args.task == ['knwl-dialo-finetune', 'knwl-dialo-gen']:
+        from knwl_dialo.finetune import main
+    elif args.task in ['knwl-dialo-eval-ppl', 'knwl-dialo-eval-f1']:
+        from knwl_dialo.evaluate import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

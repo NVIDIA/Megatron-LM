@@ -7,10 +7,10 @@ dist/
 tensorboard
 commands/
 commands_new/
+commands_others/
+commands_final/
 *.log
 logs
 *.so
 *.out
-train_gpt_conv.py
 dialogctrl/
-control_gen/
