@@ -72,23 +72,6 @@ def add_text_generate_args(parser):
     group.add_argument("--recompute", action='store_true',
                        help='During generation recompute all attention '
                        'instead of using previously computed keys/values.')
-    group.add_argument('--spec-toks', type=str, default=None,
-                       help='additional special tokens')
-    group.add_argument('--line-by-line', action="store_true",
-                       help='generate samples line by line')
-                       
-    group.add_argument('--prompt', action="store_true",
-                       help='generate samples based on prompting')
-    group.add_argument('--prompt-file', type=str, default="",
-                       help='prompting file')
-    group.add_argument('--prompt-type', type=str, default="",
-                       help='prompt type (context or keyphrase)')
-    group.add_argument('--num-prompt-examples', type=int, default=10,
-                       help='number of prompt examples')
-    group.add_argument("--noknowledge", action='store_true', default=False,
-                       help='Do not use knowledge in prompting')
-    group.add_argument('--dynamic-prompt', action='store_true', default=False,
-                       help='using different prompts for different test samples')
 
     return parser
 
