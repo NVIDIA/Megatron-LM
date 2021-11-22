@@ -30,8 +30,6 @@ from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
-from megatron.text_generation_utils import generate_samples_prompt_input_from_file
-from megatron.text_generation_utils import generate_samples_line_by_line_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
 
 
