@@ -245,17 +245,6 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
-    # Activation checkpointing.
-    if args.distribute_checkpointed_activations:
-        assert args.tensor_model_parallel_size > 1, 'can distribute ' \
-            'checkpointed activations only across tensor model ' \
-            'parallel groups'
-        assert args.activations_checkpoint_method is not None, \
-            'for distribute-checkpointed-activations to work you '\
-            'need to use a activation-checkpoint method '
-        assert args.num_layers_per_virtual_pipeline_stage is None, \
-            'currently distrobuted checkpoint activations only supported for ' \
-            'nointerleaved pipeline parallelism'
 
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
     TORCH_MINOR = int(torch.__version__.split('.')[1])
@@ -266,6 +255,22 @@ def parse_args(extra_args_provider=None, defaults={},
             print('Persistent fused layer norm kernel is supported from '
                   'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
                   'Defaulting to no_persist_layer_norm=True')
+
+    # Activation checkpointing.
+    if args.distribute_checkpointed_activations:
+        assert args.tensor_model_parallel_size > 1, 'can distribute ' \
+            'checkpointed activations only across tensor model ' \
+            'parallel groups'
+        assert args.activations_checkpoint_method is not None, \
+            'for distributed checkpoint activations to work you '\
+            'need to use a activation-checkpoint method '
+        assert args.num_layers_per_virtual_pipeline_stage is None, \
+            'currently distributed checkpoint activations only supported for ' \
+            'nointerleaved pipeline parallelism'
+        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+            'distributed checkpoint activations are supported for pytorch ' \
+            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
+            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
     _print_args(args)
     return args
