@@ -27,7 +27,7 @@ deepspeed --num_gpus=$gpus --num_nodes=1 tools/generate_samples_gpt.py \
        --genfile unconditional_samples.json \
        --top_p 0.9 \
        --log-interval 1 \
-       --num-samples $((10*$b)) \
+       --num-samples $((20*$b)) \
        --ds-inference \
 
 #$((10*$b))
