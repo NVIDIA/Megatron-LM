@@ -58,6 +58,9 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    # helper argument to set deepspeed pipeline parallel or not
+    args.ds_pipeline_enabled = not args.no_pipeline_parallel
+
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
@@ -72,6 +75,9 @@ def parse_args(extra_args_provider=None, defaults={},
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
     # Checks.
+    if args.no_pipeline_parallel:
+        assert args.pipeline_model_parallel_size == 1, \
+            "pipeline_model_parallel_size must be 1 if pipeline parallel is disabled"
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
@@ -446,6 +452,8 @@ def _add_training_args(parser):
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--no-pipeline-parallel', action='store_true',
+                       help='Disable pipeline parallelism')
 
     return parser
 

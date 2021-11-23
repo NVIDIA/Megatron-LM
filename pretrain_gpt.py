@@ -46,7 +46,7 @@ def model_provider(pre_process=True, post_process=True):
                              config_dict_or_path=args.deepspeed_config,
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
-        if args.deepspeed:
+        if args.deepspeed and not args.no_pipeline_parallel:
             model = GPTModelPipe(
                 num_tokentypes=0,
                 parallel_output=True
