@@ -264,9 +264,6 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.activations_checkpoint_method is not None, \
             'for distributed checkpoint activations to work you '\
             'need to use a activation-checkpoint method '
-        assert args.num_layers_per_virtual_pipeline_stage is None, \
-            'currently distributed checkpoint activations only supported for ' \
-            'nointerleaved pipeline parallelism'
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
             'distributed checkpoint activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
