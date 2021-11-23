@@ -47,7 +47,7 @@ def get_language_model(num_tokentypes, add_pooler,
                        encoder_attn_mask_type, init_method=None,
                        scaled_init_method=None, add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True):
+                       pre_process=True, post_process=True, num_experts=1):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -68,8 +68,8 @@ def get_language_model(num_tokentypes, add_pooler,
         decoder_attn_mask_type=decoder_attn_mask_type,
         add_pooler=add_pooler,
         pre_process=pre_process,
-        post_process=post_process
-    )
+        post_process=post_process,
+        num_experts=num_experts)
     # key used for checkpoints.
     language_model_key = 'language_model'
 
@@ -311,7 +311,8 @@ class TransformerLanguageModel(MegatronModule):
                  decoder_attn_mask_type=AttnMaskType.causal,
                  add_pooler=False,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 num_experts=1):
         super(TransformerLanguageModel, self).__init__()
         args = get_args()
 
@@ -324,6 +325,7 @@ class TransformerLanguageModel(MegatronModule):
         self.add_decoder = add_decoder
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
+        self.num_experts = num_experts
 
         # Embeddings.
         if self.pre_process:
@@ -341,7 +343,8 @@ class TransformerLanguageModel(MegatronModule):
             output_layer_init_method,
             self_attn_mask_type=self.encoder_attn_mask_type,
             pre_process=self.pre_process,
-            post_process=self.post_process
+            post_process=self.post_process,
+            num_experts=self.num_experts
         )
         self._encoder_key = 'encoder'
 
@@ -353,7 +356,8 @@ class TransformerLanguageModel(MegatronModule):
                 self.init_method,
                 output_layer_init_method,
                 layer_type=LayerType.decoder,
-                self_attn_mask_type=self.decoder_attn_mask_type)
+                self_attn_mask_type=self.decoder_attn_mask_type,
+                num_experts=self.num_experts)
             self._decoder_key = 'decoder'
 
         if self.post_process:

@@ -85,8 +85,8 @@ class GPTModel(MegatronModule):
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.causal,
             init_method=init_method_normal(args.init_method_std),
-            scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
+            num_experts=args.num_experts,
             pre_process=self.pre_process,
             post_process=self.post_process)
 
