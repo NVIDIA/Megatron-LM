@@ -159,12 +159,21 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
             torch.save(state_dict, checkpoint_name)
 
     if args.deepspeed:
+        #megatron model uses state_dict_for_save_checkpointing instead of the standard state_dict
+        #state_dict is used by deepspeed for module saving so it needs to point to the right function
+        if args.no_pipeline_parallel:
+            original_state_dict = model[0].module.state_dict
+            model[0].module.state_dict = model[0].module.state_dict_for_save_checkpoint
+
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
         # Trim off the filename and mp_rank_* directory.
         for _ in range(3):
             checkpoint_name = os.path.dirname(checkpoint_name)
-        model[0].save_checkpoint(checkpoint_name, client_state=state_dict)
+        model[0].save_checkpoint(checkpoint_name, client_state=state_dict)A
+
+        if args.no_pipeline_parallel:
+            model[0].module.state_dict = original_state_dict
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
