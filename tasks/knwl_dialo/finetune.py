@@ -36,21 +36,16 @@ def train_valid_datasets_provider():
     """Build train, valid, and test datasets for dialog/control module"""
     args = get_args()
 
-    print_rank_0('> building train, validation, and test datasets for %s module ...' % args.train_module)
+    print_rank_0('> building train, validation, and test datasets for %s module ...' % args.module)
     
     train_ds, valid_ds = build_train_valid_datasets(
         train_data_path=args.train_data_path,
         valid_data_path=args.test_data_path,
-        train_module=args.train_module,
+        module=args.module,
         max_seq_len=args.max_seq_len,
-        seed=args.seed,
-        last_turn=args.last_turn,
-        no_control_code=args.no_control_code,
-        add_separator=args.add_separator,
-        add_ctrl_code_to_dialog=args.add_ctrl_code_to_dialog,
-        remove_ctrl_sent=args.remove_ctrl_sent)
+        seed=args.seed)
         
-    print_rank_0("> finished creating datasets for %s module ..." % args.train_module)
+    print_rank_0("> finished creating datasets for %s module ..." % args.module)
     print_rank_0('> Train size: %d' % len(train_ds))
     print_rank_0('> Validation size: %d' % len(valid_ds))
 
