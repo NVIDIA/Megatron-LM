@@ -377,6 +377,9 @@ def _add_logging_args(parser):
     group.add_argument('--log-memory-to-tensorboard',
                        action='store_true',
                        help='Enable memory logging to tensorboard.')
+    group.add_argument('--log-world-size-to-tensorboard',
+                       action='store_true',
+                       help='Enable world size logging to tensorboard.')
 
     return parser
 
@@ -472,6 +475,9 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--exit-duration-in-mins', type=int, default=None,
                        help='Exit the program after this many minutes.')
+    group.add_argument('--exit-signal-handler', action='store_true',
+                       help='Dynamically save the checkpoint and shutdown the '
+                       'training if SIGTERM is received')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
