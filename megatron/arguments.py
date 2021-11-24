@@ -471,7 +471,8 @@ def _add_training_args(parser):
                        help='Use Torch Adam as optimizer on CPU.')
     group.add_argument('--no-pipeline-parallel', action='store_true',
                        help='Disable pipeline parallelism')
-
+    group.add_argument('--use-tutel', action='store_true',
+                       help='Use Tutel optimization for MoE')
     return parser
 
 
