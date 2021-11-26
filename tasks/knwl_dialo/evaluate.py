@@ -141,9 +141,9 @@ def evaluate_f1(guess_file, answer_file):
 def main():
     args = get_args()
     
-    if 'ppl' in args.task: 
+    if 'PPL' in args.task: 
         evaluate_ppl(test_dataset_provider, model_provider, forward_step)
     
-    elif 'f1' in args.task:
+    elif 'F1' in args.task:
         evaluate_f1(args.guess_file, args.answer_file)
 

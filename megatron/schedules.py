@@ -25,12 +25,17 @@ from megatron import p2p_communication
 from megatron.utils import unwrap_model
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
+from megatron.model import ModelType
+
 
 def get_forward_backward_func():
     args = get_args()
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+            assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
+                'number of microbatches is not divisible by pipeline-parallel ' \
+                'size when using interleaved schedule'
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
@@ -45,11 +50,18 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     passed-in input_tensor is used.
 
     Returns output tensor."""
+    args = get_args()
     timers = get_timers()
 
     timers('forward-compute').start()
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
+
+    unwrap_output_tensor = False
+    if not isinstance(input_tensor, list):
+        input_tensor = [input_tensor]
+        unwrap_output_tensor = True
+
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
@@ -59,7 +71,15 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
 
-    return output_tensor
+    # If T5 model (or other model with encoder and decoder)
+    # and in decoder stack, then send encoder_hidden_state
+    # downstream as well.
+    if mpu.is_pipeline_stage_after_split() and \
+            args.model_type == ModelType.encoder_and_decoder:
+        return [output_tensor, input_tensor[-1]]
+    if unwrap_output_tensor:
+        return output_tensor
+    return [output_tensor]
 
 
 def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
@@ -70,24 +90,53 @@ def backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad):
 
     Returns gradient of loss with respect to input tensor (None if first
     stage)."""
+
+    # NOTE: This code currently can handle at most one skip connection. It
+    # needs to be modified slightly to support arbitrary numbers of skip
+    # connections.
     args = get_args()
 
     timers = get_timers()
     timers('backward-compute').start()
 
     # Retain the grad on the input_tensor.
-    if input_tensor is not None:
-        input_tensor.retain_grad()
+    unwrap_input_tensor_grad = False
+    if not isinstance(input_tensor, list):
+        input_tensor = [input_tensor]
+        unwrap_input_tensor_grad = True
+    for x in input_tensor:
+        if x is not None:
+            x.retain_grad()
+
+    if not isinstance(output_tensor, list):
+        output_tensor = [output_tensor]
+    if not isinstance(output_tensor_grad, list):
+        output_tensor_grad = [output_tensor_grad]
 
     # Backward pass.
-    if output_tensor_grad is None:
-        output_tensor = optimizer.scale_loss(output_tensor)
-    torch.autograd.backward(output_tensor, grad_tensors=output_tensor_grad)
+    if output_tensor_grad[0] is None:
+        output_tensor = optimizer.scale_loss(output_tensor[0])
+    torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
-    input_tensor_grad = None
+    input_tensor_grad = [None]
     if input_tensor is not None:
-        input_tensor_grad = input_tensor.grad
+        input_tensor_grad = []
+        for x in input_tensor:
+            if x is None:
+                input_tensor_grad.append(None)
+            else:
+                input_tensor_grad.append(x.grad)
+
+    # Handle single skip connection if it exists (encoder_hidden_state in
+    # model with encoder and decoder).
+    if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+            mpu.is_pipeline_stage_after_split() and \
+            args.model_type == ModelType.encoder_and_decoder:
+        if output_tensor_grad[1] is not None:
+            input_tensor_grad[-1].add_(output_tensor_grad[1])
+    if unwrap_input_tensor_grad:
+        input_tensor_grad = input_tensor_grad[0]
 
     timers('backward-compute').stop()
 
@@ -150,6 +199,9 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
     pipeline_parallel_size = mpu.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = mpu.get_pipeline_model_parallel_rank()
 
+    args = get_args()
+    tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
+
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
     num_microbatches = get_num_microbatches() * num_model_chunks
@@ -191,6 +243,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
         model_chunk_id = get_model_chunk_id(microbatch_id, forward=True)
         mpu.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
+        # forward step
         if mpu.is_pipeline_first_stage():
             if len(input_tensors[model_chunk_id]) == \
                     len(output_tensors[model_chunk_id]):
@@ -201,6 +254,11 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                                      model[model_chunk_id],
                                      input_tensor, losses_reduced)
         output_tensors[model_chunk_id].append(output_tensor)
+
+        # if forward-only, no need to save tensors for a backward pass
+        if forward_only:
+            input_tensors[model_chunk_id].pop()
+            output_tensors[model_chunk_id].pop()
 
         return output_tensor
 
@@ -228,7 +286,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
     # Run warmup forward passes.
     mpu.set_virtual_pipeline_model_parallel_rank(0)
     input_tensors[0].append(
-        p2p_communication.recv_forward(timers))
+        p2p_communication.recv_forward(tensor_shape, timers=timers))
     for k in range(num_warmup_microbatches):
         output_tensor = forward_step_helper(k)
 
@@ -257,12 +315,15 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                 p2p_communication.send_forward_backward_recv_forward_backward(
                         output_tensor, input_tensor_grad,
                         recv_prev=recv_prev, recv_next=recv_next,
+                        tensor_shape=tensor_shape,
                         timers=timers)
             output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
         else:
             input_tensor = \
                 p2p_communication.send_forward_recv_forward(
-                    output_tensor, recv_prev, timers)
+                    output_tensor, recv_prev=recv_prev,
+                    tensor_shape=tensor_shape,
+                    timers=timers)
         input_tensors[next_forward_model_chunk_id].append(input_tensor)
 
     # Run 1F1B in steady state.
@@ -326,7 +387,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
             p2p_communication.send_forward_backward_recv_forward_backward(
                     output_tensor, input_tensor_grad,
                     recv_prev=recv_prev, recv_next=recv_next,
-                    timers=timers)
+                    tensor_shape=tensor_shape, timers=timers)
 
         # Put input_tensor and output_tensor_grad in data structures in the
         # right location.
@@ -340,7 +401,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
     if not forward_only:
         if all_warmup_microbatches:
             output_tensor_grads[num_model_chunks-1].append(
-                p2p_communication.recv_backward(timers))
+                p2p_communication.recv_backward(tensor_shape, timers=timers))
         for k in range(num_microbatches_remaining, num_microbatches):
             input_tensor_grad = backward_step_helper(k)
             next_backward_model_chunk_id = get_model_chunk_id(k+1, forward=False)
@@ -352,9 +413,105 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                 recv_next = False
             output_tensor_grads[next_backward_model_chunk_id].append(
                 p2p_communication.send_backward_recv_backward(
-                    input_tensor_grad, recv_next, timers))
+                    input_tensor_grad, recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    timers=timers))
 
     return losses_reduced
+
+
+def get_tensor_shapes(rank, model_type):
+    # Determine right tensor sizes (based on position of rank with respect to split
+    # rank) and model size.
+    # Send two tensors if model is T5 and rank is in decoder stage:
+    #     first tensor is decoder (pre-transpose),
+    #     second tensor is encoder (post-transpose).
+    # If model is T5 and rank is at the boundary:
+    #     send one tensor (post-transpose from encoder).
+    # Otherwise, send one tensor (pre-transpose).
+    args = get_args()
+    tensor_shapes = []
+    if model_type == ModelType.encoder_and_decoder:
+        if mpu.is_pipeline_stage_before_split(rank):
+            # If next rank is after split, then need transpose for encoder_hidden_state.
+            if mpu.is_pipeline_stage_before_split(rank+1):
+                tensor_shapes.append((args.seq_length, args.micro_batch_size, args.hidden_size))
+            else:
+                tensor_shapes.append((args.micro_batch_size, args.seq_length, args.hidden_size))
+        else:
+            tensor_shapes.append((args.decoder_seq_length, args.micro_batch_size, args.hidden_size))
+            tensor_shapes.append((args.micro_batch_size, args.seq_length, args.hidden_size))
+    else:
+        tensor_shapes.append((args.seq_length, args.micro_batch_size, args.hidden_size))
+    return tensor_shapes
+
+
+def recv_forward(tensor_shapes, timers):
+    input_tensors = []
+    for tensor_shape in tensor_shapes:
+        if tensor_shape is None:
+            input_tensors.append(None)
+        else:
+            input_tensors.append(p2p_communication.recv_forward(tensor_shape,
+                                                                timers=timers))
+    return input_tensors
+
+
+def recv_backward(tensor_shapes, timers):
+    output_tensor_grads = []
+    for tensor_shape in tensor_shapes:
+        if tensor_shape is None:
+            output_tensor_grads.append(None)
+        else:
+            output_tensor_grads.append(p2p_communication.recv_backward(tensor_shape,
+                                                                       timers=timers))
+    return output_tensor_grads
+
+
+def send_forward(output_tensors, tensor_shapes, timers):
+    if not isinstance(output_tensors, list):
+        output_tensors = [output_tensors]
+    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+        if tensor_shape is None:
+            continue
+        p2p_communication.send_forward(output_tensor, tensor_shape, timers=timers)
+
+
+def send_backward(input_tensor_grads, tensor_shapes, timers):
+    if not isinstance(input_tensor_grads, list):
+        input_tensor_grads = [input_tensor_grads]
+    for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
+        if tensor_shape is None:
+            continue
+        p2p_communication.send_backward(input_tensor_grad, tensor_shape, timers=timers)
+
+
+def send_forward_recv_backward(output_tensors, tensor_shapes, timers):
+    if not isinstance(output_tensors, list):
+        output_tensors = [output_tensors]
+    output_tensor_grads = []
+    for (output_tensor, tensor_shape) in zip(output_tensors, tensor_shapes):
+        if tensor_shape is None:
+            output_tensor_grads.append(None)
+            continue
+        output_tensor_grad = p2p_communication.send_forward_recv_backward(
+                output_tensor, tensor_shape, timers=timers)
+        output_tensor_grads.append(output_tensor_grad)
+    return output_tensor_grads
+
+
+def send_backward_recv_forward(input_tensor_grads, tensor_shapes, timers):
+    if not isinstance(input_tensor_grads, list):
+        input_tensor_grads = [input_tensor_grads]
+    input_tensors = []
+    for (input_tensor_grad, tensor_shape) in zip(input_tensor_grads, tensor_shapes):
+        if tensor_shape is None:
+            input_tensors.append(None)
+            continue
+        input_tensor = p2p_communication.send_backward_recv_forward(
+                input_tensor_grad, tensor_shape, timers=timers)
+        input_tensors.append(input_tensor)
+    return input_tensors
 
 
 def forward_backward_pipelining_without_interleaving(forward_step_func, data_iterator,
@@ -380,25 +537,37 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
     num_microbatches_remaining = \
         num_microbatches - num_warmup_microbatches
 
-    input_tensors = []
-    output_tensors = []
+    unwrapped_model = unwrap_model(
+        model, (torchDDP, LocalDDP, Float16Module))
+    model_type = unwrapped_model.model_type
+    rank = mpu.get_pipeline_model_parallel_rank()
+    recv_tensor_shapes = get_tensor_shapes(rank-1, model_type)
+    send_tensor_shapes = get_tensor_shapes(rank, model_type)
+
+    # Input, output tensors only need to be saved when doing backward passes
+    input_tensors = None
+    output_tensors = None
+    if not forward_only:
+        input_tensors = []
+        output_tensors = []
     losses_reduced = []
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
-        input_tensor = p2p_communication.recv_forward(timers)
+        input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
-        p2p_communication.send_forward(output_tensor, timers)
+        send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
+        if not forward_only:
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
-        input_tensor = p2p_communication.recv_forward(timers)
+        input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -407,22 +576,25 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
         if forward_only:
-            p2p_communication.send_forward(output_tensor, timers)
+            send_forward(output_tensor, send_tensor_shapes, timers=timers)
+
+            if not last_iteration:
+                input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
+
         else:
             output_tensor_grad = \
-                p2p_communication.send_forward_recv_backward(output_tensor,
-                                                             timers)
+                send_forward_recv_backward(output_tensor,
+                                           send_tensor_shapes,
+                                           timers=timers)
 
-        # Add input_tensor and output_tensor to end of list, then pop from the
-        # start of the list for backward pass.
-        input_tensors.append(input_tensor)
-        output_tensors.append(output_tensor)
+            # Add input_tensor and output_tensor to end of list.
+            input_tensors.append(input_tensor)
+            output_tensors.append(output_tensor)
 
-        if forward_only:
-            if not last_iteration:
-                input_tensor = p2p_communication.recv_forward(timers)
-        else:
-            input_tensor, output_tensor = input_tensors.pop(0), output_tensors.pop(0)
+            # Pop input_tensor and output_tensor from the start of the list for
+            # the backward pass.
+            input_tensor = input_tensors.pop(0)
+            output_tensor = output_tensors.pop(0)
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
@@ -430,11 +602,11 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
             if last_iteration:
                 input_tensor = None
-                p2p_communication.send_backward(input_tensor_grad, timers)
+                send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
             else:
                 input_tensor = \
-                    p2p_communication.send_backward_recv_forward(
-                        input_tensor_grad, timers)
+                    send_backward_recv_forward(
+                        input_tensor_grad, recv_tensor_shapes, timers=timers)
 
     # Run cooldown backward passes.
     if not forward_only:
@@ -442,12 +614,12 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
-            output_tensor_grad = p2p_communication.recv_backward(timers)
+            output_tensor_grad = recv_backward(send_tensor_shapes, timers=timers)
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
                               output_tensor_grad)
 
-            p2p_communication.send_backward(input_tensor_grad, timers)
+            send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 
     return losses_reduced

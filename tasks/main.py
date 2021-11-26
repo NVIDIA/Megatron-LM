@@ -140,11 +140,11 @@ if __name__ == '__main__':
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main
-    elif args.task == 'knwl-dialo-prompt':
+    elif args.task == 'KNWL-DIALO-PROMPT':
         from knwl_dialo.prompt import main
-    elif args.task in ['knwl-dialo-finetune', 'knwl-dialo-gen']:
+    elif args.task in ['KNWL-DIALO-FINETUNE', 'KNWL-DIALO-GEN']:
         from knwl_dialo.finetune import main
-    elif args.task == 'knwl-dialo-eval-f1':
+    elif args.task == 'KNWL-DIALO-EVAL-F1':
         from knwl_dialo.evaluate import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(

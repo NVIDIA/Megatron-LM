@@ -266,7 +266,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         super().__init__(name)
 
         if special_tokens is not None:
-            # for controllable dialog, special_tokens: "[SEP],[CTRL],[PAD]"
+            # special_tokens: "[SEP],[PAD]"
             special_tokens = special_tokens.split(",")
         else:
             special_tokens = []
@@ -277,8 +277,6 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         if special_tokens is not None and len(special_tokens) > 0:
             if "[SEP]" in special_tokens:
                 self.sep_id = self.tokenizer.special_tokens['[SEP]']
-            if "[CTRL]" in special_tokens:
-                self.ctrl_id = self.tokenizer.special_tokens['[CTRL]']
             if "[PAD]" in special_tokens:
                 self.pad_id = self.tokenizer.special_tokens['[PAD]']
 

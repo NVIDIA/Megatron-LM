@@ -59,10 +59,7 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
         model, (torchDDP, LocalDDP, Float16Module))
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor = model(tokens, position_ids, attention_mask,
-                          tokentype_ids=tokentype_ids,
-                          layer_past=layer_past,
-                          get_key_value=get_key_value,
-                          forward_method_parallel_output=forward_method_parallel_output)
+                          tokentype_ids=tokentype_ids)
 
     if get_key_value:
         output_tensor, layer_past = output_tensor

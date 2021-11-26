@@ -205,7 +205,7 @@ def main():
             args.task))
 
     # Set up model and load checkpoint.
-    model = get_model(get_model_provider(eval_metric))
+    model = get_model(get_model_provider(eval_metric), wrap_with_ddp=False)
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 

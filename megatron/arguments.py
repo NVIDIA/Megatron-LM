@@ -41,7 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
-    # parser = _add_dialog_ctrl_args(parser)
+    parser = _add_inference_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -81,6 +81,12 @@ def parse_args(extra_args_provider=None, defaults={},
                   args.world_size, args.data_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
+    if args.pipeline_model_parallel_size > 1:
+        if args.pipeline_model_parallel_split_rank is not None:
+            assert args.pipeline_model_parallel_split_rank < \
+                    args.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.pipeline_model_parallel_size)
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -92,6 +98,13 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+    if args.checkpoint_activations:
+        args.activations_checkpoint_method = 'uniform'
+        if args.rank == 0:
+            print('--checkpoint-activations is no longer valid, '
+                  'use --activation-checkpoint-method instead. '
+                  'Defaulting to activation-checkpoint-method=uniform.')
+    del args.checkpoint_activations
 
     # Set input defaults.
     for key in defaults:
@@ -149,11 +162,15 @@ def parse_args(extra_args_provider=None, defaults={},
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # If we do accumulation and all-reduces in fp32, we need to have
-    # local DDP and we should set the use-contiguous-buffers-in-ddp.
+    # If we do accumulation and all-reduces in fp32, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
-        args.use_contiguous_buffers_in_ddp = True
+        assert args.use_contiguous_buffers_in_local_ddp
+
+    # For torch DDP, we do not use contiguous buffer
+    if args.DDP_impl == 'torch':
+        args.use_contiguous_buffers_in_local_ddp = False
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -228,11 +245,29 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
+
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    # Persistent fused layer norm.
+    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+        args.no_persist_layer_norm = True
+        if args.rank == 0:
+            print('Persistent fused layer norm kernel is supported from '
+                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                  'Defaulting to no_persist_layer_norm=True')
+
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
-        assert args.checkpoint_activations, \
-            'for distribute-checkpointed-activations to work you '\
-            'need to enable checkpoint-activations'
+        assert args.tensor_model_parallel_size > 1, 'can distribute ' \
+            'checkpointed activations only across tensor model ' \
+            'parallel groups'
+        assert args.activations_checkpoint_method is not None, \
+            'for distributed checkpoint activations to work you '\
+            'need to use a activation-checkpoint method '
+        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+            'distributed checkpoint activations are supported for pytorch ' \
+            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
+            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
     _print_args(args)
     return args
@@ -257,6 +292,18 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _add_inference_args(parser):
+    group = parser.add_argument_group(title='inference')
+
+    group.add_argument('--inference-batch-times-seqlen-threshold',
+                       type=int, default=512,
+                       help='During inference, if batch-size times '
+                       'sequence-length is smaller than this threshold '
+                       'then we will not use pipelining, otherwise we will.')
+
+    return parser
+
+    
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -329,6 +376,12 @@ def _add_logging_args(parser):
                        action='store_true',
                        help='If set, write validation perplexity to '
                        'tensorboard.')
+    group.add_argument('--log-memory-to-tensorboard',
+                       action='store_true',
+                       help='Enable memory logging to tensorboard.')
+    group.add_argument('--log-world-size-to-tensorboard',
+                       action='store_true',
+                       help='Enable world size logging to tensorboard.')
 
     return parser
 
@@ -395,8 +448,20 @@ def _add_training_args(parser):
                        action='store_true',
                        help='If set, distribute checkpointed activations '
                        'across model parallel group.')
-    group.add_argument('--checkpoint-num-layers', type=int, default=1,
-                       help='chunk size (number of layers) for checkpointing.')
+    group.add_argument('--activations-checkpoint-method', type=str, default=None,
+                       choices=['uniform', 'block'],
+                       help='1) uniform: uniformly divide the total number of '
+                       'Transformer layers and checkpoint the input activation of '
+                       'each divided chunk, '
+                       '2) checkpoint the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any checkpointing'
+                       'default) do not apply activations checkpoint to any layers')
+    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
+                       help='1) uniform: the number of Transformer layers in each '
+                       'uniformly divided checkpoint unit, '
+                       '2) block: the number of individual Transformer layers '
+                       'to checkpoint within each pipeline stage.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -412,6 +477,9 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--exit-duration-in-mins', type=int, default=None,
                        help='Exit the program after this many minutes.')
+    group.add_argument('--exit-signal-handler', action='store_true',
+                       help='Dynamically save the checkpoint and shutdown the '
+                       'training if SIGTERM is received')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -431,6 +499,16 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--no-async-tensor-model-parallel-allreduce',
+                       action='store_true',
+                       help='Disable asynchronous execution of '
+                       'tensor-model-parallel all-reduce with weight '
+                       'gradient compuation of a column-linear layer.')
+    group.add_argument('--no-persist-layer-norm', action='store_true',
+                       help='Disable using persistent fused layer norm kernel. '
+                       'This kernel supports only a set of hidden sizes. Please '
+                       'check persist_ln_hidden_sizes if your hidden '
+                       'size is supported.')
     return parser
 
 
@@ -565,6 +643,9 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--pipeline-model-parallel-split-rank',
+                       type=int, default=None,
+                       help='Rank where encoder and decoder should be split.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
@@ -577,9 +658,10 @@ def _add_distributed_args(parser):
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
-    group.add_argument('--use-contiguous-buffers-in-ddp', action='store_true',
-                       help='If set, use contiguous buffer in DDP. Note that '
-                       'this option only works woth local DDP.' )
+    group.add_argument('--no-contiguous-buffers-in-local-ddp',
+                       action='store_false', help='If set, dont use '
+                       'contiguous buffer in local DDP.',
+                       dest='use_contiguous_buffers_in_local_ddp')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -594,6 +676,11 @@ def _add_distributed_args(parser):
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None, help='If set, affine parallel weights '
                        'initialization uses CPU' )
+    group.add_argument('--empty-unused-memory-level', default=0, type=int,
+                       choices=[0, 1, 2],
+                       help='Call torch.cuda.empty_cache() each iteration '
+                       '(training and eval), to reduce fragmentation.'
+                       '0=off, 1=moderate, 2=aggressive.')
     return parser
 
 
@@ -753,24 +840,3 @@ def _add_vit_args(parser):
                        help='patch dimension used in vit')
 
     return parser
-
-
-# def _add_dialog_ctrl_args(parser):
-#     group = parser.add_argument_group(title="dialog control")
-
-#     group.add_argument('--run-dialog', action='store_true',
-#                        help='run dialog modeling')
-#     group.add_argument('--num-epoch', type=int, default=30,
-#                        help='number of epoches to train the model')
-#     group.add_argument('--train-module', type=str, default="",
-#                        help='either control module or dialogue model (control or dialog)')
-#     group.add_argument('--data-folder', type=str, default="",
-#                        help='data folder (path of the data folder)')
-#     group.add_argument('--dataset-name', type=str, default="",
-#                        help='dataset name (e.g., wizard_of_wikipedia)')
-#     group.add_argument('--max-seq-len', type=int, default=1024,
-#                        help='maximum sequence length')
-#     group.add_argument('--spec-toks', type=str, default="[SEP],[CTRL],[PAD]",
-#                        help='additional special tokens')
-
-#     return parser

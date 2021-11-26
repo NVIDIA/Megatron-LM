@@ -35,4 +35,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --prompt-type knowledge \
         --num-prompt-examples 10 \
         --dynamic-prompt \
-        --task knwl-dialo-prompt 
+        --task KNWL-DIALO-PROMPT 

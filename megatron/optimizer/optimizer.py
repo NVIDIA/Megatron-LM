@@ -68,7 +68,9 @@ class MegatronOptimizer(ABC):
 
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
-                 params_have_main_grad):
+                 params_have_main_grad,
+                 use_contiguous_buffers_in_local_ddp):
+
         """Input optimizer is the base optimizer for example Adam."""
         self.optimizer = optimizer
         assert self.optimizer, 'no optimizer is provided.'
@@ -76,7 +78,11 @@ class MegatronOptimizer(ABC):
         self.clip_grad = clip_grad
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.params_have_main_grad = params_have_main_grad
+        self.use_contiguous_buffers_in_local_ddp = use_contiguous_buffers_in_local_ddp
 
+        if self.use_contiguous_buffers_in_local_ddp:
+            assert self.params_have_main_grad, \
+                "use of contiguous buffer requires that params have main grad"
 
     def get_parameters(self):
         params = []
@@ -173,7 +179,7 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
             field instead of the typical `grad` field. This happens
-            for the DDP cases where there is a contihuous buffer
+            for the DDP cases where there is a continuous buffer
             holding the gradients. For example for bfloat16, we want
             to do gradient accumulation and all-reduces in float32
             and as a result we store those gradients in the main_grad.
@@ -187,11 +193,12 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
     """
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
-                 params_have_main_grad, bf16, grad_scaler):
+                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+                 bf16, grad_scaler):
 
         super(Float16OptimizerWithFloat16Params, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad)
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
 
         self.bf16 = bf16
         self.grad_scaler = grad_scaler
@@ -282,8 +289,13 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
-                float16_groups & fp32_from_fp32_groups."""
+        float16_groups & fp32_from_fp32_groups. We additionally zero
+        fp32_from_float16_groups as a memory optimization to reduce
+        fragmentation; in the case of set_to_none==True, the space
+        used by this field can be safely deallocated at this point."""
         for group in self.float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+        for group in self.fp32_from_float16_groups:
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
@@ -300,17 +312,31 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         for model_group, main_group in zip(self.float16_groups,
                                            self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
-                if self.params_have_main_grad:
+                if self.params_have_main_grad and hasattr(model_param, 'main_grad'):
                     main_param.grad = model_param.main_grad.float()
                 else:
                     if model_param.grad is not None:
                         main_param.grad = model_param.grad.float()
+
+                # Safe to deallocate model's grad/main_grad after copying.
+                # (If using contiguous buffers, main_grad's memory should
+                # persist and therefore should not be deallocated.)
+                model_param.grad = None
+                if self.params_have_main_grad and \
+                   not self.use_contiguous_buffers_in_local_ddp:
+                    model_param.main_grad = None
+
         # For fp32 grads, we need to reset the grads to main grad.
         if self.params_have_main_grad:
             for model_group in self.fp32_from_fp32_groups:
                 for model_param in model_group:
                     model_param.grad = model_param.main_grad
 
+                    # Safe to de-reference model's main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    if not self.use_contiguous_buffers_in_local_ddp:
+                        model_param.main_grad = None
 
     def _unscale_main_grads_and_check_for_nan(self):
         main_grads = []
@@ -464,11 +490,12 @@ class FP32Optimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
-                 params_have_main_grad):
+                 params_have_main_grad,
+                 use_contiguous_buffers_in_local_ddp):
 
         super(FP32Optimizer, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad)
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
 
         self._scale = torch.cuda.FloatTensor([1.0])
 
@@ -494,6 +521,12 @@ class FP32Optimizer(MegatronOptimizer):
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
                     param.grad = param.main_grad
+
+                    # Safe to de-reference model's main_grad after copying.
+                    # (If using contiguous buffers, main_grad's memory should
+                    # persist and therefore should not be deallocated.)
+                    if not self.use_contiguous_buffers_in_local_ddp:
+                        param.main_grad = None
 
         # Clip gradients.
         grad_norm = None

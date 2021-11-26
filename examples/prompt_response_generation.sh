@@ -34,4 +34,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --prompt-file ${PROMPT_PATH} \
         --prompt-type response \
         --num-prompt-examples 20 \
-        --task knwl-dialo-prompt 
+        --task KNWL-DIALO-PROMPT 

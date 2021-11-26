@@ -14,20 +14,10 @@
 # limitations under the License.
 import torch
 
-from .package_info import (
-    __description__,
-    __contact_names__,
-    __url__,
-    __download_url__,
-    __keywords__,
-    __license__,
-    __package_name__,
-    __version__,
-)
-
 from .global_vars import get_args
 from .global_vars import get_current_global_batch_size
 from .global_vars import get_num_microbatches
+from .global_vars import get_signal_handler
 from .global_vars import update_num_microbatches
 from .global_vars import get_tokenizer
 from .global_vars import get_tensorboard_writer

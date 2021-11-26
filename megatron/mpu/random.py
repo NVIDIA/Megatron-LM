@@ -24,7 +24,6 @@ from torch import _C
 from torch.cuda import _lazy_call, device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
 
-from megatron import get_args
 from megatron.memory import allocate_mem_buff
 
 from .initialize import get_data_parallel_rank
@@ -35,37 +34,6 @@ from .initialize import get_tensor_model_parallel_world_size
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
-
-
-# Whether apply model parallelsim to checkpointed hidden states.
-_CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
-
-
-def init_checkpointed_activations_memory_buffer():
-    """Initializ the memory buffer for the checkpointed activations."""
-    args = get_args()
-
-    per_layer = args.micro_batch_size * args.max_position_embeddings * \
-                args.hidden_size // args.tensor_model_parallel_size
-    assert args.num_layers % args.checkpoint_num_layers == 0, \
-        'number of layers is not divisible by checkpoint-num-layers'
-    num_checkpointer_layers = args.num_layers // args.checkpoint_num_layers
-    numel = per_layer * num_checkpointer_layers
-    dtype = torch.half
-    if not args.fp16:
-        dtype = torch.float
-
-    global _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER
-    assert _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is None, \
-        'checkpointed activations memory buffer is already allocated.'
-    _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = allocate_mem_buff(
-        'checkpointed activations', numel, dtype, track_usage=False)
-
-
-def reset_checkpointed_activations_memory_buffer():
-    """Reset the memory used for checkpointing."""
-    if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
-        _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.reset()
 
 
 def _set_cuda_rng_state(new_state, device=-1):
@@ -101,14 +69,21 @@ def _set_cuda_rng_state(new_state, device=-1):
     _lazy_call(cb)
 
 
-def split_tensor_into_1d_equal_chunks(tensor):
+def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
     """Break a tensor into equal 1D chunks."""
-    data = tensor.view(-1)
-    partition_size = torch.numel(data) // get_tensor_model_parallel_world_size()
+    partition_size = torch.numel(tensor) // \
+        get_tensor_model_parallel_world_size()
     start_index = partition_size * get_tensor_model_parallel_rank()
     end_index = start_index + partition_size
-    return data[start_index:end_index]
-
+    if new_buffer:
+        data = torch.empty(partition_size, dtype=tensor.dtype,
+                           device=torch.cuda.current_device(),
+                           requires_grad=False)
+        data.copy_(tensor.view(-1)[start_index:end_index])
+    else:
+        data = tensor.view(-1)[start_index:end_index]
+    return data
+    
 
 def gather_split_1d_tensor(tensor):
     """Opposite of above function, gather values from model parallel ranks."""
@@ -250,8 +225,10 @@ class CheckpointFunction(torch.autograd.Function):
               tracked/set/reset.
     """
     @staticmethod
-    def forward(ctx, run_function, *args):
+    def forward(ctx, run_function, distribute_checkpointed_activations, *args):
         ctx.run_function = run_function
+        ctx.distribute_checkpointed_activations \
+            = distribute_checkpointed_activations
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -263,15 +240,13 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
-        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        if distribute_checkpointed_activations:
             ctx.input_0_shape = args[0].data.shape
-            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
-            args[0].data = _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER.add(
-                args[0].data)
+            args[0].data = split_tensor_into_1d_equal_chunks(args[0].data,
+                                                             new_buffer=True)
 
         # Store everything.
         ctx.save_for_backward(*args)
-
 
         return outputs
 
@@ -281,7 +256,7 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
         inputs = ctx.saved_tensors
-        if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
+        if ctx.distribute_checkpointed_activations:
             inputs[0].data = gather_split_1d_tensor(inputs[0].data)
             inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
 
@@ -310,10 +285,11 @@ class CheckpointFunction(torch.autograd.Function):
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
                       for inp in detached_inputs)
-        return (None,) + grads
+        return (None, None) + grads
 
 
-def checkpoint(function, *args):
+def checkpoint(function, distribute_checkpointed_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function, *args)
+    return CheckpointFunction.apply(function,
+                                    distribute_checkpointed_activations, *args)

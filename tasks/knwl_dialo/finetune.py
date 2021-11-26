@@ -200,7 +200,7 @@ def run_generation(model_provider):
 def main():
     args = get_args()
 
-    if "finetune" in args.task:
+    if "FINETUNE" in args.task:
         finetune(train_valid_datasets_provider, model_provider, \
                  forward_step=forward_step)
     else:

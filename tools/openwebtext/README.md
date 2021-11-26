@@ -20,7 +20,7 @@ python blacklist_urls.py <path to the dowloaded deduplicated URLs> <filename for
 
 4. Merge the contents into one loose json file with 1 json per newline of the format `{'text': text, 'url': unique_url}`. It is important for the url to be unique.
 
-# Prepare the data for GPT-2 training:
+# Prepare the data for GPT training:
 
 1. Perform ftfy, english detection and remove documents with less than 128 tokens. This step can be sharded and run on shards.
 ```
@@ -50,7 +50,7 @@ shuf <cleaned deduped data file> -o train_data.json
 To deduplicate the downstream tasks (e.g. lambada, squad) from the training dataset, we run the following command.
 
 ```
-python filter_ngrams.py --tasks <name of he task, e.g. lambada, squad> --dedup-dataset <training dataset to deduplicate> <json key> --output <output training dataset>
+python filter_ngrams.py --tasks <name of the task, e.g. lambada, squad> --dedup-dataset <training dataset to deduplicate> <json key> --output <output training dataset>
 ```
 We use 13-grams by default for the deduplication. When we find a 13-gram match in a training document, we split the document into two pieces and remove the 13-gram along with 200 characters from the both side of the 13-gram. We also remove any splitted document with less than 200 characters or if a document got splitted more than 10 times. These parameters can be changed using corresponding arguments.
 
