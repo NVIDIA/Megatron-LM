@@ -18,7 +18,6 @@ We present the steps to run our multi-stage dialogue prompting (MSDP), as well a
 2. The script ```tasks/knwl_dialo/scripts/prompt_resp_gen.sh``` provides an example for how to perform the response generation prompting.
 3. The automatic evaluations are the same as mentioned aboved for the knowledge generation.
 
-
 ## FKG
 
 ### Knowledge Generation
