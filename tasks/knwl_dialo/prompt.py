@@ -104,7 +104,10 @@ def generate_samples_by_prompting_input_from_file(model):
                 if args.prompt_type == "knowledge":
                     turns = splits[1].split(" [SEP] ")
                     context = turns[-1]
-                    raw_text += "( " + context + " ) " + topic + " =>"
+                    if " -> " in raw_text:
+                        raw_text += "( " + context + " ) " + topic + " ->"
+                    else:
+                        raw_text += "( " + context + " ) " + topic + " =>"
                 
                 else:
                     # args.prompt_type == "response":
