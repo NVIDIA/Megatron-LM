@@ -457,6 +457,11 @@ def _add_training_args(parser):
                        help='The capacity of the MoE expert at eval time.')
     group.add_argument('--moe-min-capacity', type=int, default=4,
                        help='The minimum capacity per MoE expert regardless of the capacity_factor.')
+    group.add_argument('--moe-loss-coeff', type=float, default=0.1,
+                       help='Scaling coefficient for adding MoE loss to model loss')
+    group.add_argument('--create-moe-param-group', action='store_true',
+                       help='Create separate groups for MoE params.'
+                       'This is necessary for techniques like ZeRO.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -518,6 +523,9 @@ def _add_learning_rate_args(parser):
                        'learning rate over.')
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
+                       'learning rate over.')
+    group.add_argument('--lr-warmup-tokens', type=int, default=None,
+                       help='number of tokens to linearly warmup '
                        'learning rate over.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
@@ -610,6 +618,8 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--moe-expert-parallel-size', type=int, default=1,
+                       help='Degree of the MoE expert parallelism.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')

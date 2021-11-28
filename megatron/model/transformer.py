@@ -550,7 +550,7 @@ class ParallelTransformerLayer(MegatronModule):
         if get_key_value:
             output = [output, presents]
 
-        return output
+        return output, moe_loss
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
     """Extends ParallelTransformerLayer to forward attention_mask through the pipeline.
@@ -671,22 +671,26 @@ class ParallelTransformer(MegatronModule):
                 attention_mask = inputs[1]
                 encoder_output = inputs[2]
                 enc_dec_attn_mask = inputs[3]
+                moe_losses = []
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_ = layer(x_, attention_mask, encoder_output, enc_dec_attn_mask)
-                return x_
+                    x_, moe_loss = layer(x_, attention_mask, encoder_output, enc_dec_attn_mask)
+                    moe_losses.append(moe_loss)
+                return (x_, *moe_losses)
             return custom_forward
 
+        moe_losses = []
         # Make sure memory is freed.
         mpu.reset_checkpointed_activations_memory_buffer()
         l = 0
         while l < self.num_layers:
-            hidden_states = mpu.checkpoint(
+            hidden_states, *local_moe_losses = mpu.checkpoint(
                 custom(l, l + self.checkpoint_num_layers),
                 hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+            moe_losses.extend(local_moe_losses)
             l += self.checkpoint_num_layers
 
-        return hidden_states
+        return hidden_states, moe_losses
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -727,9 +731,9 @@ class ParallelTransformer(MegatronModule):
 
             if encoder_output is not None:
                  encoder_output = encoder_output.transpose(0, 1).contiguous()
-
+        moe_losses = []
         if self.checkpoint_activations:
-            hidden_states = self._checkpointed_forward(hidden_states,
+            hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                        attention_mask,
                                                        encoder_output,
                                                        enc_dec_attn_mask)
@@ -741,12 +745,13 @@ class ParallelTransformer(MegatronModule):
                 past = None
                 if layer_past is not None:
                     past = layer_past[index]
-                hidden_states = layer(hidden_states,
+                hidden_states, moe_loss = layer(hidden_states,
                                       attention_mask,
                                       encoder_output=encoder_output,
                                       enc_dec_attn_mask=enc_dec_attn_mask,
                                       layer_past=past,
                                       get_key_value=get_key_value)
+                moe_losses.append(moe_loss)
                 if get_key_value:
                     hidden_states, present = hidden_states
                     presents.append(present)
@@ -761,4 +766,4 @@ class ParallelTransformer(MegatronModule):
         if get_key_value:
             output = [output, presents]
 
-        return output
+        return (output, *moe_losses)
