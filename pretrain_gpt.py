@@ -154,10 +154,11 @@ def loss_func(loss_mask, moe_loss, output_tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-    loss = loss + moe_loss
-
+    
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
+
+    loss = loss + moe_loss
 
     return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
 
