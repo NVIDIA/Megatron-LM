@@ -151,16 +151,18 @@ def get_batch_pipe(data):
 
 
 def loss_func(loss_mask, moe_loss, output_tensor):
+    args = get_args()
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    loss = loss + moe_loss
-
-    return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
+    if args.num_experts <= 1:
+        return loss, {'lm loss': averaged_loss[0]}
+    else:
+        loss = loss + moe_loss
+        return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
 
 
 def forward_step(data_iterator, model):

@@ -227,7 +227,8 @@ def _initialize_distributed():
                                           args.pipeline_model_parallel_size,
                                           args.virtual_pipeline_model_parallel_size)
 
-    if args.deepspeed:
+    # currently MoE model does not support pipeline parallel
+    if args.deepspeed and args.no_pipeline_parallel:
         groups.initialize(args.moe_expert_parallel_size, mpu)
     if args.deepspeed and args.deepspeed_activation_checkpointing:
         setup_deepspeed_random_and_activation_checkpointing(args)
