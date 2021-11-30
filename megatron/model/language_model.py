@@ -15,6 +15,7 @@
 
 """Transformer based language model."""
 
+from json import encoder
 import torch
 import torch.nn.functional as F
 
@@ -386,12 +387,13 @@ class TransformerLanguageModel(MegatronModule):
 
         # encoder.
         if enc_hidden_states is None:
-            encoder_output = self.encoder(encoder_input,
+            encoder_output, *moe_losses = self.encoder(encoder_input,
                                           enc_attn_mask,
                                           layer_past=layer_past,
                                           get_key_value=get_key_value)
         else:
             encoder_output = enc_hidden_states.to(encoder_input.dtype)
+            moe_losses = []
 
         if self.post_process:
             if self.add_pooler:
@@ -403,15 +405,15 @@ class TransformerLanguageModel(MegatronModule):
         # similarity between two sequences by average pooling
         if not self.add_decoder or output_enc_hidden:
             if self.add_pooler and self.post_process:
-                return encoder_output, pooled_output
+                return encoder_output, pooled_output, *moe_losses
             else:
-                return encoder_output
+                return encoder_output, *moe_losses
 
         # Decoder Embedding
         dec_embedding_output = self.embedding(dec_input_ids,
                                               dec_position_ids)
         # decoder
-        decoder_output = self.decoder(dec_embedding_output,
+        decoder_output, *moe_losses = self.decoder(dec_embedding_output,
                                       dec_attn_mask,
                                       layer_past=layer_past,
                                       get_key_value=get_key_value,
@@ -419,22 +421,30 @@ class TransformerLanguageModel(MegatronModule):
                                       enc_dec_attn_mask=enc_dec_attn_mask)
 
         if self.add_pooler and self.post_process:
-            return decoder_output, encoder_output, pooled_output
+            return decoder_output, encoder_output, pooled_output, *moe_losses
         else:
-            return decoder_output, encoder_output
+            return decoder_output, encoder_output, *moe_losses
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
         """For easy load."""
 
         state_dict_ = {}
+        moe_state_dict = {}
         if self.pre_process:
             state_dict_[self._embedding_key] \
                 = self.embedding.state_dict_for_save_checkpoint(
                     destination, prefix, keep_vars)
-        state_dict_[self._encoder_key] \
-            = self.encoder.state_dict_for_save_checkpoint(
+        encoder_state_dict = self.encoder.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
+        # MoE states need to be handled separately by DeepSpeed engine, thus
+        # moving them to the top level dictionary
+        # If components other than encoder may contain MoE states, need to add
+        # the same logic
+        for key in list(encoder_state_dict.keys()):
+            if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                moe_state_dict[self._encoder_key+key] = encoder_state_dict.pop(key)
+        state_dict_[self._encoder_key] = encoder_state_dict
         if self.post_process:
             if self.add_pooler:
                 state_dict_[self._pooler_key] \
@@ -444,7 +454,7 @@ class TransformerLanguageModel(MegatronModule):
             state_dict_[self._decoder_key] \
                 = self.decoder.state_dict_for_save_checkpoint(
                     destination, prefix, keep_vars)
-
+        state_dict_["moe_state_dict"] = moe_state_dict
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
@@ -476,15 +486,27 @@ class TransformerLanguageModel(MegatronModule):
                     state_dict_[key.split('transformer.')[1]] = state_dict[key]
 
         # for backward compatibility.
+        # Somehow this backward compatibility could be wrong: sometimes
+        # '.attention.' is the actual key used so should not be replaced. Thus
+        # added another logic to only replace if the key does not match
         state_dict_self_attention = {}
+        encoder_state_dict_keys = list(self.encoder.state_dict().keys())
         for key in state_dict_.keys():
-            if '.attention.' in key:
+            if '.attention.' in key and key not in encoder_state_dict_keys:
                 state_dict_self_attention[key.replace(".attention.",
                     ".self_attention.")] = state_dict_[key]
             else:
                 state_dict_self_attention[key] = state_dict_[key]
         state_dict_ = state_dict_self_attention
 
+        # Gather encoder MoE states
+        if "moe_state_dict" in state_dict:
+            for key in list(state_dict["moe_state_dict"].keys()):
+                if self._encoder_key in key:
+                    actual_key = key[len(self._encoder_key):]
+                    state_dict_[actual_key] = state_dict["moe_state_dict"].pop(key)
+            if len(state_dict["moe_state_dict"]) == 0:
+                del state_dict["moe_state_dict"]
         self.encoder.load_state_dict(state_dict_, strict=strict)
 
         if self.post_process:

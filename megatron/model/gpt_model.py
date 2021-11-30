@@ -116,7 +116,7 @@ class GPTModel(MegatronModule):
                 # If got a None input, need to reset curriculum_seqlen on user side
                 args.curriculum_seqlen = args.seq_length
 
-        lm_output = self.language_model(
+        lm_output, *moe_losses = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -130,17 +130,23 @@ class GPTModel(MegatronModule):
                 get_key_value,
                 self.parallel_output,
                 forward_method_parallel_output,
-                self.fp16_lm_cross_entropy)
+                self.fp16_lm_cross_entropy), *moe_losses
         else:
-            return lm_output
+            return lm_output, *moe_losses
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):
 
         state_dict_ = {}
-        state_dict_[self._language_model_key] \
-            = self.language_model.state_dict_for_save_checkpoint(
+        language_model_state_dict = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
+        # MoE states need to be handled separately by DeepSpeed engine, thus
+        # moving them to the top level dictionary
+        if "moe_state_dict" in language_model_state_dict:
+            for key in list(language_model_state_dict["moe_state_dict"].keys()):
+                state_dict_[key] = language_model_state_dict["moe_state_dict"].pop(key)
+            del language_model_state_dict["moe_state_dict"]
+        state_dict_[self._language_model_key] = language_model_state_dict
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
@@ -154,8 +160,15 @@ class GPTModel(MegatronModule):
         if self.post_process and not self.pre_process:
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
+        # Gather MoE states and move under language model
+        moe_state_dict = {}
+        for key in list(state_dict.keys()):
+            if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                moe_state_dict[key] = state_dict.pop(key)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
+        if len(moe_state_dict) > 0:
+            state_dict["moe_state_dict"] = moe_state_dict
         self.language_model.load_state_dict(state_dict, strict=strict)
 
 

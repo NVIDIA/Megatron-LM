@@ -844,7 +844,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             else:
                 forward_backward_func = forward_backward_no_pipelining
             
-            if args.deepspeed:
+            if args.deepspeed and args.ds_pipeline_enabled:
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
                 loss = model[0].eval_batch(data_iterator)
@@ -858,8 +858,9 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
-                        total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                        if 'moe' not in key:
+                            total_loss_dict[key] = total_loss_dict.get(
+                                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
