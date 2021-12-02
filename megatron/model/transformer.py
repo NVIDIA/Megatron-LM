@@ -95,6 +95,49 @@ class ParallelMLP(MegatronModule):
         return output, output_bias
 
 
+class SwitchMLP(MegatronModule):
+    """
+    Routes input to one of N MLP "experts"
+    """
+    def __init__(self, init_method, output_layer_init_method, num_experts):
+        super(SwitchMLP, self).__init__()
+        args = get_args()
+        self.router = torch.nn.Linear(args.hidden_size, num_experts)
+        self.experts = torch.nn.ModuleList()
+        for i in range(num_experts):
+            self.experts.append(ParallelMLP(init_method, output_layer_init_method))
+         
+    def forward(self, hidden_states):
+        # hidden_states: [b, s, h]
+        b = hidden_states.size(0)
+        s = hidden_states.size(1)
+        h = hidden_states.size(2)
+        route = self.router(hidden_states)
+        route = torch.nn.functional.softmax(route,dim=2)
+        max_prob, max_ind = torch.max(route, dim=2)
+        max_prob = torch.unsqueeze(max_prob, 2)
+        
+        hidden_states = hidden_states.permute(2,0,1).view(hidden_states.size(2), -1).permute(1,0).unsqueeze(1)
+        max_prob = max_prob.permute(2,0,1).view(max_prob.size(2), -1).permute(1,0).unsqueeze(1)
+        max_ind = max_ind.view(-1)
+
+        output_total = torch.empty_like(hidden_states)
+        output_bias_total = torch.empty_like(hidden_states)
+        for expert_num, expert in enumerate(self.experts):
+            ind = (max_ind==expert_num).nonzero().unsqueeze(2).repeat(1,1, h)
+            hidden = torch.gather(hidden_states, 0, ind)
+            output, output_bias = expert(hidden)
+            output_bias = output_bias.expand_as(output)
+            output_total.scatter_(0, ind, output) 
+            output_bias_total.scatter_(0, ind, output_bias) 
+        
+        output_total = output_total*max_prob
+        output_bias_total = output_bias_total*max_prob
+        output_total = output_total.permute(2,0,1).view(h, b, s).permute(1,2,0)
+        output_bias_total = output_bias_total.permute(2,0,1).view(h, b, s).permute(1,2,0)
+
+        return output_total, output_bias_total
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -455,8 +498,7 @@ class ParallelTransformerLayer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        self.mlp = ParallelMLP(init_method,
-                               output_layer_init_method)
+        self.mlp = SwitchMLP(init_method, output_layer_init_method, ${NUMEXPERTS})
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
@@ -531,7 +573,7 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_output
         else:
             residual = layernorm_input
-
+        
         # re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
             output = bias_dropout_add_func(
