@@ -1,16 +1,1 @@
 __pycache__
-
-# Distribution / packaging
-build/
-dist/
-*.egg-info/
-tensorboard
-commands/
-commands_new/
-commands_others/
-commands_final/
-*.log
-logs
-*.so
-*.out
-dialogctrl/
