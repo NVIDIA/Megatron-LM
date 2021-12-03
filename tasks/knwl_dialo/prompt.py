@@ -1,4 +1,6 @@
 
+"""Prompting the pretrained language model to generate knowledge/response"""
+
 import json
 import torch
 from nltk import word_tokenize
@@ -27,7 +29,9 @@ def model_provider(pre_process=True, post_process=True):
 
 
 def generate_samples_by_prompting_input_from_file(model):
-
+    """Prompt a pretrained language model to generate knowledge/response"""
+    
+    # get tokenizer
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -56,18 +60,18 @@ def generate_samples_by_prompting_input_from_file(model):
                 line = line.strip()
                 line_dict = json.loads(line)
                 key = list(line_dict.keys())[0]
-                
+
+                # get the prompt examples based on the key
                 if key not in prompt_examples_dict:
                     prompt_examples = line_dict[key]
-
                     prompt = ""
                     for instance in prompt_examples:
                         instance = instance.strip()
                         prompt += instance + " \n"
-
                     prompt_examples_dict[key] = prompt
 
     else:
+        # prompts are fixed for all test samples
         with open(args.prompt_file, "r") as f:
             prompt_examples = f.readlines()
             prompt_examples = prompt_examples[:args.num_prompt_examples]
@@ -77,13 +81,14 @@ def generate_samples_by_prompting_input_from_file(model):
                 instance = instance.strip()
                 prompt += instance + " \n"
 
+    # only two prompt types (i.e., knowledge and response) are allowed
     assert args.prompt_type in ["knowledge", "response"]
     context_count = 0
     model.eval()
+    # perform prompting
     with torch.no_grad():
         while True:
             raw_text_len = 0
-
             if mpu.is_pipeline_first_stage() \
                and mpu.get_tensor_model_parallel_rank() == 0:
                 input_str = all_raw_text[input_pos]
@@ -92,16 +97,17 @@ def generate_samples_by_prompting_input_from_file(model):
                 control_codes = splits[0].split(" [CTRL] ")
                 topic = control_codes[0]
 
+                # first add the prompt into the inputs
                 if args.dynamic_prompt:
                     turns = splits[1].split(" [SEP] ")
                     last_turn = turns[-1]
                     key = topic + " " + last_turn
                     raw_text = prompt_examples_dict[key]
-
                 else:
                     raw_text = prompt
 
                 if args.prompt_type == "knowledge":
+                    # construct inputs for knowledge generation
                     turns = splits[1].split(" [SEP] ")
                     context = turns[-1]
                     if " -> " in raw_text and " => " not in raw_text:
@@ -110,11 +116,11 @@ def generate_samples_by_prompting_input_from_file(model):
                         raw_text += "( " + context + " ) " + topic + " =>"
                 
                 else:
-                    # args.prompt_type == "response":
+                    # construct inputs for response generation
+                    # args.prompt_type == "response"
                     turns = splits[1].split(" [SEP] ")
                     knowledge = splits[2]
                     knowledge = " ".join(word_tokenize(knowledge))
-
                     last_turn = turns[-1]
                     knowledge = knowledge.strip()
                     last_turn = last_turn.strip()
@@ -137,9 +143,9 @@ def generate_samples_by_prompting_input_from_file(model):
             for _, decode_tokens in enumerate(token_stream):
                 pass
             
+            # write the generated output to the output file
             if mpu.get_tensor_model_parallel_rank() == 0:
                 if mpu.is_pipeline_first_stage():
-
                     decode_tokens, _ = decode_tokens
                     decode_tokens = decode_tokens[0].cpu().numpy().tolist()
                     trim_decode_tokens = tokenizer.detokenize(
@@ -147,13 +153,11 @@ def generate_samples_by_prompting_input_from_file(model):
                     
                     generated_output = trim_decode_tokens.split("\n")[0]
                     generated_output = generated_output.strip()
-
                     fname_out.write(generated_output)
                     fname_out.write("\n")
 
             raw_text = None
             context_count += 1
-
             if input_pos == input_count:
                 return
 
@@ -174,4 +178,5 @@ def main():
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
+    # perform the prompting
     generate_samples_by_prompting_input_from_file(model)

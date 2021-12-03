@@ -1,5 +1,5 @@
 
-"""Dialogue Finetuning"""
+"""Finetuning a pretrained language model for knowledge/response generation"""
 
 import torch
 from functools import partial
@@ -42,7 +42,7 @@ def train_valid_datasets_provider():
         train_data_path=args.train_data_path,
         valid_data_path=args.test_data_path,
         module=args.module,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=args.seq_length,
         seed=args.seed)
         
     print_rank_0("> finished creating datasets for %s module ..." % args.module)
@@ -135,30 +135,30 @@ def generate_samples_input_from_file(model):
 
     context_count = 0
     model.eval()
+    # start the generation process
     with torch.no_grad():
         while True:
             raw_text_len = 0
-
             if mpu.is_pipeline_first_stage() \
                and mpu.get_tensor_model_parallel_rank() == 0:
                 raw_text = all_raw_text[input_pos]
                 input_pos += 1
                 raw_text_len = len(raw_text)
                 context_tokens = tokenizer.tokenize(raw_text)
-            
             else:
                 context_tokens = tokenizer.tokenize("EMPTY TEXT")
 
             if input_pos % 100 == 0:
                 print_rank_0("input_pos: %d" % input_pos)
 
+            # get the generation outputs
             token_stream = get_token_stream(model, [context_tokens])
             for _, decode_tokens in enumerate(token_stream):
                 pass
 
+            # write the generation to the output file
             if mpu.get_tensor_model_parallel_rank() == 0:
                 if mpu.is_pipeline_first_stage():
-
                     decode_tokens, _ = decode_tokens
                     decode_tokens = decode_tokens[0].cpu().numpy().tolist()
                     trim_decode_tokens = tokenizer.detokenize(
@@ -194,6 +194,7 @@ def run_generation(model_provider):
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
+    # run generation
     generate_samples_input_from_file(model)
 
 
@@ -201,6 +202,7 @@ def main():
     args = get_args()
 
     if "FINETUNE" in args.task:
+        # finetune
         finetune(train_valid_datasets_provider, model_provider, \
                  forward_step=forward_step)
     else:

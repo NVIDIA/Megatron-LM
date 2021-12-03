@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# Data preparation for our framework: preprocessing the WoW and WoI datasets
+# The datasets can be downloaded through the following links:
+# WoW: https://parl.ai/projects/wizard_of_wikipedia/
+# WoI: https://parl.ai/projects/sea/
+
 DIR=`pwd`
 mkdir -p $DIR/tasks/knwl_dialo/data
 
@@ -8,6 +13,9 @@ python ${DIR}/tasks/knwl_dialo/preprocessing.py --func process_wow_dataset --inp
 
 # We provide the following script to process the raw data from Wizard of Internet
 python ${DIR}/tasks/knwl_dialo/preprocessing.py --func process_woi_dataset --input_file <PATH_OF_THE_INPUT_DATA> --output_file <PATH_OF_THE_OUTPUT_DATA>
+
+# Obtain the knowledge generation prompts and response generation prompts
+python ${DIR}/tasks/knwl_dialo/preprocessing.py --func get_prompts --test_file <PATH_OF_THE_PROCESSED_TEST_DATA> --train_file <PATH_OF_THE_PROCESSED_TRAIN_DATA> --model_file <PATH_OF_THE_DPR_MODEL> --output_file <PATH_OF_THE_OUTPUT_FILE>
 
 # Alternatively, we recommend you to directly download the already processed file through:
 wget --no-check-certificate 'https://docs.google.com/uc?export=download&id=1vP0eGxhkbWfeJ2dUUOEAflbOZq-Jlde_' -O data.gz

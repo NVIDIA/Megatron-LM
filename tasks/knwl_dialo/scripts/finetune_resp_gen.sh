@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Finetune a pretrained language model to generate the corresponding response
+# The input is the dialogue context and knowledge, and the output is the response
+# The size of the pretrained language model is 357M
+
 WORLD_SIZE=8
 
 DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
@@ -16,8 +20,6 @@ TRAIN_PATH=<Specify path for the training dataset>
 TEST_PATH=<Specify path for the test dataset>
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
-        --tensor-model-parallel-size 1 \
-        --pipeline-model-parallel-size 1 \
         --num-layers 24 \
         --hidden-size 1024 \
         --num-attention-heads 16 \
@@ -31,17 +33,13 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --lr 1.0e-5 \
         --min-lr 5.0e-6 \
         --lr-decay-style cosine \
-        --log-interval 100 \
         --vocab-file ${VOCAB_PATH} \
         --merge-file ${MERGE_PATH} \
         --save-interval 10000 \
         --save ${OUTPUT_MODEL_PATH} \
         --pretrained-checkpoint ${CHECKPOINT_PATH} \
-        --clip-grad 1.0 \
         --weight-decay 0.1 \
-        --adam-beta1 0.9 \
         --adam-beta2 0.95 \
-        --init-method-std 0.02 \
         --log-params-norm \
         --log-num-zeros-in-grad \
         --fp16 \
@@ -51,7 +49,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --task KNWL-DIALO-FINETUNE \
         --module response \
         --spec-toks [SEP],[CTRL],[PAD] \
-        --train-data-path ${TRAIN_PATH} \
-        --test-data-path ${TEST_PATH} \
-        --max-seq-len 1024 \
+        --train-data ${TRAIN_PATH} \
+        --test-data ${TEST_PATH} \
         --tokenizer-type GPT2BPETokenizer

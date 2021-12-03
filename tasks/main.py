@@ -85,8 +85,6 @@ def get_tasks_args(parser):
                         ' take from each question pool')
 
     # parameters for the knowledgeable dialogue generation
-    group.add_argument("--out-seq-length", type=int, default=1024,
-                       help='Size of the output generated text.')
     group.add_argument("--sample-input-file", type=str, default=None,
                        help='Get input from file instead of interactive mode, '
                        'each line is an input.')
@@ -102,20 +100,12 @@ def get_tasks_args(parser):
                        help='using different prompts for different test samples')
     group.add_argument('--module', type=str, default="",
                        help='either knowledge generation (knowledge) or response generation (response)')
-    group.add_argument('--train-data-path', type=str, default="",
-                       help='datapath for training set')
-    group.add_argument('--test-data-path', type=str, default="",
-                       help='datapath for test set')
     group.add_argument('--guess-file', type=str, default="",
                        help='datapath for generated sentences')
     group.add_argument('--answer-file', type=str, default="",
                        help='datapath for golden sentences')
-    group.add_argument('--max-seq-len', type=int, default=1024,
-                       help='maximum sequence length')
     group.add_argument('--spec-toks', type=str, default=None,
                        help='additional special tokens')
-    group.add_argument('--eval-prompting', action='store_true', 
-                       help='Whether to evaluate prompting')
 
     return parser
 

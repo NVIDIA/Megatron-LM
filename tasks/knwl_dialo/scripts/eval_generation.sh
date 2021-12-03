@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# This script is used to evaluate the F1 or KF1 scores.
+
 WORLD_SIZE=1
 
 DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \

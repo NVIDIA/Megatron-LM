@@ -1,4 +1,6 @@
 
+"""Model evaluation"""
+
 from megatron import get_args
 from megatron import get_timers
 from megatron import print_rank_0
@@ -17,27 +19,28 @@ from tasks.knwl_dialo.metrics import F1Metric
 from tqdm import tqdm
 
 def test_dataset_provider():
-    """Build the test dataset for dialog/control module"""
+    """Build the test dataset"""
     args = get_args()
     print_rank_0('> building the test dataset for %s module ...' \
-                    % args.train_module)
+                    % args.module)
 
-    if args.eval_prompting:
+    if args.prompt_type != "":
         print_rank_0('> evaluating ppl for prompting')
         test_ds = build_test_dataset_for_prompting(
             test_data_path=args.test_data_path,
             prompt_file=args.prompt_file,
-            train_module=args.train_module,
-            max_seq_len=args.max_seq_len,
+            module=args.module,
+            max_seq_len=args.seq_length,
             num_prompt_examples=args.num_prompt_examples,
             three_turns=args.three_turns,
             dynamic_prompt=args.dynamic_prompt)
 
     else:
+        print_rank_0('> evaluating ppl for finetuning')
         test_ds = build_test_dataset(
             test_data_path=args.test_data_path,
-            train_module=args.train_module,
-            max_seq_len=args.max_seq_len,
+            module=args.module,
+            max_seq_len=args.seq_length,
             last_turn=args.last_turn,
             no_control_code=args.no_control_code,
             add_separator=args.add_separator,
@@ -45,7 +48,7 @@ def test_dataset_provider():
             remove_ctrl_sent=args.remove_ctrl_sent)
 
     print_rank_0("> finished creating the test dataset for %s module ..." \
-                    % args.train_module)
+                    % args.module)
 
     print_rank_0('> test set size: %d' % len(test_ds))
     args.eval_iters = len(test_ds) // args.global_batch_size
@@ -68,6 +71,7 @@ def _build_test_iterator(test_dataset, task_collate_fn=None):
 
 
 def evaluate_ppl(test_dataset_provider, model_provider, forward_step):
+    """Evaluating perplexity"""
     args = get_args()
     timers = get_timers()
 
@@ -110,6 +114,7 @@ def evaluate_ppl(test_dataset_provider, model_provider, forward_step):
 
 
 def evaluate_f1(guess_file, answer_file):
+    """Evaluating F1 Score"""
 
     guess_list = []
     print_rank_0('reading %s' % guess_file)
