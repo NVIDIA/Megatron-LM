@@ -142,6 +142,9 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
         tokens = context_tokens
         if maxlen is None:
             maxlen = args.seq_length - 1
+            if maxlen > (org_context_length + args.out_seq_length):
+                maxlen = org_context_length + args.out_seq_length
+
         lengths = torch.ones([batch_size]).long().cuda() * maxlen
 
         # start the generation process

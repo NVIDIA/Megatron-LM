@@ -10,14 +10,10 @@ from collections import Counter
 from typing import List
 import numpy as np
 import re
-from nltk.corpus import stopwords
 
 re_art = re.compile(r'\b(a|an|the)\b')
 re_punc = re.compile(r'[!"#$%&()*+,-./:;<=>?@\[\]\\^`{|}~_\']')
 
-stopword_list = stopwords.words('english')
-stopword_list = stopword_list + ["n's", "'s"]
-stopword_dict = {token: True for token in stopword_list}
 
 def normalize_answer(s):
     """
@@ -29,13 +25,6 @@ def normalize_answer(s):
     s = ' '.join(s.split())
     return s
 
-def remove_stopwords(token_list):
-    new_list = []
-    for token in token_list:
-        if token in stopword_dict:
-            continue
-        new_list.append(token)
-    return new_list
 
 class F1Metric:
     """

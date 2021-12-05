@@ -120,8 +120,9 @@ def generate_samples_by_prompting_input_from_file(model):
                     # args.prompt_type == "response"
                     turns = splits[1].split(" [SEP] ")
                     knowledge = splits[2]
-                    knowledge = " ".join(word_tokenize(knowledge))
                     last_turn = turns[-1]
+                    last_turn = " ".join(word_tokenize(last_turn))
+                    knowledge = " ".join(word_tokenize(knowledge))
                     knowledge = knowledge.strip()
                     last_turn = last_turn.strip()
                     raw_text += "Topic: " + topic + ". "
