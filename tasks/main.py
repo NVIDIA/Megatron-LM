@@ -106,6 +106,8 @@ def get_tasks_args(parser):
                        help='datapath for golden sentences')
     group.add_argument('--spec-toks', type=str, default=None,
                        help='additional special tokens')
+    group.add_argument('--out-seq-length', type=int, default=100,
+                       help='output sequence length')
 
     return parser
 
