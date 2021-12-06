@@ -46,6 +46,7 @@ def process_wow_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
       topic \t dialogue context \t golden knowledge \t golden response
     """
 
+    # loading the raw data
     print("> Loading data from %s" % raw_file)
     with open(raw_file, "r") as fr:
         dialog_data = json.load(fr)
@@ -56,18 +57,20 @@ def process_wow_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
     fresp = open(resp_ref_file, "w") if resp_ref_file else None
     
     for i, sample in enumerate(tqdm(dialog_data)):
-        # get all the dialog data for a single sample
+        # get all the dialog data for a single dialog sample
         dialog = sample["dialog"]
         
-        context = []
+        turn_list = []  # collect the dialog history
+        # processing for each single dialog sample
         for j, turn in enumerate(dialog):
+            # text of each turn
             text = turn["text"]
             if not (text.endswith("?") or text.endswith(".") or text.endswith("!")):
                 text = text + "."
             
             if j == 0:
                 # first turn
-                context.append(text)
+                turn_list.append(text)
                 continue
 
             speaker = turn["speaker"].lower()
@@ -94,10 +97,14 @@ def process_wow_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                 else:
                     topic = sample["chosen_topic"]
                 
+                dialog_context = " [SEP] ".join(turn_list)
                 knowledge = checked_sentence
                 response = text
+                # add the response into the dialog history
+                turn_list.append(response)
+
                 # write to the output files
-                fproc.write(topic + "\t" + " [SEP] ".join(context) + "\t" + \
+                fproc.write(topic + "\t" + dialog_context + "\t" + \
                                 knowledge + "\t" + response + "\n")
                 
                 if fknwl:
@@ -107,11 +114,9 @@ def process_wow_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                     response = " ".join(word_tokenize(response))
                     fresp.write(response + "\n")
 
-                context.append(text)
-
             else:
                 assert "apprentice" in speaker
-                context.append(text)
+                turn_list.append(text)
 
     fproc.close()
     if fknwl:
@@ -134,16 +139,20 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
     
     with open(raw_file, "r") as fr:
         for i, line in tqdm(enumerate(fr)):
+            # read line by line, each line uses json format
             line = line.strip()
             item_dict = json.loads(line)
+
+            # item_dict is a dictionary
+            # its key is the data id, and its value contains all the data content
             item_dict = item_dict.values()
-            assert len(item_dict) == 1
-            item_dict = list(item_dict)[0]
+            item_dict = list(item_dict)[0]  # len(item_dict) == 1
             
+            # get the whole dialog data for a single dialog sample
             dialog_data = item_dict['dialog_history']
             length = len(dialog_data)
             
-            turn_list = []
+            turn_list = []  # collect the dialog history
             search_text = ""
             for i in range(length):
                 item = dialog_data[i]
@@ -154,6 +163,7 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
 
                 elif action == "Wizard => Apprentice":
                     if len(turn_list) == 0:
+                        # first turn
                         turn = item['text']
                         turn_list.append(turn)
                         continue
@@ -167,27 +177,29 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                     
                     # get the topic
                     if flag:
-                        # no knowledge sentence is used
+                        # no knowledge sentence is used for the response
                         topic = "no_topic"
-                        sent_list = ["no_passages_used"]
+                        knwl_sent = "no_passages_used"
                     else:
-                        # assert search_text != ""
+                        # we consider the search text as the topic
                         topic = search_text
-
-                        sent_list = []
+                        # get the knowledge sentence
+                        knwl_sent = ""
                         for content, select in zip(contents, selects):
                             content = content['content']
                             assert len(content) == len(select)
                             for c, s in zip(content, select):
                                 if s:
-                                    sent_list.append(c)
-                    if len(sent_list) == 0:
+                                    knwl_sent = c
+                                    break
+
+                    if knwl_sent == "":
+                        # no knowledge is used for the response
                         topic = "no_topic"
-                        sent_list = ["no_passages_used"]
+                        knwl_sent = "no_passages_used"
 
                     # get dialogue context, knowledge, and response 
                     dialog_context = " [SEP] ".join(turn_list)
-                    knwl_sent = sent_list[0]
                     response = item['text']
 
                     # processing
@@ -218,7 +230,8 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                     turn_list.append(turn)
 
                 else:
-                    assert action == "SearchAgent => Wizard"
+                    assert action == "SearchAgent => Wizard", \
+                            "Please check whether you have used the correct data!"
 
     fproc.close()
     if fknwl:
@@ -232,7 +245,8 @@ def get_database(test_datapath, train_datapath, data_type):
 
     assert data_type in ["wow_seen", "wow_unseen", "woi"], \
                 "Please input a correct data type!!"
-    # get test data topic list
+
+    # get test data topic dictionary
     print("> reading test data from %s" % test_datapath)
     test_topics = {}
     with open(test_datapath, "r") as f:
@@ -265,8 +279,6 @@ def get_database(test_datapath, train_datapath, data_type):
             # get the instance
             last_turn = turns[-1]
             if data_type == "woi":
-                instance = "( " + last_turn + " ) " + topic + " -> " + knowledge
-            else:
                 instance = "( " + last_turn + " ) " + topic + " => " + knowledge
             
             # construct dialog example

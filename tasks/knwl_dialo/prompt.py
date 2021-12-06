@@ -110,10 +110,7 @@ def generate_samples_by_prompting_input_from_file(model):
                     # construct inputs for knowledge generation
                     turns = splits[1].split(" [SEP] ")
                     context = turns[-1]
-                    if " -> " in raw_text and " => " not in raw_text:
-                        raw_text += "( " + context + " ) " + topic + " ->"
-                    else:
-                        raw_text += "( " + context + " ) " + topic + " =>"
+                    raw_text += "( " + context + " ) " + topic + " =>"
                 
                 else:
                     # construct inputs for response generation
