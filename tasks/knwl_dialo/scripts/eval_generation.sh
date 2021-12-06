@@ -10,8 +10,8 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
 
-OUTPUT_PATH=<Speicifc path for the output generation>
-GROUND_TRUTH_PATH=<Speicifc path for the ground truth>
+OUTPUT_PATH=<SPECIFIC_PATH_FOR_THE_OUTPUT_GENERATION>
+GROUND_TRUTH_PATH=<SPECIFIC_PATH_FOR_THE_GROUND_TRUTH>
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --num-layers 24 \
