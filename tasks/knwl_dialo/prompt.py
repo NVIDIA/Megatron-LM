@@ -94,8 +94,7 @@ def generate_samples_by_prompting_input_from_file(model):
                 input_str = all_raw_text[input_pos]
                 input_str = input_str.strip()
                 splits = input_str.split("\t")
-                control_codes = splits[0].split(" [CTRL] ")
-                topic = control_codes[0]
+                topic = splits[0]
 
                 # first add the prompt into the inputs
                 if args.dynamic_prompt:
@@ -137,6 +136,7 @@ def generate_samples_by_prompting_input_from_file(model):
             if input_pos % 100 == 0:
                 print_rank_0("input_pos: %d" % input_pos)
 
+            # get the generation outputs (in decode_tokens)
             token_stream = get_token_stream(model, [context_tokens])
             for _, decode_tokens in enumerate(token_stream):
                 pass
@@ -169,7 +169,6 @@ def main():
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
-
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 
