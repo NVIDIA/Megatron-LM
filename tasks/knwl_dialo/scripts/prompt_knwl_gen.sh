@@ -12,12 +12,12 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
 
-CHECKPOINT_PATH=<Specify path for the language model>
-INPUT_PATH=<Specific path for the input test dataset>
-VOCAB_PATH=<Specify path for the vocab file>
-MERGE_PATH=<Specify path for the merge file>
-OUTPUT_PATH=<Speicifc path for the output>
-PROMPT_PATH=<Specific path for the prompts>
+CHECKPOINT_PATH=<PATH_OF_THE_LANGUAGE_MODEL>
+INPUT_PATH=<PATH_OF_THE_INPUT_TEST_DATA_FILE>
+VOCAB_PATH=<PATH_OF_THE_VOCAB_FILE>
+MERGE_PATH=<PATH_OF_THE_MERGE_FILE>
+OUTPUT_PATH=<PATH_OF_THE_OUTPUT_GENERATION_FILE>
+PROMPT_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION_PROMPTS>
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --num-layers 24 \
