@@ -30,7 +30,8 @@ def get_args():
     parser.add_argument("--model_file", type=str, default=None,
                         help="path of the model file")
     parser.add_argument("--data_type", type=str, default=None,
-                        help="data types (wow_seen, wow_unseen, or woi)")
+                        help="data types, choose one out of three types: \
+                              wow_seen, wow_unseen, and woi")
     parser.add_argument("--seed", type=int, default=1234,
                         help="random seed")
 
@@ -229,6 +230,8 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
 def get_database(test_datapath, train_datapath, data_type):
     """Get the database by topics"""
 
+    assert data_type in ["wow_seen", "wow_unseen", "woi"], \
+                "Please input a correct data type!!"
     # get test data topic list
     print("> reading test data from %s" % test_datapath)
     test_topics = {}
