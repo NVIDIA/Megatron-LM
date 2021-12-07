@@ -451,7 +451,7 @@ class ParallelTransformerLayer(MegatronModule):
                 capacity_factor=args.moe_train_capacity_factor,
                 eval_capacity_factor=args.moe_eval_capacity_factor,
                 min_capacity=args.moe_min_capacity,
-                drop_tokens=args.moe_token_dropping, use_tutel=True)
+                drop_tokens=args.moe_token_dropping, use_tutel=False)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,

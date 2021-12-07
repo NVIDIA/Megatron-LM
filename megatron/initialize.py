@@ -195,7 +195,6 @@ def _initialize_distributed():
         args.world_size = torch.distributed.get_world_size()
 
     else:
-
         if args.rank == 0:
             print('> initializing torch distributed ...', flush=True)
         # Manually set the device ids.
@@ -206,7 +205,9 @@ def _initialize_distributed():
                     'expected local-rank to be the same as rank % device-count.'
             else:
                 args.local_rank = device
-            torch.cuda.set_device(device)
+        #print(f'------------ setting megatron cuda device = {args.local_rank}')
+        #exit(0)
+        #torch.cuda.set_device(device%8)
         # Call the init process
         init_method = 'tcp://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
@@ -220,7 +221,7 @@ def _initialize_distributed():
                 backend=args.distributed_backend,
                 world_size=args.world_size, rank=args.rank,
                 init_method=init_method)
-
+        torch.cuda.set_device(torch.distributed.get_rank()%8)
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
