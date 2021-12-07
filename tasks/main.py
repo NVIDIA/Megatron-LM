@@ -134,8 +134,6 @@ if __name__ == '__main__':
         from orqa.supervised.finetune import main
     elif args.task == 'KNWL-DIALO-PROMPT':
         from knwl_dialo.prompt import main
-    elif args.task in ['KNWL-DIALO-FINETUNE', 'KNWL-DIALO-GEN']:
-        from knwl_dialo.finetune import main
     elif args.task == 'KNWL-DIALO-EVAL-F1':
         from knwl_dialo.evaluate import main
     else:
