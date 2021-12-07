@@ -132,7 +132,7 @@ def main():
     if args.ds_inference:
         model = ds_inference(model, args)
         print('> DeepSpeed Inference initialized')
-
+    
     # Generate samples.
     if args.num_samples == 0:
         args.micro_batch_size = 1
@@ -143,7 +143,9 @@ def main():
     else:
         generate_and_write_samples_unconditional(model, latencies, single_token_latency, model_latencies)
     
-    if torch.cuda.current_device() == 0:
+    
+    #if torch.cuda.current_device() == 0:
+    if torch.distributed.get_rank() == 0:
         print_latency(latencies)
         print_latency(model_latencies, "model_latencies")
         print_latency(single_token_latency, "single_token_latency")
@@ -158,8 +160,9 @@ def ds_inference(model, args):
         import megatron.model as mm
         import torch
         engine = deepspeed.init_inference(model=model,
+                                          triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
-                                          mpu=mpu,
+                                          mpu=None,
                                           #ep_group=#WORLD_GROUP,
                                           dtype=torch.half,
                                           return_tuple=False,

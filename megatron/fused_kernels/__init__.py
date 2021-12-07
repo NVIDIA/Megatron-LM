@@ -36,6 +36,7 @@ def load(args):
     if int(bare_metal_major) >= 11:
         cc_flag.append('-gencode')
         cc_flag.append('arch=compute_80,code=sm_80')
+        cc_flag.append('-I/opt/conda/lib/python3.8/site-packages/pybind11/include')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
@@ -49,7 +50,8 @@ def load(args):
             sources=sources,
             build_directory=buildpath,
             extra_cflags=['-O3',],
-            extra_cuda_cflags=['-O3',
+            extra_cuda_cflags=['-I/opt/conda/lib/python3.8/site-packages/pybind11/include',
+                               '-O3',
                                '-gencode', 'arch=compute_70,code=sm_70',
                                '--use_fast_math'] + extra_cuda_flags + cc_flag,
             verbose=(args.rank == 0)
@@ -60,7 +62,8 @@ def load(args):
     # ==============
 
     if args.masked_softmax_fusion:
-        extra_cuda_flags = ['-U__CUDA_NO_HALF_OPERATORS__',
+        extra_cuda_flags = ['-I /opt/conda/lib/python3.8/site-packages/pybind11/include',
+                            '-U__CUDA_NO_HALF_OPERATORS__',
                             '-U__CUDA_NO_HALF_CONVERSIONS__',
                             '--expt-relaxed-constexpr',
                             '--expt-extended-lambda']
