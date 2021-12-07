@@ -12,37 +12,6 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 
 
-def get_ltor_attention_masks_and_position_ids(data, eod_token_id):
-    """
-    Build attention masks and position id for left to right model.
-    Different from the existing get_ltor_masks_and_position_ids function,
-    we add padding to the input sequences to make sure their lengths are the same.
-    """
-
-    micro_batch_size, seq_length = data.size()
-
-    # Attention mask
-    attention_mask = torch.tril(torch.ones(
-        (micro_batch_size, seq_length, seq_length), device=data.device)).view(
-            micro_batch_size, 1, seq_length, seq_length)
-
-    # mask padded tokens
-    for b in range(micro_batch_size):
-        for idx in range(seq_length-1):
-            if data[b, idx] == eod_token_id:
-                # pad tokens that come after the eod token
-                attention_mask[b, 0, idx+1:, :] = 0.0
-
-    # Position ids.
-    position_ids = torch.arange(seq_length, dtype=torch.long, device=data.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(data)
-    
-    # Convert attention mask to binary:
-    attention_mask = (attention_mask < 0.5)
-
-    return attention_mask, position_ids
-
-
 def switch(val1, val2, boolean):
     """Return either val1 or val2 depending on boolean"""
 
