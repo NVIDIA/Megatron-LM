@@ -268,18 +268,21 @@ def get_database(test_datapath, train_datapath, data_type):
             turns = splits[1].split(" [SEP] ")[-3:]
             knowledge = splits[2]
             response = splits[3]
+
             # filtering data samples
             if knowledge == "no_passages_used":
+                # when no knowledge is used
                 continue
             if data_type != "wow_seen" and ("(" in knowledge or ")" in knowledge):
+                # when brackets existing in the knowledge
                 continue
             if data_type != "wow_seen" and topic not in knowledge:
+                # when topic does not exist in the knowledge
                 continue
 
             # get the instance
             last_turn = turns[-1]
-            if data_type == "woi":
-                instance = "( " + last_turn + " ) " + topic + " => " + knowledge
+            instance = "( " + last_turn + " ) " + topic + " => " + knowledge
             
             # construct dialog example
             dialog_example = ""
