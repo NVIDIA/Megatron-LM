@@ -42,7 +42,6 @@ def generate_samples_by_prompting_input_from_file(model):
         fname = open(args.sample_input_file, "r")
         all_raw_text = fname.readlines()
         input_count = len(all_raw_text)
-        input_pos = 0
         if args.sample_output_file is None:
             sample_output_file = args.sample_input_file + ".out"
             print('`sample-output-file` not specified, setting '
@@ -52,8 +51,13 @@ def generate_samples_by_prompting_input_from_file(model):
 
         fname_out = open(sample_output_file, "w")
 
+    # only two prompt types (i.e., knowledge and response) are allowed
+    assert args.prompt_type in ["knowledge", "response"], \
+                "Please input a correct prompt type!"
+
     # Read the prompt file
-    if args.dynamic_prompt:
+    if args.prompt_type == "knowledge":
+        # read the prompts for the knowledge generation
         prompt_examples_dict = {}
         with open(args.prompt_file, "r") as f:
             for i, line in enumerate(f):
@@ -71,6 +75,7 @@ def generate_samples_by_prompting_input_from_file(model):
                     prompt_examples_dict[key] = prompt
 
     else:
+        # read the prompts for the response generation
         # prompts are fixed for all test samples
         with open(args.prompt_file, "r") as f:
             prompt_examples = f.readlines()
@@ -81,9 +86,8 @@ def generate_samples_by_prompting_input_from_file(model):
                 instance = instance.strip()
                 prompt += instance + " \n"
 
-    # only two prompt types (i.e., knowledge and response) are allowed
-    assert args.prompt_type in ["knowledge", "response"]
     context_count = 0
+    input_pos = 0
     model.eval()
     # perform prompting
     with torch.no_grad():
@@ -96,24 +100,25 @@ def generate_samples_by_prompting_input_from_file(model):
                 splits = input_str.split("\t")
                 topic = splits[0]
 
-                # first add the prompt into the inputs
-                if args.dynamic_prompt:
+                if args.prompt_type == "knowledge":
+                    # first add the prompt into the raw_text
                     turns = splits[1].split(" [SEP] ")
                     last_turn = turns[-1]
                     key = topic + " " + last_turn
                     raw_text = prompt_examples_dict[key]
-                else:
-                    raw_text = prompt
 
-                if args.prompt_type == "knowledge":
                     # construct inputs for knowledge generation
+                    # then add the constructed inputs into the raw_text
                     turns = splits[1].split(" [SEP] ")
                     context = turns[-1]
                     raw_text += "( " + context + " ) " + topic + " =>"
                 
                 else:
+                    # first add the prompt into the raw_text
+                    raw_text = prompt
+
                     # construct inputs for response generation
-                    # args.prompt_type == "response"
+                    # then add the constructed inputs into the raw_text
                     turns = splits[1].split(" [SEP] ")
                     knowledge = splits[2]
                     last_turn = turns[-1]
