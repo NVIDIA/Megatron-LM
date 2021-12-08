@@ -19,21 +19,21 @@ do
    # 1b
    layers=20
    dim=2048
-   args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs")
+   args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs --num-samples $((20*$bs))")
    fnames+=("gpus-$procs-layers-$layers-dim-$dim-bs-$bs")
 
    # 2b, 4b
    for layers in 18 36
    do
       dim=3072
-      args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs")
+      args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs --num-samples $((20*$bs))")
       fnames+=("gpus-$procs-layers-$layers-dim-$dim-bs-$bs")
    done
       
    #8b
    layers=40
    dim=4096
-   args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs")
+   args+=("--num-layers $layers --hidden-size $dim --micro-batch-size $bs --num-samples $((20*$bs))")
    fnames+=("gpus-$procs-layers-$layers-dim-$dim-bs-$bs")
 done
 
@@ -43,7 +43,7 @@ use_tutel=""
 #use_tutel="--use-tutel"
 
 ds_inference=""
-ds_inference="--ds-inference"
+ds_inference=" --ds-inference"
 
 #numa_bind=""
 numa_bind="--bind-to numa"
@@ -63,23 +63,29 @@ program_cmd="tools/generate_samples_gpt.py \
        --tokenizer-type GPT2BPETokenizer \
        --fp16 \
        --num-experts $experts \
-       --seq-length 101 \
-       --out-seq-length 101 \
+       --seq-length 30 \
+       --out-seq-length 30 \
        --temperature 1.0 \
        --vocab-file $VOCAB_FILE \
        --merge-file $MERGE_FILE \
        --genfile unconditional_samples.json \
        --top_p 0.9 \
-       --log-interval 1 \
-       --num-samples $((20*$b)) \
-       --deepspeed $use_tutel $ds_inference"
+       --log-interval 1 --deepspeed"
+
+program_cmd+=$use_tutel 
+program_cmd+=$ds_inference
+
 i=0
 for fname in "${fnames[@]}"
 do
-i+=1
-cmd="$launch_cmd $sccl_cmd $program_cmd ${args[$i]} &> $fname"
-echo $cmd
+echo $i
+echo ${args[$i]}
+cmd="$launch_cmd $nccl_cmd $program_cmd ${args[$i]}"
+redir="$PWD/output_dir/$fname"
+echo $cmd "&>" $redir
+$cmd &> $redir
 echo "------------------------------------------"
+((i=i+1))
 done
 
 
