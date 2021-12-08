@@ -14,10 +14,10 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
 
 CHECKPOINT_PATH=<PATH_OF_THE_LANGUAGE_MODEL>
 INPUT_PATH=<PATH_OF_THE_INPUT_TEST_DATA_FILE>
+PROMPT_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION_PROMPTS>
 VOCAB_PATH=<PATH_OF_THE_VOCAB_FILE>
 MERGE_PATH=<PATH_OF_THE_MERGE_FILE>
 OUTPUT_PATH=<PATH_OF_THE_OUTPUT_GENERATION_FILE>
-PROMPT_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION_PROMPTS>
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --num-layers 24 \
@@ -37,5 +37,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --prompt-file ${PROMPT_PATH} \
         --prompt-type knowledge \
         --num-prompt-examples 10 \
-        --dynamic-prompt \
         --task KNWL-DIALO-PROMPT 
