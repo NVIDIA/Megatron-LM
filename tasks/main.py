@@ -96,16 +96,10 @@ def get_tasks_args(parser):
                        help='prompt type (knowledge or response)')
     group.add_argument('--num-prompt-examples', type=int, default=10,
                        help='number of prompt examples')
-    group.add_argument('--dynamic-prompt', action='store_true', default=False,
-                       help='using different prompts for different test samples')
-    group.add_argument('--module', type=str, default="",
-                       help='either knowledge generation (knowledge) or response generation (response)')
     group.add_argument('--guess-file', type=str, default="",
                        help='datapath for generated sentences')
     group.add_argument('--answer-file', type=str, default="",
                        help='datapath for golden sentences')
-    group.add_argument('--spec-toks', type=str, default=None,
-                       help='additional special tokens')
     group.add_argument('--out-seq-length', type=int, default=100,
                        help='output sequence length')
 
