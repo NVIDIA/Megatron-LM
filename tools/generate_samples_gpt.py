@@ -162,7 +162,7 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
-                                          mpu=None,
+                                          mpu=mpu,
                                           #ep_group=#WORLD_GROUP,
                                           dtype=torch.half,
                                           return_tuple=False,
