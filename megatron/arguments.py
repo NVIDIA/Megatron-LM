@@ -276,8 +276,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
-    group.add_argument('--num-experts', type=int, default=1,
-                           help='number of experts')
+    group.add_argument('--num-experts', type=int, nargs='+', default=[1,],
+                           help='number of experts list, MoE related.')
+    group.add_argument('--mlp-type', type=str, default='standard',
+                           help='[standard (MoE), residual (MoE)]')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--expert-interval', type=int, default=2,

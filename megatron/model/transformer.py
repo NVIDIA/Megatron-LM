@@ -103,6 +103,42 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
+class Residual_MoE(MegatronModule):
+    def __init__(self, init_method, output_layer_init_method, num_experts=1):
+        super(Residual_MoE, self).__init__()
+        args = get_args()
+
+        # simple large mlp
+        self.mlp = ParallelMLP(init_method, output_layer_init_method)
+        # MoE experts group
+        self.moe = MoE(args.hidden_size, ParallelMLP(init_method,
+                    output_layer_init_method=output_layer_init_method),
+                    num_experts=num_experts, k=args.topk,
+                    capacity_factor=args.moe_train_capacity_factor,
+                    eval_capacity_factor=args.moe_eval_capacity_factor,
+                    min_capacity=args.moe_min_capacity,
+                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+
+        # Sum up coefficient
+        self.coefficient = mpu.RowParallelLinear(
+            args.hidden_size,
+            2,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True)
+
+        # Sum coefficient activation
+        self.coef_activation_func = F.softmax
+
+    def forward(self, hidden_states):
+        mlp_output, _  = self.mlp(hidden_states)
+        moe_output, moe_loss, _ = self.moe(hidden_states)
+
+        # Weighted sum
+        _coef, _ = self.coefficient(hidden_states)
+        coef = self.coef_activation_func(_coef, dim=-1)
+        output = coef[:, :, :1] * mlp_output + coef[:, :, 1:] * moe_output
+        return output, moe_loss, None
 
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
@@ -445,13 +481,17 @@ class ParallelTransformerLayer(MegatronModule):
             self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
         else:
-            self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
-                output_layer_init_method=output_layer_init_method),
-                num_experts=self.num_experts, k=args.topk,
-                capacity_factor=args.moe_train_capacity_factor,
-                eval_capacity_factor=args.moe_eval_capacity_factor,
-                min_capacity=args.moe_min_capacity,
-                drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+            if args.mlp_type == 'standard':
+                self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+                    output_layer_init_method=output_layer_init_method),
+                    num_experts=self.num_experts, k=args.topk,
+                    capacity_factor=args.moe_train_capacity_factor,
+                    eval_capacity_factor=args.moe_eval_capacity_factor,
+                    min_capacity=args.moe_min_capacity,
+                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+            elif args.mlp_type == 'residual':
+                self.mlp = Residual_MoE(init_method,
+                    output_layer_init_method, self.num_experts)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
@@ -598,7 +638,7 @@ class ParallelTransformer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
-                 pre_process=True, post_process=True, num_experts=1):
+                 pre_process=True, post_process=True, num_experts=[1]):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -619,14 +659,14 @@ class ParallelTransformer(MegatronModule):
         self.num_layers = args.num_layers // mpu.get_pipeline_model_parallel_world_size()
 
         # Transformer layers.
-        def build_layer(layer_number):
+        def build_layer(layer_number, n_e):
             return ParallelTransformerLayer(
                 init_method,
                 output_layer_init_method,
                 layer_number,
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type,
-                num_experts=num_experts if layer_number % args.expert_interval == 0 else 1)
+                num_experts=n_e)
         if args.virtual_pipeline_model_parallel_size is not None:
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
@@ -649,8 +689,25 @@ class ParallelTransformer(MegatronModule):
             # Each stage gets a contiguous set of layers.
             offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        # Make sure that MoE layers can be created by num_experts
+        assert len(num_experts) == 1 or len(num_experts) == self.num_layers // args.expert_interval, \
+            'num_experts must be either a single value or a list of the same length as the number of MoE layers'
+
+        # Create the list of MoE experts
+        if len(num_experts) == 1:
+            num_experts = num_experts * (self.num_layers // args.expert_interval)
+
+        self.layers = []
+        # Build the layers
+        for i in range(self.num_layers):
+            layer_num = i + 1 + offset
+            if layer_num % args.expert_interval == 0:
+                n_e = num_experts.pop(0)
+            else:
+                n_e = 1
+            self.layers.append(build_layer(layer_num, n_e))
+
+        self.layers = torch.nn.ModuleList(self.layers)
 
         if self.post_process:
             # Final layer norm before output.
