@@ -15,7 +15,8 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
 CHECKPOINT_PATH=<PATH_OF_LANGUAGE_MODEL> (e.g., /357m)
 VOCAB_PATH=<PATH_OF_VOCAB_FILE> (e.g., /gpt2-vocab.json)
 MERGE_PATH=<PATH_OF_MERGE_FILE> (e.g., /gpt2-merges.txt)
-INPUT_PATH=<PATH_OF_PROCESSED_TEST_DATA_FILE> (e.g., /testseen_processed.txt)
+INPUT_PATH=<PATH_OF_PROCESSED_TEST_DATA_FILE> \ 
+        (e.g., /testseen_processed.txt)
 PROMPT_PATH=<PATH_OF_KNOWLEDGE_GENERATION_PROMPTS> \
         (e.g., /testseen_knowledge_prompts.json)
 OUTPUT_PATH=<PATH_OF_OUTPUT_GENERATION_FILE> \
@@ -40,3 +41,5 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --prompt-type knowledge \
         --num-prompt-examples 10 \
         --task KNWL-DIALO-PROMPT 
+
+# NOTE: If you use api for the model generation, please use the "--api-prompt" flag (setting this value as True). 
