@@ -102,6 +102,8 @@ def get_tasks_args(parser):
                        help='datapath for golden sentences')
     group.add_argument('--out-seq-length', type=int, default=100,
                        help='output sequence length')
+    group.add_argument('--api-prompt', default=False, action="store_true",
+                       help='setup model api for prompting')
 
     return parser
 
