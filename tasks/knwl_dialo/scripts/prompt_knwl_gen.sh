@@ -12,12 +12,14 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --master_addr localhost \
                   --master_port 6000"
 
-CHECKPOINT_PATH=<PATH_OF_THE_LANGUAGE_MODEL>
-INPUT_PATH=<PATH_OF_THE_INPUT_TEST_DATA_FILE>
-PROMPT_PATH=<PATH_OF_THE_KNOWLEDGE_GENERATION_PROMPTS>
-VOCAB_PATH=<PATH_OF_THE_VOCAB_FILE>
-MERGE_PATH=<PATH_OF_THE_MERGE_FILE>
-OUTPUT_PATH=<PATH_OF_THE_OUTPUT_GENERATION_FILE>
+CHECKPOINT_PATH=<PATH_OF_LANGUAGE_MODEL> (e.g., /357m)
+VOCAB_PATH=<PATH_OF_VOCAB_FILE> (e.g., /gpt2-vocab.json)
+MERGE_PATH=<PATH_OF_MERGE_FILE> (e.g., /gpt2-merges.txt)
+INPUT_PATH=<PATH_OF_PROCESSED_TEST_DATA_FILE> (e.g., /testseen_processed.txt)
+PROMPT_PATH=<PATH_OF_KNOWLEDGE_GENERATION_PROMPTS> \
+        (e.g., /testseen_knowledge_prompts.json)
+OUTPUT_PATH=<PATH_OF_OUTPUT_GENERATION_FILE> \
+        (e.g., /testseen_knowledge_generations.txt)
 
 python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --num-layers 24 \

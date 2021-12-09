@@ -4,9 +4,12 @@
 
 DIR=`pwd`
 
-TEST_FILE=<PATH_OF_THE_PROCESSED_TEST_DATA>
-KNOWLEDGE_FILE=<PATH_OF_THE_GENERATED_KNOWLEDGE_DATA>
-PROCESSED_FILE=<PATH_OF_THE_INPUT_FILE_FOR_RESPONSE_GENERATION>
+TEST_FILE=<PATH_OF_PROCESSED_TEST_DATA> \
+        (e.g., /testseen_processed.txt)
+KNOWLEDGE_FILE=<PATH_OF_GENERATED_KNOWLEDGE_DATA> \
+        (e.g., /testseen_knowledge_generations.txt)
+PROCESSED_FILE=<PATH_OF_INPUT_FILE_FOR_RESPONSE_GENERATION> \
+        (e.g., /testseen_processed_with_generated_knowledge.txt)
 
 python ${DIR}/tasks/knwl_dialo/preprocessing.py \
         --func prepare_input \
