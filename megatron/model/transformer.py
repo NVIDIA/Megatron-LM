@@ -125,7 +125,8 @@ class Residual_MoE(MegatronModule):
             2,
             input_is_parallel=True,
             init_method=output_layer_init_method,
-            skip_bias_add=True)
+            skip_bias_add=True,
+            bias=False)
 
         # Sum coefficient activation
         self.coef_activation_func = F.softmax
