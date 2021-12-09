@@ -131,8 +131,26 @@ def main():
 
     if args.ds_inference:
         model = ds_inference(model, args)
-        print('> DeepSpeed Inference initialized')
+        print('> DeepSpeed Inference engine initialized')
     
+	if args.deepspeed and not args.ds_inference:
+        ds_config = {
+          "train_micro_batch_size_per_gpu": 8,
+          "optimizer": {
+              "type": "Adam",
+              "params": {
+                  "lr": 1e-4
+              }
+          },
+          "fp16": {
+              "enabled": True
+          },
+        }
+
+        # To run inference using the DeepSpeed training engine, we need the following
+        model, _, _, _ = deepspeed.initialize(model=model, model_parameters=None, config=ds_config)
+        print('> DeepSpeed Training engine initialized')
+
     # Generate samples.
     if args.num_samples == 0:
         args.micro_batch_size = 1
@@ -162,13 +180,12 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
-                                          mpu=None,
+                                          mpu=mpu,
                                           #ep_group=#WORLD_GROUP,
                                           dtype=torch.half,
                                           return_tuple=False,
                                           replace_with_kernel_inject=True,
-                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy},
-                                          moe_experts=args.num_experts)
+                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy}, moe_experts=args.num_experts)
                                           #replace_method='auto')
         m = engine.module
     else:
