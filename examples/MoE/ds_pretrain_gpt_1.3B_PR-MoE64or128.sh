@@ -256,6 +256,7 @@ megatron_options=" \
         --moe-expert-parallel-size ${EP_PARALLEL_SIZE} \
         --num-experts ${EP_SIZE} \
         --moe-loss-coeff ${MLC} \
+        --mlp-type residual \
         --moe-train-capacity-factor ${MOE_TRAIN_CAP_FACTOR} \
         --moe-eval-capacity-factor ${MOE_EVAL_CAP_FACTOR} \
         --moe-min-capacity ${MOE_MIN_CAP} \
