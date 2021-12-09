@@ -1,0 +1,1251 @@
+Warning: Permanently added '[192.168.0.71]:43529' (ECDSA) to the list of known hosts.
+Warning: Permanently added '[192.168.0.87]:46844' (ECDSA) to the list of known hosts.
+Warning: Permanently added '[192.168.0.34]:45820' (ECDSA) to the list of known hosts.
+[1,0]<stdout>:using world size: 16, data-parallel-size: 16, tensor-model-parallel size: 1, pipeline-model-parallel size: 1 
+[1,0]<stdout>:WARNING: overriding default arguments for tokenizer_type:GPT2BPETokenizer                        with tokenizer_type:GPT2BPETokenizer
+[1,0]<stdout>:setting global batch size to 2048
+[1,0]<stdout>:using torch.float16 for parameters ...
+[1,0]<stdout>:------------------------ arguments ------------------------
+[1,0]<stdout>:  accumulate_allreduce_grads_in_fp32 .............. False
+[1,0]<stdout>:  adam_beta1 ...................................... 0.9
+[1,0]<stdout>:  adam_beta2 ...................................... 0.999
+[1,0]<stdout>:  adam_eps ........................................ 1e-08
+[1,0]<stdout>:  adlr_autoresume ................................. False
+[1,0]<stdout>:  adlr_autoresume_interval ........................ 1000
+[1,0]<stdout>:  apply_query_key_layer_scaling ................... True
+[1,0]<stdout>:  apply_residual_connection_post_layernorm ........ False
+[1,0]<stdout>:  attention_dropout ............................... 0.1
+[1,0]<stdout>:  attention_softmax_in_fp32 ....................... False
+[1,0]<stdout>:  bert_binary_head ................................ True
+[1,0]<stdout>:  bert_load ....................................... None
+[1,0]<stdout>:  bf16 ............................................ False
+[1,0]<stdout>:  bias_dropout_fusion ............................. True
+[1,0]<stdout>:  bias_gelu_fusion ................................ True
+[1,0]<stdout>:  biencoder_projection_dim ........................ 0
+[1,0]<stdout>:  biencoder_shared_query_context_model ............ False
+[1,0]<stdout>:  block_data_path ................................. None[1,0]<stdout>:
+[1,0]<stdout>:  checkpoint_activations .......................... False
+[1,0]<stdout>:  checkpoint_in_cpu ............................... False
+[1,0]<stdout>:  checkpoint_num_layers ........................... 1
+[1,0]<stdout>:  clip_grad ....................................... 1.0
+[1,0]<stdout>:  consumed_train_samples .......................... 0
+[1,0]<stdout>:  consumed_train_tokens ........................... 0
+[1,0]<stdout>:  consumed_valid_samples .......................... 0
+[1,0]<stdout>:  contigious_checkpointing ........................ False
+[1,0]<stdout>:  cpu_optimizer ................................... False
+[1,0]<stdout>:  cpu_torch_adam .................................. False
+[1,0]<stdout>:  curriculum_learning ............................. False
+[1,0]<stdout>:  data_impl ....................................... infer
+[1,0]<stdout>:  data_parallel_size .............................. 16
+[1,0]<stdout>:  data_path ....................................... None
+[1,0]<stdout>:  dataloader_type ................................. single
+[1,0]<stdout>:  DDP_impl ........................................ local
+[1,0]<stdout>:  decoder_seq_length .............................. None
+[1,0]<stdout>:  deepscale ....................................... False
+[1,0]<stdout>:  deepscale_config ................................ None[1,0]<stdout>:
+[1,0]<stdout>:  deepspeed ....................................... True
+[1,0]<stdout>:  deepspeed_activation_checkpointing .............. False
+[1,0]<stdout>:  deepspeed_config ................................ None
+[1,0]<stdout>:  deepspeed_mpi ................................... False
+[1,0]<stdout>:  distribute_checkpointed_activations ............. False
+[1,0]<stdout>:  distributed_backend ............................. nccl
+[1,0]<stdout>:  ds_inference .................................... False
+[1,0]<stdout>:  embedding_path .................................. None
+[1,0]<stdout>:  encoder_seq_length .............................. 30
+[1,0]<stdout>:  eod_mask_loss ................................... False
+[1,0]<stdout>:  eval_interval ................................... 1000
+[1,0]<stdout>:  eval_iters ...................................... 100[1,0]<stdout>:
+[1,0]<stdout>:  evidence_data_path .............................. None
+[1,0]<stdout>:  exit_duration_in_mins ........................... None
+[1,0]<stdout>:  exit_interval ................................... None[1,0]<stdout>:
+[1,0]<stdout>:  expert_interval ................................. 2
+[1,0]<stdout>:  ffn_hidden_size ................................. 16384
+[1,0]<stdout>:  finetune ........................................ False
+[1,0]<stdout>:  fp16 ............................................ True[1,0]<stdout>:
+[1,0]<stdout>:  fp16_lm_cross_entropy ........................... False
+[1,0]<stdout>:  fp32_residual_connection ........................ False
+[1,0]<stdout>:  genfile ......................................... unconditional_samples.json
+[1,0]<stdout>:  global_batch_size ............................... 2048
+[1,0]<stdout>:  greedy .......................................... False
+[1,0]<stdout>:  hidden_dropout .................................. 0.1
+[1,0]<stdout>:  hidden_size ..................................... 4096
+[1,0]<stdout>:  hysteresis ...................................... 2
+[1,0]<stdout>:  ict_head_size ................................... None
+[1,0]<stdout>:  ict_load ........................................ None
+[1,0]<stdout>:  img_dim ......................................... 224[1,0]<stdout>:
+[1,0]<stdout>:  indexer_batch_size .............................. 128[1,0]<stdout>:
+[1,0]<stdout>:  indexer_log_interval ............................ 1000
+[1,0]<stdout>:  init_method_std ................................. 0.02
+[1,0]<stdout>:  init_method_xavier_uniform ...................... False
+[1,0]<stdout>:  initial_loss_scale .............................. 4294967296
+[1,0]<stdout>:  kv_channels ..................................... 128[1,0]<stdout>:
+[1,0]<stdout>:  layernorm_epsilon ............................... 1e-05
+[1,0]<stdout>:  lazy_mpu_init ................................... None
+[1,0]<stdout>:  load ............................................ checkpoints/gpt2_345m
+[1,0]<stdout>:  local_rank ...................................... None[1,0]<stdout>:
+[1,0]<stdout>:  log_batch_size_to_tensorboard ................... False
+[1,0]<stdout>:  log_interval .................................... 1
+[1,0]<stdout>:  log_learning_rate_to_tensorboard ................ True
+[1,0]<stdout>:  log_loss_scale_to_tensorboard ................... True
+[1,0]<stdout>:  log_num_zeros_in_grad ........................... False
+[1,0]<stdout>:  log_params_norm ................................. False
+[1,0]<stdout>:  log_timers_to_tensorboard ....................... False[1,0]<stdout>:
+[1,0]<stdout>:  log_validation_ppl_to_tensorboard ............... False
+[1,0]<stdout>:  loss_scale ...................................... None
+[1,0]<stdout>:  loss_scale_window ............................... 1000
+[1,0]<stdout>:  lr .............................................. None
+[1,0]<stdout>:  lr_decay_iters .................................. None[1,0]<stdout>:
+[1,0]<stdout>:  lr_decay_samples ................................ None
+[1,0]<stdout>:  lr_decay_style .................................. linear[1,0]<stdout>:
+[1,0]<stdout>:  lr_decay_tokens ................................. None
+[1,0]<stdout>:  lr_warmup_fraction .............................. None
+[1,0]<stdout>:  lr_warmup_iters ................................. 0
+[1,0]<stdout>:  lr_warmup_samples ............................... 0
+[1,0]<stdout>:  make_vocab_size_divisible_by .................... 128
+[1,0]<stdout>:  mask_prob ....................................... 0.15
+[1,0]<stdout>:  masked_softmax_fusion ........................... True
+[1,0]<stdout>:  max_position_embeddings ......................... 1024
+[1,0]<stdout>:  memory_centric_tiled_linear ..................... False
+[1,0]<stdout>:  merge_file ...................................... gpt2-merges.txt
+[1,0]<stdout>:  micro_batch_size ................................ 128
+[1,0]<stdout>:  min_loss_scale .................................. 1.0
+[1,0]<stdout>:  min_lr .......................................... 0.0
+[1,0]<stdout>:  mmap_warmup ..................................... False[1,0]<stdout>:
+[1,0]<stdout>:  moe_eval_capacity_factor ........................ 1.0
+[1,0]<stdout>:  moe_min_capacity ................................ 4
+[1,0]<stdout>:  moe_token_dropping .............................. True
+[1,0]<stdout>:  moe_train_capacity_factor ....................... 1.0
+[1,0]<stdout>:  no_load_optim ................................... True
+[1,0]<stdout>:  no_load_rng ..................................... True
+[1,0]<stdout>:  no_save_optim ................................... None[1,0]<stdout>:
+[1,0]<stdout>:  no_save_rng ..................................... None
+[1,0]<stdout>:  num_attention_heads ............................. 32
+[1,0]<stdout>:  num_channels .................................... 3
+[1,0]<stdout>:  num_classes ..................................... 1000
+[1,0]<stdout>:  num_experts ..................................... 128
+[1,0]<stdout>:  num_layers ...................................... 40
+[1,0]<stdout>:  num_layers_per_virtual_pipeline_stage ........... None
+[1,0]<stdout>:  num_samples ..................................... 2560
+[1,0]<stdout>:  num_workers ..................................... 2
+[1,0]<stdout>:  onnx_safe ....................................... None
+[1,0]<stdout>:  openai_gelu ..................................... False
+[1,0]<stdout>:  optimizer ....................................... adam
+[1,0]<stdout>:  out_seq_length .................................. 30
+[1,0]<stdout>:  override_lr_scheduler ........................... False
+[1,0]<stdout>:  params_dtype .................................... torch.float16[1,0]<stdout>:
+[1,0]<stdout>:  partition_activations ........................... False
+[1,0]<stdout>:  patch_dim ....................................... 16
+[1,0]<stdout>:  pipeline_model_parallel_size .................... 1
+[1,0]<stdout>:  profile_backward ................................ False
+[1,0]<stdout>:  query_in_block_prob ............................. 0.1
+[1,0]<stdout>:  rampup_batch_size ............................... None
+[1,0]<stdout>:  rank ............................................ 0[1,0]<stdout>:
+[1,0]<stdout>:  recompute ....................................... False
+[1,0]<stdout>:  remote_device ................................... none
+[1,0]<stdout>:  reset_attention_mask ............................ False[1,0]<stdout>:
+[1,0]<stdout>:  reset_position_ids .............................. False[1,0]<stdout>:
+[1,0]<stdout>:  retriever_report_topk_accuracies ................ []
+[1,0]<stdout>:  retriever_score_scaling ......................... False[1,0]<stdout>:
+[1,0]<stdout>:  retriever_seq_length ............................ 256
+[1,0]<stdout>:  sample_input_file ............................... None
+[1,0]<stdout>:  sample_output_file .............................. None
+[1,0]<stdout>:  sample_rate ..................................... 1.0[1,0]<stdout>:
+[1,0]<stdout>:  save ............................................ None[1,0]<stdout>:
+[1,0]<stdout>:  save_interval ................................... None
+[1,0]<stdout>:  scatter_gather_tensors_in_pipeline .............. True
+[1,0]<stdout>:  scattered_embeddings ............................ False
+[1,0]<stdout>:  seed ............................................ 1234
+[1,0]<stdout>:  seq_length ...................................... 30
+[1,0]<stdout>:  sgd_momentum .................................... 0.9
+[1,0]<stdout>:  short_seq_prob .................................. 0.1
+[1,0]<stdout>:  split ........................................... 969, 30, 1
+[1,0]<stdout>:  split_transformers .............................. False
+[1,0]<stdout>:  synchronize_each_layer .......................... False
+[1,0]<stdout>:  temperature ..................................... 1.0[1,0]<stdout>:
+[1,0]<stdout>:  tensor_model_parallel_size ...................... 1
+[1,0]<stdout>:  tensorboard_dir ................................. None
+[1,0]<stdout>:  tensorboard_log_interval ........................ 1
+[1,0]<stdout>:  tensorboard_queue_size .......................... 1000
+[1,0]<stdout>:  tile_factor ..................................... 1[1,0]<stdout>:
+[1,0]<stdout>:  titles_data_path ................................ None[1,0]<stdout>:
+[1,0]<stdout>:  tokenizer_type .................................. GPT2BPETokenizer[1,0]<stdout>:
+[1,0]<stdout>:  top_k ........................................... 0
+[1,0]<stdout>:  top_p ........................................... 0.9
+[1,0]<stdout>:  topk ............................................ 1
+[1,0]<stdout>:  train_iters ..................................... None
+[1,0]<stdout>:  train_samples ................................... None
+[1,0]<stdout>:  train_tokens .................................... None
+[1,0]<stdout>:  use_checkpoint_lr_scheduler ..................... False
+[1,0]<stdout>:  use_contiguous_buffers_in_ddp ................... False
+[1,0]<stdout>:  use_cpu_initialization .......................... None[1,0]<stdout>:
+[1,0]<stdout>:  use_one_sent_docs ............................... False
+[1,0]<stdout>:  use_pin_memory .................................. False
+[1,0]<stdout>:  virtual_pipeline_model_parallel_size ............ None
+[1,0]<stdout>:  vocab_extra_ids ................................. 0
+[1,0]<stdout>:  vocab_file ...................................... gpt2-vocab.json[1,0]<stdout>:
+[1,0]<stdout>:  weight_decay .................................... 0.01
+[1,0]<stdout>:  world_size ...................................... 16
+[1,0]<stdout>:  zero_allgather_bucket_size ...................... 0.0
+[1,0]<stdout>:  zero_contigious_gradients ....................... False
+[1,0]<stdout>:  zero_reduce_bucket_size ......................... 0.0[1,0]<stdout>:
+[1,0]<stdout>:  zero_reduce_scatter ............................. False
+[1,0]<stdout>:  zero_stage ...................................... 1.0
+[1,0]<stdout>:-------------------- end of arguments ---------------------
+[1,0]<stdout>:setting number of micro-batches to constant 1
+[1,0]<stdout>:> building GPT2BPETokenizer tokenizer ...
+[1,0]<stdout>: > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+[1,0]<stdout>:> initializing torch distributed ...
+[1,0]<stdout>:[2021-12-09 07:07:49,753] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,7]<stdout>:[2021-12-09 07:07:49,755] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,3]<stdout>:[2021-12-09 07:07:49,791] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,4]<stdout>:[2021-12-09 07:07:49,808] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,6]<stdout>:[2021-12-09 07:07:49,821] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,2]<stdout>:[2021-12-09 07:07:49,825] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,8]<stdout>:[2021-12-09 07:07:49,825] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,13]<stdout>:[2021-12-09 07:07:49,825] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,10]<stdout>:[2021-12-09 07:07:49,825] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,12]<stdout>:[2021-12-09 07:07:49,825] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,9]<stdout>:[2021-12-09 07:07:49,827] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,11]<stdout>:[2021-12-09 07:07:49,828] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,15]<stdout>:[2021-12-09 07:07:49,829] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,14]<stdout>:[2021-12-09 07:07:49,830] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,5]<stdout>:[2021-12-09 07:07:49,833] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,1]<stdout>:[2021-12-09 07:07:49,835] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,4]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=4, local_rank=4, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,7]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=7, local_rank=7, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,7]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,6]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=6, local_rank=6, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,6]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,5]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=5, local_rank=5, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,5]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,4]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,1]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=1, local_rank=1, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,1]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,2]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=2, local_rank=2, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,2]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,3]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=3, local_rank=3, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,3]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,9]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=9, local_rank=1, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,8]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=8, local_rank=0, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,8]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,10]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=10, local_rank=2, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,10]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,9]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,11]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=11, local_rank=3, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,11]<stdout>:[2021-12-09 07:07:49,929] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,0]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=0, local_rank=0, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,0]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,12]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=12, local_rank=4, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,13]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=13, local_rank=5, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,14]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=14, local_rank=6, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,12]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,13]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,15]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=15, local_rank=7, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,14]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,15]<stdout>:[2021-12-09 07:07:49,930] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,0]<stdout>:> initializing tensor model parallel with size 1
+[1,0]<stdout>:> initializing pipeline model parallel with size 1
+[1,0]<stdout>:> setting random seeds to 1234 ...
+[1,0]<stdout>:> initializing model parallel cuda seeds on global rank 0, model parallel rank 0, and data parallel rank 0 with model parallel seed: 3952 and data parallel seed: 1234
+[1,0]<stdout>:> compiling dataset index builder ...
+[1,0]<stdout>:make: Entering directory '/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/data'
+[1,0]<stdout>:make: Nothing to be done for 'default'.
+[1,0]<stdout>:make: Leaving directory '/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/data'
+[1,0]<stdout>:>>> done with dataset index builder. Compilation time: 0.090 seconds
+[1,0]<stdout>:WARNING: constraints for invoking optimized fused softmax kernel are not met. We default back to unfused kernel invocations.
+[1,0]<stdout>:> compiling and loading fused kernels ...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module scaled_upper_triang_masked_softmax_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module scaled_upper_triang_masked_softmax_cuda...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module scaled_masked_softmax_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module scaled_masked_softmax_cuda...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module fused_mix_prec_layer_norm_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module fused_mix_prec_layer_norm_cuda...
+[1,0]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,0]<stdout>:>>> done with compiling and loading fused kernels. Compilation time: 11.008 seconds
+[1,0]<stdout>:[2021-12-09 07:08:02,854] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed groups
+[1,0]<stdout>:[2021-12-09 07:08:02,854] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed model parallel group with size 1
+[1,0]<stdout>:[2021-12-09 07:08:03,028] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed expert parallel group with size 16
+[1,0]<stdout>:[2021-12-09 07:08:03,029] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [0]
+[1,0]<stdout>:[2021-12-09 07:08:03,049] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [1]
+[1,0]<stdout>:[2021-12-09 07:08:03,060] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [2]
+[1,0]<stdout>:[2021-12-09 07:08:03,060] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [3]
+[1,0]<stdout>:[2021-12-09 07:08:03,070] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [4]
+[1,0]<stdout>:[2021-12-09 07:08:03,080] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [5]
+[1,0]<stdout>:[2021-12-09 07:08:03,090] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [6]
+[1,0]<stdout>:[2021-12-09 07:08:03,101] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [7]
+[1,0]<stdout>:[2021-12-09 07:08:03,111] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [8]
+[1,0]<stdout>:[2021-12-09 07:08:03,121] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [9]
+[1,0]<stdout>:[2021-12-09 07:08:03,132] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [10]
+[1,0]<stdout>:[2021-12-09 07:08:03,142] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [11]
+[1,0]<stdout>:[2021-12-09 07:08:03,152] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [12]
+[1,0]<stdout>:[2021-12-09 07:08:03,162] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [13]
+[1,0]<stdout>:[2021-12-09 07:08:03,173] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [14]
+[1,0]<stdout>:[2021-12-09 07:08:03,183] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [15]
+[1,0]<stdout>:[2021-12-09 07:08:03,194] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert parallel process group with ranks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+[1,0]<stdout>:building GPT model ...
+[1,0]<stdout>:[2021-12-09 07:08:03,250] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,312] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,399] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,490] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,586] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,684] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,781] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,877] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:03,975] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,072] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,170] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,265] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,360] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,455] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:08:04,551] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stderr>:Traceback (most recent call last):
+[1,0]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,0]<stderr>:    main()
+[1,0]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,0]<stderr>:    model = get_model(model_provider)
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,0]<stderr>:    model = model_provider_func(
+[1,0]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,0]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,0]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,0]<stderr>:    language_model = TransformerLanguageModel(
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,0]<stderr>:    self.encoder = ParallelTransformer(
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,0]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,0]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,0]<stderr>:    return ParallelTransformerLayer(
+[1,0]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,0]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,0]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,0]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,0]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,7]<stderr>:Traceback (most recent call last):
+[1,7]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,7]<stderr>:    main()
+[1,7]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,7]<stderr>:    model = get_model(model_provider)
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,7]<stderr>:    model = model_provider_func(
+[1,7]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,7]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,7]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,7]<stderr>:    language_model = TransformerLanguageModel(
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,7]<stderr>:    self.encoder = ParallelTransformer(
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,7]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,7]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,0]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,0]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,7]<stderr>:    return ParallelTransformerLayer(
+[1,7]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,0]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,7]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,7]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,0]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,7]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,7]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,0]<stderr>:    state = deepcopy(state, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,7]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,7]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,0]<stderr>:    y = copier(x, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,7]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,7]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,10]<stderr>:Traceback (most recent call last):
+[1,10]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,10]<stderr>:    main()
+[1,10]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,10]<stderr>:    model = get_model(model_provider)
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,10]<stderr>:    model = model_provider_func(
+[1,10]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,10]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,10]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,10]<stderr>:    language_model = TransformerLanguageModel(
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,10]<stderr>:    self.encoder = ParallelTransformer(
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,10]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,10]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,10]<stderr>:    return ParallelTransformerLayer(
+[1,10]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,10]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,10]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,10]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,10]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,10]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,10]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,10]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,10]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,10]<stderr>:    state = deepcopy(state, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,10]<stderr>:    y = copier(x, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,10]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,10]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,10]<stderr>:    value = deepcopy(value, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,10]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,10]<stderr>:    state = deepcopy(state, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,10]<stderr>:    y = copier(x, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,10]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,10]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,10]<stderr>:    value = deepcopy(value, memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,10]<stderr>:    y = copier(memo)
+[1,10]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,10]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,10]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 2; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,0]<stderr>:    value = deepcopy(value, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,7]<stderr>:    state = deepcopy(state, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,7]<stderr>:    y = copier(x, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,0]<stderr>:    state = deepcopy(state, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,7]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:    y = copier(x, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,7]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,0]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,7]<stderr>:    value = deepcopy(value, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,7]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,7]<stderr>:    state = deepcopy(state, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,0]<stderr>:    value = deepcopy(value, memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,0]<stderr>:    y = copier(memo)
+[1,0]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,7]<stderr>:    y = copier(x, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,0]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,7]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,0]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 0; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,7]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,7]<stderr>:    value = deepcopy(value, memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,7]<stderr>:    y = copier(memo)
+[1,7]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,7]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,7]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 7; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,15]<stderr>:Traceback (most recent call last):
+[1,15]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,15]<stderr>:    main()
+[1,15]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,15]<stderr>:    model = get_model(model_provider)
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,15]<stderr>:    model = model_provider_func(
+[1,15]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,15]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,15]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,15]<stderr>:    language_model = TransformerLanguageModel(
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,15]<stderr>:    self.encoder = ParallelTransformer(
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,15]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,15]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,15]<stderr>:    return ParallelTransformerLayer(
+[1,15]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,15]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,15]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,15]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,15]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,15]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,15]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,15]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,15]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,15]<stderr>:    state = deepcopy(state, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,15]<stderr>:    y = copier(x, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,15]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,15]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,15]<stderr>:    value = deepcopy(value, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,15]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,15]<stderr>:    state = deepcopy(state, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,15]<stderr>:    y = copier(x, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,15]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,15]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,15]<stderr>:    value = deepcopy(value, memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,15]<stderr>:    y = copier(memo)
+[1,15]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,15]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,15]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 7; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,8]<stderr>:Traceback (most recent call last):
+[1,8]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,8]<stderr>:    main()
+[1,8]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,8]<stderr>:    model = get_model(model_provider)
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,8]<stderr>:    model = model_provider_func(
+[1,8]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,8]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,8]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,8]<stderr>:    language_model = TransformerLanguageModel(
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,8]<stderr>:    self.encoder = ParallelTransformer(
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,8]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,8]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,8]<stderr>:    return ParallelTransformerLayer(
+[1,8]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,8]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,8]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,8]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,8]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,8]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,8]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,8]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,8]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,8]<stderr>:    state = deepcopy(state, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,8]<stderr>:    y = copier(x, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,8]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,8]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,8]<stderr>:    value = deepcopy(value, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,8]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,8]<stderr>:    state = deepcopy(state, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,8]<stderr>:    y = copier(x, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,8]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,8]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,8]<stderr>:    value = deepcopy(value, memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,8]<stderr>:    y = copier(memo)
+[1,8]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,8]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,8]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 0; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,2]<stderr>:Traceback (most recent call last):
+[1,2]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,2]<stderr>:    main()
+[1,2]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,2]<stderr>:    model = get_model(model_provider)
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,2]<stderr>:    model = model_provider_func(
+[1,2]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,2]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,2]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,2]<stderr>:    language_model = TransformerLanguageModel(
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,2]<stderr>:    self.encoder = ParallelTransformer(
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,2]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,2]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,2]<stderr>:    return ParallelTransformerLayer(
+[1,2]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,2]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,2]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,2]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,2]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,2]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,2]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,2]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,2]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,2]<stderr>:    state = deepcopy(state, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,2]<stderr>:    y = copier(x, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,2]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,2]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,2]<stderr>:    value = deepcopy(value, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,2]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,2]<stderr>:    state = deepcopy(state, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,2]<stderr>:    y = copier(x, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,2]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,2]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,2]<stderr>:    value = deepcopy(value, memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,2]<stderr>:    y = copier(memo)
+[1,2]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,2]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,2]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 2; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,6]<stderr>:Traceback (most recent call last):
+[1,6]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,6]<stderr>:    main()
+[1,6]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,6]<stderr>:    model = get_model(model_provider)
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,6]<stderr>:    model = model_provider_func(
+[1,6]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,6]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,6]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,6]<stderr>:    language_model = TransformerLanguageModel(
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,6]<stderr>:    self.encoder = ParallelTransformer(
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,6]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,6]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,6]<stderr>:    return ParallelTransformerLayer(
+[1,6]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,6]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,6]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,6]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,6]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,6]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,6]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,6]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,6]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,6]<stderr>:    state = deepcopy(state, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,6]<stderr>:    y = copier(x, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,6]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,6]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,6]<stderr>:    value = deepcopy(value, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,6]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,6]<stderr>:    state = deepcopy(state, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,6]<stderr>:    y = copier(x, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,6]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,6]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,6]<stderr>:    value = deepcopy(value, memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,6]<stderr>:    y = copier(memo)
+[1,6]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,6]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,6]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 6; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,5]<stderr>:Traceback (most recent call last):
+[1,5]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,5]<stderr>:    main()
+[1,5]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,5]<stderr>:    model = get_model(model_provider)
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,5]<stderr>:    model = model_provider_func(
+[1,5]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,5]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,5]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,5]<stderr>:    language_model = TransformerLanguageModel(
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,5]<stderr>:    self.encoder = ParallelTransformer(
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,5]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,5]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,5]<stderr>:    return ParallelTransformerLayer(
+[1,5]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,5]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,5]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,5]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,5]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,5]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,5]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,5]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,5]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,5]<stderr>:    state = deepcopy(state, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,5]<stderr>:    y = copier(x, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,5]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,5]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,5]<stderr>:    value = deepcopy(value, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,5]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,5]<stderr>:    state = deepcopy(state, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,5]<stderr>:    y = copier(x, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,5]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,5]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,5]<stderr>:    value = deepcopy(value, memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,5]<stderr>:    y = copier(memo)
+[1,5]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,5]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,5]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 5; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,3]<stderr>:Traceback (most recent call last):
+[1,3]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,3]<stderr>:    main()
+[1,3]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,3]<stderr>:    model = get_model(model_provider)
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,3]<stderr>:    model = model_provider_func(
+[1,3]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,3]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,3]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,3]<stderr>:    language_model = TransformerLanguageModel(
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,3]<stderr>:    self.encoder = ParallelTransformer(
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,3]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,3]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,3]<stderr>:    return ParallelTransformerLayer(
+[1,3]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,3]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,3]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,3]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,3]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,3]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,3]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,3]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,3]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,3]<stderr>:    state = deepcopy(state, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,3]<stderr>:    y = copier(x, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,3]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,3]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,3]<stderr>:    value = deepcopy(value, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,3]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,3]<stderr>:    state = deepcopy(state, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,3]<stderr>:    y = copier(x, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,3]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,3]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,3]<stderr>:    value = deepcopy(value, memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,3]<stderr>:    y = copier(memo)
+[1,3]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,3]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,3]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 3; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,14]<stderr>:Traceback (most recent call last):
+[1,14]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,14]<stderr>:    main()
+[1,14]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,14]<stderr>:    model = get_model(model_provider)
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,14]<stderr>:    model = model_provider_func(
+[1,14]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,14]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,14]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,14]<stderr>:    language_model = TransformerLanguageModel(
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,14]<stderr>:    self.encoder = ParallelTransformer(
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,14]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,14]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,14]<stderr>:    return ParallelTransformerLayer(
+[1,14]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,14]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,14]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,14]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,14]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,14]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,14]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,14]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,14]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,14]<stderr>:    state = deepcopy(state, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,14]<stderr>:    y = copier(x, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,14]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,14]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,14]<stderr>:    value = deepcopy(value, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,14]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,14]<stderr>:    state = deepcopy(state, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,14]<stderr>:    y = copier(x, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,14]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,14]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,14]<stderr>:    value = deepcopy(value, memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,14]<stderr>:    y = copier(memo)
+[1,14]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,14]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,14]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 6; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,4]<stderr>:Traceback (most recent call last):
+[1,4]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,4]<stderr>:    main()
+[1,4]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,4]<stderr>:    model = get_model(model_provider)
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,4]<stderr>:    model = model_provider_func(
+[1,4]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,4]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,4]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,4]<stderr>:    language_model = TransformerLanguageModel(
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,4]<stderr>:    self.encoder = ParallelTransformer(
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,4]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,4]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,4]<stderr>:    return ParallelTransformerLayer(
+[1,4]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,4]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,4]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,4]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,4]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,4]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,4]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,4]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,4]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,4]<stderr>:    state = deepcopy(state, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,4]<stderr>:    y = copier(x, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,4]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,4]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,4]<stderr>:    value = deepcopy(value, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,4]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,4]<stderr>:    state = deepcopy(state, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,1]<stderr>:Traceback (most recent call last):
+[1,1]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,4]<stderr>:    y = copier(x, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,4]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,4]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,4]<stderr>:    value = deepcopy(value, memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,4]<stderr>:    y = copier(memo)
+[1,4]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,4]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,1]<stderr>:    main()
+[1,1]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,4]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 4; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)[1,4]<stderr>:
+[1,1]<stderr>:    model = get_model(model_provider)
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,1]<stderr>:    model = model_provider_func(
+[1,1]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,1]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,1]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,1]<stderr>:    language_model = TransformerLanguageModel(
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,1]<stderr>:    self.encoder = ParallelTransformer(
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,1]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,1]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,1]<stderr>:    return ParallelTransformerLayer(
+[1,1]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,1]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,1]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,1]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,1]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,1]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,1]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,1]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,1]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,1]<stderr>:    state = deepcopy(state, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,1]<stderr>:    y = copier(x, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,1]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,1]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,1]<stderr>:    value = deepcopy(value, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,1]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,1]<stderr>:    state = deepcopy(state, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,1]<stderr>:    y = copier(x, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,1]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,1]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,1]<stderr>:    value = deepcopy(value, memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,1]<stderr>:    y = copier(memo)
+[1,1]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,1]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,1]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 1; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,12]<stderr>:Traceback (most recent call last):
+[1,12]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,12]<stderr>:    main()
+[1,12]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,12]<stderr>:    model = get_model(model_provider)
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,12]<stderr>:    model = model_provider_func(
+[1,12]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,12]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,12]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,12]<stderr>:    language_model = TransformerLanguageModel(
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,12]<stderr>:    self.encoder = ParallelTransformer(
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,12]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,12]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,12]<stderr>:    return ParallelTransformerLayer(
+[1,12]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,12]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,12]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,12]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,12]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,12]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,12]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,12]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,12]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,12]<stderr>:    state = deepcopy(state, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,12]<stderr>:    y = copier(x, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,12]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,12]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,12]<stderr>:    value = deepcopy(value, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,12]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,12]<stderr>:    state = deepcopy(state, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,12]<stderr>:    y = copier(x, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,12]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,12]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,12]<stderr>:    value = deepcopy(value, memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,12]<stderr>:    y = copier(memo)
+[1,12]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,12]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,12]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 4; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,9]<stderr>:Traceback (most recent call last):
+[1,9]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,9]<stderr>:    main()
+[1,9]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,9]<stderr>:    model = get_model(model_provider)
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,9]<stderr>:    model = model_provider_func(
+[1,9]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,9]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,9]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,9]<stderr>:    language_model = TransformerLanguageModel(
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,9]<stderr>:    self.encoder = ParallelTransformer(
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,9]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,9]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,9]<stderr>:    return ParallelTransformerLayer(
+[1,9]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,9]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,9]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,9]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,9]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,9]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,9]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,9]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,9]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,9]<stderr>:    state = deepcopy(state, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,9]<stderr>:    y = copier(x, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,9]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,9]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,9]<stderr>:    value = deepcopy(value, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,9]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,9]<stderr>:    state = deepcopy(state, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,9]<stderr>:    y = copier(x, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,9]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,9]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,9]<stderr>:    value = deepcopy(value, memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,9]<stderr>:    y = copier(memo)
+[1,9]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,9]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,9]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 1; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,13]<stderr>:Traceback (most recent call last):
+[1,13]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,13]<stderr>:    main()
+[1,13]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,13]<stderr>:    model = get_model(model_provider)
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,13]<stderr>:    model = model_provider_func(
+[1,13]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,13]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,13]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,13]<stderr>:    language_model = TransformerLanguageModel(
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,13]<stderr>:    self.encoder = ParallelTransformer(
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,13]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,13]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,13]<stderr>:    return ParallelTransformerLayer(
+[1,13]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,13]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,13]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,13]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,13]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,13]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,13]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,13]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,13]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,13]<stderr>:    state = deepcopy(state, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,13]<stderr>:    y = copier(x, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,13]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,13]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,13]<stderr>:    value = deepcopy(value, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,13]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,13]<stderr>:    state = deepcopy(state, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,13]<stderr>:    y = copier(x, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,13]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,13]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,13]<stderr>:    value = deepcopy(value, memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,13]<stderr>:    y = copier(memo)
+[1,13]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,13]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,13]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 5; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+[1,11]<stderr>:Traceback (most recent call last):
+[1,11]<stderr>:  File "tools/generate_samples_gpt.py", line 220, in <module>
+[1,11]<stderr>:    main()
+[1,11]<stderr>:  File "tools/generate_samples_gpt.py", line 124, in main
+[1,11]<stderr>:    model = get_model(model_provider)
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/training.py", line 232, in get_model
+[1,11]<stderr>:    model = model_provider_func(
+[1,11]<stderr>:  File "tools/generate_samples_gpt.py", line 40, in model_provider
+[1,11]<stderr>:    model = GPTModel(num_tokentypes=0, parallel_output=False,
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/gpt_model.py", line 83, in __init__
+[1,11]<stderr>:    self.language_model, self._language_model_key = get_language_model(
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 62, in get_language_model
+[1,11]<stderr>:    language_model = TransformerLanguageModel(
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/language_model.py", line 341, in __init__
+[1,11]<stderr>:    self.encoder = ParallelTransformer(
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in __init__
+[1,11]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 649, in <listcomp>
+[1,11]<stderr>:    [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 619, in build_layer
+[1,11]<stderr>:    return ParallelTransformerLayer(
+[1,11]<stderr>:  File "/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/model/transformer.py", line 448, in __init__
+[1,11]<stderr>:    self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
+[1,11]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/layer.py", line 71, in __init__
+[1,11]<stderr>:    experts = Experts(expert, num_local_experts)
+[1,11]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in __init__
+[1,11]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,11]<stderr>:  File "/home/amawa/DeepSpeed/deepspeed/moe/experts.py", line 14, in <listcomp>
+[1,11]<stderr>:    [copy.deepcopy(expert) for i in range(num_local_experts)])
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,11]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,11]<stderr>:    state = deepcopy(state, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,11]<stderr>:    y = copier(x, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,11]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,11]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,11]<stderr>:    value = deepcopy(value, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,11]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 270, in _reconstruct
+[1,11]<stderr>:    state = deepcopy(state, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 146, in deepcopy
+[1,11]<stderr>:    y = copier(x, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 230, in _deepcopy_dict
+[1,11]<stderr>:    y[deepcopy(key, memo)] = deepcopy(value, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 172, in deepcopy
+[1,11]<stderr>:    y = _reconstruct(x, memo, *rv)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 296, in _reconstruct
+[1,11]<stderr>:    value = deepcopy(value, memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/copy.py", line 153, in deepcopy
+[1,11]<stderr>:    y = copier(memo)
+[1,11]<stderr>:  File "/opt/conda/lib/python3.8/site-packages/torch/nn/parameter.py", line 32, in __deepcopy__
+[1,11]<stderr>:    result = type(self)(self.data.clone(memory_format=torch.preserve_format), self.requires_grad)
+[1,11]<stderr>:RuntimeError: CUDA out of memory. Tried to allocate 128.00 MiB (GPU 3; 39.59 GiB total capacity; 37.89 GiB already allocated; 119.19 MiB free; 37.89 GiB reserved in total by PyTorch)
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[1938,1],0]
+  Exit code:    1
+--------------------------------------------------------------------------

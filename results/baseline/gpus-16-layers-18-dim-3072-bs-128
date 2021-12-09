@@ -1,0 +1,538 @@
+Warning: Permanently added '[192.168.0.71]:43529' (ECDSA) to the list of known hosts.
+Warning: Permanently added '[192.168.0.34]:45820' (ECDSA) to the list of known hosts.
+Warning: Permanently added '[192.168.0.87]:46844' (ECDSA) to the list of known hosts.
+[1,4]<stdout>:[2021-12-09 07:04:42,181] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,7]<stdout>:[2021-12-09 07:04:42,208] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,1]<stdout>:[2021-12-09 07:04:42,316] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,0]<stdout>:using world size: 16, data-parallel-size: 16, tensor-model-parallel size: 1, pipeline-model-parallel size: 1 
+[1,0]<stdout>:WARNING: overriding default arguments for tokenizer_type:GPT2BPETokenizer                        with tokenizer_type:GPT2BPETokenizer
+[1,0]<stdout>:setting global batch size to 2048
+[1,0]<stdout>:using torch.float16 for parameters ...
+[1,0]<stdout>:------------------------ arguments ------------------------
+[1,0]<stdout>:  accumulate_allreduce_grads_in_fp32 .............. False
+[1,0]<stdout>:  adam_beta1 ...................................... 0.9
+[1,0]<stdout>:  adam_beta2 ...................................... 0.999
+[1,0]<stdout>:  adam_eps ........................................ 1e-08
+[1,0]<stdout>:  adlr_autoresume ................................. False
+[1,0]<stdout>:  adlr_autoresume_interval ........................ 1000
+[1,0]<stdout>:  apply_query_key_layer_scaling ................... True
+[1,0]<stdout>:  apply_residual_connection_post_layernorm ........ False
+[1,0]<stdout>:  attention_dropout ............................... 0.1[1,0]<stdout>:
+[1,0]<stdout>:  attention_softmax_in_fp32 ....................... False
+[1,0]<stdout>:  bert_binary_head ................................ True
+[1,0]<stdout>:  bert_load ....................................... None
+[1,0]<stdout>:  bf16 ............................................ False
+[1,0]<stdout>:  bias_dropout_fusion ............................. True
+[1,0]<stdout>:  bias_gelu_fusion ................................ True
+[1,0]<stdout>:  biencoder_projection_dim ........................ 0
+[1,0]<stdout>:  biencoder_shared_query_context_model ............ False
+[1,0]<stdout>:  block_data_path ................................. None
+[1,0]<stdout>:  checkpoint_activations .......................... False[1,0]<stdout>:
+[1,0]<stdout>:  checkpoint_in_cpu ............................... False
+[1,0]<stdout>:  checkpoint_num_layers ........................... 1
+[1,0]<stdout>:  clip_grad ....................................... 1.0
+[1,0]<stdout>:  consumed_train_samples .......................... 0
+[1,0]<stdout>:  consumed_train_tokens ........................... 0
+[1,0]<stdout>:  consumed_valid_samples .......................... 0
+[1,0]<stdout>:  contigious_checkpointing ........................ False
+[1,0]<stdout>:  cpu_optimizer ................................... False[1,0]<stdout>:
+[1,0]<stdout>:  cpu_torch_adam .................................. False
+[1,0]<stdout>:  curriculum_learning ............................. False
+[1,0]<stdout>:  data_impl ....................................... infer
+[1,0]<stdout>:  data_parallel_size .............................. 16
+[1,0]<stdout>:  data_path ....................................... None
+[1,0]<stdout>:  dataloader_type ................................. single
+[1,0]<stdout>:  DDP_impl ........................................ local[1,0]<stdout>:
+[1,0]<stdout>:  decoder_seq_length .............................. None
+[1,0]<stdout>:  deepscale ....................................... False
+[1,0]<stdout>:  deepscale_config ................................ None
+[1,0]<stdout>:  deepspeed ....................................... True
+[1,0]<stdout>:  deepspeed_activation_checkpointing .............. False
+[1,0]<stdout>:  deepspeed_config ................................ None
+[1,0]<stdout>:  deepspeed_mpi ................................... False
+[1,0]<stdout>:  distribute_checkpointed_activations ............. False
+[1,0]<stdout>:  distributed_backend ............................. nccl
+[1,0]<stdout>:  ds_inference .................................... False
+[1,0]<stdout>:  embedding_path .................................. None
+[1,0]<stdout>:  encoder_seq_length .............................. 30
+[1,0]<stdout>:  eod_mask_loss ................................... False
+[1,0]<stdout>:  eval_interval ................................... 1000
+[1,0]<stdout>:  eval_iters ...................................... 100
+[1,0]<stdout>:  evidence_data_path .............................. None
+[1,0]<stdout>:  exit_duration_in_mins ........................... None
+[1,0]<stdout>:  exit_interval ................................... None
+[1,0]<stdout>:  expert_interval ................................. 2
+[1,0]<stdout>:  ffn_hidden_size ................................. 12288
+[1,0]<stdout>:  finetune ........................................ False
+[1,0]<stdout>:  fp16 ............................................ True
+[1,0]<stdout>:  fp16_lm_cross_entropy ........................... False
+[1,0]<stdout>:  fp32_residual_connection ........................ False
+[1,0]<stdout>:  genfile ......................................... unconditional_samples.json
+[1,0]<stdout>:  global_batch_size ............................... 2048
+[1,0]<stdout>:  greedy .......................................... False
+[1,0]<stdout>:  hidden_dropout .................................. 0.1
+[1,0]<stdout>:  hidden_size ..................................... 3072
+[1,0]<stdout>:  hysteresis ...................................... 2
+[1,0]<stdout>:  ict_head_size ................................... None
+[1,0]<stdout>:  ict_load ........................................ None
+[1,0]<stdout>:  img_dim ......................................... 224
+[1,0]<stdout>:  indexer_batch_size .............................. 128
+[1,0]<stdout>:  indexer_log_interval ............................ 1000
+[1,0]<stdout>:  init_method_std ................................. 0.02[1,0]<stdout>:
+[1,0]<stdout>:  init_method_xavier_uniform ...................... False
+[1,0]<stdout>:  initial_loss_scale .............................. 4294967296
+[1,0]<stdout>:  kv_channels ..................................... 96
+[1,0]<stdout>:  layernorm_epsilon ............................... 1e-05
+[1,0]<stdout>:  lazy_mpu_init ................................... None
+[1,0]<stdout>:  load ............................................ checkpoints/gpt2_345m
+[1,0]<stdout>:  local_rank ...................................... None
+[1,0]<stdout>:  log_batch_size_to_tensorboard ................... False
+[1,0]<stdout>:  log_interval .................................... 1
+[1,0]<stdout>:  log_learning_rate_to_tensorboard ................ True
+[1,0]<stdout>:  log_loss_scale_to_tensorboard ................... True
+[1,0]<stdout>:  log_num_zeros_in_grad ........................... False
+[1,0]<stdout>:  log_params_norm ................................. False
+[1,0]<stdout>:  log_timers_to_tensorboard ....................... False
+[1,0]<stdout>:  log_validation_ppl_to_tensorboard ............... False
+[1,0]<stdout>:  loss_scale ...................................... None
+[1,0]<stdout>:  loss_scale_window ............................... 1000
+[1,0]<stdout>:  lr .............................................. None
+[1,0]<stdout>:  lr_decay_iters .................................. None
+[1,0]<stdout>:  lr_decay_samples ................................ None
+[1,0]<stdout>:  lr_decay_style .................................. linear
+[1,0]<stdout>:  lr_decay_tokens ................................. None[1,0]<stdout>:
+[1,0]<stdout>:  lr_warmup_fraction .............................. None
+[1,0]<stdout>:  lr_warmup_iters ................................. 0
+[1,0]<stdout>:  lr_warmup_samples ............................... 0
+[1,0]<stdout>:  make_vocab_size_divisible_by .................... 128
+[1,0]<stdout>:  mask_prob ....................................... 0.15
+[1,0]<stdout>:  masked_softmax_fusion ........................... True
+[1,0]<stdout>:  max_position_embeddings ......................... 1024
+[1,0]<stdout>:  memory_centric_tiled_linear ..................... False
+[1,0]<stdout>:  merge_file ...................................... gpt2-merges.txt
+[1,0]<stdout>:  micro_batch_size ................................ 128
+[1,0]<stdout>:  min_loss_scale .................................. 1.0
+[1,0]<stdout>:  min_lr .......................................... 0.0
+[1,0]<stdout>:  mmap_warmup ..................................... False
+[1,0]<stdout>:  moe_eval_capacity_factor ........................ 1.0
+[1,0]<stdout>:  moe_min_capacity ................................ 4
+[1,0]<stdout>:  moe_token_dropping .............................. True
+[1,0]<stdout>:  moe_train_capacity_factor ....................... 1.0
+[1,0]<stdout>:  no_load_optim ................................... True
+[1,0]<stdout>:  no_load_rng ..................................... True
+[1,0]<stdout>:  no_save_optim ................................... None
+[1,0]<stdout>:  no_save_rng ..................................... None[1,0]<stdout>:
+[1,0]<stdout>:  num_attention_heads ............................. 32
+[1,0]<stdout>:  num_channels .................................... 3
+[1,0]<stdout>:  num_classes ..................................... 1000
+[1,0]<stdout>:  num_experts ..................................... 128
+[1,0]<stdout>:  num_layers ...................................... 18
+[1,0]<stdout>:  num_layers_per_virtual_pipeline_stage ........... None[1,0]<stdout>:
+[1,0]<stdout>:  num_samples ..................................... 2560
+[1,0]<stdout>:  num_workers ..................................... 2
+[1,0]<stdout>:  onnx_safe ....................................... None
+[1,0]<stdout>:  openai_gelu ..................................... False
+[1,0]<stdout>:  optimizer ....................................... adam
+[1,0]<stdout>:  out_seq_length .................................. 30
+[1,0]<stdout>:  override_lr_scheduler ........................... False
+[1,0]<stdout>:  params_dtype .................................... torch.float16
+[1,0]<stdout>:  partition_activations ........................... False[1,0]<stdout>:
+[1,0]<stdout>:  patch_dim ....................................... 16
+[1,0]<stdout>:  pipeline_model_parallel_size .................... 1
+[1,0]<stdout>:  profile_backward ................................ False
+[1,0]<stdout>:  query_in_block_prob ............................. 0.1
+[1,0]<stdout>:  rampup_batch_size ............................... None
+[1,0]<stdout>:  rank ............................................ 0[1,0]<stdout>:
+[1,0]<stdout>:  recompute ....................................... False
+[1,0]<stdout>:  remote_device ................................... none
+[1,0]<stdout>:  reset_attention_mask ............................ False
+[1,0]<stdout>:  reset_position_ids .............................. False
+[1,0]<stdout>:  retriever_report_topk_accuracies ................ []
+[1,0]<stdout>:  retriever_score_scaling ......................... False[1,0]<stdout>:
+[1,0]<stdout>:  retriever_seq_length ............................ 256
+[1,0]<stdout>:  sample_input_file ............................... None
+[1,0]<stdout>:  sample_output_file .............................. None
+[1,0]<stdout>:  sample_rate ..................................... 1.0
+[1,0]<stdout>:  save ............................................ None
+[1,0]<stdout>:  save_interval ................................... None
+[1,0]<stdout>:  scatter_gather_tensors_in_pipeline .............. True
+[1,0]<stdout>:  scattered_embeddings ............................ False
+[1,0]<stdout>:  seed ............................................ 1234
+[1,0]<stdout>:  seq_length ...................................... 30
+[1,0]<stdout>:  sgd_momentum .................................... 0.9
+[1,0]<stdout>:  short_seq_prob .................................. 0.1
+[1,0]<stdout>:  split ........................................... 969, 30, 1
+[1,0]<stdout>:  split_transformers .............................. False
+[1,0]<stdout>:  synchronize_each_layer .......................... False
+[1,0]<stdout>:  temperature ..................................... 1.0[1,0]<stdout>:
+[1,0]<stdout>:  tensor_model_parallel_size ...................... 1
+[1,0]<stdout>:  tensorboard_dir ................................. None
+[1,0]<stdout>:  tensorboard_log_interval ........................ 1
+[1,0]<stdout>:  tensorboard_queue_size .......................... 1000
+[1,0]<stdout>:  tile_factor ..................................... 1
+[1,0]<stdout>:  titles_data_path ................................ None
+[1,0]<stdout>:  tokenizer_type .................................. GPT2BPETokenizer[1,0]<stdout>:
+[1,0]<stdout>:  top_k ........................................... 0
+[1,0]<stdout>:  top_p ........................................... 0.9[1,0]<stdout>:
+[1,0]<stdout>:  topk ............................................ 1
+[1,0]<stdout>:  train_iters ..................................... None
+[1,0]<stdout>:  train_samples ................................... None
+[1,0]<stdout>:  train_tokens .................................... None
+[1,0]<stdout>:  use_checkpoint_lr_scheduler ..................... False
+[1,0]<stdout>:  use_contiguous_buffers_in_ddp ................... False
+[1,0]<stdout>:  use_cpu_initialization .......................... None
+[1,0]<stdout>:  use_one_sent_docs ............................... False
+[1,0]<stdout>:  use_pin_memory .................................. False
+[1,0]<stdout>:  virtual_pipeline_model_parallel_size ............ None
+[1,0]<stdout>:  vocab_extra_ids ................................. 0
+[1,0]<stdout>:  vocab_file ...................................... gpt2-vocab.json
+[1,0]<stdout>:  weight_decay .................................... 0.01
+[1,0]<stdout>:  world_size ...................................... 16
+[1,0]<stdout>:  zero_allgather_bucket_size ...................... 0.0
+[1,0]<stdout>:  zero_contigious_gradients ....................... False[1,0]<stdout>:
+[1,0]<stdout>:  zero_reduce_bucket_size ......................... 0.0
+[1,0]<stdout>:  zero_reduce_scatter ............................. False
+[1,0]<stdout>:  zero_stage ...................................... 1.0
+[1,0]<stdout>:-------------------- end of arguments ---------------------
+[1,0]<stdout>:setting number of micro-batches to constant 1
+[1,0]<stdout>:> building GPT2BPETokenizer tokenizer ...
+[1,5]<stdout>:[2021-12-09 07:04:42,329] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,2]<stdout>:[2021-12-09 07:04:42,382] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,3]<stdout>:[2021-12-09 07:04:42,403] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,6]<stdout>:[2021-12-09 07:04:42,406] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,0]<stdout>: > padded vocab (size: 50257) with 47 dummy tokens (new size: 50304)
+[1,0]<stdout>:> initializing torch distributed ...
+[1,0]<stdout>:[2021-12-09 07:04:42,417] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,15]<stdout>:[2021-12-09 07:04:42,709] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,9]<stdout>:[2021-12-09 07:04:42,736] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,10]<stdout>:[2021-12-09 07:04:42,768] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,11]<stdout>:[2021-12-09 07:04:42,806] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,14]<stdout>:[2021-12-09 07:04:42,847] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,13]<stdout>:[2021-12-09 07:04:42,861] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,12]<stdout>:[2021-12-09 07:04:42,867] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,8]<stdout>:[2021-12-09 07:04:42,875] [INFO] [distributed.py:36:init_distributed] Not using the DeepSpeed or torch.distributed launchers, attempting to detect MPI environment...
+[1,5]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=5, local_rank=5, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,6]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=6, local_rank=6, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,7]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=7, local_rank=7, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,7]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,4]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=4, local_rank=4, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,4]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,1]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=1, local_rank=1, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,1]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,5]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,2]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=2, local_rank=2, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,2]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,6]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,3]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=3, local_rank=3, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,3]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,9]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=9, local_rank=1, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,8]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=8, local_rank=0, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,8]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,10]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=10, local_rank=2, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,10]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,11]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=11, local_rank=3, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,11]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,9]<stdout>:[2021-12-09 07:04:42,945] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,0]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=0, local_rank=0, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,0]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,12]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=12, local_rank=4, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,13]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=13, local_rank=5, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,14]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=14, local_rank=6, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,15]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:83:mpi_discovery] Discovered MPI settings of world_rank=15, local_rank=7, world_size=16, master_addr=192.168.0.78, master_port=29500
+[1,12]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,13]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,14]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,15]<stdout>:[2021-12-09 07:04:42,947] [INFO] [distributed.py:46:init_distributed] Initializing torch distributed with backend: nccl
+[1,0]<stdout>:> initializing tensor model parallel with size 1
+[1,0]<stdout>:> initializing pipeline model parallel with size 1
+[1,0]<stdout>:> setting random seeds to 1234 ...
+[1,0]<stdout>:> initializing model parallel cuda seeds on global rank 0, model parallel rank 0, and data parallel rank 0 with model parallel seed: 3952 and data parallel seed: 1234
+[1,0]<stdout>:> compiling dataset index builder ...
+[1,0]<stdout>:make: Entering directory '/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/data'
+[1,0]<stdout>:make: Nothing to be done for 'default'.
+[1,0]<stdout>:make: Leaving directory '/home/amawa/moe-v2/Megatron-DeepSpeed/megatron/data'
+[1,0]<stdout>:>>> done with dataset index builder. Compilation time: 0.090 seconds
+[1,0]<stdout>:WARNING: constraints for invoking optimized fused softmax kernel are not met. We default back to unfused kernel invocations.
+[1,0]<stdout>:> compiling and loading fused kernels ...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module scaled_upper_triang_masked_softmax_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module scaled_upper_triang_masked_softmax_cuda...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module scaled_masked_softmax_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module scaled_masked_softmax_cuda...
+[1,0]<stdout>:Detected CUDA files, patching ldflags
+[1,0]<stdout>:Emitting ninja build file /home/amawa/moe-v2/Megatron-DeepSpeed/megatron/fused_kernels/build/build.ninja...
+[1,0]<stdout>:Building extension module fused_mix_prec_layer_norm_cuda...
+[1,0]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,0]<stdout>:ninja: no work to do.
+[1,0]<stdout>:Loading extension module fused_mix_prec_layer_norm_cuda...
+[1,0]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,0]<stdout>:>>> done with compiling and loading fused kernels. Compilation time: 10.641 seconds
+[1,0]<stdout>:[2021-12-09 07:04:55,539] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed groups
+[1,0]<stdout>:[2021-12-09 07:04:55,540] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed model parallel group with size 1
+[1,0]<stdout>:[2021-12-09 07:04:55,704] [INFO] [logging.py:69:log_dist] [Rank 0] initializing deepspeed expert parallel group with size 16
+[1,0]<stdout>:[2021-12-09 07:04:55,715] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [0]
+[1,0]<stdout>:[2021-12-09 07:04:55,725] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [1]
+[1,0]<stdout>:[2021-12-09 07:04:55,755] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [2]
+[1,0]<stdout>:[2021-12-09 07:04:55,766] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [3]
+[1,0]<stdout>:[2021-12-09 07:04:55,776] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [4]
+[1,0]<stdout>:[2021-12-09 07:04:55,786] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [5]
+[1,0]<stdout>:[2021-12-09 07:04:55,797] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [6]
+[1,0]<stdout>:[2021-12-09 07:04:55,807] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [7]
+[1,0]<stdout>:[2021-12-09 07:04:55,817] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [8]
+[1,0]<stdout>:[2021-12-09 07:04:55,827] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [9]
+[1,0]<stdout>:[2021-12-09 07:04:55,838] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [10]
+[1,0]<stdout>:[2021-12-09 07:04:55,848] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [11]
+[1,0]<stdout>:[2021-12-09 07:04:55,858] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [12]
+[1,0]<stdout>:[2021-12-09 07:04:55,869] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [13]
+[1,0]<stdout>:[2021-12-09 07:04:55,879] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [14]
+[1,0]<stdout>:[2021-12-09 07:04:55,889] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert data parallel process group with ranks: [15]
+[1,0]<stdout>:[2021-12-09 07:04:55,900] [INFO] [logging.py:69:log_dist] [Rank 0] creating expert parallel process group with ranks: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+[1,0]<stdout>:building GPT model ...
+[1,0]<stdout>:[2021-12-09 07:04:55,971] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,057] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,144] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,228] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,314] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,402] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,488] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,583] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>:[2021-12-09 07:04:56,670] [INFO] [logging.py:69:log_dist] [Rank 0] num_experts: 128 | num_local_experts: 8 | expert_parallel_size: 16
+[1,0]<stdout>: > number of parameters on (tensor, pipeline) model parallel rank (0, 0): 6957683712
+[1,0]<stdout>:[2021-12-09 07:04:56,736] [INFO] [logging.py:69:log_dist] [Rank 0] DeepSpeed info: version=0.5.9+3488b8cd, git-hash=3488b8cd, git-branch=master
+[1,12]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,13]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,10]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,5]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,4]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,2]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,3]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,11]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,7]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,8]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,1]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,9]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,6]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,15]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,14]<stdout>:NCCL version 2.8.4+cuda11.3
+[1,11]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,9]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,8]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,13]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,12]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,10]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,15]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,14]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,2]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,5]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,0]<stdout>:[2021-12-09 07:05:02,392] [INFO] [engine.py:278:__init__] DeepSpeed Flops Profiler Enabled: False
+[1,0]<stdout>:[2021-12-09 07:05:02,393] [INFO] [config.py:1058:print] DeepSpeedEngine configuration:
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   activation_checkpointing_config  {
+[1,0]<stdout>:    "partition_activations": false, 
+[1,0]<stdout>:    "contiguous_memory_optimization": false, 
+[1,0]<stdout>:    "cpu_checkpointing": false, 
+[1,0]<stdout>:    "number_checkpoints": null, 
+[1,0]<stdout>:    "synchronize_checkpoint_boundary": false, 
+[1,0]<stdout>:    "profile": false
+[1,0]<stdout>:}
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   aio_config ................... {'block_size': 1048576, 'queue_depth': 8, 'thread_count': 1, 'single_submit': False, 'overlap_events': True}
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   amp_enabled .................. False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   amp_params ................... False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   autotuning_config ............ {
+[1,0]<stdout>:    "enabled": false, 
+[1,0]<stdout>:    "start_step": null, 
+[1,0]<stdout>:    "end_step": null, 
+[1,0]<stdout>:    "metric_path": null, 
+[1,0]<stdout>:    "arg_mappings": null, 
+[1,0]<stdout>:    "metric": "throughput", 
+[1,0]<stdout>:    "model_info": null, 
+[1,0]<stdout>:    "results_dir": null, 
+[1,0]<stdout>:    "exps_dir": null, 
+[1,0]<stdout>:    "overwrite": true, 
+[1,0]<stdout>:    "fast": true, 
+[1,0]<stdout>:    "start_profile_step": 3, 
+[1,0]<stdout>:    "end_profile_step": 5, 
+[1,0]<stdout>:    "tuner_type": "gridsearch", 
+[1,0]<stdout>:    "tuner_early_stopping": 5, 
+[1,0]<stdout>:    "tuner_num_trials": 50, 
+[1,0]<stdout>:    "model_info_path": null, 
+[1,0]<stdout>:    "mp_size": 1, 
+[1,0]<stdout>:    "max_train_batch_size": null, 
+[1,0]<stdout>:    "min_train_batch_size": 1, 
+[1,0]<stdout>:    "max_train_micro_batch_size_per_gpu": 1.024000e+03, 
+[1,0]<stdout>:    "min_train_micro_batch_size_per_gpu": 1, 
+[1,0]<stdout>:    "num_tuning_micro_batch_sizes": 3
+[1,0]<stdout>:}
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   bfloat16_enabled ............. False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   checkpoint_tag_validation_enabled  True
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   checkpoint_tag_validation_fail  False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   communication_data_type ...... None
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   curriculum_enabled ........... False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   curriculum_params ............ False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   dataloader_drop_last ......... False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   disable_allgather ............ False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   dump_state ................... False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   dynamic_loss_scale_args ...... None
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   eigenvalue_enabled ........... False
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   eigenvalue_gas_boundary_resolution  1
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   eigenvalue_layer_name ........ bert.encoder.layer
+[1,0]<stdout>:[2021-12-09 07:05:02,394] [INFO] [config.py:1062:print]   eigenvalue_layer_num ......... 0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   eigenvalue_max_iter .......... 100
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   eigenvalue_stability ......... 1e-06
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   eigenvalue_tol ............... 0.01
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   eigenvalue_verbose ........... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   elasticity_enabled ........... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   flops_profiler_config ........ {
+[1,0]<stdout>:    "enabled": false, 
+[1,0]<stdout>:    "profile_step": 1, 
+[1,0]<stdout>:    "module_depth": -1, 
+[1,0]<stdout>:    "top_modules": 1, 
+[1,0]<stdout>:    "detailed": true, 
+[1,0]<stdout>:    "output_file": null
+[1,0]<stdout>:}
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   fp16_enabled ................. True
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   fp16_master_weights_and_gradients  False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   fp16_mixed_quantize .......... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   global_rank .................. 0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   gradient_accumulation_steps .. 1
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   gradient_clipping ............ 0.0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   gradient_predivide_factor .... 1.0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   initial_dynamic_scale ........ 4294967296
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   loss_scale ................... 0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   memory_breakdown ............. False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   optimizer_legacy_fusion ...... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   optimizer_name ............... adam
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   optimizer_params ............. {'lr': 0.0001}
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   pipeline ..................... {'stages': 'auto', 'partition': 'best', 'seed_layers': False, 'activation_checkpoint_interval': 0}
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   pld_enabled .................. False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   pld_params ................... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   prescale_gradients ........... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_change_rate ......... 0.001
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_groups .............. 1
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_offset .............. 1000
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_period .............. 1000
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_rounding ............ 0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_start_bits .......... 16
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_target_bits ......... 8
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_training_enabled .... False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_type ................ 0
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   quantize_verbose ............. False
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   scheduler_name ............... None
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   scheduler_params ............. None
+[1,0]<stdout>:[2021-12-09 07:05:02,395] [INFO] [config.py:1062:print]   sparse_attention ............. None
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   sparse_gradients_enabled ..... False
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   steps_per_print .............. 10
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   tensorboard_enabled .......... False
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   tensorboard_job_name ......... DeepSpeedJobName
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   tensorboard_output_path ...... 
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   train_batch_size ............. 128
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   train_micro_batch_size_per_gpu  8
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   use_quantizer_kernel ......... False
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   wall_clock_breakdown ......... False
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   world_size ................... 16
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   zero_allow_untested_optimizer  False
+[1,4]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   zero_config .................. {
+[1,0]<stdout>:    "stage": 0, 
+[1,0]<stdout>:    "contiguous_gradients": true, 
+[1,0]<stdout>:    "reduce_scatter": true, 
+[1,0]<stdout>:    "reduce_bucket_size": 5.000000e+08, 
+[1,0]<stdout>:    "allgather_partitions": true, 
+[1,0]<stdout>:    "allgather_bucket_size": 5.000000e+08, 
+[1,0]<stdout>:    "overlap_comm": false, 
+[1,0]<stdout>:    "load_from_fp32_weights": true, 
+[1,0]<stdout>:    "elastic_checkpoint": true, 
+[1,0]<stdout>:    "offload_param": null, 
+[1,0]<stdout>:    "offload_optimizer": null, 
+[1,0]<stdout>:    "sub_group_size": 1.000000e+09, 
+[1,0]<stdout>:    "prefetch_bucket_size": 5.000000e+07, 
+[1,0]<stdout>:    "param_persistence_threshold": 1.000000e+05, 
+[1,0]<stdout>:    "max_live_parameters": 1.000000e+09, 
+[1,0]<stdout>:    "max_reuse_distance": 1.000000e+09, 
+[1,0]<stdout>:    "gather_fp16_weights_on_model_save": false, 
+[1,0]<stdout>:    "ignore_unused_parameters": true, 
+[1,0]<stdout>:    "round_robin_gradients": false, 
+[1,0]<stdout>:    "legacy_stage1": false
+[1,0]<stdout>:}
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   zero_enabled ................. False
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1062:print]   zero_optimization_stage ...... 0
+[1,3]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,0]<stdout>:[2021-12-09 07:05:02,396] [INFO] [config.py:1064:print]   json = {
+[1,0]<stdout>:    "train_micro_batch_size_per_gpu": 8, 
+[1,0]<stdout>:    "optimizer": {
+[1,0]<stdout>:        "type": "Adam", 
+[1,0]<stdout>:        "params": {
+[1,0]<stdout>:            "lr": 0.0001
+[1,0]<stdout>:        }
+[1,0]<stdout>:    }, 
+[1,0]<stdout>:    "fp16": {
+[1,0]<stdout>:        "enabled": true
+[1,0]<stdout>:    }
+[1,0]<stdout>:}
+[1,0]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,7]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,6]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,1]<stdout>:Using /home/amawa/.cache/torch_extensions as PyTorch extensions root...
+[1,11]<stdout>:Emitting ninja build file /home/amawa/.cache/torch_extensions/utils/build.ninja...
+[1,11]<stdout>:Building extension module utils...
+[1,11]<stdout>:Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[1,11]<stdout>:ninja: no work to do.
+[1,11]<stdout>:Loading extension module utils...
+[1,11]<stdout>:Time to load utils op: 0.30272555351257324 seconds
+[1,10]<stdout>:Loading extension module utils...
+[1,15]<stdout>:Loading extension module utils...
+[1,9]<stdout>:Loading extension module utils...
+[1,8]<stdout>:Loading extension module utils...
+[1,13]<stdout>:Loading extension module utils...
+[1,12]<stdout>:Loading extension module utils...
+[1,10]<stdout>:Time to load utils op: 0.32037782669067383 seconds
+[1,15]<stdout>:Time to load utils op: 0.31703853607177734 seconds
+[1,9]<stdout>:Time to load utils op: 0.321500301361084 seconds
+[1,14]<stdout>:Loading extension module utils...
+[1,8]<stdout>:Time to load utils op: 0.3216681480407715 seconds
+[1,13]<stdout>:Time to load utils op: 0.3216438293457031 seconds
+[1,12]<stdout>:Time to load utils op: 0.3223276138305664 seconds
+[1,14]<stdout>:Time to load utils op: 0.3160996437072754 seconds
+[1,0]<stdout>:Loading extension module utils...
+[1,7]<stdout>:Loading extension module utils...
+[1,6]<stdout>:Loading extension module utils...
+[1,1]<stdout>:Loading extension module utils...
+[1,6]<stdout>:Time to load utils op: 3.0084619522094727 seconds
+[1,7]<stdout>:Time to load utils op: 3.0090322494506836 seconds
+[1,0]<stdout>:Time to load utils op: 3.014835834503174 seconds
+[1,1]<stdout>:Time to load utils op: 3.0079519748687744 seconds
+[1,5]<stdout>:Loading extension module utils...
+[1,2]<stdout>:Loading extension module utils...
+[1,5]<stdout>:Time to load utils op: 3.114370346069336 seconds
+[1,2]<stdout>:Time to load utils op: 3.114720582962036 seconds
+[1,4]<stdout>:Loading extension module utils...
+[1,3]<stdout>:Loading extension module utils...
+[1,4]<stdout>:Time to load utils op: 3.108485698699951 seconds
+[1,3]<stdout>:Time to load utils op: 3.108363151550293 seconds
+[1,0]<stdout>:====== latency stats {0} ====== 
+[1,0]<stdout>:	Avg Latency:  1405.05 ms
+[1,0]<stdout>:	P50 Latency:  1402.03 ms
+[1,0]<stdout>:	P90 Latency:  1408.34 ms
+[1,0]<stdout>:	P95 Latency:  1408.34 ms
+[1,0]<stdout>:	P99 Latency:  1408.34 ms
+[1,0]<stdout>:	999 Latency:  1408.34 ms
+[1,0]<stdout>:====== latency stats {0} ====== model_latencies
+[1,0]<stdout>:	Avg Latency:    34.75 ms
+[1,0]<stdout>:	P50 Latency:    33.63 ms
+[1,0]<stdout>:	P90 Latency:    35.65 ms
+[1,0]<stdout>:	P95 Latency:    37.27 ms
+[1,0]<stdout>:	P99 Latency:    61.34 ms
+[1,0]<stdout>:	999 Latency:    93.14 ms
+[1,0]<stdout>:====== latency stats {0} ====== single_token_latency
+[1,0]<stdout>:	Avg Latency:    49.31 ms
+[1,0]<stdout>:	P50 Latency:    48.13 ms
+[1,0]<stdout>:	P90 Latency:    50.13 ms
+[1,0]<stdout>:	P95 Latency:    51.74 ms[1,0]<stdout>:
+[1,0]<stdout>:	P99 Latency:    75.79 ms
+[1,0]<stdout>:	999 Latency:   107.81 ms
