@@ -133,7 +133,7 @@ def main():
         model = ds_inference(model, args)
         print('> DeepSpeed Inference engine initialized')
     
-	if args.deepspeed and not args.ds_inference:
+    if args.deepspeed and not args.ds_inference:
         ds_config = {
           "train_micro_batch_size_per_gpu": 8,
           "optimizer": {
