@@ -120,13 +120,12 @@ MP_SIZE=1
 ## Currently we don't support PP for MoE. To disable PP, set PP_SIZE
 ## to 1 and use the "--no-pipeline-parallel" arg.
 PP_SIZE=1
-NUM_GPUS=8
+NUM_GPUS=64
 ###############################################################################
 ### MoE configs
 ## Number of experts. EP_SIZE 128 means standard MoE
 # EP_SIZE=128
-# EP_SIZE="64 64 64 64 64 64 64 64 64 64 128 128"
-EP_SIZE="4 4 4 4 4 4 4 4 4 4 8 8"
+EP_SIZE="64 64 64 64 64 64 64 64 64 64 128 128"
 
 
 EP_PARALLEL_SIZE=$NUM_GPUS
