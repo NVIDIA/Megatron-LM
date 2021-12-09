@@ -42,4 +42,5 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --num-prompt-examples 20 \
         --task KNWL-DIALO-PROMPT 
 
-# NOTE: If you use api for the model generation, please use the "--api-prompt" flag (setting this value as True). 
+# NOTE: If you use api for the model generation, please use 
+# the "--api-prompt" flag (setting this value as True). 
