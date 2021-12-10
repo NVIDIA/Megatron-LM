@@ -144,7 +144,7 @@ def generate_samples_by_calling_api():
 
         # get the output generations from the api, 
         # and write to the output file
-        generations = call_model_api(inputs)
+        generations = call_model_api(inputs, args.out_seq_length)
         fname_out.write(generations)
         fname_out.write("\n")
 
