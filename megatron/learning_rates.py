@@ -43,7 +43,7 @@ class AnnealingLR(object):
 
         self.decay_tokens = args.lr_decay_tokens
         self.num_tokens = 0
-        self.warmup_tokens = 0
+        self.warmup_tokens = args.lr_warmup_tokens
 
         self.decay_style = decay_style
 
@@ -64,12 +64,18 @@ class AnnealingLR(object):
               https://openreview.net/pdf?id=BJYwwY9ll pg. 4"""
 
         # Use linear warmup for the initial part.
-        if self.warmup_steps > 0 and self.num_steps <= self.warmup_steps:
-            if self.num_steps == self.warmup_steps and \
-                self.decay_tokens is not None:
-                self.warmup_tokens = self.num_tokens
-            return self.max_lr * float(self.num_steps) / \
-                float(self.warmup_steps)
+        if self.warmup_tokens is None:
+            if self.warmup_steps > 0 and self.num_steps <= self.warmup_steps:
+                if self.num_steps == self.warmup_steps and \
+                    self.decay_tokens is not None:
+                    # The case of step/sample-wise warmup + token-wise decay
+                    self.warmup_tokens = self.num_tokens
+                return self.max_lr * float(self.num_steps) / \
+                    float(self.warmup_steps)
+        else:
+            if self.warmup_tokens > 0 and self.num_tokens <= self.warmup_tokens:
+                return self.max_lr * float(self.num_tokens) / \
+                    float(self.warmup_tokens)
 
         # If the learning rate is constant, just return the initial value.
         if self.decay_style == 'constant':

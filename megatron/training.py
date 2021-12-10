@@ -392,12 +392,12 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
-    if args.deepspeed:
-        assert isinstance(model[0], deepspeed.PipelineEngine), model
-        loss = model[0].train_batch(data_iter=data_iterator)
+    if args.deepspeed and args.ds_pipeline_enabled:
         skipped_iter = 0
-        grad_norm = model[0].get_global_grad_norm()
         num_zeros_in_grad = 0
+        assert isinstance(model[0], deepspeed.PipelineEngine)
+        loss = model[0].train_batch(data_iter=data_iterator)
+        grad_norm = model[0].get_global_grad_norm()
         return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
@@ -471,6 +471,12 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 0
         grad_norm = None
         num_zeros_in_grad = None
+        
+        loss_reduced = {}
+        for key in losses_reduced[0]:
+            losses_reduced_for_key = [x[key] for x in losses_reduced]
+            loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+        return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     else:
         if update_successful:
             increment = get_num_microbatches() * \
@@ -838,7 +844,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             else:
                 forward_backward_func = forward_backward_no_pipelining
             
-            if args.deepspeed:
+            if args.deepspeed and args.ds_pipeline_enabled:
                 # DeepSpeed uses eval_batch() and already aggregates losses.
                 assert isinstance(model, list) and len(model) == 1
                 loss = model[0].eval_batch(data_iterator)
@@ -852,8 +858,9 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
-                        total_loss_dict[key] = total_loss_dict.get(
-                            key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                        if 'moe' not in key:
+                            total_loss_dict[key] = total_loss_dict.get(
+                                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \

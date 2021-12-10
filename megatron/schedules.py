@@ -123,9 +123,14 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     assert len(model) == 1
     model = model[0]
 
+    args = get_args()
+
     context_handler = dummy_handler
     if isinstance(model, torchDDP):
         context_handler = model.no_sync
+
+    if args.deepspeed:
+        model.set_gradient_accumulation_boundary(False)
 
     losses_reduced = []
     input_tensor, output_tensor_grad = None, None
@@ -136,6 +141,9 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
             if not forward_only:
                 backward_step(optimizer, input_tensor, output_tensor,
                               output_tensor_grad, model)
+
+    if args.deepspeed:
+        model.set_gradient_accumulation_boundary(True)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).

@@ -46,7 +46,7 @@ def model_provider(pre_process=True, post_process=True):
                              config_dict_or_path=args.deepspeed_config,
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
-        if args.deepspeed:
+        if args.deepspeed and not args.no_pipeline_parallel:
             model = GPTModelPipe(
                 num_tokentypes=0,
                 parallel_output=True
@@ -150,15 +150,19 @@ def get_batch_pipe(data):
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, moe_loss, output_tensor):
+    args = get_args()
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
+    
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss, {'lm loss': averaged_loss[0]}
+    if args.num_experts <= 1:
+        return loss, {'lm loss': averaged_loss[0]}
+    else:
+        loss = loss + moe_loss
+        return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
 
 
 def forward_step(data_iterator, model):
@@ -172,12 +176,18 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    output_tensor, *other_losses = model(tokens, position_ids, attention_mask,
+                                         labels=labels)
     if args.curriculum_learning and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
-    return output_tensor, partial(loss_func, loss_mask)
+    moe_losses = []
+    for moe_loss in other_losses:
+        if moe_loss is not None:
+            moe_losses.append(moe_loss)
+    moe_loss = sum(moe_losses) * args.moe_loss_coeff
+
+    return output_tensor, partial(loss_func, loss_mask, moe_loss)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
