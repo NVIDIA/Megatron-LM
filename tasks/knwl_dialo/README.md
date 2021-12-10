@@ -1,7 +1,7 @@
 
 # Multi-Stage Prompting for Knowledgeable Dialogue Generation
 
-Blow we present the steps to run our multi-stage dialogue prompting (MSDP) framework.
+Below we present the steps to run our multi-stage dialogue prompting (MSDP) framework.
 
 ## Multi-Stage Dialogue Prompting
 
