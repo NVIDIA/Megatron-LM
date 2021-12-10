@@ -54,8 +54,8 @@ def free_output_tensor(output_tensors):
     if isinstance(output_tensors, torch.Tensor):
         output_tensors = [output_tensors]
     for output_tensor in output_tensors:
-        output_tensor.data = torch.FloatTensor([0]).to(output_tensor.data)
-
+        output_tensor.data = torch.cuda.FloatTensor([0])
+        
 def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
 
