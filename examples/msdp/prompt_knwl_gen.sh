@@ -22,7 +22,7 @@ PROMPT_PATH=<PATH_OF_KNOWLEDGE_GENERATION_PROMPTS> \
 OUTPUT_PATH=<PATH_OF_OUTPUT_GENERATION_FILE> \
         (e.g., /testseen_knowledge_generations.txt)
 
-python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
+python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/msdp/main.py \
         --num-layers 24 \
         --hidden-size 1024 \
         --num-attention-heads 16 \
@@ -40,7 +40,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
         --prompt-file ${PROMPT_PATH} \
         --prompt-type knowledge \
         --num-prompt-examples 10 \
-        --task KNWL-DIALO-PROMPT 
+        --task MSDP-PROMPT 
 
 # NOTE: If you use api for the model generation, please use 
 # the "--api-prompt" flag (setting this value as True). 

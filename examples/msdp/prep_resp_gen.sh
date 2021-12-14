@@ -11,7 +11,7 @@ KNOWLEDGE_FILE=<PATH_OF_GENERATED_KNOWLEDGE_DATA> \
 PROCESSED_FILE=<PATH_OF_INPUT_FILE_FOR_RESPONSE_GENERATION> \
         (e.g., /testseen_processed_with_generated_knowledge.txt)
 
-python ${DIR}/tasks/knwl_dialo/preprocessing.py \
+python ${DIR}/tasks/msdp/preprocessing.py \
         --func prepare_input \
         --test_file ${TEST_FILE} \
         --knowledge_gen_file ${KNOWLEDGE_FILE} \
