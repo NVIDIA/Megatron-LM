@@ -427,6 +427,15 @@ def train_step(forward_step_func, data_iterator,
             else:
                 grad = word_embeddings_weight.grad
             torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+
+    if mpu.is_rank_in_position_embedding_group() and \
+            mpu.get_pipeline_model_parallel_world_size() > 1 and \
+            args.pipeline_model_parallel_split_rank is not None:
+        unwrapped_model = model[0]
+        unwrapped_model = unwrap_model(
+            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+        grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
     # Update parameters.
