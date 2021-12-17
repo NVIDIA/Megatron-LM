@@ -343,7 +343,8 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-
+    group.add_argument('--num-experts', type=int, default=None,
+                       help='Number of Experts in Switch Transformer (None means no Switch)')
     return parser
 
 

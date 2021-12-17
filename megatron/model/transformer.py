@@ -99,12 +99,12 @@ class SwitchMLP(MegatronModule):
     """
     Routes input to one of N MLP "experts"
     """
-    def __init__(self, init_method, output_layer_init_method, num_experts):
+    def __init__(self, init_method, output_layer_init_method):
         super(SwitchMLP, self).__init__()
         args = get_args()
-        self.router = torch.nn.Linear(args.hidden_size, num_experts)
+        self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
         self.experts = torch.nn.ModuleList()
-        for i in range(num_experts):
+        for i in range(args.num_experts):
             self.experts.append(ParallelMLP(init_method, output_layer_init_method))
          
     def forward(self, hidden_states):
@@ -113,16 +113,20 @@ class SwitchMLP(MegatronModule):
         s = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states)
-        route = torch.nn.functional.softmax(route,dim=2)
+        route = torch.nn.functional.softmax(route, dim=2)
         max_prob, max_ind = torch.max(route, dim=2)
         max_prob = torch.unsqueeze(max_prob, 2)
         
+        # TODO (rprenger) TODO this could be made easier to read
+        # Converting [b, s, h] to [b*s, h].
+        # Each vector could be routed differently 
         hidden_states = hidden_states.permute(2,0,1).view(hidden_states.size(2), -1).permute(1,0).unsqueeze(1)
         max_prob = max_prob.permute(2,0,1).view(max_prob.size(2), -1).permute(1,0).unsqueeze(1)
         max_ind = max_ind.view(-1)
 
         output_total = torch.empty_like(hidden_states)
         output_bias_total = torch.empty_like(hidden_states)
+        #TODO (rprenger) This does each expert in serial, but it could be parallelized
         for expert_num, expert in enumerate(self.experts):
             ind = (max_ind==expert_num).nonzero().unsqueeze(2).repeat(1,1, h)
             hidden = torch.gather(hidden_states, 0, ind)
@@ -498,7 +502,10 @@ class ParallelTransformerLayer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        self.mlp = SwitchMLP(init_method, output_layer_init_method, ${NUMEXPERTS})
+        if args.num_experts is not None:
+            self.mlp = SwitchMLP(init_method, output_layer_init_method)
+        else:
+            self.mlp = ParallelMLP(init_method, output_layer_init_method)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
