@@ -30,7 +30,7 @@ _MODEL_PARALLEL_GROUP = None
 # Embedding group.
 _EMBEDDING_GROUP = None
 # Position embedding group.
-_POSITION EMBEDDING_GROUP = None
+_POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
@@ -208,7 +208,7 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
-            _POSITION_EMBEDDING_GLOBAL_RANKS = embedding_ranks
+            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
 
 def model_parallel_is_initialized():
