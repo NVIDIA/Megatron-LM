@@ -334,10 +334,6 @@ class TransformerLanguageModel(MegatronModule):
         # Decoder (usually set to False, True if part of an encoder-decoder
         # architecture and in decoder-only stage).
         if self.add_decoder:
-            # Temporary assertion until we verify correctness of pipeline parallelism
-            # implementation of T5.
-            assert args.pipeline_model_parallel_size == 1, \
-                'pipeline parallelism is not supported in the presence of decoder'
             self.decoder = ParallelTransformer(
                 self.init_method,
                 output_layer_init_method,
@@ -386,8 +382,7 @@ class TransformerLanguageModel(MegatronModule):
     def forward(self, enc_input_ids, enc_position_ids, enc_attn_mask,
                 dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
                 enc_dec_attn_mask=None, tokentype_ids=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None,
+                inference_params=None,
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
@@ -404,8 +399,7 @@ class TransformerLanguageModel(MegatronModule):
                 encoder_output = self.encoder(
                     encoder_input,
                     enc_attn_mask,
-                    set_inference_key_value_memory=set_inference_key_value_memory,
-                    inference_max_sequence_len=inference_max_sequence_len)
+                    inference_params=inference_params)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -438,8 +432,7 @@ class TransformerLanguageModel(MegatronModule):
             dec_attn_mask,
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
-            set_inference_key_value_memory=set_inference_key_value_memory,
-            inference_max_sequence_len=inference_max_sequence_len)
+            inference_params=inference_params)
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output

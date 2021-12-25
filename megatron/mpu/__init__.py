@@ -25,6 +25,7 @@ from .initialize import get_data_parallel_group
 from .initialize import get_data_parallel_rank
 from .initialize import get_data_parallel_world_size
 from .initialize import get_embedding_group
+from .initialize import get_position_embedding_group
 from .initialize import get_model_parallel_group
 from .initialize import get_tensor_model_parallel_group
 from .initialize import get_pipeline_model_parallel_group
@@ -32,6 +33,7 @@ from .initialize import get_tensor_model_parallel_rank, set_tensor_model_paralle
 from .initialize import get_pipeline_model_parallel_rank, set_pipeline_model_parallel_rank
 from .initialize import is_pipeline_first_stage, is_pipeline_last_stage
 from .initialize import is_rank_in_embedding_group
+from .initialize import is_rank_in_position_embedding_group
 from .initialize import is_pipeline_stage_before_split, is_pipeline_stage_after_split
 from .initialize import is_pipeline_stage_at_split
 from .initialize import get_num_layers

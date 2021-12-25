@@ -179,11 +179,6 @@ class ParallelAttention(MegatronModule):
             init_method=output_layer_init_method,
             skip_bias_add=True)
 
-        # Inference key-value memory
-        self.inference_key_memory = None
-        self.inference_value_memory = None
-        self.inference_current_sequence_len = 0
-
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size):
         return torch.empty(
@@ -196,35 +191,27 @@ class ParallelAttention(MegatronModule):
         
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, inference_params=None):
         # hidden_states: [sq, b, h]
 
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        if set_inference_key_value_memory:
-            assert inference_max_sequence_len and inference_max_sequence_len > 0
-            self.inference_key_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1))
-            self.inference_value_memory = self._allocate_memory(
-                inference_max_sequence_len, hidden_states.size(1))
-            self.inference_current_sequence_len = 0
-        # Some consistency check.
-        if inference_max_sequence_len:
-            assert self.inference_current_sequence_len < \
-                self.inference_key_memory.size(0)
-            assert inference_max_sequence_len == \
-                self.inference_key_memory.size(0)
-        # This is added for safety. In case inference_max_sequence_len
-        # is not provided, make sure there is no potential memory left
-        # from previous inference.
-        if not inference_max_sequence_len:
-            self.inference_key_memory = None
-            self.inference_value_memory = None
-        
+        if inference_params:
+            if self.layer_number not in inference_params.key_value_memory_dict:
+                inf_max_seq_len = inference_params.max_sequence_len
+                inf_max_batch_size = inference_params.max_batch_size
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size)
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_len, inf_max_batch_size)
+                inference_params.key_value_memory_dict[self.layer_number] = (
+                    inference_key_memory, inference_value_memory)
+            else:
+                inference_key_memory, inference_value_memory = \
+                    inference_params.key_value_memory_dict[self.layer_number]
+
 
         # =====================
         # Query, Key, and Value
@@ -267,22 +254,26 @@ class ParallelAttention(MegatronModule):
             query_layer = query_layer.view(*new_tensor_shape)
 
 
-        # ===================================================
-        # Adjust key, value, and attention mask for inference
-        # ===================================================
+        # ==================================
+        # Adjust key and value for inference
+        # ==================================
 
-        if inference_max_sequence_len:
-            # Adjust the range variables.
-            start = self.inference_current_sequence_len
-            self.inference_current_sequence_len += key_layer.size(0)
-            end = self.inference_current_sequence_len
+        if inference_params:
+            batch_start = inference_params.batch_size_offset
+            batch_end = batch_start + key_layer.size(1)
+            assert batch_end <= inference_key_memory.size(1)
+            sequence_start = inference_params.sequence_len_offset
+            sequence_end = sequence_start + key_layer.size(0)
+            assert sequence_end <= inference_key_memory.size(0)
             # Copy key and values.
-            self.inference_key_memory[start:end, ...] = key_layer
-            self.inference_value_memory[start:end, ...] = value_layer
-            key_layer = self.inference_key_memory[:end, ...]
-            value_layer = self.inference_value_memory[:end, ...]
-            # Adjust attention mask
-            attention_mask = attention_mask[..., start:end, :end]
+            inference_key_memory[sequence_start:sequence_end,
+                                 batch_start:batch_end, ...] = key_layer
+            inference_value_memory[sequence_start:sequence_end,
+                                   batch_start:batch_end, ...] = value_layer
+            key_layer = inference_key_memory[
+                :sequence_end, batch_start:batch_end, ...]
+            value_layer = inference_value_memory[
+                :sequence_end, batch_start:batch_end, ...]
 
 
         # ===================================
@@ -432,7 +423,8 @@ class ParallelTransformerLayer(MegatronModule):
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon)
+            eps=args.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -447,7 +439,8 @@ class ParallelTransformerLayer(MegatronModule):
         # Layernorm on the attention output
         self.post_attention_layernorm = LayerNorm(
             args.hidden_size,
-            eps=args.layernorm_epsilon)
+            eps=args.layernorm_epsilon,
+            no_persist_layer_norm=args.no_persist_layer_norm)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -458,17 +451,16 @@ class ParallelTransformerLayer(MegatronModule):
             # Layernorm on the attention output.
             self.post_inter_attention_layernorm = LayerNorm(
                 args.hidden_size,
-                eps=args.layernorm_epsilon)
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
         self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                enc_dec_attn_mask=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
         # hidden_states: [b, s, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -478,8 +470,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.self_attention(
                 layernorm_output,
                 attention_mask,
-                set_inference_key_value_memory=set_inference_key_value_memory,
-                inference_max_sequence_len=inference_max_sequence_len)
+                inference_params=inference_params)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -589,6 +580,7 @@ class ParallelTransformer(MegatronModule):
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
                 'virtual_pipeline_model_parallel_size'
+            assert args.model_type != ModelType.encoder_and_decoder
             # Number of layers in each model chunk is the number of layers in the stage,
             # divided by the number of model chunks in a stage.
             self.num_layers = self.num_layers // args.virtual_pipeline_model_parallel_size
@@ -605,7 +597,16 @@ class ParallelTransformer(MegatronModule):
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
-            offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+            if args.model_type == ModelType.encoder_and_decoder and \
+                    mpu.get_pipeline_model_parallel_world_size() > 1:
+                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+                if layer_type == LayerType.encoder:
+                    offset = pipeline_rank * self.num_layers
+                else:
+                    num_ranks_in_enc = args.pipeline_model_parallel_split_rank
+                    offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+            else:
+                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1 + offset) for i in range(self.num_layers)])
@@ -614,7 +615,8 @@ class ParallelTransformer(MegatronModule):
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
-                eps=args.layernorm_epsilon)
+                eps=args.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -634,23 +636,6 @@ class ParallelTransformer(MegatronModule):
                 return x_
             return custom_forward
 
-        def distribute_checkpointed_activations_helper(layer_number):
-            """Distribute checkpointed activations across the tensor model
-               Parallel ranks if the `distribute-checkpointed-activations
-               is on and either of the following conditions is met:
-                 - it is not the first layer in the in the pipeline stage.
-                   The first layer is used in the pipeline parallelism 
-                   and changing its shape throws error in the backward pass.
-                 - we are at the first pipline stage so the input tensor is
-                   not used in pipeline parallelism. Note that no pipeline
-                   parallelism is a special case of this.
-            """
-            not_first_layer_in_pipeline_stage = (layer_number > 0)
-            is_first_pipeline_stage = (
-                mpu.get_pipeline_model_parallel_rank() == 0)
-            return self.distribute_checkpointed_activations and \
-                (not_first_layer_in_pipeline_stage or is_first_pipeline_stage)
-
         if self.activations_checkpoint_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
@@ -659,7 +644,7 @@ class ParallelTransformer(MegatronModule):
             while l < self.num_layers:
                 hidden_states = mpu.checkpoint(
                     custom(l, l + self.activations_checkpoint_num_layers),
-                    distribute_checkpointed_activations_helper(l),
+                    self.distribute_checkpointed_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 l += self.activations_checkpoint_num_layers
         elif self.activations_checkpoint_method == 'block':
@@ -670,7 +655,7 @@ class ParallelTransformer(MegatronModule):
                 if l < self.activations_checkpoint_num_layers:
                     hidden_states = mpu.checkpoint(
                         custom(l, l + 1),
-                        distribute_checkpointed_activations_helper(l),
+                        self.distribute_checkpointed_activations,
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 else:
                     hidden_states = custom(l, l + 1)(
@@ -691,13 +676,11 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = input_tensor
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None,
-                enc_dec_attn_mask=None,
-                set_inference_key_value_memory=False,
-                inference_max_sequence_len=None):
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
 
         # Checks.
-        if inference_max_sequence_len:
+        if inference_params:
             assert self.activations_checkpoint_method is None, \
                 'inference does not work with activation checkpointing'
 
@@ -729,8 +712,8 @@ class ParallelTransformer(MegatronModule):
                     attention_mask,
                     encoder_output=encoder_output,
                     enc_dec_attn_mask=enc_dec_attn_mask,
-                    set_inference_key_value_memory=set_inference_key_value_memory,
-                    inference_max_sequence_len=inference_max_sequence_len)
+                    inference_params=inference_params)
+
 
         # Final layer norm.
         if self.post_process:

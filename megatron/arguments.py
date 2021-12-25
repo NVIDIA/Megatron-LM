@@ -41,6 +41,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_biencoder_args(parser)
     parser = _add_vit_args(parser)
     parser = _add_logging_args(parser)
+    parser = _add_inference_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -244,17 +245,29 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
+
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    # Persistent fused layer norm.
+    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+        args.no_persist_layer_norm = True
+        if args.rank == 0:
+            print('Persistent fused layer norm kernel is supported from '
+                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                  'Defaulting to no_persist_layer_norm=True')
+
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
             'checkpointed activations only across tensor model ' \
             'parallel groups'
         assert args.activations_checkpoint_method is not None, \
-            'for distribute-checkpointed-activations to work you '\
+            'for distributed checkpoint activations to work you '\
             'need to use a activation-checkpoint method '
-        assert args.num_layers_per_virtual_pipeline_stage is None, \
-            'currently distrobuted checkpoint activations only supported for ' \
-            'nointerleaved pipeline parallelism'
+        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+            'distributed checkpoint activations are supported for pytorch ' \
+            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
+            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
     _print_args(args)
     return args
@@ -279,6 +292,18 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _add_inference_args(parser):
+    group = parser.add_argument_group(title='inference')
+
+    group.add_argument('--inference-batch-times-seqlen-threshold',
+                       type=int, default=512,
+                       help='During inference, if batch-size times '
+                       'sequence-length is smaller than this threshold '
+                       'then we will not use pipelining, otherwise we will.')
+
+    return parser
+
+    
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -354,6 +379,9 @@ def _add_logging_args(parser):
     group.add_argument('--log-memory-to-tensorboard',
                        action='store_true',
                        help='Enable memory logging to tensorboard.')
+    group.add_argument('--log-world-size-to-tensorboard',
+                       action='store_true',
+                       help='Enable world size logging to tensorboard.')
 
     return parser
 
@@ -449,6 +477,9 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--exit-duration-in-mins', type=int, default=None,
                        help='Exit the program after this many minutes.')
+    group.add_argument('--exit-signal-handler', action='store_true',
+                       help='Dynamically save the checkpoint and shutdown the '
+                       'training if SIGTERM is received')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -473,6 +504,11 @@ def _add_training_args(parser):
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
                        'gradient compuation of a column-linear layer.')
+    group.add_argument('--no-persist-layer-norm', action='store_true',
+                       help='Disable using persistent fused layer norm kernel. '
+                       'This kernel supports only a set of hidden sizes. Please '
+                       'check persist_ln_hidden_sizes if your hidden '
+                       'size is supported.')
     return parser
 
 

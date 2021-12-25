@@ -26,6 +26,7 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
+from megatron import get_signal_handler
 from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_current_global_batch_size
@@ -426,6 +427,20 @@ def train_step(forward_step_func, data_iterator,
             else:
                 grad = word_embeddings_weight.grad
             torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+
+    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
+    # stages to ensure that position embeddings parameters stay in sync.
+    # This should only run for T5 models with pipeline parallelism
+    if mpu.is_rank_in_position_embedding_group() and \
+            mpu.get_pipeline_model_parallel_world_size() > 1 and \
+            args.pipeline_model_parallel_split_rank is not None:
+        unwrapped_model = model[0]
+        unwrapped_model = unwrap_model(
+            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+        assert args.DDP_impl == 'local', \
+            'T5 model is only supported with local DDP mode'
+        grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
     # Update parameters.
@@ -543,6 +558,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale vs samples', loss_scale,
+                              args.consumed_train_samples)
+        if args.log_world_size_to_tensorboard:
+            writer.add_scalar('world-size', args.world_size, iteration)
+            writer.add_scalar('world-size vs samples', args.world_size,
                               args.consumed_train_samples)
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
@@ -698,6 +717,14 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
 
         # Checkpointing
         saved_checkpoint = False
+        if args.exit_signal_handler:
+            signal_handler = get_signal_handler()
+            if any(signal_handler.signals_received()):
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                         lr_scheduler)
+                print_datetime('exiting program after receiving SIGTERM.')
+                sys.exit()
+
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
             save_checkpoint_and_time(iteration, model, optimizer,

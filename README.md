@@ -11,7 +11,9 @@ Below are some of the projects where we have directly used Megatron:
 * [Scaling Language Model Training to a Trillion Parameters Using Megatron](https://arxiv.org/pdf/2104.04473.pdf)
 * [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
 
-Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specific model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. The table below shows the model configurations along with the achieved FLOPs (both per GPU and aggregate over all GPUs). Note that the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
+Megatron is also used in [NeMo Megatron](https://developer.nvidia.com/nvidia-nemo#nemo-megatron), a framework to help enterprises overcome the challenges of building and training sophisticated natural language processing models with billions and trillions of parameters.
+
+Our codebase is capable of efficiently training very large (hundreds of billions of parameters) language models with both model and data parallelism. To demonstrate how the code scales with multiple GPUs and model sizes, we consider GPT models from 1 billion all the way to 1 trillion parameters. All models use a vocabulary size of 51,200 and a sequence length of 2048. We vary hidden size, number of attention heads, and number of layers to arrive at a specifc model size. As the model size increases, we also modestly increase the batch size. We leverage [NVIDIA's Selene supercomputer](https://www.top500.org/system/179842/) to perform scaling studies and use up to 3072 [A100](https://www.nvidia.com/en-us/data-center/a100/) GPUs for the largest model. The table below shows the model configurations along with the achieved FLOPs (both per GPU and aggregate over all GPUs). Note that these results are from benchmark runs and these models were not trained to convergence; however, the FLOPs are measured for end-to-end training, i.e., includes all operations including data loading, optimization, and even logging.
 
 ![Cases](images/cases_april2021.png)
 
@@ -426,32 +428,22 @@ WORLD_SIZE=$TENSOR_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
 Several downstream tasks are described for both GPT and BERT models below. They can be run in distributed and model parallel modes with the same changes used in the training scripts.
 
 ## GPT Text Generation
-`bash examples/generate_text.sh`
 
-We generate text samples using largely the GPT pretraining script. Few changes need to make, such as we need to provide the path to the pretrained checkpoint, the length of the output samples, whether to generate texts unconditionally (`--num-samples` to denote how many samples to generate) or conditional (need to pass `--sample-input-file <filename>` where each line of the file will be used as the conditional texts). There are few optional parameters to play, e.g. `top-k`, `top-p`, or `greedy` (set top-k and top-p to 0) sampling..
+We have included a simple REST server to use for text generation in `tools/run_text_generation_server.py`. You run it much like you would start a pretraining job, specifying an appropriate pretrained checkpoint. There are also few optional parameters: `temperature`, `top-k`and `top-p`. See `--help` or the source file for more information. See [examples/run_text_generation_server_345M.sh](examples/run_text_generation_server_345M.sh) for an example of how to run the server.
+
+Once the server is running you can use `tools/text_generation_cli.py` to query it, it takes one argument which is the host the server is running on.
 
 <pre>
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
-GPT_ARGS=&#60;same as those in <a href="#gpt-pretraining">GPT pretraining</a> above&#62;
-
-MAX_OUTPUT_SEQUENCE_LENGTH=1024
-TEMPERATURE=1.0
-TOP_P=0.9
-NUMBER_OF_SAMPLES=2
-OUTPUT_FILE=samples.json
-
-python tools/generate_samples_gpt.py \
-       $GPT_ARGS \
-       --load $CHECKPOINT_PATH \
-       --out-seq-length $MAX_OUTPUT_SEQUENCE_LENGTH \
-       --temperature $TEMPERATURE \
-       --genfile $OUTPUT_FILE \
-       --num-samples $NUMBER_OF_SAMPLES \
-       --top_p $TOP_P \
-       --recompute
+tools/text_generation_cli.py localhost
 </pre>
+
+You can also use CURL or any other tools to query the server directly:
+
+<pre>
+curl 'http://localhost:5000/api' -X 'PUT' -H 'Content-Type: application/json; charset=UTF-8'  -d '{"prompts":["Hello world"], "tokens_to_generate":1}'
+</pre>
+
+See [megatron/text_generation_server.py](megatron/text_generation_server.py) for more API options.
 
 ## GPT Evaluation
 We include example scripts for GPT evaluation on WikiText perplexity evaluation and LAMBADA Cloze accuracy.

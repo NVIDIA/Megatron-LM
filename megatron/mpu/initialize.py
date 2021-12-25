@@ -29,6 +29,8 @@ _PIPELINE_MODEL_PARALLEL_GROUP = None
 _MODEL_PARALLEL_GROUP = None
 # Embedding group.
 _EMBEDDING_GROUP = None
+# Position embedding group.
+_POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 
@@ -44,6 +46,9 @@ _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
 # A list of ranks that have a copy of the embedding.
 _EMBEDDING_GLOBAL_RANKS = None
+
+# A list of ranks that have a copy of the position embedding.
+_POSITION_EMBEDDING_GLOBAL_RANKS = None
 
 # A list of global ranks for each pipeline group to ease calculation of the source
 # rank when broadcasting from the first or last pipeline stage.
@@ -165,6 +170,10 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
     global _EMBEDDING_GLOBAL_RANKS
     assert _EMBEDDING_GROUP is None, \
         'embedding group is already initialized'
+    global _POSITION_EMBEDDING_GROUP
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+    assert _POSITION_EMBEDDING_GROUP is None, \
+        'position embedding group is already initialized'
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size,
                       num_pipeline_model_parallel_groups)
@@ -176,18 +185,30 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         # first and last stages).
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
-            if pipeline_model_parallel_split_rank_ is not None and \
-                    pipeline_model_parallel_split_rank_ not in embedding_ranks:
-                embedding_ranks = [ranks[0],
-                                   ranks[pipeline_model_parallel_split_rank_],
-                                   ranks[-1]]
+            position_embedding_ranks = [ranks[0]]
+            if pipeline_model_parallel_split_rank_ is not None:
+                if ranks[pipeline_model_parallel_split_rank_] not in embedding_ranks:
+                    embedding_ranks = [ranks[0],
+                                       ranks[pipeline_model_parallel_split_rank_],
+                                       ranks[-1]]
+                if ranks[pipeline_model_parallel_split_rank_] not in position_embedding_ranks:
+                    position_embedding_ranks = [ranks[0],
+                                       ranks[pipeline_model_parallel_split_rank_]]
         else:
             embedding_ranks = ranks
+            position_embedding_ranks = ranks
+
         group = torch.distributed.new_group(embedding_ranks)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
+
+        group = torch.distributed.new_group(position_embedding_ranks)
+        if rank in position_embedding_ranks:
+            _POSITION_EMBEDDING_GROUP = group
+        if rank in ranks:
+            _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
 
 def model_parallel_is_initialized():
@@ -232,6 +253,13 @@ def get_embedding_group():
     assert _EMBEDDING_GROUP is not None, \
         'embedding group is not initialized'
     return _EMBEDDING_GROUP
+
+
+def get_position_embedding_group():
+    """Get the position embedding group the caller rank belongs to."""
+    assert _POSITION_EMBEDDING_GROUP is not None, \
+        'position embedding group is not initialized'
+    return _POSITION_EMBEDDING_GROUP
 
 
 def set_tensor_model_parallel_world_size(world_size):
@@ -352,6 +380,13 @@ def is_rank_in_embedding_group(ignore_virtual=False):
     return False
 
 
+def is_rank_in_position_embedding_group():
+    """Return true if current rank is in position embedding group, False otherwise."""
+    rank = torch.distributed.get_rank()
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+    return rank in _POSITION_EMBEDDING_GLOBAL_RANKS
+
+
 def is_pipeline_stage_before_split(rank=None):
     """Return True if pipeline stage executes encoder block for a model
     with both encoder and decoder."""
@@ -467,3 +502,5 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP = None
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
+    global _POSITION_EMBEDDING_GROUP
+    _POSITION_EMBEDDING_GROUP = None
