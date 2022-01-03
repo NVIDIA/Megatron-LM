@@ -32,6 +32,9 @@ from megatron.checkpointing import get_checkpoint_tracker_filename
 from megatron.global_vars import set_global_variables, get_args
 from megatron.global_vars import rebuild_tokenizer
 
+from mpi4py import MPI
+import subprocess
+from datetime import timedelta
 
 def split_into_partitions(tensor, num_partitions, partition_dim, stride):
 
@@ -193,6 +196,29 @@ def main():
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
     os.environ["WORLD_SIZE"] = f'{2**31}'
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+    master_addr = None
+    if rank == 0:
+        hostname_cmd = ["hostname -I"]
+        result = subprocess.check_output(hostname_cmd, shell=True)
+        master_addr = result.decode('utf-8').split()[0]
+    master_addr = comm.bcast(master_addr, root=0)
+    proc_name = MPI.Get_processor_name()
+    all_procs = comm.allgather(proc_name)
+    local_rank = sum([i == proc_name for i in all_procs[:rank]])
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['LOCAL_RANK'] = str(local_rank)
+    os.environ['MASTER_ADDR'] = master_addr
+    os.environ['MASTER_PORT'] = str(29500)
+    init_method=None
+    torch.distributed.init_process_group(
+        backend="nccl",
+        timeout=timedelta(minutes=10),
+        init_method=init_method)
 
     # Args
     set_global_variables(extra_args_provider=get_mp_merge_args,

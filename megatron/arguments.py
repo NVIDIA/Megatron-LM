@@ -19,6 +19,8 @@ import argparse
 import os
 
 import torch
+from mpi4py import MPI
+import subprocess
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -54,8 +56,10 @@ def parse_args(extra_args_provider=None, defaults={},
         args = parser.parse_args()
 
     # Distributed args.
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    comm = MPI.COMM_WORLD
+    args.rank = comm.Get_rank()
+    args.world_size = comm.Get_size()
+
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
