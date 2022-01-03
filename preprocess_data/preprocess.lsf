@@ -1,0 +1,20 @@
+#!/bin/bash
+
+#BSUB -nnodes 1
+#BSUB -W 0:35
+#BSUB -P med106
+#BSUB -alloc_flags "smt4 nvme"
+#BSUB -J megatron
+#BSUB -o megatron.%J
+#BSUB -q batch
+
+set +x
+
+module load open-ce/1.4.0-py38-0
+conda deactivate
+conda activate /gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch
+
+export OMP_NUM_THREADS=1
+export PYTHONPATH=$PYTHONPATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/Megatron-LM
+
+jsrun python ../tools/preprocess_data.py --input /gpfs/alpine/med106/world-shared/irl1/rhel8/Megatron-LM/preprocess_data/pm014.json --output-prefix pm014 --vocab /gpfs/alpine/world-shared/med106/g8o/pubmed_bert-vocab.txt --dataset-impl mmap --tokenizer-type BertWordPieceLowerCase --split-sentences --json-keys abstract --workers 42
