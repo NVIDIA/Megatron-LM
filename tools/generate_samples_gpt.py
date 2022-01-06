@@ -32,6 +32,7 @@ from megatron.text_generation_utils import generate_and_write_samples_unconditio
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
 import deepspeed
+import torch
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -113,12 +114,13 @@ def main():
                                        'no_load_optim': True})
 
     args = get_args()
+    
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-    
-    import torch
-    deepspeed.utils.groups.initialize(ep_size=torch.distributed.get_world_size())
+
+    import torch    
+    deepspeed.utils.groups.initialize(torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
@@ -170,9 +172,27 @@ def main():
 
 
 def ds_inference(model, args):
+    from deepspeed.ops.transformer.inference import create_comm
+    import torch
+    
+    ep_cnt = (torch.distributed.get_rank() // args.num_experts[0])
+
+    nnodes = (torch.distributed.get_world_size() // args.tensor_model_parallel_size) // \
+                (max(args.num_experts[0], torch.distributed.get_world_size()) // args.num_experts[0])
+    
+    mp_color = ep_cnt * args.tensor_model_parallel_size + \
+                    torch.distributed.get_rank() % args.tensor_model_parallel_size
+    if args.tensor_model_parallel_size > 1:
+        ds_comm = create_comm([ep_cnt * args.num_experts[0] + nr * args.tensor_model_parallel_size + \
+                            (torch.distributed.get_rank() % args.tensor_model_parallel_size) for nr in range(nnodes)], \
+                            color=mp_color)
+    
+    if torch.distributed.get_world_size() > args.num_experts[0]:
+        expert_mp_size = torch.distributed.get_world_size() // args.num_experts[0]   
+        expert_mp_color = torch.distributed.get_rank() % args.num_experts[0]
+        expert_mp_comm = create_comm([expert_mp_color + nr * args.num_experts[0] for nr in range(expert_mp_size)], color=expert_mp_color+16)
     m = None
     simple = True
-
     if simple:
         import deepspeed.module_inject as module_inject
         import megatron.model as mm
@@ -180,12 +200,15 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
-                                          mpu=mpu,
-                                          #ep_group=#WORLD_GROUP,
+                                          mpu=mpu if args.tensor_model_parallel_size > 1 else None,
+                                          ep_group=ds_comm if args.tensor_model_parallel_size > 1 else None,
+                                          expert_mp_group=expert_mp_comm if torch.distributed.get_world_size() > args.num_experts[0] else None,
                                           dtype=torch.half,
                                           return_tuple=False,
                                           replace_with_kernel_inject=True,
-                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy}, moe_experts=args.num_experts)
+                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy},
+                                          moe_experts=args.num_experts[0],
+                                          moe_type=args.mlp_type)
                                           #replace_method='auto')
         m = engine.module
     else:
