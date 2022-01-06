@@ -203,13 +203,9 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
-<<<<<<< HEAD
                                           mpu=mpu if args.tensor_model_parallel_size > 1 else None,
                                           ep_group=ds_comm if args.tensor_model_parallel_size > 1 else None,
                                           expert_mp_group=expert_mp_comm if torch.distributed.get_world_size() > args.num_experts[0] else None,
-=======
-                                          mpu=None,
->>>>>>> 36978d3b8e64fee4cd7bc566ee789020f34ebe20
                                           dtype=torch.half,
                                           return_tuple=False,
                                           replace_with_kernel_inject=True,
