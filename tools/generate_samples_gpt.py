@@ -15,6 +15,9 @@
 
 """Sample Generate GPT"""
 
+import deepspeed
+from deepspeed.ops.transformer.inference import create_comm
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -40,8 +43,8 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
-
-    #print(f'model = {model}')
+    params = sum([p.nelement() for p in model.parameters()])
+    print(f'model = {params}')
     return model
 
 
@@ -200,9 +203,13 @@ def ds_inference(model, args):
         engine = deepspeed.init_inference(model=model,
                                           triangular_masking=False,
                                           mp_size=args.tensor_model_parallel_size, 
+<<<<<<< HEAD
                                           mpu=mpu if args.tensor_model_parallel_size > 1 else None,
                                           ep_group=ds_comm if args.tensor_model_parallel_size > 1 else None,
                                           expert_mp_group=expert_mp_comm if torch.distributed.get_world_size() > args.num_experts[0] else None,
+=======
+                                          mpu=None,
+>>>>>>> 36978d3b8e64fee4cd7bc566ee789020f34ebe20
                                           dtype=torch.half,
                                           return_tuple=False,
                                           replace_with_kernel_inject=True,
