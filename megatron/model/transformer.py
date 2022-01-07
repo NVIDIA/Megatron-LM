@@ -696,6 +696,21 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        # >>>
+        def make_standalone_tensor(a):
+            assert a._base is not None
+            b = torch.empty((1,), dtype = a.dtype, device = a.device)
+            b.data = a.data
+            return b
+        # <<<
+
+        # hidden_states = make_standalone_tensor(hidden_states)
+        hidden_states = hidden_states.clone()
+        # >>>
+        # from lutil import pax
+        # pax({"hidden_states": hidden_states})
+        # <<<
+
         if encoder_output is not None:
              encoder_output = encoder_output.transpose(0, 1).contiguous()
 
