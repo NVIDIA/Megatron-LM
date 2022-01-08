@@ -98,13 +98,54 @@ def gather_split_1d_tensor(tensor):
                                  group=get_tensor_model_parallel_group())
     return gathered
 
-def safely_set_tensor_data_attr(tensor, new_data_tensor):
+# >>>
+# from lutil import pax
+
+# def make_standalone_tensor(a):
+#     assert a._base is not None
+#     b = torch.empty((1,), dtype = a.dtype, device = a.device)
+#     b.data = a.data
+#     return b
+# class MakeStandaloneTensor(torch.autograd.Function):
+class MakeViewlessTensor_(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp):
+        assert inp._base is not None
+        out = torch.empty((1,), dtype = inp.dtype, device = inp.device)
+        out.data = inp.data
+        # pax(0, {"inp": inp, "out": out})
+        return out
+    @staticmethod
+    def backward(ctx, grad_output):
+        # pax(0, {"grad_output": grad_output})
+        return grad_output
+
+def make_viewless_tensor(tensor):
+    if tensor._base is None:
+        return tensor
+    else:
+        return MakeViewlessTensor_.apply(tensor)
+
+def assert_viewless_tensor(tensor):
+    if isinstance(tensor, list):
+        [ assert_viewless_tensor(t) for t in tensor ]
+        return
+    # assert isinstance(tensor, torch.Tensor), \
+    #     "expected Tensor; found %s." % type(tensor).__name__
+    if not isinstance(tensor, torch.Tensor):
+        return
     assert tensor._base is None, (
-        "Ensure tensor._base is None before setting tensor.data. Otherwise, "
-        "a memory leak will occur (and likely accumulate over iterations). "
-        "FYI, tensor._base has shape %s, and new_data_tensor has shape %s."
+        "Ensure tensor._base is None before setting tensor.data or storing "
+        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
+        "likely accumulate over iterations). FYI, tensor._base has shape "
+        "%s, and new_data_tensor has shape %s."
     ) % (tensor._base.shape, new_data_tensor.shape)
+
+# def set_viewless_tensor_data_attr(tensor, new_data_tensor):
+def safely_set_tensor_data_attr(tensor, new_data_tensor):
+    assert_viewless_tensor(tensor)
     tensor.data = new_data_tensor
+# <<<
 
 class CudaRNGStatesTracker:
     """Tracker for the cuda RNG states.
@@ -253,11 +294,13 @@ class CheckpointFunction(torch.autograd.Function):
             # with data_leak_ctx(args[0]):
             # <<<
             ctx.input_0_shape = args[0].data.shape
+            # >>>
             # args[0].data = split_tensor_into_1d_equal_chunks(args[0].data,
             #                                                  new_buffer=True)
             safely_set_tensor_data_attr(
                 args[0],
                 split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
+            # <<<
 
         # Store everything.
         ctx.save_for_backward(*args)
@@ -271,8 +314,16 @@ class CheckpointFunction(torch.autograd.Function):
                                "please use .backward() if possible")
         inputs = ctx.saved_tensors
         if ctx.distribute_checkpointed_activations:
-            inputs[0].data = gather_split_1d_tensor(inputs[0].data)
-            inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
+            # >>>
+            # inputs[0].data = gather_split_1d_tensor(inputs[0].data)
+            # inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
+            safely_set_tensor_data_attr(
+                inputs[0],
+                gather_split_1d_tensor(inputs[0].data))
+            safely_set_tensor_data_attr(
+                inputs[0],
+                inputs[0].data.view(ctx.input_0_shape))
+            # <<<
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()

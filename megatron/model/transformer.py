@@ -27,6 +27,9 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
+# >>>
+from megatron.mpu.random import make_viewless_tensor
+# <<<
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -696,19 +699,14 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        # >>>
-        def make_standalone_tensor(a):
-            assert a._base is not None
-            b = torch.empty((1,), dtype = a.dtype, device = a.device)
-            b.data = a.data
-            return b
-        # <<<
-
         # hidden_states = make_standalone_tensor(hidden_states)
-        hidden_states = hidden_states.clone()
+        # hidden_states = MakeStandaloneTensor.apply(hidden_states)
+        # hidden_states = MakeViewlessTensor.apply(hidden_states)
+        hidden_states = make_viewless_tensor(hidden_states)
+        # hidden_states = hidden_states.clone()
         # >>>
         # from lutil import pax
-        # pax({"hidden_states": hidden_states})
+        # pax(0, {"hidden_states": hidden_states})
         # <<<
 
         if encoder_output is not None:
