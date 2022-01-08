@@ -632,11 +632,11 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
         if not forward_only:
             # >>>
-            if input_tensor[0] is not None:
-                from lutil import pax
-                pax({
-                    "input_tensor" : input_tensor,
-                })
+            # if input_tensor[0] is not None:
+            #     from lutil import pax
+            #     pax({
+            #         "input_tensor" : input_tensor,
+            #     })
             # <<<
             assert_viewless_tensor(input_tensor)
             assert_viewless_tensor(output_tensor)
