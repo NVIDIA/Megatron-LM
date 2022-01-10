@@ -99,7 +99,7 @@ def gather_split_1d_tensor(tensor):
     return gathered
 
 # >>>
-# from lutil import pax
+from lutil import pax # ****************
 
 # def make_standalone_tensor(a):
 #     assert a._base is not None
@@ -107,26 +107,66 @@ def gather_split_1d_tensor(tensor):
 #     b.data = a.data
 #     return b
 # class MakeStandaloneTensor(torch.autograd.Function):
-class MakeViewlessTensor_(torch.autograd.Function):
+# class MakeViewlessTensor_(torch.autograd.Function):
+class MakeViewlessTensor(torch.autograd.Function):
+    # @staticmethod
+    # def forward(ctx, inp):
+    #     assert inp._base is not None
+    #     out = torch.empty((1,), dtype = inp.dtype, device = inp.device)
+    #     out.data = inp.data
+    #     # pax(0, {"inp": inp, "out": out})
+    #     return out
     @staticmethod
-    def forward(ctx, inp):
-        assert inp._base is not None
-        out = torch.empty((1,), dtype = inp.dtype, device = inp.device)
-        out.data = inp.data
-        # pax(0, {"inp": inp, "out": out})
-        return out
+    def forward(ctx, inp, requires_grad):
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+    # @staticmethod
+    # def forward(ctx, args):
+    #     return [_kernel_make_viewless_tensor(*args)]
     @staticmethod
     def backward(ctx, grad_output):
         # pax(0, {"grad_output": grad_output})
-        return grad_output
+        # return grad_output
+        return grad_output, None
 
-def make_viewless_tensor(tensor):
-    if tensor._base is None:
-        return tensor
+def _kernel_make_viewless_tensor(inp, requires_grad):
+    out = torch.empty(
+        (1,),
+        dtype = inp.dtype,
+        device = inp.device,
+        requires_grad = requires_grad,
+    )
+    out.data = inp.data
+    # >>>
+    # pax(0, {"inp": inp, "out": out})
+    # assert out.requires_grad
+    # <<<
+    return out
+
+# def make_viewless_tensor(tensor):
+#     if tensor._base is None:
+#         return tensor
+#     else:
+#         return MakeViewlessTensor_.apply(tensor)
+def make_viewless_tensor(inp, requires_grad, keep_graph):
+
+    # return tensor as-is, if not a 'view'
+    if inp._base is None:
+        return inp
+
+    # create viewless tensor
+    if keep_graph:
+        # return MakeViewlessTensor.apply((inp, requires_grad))[0]
+        return MakeViewlessTensor.apply(inp, requires_grad)
     else:
-        return MakeViewlessTensor_.apply(tensor)
+        return _kernel_make_viewless_tensor(inp, requires_grad)
+    # return MakeViewlessTensor.apply((inp, requires_grad))[0]
+    # return MakeViewlessTensor.apply(inp, requires_grad)
+    # return MakeViewlessTensor.apply(inp)
+    # return MakeViewlessTensor.apply(inp, 7)
+    # return MakeViewlessTensor.apply(inp, 7)[0]
 
-def assert_viewless_tensor(tensor):
+
+def assert_viewless_tensor(tensor, extra_msg = None):
     if isinstance(tensor, list):
         [ assert_viewless_tensor(t) for t in tensor ]
         return
@@ -137,13 +177,12 @@ def assert_viewless_tensor(tensor):
     assert tensor._base is None, (
         "Ensure tensor._base is None before setting tensor.data or storing "
         "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). FYI, tensor._base has shape "
-        "%s, and new_data_tensor has shape %s."
-    ) % (tensor._base.shape, new_data_tensor.shape)
+        "likely accumulate over iterations). %s"
+    ) % extra_msg
 
 # def set_viewless_tensor_data_attr(tensor, new_data_tensor):
 def safely_set_tensor_data_attr(tensor, new_data_tensor):
-    assert_viewless_tensor(tensor)
+    assert_viewless_tensor(tensor, extra_msg = "FYI, tensor._base has shape %s, and new_data_tensor has shape %s." % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape))
     tensor.data = new_data_tensor
 # <<<
 

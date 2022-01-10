@@ -699,15 +699,12 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        # hidden_states = make_standalone_tensor(hidden_states)
-        # hidden_states = MakeStandaloneTensor.apply(hidden_states)
-        # hidden_states = MakeViewlessTensor.apply(hidden_states)
-        hidden_states = make_viewless_tensor(hidden_states)
-        # hidden_states = hidden_states.clone()
-        # >>>
-        # from lutil import pax
-        # pax(0, {"hidden_states": hidden_states})
-        # <<<
+        # Viewless tensor
+        hidden_states = make_viewless_tensor(
+            hidden_states,
+            requires_grad = True,
+            keep_graph = True,
+        )
 
         if encoder_output is not None:
              encoder_output = encoder_output.transpose(0, 1).contiguous()

@@ -631,13 +631,6 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
         if not forward_only:
-            # >>>
-            # if input_tensor[0] is not None:
-            #     from lutil import pax
-            #     pax({
-            #         "input_tensor" : input_tensor,
-            #     })
-            # <<<
             assert_viewless_tensor(input_tensor)
             assert_viewless_tensor(output_tensor)
             input_tensors.append(input_tensor)
@@ -669,15 +662,6 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
                                            timers=timers)
 
             # Add input_tensor and output_tensor to end of list.
-            # >>>
-            # assert input_tensor[0]._base is None, \
-            #     "rank %s; uh oh." % torch.distributed.get_rank()
-            # if input_tensor[0] is not None:
-            #     from lutil import pax
-            #     pax(4, {
-            #         "input_tensor[0]" : input_tensor[0],
-            #     })
-            # <<<
             assert_viewless_tensor(input_tensor)
             assert_viewless_tensor(output_tensor)
             input_tensors.append(input_tensor)
