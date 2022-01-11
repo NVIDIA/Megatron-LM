@@ -27,10 +27,6 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
-# >>>
-from megatron.mpu.random import make_viewless_tensor
-# <<<
-
 """ We use the following notation throughout this file:
      h: hidden size
      n: number of attention heads
@@ -700,7 +696,10 @@ class ParallelTransformer(MegatronModule):
             hidden_states = self.input_tensor
 
         # Viewless tensor
-        hidden_states = make_viewless_tensor(
+        # >>>
+        assert hidden_states is not None, "rank == %d." % torch.distributed.get_rank()
+        # <<<
+        hidden_states = mpu.make_viewless_tensor(
             hidden_states,
             requires_grad = True,
             keep_graph = True,

@@ -20,9 +20,6 @@ import torch
 from megatron import get_args
 from megatron import mpu
 
-# >>>
-from megatron.mpu.random import make_viewless_tensor
-# <<<
 
 def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
                  tensor_shape,
@@ -145,16 +142,16 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
         if recv_prev:
             tensor_recv_prev = mpu.gather_split_1d_tensor(
                 tensor_recv_prev).view(tensor_shape).requires_grad_()
-            tensor_recv_prev = make_viewless_tensor(tensor_recv_prev,
-                                                    requires_grad = True,
-                                                    keep_graph = False)
+            tensor_recv_prev = mpu.make_viewless_tensor(tensor_recv_prev,
+                                                        requires_grad = True,
+                                                        keep_graph = False)
 
         if recv_next:
             tensor_recv_next = mpu.gather_split_1d_tensor(
                 tensor_recv_next).view(tensor_shape).requires_grad_()
-            tensor_recv_next = make_viewless_tensor(tensor_recv_next,
-                                                    requires_grad = True,
-                                                    keep_graph = False)
+            tensor_recv_next = mpu.make_viewless_tensor(tensor_recv_next,
+                                                        requires_grad = True,
+                                                        keep_graph = False)
 
     return tensor_recv_prev, tensor_recv_next
 

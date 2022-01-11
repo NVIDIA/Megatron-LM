@@ -65,6 +65,9 @@ from .random import get_cuda_rng_tracker
 from .random import model_parallel_cuda_manual_seed
 from .random import gather_split_1d_tensor
 from .random import split_tensor_into_1d_equal_chunks
+from .random import make_viewless_tensor
+from .random import assert_viewless_tensor
+from .random import safely_set_viewless_tensor_data
 
 from .utils import divide
 from .utils import split_tensor_along_last_dim
