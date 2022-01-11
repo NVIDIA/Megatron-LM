@@ -28,9 +28,6 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model import ModelType
 
-# >>>
-# from megatron.mpu.random import assert_viewless_tensor
-# <<<
 
 def get_forward_backward_func():
     args = get_args()

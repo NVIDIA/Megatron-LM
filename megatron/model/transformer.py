@@ -696,9 +696,6 @@ class ParallelTransformer(MegatronModule):
             hidden_states = self.input_tensor
 
         # Viewless tensor
-        # >>>
-        assert hidden_states is not None, "rank == %d." % torch.distributed.get_rank()
-        # <<<
         hidden_states = mpu.make_viewless_tensor(
             hidden_states,
             requires_grad = True,
