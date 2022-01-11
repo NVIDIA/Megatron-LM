@@ -329,6 +329,7 @@ class CheckpointFunction(torch.autograd.Function):
         # the chunk corresponding to the current rank.
         if distribute_checkpointed_activations:
             # >>>
+            # raise Exception("distrib.")
             # from lutil import data_leak_ctx
             # with data_leak_ctx(args[0]):
             # <<<
