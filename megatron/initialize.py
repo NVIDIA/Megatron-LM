@@ -118,7 +118,7 @@ def _compile_dependencies():
         args.micro_batch_size
     # Constraints on sequence length and attn_batch_size to enable warp based
     # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = seq_len > 16 and seq_len <=2048 and \
+    custom_kernel_constraint = seq_len > 16 and seq_len <=4096 and \
         seq_len % 4 == 0 and attn_batch_size % 4 == 0
     # Print a warning.
     if not ((args.fp16 or args.bf16) and
@@ -206,8 +206,8 @@ def _init_autoresume():
 def _set_random_seed(seed_):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        # Ensure that different pipeline MP stages and different data parallel ranks get different seeds.
+        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank()) + (10 * mpu.get_data_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)

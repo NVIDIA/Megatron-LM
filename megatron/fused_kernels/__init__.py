@@ -78,6 +78,12 @@ def load(args):
         scaled_masked_softmax_cuda = _cpp_extention_load_helper(
             "scaled_masked_softmax_cuda", sources, extra_cuda_flags)
 
+        # Softmax
+        sources=[srcpath / 'scaled_softmax.cpp',
+                 srcpath / 'scaled_softmax_cuda.cu']
+        scaled_softmax_cuda = _cpp_extention_load_helper(
+            "scaled_softmax_cuda", sources, extra_cuda_flags)
+
     # =================================
     # Mixed precision fused layer norm.
     # =================================

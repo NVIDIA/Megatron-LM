@@ -285,7 +285,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                               args.accumulate_allreduce_grads_in_fp32,
                               args.use_contiguous_buffers_in_local_ddp)
                      for model_module in model]
-
+            for model_module in model:
+                model_module.broadcast_params()
         else:
             raise NotImplementedError('Unknown DDP implementation specified: '
                                       '{}. Exiting.'.format(args.DDP_impl))
