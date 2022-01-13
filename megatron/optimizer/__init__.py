@@ -22,7 +22,7 @@ from megatron.model import LayerNorm
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
-from deepspeed.moe.utils import is_moe_param
+from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
 
 def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
@@ -33,49 +33,20 @@ def _get_params_for_weight_decay_optimization(modules):
     weight_decay_params = {'params': [], 'name' : 'weight_decay_params'}
     no_weight_decay_params = {'params': [], 'weight_decay': 0.0, 'name': 'no_weight_decay_params'}
     
-    moe_params_with_weight_decay = {'params':[], 'moe': True, 'name': 'moe_params_with_weight_decay'}
-    moe_params_without_weight_decay = {'params':[], 'moe': True, 'weight_decay': 0.0, 'name':'moe_params_without_weight_decay'}
-    
-    if args.create_moe_param_group:
-        for module in modules:
-            for module_ in module.modules():
-                moe_params_with_weight_decay['params'].extend([p for n,p in \
-                    list(module_._parameters.items()) if p is not None and \
-                    is_moe_param(p) and n != 'bias'])
-                moe_params_without_weight_decay['params'].extend([p for n,p in\
-                    list(module_._parameters.items()) if p is not None and \
-                    is_moe_param(p) and n == 'bias'])
-        for module in modules:
-            for module_ in module.modules():
-                if isinstance(module_, LayerNorm):
-                    no_weight_decay_params['params'].extend(
-                        [p for p in list(module_._parameters.values())
-                        if p is not None and not is_moe_param(p)])
-                else:
-                    weight_decay_params['params'].extend(
-                        [p for n, p in list(module_._parameters.items())
-                        if p is not None and n != 'bias' and not is_moe_param(p)])
-                    no_weight_decay_params['params'].extend(
-                        [p for n, p in list(module_._parameters.items())
-                        if p is not None and n == 'bias' and not is_moe_param(p)])
-        return weight_decay_params, no_weight_decay_params, \
-            moe_params_with_weight_decay, moe_params_without_weight_decay
-    else:
-        for module in modules:
-            for module_ in module.modules():
-                if isinstance(module_, LayerNorm):
-                    no_weight_decay_params['params'].extend(
-                        [p for p in list(module_._parameters.values())
-                        if p is not None])
-                else:
-                    weight_decay_params['params'].extend(
-                        [p for n, p in list(module_._parameters.items())
-                        if p is not None and n != 'bias'])
-                    no_weight_decay_params['params'].extend(
-                        [p for n, p in list(module_._parameters.items())
-                        if p is not None and n == 'bias'])
-        return weight_decay_params, no_weight_decay_params
-
+    for module in modules:
+        for module_ in module.modules():
+            if isinstance(module_, LayerNorm):
+                no_weight_decay_params['params'].extend(
+                    [p for p in list(module_._parameters.values())
+                    if p is not None])
+            else:
+                weight_decay_params['params'].extend(
+                    [p for n, p in list(module_._parameters.items())
+                    if p is not None and n != 'bias'])
+                no_weight_decay_params['params'].extend(
+                    [p for n, p in list(module_._parameters.items())
+                    if p is not None and n == 'bias'])
+    return weight_decay_params, no_weight_decay_params
 
 def get_megatron_optimizer(model):
     args = get_args()
@@ -85,6 +56,8 @@ def get_megatron_optimizer(model):
 
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
+    if args.create_moe_param_group:
+        param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
     if args.optimizer == 'adam':
         optimizer = Adam(param_groups,
                          lr=args.lr,

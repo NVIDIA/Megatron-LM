@@ -276,8 +276,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
-    group.add_argument('--num-experts', type=int, default=1,
-                           help='number of experts')
+    group.add_argument('--num-experts', type=int, nargs='+', default=[1,],
+                           help='number of experts list, MoE related.')
+    group.add_argument('--mlp-type', type=str, default='standard',
+                           help='Only applicable when num-experts > 1, accepts [standard, residual]')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--expert-interval', type=int, default=2,
@@ -468,6 +470,8 @@ def _add_training_args(parser):
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--ds-inference', action='store_true',
+                       help='DeepSpeed inference engine being used')
     group.add_argument('--cpu-optimizer', action='store_true',
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',

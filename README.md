@@ -68,6 +68,12 @@ GPT-345M: wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia
 
 The models require vocabulary files to run. The BERT  WordPiece vocab file can be extracted from Google's pretrained BERT models: [uncased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt), [cased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt). The GPT [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
 
+Additional notes for DeepSpeed. We have added a helper script to download the checkpoints and make the example runnable.
+
+Steps to follow:
+ - bash ds_download_ckpt.sh -- this will download and extract the checkpoint and GPT merges and vocab files.
+ - bash examples/generate_text.sh -- this will generate examples using the 345m GPT model.
+
 # Usage
 
 After installation, there are several possible workflows. The most comprehensive is:
