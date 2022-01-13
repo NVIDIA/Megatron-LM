@@ -59,8 +59,8 @@ def parse_args(extra_args_provider=None, defaults={},
         args = parser.parse_args()
 
     # Distributed args.
-    args.rank = int(os.getenv('OMPI_COMM_WORLD_RANK', '0'))
-    args.world_size = int(os.getenv("OMPI_COMM_WORLD_SIZE", '1'))
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)

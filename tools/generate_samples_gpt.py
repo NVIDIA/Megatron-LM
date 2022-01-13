@@ -16,7 +16,6 @@
 """Sample Generate GPT"""
 
 import deepspeed
-from deepspeed.ops.transformer.inference import create_comm
 
 import os
 import sys
@@ -175,72 +174,19 @@ def main():
 
 
 def ds_inference(model, args):
-    from deepspeed.ops.transformer.inference import create_comm
-    import torch
+    import megatron.model as mm
+    engine = deepspeed.init_inference(model=model,
+                                      mp_size=args.tensor_model_parallel_size, 
+                                      mpu=mpu,
+                                      ep_size=torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1,
+                                      dtype=torch.half,
+                                      triangular_masking=True,
+                                      return_tuple=False,
+                                      replace_with_kernel_inject=True,
+                                      moe_experts=args.num_experts[0],
+                                      moe_type=args.mlp_type)
     
-    ep_cnt = (torch.distributed.get_rank() // args.num_experts[0])
-
-    nnodes = (torch.distributed.get_world_size() // args.tensor_model_parallel_size) // \
-                (max(args.num_experts[0], torch.distributed.get_world_size()) // args.num_experts[0])
-    
-    mp_color = ep_cnt * args.tensor_model_parallel_size + \
-                    torch.distributed.get_rank() % args.tensor_model_parallel_size
-    if args.tensor_model_parallel_size > 1:
-        ds_comm = create_comm([ep_cnt * args.num_experts[0] + nr * args.tensor_model_parallel_size + \
-                            (torch.distributed.get_rank() % args.tensor_model_parallel_size) for nr in range(nnodes)], \
-                            color=mp_color)
-    
-    if torch.distributed.get_world_size() > args.num_experts[0]:
-        expert_mp_size = torch.distributed.get_world_size() // args.num_experts[0]   
-        expert_mp_color = torch.distributed.get_rank() % args.num_experts[0]
-        expert_mp_comm = create_comm([expert_mp_color + nr * args.num_experts[0] for nr in range(expert_mp_size)], color=expert_mp_color+16)
-    m = None
-    simple = True
-    if simple:
-        import deepspeed.module_inject as module_inject
-        import megatron.model as mm
-        import torch
-        engine = deepspeed.init_inference(model=model,
-                                          triangular_masking=False,
-                                          mp_size=args.tensor_model_parallel_size, 
-                                          mpu=mpu if args.tensor_model_parallel_size > 1 else None,
-                                          ep_group=ds_comm if args.tensor_model_parallel_size > 1 else None,
-                                          expert_mp_group=expert_mp_comm if torch.distributed.get_world_size() > args.num_experts[0] else None,
-                                          dtype=torch.half,
-                                          return_tuple=False,
-                                          replace_with_kernel_inject=True,
-                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy},
-                                          moe_experts=args.num_experts[0],
-                                          moe_type=args.mlp_type)
-                                          #replace_method='auto')
-        m = engine.module
-    else:
-
-        import deepspeed.module_inject as module_inject
-        policy = module_inject.replace_policy.MegatronLayerPolicy
-        policy.version = 1
-        import torch
-        q_scale = [[torch.randn(2).to(torch.cuda.current_device()) / 100 for _ in range(4)] for _ in range(96)]
-        quantize_settings = (q_scale, #quantization_scales
-                 1, #merge_count
-                 False, #mlp_extra_grouping
-                 1, #quantize_groups
-                )
-
-        import megatron.model as mm
-        m = module_inject.replace_transformer_layer(orig_layer_impl=mm.transformer.ParallelTransformerLayer,
-                                  model=model,
-                                  policy=policy,
-                                  hidden_size=args.hidden_size,
-                                  num_attention_heads=args.num_attention_heads,
-                                  mp_size=args.tensor_model_parallel_size,
-                                  mp_group=mpu.get_tensor_model_parallel_group(),
-                                  #dp_group=mpu.get_data_parallel_group, 
-                                  fp16=args.fp16,
-                                  training=False,
-                                  quantize=True,
-                                  quantize_settings=quantize_settings)
-    return m
+    return engine.module
 
 if __name__ == "__main__":
 
