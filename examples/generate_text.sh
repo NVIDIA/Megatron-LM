@@ -37,5 +37,4 @@ deepspeed --num_gpus=$gpus --num_nodes=1 tools/generate_samples_gpt.py \
        $use_tutel $ds_inference
 
 #$((10*$b))
-
 #       --recompute

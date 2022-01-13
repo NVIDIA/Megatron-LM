@@ -494,6 +494,7 @@ class ParallelTransformerLayer(MegatronModule):
                 self.mlp = Residual_MoE(init_method,
                     output_layer_init_method, self.num_experts)
 
+
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 layer_past=None, get_key_value=False):
@@ -640,6 +641,7 @@ class ParallelTransformer(MegatronModule):
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
                  pre_process=True, post_process=True, num_experts=[1]):
+
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -668,6 +670,7 @@ class ParallelTransformer(MegatronModule):
                 layer_type=layer_type,
                 self_attn_mask_type=self_attn_mask_type,
                 num_experts=n_e)
+
         if args.virtual_pipeline_model_parallel_size is not None:
             assert args.num_layers % args.virtual_pipeline_model_parallel_size == 0, \
                 'num_layers_per_stage must be divisible by ' \
@@ -793,6 +796,7 @@ class ParallelTransformer(MegatronModule):
 
             if encoder_output is not None:
                  encoder_output = encoder_output.transpose(0, 1).contiguous()
+
         moe_losses = []
         if self.checkpoint_activations:
             hidden_states, moe_losses = self._checkpointed_forward(hidden_states,

@@ -48,7 +48,6 @@ def _get_params_for_weight_decay_optimization(modules):
                     if p is not None and n == 'bias'])
     return weight_decay_params, no_weight_decay_params
 
-
 def get_megatron_optimizer(model):
     args = get_args()
 
