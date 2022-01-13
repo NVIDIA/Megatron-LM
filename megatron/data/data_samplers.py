@@ -164,7 +164,7 @@ class MegatronPretrainingRandomSampler:
         current_epoch_samples = self.consumed_samples % active_total_samples
         assert current_epoch_samples % self.micro_batch_times_data_parallel_size == 0
 
-        if isinstance(dataset, RandomSeedDataset):
+        if isinstance(self.dataset, RandomSeedDataset):
             self.dataset.set_epoch(self.epoch)
 
         # data sharding and random sampling

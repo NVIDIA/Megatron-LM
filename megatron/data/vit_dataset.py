@@ -35,7 +35,7 @@ class ClassificationTransform():
                 T.ColorJitter(0.4, 0.4, 0.4, 0.1),
                 ImageNetPolicy(),
                 T.ToTensor(),
-                T.Normalize(*self.mean_std),
+                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
                 T.ConvertImageDtype(self.data_type)
             ])
         else:

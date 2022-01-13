@@ -19,8 +19,6 @@ import torch
 from megatron import get_args
 from megatron.model.utils import get_linear_layer
 from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
-from megatron.model.vision.mit_backbone import mit_b3_avg
-from megatron.model.vision.utils import trunc_normal_
 from megatron.model.module import MegatronModule
 
 class VitClassificationModel(MegatronModule):
