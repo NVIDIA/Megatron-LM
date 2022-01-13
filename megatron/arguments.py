@@ -681,9 +681,6 @@ def _add_distributed_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
-    group.add_argument('--deallocate-pipeline-outputs', action='store_true',
-                       default=False, help='If set, pipeline output tensors '
-                       'are deallocated during the forward pass.')
     return parser
 
 
