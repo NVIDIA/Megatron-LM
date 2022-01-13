@@ -31,7 +31,7 @@ from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
-import deepspeed
+
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -40,7 +40,6 @@ def model_provider(pre_process=True, post_process=True):
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
 
-    #print(f'model = {model}')
     return model
 
 
@@ -73,40 +72,11 @@ def add_text_generate_args(parser):
                        'instead of using previously computed keys/values.')
 
     return parser
-def print_latency(latency_set, title=""):
-    # 10 warmup queries
-    latency_set = latency_set[10:]
-    count = len(latency_set)
-    if count > 0:
-        latency_set.sort()
-        n50 = (count - 1) * 0.5 + 1
-        n90 = (count - 1) * 0.9 + 1
-        n95 = (count - 1) * 0.95 + 1
-        n99 = (count - 1) * 0.99 + 1
-        n999 = (count - 1) * 0.999 + 1
 
-        avg = sum(latency_set) / count
-        p50 = latency_set[int(n50) - 1]
-        p90 = latency_set[int(n90) - 1]
-        p95 = latency_set[int(n95) - 1]
-        p99 = latency_set[int(n99) - 1]
-        p999 = latency_set[int(n999) - 1]
-
-        print("====== latency stats {0} ======", title)
-        print("\tAvg Latency: {0:8.2f} ms".format(avg * 1000))
-        print("\tP50 Latency: {0:8.2f} ms".format(p50 * 1000))
-        print("\tP90 Latency: {0:8.2f} ms".format(p90 * 1000))
-        print("\tP95 Latency: {0:8.2f} ms".format(p95 * 1000))
-        print("\tP99 Latency: {0:8.2f} ms".format(p99 * 1000))
-        print("\t999 Latency: {0:8.2f} ms".format(p999 * 1000))
-    
 
 def main():
     """Main program."""
 
-    latencies = []
-    model_latencies = []
-    single_token_latency = []
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                                        'no_load_rng': True,
@@ -116,22 +86,15 @@ def main():
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-    
-    import torch
-    deepspeed.utils.groups.initialize(ep_size=torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
 
-    #if args.load is not None:
-    #    _ = load_checkpoint(model, None, None)
+    if args.load is not None:
+        _ = load_checkpoint(model, None, None)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
-
-    if args.ds_inference:
-        model = ds_inference(model, args)
-        print('> DeepSpeed Inference initialized')
 
     # Generate samples.
     if args.num_samples == 0:
@@ -141,60 +104,8 @@ def main():
         else:
             generate_samples_interactive(model)
     else:
-        generate_and_write_samples_unconditional(model, latencies, single_token_latency, model_latencies)
-    
-    if torch.cuda.current_device() == 0:
-        print_latency(latencies)
-        print_latency(model_latencies, "model_latencies")
-        print_latency(single_token_latency, "single_token_latency")
+        generate_and_write_samples_unconditional(model)
 
-
-def ds_inference(model, args):
-    m = None
-    simple = True
-
-    if simple:
-        import deepspeed.module_inject as module_inject
-        import megatron.model as mm
-        import torch
-        engine = deepspeed.init_inference(model=model,
-                                          mp_size=args.tensor_model_parallel_size, 
-                                          mpu=mpu,
-                                          #ep_group=#WORLD_GROUP,
-                                          dtype=torch.half,
-                                          return_tuple=False,
-                                          replace_with_kernel_inject=True,
-                                          injection_policy={mm.transformer.ParallelTransformerLayer:module_inject.replace_policy.MegatronLayerPolicy},
-                                          moe_experts=args.num_experts)
-                                          #replace_method='auto')
-        m = engine.module
-    else:
-
-        import deepspeed.module_inject as module_inject
-        policy = module_inject.replace_policy.MegatronLayerPolicy
-        policy.version = 1
-        import torch
-        q_scale = [[torch.randn(2).to(torch.cuda.current_device()) / 100 for _ in range(4)] for _ in range(96)]
-        quantize_settings = (q_scale, #quantization_scales
-                 1, #merge_count
-                 False, #mlp_extra_grouping
-                 1, #quantize_groups
-                )
-
-        import megatron.model as mm
-        m = module_inject.replace_transformer_layer(orig_layer_impl=mm.transformer.ParallelTransformerLayer,
-                                  model=model,
-                                  policy=policy,
-                                  hidden_size=args.hidden_size,
-                                  num_attention_heads=args.num_attention_heads,
-                                  mp_size=args.tensor_model_parallel_size,
-                                  mp_group=mpu.get_tensor_model_parallel_group(),
-                                  #dp_group=mpu.get_data_parallel_group, 
-                                  fp16=args.fp16,
-                                  training=False,
-                                  quantize=True,
-                                  quantize_settings=quantize_settings)
-    return m
 
 if __name__ == "__main__":
 
