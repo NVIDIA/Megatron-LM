@@ -493,7 +493,8 @@ class ParallelTransformerLayer(MegatronModule):
             elif args.mlp_type == 'residual':
                 self.mlp = Residual_MoE(init_method,
                     output_layer_init_method, self.num_experts)
-
+            else:
+               raise ValueError(f"{args.mlp_type} is not a correct MLP type. Please use standard or residual")
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
