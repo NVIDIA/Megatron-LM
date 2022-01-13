@@ -76,8 +76,8 @@ def get_forward_backward_func():
 #         )
 #         # <<<
 # <<<
-def free_output_tensor(out):
-    '''Pseudo-free (i.e., set to scalar) the output tensor's '.data' field.
+def deallocate_output_tensor(out):
+    '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
     This method should be called right after the output tensor has been
     sent to the next pipeline stage. At this point, the output tensor is
@@ -96,7 +96,7 @@ def free_output_tensor(out):
 def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
 
-    To make the 'free_output_tensor' (above) optimization work, the C++
+    To make the 'deallocate_output_tensor' (above) optimization work, the C++
     autograd engine must be called directly, bypassing Pytorch's
     torch.autograd.backward. Pytorch's 'backward' checks that the output and
     grad have the same shape, while C++'s 'backward' does not.
@@ -428,7 +428,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
         # >>>
         pax({"output_tensor": output_tensor})
         # <<<
-        free_output_tensor(output_tensor)
+        deallocate_output_tensor(output_tensor)
 
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
@@ -492,7 +492,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                     output_tensor, input_tensor_grad,
                     recv_prev=recv_prev, recv_next=recv_next,
                     tensor_shape=tensor_shape, timers=timers)
-        free_output_tensor(output_tensor)
+        deallocate_output_tensor(output_tensor)
 
         # Put input_tensor and output_tensor_grad in data structures in the
         # right location.
@@ -668,7 +668,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            free_output_tensor(output_tensor[0])
+            deallocate_output_tensor(output_tensor[0])
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -697,7 +697,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            free_output_tensor(output_tensor[0])
+            deallocate_output_tensor(output_tensor[0])
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
