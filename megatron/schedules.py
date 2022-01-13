@@ -49,6 +49,8 @@ def deallocate_output_tensor(out):
     sent to the next pipeline stage. At this point, the output tensor is
     only useful for its '.grad_fn' field, and not its '.data'.
     '''
+    if out is None:
+        return
     assert isinstance(out, torch.Tensor), \
         "expected Tensor, found %s." % type(out).__name__
     assert out._base is None, \
