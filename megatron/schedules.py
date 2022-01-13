@@ -28,10 +28,6 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model import ModelType
 
-# >>>
-from lutil import pax, tp, KEY_RANK
-# <<<
-
 def get_forward_backward_func():
     args = get_args()
     if mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -46,36 +42,6 @@ def get_forward_backward_func():
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
 
-# >>>
-# def free_output_tensor(output_tensors, deallocate_pipeline_outputs):
-#     '''Pseudo-free (i.e., set to scalar) the output tensor's '.data' field.
-
-#     This method should be called right after the output tensor has been
-#     sent to the next pipeline stage. At this point, the output tensor is
-#     only useful for its '.grad_fn' field, and not its '.data'.
-#     '''
-#     # >>>
-#     # raise Exception("hi.")
-#     # <<<
-#     if not deallocate_pipeline_outputs or output_tensors is None:
-#         return
-#     if isinstance(output_tensors, torch.Tensor):
-#         output_tensors = [output_tensors]
-#     for output_tensor in output_tensors:
-#         # >>>
-#         # if output_tensor.nelement() < 10:
-#         #     # raise Exception("interesting.")
-#         #     continue
-#         # <<<
-#         # >>>
-#         # output_tensor.data = torch.cuda.FloatTensor([0])
-#         output_tensor.data = torch.empty(
-#             (1,),
-#             device = torch.cuda.current_device(),
-#             dtype = output_tensor.dtype,
-#         )
-#         # <<<
-# <<<
 def deallocate_output_tensor(out):
     '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
@@ -118,21 +84,15 @@ def custom_backward(output, grad_output):
         )
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
-    # >>>
-    try:
-        Variable._execution_engine.run_backward(
-            tensors = (output,),
-            grad_tensors = (grad_output,),
-            keep_graph = False,
-            create_graph = False,
-            inputs = tuple(),
-            allow_unreachable=True,
-            accumulate_grad=True,
-        )
-    except Exception as e:
-        print(">>>> rank = %d. <<<<" % torch.distributed.get_rank())
-        raise e
-    # <<<
+    Variable._execution_engine.run_backward(
+        tensors = (output,),
+        grad_tensors = (grad_output,),
+        keep_graph = False,
+        create_graph = False,
+        inputs = tuple(),
+        allow_unreachable=True,
+        accumulate_grad=True,
+    )
         
 
 def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_reduced):
@@ -162,14 +122,6 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
         output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
-
-    # >>>
-    # if torch.distributed.get_rank() == 4:
-    #     pax(4, {
-    #         "output_tensor" : tp(output_tensor),
-    #         "input_tensor[-1]" : tp(input_tensor[-1]),
-    #     })
-    # <<<
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
@@ -425,9 +377,6 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                     tensor_shape=tensor_shape,
                     timers=timers)
         input_tensors[next_forward_model_chunk_id].append(input_tensor)
-        # >>>
-        pax({"output_tensor": output_tensor})
-        # <<<
         deallocate_output_tensor(output_tensor)
 
     # Run 1F1B in steady state.
