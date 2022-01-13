@@ -183,7 +183,7 @@ def ds_inference(model, args):
                                       triangular_masking=True,
                                       return_tuple=False,
                                       replace_with_kernel_inject=True,
-                                      moe_experts=args.num_experts[0],
+                                      moe_experts=args.num_experts,
                                       moe_type=args.mlp_type)
     
     return engine.module
