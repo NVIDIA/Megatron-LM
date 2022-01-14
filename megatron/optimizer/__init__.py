@@ -22,8 +22,6 @@ from megatron.model import LayerNorm
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
-from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
-
 def _get_params_for_weight_decay_optimization(modules):
     """Divide params into with-weight-decay and without-weight-decay groups.
     Layernorms and baises will have no weight decay but the rest will.
@@ -57,6 +55,7 @@ def get_megatron_optimizer(model):
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
     if args.create_moe_param_group:
+        from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
         param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
     if args.optimizer == 'adam':
         optimizer = Adam(param_groups,

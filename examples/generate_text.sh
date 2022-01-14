@@ -4,10 +4,10 @@ CHECKPOINT_PATH=checkpoints/gpt2_345m
 VOCAB_FILE=gpt2-vocab.json
 MERGE_FILE=gpt2-merges.txt
 b=8
-mp=16
-experts=128
+mp=1
+experts=2
 nodes=1
-gpus=8
+gpus=1
 
 
 use_tutel=""
@@ -17,18 +17,15 @@ use_tutel=""
 #ds_inference=""
 ds_inference="--ds-inference"
 
-nodes=${NODES[$ns]}
-procs=$(($nodes * $gpus))
-launch_cmd="deepspeed --num_nodes $nodes --num_gpus 8"
-L=${NUM_LAYERS[$k]}
-H=${HIDDEN[$k]}
-A=${HEADS[$k]}
+launch_cmd="deepspeed --num_nodes $nodes --num_gpus $gpus"
+L=24
+H=2048
+A=16
 #experts1=${experts[$k]}
 program_cmd="tools/generate_samples_gpt.py \
        --tensor-model-parallel-size $mp \
        --num-layers $L \
        --hidden-size $H \
-       --load $CHECKPOINT_PATH \
        --num-attention-heads $A \
        --max-position-embeddings 1024 \
        --tokenizer-type GPT2BPETokenizer \
@@ -45,7 +42,6 @@ program_cmd="tools/generate_samples_gpt.py \
        --top_p 0.9 \
        --log-interval 1 \
        --num-samples $((100*$b))
-       --deepspeed \
        $use_tutel $ds_inference"
 
 echo $launch_cmd $program_cmd

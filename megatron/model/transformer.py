@@ -655,7 +655,7 @@ class ParallelTransformer(MegatronModule):
 
         super(ParallelTransformer, self).__init__()
         args = get_args()
-
+    
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
         self.pre_process = pre_process
@@ -734,7 +734,6 @@ class ParallelTransformer(MegatronModule):
             global get_cuda_rng_tracker, checkpoint
             get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
             checkpoint = deepspeed.checkpointing.checkpoint
-
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
@@ -822,13 +821,15 @@ class ParallelTransformer(MegatronModule):
                 past = None
                 if layer_past is not None:
                     past = layer_past[index]
-                hidden_states, moe_loss = layer(hidden_states,
+                hidden_states = layer(hidden_states,
                                       attention_mask,
                                       encoder_output=encoder_output,
                                       enc_dec_attn_mask=enc_dec_attn_mask,
                                       layer_past=past,
                                       get_key_value=get_key_value)
-                moe_losses.append(moe_loss)
+                if not self.ds_inference:
+                    hidden_states, moe_loss = hidden_states
+                    moe_losses.append(moe_loss)
                 if get_key_value:
                     hidden_states, present = hidden_states
                     presents.append(present)

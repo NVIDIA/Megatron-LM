@@ -41,7 +41,8 @@ def model_provider(pre_process=True, post_process=True):
 
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
-                     pre_process=pre_process, post_process=post_process)
+                     pre_process=pre_process, post_process=post_process, 
+                     return_moe_loss=False) # we need to set "return_moe_loss" for the inference_mode
     return model
 
 
@@ -75,9 +76,38 @@ def add_text_generate_args(parser):
 
     return parser
 
+def print_latency(latency_set, title=""):
+    # 10 warmup queries
+    latency_set = latency_set[10:]
+    count = len(latency_set)
+    if count > 0:
+        latency_set.sort()
+        n50 = (count - 1) * 0.5 + 1
+        n90 = (count - 1) * 0.9 + 1
+        n95 = (count - 1) * 0.95 + 1
+        n99 = (count - 1) * 0.99 + 1
+        n999 = (count - 1) * 0.999 + 1
 
+        avg = sum(latency_set) / count
+        p50 = latency_set[int(n50) - 1]
+        p90 = latency_set[int(n90) - 1]
+        p95 = latency_set[int(n95) - 1]
+        p99 = latency_set[int(n99) - 1]
+        p999 = latency_set[int(n999) - 1]
+
+        print("====== latency stats {0} ======", title)
+        print("\tAvg Latency: {0:8.2f} ms".format(avg * 1000))
+        print("\tP50 Latency: {0:8.2f} ms".format(p50 * 1000))
+        print("\tP90 Latency: {0:8.2f} ms".format(p90 * 1000))
+        print("\tP95 Latency: {0:8.2f} ms".format(p95 * 1000))
+        print("\tP99 Latency: {0:8.2f} ms".format(p99 * 1000))
+        print("\t999 Latency: {0:8.2f} ms".format(p999 * 1000))
+        
 def main():
     """Main program."""
+    latencies = []
+    model_latencies = []
+    single_token_latency = []
 
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
@@ -129,7 +159,6 @@ def ds_inference(model, args):
                                       mp_size=args.tensor_model_parallel_size, 
                                       mpu=mpu,
                                       dtype=torch.half,
-                                      return_tuple=False,
                                       replace_with_kernel_inject=True,
                                       moe_experts=args.num_experts,
                                       moe_type=args.mlp_type)

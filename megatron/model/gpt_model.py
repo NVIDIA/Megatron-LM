@@ -71,7 +71,8 @@ class GPTModel(MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 return_moe_loss=True):
         super(GPTModel, self).__init__()
         args = get_args()
 
@@ -79,7 +80,7 @@ class GPTModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
-
+        self.return_moe_loss = return_moe_loss
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
             add_pooler=False,
@@ -124,15 +125,18 @@ class GPTModel(MegatronModule):
             get_key_value=get_key_value)
 
         if self.post_process:
-            return post_language_model_processing(
-                lm_output, labels,
-                self.word_embeddings_weight(),
-                get_key_value,
-                self.parallel_output,
-                forward_method_parallel_output,
-                self.fp16_lm_cross_entropy), *moe_losses
-        else:
+            lm_output = post_language_model_processing(
+                    lm_output, labels,
+                    self.word_embeddings_weight(),
+                    get_key_value,
+                    self.parallel_output,
+                    forward_method_parallel_output,
+                    self.fp16_lm_cross_entropy)
+        
+        if self.return_moe_loss:
             return lm_output, *moe_losses
+        else:
+            return lm_output
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
                                        keep_vars=False):

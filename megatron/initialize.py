@@ -184,7 +184,6 @@ def setup_deepspeed_random_and_activation_checkpointing(args):
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
     args = get_args()
-
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
