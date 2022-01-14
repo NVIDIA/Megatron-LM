@@ -107,44 +107,6 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
-class Residual_MoE(MegatronModule):
-    def __init__(self, init_method, output_layer_init_method, num_experts=1):
-        super(Residual_MoE, self).__init__()
-        args = get_args()
-
-        # simple large mlp
-        self.mlp = ParallelMLP(init_method, output_layer_init_method)
-        # MoE experts group
-        self.moe = MoE(args.hidden_size, ParallelMLP(init_method,
-                    output_layer_init_method=output_layer_init_method),
-                    num_experts=num_experts, k=args.topk,
-                    capacity_factor=args.moe_train_capacity_factor,
-                    eval_capacity_factor=args.moe_eval_capacity_factor,
-                    min_capacity=args.moe_min_capacity,
-                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
-
-        # Sum up coefficient
-        self.coefficient = mpu.RowParallelLinear(
-            args.hidden_size,
-            2,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            bias=False)
-
-        # Sum coefficient activation
-        self.coef_activation_func = F.softmax
-
-    def forward(self, hidden_states):
-        mlp_output, _  = self.mlp(hidden_states)
-        moe_output, moe_loss, _ = self.moe(hidden_states)
-
-        # Weighted sum
-        _coef, _ = self.coefficient(hidden_states)
-        coef = self.coef_activation_func(_coef, dim=-1)
-        output = coef[:, :, :1] * mlp_output + coef[:, :, 1:] * moe_output
-        return output, moe_loss, None
-
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
