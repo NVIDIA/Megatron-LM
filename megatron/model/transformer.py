@@ -497,7 +497,7 @@ class ParallelTransformerLayer(MegatronModule):
                               capacity_factor=args.moe_train_capacity_factor,
                               eval_capacity_factor=args.moe_eval_capacity_factor,
                               min_capacity=args.moe_min_capacity,
-                              drop_tokens=args.moe_token_dropping, use_tutel=False)
+                              drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
             elif args.mlp_type == 'residual':
                 self.mlp = Residual_MoE(init_method,
                                      output_layer_init_method, 
