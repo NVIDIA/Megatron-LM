@@ -286,8 +286,6 @@ def _add_network_size_args(parser):
                            help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
-    group.add_argument('--mlp-type', type=str, default='standard',
-                           help='[standard (MoE), residual (MoE)]')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
                        help='Transformer Feed-Forward Network hidden size. '
                        'This is set to 4*hidden-size if not provided')
