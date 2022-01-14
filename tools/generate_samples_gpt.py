@@ -15,6 +15,8 @@
 
 """Sample Generate GPT"""
 
+import deepspeed
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -31,7 +33,8 @@ from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
-
+import deepspeed
+import torch
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -39,7 +42,6 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
-
     return model
 
 
@@ -83,9 +85,12 @@ def main():
                                        'no_load_optim': True})
 
     args = get_args()
+    
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
+
+    deepspeed.utils.groups.initialize(torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
@@ -96,6 +101,10 @@ def main():
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
+    if args.ds_inference:
+        model = ds_inference(model, args)
+        print('> DeepSpeed Inference engine initialized')
+
     # Generate samples.
     if args.num_samples == 0:
         args.micro_batch_size = 1
@@ -104,8 +113,28 @@ def main():
         else:
             generate_samples_interactive(model)
     else:
-        generate_and_write_samples_unconditional(model)
+        generate_and_write_samples_unconditional(model, latencies, single_token_latency, model_latencies)
+    
+    
+    #if torch.cuda.current_device() == 0:
+    if torch.distributed.get_rank() == 0:
+        print_latency(latencies)
+        print_latency(model_latencies, "model_latencies")
+        print_latency(single_token_latency, "single_token_latency")
 
+
+def ds_inference(model, args):
+    import megatron.model as mm
+    engine = deepspeed.init_inference(model=model,
+                                      mp_size=args.tensor_model_parallel_size, 
+                                      mpu=mpu,
+                                      dtype=torch.half,
+                                      return_tuple=False,
+                                      replace_with_kernel_inject=True,
+                                      moe_experts=args.num_experts,
+                                      moe_type=args.mlp_type)
+    
+    return engine.module
 
 if __name__ == "__main__":
 

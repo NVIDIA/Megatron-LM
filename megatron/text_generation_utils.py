@@ -458,7 +458,12 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     # Forward pass through the model.
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
-    unwrapped_model.set_input_tensor(input_tensor)
+
+    if hasattr(unwrapped_model, 'set_input_tensor'):
+        unwrapped_model.set_input_tensor(input_tensor)
+    elif args.deepspeed or args.ds_inference:
+        unwrapped_model.module.set_input_tensor(input_tensor)
+
     output_tensor = model(tokens, position_ids, attention_mask,
                           tokentype_ids=tokentype_ids,
                           layer_past=layer_past,

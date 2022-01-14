@@ -26,7 +26,7 @@ from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
-
+from torch import distributed as dist
 import deepspeed
 from deepspeed.moe.layer import MoE
 # flags required to enable jit fusion kernels
@@ -59,7 +59,7 @@ class ParallelMLP(MegatronModule):
     applied.
     """
 
-    def __init__(self, init_method, output_layer_init_method):
+    def __init__(self, init_method, output_layer_init_method, MOE=False, MoE_mp_size=1):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
@@ -69,7 +69,9 @@ class ParallelMLP(MegatronModule):
             args.ffn_hidden_size,
             gather_output=False,
             init_method=init_method,
-            skip_bias_add=True)
+            skip_bias_add=True, 
+            MOE=MOE,
+            MoE_mp_size=MoE_mp_size)
 
         self.bias_gelu_fusion = args.bias_gelu_fusion
         self.activation_func = F.gelu
@@ -84,7 +86,9 @@ class ParallelMLP(MegatronModule):
             args.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
-            skip_bias_add=True)
+            skip_bias_add=True, 
+            MOE=MOE,
+            MoE_mp_size=MoE_mp_size)
 
 
     def forward(self, hidden_states):
@@ -102,44 +106,6 @@ class ParallelMLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
-
-class Residual_MoE(MegatronModule):
-    def __init__(self, init_method, output_layer_init_method, num_experts=1):
-        super(Residual_MoE, self).__init__()
-        args = get_args()
-
-        # simple large mlp
-        self.mlp = ParallelMLP(init_method, output_layer_init_method)
-        # MoE experts group
-        self.moe = MoE(args.hidden_size, ParallelMLP(init_method,
-                    output_layer_init_method=output_layer_init_method),
-                    num_experts=num_experts, k=args.topk,
-                    capacity_factor=args.moe_train_capacity_factor,
-                    eval_capacity_factor=args.moe_eval_capacity_factor,
-                    min_capacity=args.moe_min_capacity,
-                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
-
-        # Sum up coefficient
-        self.coefficient = mpu.RowParallelLinear(
-            args.hidden_size,
-            2,
-            input_is_parallel=True,
-            init_method=output_layer_init_method,
-            skip_bias_add=True,
-            bias=False)
-
-        # Sum coefficient activation
-        self.coef_activation_func = F.softmax
-
-    def forward(self, hidden_states):
-        mlp_output, _  = self.mlp(hidden_states)
-        moe_output, moe_loss, _ = self.moe(hidden_states)
-
-        # Weighted sum
-        _coef, _ = self.coefficient(hidden_states)
-        coef = self.coef_activation_func(_coef, dim=-1)
-        output = coef[:, :, :1] * mlp_output + coef[:, :, 1:] * moe_output
-        return output, moe_loss, None
 
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
@@ -397,6 +363,44 @@ class ParallelAttention(MegatronModule):
 
         return output, bias
 
+class Residual_MoE(MegatronModule):
+    def __init__(self, init_method, output_layer_init_method, num_experts=1, MOE=True, MoE_mp_size=1):
+        super(Residual_MoE, self).__init__()
+        args = get_args()
+
+        # simple large mlp
+        self.mlp = ParallelMLP(init_method, output_layer_init_method)
+        # MoE experts group
+        self.moe = MoE(args.hidden_size, ParallelMLP(init_method,
+                    output_layer_init_method=output_layer_init_method, MOE=MOE, MoE_mp_size=MoE_mp_size),
+                    num_experts=num_experts, k=args.topk,
+                    capacity_factor=args.moe_train_capacity_factor,
+                    eval_capacity_factor=args.moe_eval_capacity_factor,
+                    min_capacity=args.moe_min_capacity,
+                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+
+        # Sum up coefficient
+        self.coefficient = mpu.RowParallelLinear(
+            args.hidden_size,
+            2,
+            input_is_parallel=True,
+            init_method=output_layer_init_method,
+            skip_bias_add=True,
+            bias=False, MOE=MOE, MoE_mp_size=MoE_mp_size)
+
+        # Sum coefficient activation
+        self.coef_activation_func = F.softmax
+
+    def forward(self, hidden_states):
+        mlp_output, _  = self.mlp(hidden_states)
+        moe_output, moe_loss, _ = self.moe(hidden_states)
+
+        # Weighted sum
+        _coef, _ = self.coefficient(hidden_states)
+        coef = self.coef_activation_func(_coef, dim=-1)
+        output = coef[:, :, :1] * mlp_output + coef[:, :, 1:] * moe_output
+        return output, moe_loss, None
+
 
 def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Tensor, Tensor, float, bool) -> Tensor
@@ -475,24 +479,30 @@ class ParallelTransformerLayer(MegatronModule):
             self.post_inter_attention_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
-
+                
         self.num_experts = num_experts
         # MLP
         if self.num_experts <= 1:
             self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
         else:
+            moe_mp_size=1 if self.num_experts > dist.get_world_size() else dist.get_world_size() // self.num_experts
             if args.mlp_type == 'standard':
-                self.mlp = MoE(args.hidden_size, ParallelMLP(init_method,
-                    output_layer_init_method=output_layer_init_method),
-                    num_experts=self.num_experts, k=args.topk,
-                    capacity_factor=args.moe_train_capacity_factor,
-                    eval_capacity_factor=args.moe_eval_capacity_factor,
-                    min_capacity=args.moe_min_capacity,
-                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+                self.mlp = MoE(args.hidden_size, 
+                              ParallelMLP(init_method,
+                                   output_layer_init_method=output_layer_init_method, 
+                                   MOE=True, 
+                                   MoE_mp_size=moe_mp_size),
+                              num_experts=self.num_experts, k=args.topk,
+                              capacity_factor=args.moe_train_capacity_factor,
+                              eval_capacity_factor=args.moe_eval_capacity_factor,
+                              min_capacity=args.moe_min_capacity,
+                              drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
             elif args.mlp_type == 'residual':
                 self.mlp = Residual_MoE(init_method,
-                    output_layer_init_method, self.num_experts)
+                                     output_layer_init_method, 
+                                     self.num_experts, 
+                                     MoE_mp_size=moe_mp_size)
             else:
                raise ValueError(f"{args.mlp_type} is not a correct MLP type. Please use standard or residual")
 
@@ -825,8 +835,9 @@ class ParallelTransformer(MegatronModule):
 
         # Final layer norm.
         if self.post_process:
-            # Reverting data format change [s b h] --> [b s h].
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
+            if not self.ds_inference:
+                # Reverting data format change [s b h] --> [b s h].
+                hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)
         else:
             output = hidden_states
