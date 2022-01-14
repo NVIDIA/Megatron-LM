@@ -7,3 +7,6 @@ dist/
 
 # binaries
 *.so
+
+# tmp files
+*.swp
