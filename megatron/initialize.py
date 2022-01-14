@@ -205,23 +205,22 @@ def _initialize_distributed():
                     'expected local-rank to be the same as rank % device-count.'
             else:
                 args.local_rank = device
-        #print(f'------------ setting megatron cuda device = {args.local_rank}')
-        #exit(0)
-        #torch.cuda.set_device(device%8)
+
+        torch.cuda.set_device(device) 
+
         # Call the init process
         init_method = 'tcp://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
         master_port = os.getenv('MASTER_PORT', '6000')
         init_method += master_ip + ':' + master_port
 
-        if args.deepspeed:
+        if args.deepspeed or args.ds_inference:
             deepspeed.init_distributed()
         else:
             torch.distributed.init_process_group(
                 backend=args.distributed_backend,
                 world_size=args.world_size, rank=args.rank,
                 init_method=init_method)
-        torch.cuda.set_device(torch.distributed.get_rank()%8)
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
     if device_count > 0:
