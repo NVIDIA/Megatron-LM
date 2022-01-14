@@ -377,7 +377,7 @@ class Residual_MoE(MegatronModule):
                     capacity_factor=args.moe_train_capacity_factor,
                     eval_capacity_factor=args.moe_eval_capacity_factor,
                     min_capacity=args.moe_min_capacity,
-                    drop_tokens=args.moe_token_dropping, use_tutel=False)
+                    drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
 
         # Sum up coefficient
         self.coefficient = mpu.RowParallelLinear(
@@ -386,7 +386,7 @@ class Residual_MoE(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
-            bias=False, MOE=MOE)
+            bias=False, MOE=MOE, MoE_mp_size=MoE_mp_size)
 
         # Sum coefficient activation
         self.coef_activation_func = F.softmax
