@@ -9,24 +9,13 @@ experts=128
 nodes=1
 gpus=8
 
+
 use_tutel=""
 #use_tutel="--use-tutel"
 
-ds_inference=""
+
+#ds_inference=""
 ds_inference="--ds-inference"
-numa_bind=""
-numa_bind="--bind-to numa"
-experts=128
-NUM_LAYERS=(40)
-HIDDEN=(4096)
-HEADS=(32)
-NODES=(4)
-for ns in ${!NODES[@]};
-do
-for mp in 4
-do
-for k in ${!NUM_LAYERS[@]};
-do
 
 nodes=${NODES[$ns]}
 procs=$(($nodes * $gpus))
@@ -60,8 +49,4 @@ program_cmd="tools/generate_samples_gpt.py \
        $use_tutel $ds_inference"
 
 echo $launch_cmd $program_cmd
-
 $launch_cmd $program_cmd
-done
-done
-done

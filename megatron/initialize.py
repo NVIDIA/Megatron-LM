@@ -32,7 +32,7 @@ from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
 
 import deepspeed
-
+import deepspeed.utils.groups as groups
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
@@ -232,6 +232,12 @@ def _initialize_distributed():
                                           args.pipeline_model_parallel_size,
                                           args.virtual_pipeline_model_parallel_size)
 
+    # currently MoE model does not support pipeline parallel
+    if args.deepspeed and args.no_pipeline_parallel:
+        if len(args.num_experts) == 1:
+            groups.initialize(args.moe_expert_parallel_size, mpu)
+        else:
+            groups.initialize(args.moe_expert_parallel_size, mpu, args.num_experts)
     if args.deepspeed and args.deepspeed_activation_checkpointing:
         setup_deepspeed_random_and_activation_checkpointing(args)
 

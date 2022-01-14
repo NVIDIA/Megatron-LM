@@ -42,8 +42,6 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
-    params = sum([p.nelement() for p in model.parameters()])
-    print(f'model = {params}')
     return model
 
 
@@ -76,40 +74,11 @@ def add_text_generate_args(parser):
                        'instead of using previously computed keys/values.')
 
     return parser
-def print_latency(latency_set, title=""):
-    # 10 warmup queries
-    latency_set = latency_set[10:]
-    count = len(latency_set)
-    if count > 0:
-        latency_set.sort()
-        n50 = (count - 1) * 0.5 + 1
-        n90 = (count - 1) * 0.9 + 1
-        n95 = (count - 1) * 0.95 + 1
-        n99 = (count - 1) * 0.99 + 1
-        n999 = (count - 1) * 0.999 + 1
 
-        avg = sum(latency_set) / count
-        p50 = latency_set[int(n50) - 1]
-        p90 = latency_set[int(n90) - 1]
-        p95 = latency_set[int(n95) - 1]
-        p99 = latency_set[int(n99) - 1]
-        p999 = latency_set[int(n999) - 1]
-
-        print("====== latency stats {0} ======", title)
-        print("\tAvg Latency: {0:8.2f} ms".format(avg * 1000))
-        print("\tP50 Latency: {0:8.2f} ms".format(p50 * 1000))
-        print("\tP90 Latency: {0:8.2f} ms".format(p90 * 1000))
-        print("\tP95 Latency: {0:8.2f} ms".format(p95 * 1000))
-        print("\tP99 Latency: {0:8.2f} ms".format(p99 * 1000))
-        print("\t999 Latency: {0:8.2f} ms".format(p999 * 1000))
-    
 
 def main():
     """Main program."""
 
-    latencies = []
-    model_latencies = []
-    single_token_latency = []
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                                        'no_load_rng': True,
@@ -121,14 +90,13 @@ def main():
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
-    import torch    
     deepspeed.utils.groups.initialize(torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
 
-    #if args.load is not None:
-    #    _ = load_checkpoint(model, None, None)
+    if args.load is not None:
+        _ = load_checkpoint(model, None, None)
 
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
@@ -136,24 +104,6 @@ def main():
     if args.ds_inference:
         model = ds_inference(model, args)
         print('> DeepSpeed Inference engine initialized')
-    
-    if args.deepspeed and not args.ds_inference:
-        ds_config = {
-          "train_micro_batch_size_per_gpu": 8,
-          "optimizer": {
-              "type": "Adam",
-              "params": {
-                  "lr": 1e-4
-              }
-          },
-          "fp16": {
-              "enabled": True
-          },
-        }
-
-        # To run inference using the DeepSpeed training engine, we need the following
-        model, _, _, _ = deepspeed.initialize(model=model, model_parameters=None, config=ds_config)
-        print('> DeepSpeed Training engine initialized')
 
     # Generate samples.
     if args.num_samples == 0:

@@ -58,6 +58,9 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
+    # helper argument to set deepspeed pipeline parallel or not
+    args.ds_pipeline_enabled = not args.no_pipeline_parallel
+
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
@@ -72,6 +75,9 @@ def parse_args(extra_args_provider=None, defaults={},
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
     # Checks.
+    if args.no_pipeline_parallel:
+        assert args.pipeline_model_parallel_size == 1, \
+            "pipeline_model_parallel_size must be 1 if pipeline parallel is disabled"
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
@@ -270,8 +276,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
-    group.add_argument('--num-experts', type=int, nargs='+', default=1,
-                           help='number of experts')
+    group.add_argument('--num-experts', type=int, nargs='+', default=[1,],
+                           help='number of experts list, MoE related.')
+    group.add_argument('--mlp-type', type=str, default='standard',
+                           help='Only applicable when num-experts > 1, accepts [standard, residual]')
     group.add_argument('--topk', type=int, default=1,
                            help='Sets the k in TopK gating for MoE layers')
     group.add_argument('--expert-interval', type=int, default=2,
@@ -453,6 +461,11 @@ def _add_training_args(parser):
                        help='The capacity of the MoE expert at eval time.')
     group.add_argument('--moe-min-capacity', type=int, default=4,
                        help='The minimum capacity per MoE expert regardless of the capacity_factor.')
+    group.add_argument('--moe-loss-coeff', type=float, default=0.1,
+                       help='Scaling coefficient for adding MoE loss to model loss')
+    group.add_argument('--create-moe-param-group', action='store_true',
+                       help='Create separate groups for MoE params.'
+                       'This is necessary for techniques like ZeRO.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -465,7 +478,10 @@ def _add_training_args(parser):
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
-
+    group.add_argument('--no-pipeline-parallel', action='store_true',
+                       help='Disable pipeline parallelism')
+    group.add_argument('--use-tutel', action='store_true',
+                       help='Use Tutel optimization for MoE')
     return parser
 
 
@@ -511,6 +527,9 @@ def _add_learning_rate_args(parser):
                        'learning rate over.')
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
+                       'learning rate over.')
+    group.add_argument('--lr-warmup-tokens', type=int, default=None,
+                       help='number of tokens to linearly warmup '
                        'learning rate over.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
@@ -603,6 +622,8 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--moe-expert-parallel-size', type=int, default=1,
+                       help='Degree of the MoE expert parallelism.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
