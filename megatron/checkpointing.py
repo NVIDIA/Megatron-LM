@@ -416,7 +416,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
                 mpu.get_cuda_rng_tracker().set_states(
-                    state_dict['rng_tracker_states'])
+                    rng_state['rng_tracker_states'])
             else:  # backward compatability
                 random.setstate(state_dict['random_rng_state'])
                 np.random.set_state(state_dict['np_rng_state'])
