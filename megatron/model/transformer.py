@@ -386,7 +386,7 @@ class Residual_MoE(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
-            bias=False, MOE=MOE, MoE_mp_size=MoE_mp_size)
+            bias=False, MOE=MOE, MoE_mp_size=1)
 
         # Sum coefficient activation
         self.coef_activation_func = F.softmax
@@ -486,7 +486,10 @@ class ParallelTransformerLayer(MegatronModule):
             self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
         else:
-            moe_mp_size=1 if self.num_experts > dist.get_world_size() else dist.get_world_size() // self.num_experts
+            if not args.ds_inference or self.num_experts > dist.get_world_size():
+                moe_mp_size = 1
+            else:
+                moe_mp_size = dist.get_world_size() // self.num_experts
             if args.mlp_type == 'standard':
                 self.mlp = MoE(args.hidden_size, 
                               ParallelMLP(init_method,

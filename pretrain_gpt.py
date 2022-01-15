@@ -158,7 +158,7 @@ def loss_func(loss_mask, moe_loss, output_tensor):
     
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-    if args.num_experts <= 1:
+    if max(args.num_experts) <= 1:
         return loss, {'lm loss': averaged_loss[0]}
     else:
         loss = loss + moe_loss
