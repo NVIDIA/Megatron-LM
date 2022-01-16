@@ -69,7 +69,7 @@ class ParallelMLP(MegatronModule):
             args.ffn_hidden_size,
             gather_output=False,
             init_method=init_method,
-            skip_bias_add=True, 
+            skip_bias_add=True,
             MOE=MOE,
             MoE_mp_size=MoE_mp_size)
 
@@ -86,7 +86,7 @@ class ParallelMLP(MegatronModule):
             args.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
-            skip_bias_add=True, 
+            skip_bias_add=True,
             MOE=MOE,
             MoE_mp_size=MoE_mp_size)
 
@@ -379,10 +379,12 @@ class Residual_MoE(MegatronModule):
                     min_capacity=args.moe_min_capacity,
                     drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
 
-        # Sum up coefficient
+        # Sum up coefficient: as we have two branches (MLP and EXPERT)
+        BRANCHES = 2
+        # Used for weighted sum of the outputs from MLP and Expert
         self.coefficient = mpu.RowParallelLinear(
             args.hidden_size,
-            2,
+            BRANCHES,
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
@@ -479,7 +481,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.post_inter_attention_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon)
-                
+
         self.num_experts = num_experts
         # MLP
         if self.num_experts <= 1:
@@ -491,10 +493,10 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 moe_mp_size = dist.get_world_size() // self.num_experts
             if args.mlp_type == 'standard':
-                self.mlp = MoE(args.hidden_size, 
+                self.mlp = MoE(args.hidden_size,
                               ParallelMLP(init_method,
-                                   output_layer_init_method=output_layer_init_method, 
-                                   MOE=True, 
+                                   output_layer_init_method=output_layer_init_method,
+                                   MOE=True,
                                    MoE_mp_size=moe_mp_size),
                               num_experts=self.num_experts, k=args.topk,
                               capacity_factor=args.moe_train_capacity_factor,
@@ -503,8 +505,8 @@ class ParallelTransformerLayer(MegatronModule):
                               drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
             elif args.mlp_type == 'residual':
                 self.mlp = Residual_MoE(init_method,
-                                     output_layer_init_method, 
-                                     self.num_experts, 
+                                     output_layer_init_method,
+                                     self.num_experts,
                                      MoE_mp_size=moe_mp_size)
             else:
                raise ValueError(f"{args.mlp_type} is not a correct MLP type. Please use standard or residual")
@@ -585,7 +587,7 @@ class ParallelTransformerLayer(MegatronModule):
             mlp_output, mlp_bias = self.mlp(layernorm_output)
         else:
             mlp_output, moe_loss, _ = self.mlp(layernorm_output)
-        
+
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -620,7 +622,7 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
        to the next stage in the pipeline.
 
        This version is useful if masks are dynamic.
-    
+
     2) forward(input, **kwargs) -> output
        When the mask is static over all samples, it is advantageous to
        cache the mask and avoid communicating it.
