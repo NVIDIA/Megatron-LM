@@ -503,7 +503,11 @@ class TransformerLanguageModel(MegatronModule):
         if "moe_state_dict" in state_dict:
             for key in list(state_dict["moe_state_dict"].keys()):
                 if self._encoder_key in key:
-                    actual_key = key[len(self._encoder_key):]
+                    key_list = key.split('.')
+                    while key_list[0] != 'encoder':
+                        key_list.pop(0)
+                    key_list.pop(0)
+                    actual_key = '.'.join(key_list)
                     state_dict_[actual_key] = state_dict["moe_state_dict"].pop(key)
             if len(state_dict["moe_state_dict"]) == 0:
                 del state_dict["moe_state_dict"]
