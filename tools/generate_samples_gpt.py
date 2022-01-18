@@ -120,7 +120,7 @@ def main():
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
 
-    deepspeed.utils.groups.initialize(torch.distributed.get_world_size())
+    deepspeed.utils.groups.initialize(args.num_experts[0] if torch.distributed.get_world_size() > args.num_experts[0] else torch.distributed.get_world_size())
 
     # Set up model and load checkpoint.
     model = get_model(model_provider)
