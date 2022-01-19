@@ -1,0 +1,69 @@
+#!/bin/bash
+
+#BSUB -nnodes 2
+#BSUB -W 0:30
+#BSUB -P med106
+#BSUB -alloc_flags "smt4 nvme"
+#BSUB -J hoc
+#BSUB -o hoc.%J
+#BSUB -q batch
+
+set +x
+
+#module load open-ce/1.4.0-py38-0
+module load open-ce
+conda deactivate
+conda activate /gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch
+module list
+
+export OMP_NUM_THREADS=1
+#export PYTHONPATH=$PYTHONPATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/megatron/fused_kernels
+#export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch/lib/python3.8/site-packages/torch/lib
+#export PATH=$PATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch/lib/python3.8/site-packages/torch/include
+
+nodes=($(cat ${LSB_DJOB_HOSTFILE} | sort | uniq | grep -v login | grep -v batch))
+nnodes=${#nodes[@]}
+echo $nnodes
+
+#export TRAIN_DATA=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/picodata/train.tsv
+#TRAIN_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata/train.tsv"
+TRAIN_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata_small"
+#export TRAIN_DATA=picodata/train.tsv
+#export VALID_DATA=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/picodata/dev.tsv
+#VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata/dev.tsv"
+VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata_small"
+#export VALID_DATA=picodata/dev.tsv
+
+export VOCAB_FILE=/gpfs/alpine/world-shared/med106/g8o/pubmed_bert-vocab.txt
+export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/chkpt_222
+export PRETRAINED_CHECKPOINT=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/chkptt
+
+jsrun --smpiargs="-disable_gpu_hooks" -n $nnodes -r 1 -g 6 -a 6 -c 42 python tasks/main.py \
+       --task HOC \
+       --tensor-model-parallel-size 2 \
+       --pipeline-model-parallel-size 2 \
+       --num-layers 24 \
+       --hidden-size 1024 \
+       --num-attention-heads 16 \
+       --seq-length 512 \
+       --max-position-embeddings 512 \
+       --fp16 \
+       --vocab-file $VOCAB_FILE \
+       --train-data $TRAIN_DATA \
+       --valid-data $VALID_DATA \
+       --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
+       --activations-checkpoint-method uniform \
+       --save-interval 10000 \
+       --save $CHECKPOINT_PATH \
+       --log-interval 100 \
+       --eval-interval 1000 \
+       --eval-iters 10 \
+       --weight-decay 1e-2 \
+       --tokenizer-type BertWordPieceLowerCase \
+       --epochs 1 \
+       --micro-batch-size 4 \
+       --lr 0.0001 \
+       --lr-warmup-fraction 0.06 \
+       --distributed-backend nccl
+       #--DDP-impl torch \
+
