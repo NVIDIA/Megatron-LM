@@ -142,6 +142,7 @@ def read_metadata(tracker_filename):
 
 def get_rng_state():
     """ collect rng state across data parallel ranks """
+    args = get_args()
     rng_state = {
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
@@ -151,7 +152,8 @@ def get_rng_state():
 
     rng_state_list = None
     if torch.distributed.is_initialized() and \
-            mpu.get_data_parallel_world_size() > 1:
+            mpu.get_data_parallel_world_size() > 1 and \
+            args.data_parallel_random_init:
         if mpu.get_data_parallel_rank() == 0:
             rng_state_list = \
                 [None for i in range(mpu.get_data_parallel_world_size())]
@@ -407,7 +409,10 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         try:
             if 'rng_state' in state_dict:
                 # access rng_state for data parallel rank
-                rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+                if args.data_parallel_random_init:
+                    rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+                else:
+                    rng_state = state_dict['rng_state'][0]
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])

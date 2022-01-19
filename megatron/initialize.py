@@ -62,7 +62,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Random seeds for reproducibility.
         if args.rank == 0:
             print('> setting random seeds to {} ...'.format(args.seed))
-        _set_random_seed(args.seed)
+        _set_random_seed(args.seed, args.data_parallel_random_init)
 
     # Set pytorch JIT layer fusion options.
     _set_jit_fusion_options()
@@ -203,11 +203,14 @@ def _init_autoresume():
         torch.distributed.barrier()
 
 
-def _set_random_seed(seed_):
+def _set_random_seed(seed_, data_parallel_random_init=False):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
-        # Ensure that different pipeline MP stages and different data parallel ranks get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank()) + (10 * mpu.get_data_parallel_rank())
+        # Ensure that different pipeline MP stages get different seeds.
+        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        # Ensure different data parallel ranks get different seeds
+        if data_parallel_random_init:
+            seed = seed + (10 * mpu.get_data_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
