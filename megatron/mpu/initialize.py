@@ -452,6 +452,15 @@ def get_tensor_model_parallel_src_rank():
     return (global_rank // local_world_size) * local_world_size
 
 
+def get_data_parallel_src_rank():
+    """Calculate the global rank corresponding to the first local rank
+    in the tensor model parallel group."""
+    global_rank = torch.distributed.get_rank()
+    data_parallel_size = get_data_parallel_world_size()
+    num_data_parallel_groups = torch.distributed.get_world_size() // data_parallel_size
+    return global_rank % num_data_parallel_groups
+
+
 def get_pipeline_model_parallel_first_rank():
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"

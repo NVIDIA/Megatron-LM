@@ -13,46 +13,67 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import random
+import numpy as np
 import torch
-from torchvision import datasets, transforms
+import torchvision.transforms as T
+from torchvision import datasets
+from megatron import get_args
+from megatron.data.image_folder import ImageFolder
 from megatron.data.autoaugment import ImageNetPolicy
+from megatron.data.data_samplers import RandomSeedDataset
+
+class ClassificationTransform():
+    def __init__(self, image_size, train=True):
+        args = get_args()
+        assert args.fp16 or args.bf16
+        self.data_type = torch.half if args.fp16 else torch.bfloat16
+        if train:
+            self.transform = T.Compose([
+                T.RandomResizedCrop(image_size),
+                T.RandomHorizontalFlip(),
+                T.ColorJitter(0.4, 0.4, 0.4, 0.1),
+                ImageNetPolicy(),
+                T.ToTensor(),
+                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                T.ConvertImageDtype(self.data_type)
+            ])
+        else:
+            self.transform = T.Compose([
+                T.Resize(image_size),
+                T.CenterCrop(image_size),
+                T.ToTensor(),
+                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+                T.ConvertImageDtype(self.data_type)
+            ])
+
+    def __call__(self, input):
+        output = self.transform(input)
+        return output
 
 
-def build_train_valid_datasets(data_path, crop_size=224, color_jitter=True):
+
+def build_train_valid_datasets(data_path, image_size=224):
+    args = get_args()
+    train_transform = ClassificationTransform(image_size)
+    val_transform = ClassificationTransform(image_size, train=False)
 
     # training dataset
-    train_data_path = os.path.join(data_path[0], "train")
-    normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    process = [
-        transforms.RandomResizedCrop(crop_size),
-        transforms.RandomHorizontalFlip(),
-    ]
-    if color_jitter:
-        process += [
-            transforms.ColorJitter(
-                brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1
-            )
-        ]
-    fp16_t = transforms.ConvertImageDtype(torch.half)
-    process += [ImageNetPolicy(), transforms.ToTensor(), normalize, fp16_t]
-    transform_train = transforms.Compose(process)
-    train_data = datasets.ImageFolder(
-        root=train_data_path, transform=transform_train
+    train_data_path = data_path[0]
+    train_data = ImageFolder(
+        root=train_data_path,
+        transform=train_transform,
+        classes_fraction=args.classes_fraction,
+        data_per_class_fraction=args.data_per_class_fraction
     )
+    train_data = RandomSeedDataset(train_data)
 
     # validation dataset
-    val_data_path = os.path.join(data_path[0], "val")
-    transform_val = transforms.Compose(
-        [
-            transforms.Resize(crop_size),
-            transforms.CenterCrop(crop_size),
-            transforms.ToTensor(),
-            normalize,
-            fp16_t
-        ]
+    val_data_path = data_path[1]
+    val_data = ImageFolder(
+        root=val_data_path,
+        transform=val_transform
     )
-    val_data = datasets.ImageFolder(
-        root=val_data_path, transform=transform_val
-    )
+    val_data = RandomSeedDataset(val_data)
 
     return train_data, val_data

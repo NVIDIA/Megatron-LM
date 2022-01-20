@@ -518,6 +518,9 @@ def _add_initialization_args(parser):
     group.add_argument('--seed', type=int, default=1234,
                        help='Random seed used for python, numpy, '
                        'pytorch, and cuda.')
+    group.add_argument('--data-parallel-random-init', action='store_true',
+                       help='Enable random initialization of params '
+                       'across data parallel ranks')
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
@@ -835,11 +838,20 @@ def _add_vit_args(parser):
 
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
-    group.add_argument('--img-dim', type=int, default=224,
-                       help='Image size for vision classification task')
+    group.add_argument('--img-h', type=int, default=224,
+                       help='Image height for vision classification task')
+    group.add_argument('--img-w', type=int, default=224,
+                       help='Image height for vision classification task')
     group.add_argument('--num-channels', type=int, default=3,
                        help='Number of channels in input image data')
     group.add_argument('--patch-dim', type=int, default=16,
                        help='patch dimension used in vit')
+    group.add_argument('--classes-fraction', type=float, default=1.0,
+                       help='training with fraction of classes.')
+    group.add_argument('--data-per-class-fraction', type=float, default=1.0,
+                       help='training with fraction of data per class.')
+    group.add_argument('--no-data-sharding', action='store_false',
+                       help='Disable data sharding.',
+                       dest='data_sharding')
 
     return parser

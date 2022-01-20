@@ -65,13 +65,14 @@ def check_checkpoint_args(checkpoint_args):
         _compare('make_vocab_size_divisible_by')
         _compare('padded_vocab_size')
         _compare('tokenizer_type')
+    if args.data_parallel_random_init:
+        _compare('data_parallel_random_init')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size',
                  old_arg_name='model_parallel_size')
     if get_checkpoint_version() >= 3.0:
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
-
 
 def ensure_directory_exists(filename):
     """Build filename's path if it does not already exists."""
@@ -140,6 +141,32 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
+def get_rng_state():
+    """ collect rng state across data parallel ranks """
+    args = get_args()
+    rng_state = {
+        'random_rng_state': random.getstate(),
+        'np_rng_state': np.random.get_state(),
+        'torch_rng_state': torch.get_rng_state(),
+        'cuda_rng_state': torch.cuda.get_rng_state(),
+        'rng_tracker_states': mpu.get_cuda_rng_tracker().get_states()}
+
+    rng_state_list = None
+    if torch.distributed.is_initialized() and \
+            mpu.get_data_parallel_world_size() > 1 and \
+            args.data_parallel_random_init:
+        rng_state_list = \
+            [None for i in range(mpu.get_data_parallel_world_size())]
+        torch.distributed.all_gather_object(
+            rng_state_list,
+            rng_state,
+            group=mpu.get_data_parallel_group())
+    else:
+        rng_state_list = [rng_state]
+
+    return rng_state_list
+
+
 def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     """Save a model checkpoint."""
     args = get_args()
@@ -149,6 +176,9 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
+
+    # collect rng state across data parallel ranks
+    rng_state = get_rng_state()
 
     if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
 
@@ -173,12 +203,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
         # RNG states.
         if not args.no_save_rng:
-            state_dict['random_rng_state'] = random.getstate()
-            state_dict['np_rng_state'] = np.random.get_state()
-            state_dict['torch_rng_state'] = torch.get_rng_state()
-            state_dict['cuda_rng_state'] = torch.cuda.get_rng_state()
-            state_dict['rng_tracker_states'] \
-                = mpu.get_cuda_rng_tracker().get_states()
+            state_dict["rng_state"] = rng_state
 
         # Save.
         checkpoint_name = get_checkpoint_name(args.save, iteration)
@@ -381,15 +406,32 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
         try:
-            random.setstate(state_dict['random_rng_state'])
-            np.random.set_state(state_dict['np_rng_state'])
-            torch.set_rng_state(state_dict['torch_rng_state'])
-            torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
-            # Check for empty states array
-            if not state_dict['rng_tracker_states']:
-                raise KeyError
-            mpu.get_cuda_rng_tracker().set_states(
-                state_dict['rng_tracker_states'])
+            if 'rng_state' in state_dict:
+                # access rng_state for data parallel rank
+                if args.data_parallel_random_init:
+
+                    rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+                else:
+                    rng_state = state_dict['rng_state'][0]
+                random.setstate(rng_state['random_rng_state'])
+                np.random.set_state(rng_state['np_rng_state'])
+                torch.set_rng_state(rng_state['torch_rng_state'])
+                torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+                # Check for empty states array
+                if not rng_state['rng_tracker_states']:
+                    raise KeyError
+                mpu.get_cuda_rng_tracker().set_states(
+                    rng_state['rng_tracker_states'])
+            else:  # backward compatability
+                random.setstate(state_dict['random_rng_state'])
+                np.random.set_state(state_dict['np_rng_state'])
+                torch.set_rng_state(state_dict['torch_rng_state'])
+                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+                # Check for empty states array
+                if not state_dict['rng_tracker_states']:
+                    raise KeyError
+                mpu.get_cuda_rng_tracker().set_states(
+                    state_dict['rng_tracker_states'])
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
