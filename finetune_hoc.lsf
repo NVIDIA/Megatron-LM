@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #BSUB -nnodes 2
-#BSUB -W 0:30
+#BSUB -W 2:00
 #BSUB -P med106
 #BSUB -alloc_flags "smt4 nvme"
-#BSUB -J hoc
-#BSUB -o hoc.%J
+#BSUB -J hoc_FULL
+#BSUB -o hoc_FULL.%J
 #BSUB -q batch
 
 set +x
@@ -27,15 +27,15 @@ echo $nnodes
 
 #export TRAIN_DATA=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/picodata/train.tsv
 #TRAIN_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata/train.tsv"
-TRAIN_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata_small"
+TRAIN_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata"
 #export TRAIN_DATA=picodata/train.tsv
 #export VALID_DATA=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/picodata/dev.tsv
 #VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata/dev.tsv"
-VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata_small"
+VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata"
 #export VALID_DATA=picodata/dev.tsv
 
 export VOCAB_FILE=/gpfs/alpine/world-shared/med106/g8o/pubmed_bert-vocab.txt
-export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/chkpt_222
+export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/finetune-HOC_BIG
 export PRETRAINED_CHECKPOINT=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/chkptt
 
 jsrun --smpiargs="-disable_gpu_hooks" -n $nnodes -r 1 -g 6 -a 6 -c 42 python tasks/main.py \
@@ -60,7 +60,7 @@ jsrun --smpiargs="-disable_gpu_hooks" -n $nnodes -r 1 -g 6 -a 6 -c 42 python tas
        --eval-iters 10 \
        --weight-decay 1e-2 \
        --tokenizer-type BertWordPieceLowerCase \
-       --epochs 1 \
+       --epochs 5 \
        --micro-batch-size 4 \
        --lr 0.0001 \
        --lr-warmup-fraction 0.06 \
