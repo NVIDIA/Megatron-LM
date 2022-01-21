@@ -43,10 +43,11 @@ def process_batch(batch):
     types = batch['types'].long().cuda().contiguous()
     labels = batch['label'].long().cuda().contiguous()
     attention_mask = batch['padding_mask'].float().cuda().contiguous()
+    abstract_ids = batch['uid'].long().cuda().contiguous()
     if args.fp16:
         attention_mask = attention_mask.half()
 
-    return tokens, types, labels, attention_mask
+    return tokens, types, labels, attention_mask, abstract_ids
 
 
 def cross_entropy_loss_func(labels, output_tensor):
@@ -79,7 +80,7 @@ def _cross_entropy_forward_step(batch, model):
         batch_ = next(batch)
     except BaseException:
         batch_ = batch
-    tokens, types, labels, attention_mask = process_batch(batch_)
+    tokens, types, labels, attention_mask, abstract_ids = process_batch(batch_)
     timers('batch-generator').stop()
 
     # Forward model.
@@ -162,7 +163,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset,
 
 
 def _train(model, optimizer, lr_scheduler, forward_step,
-           train_dataloader, valid_dataloader, end_of_epoch_callback):
+           train_dataloader, valid_dataloader, end_of_epoch_callback, end_of_training_eval_callback, end_of_training_f1_callback):
     """Train the model."""
     args = get_args()
     timers = get_timers()
@@ -253,12 +254,20 @@ def _train(model, optimizer, lr_scheduler, forward_step,
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
             end_of_epoch_callback(model, epoch)
+    
+    if end_of_training_eval_callback is not None:
+        end_of_training_eval_callback(model, args.epochs)
+
+    if end_of_training_f1_callback is not None:
+        end_of_training_f1_callback(model, args.epochs)
 
 
 def finetune(train_valid_datasets_provider, model_provider,
              model_type=ModelType.encoder_or_decoder,
              forward_step=_cross_entropy_forward_step,
              end_of_epoch_callback_provider=None,
+             end_of_training_eval_callback_provider=None,
+             end_of_training_f1_callback_provider=None,
              task_collate_fn=None):
     """Main finetune function used across all tasks."""
     args = get_args()
@@ -282,6 +291,14 @@ def finetune(train_valid_datasets_provider, model_provider,
     end_of_epoch_callback = None
     if end_of_epoch_callback_provider is not None:
         end_of_epoch_callback = end_of_epoch_callback_provider()
+
+    end_of_training_f1_callback = None
+    if end_of_training_f1_callback_provider is not None:
+        end_of_training_f1_callback = end_of_training_f1_callback_provider()
+
+    end_of_training_eval_callback = None
+    if end_of_training_eval_callback_provider is not None:
+        end_of_training_eval_callback = end_of_training_eval_callback_provider()
     timers('callback function').stop()
 
     # Build model, optimizer and learning rate scheduler.
@@ -315,7 +332,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # Finetune the model.
     if args.epochs > 0:
         _train(model, optimizer, lr_scheduler, forward_step,
-               train_dataloader, valid_dataloader, end_of_epoch_callback)
+               train_dataloader, valid_dataloader, end_of_epoch_callback, end_of_training_eval_callback, end_of_training_f1_callback)
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:

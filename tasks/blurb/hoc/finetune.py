@@ -21,6 +21,7 @@ from megatron import get_tokenizer
 from megatron import mpu
 from megatron.model.classification_hoc import Classification_hoc
 from tasks.blurb.hoc.eval_utils import accuracy_func_provider
+from tasks.blurb.hoc.f1_utils import accuracy_f1_func_provider
 from tasks.blurb.hoc.finetune_utils import finetune
 from tasks.blurb.hoc.data import HOCDataset
 
@@ -56,6 +57,24 @@ def metrics_func_provider():
         return HOCDataset('dev', [datapath], tokenizer, args.seq_length)
     return accuracy_func_provider(single_dataset_provider)
 
+def test_metrics_func_provider():
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    def single_dataset_provider(datapath):
+        return HOCDataset('test', [datapath], tokenizer, args.seq_length)
+    return accuracy_func_provider(single_dataset_provider)
+
+def f1_func_provider():
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    def single_dataset_provider(datapath):
+        return HOCDataset('test', [datapath], tokenizer, args.seq_length)
+    return accuracy_f1_func_provider(single_dataset_provider)
+
 def main():
     finetune(train_valid_datasets_provider, model_provider,
-             end_of_epoch_callback_provider=metrics_func_provider)
+             end_of_epoch_callback_provider=metrics_func_provider,
+             end_of_training_eval_callback_provider=test_metrics_func_provider, 
+             end_of_training_f1_callback_provider=f1_func_provider)

@@ -25,13 +25,16 @@ import numpy as np
 from megatron import get_args
 from megatron import print_rank_last, is_last_rank
 from megatron import mpu
+#from megatron.schedules_output import get_forward_backward_func
 from megatron.schedules import get_forward_backward_func
 from tasks.blurb.hoc.finetune_utils import build_data_loader
 from tasks.blurb.hoc.finetune_utils import process_batch
 from megatron.utils import average_losses_across_data_parallel_group
 
+from sklearn.metrics import f1_score
 
-def accuracy_func_provider(single_dataset_provider):
+
+def accuracy_f1_func_provider(single_dataset_provider):
     """Provide function that calculates accuracies."""
     args = get_args()
 
@@ -40,16 +43,24 @@ def accuracy_func_provider(single_dataset_provider):
     dataloaders = []
     for datapath in datapaths:
         dataset = single_dataset_provider(datapath)
+        #Set batch_size to 1, when calculating F1 scores
+        args.f1_micro_batch_size = 1
+        args.f1_global_batch_size = args.f1_micro_batch_size*args.data_parallel_size
         dataloader = build_data_loader(
-            dataset, args.orig_micro_batch_size, num_workers=args.num_workers,
+            dataset, args.f1_micro_batch_size, num_workers=args.num_workers,
             drop_last=(mpu.get_data_parallel_world_size() > 1))
         dataloaders.append((dataset.dataset_name, dataloader))
+        #dataloader = build_data_loader(
+        #    dataset, args.orig_micro_batch_size, num_workers=args.num_workers,
+        #    drop_last=(mpu.get_data_parallel_world_size() > 1))
+        #dataloaders.append((dataset.dataset_name, dataloader))
 
     def metrics_func(model, epoch, output_predictions=False):
         print_rank_last('calculating metrics ...')
         num_classes=10
-        correct = np.zeros(num_classes, dtype=int)
+        f1 = np.zeros(num_classes)
         total = 0
+        correct = 0
         if output_predictions:
             assert mpu.get_data_parallel_world_size() == 1
             named_predictions = []
@@ -59,7 +70,9 @@ def accuracy_func_provider(single_dataset_provider):
             output = calculate_correct_answers(name, model, dataloader,
                                                epoch, output_predictions)
             if not output_predictions:
-                correct_ans, total_count = output
+                #correct_ans, total_count = output
+                #f1_scores, correct_ans, total_count = output
+                f1_scores, total_count = output
             else:
                 correct_ans, total_count, predictions = output
                 named_predictions.append((name, predictions))
@@ -67,13 +80,19 @@ def accuracy_func_provider(single_dataset_provider):
             if mpu.is_pipeline_last_stage():
             #if is_last_rank():
                 for i in range(num_classes):
-                    correct[i] += correct_ans[i]
+                    f1[i] += f1_scores[i]
                 total += total_count
+                #correct += correct_ans
         if is_last_rank():
             for i in range(num_classes):
-                percent = float(correct[i]) * 100.0 / float(total)
-                print(' >> |epoch: {}| overall: correct / total = {} / {} = '
-                    '{:.4f} %'.format(epoch, correct[i], total, percent))
+                #percent = float(correct[i]) * 100.0 / float(total)
+                print(' >> |epoch: {}| overall: correct / total = {} / {} | '
+                    'F1 Scores: {:.4f} '.format(epoch, correct, total, f1[i]))
+        #if is_last_rank():
+        #    for i in range(num_classes):
+        #        percent = float(correct[i]) * 100.0 / float(total)
+        #        print(' >> |epoch: {}| overall: correct / total = {} / {} = '
+        #            '{:.4f} %'.format(epoch, correct[i], total, percent))
 
         if output_predictions and is_last_rank():
             assert args.load is not None
@@ -105,33 +124,33 @@ def calculate_correct_answers(name, model, dataloader,
         sample_multiplier = ds.sample_multiplier
     else:
         sample_multiplier = 1
-    micro_batch_size_times_data_parallel = args.orig_micro_batch_size * args.data_parallel_size
-    num_micro_batches = args.orig_global_batch_size // micro_batch_size_times_data_parallel
+    #micro_batch_size_times_data_parallel = args.orig_micro_batch_size * args.data_parallel_size
+    micro_batch_size_times_data_parallel = args.f1_micro_batch_size * args.data_parallel_size
+    #num_micro_batches = args.orig_global_batch_size // micro_batch_size_times_data_parallel
+    num_micro_batches = args.f1_global_batch_size // micro_batch_size_times_data_parallel
 
     #def loss_func(output_predictions, labels, output_tensor, bs):
     def loss_func(output_predictions, labels, output_tensor):
 
         loss_fcn = torch.nn.CrossEntropyLoss()
         num_classes = 10
-        loss = None
         loss_dict = {}
+        loss = None
         for i in range(num_classes):
             if loss is None:
                 loss = loss_fcn(output_tensor[:,i,:],labels[:,i])
             else:
                 loss += loss_fcn(output_tensor[:,i,:],labels[:,i])
 
+            predicted = torch.argmax(output_tensor[:,i,:], dim=-1).cpu()
+            loss_dict['predicted{%d}' % i] = predicted
 
-            predicted = torch.argmax(output_tensor[:,i,:], dim=-1)
-            corrects = (predicted == labels[:,i])
-
-            loss_dict['correct{%d}' % i] = corrects.sum().item()
-
-        loss_dict['total'] = labels.size(dim=0)
+        loss_dict['total'] = labels.size(dim=0) 
         #loss_dict['total'] = bs
 
         #averaged_loss = average_losses_across_data_parallel_group([loss])
         #return loss, {'lm loss': averaged_loss[0]}, loss_dict
+    
         return 0, loss_dict
 
     # defined inside to capture output_predictions
@@ -151,10 +170,12 @@ def calculate_correct_answers(name, model, dataloader,
         return output_tensor, partial(loss_func, output_predictions, labels)
 
     num_classes = 10
+    abstract_scores = {}
+    abstract_truth = {}
+    correct = np.zeros(num_classes)
+    total = 0
     with torch.no_grad():
         # For all the batches in the dataset.
-        total = 0
-        correct = np.zeros(num_classes, dtype=int)
         if output_predictions:
             # This option is only possible when data parallel size is 1.
             assert mpu.get_data_parallel_world_size() == 1
@@ -171,28 +192,47 @@ def calculate_correct_answers(name, model, dataloader,
             args.micro_batch_size = actual_batch_size * sample_multiplier
             args.global_batch_size = actual_batch_size * sample_multiplier * num_micro_batches
 
-            loss_dicts = forward_backward_func(correct_answers_forward_step, batch, model,
+
+            tokens,types,labels,attention_mask,abstract_ids = process_batch(batch)
+            
+            #output_tensor = forward_backward_func(correct_answers_forward_step, batch, model, 
+            #                                   optimizer=None, timers=None, forward_only=True)
+            loss_dicts = forward_backward_func(correct_answers_forward_step, batch, model, 
                                                optimizer=None, timers=None, forward_only=True)
 
-            for loss_dict in loss_dicts:
-                if output_predictions:
-                    softmaxes.extend(loss_dict['softmaxes'])
-                    labels.extend(loss_dict['labels'])
-                    ids.extend(loss_dict['ids'])
+            abstract_id = abstract_ids.cpu()[0]
+            batch_labels = labels.cpu()[0]
 
+            if abstract_id not in abstract_scores:
+                abstract_scores[abstract_id] = np.zeros(num_classes)
+            if abstract_id not in abstract_truth:
+                abstract_truth[abstract_id] = batch_labels
+            else:
+                abstract_truth[abstract_id] += batch_labels
+
+            for loss_dict in loss_dicts:
                 total += loss_dict['total']
-                correct[0] += loss_dict['correct{0}']
-                correct[1] += loss_dict['correct{1}']
-                correct[2] += loss_dict['correct{2}']
-                correct[3] += loss_dict['correct{3}']
-                correct[4] += loss_dict['correct{4}']
-                correct[5] += loss_dict['correct{5}']
-                correct[6] += loss_dict['correct{6}']
-                correct[7] += loss_dict['correct{7}']
-                correct[8] += loss_dict['correct{8}']
-                correct[9] += loss_dict['correct{9}']
-                #for i in range(num_classes):
-                #    correct[i] += loss_dict['correct{%d}' % i]
+                abstract_scores[abstract_id][0] += loss_dict['predicted{0}']
+                abstract_scores[abstract_id][1] += loss_dict['predicted{1}']
+                abstract_scores[abstract_id][2] += loss_dict['predicted{2}']
+                abstract_scores[abstract_id][3] += loss_dict['predicted{3}']
+                abstract_scores[abstract_id][4] += loss_dict['predicted{4}']
+                abstract_scores[abstract_id][5] += loss_dict['predicted{5}']
+                abstract_scores[abstract_id][6] += loss_dict['predicted{6}']
+                abstract_scores[abstract_id][7] += loss_dict['predicted{7}']
+                abstract_scores[abstract_id][8] += loss_dict['predicted{8}']
+                abstract_scores[abstract_id][9] += loss_dict['predicted{9}']
+
+    pred_labels = np.zeros((len(abstract_scores), num_classes), dtype=np.int32)
+    actual_labels = np.zeros((len(abstract_scores), num_classes), dtype=np.int32)         
+    for i,abstract_id in enumerate(abstract_scores.keys()):
+        pred_labels[i,:] = np.clip(abstract_scores[abstract_id], 0, 1)
+        actual_labels[i,:] = np.clip(abstract_truth[abstract_id], 0, 1)
+        correct += 1.0*((abstract_scores[abstract_id] > 0) == (abstract_truth[abstract_id] > 0))
+
+    f1 = np.zeros(num_classes)
+    for j in range(num_classes):
+        f1[j] = f1_score(actual_labels[:,j], pred_labels[:,j])
 
     for m in model:
         m.train()
@@ -201,24 +241,24 @@ def calculate_correct_answers(name, model, dataloader,
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
-        correct_ans = np.zeros(num_classes,dtype=int)
+        f1_scores = np.zeros(num_classes)
         for i in range(num_classes):
-            unreduced = torch.cuda.LongTensor([correct[i], total])
+            #unreduced = torch.cuda.LongTensor([correct, total])
+            unreduced = torch.cuda.LongTensor([total])
             torch.distributed.all_reduce(unreduced,
                                         group=mpu.get_data_parallel_group())
-            # Print on screen.
-            correct_ans[i] = unreduced[0].item()
-            total_count = unreduced[1].item()
-            percent = float(correct_ans[i]) * 100.0 / float(total_count)
+            total_count = unreduced[0].item()
+
+            unreducedFloat = torch.cuda.FloatTensor([f1[i]])
+            torch.distributed.all_reduce(unreducedFloat,
+                                        group=mpu.get_data_parallel_group())
+            f1_scores[i] = unreducedFloat[0].item()
             elapsed_time = time.time() - start_time
-            print_rank_last(' > |epoch: {}| metrics for {}: correct / total '
-                            '= {} / {} = {:.4f} %, elapsed time (sec): {:.3f}'.format(
-                                epoch, name, correct_ans[i], total_count,
-                                percent, elapsed_time))
 
         if output_predictions:
             return correct_ans, total_count, (softmaxes, labels, ids)
-        return correct_ans, total_count
+        #return f1_scores, correct, total_count
+        return f1_scores, total_count
     if output_predictions:
         return 0, 0, ()
     return 0, 0

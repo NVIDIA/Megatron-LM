@@ -80,13 +80,13 @@ def _read_hoc(file_path,dataset_name):
         else:
             continue
 
-    return data_x, data_y
+    return data_x, data_y, abstract_ids
 
 def process_single_datapath(datapath, MegatronTokenizer, max_seq_length, dataset_name):
 
     print_rank_0('   > working on {}'.format(datapath))
     start_time = time.time()
-    data_x, data_y = _read_hoc(datapath,dataset_name)
+    data_x, data_y, abstract_ids = _read_hoc(datapath,dataset_name)
 
     samples = []
     num_samples = 0
@@ -99,7 +99,8 @@ def process_single_datapath(datapath, MegatronTokenizer, max_seq_length, dataset
         ids, types, paddings = build_tokens_types_paddings_from_text(
             context, no_context, MegatronTokenizer,  max_seq_length)
         label = data_y[i]
-        samples.append(build_sample_hoc(ids,types,paddings,label,num_samples))
+        abstract_id = abstract_ids[i]
+        samples.append(build_sample_hoc(ids,types,paddings,label,abstract_id))
         num_samples += 1
     
     elapsed_time = time.time() - start_time
