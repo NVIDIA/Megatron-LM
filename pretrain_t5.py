@@ -27,7 +27,7 @@ from megatron import (
 )
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import T5Model, ModelType
-from megatron.training import pretrain
+from megatron.training import pretrain, get_model
 from megatron.utils import average_losses_across_data_parallel_group
 
 
@@ -77,7 +77,13 @@ def model_provider(pre_process=True, post_process=True,
                     pre_process=pre_process,
                     post_process=post_process,
                     add_encoder=add_encoder,
-                    add_decoder=add_decoder)
+                    add_decoder=add_decoder).eval()
+    weight = torch.load("/home/wang/workspace/libai/tests/t5_test/megatron_t5.pth")
+    key_set = set()
+    for k, v in weight.items():
+        key_set.add(k)
+        model.state_dict()[k].copy_(v)
+    print(set(model.state_dict().keys()) - key_set)
     return model
 
 
@@ -167,6 +173,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     pretrain(train_valid_test_datasets_provider, model_provider, ModelType.encoder_and_decoder,
              forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

@@ -665,8 +665,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     write_args_to_tensorboard()
 
     # Turn on training mode which enables dropout.
-    for model_module in model:
-        model_module.train()
+    # for model_module in model:
+    #     model_module.train()
 
     # Tracking loss.
     total_loss_dict = {}
@@ -872,9 +872,14 @@ def build_train_valid_test_data_iterators(
         eval_iters = (args.train_iters // args.eval_interval + 1) * \
                      args.eval_iters
         test_iters = args.eval_iters
-        train_val_test_num_samples = [train_samples,
-                                      eval_iters * args.global_batch_size,
-                                      test_iters * args.global_batch_size]
+        train_val_test_num_samples = [
+            # train_samples,
+            # eval_iters * args.global_batch_size,
+            # test_iters * args.global_batch_size
+            160000,
+            1760,
+            160
+        ]
         print_rank_0(' > datasets target sizes (minimum size):')
         print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
         print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
