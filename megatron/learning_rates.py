@@ -24,6 +24,7 @@ class AnnealingLR(object):
 
     def __init__(self, optimizer, max_lr, min_lr,
                  warmup_steps, decay_steps, decay_style,
+                 start_wd, end_wd, wd_incr_style,
                  use_checkpoint_lr_scheduler=True,
                  override_lr_scheduler=False):
 
@@ -43,6 +44,13 @@ class AnnealingLR(object):
 
         self.decay_style = decay_style
 
+        self.start_wd = start_wd
+        self.end_wd = end_wd
+        assert self.start_wd >= 0.0
+        assert self.end_wd >= self.start_wd
+        
+        self.wd_incr_style = wd_incr_style
+
         self.override_lr_scheduler = override_lr_scheduler
         self.use_checkpoint_lr_scheduler = use_checkpoint_lr_scheduler
         if self.override_lr_scheduler:
@@ -51,8 +59,31 @@ class AnnealingLR(object):
 
         # Set the learning rate
         self.step(0)
-
         print_rank_0('> learning rate decay style: {}'.format(self.decay_style))
+
+
+    def get_wd(self):
+        if self.num_steps > self.decay_steps:
+            return self.end_wd
+
+        if self.wd_incr_style == 'constant':
+            assert self.start_wd == self.end_wd
+            return self.end_wd
+
+        decay_ratio = float(self.num_steps) / float(self.decay_steps)
+        assert decay_ratio >= 0.0
+        assert decay_ratio <= 1.0
+        delta_wd = self.end_wd - self.start_wd
+
+        if self.wd_incr_style == 'linear':
+            coeff = decay_ratio
+        elif self.wd_incr_style == 'cosine':
+            coeff = 0.5 * (math.cos(math.pi * (1 - decay_ratio)) + 1.0)
+        else:
+            raise Exception('{} weight decay increment style is not supported.'.format(
+                self.wd_incr_style))
+
+        return self.start_wd + coeff * delta_wd
 
 
     def get_lr(self):
@@ -95,8 +126,10 @@ class AnnealingLR(object):
         """Set lr for all parameters groups."""
         self.num_steps += increment
         new_lr = self.get_lr()
+        new_wd = self.get_wd()
         for group in self.optimizer.param_groups:
-            group['lr'] = new_lr
+            group['lr'] = new_lr * group['lr_mult']
+            group['weight_decay'] = new_wd * group['wd_mult']
 
 
     def state_dict(self):

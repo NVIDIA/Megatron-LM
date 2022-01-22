@@ -65,6 +65,7 @@ def pretrain(train_valid_test_dataset_provider,
              model_provider,
              model_type,
              forward_step_func,
+             process_non_loss_data_func=None,
              extra_args_provider=None,
              args_defaults={}):
     """Main training program.
@@ -145,14 +146,16 @@ def pretrain(train_valid_test_dataset_provider,
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, lr_scheduler,
-                          train_data_iterator, valid_data_iterator)
+                          train_data_iterator, valid_data_iterator,
+                          process_non_loss_data_func)
     print_datetime('after training is done')
 
     if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
-                                   iteration, False)
+                                   iteration, process_non_loss_data_func,
+                                   False)
 
     if args.save and iteration != 0:
         save_checkpoint(iteration, model, optimizer, lr_scheduler)
@@ -162,7 +165,8 @@ def pretrain(train_valid_test_dataset_provider,
         prefix = 'the end of training for test data'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
-                                   0, True)
+                                   0, process_non_loss_data_func,
+                                   True)
 
 def update_train_iters(args):
 
@@ -333,13 +337,20 @@ def get_learning_rate_scheduler(optimizer):
         warmup_steps=warmup_steps,
         decay_steps=decay_steps,
         decay_style=args.lr_decay_style,
+        start_wd=args.start_wd,
+        end_wd=args.end_wd,
+        wd_incr_style=args.wd_incr_style,
         use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
         override_lr_scheduler=args.override_lr_scheduler)
 
     return lr_scheduler
 
 
-def setup_model_and_optimizer(model_provider_func, model_type):
+def setup_model_and_optimizer(model_provider_func,
+                              model_type,
+                              no_wd_decay_cond=None,
+                              scale_lr_cond=None,
+                              lr_mult=1.0):
     """Setup model and optimizer."""
     args = get_args()
 
@@ -347,7 +358,8 @@ def setup_model_and_optimizer(model_provider_func, model_type):
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
-    optimizer = get_megatron_optimizer(unwrapped_model)
+    optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
+                                       scale_lr_cond, lr_mult)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
@@ -659,7 +671,8 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator):
+          train_data_iterator, valid_data_iterator,
+          process_non_loss_data_func):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -716,7 +729,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             prefix = 'iteration {}'.format(iteration)
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
-                                       iteration, False)
+                                       iteration, process_non_loss_data_func,
+                                       False)
 
         # Checkpointing
         saved_checkpoint = False
@@ -762,7 +776,11 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
     return iteration
 
 
-def evaluate(forward_step_func, data_iterator, model, verbose=False):
+def evaluate(forward_step_func,
+             data_iterator,
+             model,
+             process_non_loss_data_func,
+             verbose=False):
     """Evaluation."""
     args = get_args()
 
@@ -799,6 +817,12 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
                                            * get_num_microbatches()
+        collected_non_loss_data = None
+        if process_non_loss_data_func is not None and is_last_rank():
+            collected_non_loss_data = forward_backward_func(
+                forward_step_func, data_iterator, model, optimizer=None,
+                timers=None, forward_only=True, collect_non_loss_data=True)
+
     # Move model back to the train mode.
     for model_module in model:
         model_module.train()
@@ -806,16 +830,19 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
 
-    return total_loss_dict
+    return total_loss_dict, collected_non_loss_data
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
-                               iteration, verbose=False):
+                               iteration, process_non_loss_data_func,
+                               verbose=False):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     writer = get_tensorboard_writer()
 
-    total_loss_dict = evaluate(forward_step_func, data_iterator, model, verbose)
+    total_loss_dict, collected_non_loss_data = evaluate(
+        forward_step_func, data_iterator, model,
+        process_non_loss_data_func, verbose)
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
@@ -833,6 +860,9 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+
+    if process_non_loss_data_func is not None and writer and is_last_rank():
+        process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
     print_rank_last('-' * length)

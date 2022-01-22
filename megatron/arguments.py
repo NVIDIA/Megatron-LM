@@ -246,6 +246,10 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
+    if args.weight_decay is not None:
+        args.start_wd = args.weight_decay
+        args.end_wd = args.weight_decay
+
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
     TORCH_MINOR = int(torch.__version__.split('.')[1])
     # Persistent fused layer norm.
@@ -395,6 +399,13 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--start-wd', type=float, default=0.01,
+                       help='Initial weight decay coefficient for L2 regularization.')
+    group.add_argument('--end-wd', type=float, default=0.01,
+                       help='End of run weight decay coefficient for L2 regularization.')
+    group.add_argument('--wd-incr-style', type=str, default='linear',
+                       choices=['constant', 'linear', 'cosine'],
+                       help='Weight decay increment function.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
