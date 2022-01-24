@@ -343,11 +343,13 @@ def get_num_layers(args, is_encoder_and_decoder_model):
             else:
                 num_layers = args.num_layers // num_ranks_in_decoder
         else:
-            transformer_pipeline_size = (
-                get_pipeline_model_parallel_world_size() - 1
-                if args.standalone_embed_stage else
-                get_pipeline_model_parallel_world_size()
-            )
+            # >>>
+            # transformer_pipeline_size = (
+            #     get_pipeline_model_parallel_world_size() - 1
+            #     if args.standalone_embed_stage else
+            #     get_pipeline_model_parallel_world_size()
+            # )
+            # <<<
             assert args.num_layers % transformer_pipeline_size == 0, \
                 'num_layers must be divisible by transformer_pipeline_size'
             num_layers = (
@@ -359,15 +361,15 @@ def get_num_layers(args, is_encoder_and_decoder_model):
     else:
         num_layers = args.num_layers
     # >>>
-    from lutil import pax
-    pax(0, {
-        "rank" : torch.distributed.get_rank(),
-        "pipeline rank" : "%d / %d" % (
-            get_pipeline_model_parallel_rank(),
-            get_pipeline_model_parallel_world_size(),
-        ),
-        "num_layers" : num_layers,
-    })
+    # from lutil import pax
+    # pax(7, {
+    #     "rank" : torch.distributed.get_rank(),
+    #     "pipeline rank" : "%d / %d" % (
+    #         get_pipeline_model_parallel_rank(),
+    #         get_pipeline_model_parallel_world_size(),
+    #     ),
+    #     "num_layers" : num_layers,
+    # })
     # <<<
     return num_layers
 

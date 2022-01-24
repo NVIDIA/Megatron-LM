@@ -137,11 +137,11 @@ def pretrain(train_valid_test_dataset_provider,
     print_datetime('after dataloaders are built')
 
     # >>>
-    from lutil import pax
-    pax({
-        "model / len" : len(model),
-        # "do_train": args.do_train,
-    })
+    # from lutil import pax
+    # pax({
+    #     "model / len" : len(model),
+    #     # "do_train": args.do_train,
+    # })
     # <<<
 
     # Print setup timing.
@@ -233,11 +233,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             this_model.model_type = model_type
             model.append(this_model)
         # >>>
-        from lutil import pax
-        pax({
-            "virtual size" : args.virtual_pipeline_model_parallel_size,
-            "model" : model,
-        })
+        # from lutil import pax
+        # pax({
+        #     "virtual size" : args.virtual_pipeline_model_parallel_size,
+        #     "model" : model,
+        # })
         # <<<
     else:
         pre_process = mpu.is_pipeline_first_stage()
@@ -366,8 +366,8 @@ def setup_model_and_optimizer(model_provider_func, model_type):
     model = get_model(model_provider_func, model_type)
 
     # >>>
-    from lutil import pax
-    pax({"model": model})
+    # from lutil import pax
+    # pax({"model": model})
     # <<<
 
     unwrapped_model = unwrap_model(model,
@@ -938,8 +938,8 @@ def build_train_valid_test_data_iterators(
     args.do_test = flags[2].item()
 
     # >>>
-    from lutil import pax
-    pax({"hi": "there"})
+    # from lutil import pax
+    # pax({"hi": "there"})
     # <<<
 
     # Build iterators.

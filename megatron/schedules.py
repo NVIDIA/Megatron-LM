@@ -33,6 +33,13 @@ def get_forward_backward_func():
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
+            # >>>
+            # from lutil import pax
+            # pax({
+            #     "num microbatches" : get_num_microbatches(),
+            #     "pipeline size" : args.pipeline_model_parallel_size,
+            # })
+            # <<<
             assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
                 'number of microbatches is not divisible by pipeline-parallel ' \
                 'size when using interleaved schedule'

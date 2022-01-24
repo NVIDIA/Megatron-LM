@@ -66,6 +66,11 @@ def parse_args(extra_args_provider=None, defaults={},
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
+    args.transformer_pipeline_model_parallel_size = (
+        args.pipeline_model_parallel_size - 1
+        if args.standalone_embed_stage else
+        args.pipeline_model_parallel_size
+    )
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
@@ -141,11 +146,6 @@ def parse_args(extra_args_provider=None, defaults={},
         #     (args.num_layers // args.pipeline_model_parallel_size) // \
         #     args.num_layers_per_virtual_pipeline_stage
         # <<<
-        transformer_pipeline_size = (
-            args.pipeline_model_parallel_size - 1
-            if args.standalone_embed_stage else
-            args.pipeline_model_parallel_size
-        )
         args.virtual_pipeline_model_parallel_size = \
             (args.num_layers // transformer_pipeline_size) // \
             args.num_layers_per_virtual_pipeline_stage
