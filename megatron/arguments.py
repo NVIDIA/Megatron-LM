@@ -684,6 +684,10 @@ def _add_distributed_args(parser):
     group.add_argument('--deallocate-pipeline-outputs', action='store_true',
                        default=False, help='If set, pipeline output tensors '
                        'are deallocated during the forward pass.')
+    group.add_argument('--standalone-embed-stage', action='store_true',
+                       default=False, help='If set, *input* embedding layer '
+                       'is placed on its own pipeline stage, without any '
+                       'transformer layers.')
     return parser
 
 
