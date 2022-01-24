@@ -128,8 +128,8 @@ class AnnealingLR(object):
         new_lr = self.get_lr()
         new_wd = self.get_wd()
         for group in self.optimizer.param_groups:
-            group['lr'] = new_lr * group['lr_mult']
-            group['weight_decay'] = new_wd * group['wd_mult']
+            group['lr'] = new_lr * group.get('lr_mult', 1.0)
+            group['weight_decay'] = new_wd * group.get('wd_mult', 1.0)
 
 
     def state_dict(self):

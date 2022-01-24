@@ -608,7 +608,7 @@ class ParallelTransformer(MegatronModule):
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
 
-        self.dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.num_layers)]
+        self.dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, args.num_layers)]
 
         # Transformer layers.
         def build_layer(layer_number):
