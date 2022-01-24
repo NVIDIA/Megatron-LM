@@ -136,6 +136,14 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
+    # >>>
+    from lutil import pax
+    pax({
+        "model / len" : len(model),
+        # "do_train": args.do_train,
+    })
+    # <<<
+
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
@@ -199,6 +207,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
 
+    # >>>
+    # from lutil import pax
+    # pax({
+    #     "pipeline world size" : mpu.get_pipeline_model_parallel_world_size(),
+    #     "virtual size" : args.virtual_pipeline_model_parallel_size,
+    # })
+    # <<<
+
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and \
        args.virtual_pipeline_model_parallel_size is not None:
@@ -216,6 +232,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
+        # >>>
+        from lutil import pax
+        pax({
+            "virtual size" : args.virtual_pipeline_model_parallel_size,
+            "model" : model,
+        })
+        # <<<
     else:
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
@@ -341,6 +364,11 @@ def setup_model_and_optimizer(model_provider_func, model_type):
     args = get_args()
 
     model = get_model(model_provider_func, model_type)
+
+    # >>>
+    from lutil import pax
+    pax({"model": model})
+    # <<<
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
@@ -909,6 +937,10 @@ def build_train_valid_test_data_iterators(
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
 
+    # >>>
+    from lutil import pax
+    pax({"hi": "there"})
+    # <<<
 
     # Build iterators.
     dl_type = args.dataloader_type

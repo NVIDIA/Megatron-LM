@@ -565,6 +565,9 @@ class ParallelTransformer(MegatronModule):
         self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
 
         # Number of layers.
+        # >>>
+        # raise Exception("rank %d." % torch.distributed.get_rank())
+        # <<<
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
 

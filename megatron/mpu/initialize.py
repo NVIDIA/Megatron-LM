@@ -356,16 +356,19 @@ def get_num_layers(args, is_encoder_and_decoder_model):
                 and get_pipeline_model_parallel_rank() == 0 else
                 args.num_layers // transformer_pipeline_size
             )
-            # >>>
-            # from lutil import pax
-            # pax({
-            #     "rank" : torch.distributed.get_rank(),
-            #     "pipeline rank" : get_pipeline_model_parallel_rank(),
-            #     "num_layers" : num_layers,
-            # })
-            # <<<
     else:
         num_layers = args.num_layers
+    # >>>
+    from lutil import pax
+    pax(0, {
+        "rank" : torch.distributed.get_rank(),
+        "pipeline rank" : "%d / %d" % (
+            get_pipeline_model_parallel_rank(),
+            get_pipeline_model_parallel_world_size(),
+        ),
+        "num_layers" : num_layers,
+    })
+    # <<<
     return num_layers
 
 

@@ -136,9 +136,29 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
+        # >>>
+        # args.virtual_pipeline_model_parallel_size = \
+        #     (args.num_layers // args.pipeline_model_parallel_size) // \
+        #     args.num_layers_per_virtual_pipeline_stage
+        # <<<
+        transformer_pipeline_size = (
+            args.pipeline_model_parallel_size - 1
+            if args.standalone_embed_stage else
+            args.pipeline_model_parallel_size
+        )
         args.virtual_pipeline_model_parallel_size = \
-            (args.num_layers // args.pipeline_model_parallel_size) // \
+            (args.num_layers // transformer_pipeline_size) // \
             args.num_layers_per_virtual_pipeline_stage
+        # >>>
+        # from lutil import pax
+        # pax({
+        #     "num_layers" : args.num_layers,
+        #     "pipeline size" : args.pipeline_model_parallel_size,
+        #     "transformer size" : transformer_pipeline_size,
+        #     "num virt layers" : args.num_layers_per_virtual_pipeline_stage,
+        #     "virtual size" : args.virtual_pipeline_model_parallel_size,
+        # })
+        # <<<
     else:
         args.virtual_pipeline_model_parallel_size = None
 
