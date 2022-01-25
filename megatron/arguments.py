@@ -147,7 +147,7 @@ def parse_args(extra_args_provider=None, defaults={},
         #     args.num_layers_per_virtual_pipeline_stage
         # <<<
         args.virtual_pipeline_model_parallel_size = \
-            (args.num_layers // transformer_pipeline_size) // \
+            (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
             args.num_layers_per_virtual_pipeline_stage
         # >>>
         # from lutil import pax

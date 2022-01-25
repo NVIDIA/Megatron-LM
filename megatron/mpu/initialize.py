@@ -350,13 +350,13 @@ def get_num_layers(args, is_encoder_and_decoder_model):
             #     get_pipeline_model_parallel_world_size()
             # )
             # <<<
-            assert args.num_layers % transformer_pipeline_size == 0, \
-                'num_layers must be divisible by transformer_pipeline_size'
+            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
             num_layers = (
                 0
                 if args.standalone_embed_stage
                 and get_pipeline_model_parallel_rank() == 0 else
-                args.num_layers // transformer_pipeline_size
+                args.num_layers // args.transformer_pipeline_model_parallel_size
             )
     else:
         num_layers = args.num_layers

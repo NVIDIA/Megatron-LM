@@ -40,9 +40,26 @@ def get_forward_backward_func():
             #     "pipeline size" : args.pipeline_model_parallel_size,
             # })
             # <<<
-            assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
-                'number of microbatches is not divisible by pipeline-parallel ' \
-                'size when using interleaved schedule'
+            # >>>
+            # assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
+            #     'number of microbatches is not divisible by pipeline-parallel ' \
+            #     'size when using interleaved schedule'
+            # assert get_num_microbatches() % \
+            #     args.transformer_pipeline_model_parallel_size == 0, \
+            #     'number of microbatches (%d) is not divisible by transformer-' \
+            #     'pipeline-model-parallel-size (%d) when using interleaved ' \
+            #     'schedule' % (
+            #         get_num_microbatches(),
+            #         args.transformer_pipeline_model_parallel_size,
+            #     )
+            assert get_num_microbatches() % \
+                args.pipeline_model_parallel_size == 0, \
+                'number of microbatches (%d) is not divisible by pipeline-' \
+                'model-parallel-size (%d) when using interleaved schedule' % (
+                    get_num_microbatches(),
+                    args.pipeline_model_parallel_size,
+                )
+            # <<<
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
