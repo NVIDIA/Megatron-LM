@@ -78,7 +78,7 @@ def model_provider(pre_process=True, post_process=True,
                     post_process=post_process,
                     add_encoder=add_encoder,
                     add_decoder=add_decoder).eval()
-    weight = torch.load("/home/wang/workspace/libai/tests/t5_test/megatron_t5.pth")
+    weight = torch.load("/workspace/libai/tests/t5_test/megatron_t5.pth")
     key_set = set()
     for k, v in weight.items():
         key_set.add(k)
@@ -119,7 +119,11 @@ def loss_func(loss_mask, output_tensor):
     lm_loss_ = output_tensor.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
-
+    from pathlib import Path
+    with open('megatron_loss.txt', 'a') as f:
+        f.writelines([str(lm_loss.detach().cpu().numpy()) + '\n'])
+    # Path('loss_curve.txt').write_text('{lm_loss.detach().cpu().numpy():.6f}') 
+    print('loss: {:.6f}'.format(lm_loss.detach().cpu().numpy()))
     loss = lm_loss
     averaged_losses = average_losses_across_data_parallel_group([lm_loss])
 

@@ -10,6 +10,8 @@ CHECKPOINT_PATH=checkpoints/t5_base
 VOCAB_FILE=/home/wang/data/t5/dataset/bert-base-chinese-vocab.txt
 DATA_PATH=/home/wang/data/t5/dataset/loss_compara_content_sentence
 
+VOCAB_FILE=/workspace/data/libai_dataset/bert-base-chinese-vocab.txt
+DATA_PATH=/workspace/data/libai_dataset/loss_compara_content_sentence
 
 python3 pretrain_t5.py \
        --num-layers 6 \
@@ -36,7 +38,7 @@ python3 pretrain_t5.py \
        --lr-warmup-fraction .00 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
-       --log-interval 100 \
+       --log-interval 1 \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
