@@ -44,6 +44,7 @@ def get_param_groups(modules,
             if no_weight_decay_cond is not None:
                 no_wd = no_weight_decay_cond(name, param)
             else:
+                # do not regularize biases nor Norm parameters
                 no_wd = name.endswith(".bias") or len(param.shape) == 1
 
             if scale_lr_cond is not None:
