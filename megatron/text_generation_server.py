@@ -122,10 +122,17 @@ class MegatronGenerate(Resource):
             if random_seed < 0: 
                 return "random_seed must be a positive integer"
 
+        no_log = False
+        if "no_log" in request.get_json():
+            no_log = request.get_json()["no_log"]
+            if not isinstance(no_log, bool):
+                return "no_log must be a boolean value"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
-            print("request IP: " + str(request.remote_addr))
-            print(json.dumps(request.get_json()),flush=True)
-            print("start time: ", datetime.datetime.now())
+            if not no_log:
+                print("request IP: " + str(request.remote_addr))
+                print(json.dumps(request.get_json()),flush=True)
+                print("start time: ", datetime.datetime.now())
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
             try:
                 response, response_seg, response_logprobs, _ = \
