@@ -185,6 +185,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
             buffer_.zero()
 
 
+    def broadcast_params(self):
+        for param in self.module.parameters():
+            torch.distributed.broadcast(param.data,
+                                        src=mpu.get_data_parallel_src_rank(),
+                                        group=mpu.get_data_parallel_group())
+
+
     def allreduce_gradients(self):
         """Reduce gradients across data parallel ranks."""
         # If we have buffers, simply reduce the data in the buffer.
