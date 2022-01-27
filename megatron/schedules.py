@@ -28,6 +28,7 @@ from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model import ModelType
 
+
 def get_forward_backward_func():
     args = get_args()
     if mpu.get_pipeline_model_parallel_world_size() > 1:

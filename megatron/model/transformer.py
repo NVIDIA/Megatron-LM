@@ -27,7 +27,6 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
-
 """ We use the following notation throughout this file:
      h: hidden size
      n: number of attention heads
@@ -696,9 +695,32 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        if encoder_output is not None:
-             encoder_output = encoder_output.transpose(0, 1).contiguous()
+        # Viewless tensor.
+        # - We only need to create a viewless tensor in the case of micro batch
+        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
+        #   above creates a view tensor, and '.contiguous()' is a pass-through.
+        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
+        #   the need to make it viewless.
+        #
+        #   However, we don't explicitly check mbs == 1 here because
+        #   make_viewless_tensor() has negligible overhead when its input
+        #   is already viewless.
+        # 
+        # - For the 'else' case above, calling make_viewless_tensor() here is
+        #   likely redundant, since p2p_communication.py (likely originator)
+        #   already creates viewless tensors. That said, make_viewless_tensor()
+        #   is called here to be future-proof and corner-case-proof.
+        hidden_states = mpu.make_viewless_tensor(
+            hidden_states,
+            requires_grad = True,
+            keep_graph = True,
+        )
 
+        # Transpose encoder output.
+        if encoder_output is not None:
+            encoder_output = encoder_output.transpose(0, 1).contiguous()
+
+        # Forward pass.
         if self.activations_checkpoint_method is not None:
             hidden_states = self._checkpointed_forward(hidden_states,
                                                        attention_mask,
