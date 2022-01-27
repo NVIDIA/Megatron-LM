@@ -246,14 +246,14 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.wd_incr_style == 'constant':
-        assert args.start_wd is None
-        assert args.end_wd is None
-        args.start_wd = args.weight_decay
-        args.end_wd = args.weight_decay
+    if args.weight_decay_incr_style == 'constant':
+        assert args.start_weight_decay is None
+        assert args.end_weight_decay is None
+        args.start_weight_decay = args.weight_decay
+        args.end_weight_decay = args.weight_decay
     else:
-        assert args.start_wd is not None
-        assert args.end_wd is not None
+        assert args.start_weight_decay is not None
+        assert args.end_weight_decay is not None
 
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
     TORCH_MINOR = int(torch.__version__.split('.')[1])
@@ -404,11 +404,11 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
-    group.add_argument('--start-wd', type=float,
+    group.add_argument('--start-weight-decay', type=float,
                        help='Initial weight decay coefficient for L2 regularization.')
-    group.add_argument('--end-wd', type=float,
+    group.add_argument('--end-weight-decay', type=float,
                        help='End of run weight decay coefficient for L2 regularization.')
-    group.add_argument('--wd-incr-style', type=str, default='constant',
+    group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
     group.add_argument('--clip-grad', type=float, default=1.0,

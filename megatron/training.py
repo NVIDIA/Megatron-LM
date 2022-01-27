@@ -341,9 +341,9 @@ def get_learning_rate_scheduler(optimizer):
         warmup_steps=warmup_steps,
         decay_steps=decay_steps,
         decay_style=args.lr_decay_style,
-        start_wd=args.start_wd,
-        end_wd=args.end_wd,
-        wd_incr_style=args.wd_incr_style,
+        start_wd=args.start_weight_decay,
+        end_wd=args.end_weight_decay,
+        wd_incr_style=args.weight_decay_incr_style,
         use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
         override_lr_scheduler=args.override_lr_scheduler)
 
