@@ -312,11 +312,12 @@ def get_optimizer_param_scheduler(optimizer):
     if args.train_iters:
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
-        decay_steps = args.lr_decay_iters * args.global_batch_size
+        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
+        wd_incr_steps = args.train_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
-            warmup_steps = args.lr_warmup_fraction * decay_steps
+            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
-            warmup_steps = args.lr_warmup_iters * args.global_batch_size
+            lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
     elif args.train_samples:
         # We need to set training iters for later use. Technically
@@ -325,11 +326,12 @@ def get_optimizer_param_scheduler(optimizer):
         update_train_iters(args)
         if args.lr_decay_samples is None:
             args.lr_decay_samples = args.train_samples
-        decay_steps = args.lr_decay_samples
+        lr_decay_steps = args.lr_decay_samples
+        wd_incr_steps = args.train_samples
         if args.lr_warmup_fraction is not None:
-            warmup_steps = args.lr_warmup_fraction * decay_steps
+            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
-            warmup_steps = args.lr_warmup_samples
+            lr_warmup_steps = args.lr_warmup_samples
     else:
         raise Exception(
             'either train-iters or train-samples should be provided.')
@@ -338,11 +340,12 @@ def get_optimizer_param_scheduler(optimizer):
         optimizer,
         max_lr=args.lr,
         min_lr=args.min_lr,
-        warmup_steps=warmup_steps,
-        decay_steps=decay_steps,
-        decay_style=args.lr_decay_style,
+        lr_warmup_steps=lr_warmup_steps,
+        lr_decay_steps=lr_decay_steps,
+        lr_decay_style=args.lr_decay_style,
         start_wd=args.start_weight_decay,
         end_wd=args.end_weight_decay,
+        wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler)
