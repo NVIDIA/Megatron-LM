@@ -14,5 +14,5 @@ PROCESSED_FILE=<PATH_OF_INPUT_FILE_FOR_RESPONSE_GENERATION> \
 python ${DIR}/tasks/msdp/preprocessing.py \
         --func prepare_input \
         --test_file ${TEST_FILE} \
-        --knowledge_gen_file ${KNOWLEDGE_FILE} \
+        --knwl_gen_file ${KNOWLEDGE_FILE} \
         --processed_file ${PROCESSED_FILE}
