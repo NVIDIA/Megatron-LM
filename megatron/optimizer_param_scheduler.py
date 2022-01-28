@@ -19,14 +19,14 @@ import math
 
 from megatron import print_rank_0
 
-class AnnealingLR(object):
+class OptimizerParamScheduler(object):
     """Anneals the learning rate."""
 
     def __init__(self, optimizer, max_lr, min_lr,
                  warmup_steps, decay_steps, decay_style,
                  start_wd, end_wd, wd_incr_style,
-                 use_checkpoint_lr_scheduler=True,
-                 override_lr_scheduler=False):
+                 use_checkpoint_opt_param_scheduler=True,
+                 override_opt_param_scheduler=False):
 
         # Class values.
         self.optimizer = optimizer
@@ -51,10 +51,10 @@ class AnnealingLR(object):
         
         self.wd_incr_style = wd_incr_style
 
-        self.override_lr_scheduler = override_lr_scheduler
-        self.use_checkpoint_lr_scheduler = use_checkpoint_lr_scheduler
-        if self.override_lr_scheduler:
-            assert not self.use_checkpoint_lr_scheduler, 'both override and '\
+        self.override_opt_param_scheduler = override_opt_param_scheduler
+        self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
+        if self.override_opt_param_scheduler:
+            assert not self.use_checkpoint_opt_param_scheduler, 'both override and '\
                 'use-checkpoint are set.'
 
         # Set the learning rate
@@ -147,11 +147,11 @@ class AnnealingLR(object):
     def _check_and_set(self, cls_value, sd_value, name):
         """Auxiliary function for checking the values in the checkpoint and
         setting them."""
-        if self.override_lr_scheduler:
+        if self.override_opt_param_scheduler:
             print_rank_0(' > overriding {} value to {}'.format(name, cls_value))
             return cls_value
 
-        if not self.use_checkpoint_lr_scheduler:
+        if not self.use_checkpoint_opt_param_scheduler:
             assert cls_value == sd_value, \
                 f'AnnealingLR: class input value {cls_value} and checkpoint' \
                 f'value {sd_value} for {name} do not match'

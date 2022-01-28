@@ -167,7 +167,7 @@ def get_rng_state():
     return rng_state_list
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -198,8 +198,8 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         if not args.no_save_optim:
             if optimizer is not None:
                 state_dict['optimizer'] = optimizer.state_dict()
-            if lr_scheduler is not None:
-                state_dict['lr_scheduler'] = lr_scheduler.state_dict()
+            if opt_param_scheduler is not None:
+                state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
 
         # RNG states.
         if not args.no_save_rng:
@@ -295,7 +295,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
+def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -394,8 +394,11 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         try:
             if optimizer is not None:
                 optimizer.load_state_dict(state_dict['optimizer'])
-            if lr_scheduler is not None:
-                lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+            if opt_param_scheduler is not None:
+                if 'lr_scheduler' in state_dict: # backward compatbility
+                    opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
+                else:
+                    opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
         except KeyError:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '

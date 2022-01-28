@@ -43,7 +43,7 @@ from megatron.model import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
-from megatron.learning_rates import AnnealingLR
+from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
@@ -118,7 +118,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup').start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider,
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider,
                                                                model_type)
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
@@ -149,7 +149,7 @@ def pretrain(train_valid_test_dataset_provider,
     iteration = 0
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
-                          model, optimizer, lr_scheduler,
+                          model, optimizer, opt_param_scheduler,
                           train_data_iterator, valid_data_iterator,
                           process_non_loss_data_func)
     print_datetime('after training is done')
@@ -162,7 +162,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    False)
 
     if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, lr_scheduler)
+        save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
     if args.do_test:
         # Run on test data.
@@ -304,7 +304,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     return model
 
 
-def get_learning_rate_scheduler(optimizer):
+def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     args = get_args()
 
@@ -334,7 +334,7 @@ def get_learning_rate_scheduler(optimizer):
         raise Exception(
             'either train-iters or train-samples should be provided.')
 
-    lr_scheduler = AnnealingLR(
+    opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
         max_lr=args.lr,
         min_lr=args.min_lr,
@@ -344,10 +344,10 @@ def get_learning_rate_scheduler(optimizer):
         start_wd=args.start_weight_decay,
         end_wd=args.end_weight_decay,
         wd_incr_style=args.weight_decay_incr_style,
-        use_checkpoint_lr_scheduler=args.use_checkpoint_lr_scheduler,
-        override_lr_scheduler=args.override_lr_scheduler)
+        use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=args.override_opt_param_scheduler)
 
-    return lr_scheduler
+    return opt_param_scheduler
 
 
 def setup_model_and_optimizer(model_provider_func,
@@ -365,7 +365,7 @@ def setup_model_and_optimizer(model_provider_func,
     optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
 
-    lr_scheduler = get_learning_rate_scheduler(optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:
         timers = get_timers()
@@ -373,7 +373,7 @@ def setup_model_and_optimizer(model_provider_func,
         # max time.
         torch.distributed.barrier()
         timers('load-checkpoint').start()
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
@@ -392,11 +392,11 @@ def setup_model_and_optimizer(model_provider_func,
         if args.fp16:
             optimizer.reload_model_params()
 
-    return model, optimizer, lr_scheduler
+    return model, optimizer, opt_param_scheduler
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, lr_scheduler):
+               model, optimizer, opt_param_scheduler):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -472,7 +472,7 @@ def train_step(forward_step_func, data_iterator,
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
-        lr_scheduler.step(increment=increment)
+        opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
         skipped_iter = 1
@@ -662,19 +662,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     return report_memory_flag
 
 
-def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
+def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
     torch.distributed.barrier()
     timers('save-checkpoint').start()
-    save_checkpoint(iteration, model, optimizer, lr_scheduler)
+    save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
     torch.distributed.barrier()
     timers('save-checkpoint').stop()
     timers.log(['save-checkpoint'])
 
 
-def train(forward_step_func, model, optimizer, lr_scheduler,
+def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
           process_non_loss_data_func):
     """Train the model function."""
@@ -704,7 +704,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                        train_data_iterator,
                        model,
                        optimizer,
-                       lr_scheduler)
+                       opt_param_scheduler)
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -725,7 +725,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         if args.adlr_autoresume and \
            (iteration % args.adlr_autoresume_interval == 0):
             check_adlr_autoresume_termination(iteration, model, optimizer,
-                                              lr_scheduler)
+                                              opt_param_scheduler)
 
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
@@ -742,14 +742,14 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             signal_handler = get_signal_handler()
             if any(signal_handler.signals_received()):
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         lr_scheduler)
+                                         opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
                 sys.exit()
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
             save_checkpoint_and_time(iteration, model, optimizer,
-                                     lr_scheduler)
+                                     opt_param_scheduler)
             saved_checkpoint = True
 
         # Exiting based on duration
@@ -763,7 +763,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
             if done:
                 if not saved_checkpoint:
                     save_checkpoint_and_time(iteration, model, optimizer,
-                                             lr_scheduler)
+                                             opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
                 sys.exit()
 
@@ -771,7 +771,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         if args.exit_interval and iteration % args.exit_interval == 0:
             if not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
-                                         lr_scheduler)
+                                         opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()

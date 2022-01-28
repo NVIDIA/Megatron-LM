@@ -135,7 +135,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
 def _train(
     model,
     optimizer,
-    lr_scheduler,
+    opt_param_scheduler,
     forward_step,
     train_dataloader,
     valid_dataloader,
@@ -179,7 +179,7 @@ def _train(
 
             # Train for one step.
             losses_dict, skipped_iter, grad_norm, num_zeros_in_grad = train_step(
-                forward_step, batch, model, optimizer, lr_scheduler
+                forward_step, batch, model, optimizer, opt_param_scheduler
             )
             iteration += 1
 
@@ -206,7 +206,7 @@ def _train(
                 iteration % args.adlr_autoresume_interval == 0
             ):
                 check_adlr_autoresume_termination(
-                    iteration, model, optimizer, lr_scheduler
+                    iteration, model, optimizer, opt_param_scheduler
                 )
 
             # Checkpointing
@@ -215,7 +215,7 @@ def _train(
                 and args.save_interval
                 and iteration % args.save_interval == 0
             ):
-                save_checkpoint(iteration, model, optimizer, lr_scheduler)
+                save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
             # Evaluation
             if args.eval_interval and iteration % args.eval_interval == 0:
@@ -231,7 +231,7 @@ def _train(
 
         # Checkpointing at the end of each epoch.
         if args.save:
-            save_checkpoint(iteration, model, optimizer, lr_scheduler)
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
@@ -266,7 +266,7 @@ def finetune(
 
     # Build model, optimizer and learning rate scheduler.
     timers("model and optimizer").start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider)
     timers("model and optimizer").stop()
 
     # If pretrained checkpoint is provided and we have not trained for
@@ -300,7 +300,7 @@ def finetune(
         _train(
             model,
             optimizer,
-            lr_scheduler,
+            opt_param_scheduler,
             forward_step,
             train_dataloader,
             valid_dataloader,
