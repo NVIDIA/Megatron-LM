@@ -4,3 +4,9 @@ __pycache__
 build/
 dist/
 *.egg-info/
+
+# binaries
+*.so
+
+# tmp files
+*.swp
