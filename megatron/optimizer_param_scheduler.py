@@ -178,9 +178,9 @@ class OptimizerParamScheduler(object):
                                           'minimum learning rate')
 
         if 'warmup_iter' in sd:
-            warmup_steps_ = sd['warmup_iter']
+            lr_warmup_steps_ = sd['warmup_iter']
         elif 'warmup_steps' in sd:
-            warmup_steps_ = sd['warmup_steps']
+            lr_warmup_steps_ = sd['warmup_steps']
         else:
             lr_warmup_steps_ = sd['lr_warmup_steps']
         self.lr_warmup_steps = self._check_and_set(self.lr_warmup_steps,
