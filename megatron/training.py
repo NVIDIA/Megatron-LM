@@ -369,8 +369,18 @@ def setup_model_and_optimizer(model_provider_func, model_type):
     model = get_model(model_provider_func, model_type)
 
     # >>>
-    # from lutil import pax
-    # pax({"model": model})
+    # if mpu.get_tensor_model_parallel_rank() == 0:
+    #     from lutil import pax
+    #     pax({
+    #         # "model" : model,
+    #         "model" : [
+    #             sum(t.nelement() for t in m.parameters())
+    #             for m in model
+    #         ],
+    #     })
+    # else:
+    #     torch.distributed.barrier()
+    #     exit(0)
     # <<<
 
     unwrapped_model = unwrap_model(model,

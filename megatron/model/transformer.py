@@ -698,6 +698,18 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        # >>>
+        # if not self.pre_process and self.num_layers == 0:
+        #     # raise Exception("tp %d, pp %d, vp %d ... hidden states %s, input tensor %s." % (
+        #     #     mpu.get_tensor_model_parallel_rank(),
+        #     #     mpu.get_pipeline_model_parallel_rank(),
+        #     #     mpu.get_virtual_pipeline_model_parallel_rank(),
+        #     #     "--" if hidden_states is None else str(hidden_states.shape),
+        #     #     "--" if self.input_tensor is None else str(self.input_tensor.shape),
+        #     # ))
+        #     hidden_states = hidden_states.clone()
+        # <<<
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'

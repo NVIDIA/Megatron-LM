@@ -334,6 +334,15 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                                      input_tensor, losses_reduced)
         output_tensors[model_chunk_id].append(output_tensor)
 
+        # >>>
+        if id(input_tensor) == id(output_tensor):
+            raise Exception("tp %d, pp %d, vp %d." % (
+                mpu.get_tensor_model_parallel_rank(),
+                mpu.get_pipeline_model_parallel_rank(),
+                mpu.get_virtual_pipeline_model_parallel_rank(),
+            ))
+        # <<<
+
         # if forward-only, no need to save tensors for a backward pass
         if forward_only:
             input_tensors[model_chunk_id].pop()

@@ -136,22 +136,35 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     # To protect against race condition when using batch_isend_irecv().
     torch.cuda.synchronize()
 
+    # >>>
+    def make_viewless_tensor(t):
+        return mpu.make_viewless_tensor(t, requires_grad=True, keep_graph=False)
+    # <<<
+
     # If using scatter-gather optimization, gather smaller chunks.
     if not override_scatter_gather_tensors_in_pipeline and \
             args.scatter_gather_tensors_in_pipeline:
         if recv_prev:
             tensor_recv_prev = mpu.gather_split_1d_tensor(
                 tensor_recv_prev).view(tensor_shape).requires_grad_()
-            tensor_recv_prev = mpu.make_viewless_tensor(tensor_recv_prev,
-                                                        requires_grad = True,
-                                                        keep_graph = False)
+            # >>>
+            # tensor_recv_prev = mpu.make_viewless_tensor(tensor_recv_prev,
+            #                                             requires_grad = True,
+            #                                             keep_graph = False)
+            # +++
+            tensor_recv_prev = make_viewless_tensor(tensor_recv_prev)
+            # <<<
 
         if recv_next:
             tensor_recv_next = mpu.gather_split_1d_tensor(
                 tensor_recv_next).view(tensor_shape).requires_grad_()
-            tensor_recv_next = mpu.make_viewless_tensor(tensor_recv_next,
-                                                        requires_grad = True,
-                                                        keep_graph = False)
+            # >>>
+            # tensor_recv_next = mpu.make_viewless_tensor(tensor_recv_next,
+            #                                             requires_grad = True,
+            #                                             keep_graph = False)
+            # +++
+            tensor_recv_next = make_viewless_tensor(tensor_recv_next)
+            # <<<
 
     return tensor_recv_prev, tensor_recv_next
 
