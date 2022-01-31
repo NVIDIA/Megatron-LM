@@ -542,6 +542,25 @@ class ParallelTransformerLayer(MegatronModule):
         return output
 
 
+# >>>
+class NoopTransformerLayer(MegatronModule):
+    """A single 'no-op' transformer layer.
+
+    The sole purpose of this layer is for when args.standalone_embedding_stage
+    == True. ?????
+    """
+
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, attention_mask,
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
+        return hidden_states.clone()
+# <<<
+
+
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -569,6 +588,14 @@ class ParallelTransformer(MegatronModule):
         # <<<
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
+        # >>>
+        # if not self.pre_process and self.num_layers == 0:
+        #     raise Exception(">>>> t %d, p %d, v %d. <<<<" % (
+        #         mpu.get_tensor_model_parallel_rank(),
+        #         mpu.get_pipeline_model_parallel_rank(),
+        #         mpu.get_virtual_pipeline_model_parallel_rank(),
+        #     ))
+        # <<<
 
         # Transformer layers.
         def build_layer(layer_number):
@@ -610,8 +637,28 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        # >>>
+        if self.num_layers == 0:
+            # when args.standalone_embed_stage == True, virtual pipeline ranks
+            # on pipeline rank 0 will have zero transformer layers assigned to
+            # them. This will cause a couple optimization techniques to fail:
+            # 
+            # 1. distributed checkpointing (we
+            # 2. pipeline output tensor deallocation (would fail because the
+            #    output tensor is the same object as the input tensor, and
+            #    thus we also deallocate the input tensor, which causes
+            #    autograd.backward to fail)
+            # 
+            # to remedy this, we assign a 'no-op' layer on these ranks, which
+            # will pass the data flow through the checkpoint function, and in
+            # turn also results in the schedule's input and output tensors
+            # being separate objects.
+            self.num_layers = 1
+            self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
+        else:
+            self.layers = torch.nn.ModuleList(
+                [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        # <<<
 
         if self.post_process:
             # Final layer norm before output.
