@@ -254,8 +254,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 pre_process = rank == 0 or rank == split_rank
                 post_process = (rank == (split_rank - 1)) or (
                         rank == (world_size - 1))
-                add_encoder = mpu.is_pipeline_stage_before_split()
-                add_decoder = mpu.is_pipeline_stage_after_split()
+                # >>>
+                add_encoder = mpu.is_pipeline_stage_before_split() # args)
+                add_decoder = mpu.is_pipeline_stage_after_split() # args)
+                # <<<
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,
