@@ -251,7 +251,7 @@ def build_train_valid_datasets(data_path, image_size=224):
     val_transform = ClassificationTransform(image_size, train=False)
 
     # training dataset
-    train_data_path = data_path[0] if len(data_path) <= 2 else data_path[2] #TODO VIJAY
+    train_data_path = data_path[0] if len(data_path) <= 2 else data_path[2]
     train_data = ImageFolder(
         root=train_data_path,
         transform=train_transform,

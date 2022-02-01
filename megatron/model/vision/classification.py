@@ -68,7 +68,7 @@ class VitClassificationModel(MegatronModule):
 class MitClassificationModel(MegatronModule):
     """Mix vision Transformer Model."""
 
-    def __init__(self, num_classes
+    def __init__(self, num_classes,
                  pre_process=True, post_process=True):
         super(MitClassificationModel, self).__init__()
         args = get_args()

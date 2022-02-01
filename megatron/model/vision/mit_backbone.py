@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-from megatron.model.vision.utils import DropPath, trunc_normal_
+from megatron.model.vision.utils import trunc_normal_
+from megatron.model.transformer import DropPath
 from megatron.model import LayerNorm
 
 

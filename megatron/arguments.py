@@ -880,10 +880,9 @@ def _add_vision_args(parser):
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 
-
     # pretraining type and backbone selection`
     group.add_argument('--vision-pretraining-type', type=str, default='classify',
-                       choices=['classify', 'inpaint', 'contrast'],
+                       choices=['classify', 'inpaint', 'dino'],
                        help='pretraining objectives')
     group.add_argument('--vision-backbone-type', type=str, default='vit',
                        choices=['vit', 'mit', 'swin'],
@@ -898,7 +897,6 @@ def _add_vision_args(parser):
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
-
  
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,

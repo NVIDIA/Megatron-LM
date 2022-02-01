@@ -714,7 +714,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     report_memory_flag = True
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
-	args.curr_iteration = iteration
+        args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -804,7 +804,7 @@ def evaluate(forward_step_func,
     """Evaluation."""
     args = get_args()
 
-    if args.vision_pretraining_type == "contrast":
+    if args.vision_pretraining_type == "dino":
         args.knn_features = compute_feature_bank(model)
 
     # Turn on evaluation mode which disables dropout.
