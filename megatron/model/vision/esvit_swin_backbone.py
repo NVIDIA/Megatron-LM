@@ -14,7 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 import torch.distributed as dist
-from megatron.model.vision.utils import DropPath, trunc_normal_
+from megatron.model.vision.utils import trunc_normal_
+from megatron.model.transformer import DropPath
 from megatron import get_args
 from megatron.model import LayerNorm
 import numpy as np
@@ -809,12 +810,12 @@ class SwinTransformer(nn.Module):
 def get_swin(is_teacher=False):
     args = get_args()
 
-    if args.swin_type == "tiny":
+    if args.swin_backbone_type == "tiny":
         embed_dim = 96
         depths = [2, 2, 6, 2]
         num_heads = [3, 6, 12, 24]
         drop_path_rate = 0.1
-    elif args.swin_type == 'h3':
+    elif args.swin_backbone_type == 'h3':
         embed_dim = 384
         depths = [2, 2, 18, 2]
         num_heads = [6, 12, 24, 48]

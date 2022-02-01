@@ -23,13 +23,14 @@ import torch.distributed as dist
 from functools import partial
 from megatron import get_args, get_timers, mpu, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
-from megatron.model.vision.contrastive import DINOPretrainModel
+from megatron.model.vision.dino import DINOPretrainModel
 from megatron.model.vision.knn_monitor import knn_predict
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group, unwrap_model
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
+from megatron.model import ModelType
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -116,6 +117,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'dataloader_type': 'cyclic'}
     )
