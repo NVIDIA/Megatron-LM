@@ -143,12 +143,19 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
 
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
+    # >>>
+    mpu.assert_viewless_tensor(output_tensor)
+    # <<<
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
         loss, loss_reduced = output_tensor
         output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
+
+    # >>>
+    mpu.assert_viewless_tensor(output_tensor)
+    # <<<
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state

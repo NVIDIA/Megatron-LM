@@ -546,7 +546,7 @@ class ParallelTransformerLayer(MegatronModule):
 class NoopTransformerLayer(MegatronModule):
     """A single 'no-op' transformer layer.
 
-    The sole purpose of this layer is for when args.standalone_embedding_stage
+    The sole purpose of this layer is for when args.standalone_embed_stage
     == True. ?????
     """
 
@@ -804,7 +804,27 @@ class ParallelTransformer(MegatronModule):
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)
+            # >>>
+            # if True or output._base is not None:
+            #     # from lutil import pax, tp
+            #     # pax({
+            #     #     "hidden_states" : tp(hidden_states),
+            #     #     "output" : tp(output),
+            #     # })
+            #     # raise Exception(">>> rank %d, view %d, hid '%s', out '%s'. <<<" %(
+            #     #     torch.distributed.get_rank(),
+            #     #     output._base is not None,
+            #     #     str(hidden_states.shape),
+            #     #     str(output.shape),
+            #     # ))
+            #     args = get_args()
+            #     raise Exception(">>> rank %d, hid %d, view %d. <<<" %(
+            #         torch.distributed.get_rank(),
+            #         args.hidden_size,
+            #         output._base is not None,
+            #     ))
+            # <<<
         else:
             output = hidden_states
-        
+
         return output
