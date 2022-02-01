@@ -141,24 +141,9 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
-        # >>>
-        # args.virtual_pipeline_model_parallel_size = \
-        #     (args.num_layers // args.pipeline_model_parallel_size) // \
-        #     args.num_layers_per_virtual_pipeline_stage
-        # <<<
         args.virtual_pipeline_model_parallel_size = \
             (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
             args.num_layers_per_virtual_pipeline_stage
-        # >>>
-        # from lutil import pax
-        # pax({
-        #     "num_layers" : args.num_layers,
-        #     "pipeline size" : args.pipeline_model_parallel_size,
-        #     "transformer size" : transformer_pipeline_size,
-        #     "num virt layers" : args.num_layers_per_virtual_pipeline_stage,
-        #     "virtual size" : args.virtual_pipeline_model_parallel_size,
-        # })
-        # <<<
     else:
         args.virtual_pipeline_model_parallel_size = None
 
@@ -707,7 +692,8 @@ def _add_distributed_args(parser):
     group.add_argument('--standalone-embed-stage', action='store_true',
                        default=False, help='If set, *input* embedding layer '
                        'is placed on its own pipeline stage, without any '
-                       'transformer layers.')
+                       'transformer layers. (For T5, this flag currently only '
+                       'affects the encoder embedding.)')
     return parser
 
 

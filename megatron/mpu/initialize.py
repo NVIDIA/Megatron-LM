@@ -269,9 +269,6 @@ def set_tensor_model_parallel_world_size(world_size):
 
 
 def set_pipeline_model_parallel_world_size(world_size):
-    # >>>
-    raise Exception("hi.")
-    # <<<
     """Set the pipeline model parallel size"""
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
@@ -290,9 +287,6 @@ def get_pipeline_model_parallel_world_size():
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    # >>>
-    # raise Exception("hi.")
-    # <<<
     return torch.distributed.get_world_size(group=get_pipeline_model_parallel_group())
 
 
@@ -328,49 +322,34 @@ def get_num_layers(args, is_encoder_and_decoder_model):
     """Compute the number of transformer layers resident on the current rank."""
     if get_pipeline_model_parallel_world_size() > 1:
         if is_encoder_and_decoder_model:
-            # >>>
-            # raise Exception("fix for t5.")
-            # <<<
             assert args.pipeline_model_parallel_split_rank is not None
-            # >>>
-            # num_ranks_in_encoder = args.pipeline_model_parallel_split_rank
-            # +++
+
+            # When a standalone embedding stage is used, a rank is taken from
+            # the encoder's ranks, to be used for the encoder's embedding
+            # layer. This way, the rank referenced by the 'split rank' remains
+            # the same whether or not a standalone embedding stage is used.
             num_ranks_in_encoder = (
                 args.pipeline_model_parallel_split_rank - 1
                 if args.standalone_embed_stage else
                 args.pipeline_model_parallel_split_rank
             )
-            # <<<
-            # >>>
-            # num_ranks_in_decoder = get_pipeline_model_parallel_world_size() - num_ranks_in_encoder
-            # +++
             num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
-            # <<<
-            # >>>
-            # raise Exception(">>>> standalone %d, encoder %d, decoder %d. <<<<" % (
-            #     args.standalone_embed_stage,
-            #     num_ranks_in_encoder,
-            #     num_ranks_in_decoder,
-            # ))
-            # <<<
             assert args.num_layers % num_ranks_in_encoder == 0, \
                     'num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.num_layers, num_ranks_in_encoder)
             assert args.num_layers % num_ranks_in_decoder == 0, \
                     'num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.num_layers, num_ranks_in_decoder)
-            if is_pipeline_stage_before_split(): # args):
+            if is_pipeline_stage_before_split():
                 num_layers = args.num_layers // num_ranks_in_encoder
             else:
                 num_layers = args.num_layers // num_ranks_in_decoder
         else:
-            # >>>
-            # transformer_pipeline_size = (
-            #     get_pipeline_model_parallel_world_size() - 1
-            #     if args.standalone_embed_stage else
-            #     get_pipeline_model_parallel_world_size()
-            # )
-            # <<<
             assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                 'num_layers must be divisible by transformer_pipeline_model_parallel_size'
+
+            # When a standalone embedding stage is used, all transformer layers
+            # are divided among pipeline rank >= 1, while on pipeline rank 0,
+            # ranks either contain the input embedding layer (virtual pp rank 0),
+            # or no layers at all (virtual pp rank >= 1).
             num_layers = (
                 0
                 if args.standalone_embed_stage
@@ -379,17 +358,6 @@ def get_num_layers(args, is_encoder_and_decoder_model):
             )
     else:
         num_layers = args.num_layers
-    # >>>
-    # from lutil import pax
-    # pax(7, {
-    #     "rank" : torch.distributed.get_rank(),
-    #     "pipeline rank" : "%d / %d" % (
-    #         get_pipeline_model_parallel_rank(),
-    #         get_pipeline_model_parallel_world_size(),
-    #     ),
-    #     "num_layers" : num_layers,
-    # })
-    # <<<
     return num_layers
 
 
@@ -438,9 +406,6 @@ def is_rank_in_position_embedding_group():
     return rank in _POSITION_EMBEDDING_GLOBAL_RANKS
 
 
-# >>>
-# def is_pipeline_stage_before_split(args, rank=None):
-# <<<
 def is_pipeline_stage_before_split(rank=None):
     """Return True if pipeline stage executes encoder block for a model
     with both encoder and decoder."""
@@ -448,11 +413,6 @@ def is_pipeline_stage_before_split(rank=None):
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
-    # >>>
-    # if args.standalone_embed_stage:
-    #     rank += 1
-    assert isinstance(rank, (type(None), int)), "rank == <%s>." % type(rank).__name__
-    # <<<
     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
         return True
@@ -461,9 +421,6 @@ def is_pipeline_stage_before_split(rank=None):
     return False
 
 
-# >>>
-# def is_pipeline_stage_after_split(args, rank=None):
-# <<<
 def is_pipeline_stage_after_split(rank=None):
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
@@ -471,11 +428,6 @@ def is_pipeline_stage_after_split(rank=None):
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
-    # >>>
-    # if args.standalone_embed_stage:
-    #     rank += 1
-    assert isinstance(rank, (type(None), int)), "rank == <%s>." % type(rank).__name__
-    # <<<
     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
         return True

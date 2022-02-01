@@ -542,12 +542,20 @@ class ParallelTransformerLayer(MegatronModule):
         return output
 
 
-# >>>
 class NoopTransformerLayer(MegatronModule):
     """A single 'no-op' transformer layer.
 
-    The sole purpose of this layer is for when args.standalone_embed_stage
-    == True. ?????
+    The sole purpose of this layer is for when a standalone embedding layer
+    is used (i.e., args.standalone_embed_stage == True). In this case,
+    zero transformer layers are assigned when pipeline rank == 0. Additionally,
+    when virtual pipeline rank >= 1, zero total model parameters are created
+    (virtual rank 0 contains the input embedding). This results in the model's
+    input and output tensors being the same, which causes an error when
+    performing certain memory optimiations on the output tensor (e.g.,
+    deallocating it). Thus, this layer disconnects the input from the output
+    via a clone. Since ranks containing a no-op layer are generally under-
+    utilized (both compute and memory), there's no worry of any performance
+    degredation.
     """
 
     def __init__(self, layer_number):
@@ -558,7 +566,6 @@ class NoopTransformerLayer(MegatronModule):
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
         return hidden_states.clone()
-# <<<
 
 
 class ParallelTransformer(MegatronModule):
@@ -583,19 +590,8 @@ class ParallelTransformer(MegatronModule):
         self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
 
         # Number of layers.
-        # >>>
-        # raise Exception("rank %d." % torch.distributed.get_rank())
-        # <<<
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
-        # >>>
-        # if not self.pre_process and self.num_layers == 0:
-        #     raise Exception(">>>> t %d, p %d, v %d. <<<<" % (
-        #         mpu.get_tensor_model_parallel_rank(),
-        #         mpu.get_pipeline_model_parallel_rank(),
-        #         mpu.get_virtual_pipeline_model_parallel_rank(),
-        #     ))
-        # <<<
 
         # Transformer layers.
         def build_layer(layer_number):
@@ -637,28 +633,20 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        # >>>
         if self.num_layers == 0:
-            # when args.standalone_embed_stage == True, virtual pipeline ranks
+            # When a standalone embedding stage is used (e.g.,
+            # args.standalone_embed_stage == True), virtual pipeline ranks
             # on pipeline rank 0 will have zero transformer layers assigned to
-            # them. This will cause a couple optimization techniques to fail:
-            # 
-            # 1. distributed checkpointing (we
-            # 2. pipeline output tensor deallocation (would fail because the
-            #    output tensor is the same object as the input tensor, and
-            #    thus we also deallocate the input tensor, which causes
-            #    autograd.backward to fail)
-            # 
-            # to remedy this, we assign a 'no-op' layer on these ranks, which
-            # will pass the data flow through the checkpoint function, and in
-            # turn also results in the schedule's input and output tensors
-            # being separate objects.
+            # them. This results in the model's input and output tensors to be
+            # the same, which will cause failure for certain output tensor
+            # optimizations (e.g., pipeline output deallocation). To remedy
+            # this, we assign a 'no-op' layer on these ranks, which will
+            # disconnect the input tensor from the output tensor.
             self.num_layers = 1
             self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
         else:
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
-        # <<<
 
         if self.post_process:
             # Final layer norm before output.
@@ -745,18 +733,6 @@ class ParallelTransformer(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        # >>>
-        # if not self.pre_process and self.num_layers == 0:
-        #     # raise Exception("tp %d, pp %d, vp %d ... hidden states %s, input tensor %s." % (
-        #     #     mpu.get_tensor_model_parallel_rank(),
-        #     #     mpu.get_pipeline_model_parallel_rank(),
-        #     #     mpu.get_virtual_pipeline_model_parallel_rank(),
-        #     #     "--" if hidden_states is None else str(hidden_states.shape),
-        #     #     "--" if self.input_tensor is None else str(self.input_tensor.shape),
-        #     # ))
-        #     hidden_states = hidden_states.clone()
-        # <<<
-
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -804,26 +780,6 @@ class ParallelTransformer(MegatronModule):
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
             output = self.final_layernorm(hidden_states)
-            # >>>
-            # if True or output._base is not None:
-            #     # from lutil import pax, tp
-            #     # pax({
-            #     #     "hidden_states" : tp(hidden_states),
-            #     #     "output" : tp(output),
-            #     # })
-            #     # raise Exception(">>> rank %d, view %d, hid '%s', out '%s'. <<<" %(
-            #     #     torch.distributed.get_rank(),
-            #     #     output._base is not None,
-            #     #     str(hidden_states.shape),
-            #     #     str(output.shape),
-            #     # ))
-            #     args = get_args()
-            #     raise Exception(">>> rank %d, hid %d, view %d. <<<" %(
-            #         torch.distributed.get_rank(),
-            #         args.hidden_size,
-            #         output._base is not None,
-            #     ))
-            # <<<
         else:
             output = hidden_states
 

@@ -34,25 +34,6 @@ def get_forward_backward_func():
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
-            # >>>
-            # from lutil import pax
-            # pax({
-            #     "num microbatches" : get_num_microbatches(),
-            #     "pipeline size" : args.pipeline_model_parallel_size,
-            # })
-            # <<<
-            # >>>
-            # assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
-            #     'number of microbatches is not divisible by pipeline-parallel ' \
-            #     'size when using interleaved schedule'
-            # assert get_num_microbatches() % \
-            #     args.transformer_pipeline_model_parallel_size == 0, \
-            #     'number of microbatches (%d) is not divisible by transformer-' \
-            #     'pipeline-model-parallel-size (%d) when using interleaved ' \
-            #     'schedule' % (
-            #         get_num_microbatches(),
-            #         args.transformer_pipeline_model_parallel_size,
-            #     )
             assert get_num_microbatches() % \
                 args.pipeline_model_parallel_size == 0, \
                 'number of microbatches (%d) is not divisible by pipeline-' \
@@ -60,7 +41,6 @@ def get_forward_backward_func():
                     get_num_microbatches(),
                     args.pipeline_model_parallel_size,
                 )
-            # <<<
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
@@ -143,19 +123,12 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
 
     unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
-    # >>>
-    mpu.assert_viewless_tensor(output_tensor)
-    # <<<
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
         loss, loss_reduced = output_tensor
         output_tensor = loss / get_num_microbatches()
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
-
-    # >>>
-    mpu.assert_viewless_tensor(output_tensor)
-    # <<<
 
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
@@ -340,15 +313,6 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
                                      model[model_chunk_id],
                                      input_tensor, losses_reduced)
         output_tensors[model_chunk_id].append(output_tensor)
-
-        # >>>
-        # if id(input_tensor) == id(output_tensor):
-        #     raise Exception("tp %d, pp %d, vp %d." % (
-        #         mpu.get_tensor_model_parallel_rank(),
-        #         mpu.get_pipeline_model_parallel_rank(),
-        #         mpu.get_virtual_pipeline_model_parallel_rank(),
-        #     ))
-        # <<<
 
         # if forward-only, no need to save tensors for a backward pass
         if forward_only:
