@@ -25,7 +25,7 @@ from megatron.model.vision.inpainting import MitInpaintingModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from tasks.vision.metrics import SSIM, PSNR
-
+from megatron.model import ModelType
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -143,6 +143,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
+        ModelType.encoder_or_decoder,
         forward_step,
         process_non_loss_data,
         args_defaults={'dataloader_type': 'cyclic'}

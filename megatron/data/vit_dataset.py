@@ -206,9 +206,9 @@ class DinoTransform(object):
             normalize
         ])
         # transformation for the local small crops
-        self.local_crops_number = args.local_crops_number
+        self.local_crops_number = args.dino_local_crops_number
         self.local_transform = T.Compose([
-            T.RandomResizedCrop(args.local_img_size,
+            T.RandomResizedCrop(args.dino_local_img_size,
                                 scale=(0.05, scale_const),
                                 interpolation=Image.BICUBIC),
             flip_and_color_jitter,
@@ -218,12 +218,6 @@ class DinoTransform(object):
 
     def __call__(self, image):
         crops = []
-        args = get_args()
-
-        if args.street_data:
-            crop_transform = T.RandomCrop(300)
-            image = crop_transform(image)
-
         crops.append(self.global_transform1(image))
         crops.append(self.global_transform2(image))
         for _ in range(self.local_crops_number):
@@ -246,9 +240,6 @@ def build_train_valid_datasets(data_path, image_size=224):
     else:
         raise Exception('{} vit pretraining type is not supported.'.format(
                 args.vit_pretraining_type))
-
-    train_transform = ClassificationTransform(image_size)
-    val_transform = ClassificationTransform(image_size, train=False)
 
     # training dataset
     train_data_path = data_path[0] if len(data_path) <= 2 else data_path[2]
