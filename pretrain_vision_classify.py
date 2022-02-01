@@ -30,14 +30,15 @@ from megatron.utils import average_losses_across_data_parallel_group
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
-    print_rank_0("building VIT model ...")
     args = get_args()
 
     if args.vision_backbone_type == 'vit':
+        print_rank_0("building VIT model ...")
         model = VitClassificationModel(num_classes=args.num_classes,
                                        pre_process=pre_process,
                                        post_process=post_process)
     elif args.vision_backbone_type == 'mit':
+        print_rank_0("building MIT model ...")
         model = MitClassificationModel(num_classes=args.num_classes,
                                        pre_process=pre_process,
                                        post_process=post_process)
