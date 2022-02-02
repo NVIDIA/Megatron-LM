@@ -89,7 +89,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
         directory = 'iter_{:07d}'.format(iteration)
     # Use both the tensor and pipeline MP rank.
     if pipeline_parallel_size is None:
-        parallel_size = mpu.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_size = mpu.get_pipeline_model_parallel_world_size()
     if tensor_rank is None:
         tensor_rank = mpu.get_tensor_model_parallel_rank()
     if pipeline_rank is None:
