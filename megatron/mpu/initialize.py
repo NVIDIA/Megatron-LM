@@ -330,7 +330,7 @@ def get_num_layers(args, is_encoder_and_decoder_model):
             # the same whether or not a standalone embedding stage is used.
             num_ranks_in_encoder = (
                 args.pipeline_model_parallel_split_rank - 1
-                if args.standalone_embed_stage else
+                if args.standalone_embedding_stage else
                 args.pipeline_model_parallel_split_rank
             )
             num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
@@ -352,7 +352,7 @@ def get_num_layers(args, is_encoder_and_decoder_model):
             # or no layers at all (virtual pp rank >= 1).
             num_layers = (
                 0
-                if args.standalone_embed_stage
+                if args.standalone_embedding_stage
                 and get_pipeline_model_parallel_rank() == 0 else
                 args.num_layers // args.transformer_pipeline_model_parallel_size
             )

@@ -546,7 +546,7 @@ class NoopTransformerLayer(MegatronModule):
     """A single 'no-op' transformer layer.
 
     The sole purpose of this layer is for when a standalone embedding layer
-    is used (i.e., args.standalone_embed_stage == True). In this case,
+    is used (i.e., args.standalone_embedding_stage == True). In this case,
     zero transformer layers are assigned when pipeline rank == 0. Additionally,
     when virtual pipeline rank >= 1, zero total model parameters are created
     (virtual rank 0 contains the input embedding). This results in the model's
@@ -635,7 +635,7 @@ class ParallelTransformer(MegatronModule):
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
-            # args.standalone_embed_stage == True), virtual pipeline ranks
+            # args.standalone_embedding_stage == True), virtual pipeline ranks
             # on pipeline rank 0 will have zero transformer layers assigned to
             # them. This results in the model's input and output tensors to be
             # the same, which will cause failure for certain output tensor

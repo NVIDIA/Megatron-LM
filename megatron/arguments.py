@@ -68,7 +68,7 @@ def parse_args(extra_args_provider=None, defaults={},
         (args.world_size // args.tensor_model_parallel_size))
     args.transformer_pipeline_model_parallel_size = (
         args.pipeline_model_parallel_size - 1
-        if args.standalone_embed_stage else
+        if args.standalone_embedding_stage else
         args.pipeline_model_parallel_size
     )
     # Checks.
@@ -689,7 +689,7 @@ def _add_distributed_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
-    group.add_argument('--standalone-embed-stage', action='store_true',
+    group.add_argument('--standalone-embedding-stage', action='store_true',
                        default=False, help='If set, *input* embedding layer '
                        'is placed on its own pipeline stage, without any '
                        'transformer layers. (For T5, this flag currently only '
