@@ -136,7 +136,7 @@ def generate_tokens_probs_and_return_on_first_stage(
     
     # If the context is too big, this happens
     if min_prompt_length >= max_sequence_length:
-        raise ValueError
+        raise ValueError("context length + tokens_to_generate too large")
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_sequence_length)
