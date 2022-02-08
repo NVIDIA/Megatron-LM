@@ -579,6 +579,32 @@ class ParallelTransformerLayer(MegatronModule):
         return output
 
 
+class NoopTransformerLayer(MegatronModule):
+    """A single 'no-op' transformer layer.
+
+    The sole purpose of this layer is for when a standalone embedding layer
+    is used (i.e., args.standalone_embedding_stage == True). In this case,
+    zero transformer layers are assigned when pipeline rank == 0. Additionally,
+    when virtual pipeline rank >= 1, zero total model parameters are created
+    (virtual rank 0 contains the input embedding). This results in the model's
+    input and output tensors being the same, which causes an error when
+    performing certain memory optimiations on the output tensor (e.g.,
+    deallocating it). Thus, this layer disconnects the input from the output
+    via a clone. Since ranks containing a no-op layer are generally under-
+    utilized (both compute and memory), there's no worry of any performance
+    degredation.
+    """
+
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, attention_mask,
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
+        return hidden_states.clone()
+
+
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -649,8 +675,20 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        if self.num_layers == 0:
+            # When a standalone embedding stage is used (e.g.,
+            # args.standalone_embedding_stage == True), virtual pipeline ranks
+            # on pipeline rank 0 will have zero transformer layers assigned to
+            # them. This results in the model's input and output tensors to be
+            # the same, which will cause failure for certain output tensor
+            # optimizations (e.g., pipeline output deallocation). To remedy
+            # this, we assign a 'no-op' layer on these ranks, which will
+            # disconnect the input tensor from the output tensor.
+            self.num_layers = 1
+            self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
+        else:
+            self.layers = torch.nn.ModuleList(
+                [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if self.post_process:
             # Final layer norm before output.
@@ -786,5 +824,5 @@ class ParallelTransformer(MegatronModule):
             output = self.final_layernorm(hidden_states)
         else:
             output = hidden_states
-        
+
         return output

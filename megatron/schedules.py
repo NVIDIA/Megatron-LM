@@ -34,9 +34,13 @@ def get_forward_backward_func():
     if mpu.get_pipeline_model_parallel_world_size() > 1:
         if args.virtual_pipeline_model_parallel_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
-            assert get_num_microbatches() % args.pipeline_model_parallel_size == 0, \
-                'number of microbatches is not divisible by pipeline-parallel ' \
-                'size when using interleaved schedule'
+            assert get_num_microbatches() % \
+                args.pipeline_model_parallel_size == 0, \
+                'number of microbatches (%d) is not divisible by pipeline-' \
+                'model-parallel-size (%d) when using interleaved schedule' % (
+                    get_num_microbatches(),
+                    args.pipeline_model_parallel_size,
+                )
         else:
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
