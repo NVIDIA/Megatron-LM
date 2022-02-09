@@ -85,6 +85,18 @@ def get_megatron_optimizer(model,
                                     scale_lr_cond,
                                     lr_mult)
 
+    # >>>
+    # from lutil import pax
+    # pax(0, {
+    #     "model" : model,
+    #     "param_groups" : param_groups,
+    #     "param_groups / 0" : param_groups[0],
+    #     "param_groups / 0 / params" : param_groups[0]["params"],
+    #     "param_groups / 1" : param_groups[1],
+    #     "param_groups / 1 / params" : param_groups[1]["params"],
+    # })
+    # <<<
+
     if args.optimizer == 'adam':
         optimizer = Adam(param_groups,
                          lr=args.lr,
