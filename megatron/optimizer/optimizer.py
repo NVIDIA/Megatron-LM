@@ -275,6 +275,12 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                         # <<<
                         # >>>
                         # debug()
+
+                        # from lutil import pax, tp
+                        # pax(0, {
+                        #     "param" : tp(param),
+                        #     "main_param" : tp(main_param),
+                        # })
                         # <<<
                         fp32_from_float16_params_this_group.append(main_param)
                         # Reset existing state dict key to the new main param.
@@ -353,6 +359,84 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             return self._scale_one
         return self.grad_scaler.scale
 
+
+    # >>>
+    def reduce_gradientss(self):
+
+        # >>>
+        # if not args.use_distributed_optimizer:
+
+        # All-reduce if needed.
+        # >>>
+        # if args.DDP_impl == 'local' and not args.use_distributed_optimizer:
+        if args.DDP_impl == 'local':
+        # <<<
+            timers('backward-params-all-reduce').start()
+            for model_module in model:
+                # >>>
+                # from lutil import pax, tp
+                # pax(0, {
+                #     "model" : model,
+                #     "model_module" : model_module,
+                # })
+                # <<<
+                # >>>
+                # e.g., grad_shard = optimizer.get_grad_shard()
+                # <<<
+                model_module.allreduce_gradients()
+            timers('backward-params-all-reduce').stop()
+
+        # All-reduce word_embeddings' grad across first and last stages to ensure
+        # that word_embeddings parameters stay in sync.
+        # This should only run for models that support pipelined model parallelism
+        # (BERT and GPT-2).
+        timers('backward-embedding-all-reduce').start()
+        if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
+                mpu.get_pipeline_model_parallel_world_size() > 1:
+            if mpu.is_pipeline_first_stage(ignore_virtual=True):
+                unwrapped_model = model[0]
+            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
+                unwrapped_model = model[-1]
+            else:  # We do not support the interleaved schedule for T5 yet.
+                unwrapped_model = model[0]
+            unwrapped_model = unwrap_model(
+                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+
+            if unwrapped_model.share_word_embeddings:
+                word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+                # >>>
+                # if args.DDP_impl == 'local':
+                #     grad = word_embeddings_weight.main_grad
+                # else:
+                #     grad = word_embeddings_weight.grad
+                # torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                # +++
+                grad_shard = optimizer.get_grad_shard(word_embeddings)
+                torch.distributed.all_reduce(grad_shard,
+                                             group=mpu.get_embedding_group())
+                # <<<
+
+        # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
+        # stages to ensure that position embeddings parameters stay in sync.
+        # This should only run for T5 models with pipeline parallelism
+        if mpu.is_rank_in_position_embedding_group() and \
+                mpu.get_pipeline_model_parallel_world_size() > 1 and \
+                args.pipeline_model_parallel_split_rank is not None:
+            unwrapped_model = model[0]
+            unwrapped_model = unwrap_model(
+                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+            assert args.DDP_impl == 'local', \
+                'T5 model is only supported with local DDP mode'
+            # >>>
+            # grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+            # torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            # +++
+            grad_shard = optimizer.get_grad_shard(
+                unwrapped_model.language_model.embedding.position_embeddings.weight)
+            torch.distributed.all_reduce(grad_shard,
+                                         group=mpu.get_position_embedding_group())
+            # <<<
+        timers('backward-embedding-all-reduce').stop()
 
     def _copy_model_grads_to_main_grads(self):
         # This only needs to be done for the float16 group.
@@ -541,6 +625,15 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
+
+# >>>
+class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
+
+    def step(self):
+
+        raise Exception("hi.")
+
+# <<<
 
 
 class FP32Optimizer(MegatronOptimizer):

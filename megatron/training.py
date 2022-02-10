@@ -410,60 +410,30 @@ def train_step(forward_step_func, data_iterator,
             partition.zero_grad_buffer()
     optimizer.zero_grad()
 
+    # >>>
+    # Forward pass.
+    # <<<
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
         optimizer, timers, forward_only=False)
 
-    # Empty unused memory
+    # >>>
+    # Empty unused memory.
+    # <<<
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
-    # All-reduce if needed.
-    if args.DDP_impl == 'local':
-        timers('backward-params-all-reduce').start()
-        for model_module in model:
-            model_module.allreduce_gradients()
-        timers('backward-params-all-reduce').stop()
+    # >>>
+    # Reduce gradients. (with distributed optimizer option, optimizer
+    # now responsible for reducing gradients)
+    optimizer.reduce_gradients()
+    # <<<
 
-    # All-reduce word_embeddings' grad across first and last stages to ensure
-    # that word_embeddings parameters stay in sync.
-    # This should only run for models that support pipelined model parallelism
-    # (BERT and GPT-2).
-    timers('backward-embedding-all-reduce').start()
-    if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
-            mpu.get_pipeline_model_parallel_world_size() > 1:
-        if mpu.is_pipeline_first_stage(ignore_virtual=True):
-            unwrapped_model = model[0]
-        elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-            unwrapped_model = model[-1]
-        else:  # We do not support the interleaved schedule for T5 yet.
-            unwrapped_model = model[0]
-        unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-
-        if unwrapped_model.share_word_embeddings:
-            word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-            if args.DDP_impl == 'local':
-                grad = word_embeddings_weight.main_grad
-            else:
-                grad = word_embeddings_weight.grad
-            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
-
-    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
-    # stages to ensure that position embeddings parameters stay in sync.
-    # This should only run for T5 models with pipeline parallelism
-    if mpu.is_rank_in_position_embedding_group() and \
-            mpu.get_pipeline_model_parallel_world_size() > 1 and \
-            args.pipeline_model_parallel_split_rank is not None:
-        unwrapped_model = model[0]
-        unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-        assert args.DDP_impl == 'local', \
-            'T5 model is only supported with local DDP mode'
-        grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
-    timers('backward-embedding-all-reduce').stop()
+    # >>>
+    from lutil import pax
+    pax({"optimizer": optimizer})
+    # <<<
 
     # Update parameters.
     timers('optimizer').start()

@@ -168,6 +168,14 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
+    # >>>
+    # If we use the distributed optimizer, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
+    if args.use_distributed_optimizer:
+        assert args.DDP_impl == 'local'
+        assert args.use_contiguous_buffers_in_local_ddp
+    # <<<
+
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
         args.use_contiguous_buffers_in_local_ddp = False
@@ -700,6 +708,10 @@ def _add_distributed_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    # >>>
+    group.add_argument('--use-distributed-optimizer', action='store_true',
+                       help='Use distributed optimizer.')
+    # <<<
     return parser
 
 

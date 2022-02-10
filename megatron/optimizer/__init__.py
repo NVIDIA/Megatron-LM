@@ -19,9 +19,17 @@ from apex.optimizers import FusedSGD as SGD
 from megatron import get_args
 from megatron.model import LayerNorm
 
+# >>>
+from .distributed_fused_adam import DistributedFusedAdam
+# <<<
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
-
+# >>>
+from .optimizer import (
+    Float16OptimizerWithFloat16Params,
+    Float16DistributedOptimizer,
+    FP32Optimizer,
+)
+# <<<
 
 def get_param_groups(modules,
                      no_weight_decay_cond,
@@ -97,7 +105,11 @@ def get_megatron_optimizer(model,
     # })
     # <<<
 
-    if args.optimizer == 'adam':
+    # >>>
+    if args.use_distributed_optimizer:
+        optimizer = DistributedFusedAdam(param_groups)
+    # <<<
+    elif args.optimizer == 'adam':
         optimizer = Adam(param_groups,
                          lr=args.lr,
                          weight_decay=args.weight_decay,
@@ -141,13 +153,18 @@ def get_megatron_optimizer(model,
                     hysteresis=args.hysteresis)
 
         # Megatron optimizer.
-        return Float16OptimizerWithFloat16Params(optimizer,
-                                                 args.clip_grad,
-                                                 args.log_num_zeros_in_grad,
-                                                 params_have_main_grad,
-                                                 args.use_contiguous_buffers_in_local_ddp,
-                                                 args.bf16,
-                                                 grad_scaler)
+        # >>>
+        opt_ty = Float16DistributedOptimizer \
+            if args.use_distributed_optimizer \
+            else Float16OptimizerWithFloat16Params
+        return opt_ty(optimizer,
+                      args.clip_grad,
+                      args.log_num_zeros_in_grad,
+                      params_have_main_grad,
+                      args.use_contiguous_buffers_in_local_ddp,
+                      args.bf16,
+                      grad_scaler)
+        # <<<
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,
