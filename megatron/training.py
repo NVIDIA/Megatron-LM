@@ -427,18 +427,24 @@ def train_step(forward_step_func, data_iterator,
     # >>>
     # Reduce gradients. (with distributed optimizer option, optimizer
     # now responsible for reducing gradients)
-    optimizer.reduce_gradients()
+    optimizer.reduce_gradients(model)
     # <<<
 
     # >>>
-    from lutil import pax
-    pax({"optimizer": optimizer})
+    # from lutil import pax
+    # pax(0, {"optimizer": optimizer})
     # <<<
 
     # Update parameters.
     timers('optimizer').start()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+
+    # >>>
+    # Gather params gradients. (with distributed optimizer option, optimizer
+    # now responsible for gathering updated params)
+    optimizer.gather_params()
+    # <<<
 
     # Update learning rate.
     if update_successful:

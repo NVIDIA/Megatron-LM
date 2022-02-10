@@ -29,6 +29,9 @@ from megatron import print_rank_0
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
+# >>>
+from lutil import pax, tp
+# <<<
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -361,7 +364,20 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
 
     # >>>
-    def reduce_gradientss(self):
+    def reduce_gradients(self, model):
+
+        # >>>
+        from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+
+        from megatron import get_args
+        from megatron import get_timers
+        from megatron.model import DistributedDataParallel as LocalDDP
+        from megatron.model import Float16Module
+        from megatron.utils import unwrap_model
+
+        args = get_args()
+        timers = get_timers()
+        # <<<
 
         # >>>
         # if not args.use_distributed_optimizer:
@@ -405,15 +421,15 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             if unwrapped_model.share_word_embeddings:
                 word_embeddings_weight = unwrapped_model.word_embeddings_weight()
                 # >>>
-                # if args.DDP_impl == 'local':
-                #     grad = word_embeddings_weight.main_grad
-                # else:
-                #     grad = word_embeddings_weight.grad
-                # torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+                if args.DDP_impl == 'local':
+                    grad = word_embeddings_weight.main_grad
+                else:
+                    grad = word_embeddings_weight.grad
+                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
                 # +++
-                grad_shard = optimizer.get_grad_shard(word_embeddings)
-                torch.distributed.all_reduce(grad_shard,
-                                             group=mpu.get_embedding_group())
+                # grad_shard = optimizer.get_grad_shard(word_embeddings)
+                # torch.distributed.all_reduce(grad_shard,
+                #                              group=mpu.get_embedding_group())
                 # <<<
 
         # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
@@ -428,13 +444,13 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             assert args.DDP_impl == 'local', \
                 'T5 model is only supported with local DDP mode'
             # >>>
-            # grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-            # torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+            grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+            torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
             # +++
-            grad_shard = optimizer.get_grad_shard(
-                unwrapped_model.language_model.embedding.position_embeddings.weight)
-            torch.distributed.all_reduce(grad_shard,
-                                         group=mpu.get_position_embedding_group())
+            # grad_shard = optimizer.get_grad_shard(
+            #     unwrapped_model.language_model.embedding.position_embeddings.weight)
+            # torch.distributed.all_reduce(grad_shard,
+            #                              group=mpu.get_position_embedding_group())
             # <<<
         timers('backward-embedding-all-reduce').stop()
 
@@ -629,9 +645,111 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 # >>>
 class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
 
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.initialized = False
+        # >>>
+        self.initialize()
+        # <<<
+
+    def initialize(self):
+
+        # >>>
+        import math
+        # <<<
+
+        if self.initialized:
+            raise Exception("initialization worked.")
+            return
+        self.initialized = True
+
+        data_parallel_rank = mpu.get_data_parallel_rank()
+        data_parallel_world_size = mpu.get_data_parallel_world_size()
+        total_param_size = sum(
+            p.numel()
+            for g in self.param_groups
+            for p in g["params"]
+        )
+        shard_size = int(math.ceil(total_param_size / data_parallel_world_size))
+        shard_start_index = data_parallel_rank * shard_size
+        shard_end_index = min(total_param_size, shard_start_index + shard_size)
+        self.shard_size = shard_end_index - shard_start_index
+
+        # allocate_shard = lambda dtype : torch.empty(
+        #     [self.shard_size],
+        #     dtype = dtype,
+        #     device = torch.cuda.current_device())
+        allocate_shard = lambda dtype : MemoryBuffer(self.shard_size, dtype)
+
+        self.main_param_shard = allocate_shard(torch.float)
+        self.main_grad_shard = allocate_shard(torch.float)
+        self.adam_m_shard = allocate_shard(torch.float)
+        self.adam_v_shard = allocate_shard(torch.float)
+
+    def reduce_gradients(self, model):
+
+        # >>>
+        # from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+
+        from megatron import get_args
+        # from megatron import get_timers
+        # from megatron.model import DistributedDataParallel as LocalDDP
+        # from megatron.model import Float16Module
+        # from megatron.utils import unwrap_model
+
+        args = get_args()
+        # timers = get_timers()
+        # <<<
+
+        # >>>
+        assert args.use_contiguous_buffers_in_local_ddp
+        # <<<
+
+        # grad_buffers = [ m._grad_buffers for m in model ]
+        for virtual_model in model:
+
+            grad_buffers = virtual_model._grad_buffers
+
+            for dtype, grad_buffer in grad_buffers.items():
+
+                dp_grad_buffers = [
+                    grad_buffer.get(self.shard_sizes[i],
+                                    self.shard_start_indexes[i])
+                    for i in self.data_parallel_world_size]
+
+                pax(0, {"dp_grad_buffers": dp_grad_buffers})
+
+                torch.distributed.reduce_scatter(
+                    self.main_grad_shard,
+                    grad_buffer.data,
+                    group = mpu.get_data_parallel_group(),
+                )
+
+                # >>>
+                pax(0, {
+                    "virtual_model" : virtual_model,
+                    "grad_buffers" : grad_buffers,
+                    "dtype" : dtype,
+                    "grad_buffer / len" : grad_buffer.numel,
+                    "grad_buffer / data" : tp(grad_buffer.data),
+                    # "optimizer" : self.optimizer,
+                    "main_grad_shard" : tp(self.main_grad_shard),
+                })
+                # <<<
+
+        # >>>
+        from lutil import pax, tp
+        pax(0, {
+            "model" : model,
+            "grad_buffers" : grad_buffers,
+            "grad_buffers / 0" : grad_buffers[0],
+            "grad_buffers / 0 / data" :tp(list(grad_buffers[0].values())[0].data),
+        })
+        # <<<
+
     def step(self):
 
-        raise Exception("hi.")
+        raise Exception("step.")
 
 # <<<
 
