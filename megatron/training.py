@@ -148,11 +148,11 @@ def pretrain(train_valid_test_dataset_provider,
                           train_data_iterator, valid_data_iterator)
     print_datetime('after training is done')
 
-    if args.do_valid:
-        prefix = 'the end of training for val data'
-        evaluate_and_print_results(prefix, forward_step_func,
-                                   valid_data_iterator, model,
-                                   iteration, False)
+    #   if args.do_valid:
+    #       prefix = 'the end of training for val data'
+    #       evaluate_and_print_results(prefix, forward_step_func,
+    #                                  valid_data_iterator, model,
+    #                                  iteration, False)
 
     if args.save and iteration != 0:
         save_checkpoint(iteration, model, optimizer, lr_scheduler)
