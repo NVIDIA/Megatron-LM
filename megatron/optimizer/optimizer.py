@@ -122,7 +122,17 @@ class MegatronOptimizer(ABC):
 
 
     @abstractmethod
+    def reduce_gradients(self):
+        pass
+
+
+    @abstractmethod
     def step(self):
+        pass
+
+
+    @abstractmethod
+    def gather_params(self):
         pass
 
 
@@ -170,7 +180,50 @@ class MegatronOptimizer(ABC):
 
 
 
-class Float16OptimizerWithFloat16Params(MegatronOptimizer):
+class BaseFloat16Optimizer(MegatronOptimizer):
+
+    def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
+                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+                 bf16, grad_scaler):
+
+        super().__init__(
+            optimizer, clip_grad, log_num_zeros_in_grad,
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
+
+        self.bf16 = bf16
+        self.grad_scaler = grad_scaler
+        # None grad scaler is only supported for bf16.
+        if self.grad_scaler is None:
+            assert self.bf16, 'fp16 expects a grad scaler.'
+
+        # Tensor used to determine if a nan/if has happend.
+        # Any non-zero value indicates inf/nan.
+        # Note that we keep this for the cases that grad scaler is none.
+        # We still record nan/inf if we have a bfloat16 with a grad scaler.
+        if self.grad_scaler:
+            self.found_inf = torch.cuda.FloatTensor([0.0])
+
+        # Dummy tensor needed for apex multi-apply tensor.
+        # For bfloat, we don't have multi-tensor apply and for now
+        # we set it to none so the multi-tensor apply gets ignored.
+        if bf16:
+            self._dummy_overflow_buf = None
+        else:
+            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
+
+        # In case grad scaler is not passed, define the unity scale.
+        if self.grad_scaler is None:
+            self._scale_one = torch.cuda.FloatTensor([1.0])
+
+
+    def get_loss_scale(self):
+        if self.grad_scaler is None:
+            return self._scale_one
+        return self.grad_scaler.scale
+
+
+# class Float16OptimizerWithFloat16Params(MegatronOptimizer):
+class Float16OptimizerWithFloat16Params(BaseFloat16Optimizer):
     """Float16 optimizer for fp16 and bf16 data types.
 
     Arguments:
@@ -199,34 +252,10 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
                  bf16, grad_scaler):
 
-        super(Float16OptimizerWithFloat16Params, self).__init__(
+        super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
-
-        self.bf16 = bf16
-        self.grad_scaler = grad_scaler
-        # None grad scaler is only supported for bf16.
-        if self.grad_scaler is None:
-            assert self.bf16, 'fp16 expects a grad scaler.'
-
-        # Tensor used to determine if a nan/if has happend.
-        # Any non-zero value indicates inf/nan.
-        # Note that we keep this for the cases that grad scaler is none.
-        # We still record nan/inf if we have a bfloat16 with a grad scaler.
-        if self.grad_scaler:
-            self.found_inf = torch.cuda.FloatTensor([0.0])
-
-        # Dummy tensor needed for apex multi-apply tensor.
-        # For bfloat, we don't have multi-tensor apply and for now
-        # we set it to none so the multi-tensor apply gets ignored.
-        if bf16:
-            self._dummy_overflow_buf = None
-        else:
-            self._dummy_overflow_buf = torch.cuda.IntTensor([0])
-
-        # In case grad scaler is not passed, define the unity scale.
-        if self.grad_scaler is None:
-            self._scale_one = torch.cuda.FloatTensor([1.0])
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            bf16, grad_scaler)
 
         # ======================
         # main parameter stuff
@@ -319,29 +348,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
         # recast preexisting per-param state tensors
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-        # >>>
-        # from lutil import pax
-        # pax(0, {
-        #     # "float16_groups / len" : [ len(g) for g in self.float16_groups ],
-        #     # "fp32_from_float16_groups / len" :
-        #     # [ len(g) for g in self.fp32_from_float16_groups ],
-        #     # "float16_groups / 0" : self.float16_groups[0],
-        #     # "float16_groups / 1" : self.float16_groups[1],
-        #     # "fp32_from_float16_groups / 0" : self.fp32_from_float16_groups[0],
-        #     # "fp32_from_float16_groups / 1" : self.fp32_from_float16_groups[1],
-        #     # "fp32_from_float32_groups" : self.fp32_from_fp32_groups,
-        #     "optimizer" : self.optimizer,
-        #     # "optimizer / sd" : self.optimizer.state_dict(),
-        #     # "optimizer / state" : self.optimizer.state_dict()["state"],
-        #     # "optimizer / pg" : self.optimizer.state_dict()["param_groups"],
-        #     # "optimizer / pg / 0" : self.optimizer.state_dict()["param_groups"][0],
-        #     # "optimizer / pg / 1" : self.optimizer.state_dict()["param_groups"][1],
-        #     "optimizer -> pg" : optimizer.param_groups,
-        #     "optimizer -> pg / 0" : optimizer.param_groups[0]["params"],
-        #     "optimizer -> pg / 1" : optimizer.param_groups[1]["params"],
-        # })
-        # <<<
-
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -355,12 +361,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
-
-
-    def get_loss_scale(self):
-        if self.grad_scaler is None:
-            return self._scale_one
-        return self.grad_scaler.scale
 
 
     # >>>
@@ -658,7 +658,8 @@ from lutil import pax, tp
 # <<<
 
 # class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
-class Float16DistributedOptimizer(MegatronOptimizer):
+# class Float16DistributedOptimizer(MegatronOptimizer):
+class Float16DistributedOptimizer(BaseFloat16Optimizer):
 
     # >>>
     @classmethod
@@ -702,7 +703,8 @@ class Float16DistributedOptimizer(MegatronOptimizer):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            bf16, grad_scaler)
 
         # >>>
         # self.test_reduce_scatter()
@@ -759,34 +761,41 @@ class Float16DistributedOptimizer(MegatronOptimizer):
         allocate_shard = lambda shard_size, dtype : torch.empty(
             (shard_size,),
             dtype = dtype,
-            device = torch.cuda.current_device())
+            device = torch.cuda.current_device(),
+            requires_grad = True)
+        # return torch.nn.Parameter ?
         # allocate_shard = lambda dtype : MemoryBuffer(self.shard_size, dtype)
 
-        # Collect DP world shard infos, per group.
+        # Allocate shards.
+        # (Also, collect world DP shard info.)
         model_main_dtypes = set([ args.params_dtype, torch.float ])
         self.world_shard_info_groups = [] # world_group_shard_infos ?
         self.main_param_shard_groups = []
-        for model_param_group_size in model_param_group_sizes:
+        for group_index, model_param_group in enumerate(self.model_param_groups):
 
-            max_world_shard_size = int(math.ceil(model_param_group_size /
+            model_param_size = model_param_group["size"]
+            max_world_shard_size = int(math.ceil(model_param_size /
                                                  self.data_parallel_world_size))
 
-            # Group shard infos.
-            shard_infos = []
+            # DP world shard infos.
+            world_shard_infos = []
             for r in range(self.data_parallel_world_size):
-                shard_start_index = r * max_shard_size
-                shard_end_index = min(self.total_param_size,
-                                      shard_start_index + max_shard_size)
-                shard_infos.append({
+                shard_start_index = r * max_world_shard_size
+                shard_end_index = min(model_param_size,
+                                      shard_start_index + max_world_shard_size)
+                world_shard_infos.append({
                     "start" : shard_start_index,
                     "end" : shard_end_index,
                     "size" : shard_end_index - shard_start_index,
                 })
-            self.world_shard_info_groups.append(shard_infos)
+            self.world_shard_info_groups.append(world_shard_infos)
+
+            # pax(0, {"world_shard_infos": world_shard_infos})
 
             # Allocate shards.
-            local_shard_size = \
-                self.world_shard_infos[self.data_parallel_rank]["size"]
+            # (Non-fp32 shards are for convenience; e.g., intermediaries
+            # between model params and main fp32 shard. Necessary???)
+            local_shard_size = world_shard_infos[self.data_parallel_rank]["size"]
 
             # # self.main_param_shard = allocate_shard(torch.float)
             # # self.main_grad_shard = allocate_shard(torch.float)
@@ -795,29 +804,50 @@ class Float16DistributedOptimizer(MegatronOptimizer):
             # self.adam_m_shard = allocate_shard(torch.float)
             # self.adam_v_shard = allocate_shard(torch.float)
 
-            self.main_param_shard_groups.append({ty:allocate_shard(ty)
-                                                 for ty in model_main_dtypes})
+            main_param_shards = {
+                ty : allocate_shard(local_shard_size, ty)
+                for ty in model_main_dtypes}
+            self.main_param_shard_groups.append(main_param_shards)
 
-            # >>>
+            # Update optimizer group.
+            self.optimizer.param_groups[group_index]["params"] = \
+                [ main_param_shards[torch.float] ]
+
             # pax(0, {
-            #     "total_param_size" : self.total_param_size,
-            #     "max_shard_size" : max_shard_size,
-            #     "shard_infos" : self.shard_infos,
-            #     "shard_size" : shard_size,
-            #     "param_shard_map" : self.param_shard_map,
+            #     "param_groups" : self.optimizer.param_groups,
+            #     "params" : self.optimizer.param_groups[group_index]["params"],
             # })
-            # <<<
 
-    def get_loss_scale(self):
-        raise Exception("hi.")
+        # Leverage state_dict() and load_state_dict() to
+        # recast preexisting per-param state tensors
+        self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+    # def get_loss_scale(self):
+    #     if self.grad_scaler is None:
+    #         return self._scale_one
+    #     return self.grad_scaler.scale
+
     def load_state_dict(self):
         raise Exception("hi.")
     def reload_model_params(self):
         raise Exception("hi.")
     def state_dict(self):
         raise Exception("hi.")
-    def zero_grad(self):
-        raise Exception("hi.")
+
+    def zero_grad(self, set_to_none=True):
+
+        params = []
+        for model_param_group in self.model_param_groups:
+            params.extend(model_param_group["offset_map"].keys())
+        for main_group in self.optimizer.param_groups:
+            params.extend(main_group["params"])
+
+        _zero_grad_group_helper(params, set_to_none)
+
+        # pax(0, {
+        #     "model_param_groups" : self.model_param_groups,
+        #     "params" : params,
+        # })
 
     def reduce_gradients(self, model):
 
@@ -880,9 +910,15 @@ class Float16DistributedOptimizer(MegatronOptimizer):
         })
         # <<<
 
+
     def step(self):
 
         raise Exception("step.")
+
+
+    def gather_params(self):
+
+        raise Exception("gather params.")
 
 # <<<
 
