@@ -234,6 +234,8 @@ def generate_tokens_probs_and_return_on_first_stage(
             # Check if all the sequences have hit the termination_id.
             done = None
             if mpu.is_pipeline_last_stage():
+                # TODO(rprenger) These stopping methods are tokenizer dependent
+                # instead tokenization should be in the inference loop so stop sequences can be used
                 if stop_on_double_eol:
                     hit_double_eol = (new_sample == 628).byte() & started.byte()
                     hit_two_eols = (new_sample == 198).byte() & (tokens[:, context_length-1] == 198).byte() & started.byte()
