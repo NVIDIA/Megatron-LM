@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 import torch.distributed as dist
-from megatron.model.vision.utils import trunc_normal_
+from torch.nn.init import trunc_normal_
 from megatron.model.transformer import DropPath
 from megatron import get_args
 from megatron.model import LayerNorm

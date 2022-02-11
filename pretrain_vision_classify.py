@@ -112,5 +112,5 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'dataloader_type': 'cyclic'}
+        args_defaults={'dataloader_type': 'cyclic', 'vision_pretraining': True}
     )

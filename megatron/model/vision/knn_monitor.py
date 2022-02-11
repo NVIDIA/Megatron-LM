@@ -4,6 +4,9 @@ from megatron import print_rank_0, get_args, mpu
 from megatron.data.vit_dataset import ClassificationTransform
 from megatron.data.image_folder import ImageFolder
 
+_FEATURE_BANK = None
+
+
 def build_data_loader(dataset, drop_last=True, shuffle=False):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
     # Sampler.
@@ -32,6 +35,7 @@ def build_data_loader(dataset, drop_last=True, shuffle=False):
 
 def compute_feature_bank(model):
     args = get_args()
+    global _FEATURE_BANK
     feature_bank = []
     feature_label = []
 
@@ -84,7 +88,13 @@ def compute_feature_bank(model):
     print_rank_0("feature_banks size is {}".format(feature_banks.size()))
     print_rank_0("feature labels size is {}".format(feature_labels.size()))
 
-    return (feature_banks, feature_labels, classes)
+    _FEATURE_BANK = (feature_banks, feature_labels, classes)
+
+
+def get_feature_bank():
+    global _FEATURE_BANK
+    assert _FEATURE_BANK is not None
+    return _FEATURE_BANK
 
 
 # knn monitor as in InstDisc https://arxiv.org/abs/1805.01978

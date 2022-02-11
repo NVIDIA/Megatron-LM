@@ -21,7 +21,6 @@ import sys
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
-
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
@@ -465,7 +464,7 @@ def train_step(forward_step_func, data_iterator,
         torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
     timers('backward-embedding-all-reduce').stop()
 
-    if args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
@@ -476,7 +475,7 @@ def train_step(forward_step_func, data_iterator,
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
-    if args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.update_momentum(args.curr_iteration)
@@ -804,8 +803,8 @@ def evaluate(forward_step_func,
     """Evaluation."""
     args = get_args()
 
-    if args.vision_pretraining_type == "dino":
-        args.knn_features = compute_feature_bank(model)
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        compute_feature_bank(model)
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
