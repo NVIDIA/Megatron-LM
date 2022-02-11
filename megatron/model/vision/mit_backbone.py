@@ -2,13 +2,15 @@
 # Copyright (c) 2021, NVIDIA Corporation. All rights reserved.
 #
 # This work is licensed under the NVIDIA Source Code License
+# found in the LICENSE file in the root directory of this 
+# source tree.
 # ---------------------------------------------------------------
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-from megatron.model.vision.utils import trunc_normal_
+from torch.nn.init import trunc_normal_
 from megatron.model.transformer import DropPath
 from megatron.model import LayerNorm
 

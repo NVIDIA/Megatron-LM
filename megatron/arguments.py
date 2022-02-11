@@ -881,6 +881,8 @@ def _add_vision_args(parser):
                        help='learning rate multiplier for head during finetuning')
 
     # pretraining type and backbone selection`
+    group.add_argument('--vision-pretraining', action='store_true',
+                       help='flag to indicate vision pretraining')
     group.add_argument('--vision-pretraining-type', type=str, default='classify',
                        choices=['classify', 'inpaint', 'dino'],
                        help='pretraining objectives')

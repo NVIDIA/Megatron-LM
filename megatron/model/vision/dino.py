@@ -11,11 +11,11 @@ import einops
 import torch
 import numpy as np
 import torch.nn.functional as F
+from torch.nn.init import trunc_normal_
 from megatron import get_args, print_rank_0
 from megatron.model.utils import get_linear_layer
 from megatron.model.vision.vit_backbone import VitBackbone
 from megatron.model.module import MegatronModule
-from megatron.model.vision.utils import trunc_normal_
 from megatron.model.vision.mit_backbone import mit_b5_avg
 from megatron.model.vision.esvit_swin_backbone import get_swin
 

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pretrain VIT"""
-
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -24,7 +22,7 @@ from functools import partial
 from megatron import get_args, get_timers, mpu, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model.vision.dino import DINOPretrainModel
-from megatron.model.vision.knn_monitor import knn_predict
+from megatron.model.vision.knn_monitor import knn_predict, get_feature_bank
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group, unwrap_model
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
@@ -34,7 +32,6 @@ from megatron.model import ModelType
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
-    print_rank_0("building VIT model ...")
     return DINOPretrainModel(pre_process=pre_process, post_process=post_process)
 
 def get_batch(data_iterator):
@@ -65,7 +62,7 @@ def loss_func(model, labels, output_tensor, collect_data=False):
         return loss, {"loss": averaged_loss[0]}
     else:
         _, teacher_feature = output_tensor
-        feature_bank, feature_labels, classes = args.knn_features
+        feature_bank, feature_labels, classes = get_feature_bank()
         feature = F.normalize(teacher_feature.float(), dim=1)
 
         knn_accs = []
@@ -119,6 +116,6 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'dataloader_type': 'cyclic'}
+        args_defaults={'dataloader_type': 'cyclic', 'vision_pretraining': True}
     )
 
