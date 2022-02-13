@@ -175,6 +175,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
+            setattr(self.weight, 'fuse_gradient_accumulation',
+                    args.gradient_accumulation_fusion)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -199,15 +201,18 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
-class ColumnParallelLinearWithAsyncAllreduce(torch.autograd.Function):
+class LinearWithGradAccumulationAndAsyncAllreduce(torch.autograd.Function):
     """
-    Column-parallel linear layer execution with asynchronous all-reduce
-    execution in backprop.
+    Linear layer execution with asynchronous all-reduce and gradient accumulation
+    fusion in backprop.
     """
     @staticmethod
-    def forward(ctx, input, weight, bias):
+    def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
+                async_grad_allreduce):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.async_grad_allreduce = async_grad_allreduce
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
@@ -215,19 +220,33 @@ class ColumnParallelLinearWithAsyncAllreduce(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        import fused_dense_cuda
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_input = grad_output.matmul(weight)
-        # Asyncronous all-reduce
-        handle = torch.distributed.all_reduce(
-                grad_input, group=get_tensor_model_parallel_group(), async_op=True)
-        # Delay the start of weight gradient computation shortly (3us) to have
-        # all-reduce scheduled first and have GPU resources allocated
-        _ = torch.empty(1, device=grad_output.device) + 1
-        grad_weight = grad_output.t().matmul(input)
+
+        # Convert the tensor shapes to 2D for execution compatibility
+        grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
+                                       grad_output.shape[2])
+        input = input.view(input.shape[0] * input.shape[1], input.shape[2])
+
+        if ctx.async_grad_allreduce:
+            # Asynchronous all-reduce
+            handle = torch.distributed.all_reduce(
+                    grad_input, group=get_tensor_model_parallel_group(), async_op=True)
+            # Delay the start of weight gradient computation shortly (3us) to have
+            # all-reduce scheduled first and have GPU resources allocated
+            _ = torch.empty(1, device=grad_output.device) + 1
+        if ctx.gradient_accumulation_fusion:
+            fused_dense_cuda.wgrad_gemm_accum_fp32(input, grad_output, weight.main_grad)
+            grad_weight = None
+        else:
+            # Matrix multiply with asynchronous all-reduce execution
+            grad_weight = grad_output.t().matmul(input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
-        handle.wait()
-        return grad_input, grad_weight, grad_bias
+        if ctx.async_grad_allreduce:
+            handle.wait()
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -240,7 +259,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
         bias: If true, add bias
-        gather_output: If true, call all-gather on output and make Y avaiable
+        gather_output: If true, call all-gather on output and make Y available
                        to all GPUs, otherwise, every GPU will have its output
                        which is Y_i = XA_i
         init_method: method to initialize weights. Note that bias is always set
@@ -305,29 +324,25 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
         self.async_tensor_model_parallel_allreduce = (
-                not args.no_async_tensor_model_parallel_allreduce and
+                args.async_tensor_model_parallel_allreduce and
                 world_size > 1)
-
+        self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        setattr(self.weight, 'fuse_gradient_accumulation',
+                self.gradient_accumulation_fusion)
 
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce:
-            input_shape = input_.shape
-            input_ = input_.view(input_shape[0] * input_shape[1],input_shape[2])
-            # Maxtrix multiply with asynchronouse all-reduce execution
-            output_parallel = ColumnParallelLinearWithAsyncAllreduce.apply(
-                    input_, self.weight, bias)
-            output_parallel = output_parallel.view(
-                    input_shape[0], input_shape[1], output_parallel.shape[1])
+            input_parallel = input_
         else:
             # Set up backprop all-reduce.
             input_parallel = copy_to_tensor_model_parallel_region(input_)
-
-            # Matrix multiply.
-            output_parallel = F.linear(input_parallel, self.weight, bias)
-
+        # Matrix multiply.
+        output_parallel = LinearWithGradAccumulationAndAsyncAllreduce.apply(
+            input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
+            self.async_tensor_model_parallel_allreduce)
         if self.gather_output:
             # All-gather across the partitions.
             output = gather_from_tensor_model_parallel_region(output_parallel)
@@ -415,7 +430,9 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-
+        self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        setattr(self.weight, 'fuse_gradient_accumulation',
+                self.gradient_accumulation_fusion)
 
 
     def forward(self, input_):
@@ -425,7 +442,9 @@ class RowParallelLinear(torch.nn.Module):
         else:
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = F.linear(input_parallel, self.weight)
+        output_parallel = LinearWithGradAccumulationAndAsyncAllreduce.apply(
+            input_parallel, self.weight, None,
+            self.gradient_accumulation_fusion, None)
         # All-reduce across all the partitions.
         output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:

@@ -164,18 +164,25 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     grad_acc.register_hook(self._make_param_hook(param))
                     self.grad_accs.append(grad_acc)
 
-
     def _make_param_hook(self, param):
         """Create the all-reduce hook for backprop."""
         # Hook used for back-prop.
         def param_hook(*unused):
-            # Add the gradient to the buffer.
-            if param.grad.data is not None:
-                param.main_grad.add_(param.grad.data)
-                # Now we can deallocate grad memory.
-                param.grad = None
+            if not self.skip_gradient_func(param):
+                # Add the gradient to the buffer.
+                if param.grad.data is not None:
+                    # The gradient function of linear layers is fused with GEMMs
+                    param.main_grad.add_(param.grad.data)
+                    # Now we can deallocate grad memory.
+                    param.grad = None
         return param_hook
 
+    def skip_gradient_func(self, param):
+        # Skip gradient function of linear layers
+        # Gradient accumulation is fused to weight gradient computation operators
+        if getattr(param, 'fuse_gradient_accumulation', False):
+            return True
+        return False
 
     def zero_grad_buffer(self):
         """Set the grad buffer data to zero. Needs to be called at the

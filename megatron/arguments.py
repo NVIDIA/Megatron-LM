@@ -172,6 +172,14 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
+    else:
+        if args.gradient_accumulation_fusion:
+            args.gradient_accumulation_fusion = False
+            if args.rank == 0:
+                print('Gradient accumulation fusion to linear layer weight '
+                      'gradient computation is supported only with fp32 '
+                      'gradient accumulation. Setting gradient_accumulation_fusion '
+                      'to False', flush=True)
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
@@ -521,15 +529,21 @@ def _add_training_args(parser):
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
-                       action='store_true',
+                       action='store_false',
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
-                       'gradient compuation of a column-linear layer.')
+                       'gradient compuation of a column-linear layer.',
+                       dest='async_tensor_model_parallel_allreduce')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--no-gradient-accumulation-fusion',
+                       action='store_false',
+                       help='Disable fuisng gradient accumulation to weight '
+                       'gradient computation of linear layers',
+                       dest='gradient_accumulation_fusion')
     return parser
 
 
