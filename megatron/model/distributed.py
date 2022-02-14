@@ -123,11 +123,16 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self._grad_buffers = None
         # >>>
         from collections import defaultdict
-        self._grad_buffer_param_offsets = None
+        # self._grad_buffer_param_offsets = None
+        self._grad_buffer_param_index_map = None
         # <<<
         if self.use_contiguous_buffers:
             self._grad_buffers = {}
-            self._grad_buffer_param_offsets = defaultdict(dict)
+            # >>>
+            # self._grad_buffer_param_offsets = defaultdict(dict)
+            # self._grad_buffer_param_index_map = defaultdict(dict)
+            self._grad_buffer_param_index_map = {}
+            # <<<
 
             # Simple function to define buffer type.
             def _get_buffer_type(param):
@@ -154,8 +159,16 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     type_num_elements[dtype] -= param.data.nelement()
                     param.main_grad = self._grad_buffers[dtype].get(
                         param.data.shape, type_num_elements[dtype])
-                    self._grad_buffer_param_offsets[dtype][param] = \
-                        type_num_elements[dtype]
+                    # >>>
+                    # self._grad_buffer_param_offsets[dtype][param] = \
+                    #     type_num_elements[dtype]
+                    if dtype not in self._grad_buffer_param_index_map:
+                        self._grad_buffer_param_index_map[dtype] = {}
+                    self._grad_buffer_param_index_map[dtype][param] = {
+                        "start" : type_num_elements[dtype],
+                        "end" : param.data.nelement(),
+                    }
+                    # <<<
 
             # Backward hook.
             # Accumalation function for the gradients. We need
