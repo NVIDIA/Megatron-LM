@@ -121,8 +121,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # the case we use continuous buffers.
         # ===================================
         self._grad_buffers = None
+        # >>>
+        from collections import defaultdict
+        self._grad_buffer_param_offsets = None
+        # <<<
         if self.use_contiguous_buffers:
             self._grad_buffers = {}
+            self._grad_buffer_param_offsets = defaultdict(dict)
 
             # Simple function to define buffer type.
             def _get_buffer_type(param):
@@ -149,6 +154,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     type_num_elements[dtype] -= param.data.nelement()
                     param.main_grad = self._grad_buffers[dtype].get(
                         param.data.shape, type_num_elements[dtype])
+                    self._grad_buffer_param_offsets[dtype][param] = \
+                        type_num_elements[dtype]
 
             # Backward hook.
             # Accumalation function for the gradients. We need
@@ -163,6 +170,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
                     grad_acc.register_hook(self._make_param_hook(param))
                     self.grad_accs.append(grad_acc)
+
+        # >>>
+        # from lutil import pax, tp
+        # pax(0, {
+        #     "_grad_buffers" : {k:b.numel for k,b in self._grad_buffers.items()},
+        #     "_grad_buffer_param_offsets" : self._grad_buffer_param_offsets,
+        #     **{"_grad_buffer_param_offsets / %s" % ty : {
+        #         str(p.shape) : o for p, o in po.items()
+        #     } for ty, po in self._grad_buffer_param_offsets.items()},
+        # })
+        # <<<
 
 
     def _make_param_hook(self, param):

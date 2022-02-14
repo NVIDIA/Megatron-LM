@@ -758,13 +758,13 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         # })
 
         # Shard allocator.
+        # ** torch.nn.Parameter ??
+        # ** MemoryBuffer ??
         allocate_shard = lambda shard_size, dtype : torch.empty(
             (shard_size,),
             dtype = dtype,
             device = torch.cuda.current_device(),
             requires_grad = True)
-        # return torch.nn.Parameter ?
-        # allocate_shard = lambda dtype : MemoryBuffer(self.shard_size, dtype)
 
         # Allocate shards.
         # (Also, collect world DP shard info.)
@@ -859,6 +859,19 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         # >>> [ already checked in arguments.py ]
         assert args.use_contiguous_buffers_in_local_ddp
         # <<<
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Copy model grads to main shard.
+
+        self.world_shard_info_groups = [] # world_group_shard_infos ?
+        self.main_param_shard_groups = []
+        pax(0, {"main_shard_info_groups": self.main_shard_info_groups})
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Reduce-scatter.
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
         # grad_buffers = [ m._grad_buffers for m in model ]
         for virtual_model in model:
