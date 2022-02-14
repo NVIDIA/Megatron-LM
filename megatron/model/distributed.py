@@ -164,10 +164,14 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     #     type_num_elements[dtype]
                     if dtype not in self._grad_buffer_param_index_map:
                         self._grad_buffer_param_index_map[dtype] = {}
-                    self._grad_buffer_param_index_map[dtype][param] = {
-                        "start" : type_num_elements[dtype],
-                        "end" : param.data.nelement(),
-                    }
+                    # self._grad_buffer_param_index_map[dtype][param] = {
+                    #     "start" : type_num_elements[dtype],
+                    #     "end" : type_num_elements[dtype] + param.data.nelement(),
+                    # }
+                    self._grad_buffer_param_index_map[dtype][param] = (
+                        type_num_elements[dtype],
+                        type_num_elements[dtype] + param.data.nelement(),
+                    )
                     # <<<
 
             # Backward hook.
