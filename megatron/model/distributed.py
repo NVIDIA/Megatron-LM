@@ -122,7 +122,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # ===================================
         self._grad_buffers = None
         # >>>
-        from collections import defaultdict
+        # from collections import defaultdict
         # self._grad_buffer_param_offsets = None
         self._grad_buffer_param_index_map = None
         # <<<
