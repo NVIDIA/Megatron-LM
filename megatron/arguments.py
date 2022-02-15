@@ -39,7 +39,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
-    parser = _add_vit_args(parser)
+    parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
 
@@ -856,9 +856,10 @@ def _add_biencoder_args(parser):
     return parser
 
 
-def _add_vit_args(parser):
-    group = parser.add_argument_group(title="vit")
+def _add_vision_args(parser):
+    group = parser.add_argument_group(title="vision")
 
+    # general vision arguements
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
     group.add_argument('--img-h', type=int, default=224,
@@ -868,7 +869,7 @@ def _add_vit_args(parser):
     group.add_argument('--num-channels', type=int, default=3,
                        help='Number of channels in input image data')
     group.add_argument('--patch-dim', type=int, default=16,
-                       help='patch dimension used in vit')
+                       help='patch dimension')
     group.add_argument('--classes-fraction', type=float, default=1.0,
                        help='training with fraction of classes.')
     group.add_argument('--data-per-class-fraction', type=float, default=1.0,
@@ -876,5 +877,49 @@ def _add_vit_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
+    group.add_argument('--head-lr-mult', type=float, default=1.0,
+                       help='learning rate multiplier for head during finetuning')
+
+    # pretraining type and backbone selection`
+    group.add_argument('--vision-pretraining', action='store_true',
+                       help='flag to indicate vision pretraining')
+    group.add_argument('--vision-pretraining-type', type=str, default='classify',
+                       choices=['classify', 'inpaint', 'dino'],
+                       help='pretraining objectives')
+    group.add_argument('--vision-backbone-type', type=str, default='vit',
+                       choices=['vit', 'mit', 'swin'],
+                       help='backbone types types')
+    group.add_argument('--swin-backbone-type', type=str, default='tiny',
+                       choices=['tiny', 'base', 'h3'],
+                       help='pretraining objectives')
+    
+    # inpainting arguments
+    group.add_argument('--mask-type', type=str, default='random',
+                       choices=['random', 'row'],
+                       help='mask types')
+    group.add_argument('--mask-factor', type=float, default=1.0,
+                       help='mask size scaling parameter')
+ 
+    # dino arguments
+    group.add_argument('--iter-per-epoch', type=int, default=1250,
+                       help='iterations per epoch')
+    group.add_argument('--dino-local-img-size', type=int, default=96,
+                       help='Image size for vision classification task')
+    group.add_argument('--dino-local-crops-number', type=int, default=10,
+                       help='Number of local crops')
+    group.add_argument('--dino-head-hidden-size', type=int, default=2048,
+                       help='Hidden dimension size in dino head')
+    group.add_argument('--dino-bottleneck-size', type=int, default=256,
+                       help='Bottle neck dimension in dino head ')
+    group.add_argument('--dino-freeze-last-layer', type=float, default=1,
+                       help='Freezing last layer weights')
+    group.add_argument('--dino-norm-last-layer', action='store_true',
+                       help='Disable Norm in last layer.')
+    group.add_argument('--dino-warmup-teacher-temp', type=float, default=0.04,
+                       help='warump teacher temperature')
+    group.add_argument('--dino-teacher-temp', type=float, default=0.07,
+                       help='teacher temperature')
+    group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
+                       help='warmup teacher temperaure epochs')
 
     return parser

@@ -147,7 +147,8 @@ class VitBackbone(MegatronModule):
                  pre_process=True,
                  post_process=True,
                  class_token=True,
-                 single_token_output=False):
+                 single_token_output=False,
+                 drop_path_rate=0.0):
         super(VitBackbone, self).__init__(share_word_embeddings=False)
         args = get_args()
 
@@ -170,6 +171,7 @@ class VitBackbone(MegatronModule):
         self.img_w = args.img_w
         self.micro_batch_size = args.micro_batch_size
         self.single_token_output = single_token_output
+        self.drop_path_rate = drop_path_rate
 
         assert self.img_h % self.patch_dim == 0
         assert self.img_w % self.patch_dim == 0
@@ -216,6 +218,7 @@ class VitBackbone(MegatronModule):
             self.scaled_init_method,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            drop_path_rate=self.drop_path_rate
         )
 
     def set_input_tensor(self, input_tensor):
