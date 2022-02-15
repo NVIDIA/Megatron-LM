@@ -130,9 +130,11 @@ def parse_args(extra_args_provider=None, defaults={},
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        assert args.pipeline_model_parallel_size > 2, \
-            'pipeline-model-parallel size should be greater than 2 with ' \
-            'interleaved schedule'
+        # >>> [ temporarily turning off ]
+        # assert args.pipeline_model_parallel_size > 2, \
+        #     'pipeline-model-parallel size should be greater than 2 with ' \
+        #     'interleaved schedule'
+        # <<<
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'

@@ -365,8 +365,12 @@ def setup_model_and_optimizer(model_provider_func,
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
-    optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
+    # >>>
+    # optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
+    #                                    scale_lr_cond, lr_mult)
+    optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+    # <<<
 
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 

@@ -97,11 +97,11 @@ def get_megatron_optimizer(model,
     # from lutil import pax
     # pax(0, {
     #     "model" : model,
-    #     "param_groups" : param_groups,
-    #     "param_groups / 0" : param_groups[0],
-    #     "param_groups / 0 / params" : param_groups[0]["params"],
-    #     "param_groups / 1" : param_groups[1],
-    #     "param_groups / 1 / params" : param_groups[1]["params"],
+    #     # "param_groups" : param_groups,
+    #     # "param_groups / 0" : param_groups[0],
+    #     # "param_groups / 0 / params" : param_groups[0]["params"],
+    #     # "param_groups / 1" : param_groups[1],
+    #     # "param_groups / 1 / params" : param_groups[1]["params"],
     # })
     # <<<
 
@@ -164,7 +164,8 @@ def get_megatron_optimizer(model,
                       params_have_main_grad,
                       args.use_contiguous_buffers_in_local_ddp,
                       args.bf16,
-                      grad_scaler)
+                      grad_scaler,
+                      model)
         # <<<
 
     # FP32.
