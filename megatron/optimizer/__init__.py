@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from apex.optimizers import FusedAdam as Adam
+#from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
+#from apex.optimizers import FusedLAMB as Lamb
+from deepspeed.ops.adam import FusedAdam as Adam
+from deepspeed.ops.lamb import FusedLamb as Lamb
 
 from megatron import get_args
 from megatron.model import LayerNorm
@@ -63,6 +66,12 @@ def get_megatron_optimizer(model):
                         lr=args.lr,
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)
+    elif args.optimizer == 'lamb':
+        optimizer = Lamb(param_groups,
+                         lr=args.lr,
+                         weight_decay=args.weight_decay,
+                         betas=(args.adam_beta1, args.adam_beta2),
+                         eps=args.adam_eps)
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))

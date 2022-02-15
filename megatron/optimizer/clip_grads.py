@@ -18,8 +18,12 @@
 import torch
 from torch._six import inf
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+#from apex.multi_tensor_apply import multi_tensor_applier
+from deepspeed.ops.adam.multi_tensor_apply import MultiTensorApply
+multi_tensor_applier=MultiTensorApply(2048*32)
+
+#import amp_C
+from deepspeed.ops.multi_tensor import multi_tensor_l2norm, multi_tensor_scale
 
 from megatron import mpu
 from megatron.model.module import param_is_not_shared
@@ -89,7 +93,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
             grad_norm, _ = multi_tensor_applier(
-                amp_C.multi_tensor_l2norm,
+                multi_tensor_l2norm,
                 dummy_overflow_buf,
                 [grads_for_norm],
                 False # no per-parameter norm
@@ -113,7 +117,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
         dummy_overflow_buf = torch.cuda.IntTensor([0])
-        multi_tensor_applier(amp_C.multi_tensor_scale,
+        multi_tensor_applier(multi_tensor_scale,
                              dummy_overflow_buf,
                              [grads, grads],
                              clip_coeff)
