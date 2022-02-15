@@ -34,7 +34,7 @@ python3 pretrain_t5.py \
        --split 949,50,1 \
        --lr 0.0001 \
        --min-lr 0.00001 \
-       --lr-decay-style linear \
+       --lr-decay-style constant \
        --lr-warmup-fraction .00 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \

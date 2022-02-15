@@ -5,25 +5,27 @@
 RANK=0
 WORLD_SIZE=1
 
-DATA_PATH=<Specify path and file prefix>_text_document
-CHECKPOINT_PATH=<Specify path>
+# DATA_PATH=<Specify path and file prefix>_text_document
+# CHECKPOINT_PATH=<Specify path>
+CHECKPOINT_PATH=checkpoints/gpt_base
+DATA_PATH=/workspace/data/libai_dataset/loss_compara_content_sentence
 
-
-python pretrain_gpt.py \
-       --num-layers 24 \
-       --hidden-size 1024 \
+python3 pretrain_gpt.py \
+       --num-layers 6 \
+       --hidden-size 384 \
        --num-attention-heads 16 \
        --micro-batch-size 4 \
        --global-batch-size 8 \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
+       --seq-length 256 \
+       --max-position-embeddings 256 \
        --train-iters 500000 \
        --lr-decay-iters 320000 \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file gpt2-vocab.json \
-       --merge-file gpt2-merges.txt \
+       --num-workers 0 \
+       --vocab-file /workspace/data/gpt_dataset/gpt2-vocab.json \
+       --merge-file /workspace/data/gpt_dataset/gpt2-merges.txt \
        --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
@@ -38,4 +40,8 @@ python pretrain_gpt.py \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
-       --fp16
+       --no-bias-dropout-fusion \
+       # --fp16
+
+       # --seq-length 1024 \
+       # --max-position-embeddings 1024 \

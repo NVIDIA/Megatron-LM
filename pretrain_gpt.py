@@ -38,6 +38,12 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process
     )
+    weight = torch.load("/workspace/libai/tests/gpt_test/megatron_gpt.pth")
+    key_set = set()
+    for k, v in weight.items():
+        key_set.add(k)
+        model.state_dict()[k].copy_(v)
+    print(set(model.state_dict().keys()) - key_set)
     return model
 
 
