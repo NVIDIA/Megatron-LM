@@ -128,7 +128,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup').start()
-    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
+    model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider, teacher=False)
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
@@ -150,6 +150,12 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
+    print_rank_0('***>>>>> Student model checkpoint iteration:{}'.format(args.iteration))
+    iteration_stuent = args.iteration
+
+    if args.mos: # Set up teacher model
+        teacher_model = setup_teacher_model(args)
+
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
@@ -159,7 +165,8 @@ def pretrain(train_valid_test_dataset_provider,
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, lr_scheduler,
-                          train_data_iterator, valid_data_iterator)
+                          train_data_iterator, valid_data_iterator, 
+                          teacher_model=teacher_model)
     print_datetime('after training is done')
 
     if args.do_valid:
@@ -207,6 +214,32 @@ def update_train_iters(args):
 
     print_rank_0('setting training iterations to {}'.format(args.train_iters))
 
+
+def setup_teacher_model(args):        
+    num_layers_student = args.num_layers
+    num_experts_student = args.num_experts
+    hidden_size_student = args.hidden_size
+    num_attention_heads_student = args.num_attention_heads
+    load_student = args.load
+
+    print_rank_0('***>>>>> Setting up the teacher model')
+
+    args.num_layers = args.num_layers_teacher
+    args.num_experts = args.num_experts_teacher
+    args.hidden_size = args.hidden_size_teacher
+    args.num_attention_heads = args.num_attention_heads_teacher
+    args.load = args.load_teacher
+    teacher_model, _, _ = load_model_weights_only(model_provider)
+    print_rank_0('***>>>>> Teacher model:{}'.format(teacher_model))
+
+    args.num_layers = num_layers_student
+    args.num_experts = num_experts_student
+    args.hidden_size = hidden_size_student
+    args.num_attention_heads = num_attention_heads_student
+    args.load = load_student
+    args.iteration = iteration_stuent
+
+    return teacher_model
 
 def get_model(model_provider_func):
     """Build the model."""
@@ -326,8 +359,46 @@ def get_learning_rate_scheduler(optimizer):
 
     return lr_scheduler
 
+def load_model_weights_only(model_provider_func):
+    """Setup model and optimizer."""
+    args = get_args()
+    print_rank_0('***>>>>> Args:{}'.format(args))
 
-def setup_model_and_optimizer(model_provider_func):
+    model = get_model(model_provider_func)
+
+    optimizer = None
+    lr_scheduler = None
+
+    if args.deepspeed:
+        with open(args.deepspeed_config, 'r') as fd:
+            ds_config = json.load(fd)
+
+        if 'zero_optimization' in ds_config:
+            del ds_config['zero_optimization']
+
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model[0],
+            config=ds_config
+        )
+
+        if isinstance(model, deepspeed.PipelineEngine):
+            # hack to get batch_fn from pretrain_gpt.py
+            model.set_batch_fn(model.module._megatron_batch_fn)
+
+            assert model.grid.get_pipe_parallel_rank() == mpu.get_pipeline_model_parallel_rank()
+            assert model.grid.get_slice_parallel_rank() == mpu.get_tensor_model_parallel_rank()
+            assert model.grid.get_data_parallel_rank() == mpu.get_data_parallel_rank()
+        model = [model]
+
+    print_datetime('before load checkpoint')
+    if args.load is not None:
+        iteration = load_checkpoint(model, optimizer, lr_scheduler, strict=True, load_only_weights=True)
+
+    print_datetime('after load checkpoint weights')
+
+    return model, optimizer, lr_scheduler
+
+def setup_model_and_optimizer(model_provider_func, teacher=False):
     """Setup model and optimizer."""
     args = get_args()
 
@@ -336,7 +407,10 @@ def setup_model_and_optimizer(model_provider_func):
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
 
-    optimizer = get_megatron_optimizer(unwrapped_model)
+    if teacher:
+        optimizer = None
+    else:
+        optimizer = get_megatron_optimizer(unwrapped_model)
 
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
@@ -364,7 +438,10 @@ def setup_model_and_optimizer(model_provider_func):
         # max time.
         torch.distributed.barrier()
         timers('load-checkpoint').start()
-        args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
+        if args.mos:
+            args.iteration = load_checkpoint(model, optimizer, lr_scheduler, strict=False, load_only_weights=False)
+        else:
+            args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
@@ -387,7 +464,7 @@ def setup_model_and_optimizer(model_provider_func):
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, lr_scheduler):
+               model, optimizer, lr_scheduler, teacher_model=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -420,7 +497,7 @@ def train_step(forward_step_func, data_iterator,
         forward_backward_func = forward_backward_no_pipelining
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
-        optimizer, timers, forward_only=False)
+        optimizer, timers, forward_only=False, teacher_model=teacher_model)
 
     # All-reduce if needed.
     if not args.deepspeed and args.DDP_impl == 'local':
@@ -690,7 +767,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator):
+          train_data_iterator, valid_data_iterator, teacher_model=None):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -730,7 +807,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                        train_data_iterator,
                        model,
                        optimizer,
-                       lr_scheduler)
+                       lr_scheduler,
+                       teacher_model=teacher_model)
         iteration += 1
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \

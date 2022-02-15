@@ -45,6 +45,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_zero_args(parser)
     parser = _add_memoryopt_args(parser)
     parser = _add_activation_checkpoint_args(parser)
+    parser = _add_distillation_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -567,6 +568,8 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-load-lr-state', action='store_true',
+                       help='Do not load lr state when loading checkpoint.')   
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
@@ -865,4 +868,31 @@ def _add_activation_checkpoint_args(parser):
                        help='does a synchronize at the beginning and end of each checkpointed layer.')
     group.add_argument('--profile-backward', action='store_true',
                        help='Enables backward pass profiling for checkpointed layers.')
+    return parser
+
+
+def _add_distillation_args(parser):
+    group = parser.add_argument_group('Knowledge distillation',
+                                      'Distillation Configurations')
+    
+    group.add_argument('--num-layers-teacher', type=int, default=None,
+                       help='Number of the teacher transformer layers.')                  
+    group.add_argument('--num-experts-teacher', type=int, nargs='+', default=[1,],
+                        help='number of teacher experts list, MoE related.')
+    group.add_argument('--hidden-size-teacher', type=int, default=None,
+                       help='Tansformer teacher hidden size.')
+    group.add_argument('--num-attention-heads-teacher', type=int, default=None,
+                       help='Number of teacher transformer attention heads.') 
+
+    group.add_argument('--mos', action='store_true',
+                       help='Enable Mixture-of-Students via knolwedge distillation.')
+    group.add_argument('--kd-alpha-ce', default=1, type=float)
+    group.add_argument('--kd-beta-ce', default=1, type=float)
+    group.add_argument('--kd-temp', default=1.0, type=float)
+    group.add_argument('--reset-iteration', action='store_true',
+                    help='Reset the iteration count.')
+    
+    group.add_argument('--load-teacher', type=str, default=None,
+                       help='Directory containing a teacher model checkpoint.')
+
     return parser

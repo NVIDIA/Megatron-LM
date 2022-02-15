@@ -57,7 +57,8 @@ def check_checkpoint_args(checkpoint_args):
                             arg_name, checkpoint_value, args_value)
         assert checkpoint_value == args_value, error_message
 
-    _compare('num_layers')
+    if not args.mos:
+        _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
     _compare('max_position_embeddings')
@@ -260,7 +261,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True):
+def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True, load_only_weights=False):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -270,7 +271,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     load_dir = getattr(args, load_arg)
 
     if args.deepspeed:
-        loaded_dir, state_dict = model[0].load_checkpoint(load_dir)
+        loaded_dir, state_dict = model[0].load_checkpoint(load_dir,load_module_strict=strict)
         if loaded_dir is None:
             print_rank_0('WARNING: could not find the metadata file {} '.format(
                 load_dir))
@@ -307,8 +308,9 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                         tracker_filename))
                     sys.exit()
 
-        assert iteration > 0 or release, 'error parsing metadata file {}'.format(
-            tracker_filename)
+        if not args.mos:
+            assert iteration > 0 or release, 'error parsing metadata file {}'.format(
+                tracker_filename)
 
         # Checkpoint.
         checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
@@ -337,7 +339,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
-    if args.finetune or release:
+    if args.finetune or release or args.reset_iteration or load_only_weights:
         iteration = 0
     else:
         try:
@@ -354,18 +356,19 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                 sys.exit()
 
     # Check arguments.
-    assert args.consumed_train_samples == 0
-    assert args.consumed_valid_samples == 0
-    if 'args' in state_dict:
-        checkpoint_args = state_dict['args']
-        check_checkpoint_args(checkpoint_args)
-        args.consumed_train_samples = getattr(checkpoint_args,
-                                              'consumed_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples)
-        args.consumed_valid_samples = getattr(checkpoint_args,
-                                              'consumed_valid_samples', 0)
-    else:
-        print_rank_0('could not find arguments in the checkpoint ...')
+    if not load_only_weights:
+        assert args.consumed_train_samples == 0
+        assert args.consumed_valid_samples == 0
+        if 'args' in state_dict:
+            checkpoint_args = state_dict['args']
+            check_checkpoint_args(checkpoint_args)
+            args.consumed_train_samples = getattr(checkpoint_args,
+                                                'consumed_train_samples', 0)
+            update_num_microbatches(consumed_samples=args.consumed_train_samples)
+            args.consumed_valid_samples = getattr(checkpoint_args,
+                                                'consumed_valid_samples', 0)
+        else:
+            print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
     if not args.deepspeed:
@@ -387,7 +390,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             try:
                 if optimizer is not None:
                     optimizer.load_state_dict(state_dict['optimizer'])
-                if lr_scheduler is not None:
+                if lr_scheduler is not None and not args.no_load_lr_state:
                     lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
             except KeyError:
                 print_rank_0('Unable to load optimizer from checkpoint {}. '
