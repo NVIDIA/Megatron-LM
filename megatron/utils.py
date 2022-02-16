@@ -20,10 +20,8 @@ import sys
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
 
-#from apex.multi_tensor_apply import multi_tensor_applier
-from deepspeed.ops.adam.multi_tensor_apply import MultiTensorApply
-multi_tensor_applier=MultiTensorApply(2048*32)
-#import amp_C
+from apex.multi_tensor_apply import multi_tensor_applier
+import amp_C
 
 from megatron import get_args
 from megatron import print_rank_0
@@ -67,7 +65,7 @@ def calc_params_l2_norm(model):
     # Calculate norm
     dummy_overflow_buf = torch.cuda.IntTensor([0])
     norm, _ = multi_tensor_applier(
-        multi_tensor_l2norm,
+        amp_C.multi_tensor_l2norm,
         dummy_overflow_buf,
         [params_data],
         False # no per-parameter norm

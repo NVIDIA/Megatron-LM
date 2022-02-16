@@ -13,11 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#from apex.optimizers import FusedAdam as Adam
+from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
-#from apex.optimizers import FusedLAMB as Lamb
-from deepspeed.ops.adam import FusedAdam as Adam
-from deepspeed.ops.lamb import FusedLamb as Lamb
+from apex.optimizers import FusedLAMB as Lamb
 
 from megatron import get_args
 from megatron.model import LayerNorm

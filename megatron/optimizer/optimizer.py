@@ -20,12 +20,9 @@ from abc import abstractmethod
 
 import torch
 
-#from apex.multi_tensor_apply import multi_tensor_applier
-from deepspeed.ops.adam.multi_tensor_apply import MultiTensorApply
-multi_tensor_applier=MultiTensorApply(2048*32)
+from apex.multi_tensor_apply import multi_tensor_applier
 
-#import amp_C
-from deepspeed.ops.multi_tensor import multi_tensor_l2norm, multi_tensor_scale
+import amp_C
 
 from megatron import get_timers
 from megatron import mpu
@@ -57,7 +54,7 @@ def _multi_tensor_copy_this_to_that(this, that, overflow_buf=None):
     if overflow_buf:
         overflow_buf.fill_(0)
         # Scaling with factor `1.0` is equivalent to copy.
-        multi_tensor_applier(multi_tensor_scale,
+        multi_tensor_applier(amp_C.multi_tensor_scale,
                              overflow_buf,
                              [this, that],
                              1.0)
