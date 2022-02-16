@@ -1303,7 +1303,18 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
         # <<<
 
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Sync word embedding params.
+
+        # ... todo ...
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Sync T5 position embedding params.
+
+        # ... todo ...
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # Reduce-scatter.
+
         # ** only contiguous grad buffer supported, for now [ TEMPORARY ] **
         assert args.use_contiguous_buffers_in_local_ddp
 
@@ -1334,63 +1345,9 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 # })
 
         # >>>
-        torch.distributed.barrier()
-        raise Exception("hi.")
+        # torch.distributed.barrier()
+        # raise Exception("hi.")
         # <<<
-
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-        # grad_buffers = [ m._grad_buffers for m in model ]
-        for virtual_model in model:
-
-            grad_buffer_map = virtual_model._grad_buffers
-
-            # >>>
-            assert len(grad_buffer_map) == 1, \
-                "multiple param types not currently supported."
-            assert args.params_dtype in grad_buffer_map
-            assert self.total_param_size == grad_buffer_map[args.params_dtype].numel
-            # <<<
-
-            # pax(0, {
-            #     "total_param_size" : self.total_param_size,
-            #     "grad_buffer" : tp(grad_buffer_map[args.params_dtype]),
-            # })
-
-            for dtype, grad_buffer in grad_buffer_map.items():
-
-                dp_grad_buffers = [
-                    grad_buffer.get(torch.Size((self.shard_infos[i]["size"],)),
-                                    self.shard_infos[i]["start"])
-                    for i in range(self.data_parallel_world_size)]
-                grad_shard = self.grad_shard_map[dtype]
-
-                torch.distributed.reduce_scatter(
-                    grad_shard,
-                    dp_grad_buffers,
-                    group = self.data_parallel_group,
-                )
-
-                # >>>
-                pax(0, {
-                    "virtual_model" : virtual_model,
-                    "grad_buffer_map" : grad_buffer_map,
-                    "dtype" : dtype,
-                    "grad_shard" : tp(grad_shard),
-                    "dp_grad_buffers" : dp_grad_buffers,
-                })
-                # <<<
-
-        # >>>
-        pax(0, {
-            "model" : model,
-            "grad_buffers" : grad_buffers,
-            "grad_buffers / 0" : grad_buffers[0],
-            "grad_buffers / 0 / data" :tp(list(grad_buffers[0].values())[0].data),
-        })
-        # <<<
-
 
     def step(self):
 
