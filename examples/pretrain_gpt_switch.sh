@@ -1,18 +1,14 @@
 #!/bin/bash
 
-#SBATCH <SLURM OPTIONS> --nodes=1 --exclusive --ntasks-per-node=8 --job-name=megatron_gpt_switch
-
-DIR=`pwd`
-DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-mkdir -p $DIR/logs
+# Runs a GPT model with switch MLP.
 
 CHECKPOINT_DIR="<PATH TO CHECKPOINT DIR>"
 TENSORBOARD_DIR="<PATH TO TENSORBOARD DIR>"
 DATA_BLEND="<PATH TO DATA BLEND>"
 BPE_DIR="<PATH TO BPE DIR>"
 
-options=" \
-    --exit-duration-in-mins 230 \
+python pretrain_gpt.py \
+    --num-experts 8 \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --num-layers 24 \
@@ -48,13 +44,4 @@ options=" \
     --fp16 \
     --DDP-impl torch \
     --tensorboard-dir ${TENSORBOARD_DIR} \
-    --checkpoint-activations "
-
-run_cmd="cd $DIR && python pretrain_gpt.py ${options}"
-
-srun -l \
-     --container-image "nvcr.io/nvidia/pytorch:20.12-py3" \
-     --container-mounts "<DIRECTORIES TO MOUNT>" \
-     --output=$DIR/logs/%x_%j_$DATETIME.log sh -c "${run_cmd}"
-
-set +x
+    --checkpoint-activations
