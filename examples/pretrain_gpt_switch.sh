@@ -1,21 +1,15 @@
 #!/bin/bash
 
-#SBATCH -A adlr -J adlr-nlp-largelm:switch_RUNVAR_expert -p luna -t 4:00:00 --nodes=1 --exclusive --mem=0 --overcommit --ntasks-per-node=8 --dependency=singleton
-
-NAME="gpt3-357m_switch_RUNVAR_expert"
+#SBATCH <SLURM OPTIONS> --nodes=1 --exclusive --ntasks-per-node=8 --job-name=megatron_gpt_switch
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/rprenger/switch/${NAME}"
-TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
-mkdir -p ${TENSORBOARD_DIR}
-
-# Get the data blend
-. /lustre/fsw/adlr/adlr-nlp/data/pile-cc1-cc2-shuf/gpt3_blend.sh
-
-BPE_DIR="/lustre/fsw/adlr/adlr-nlp/data/pile-cc1-cc2-shuf/bpe"
+CHECKPOINT_DIR="<PATH TO CHECKPOINT DIR>"
+TENSORBOARD_DIR="<PATH TO TENSORBOARD DIR>"
+DATA_BLEND="<PATH TO DATA BLEND>"
+BPE_DIR="<PATH TO BPE DIR>"
 
 options=" \
     --exit-duration-in-mins 230 \
@@ -59,10 +53,8 @@ options=" \
 run_cmd="cd $DIR && python pretrain_gpt.py ${options}"
 
 srun -l \
-     --container-image "/lustre/fsw/adlr/adlr-nlp/images/pytorch+bf16_nccl_fusion.sqsh" \
-     --container-mounts "/lustre/fsw/adlr:/lustre/fsw/adlr,/home/rprenger/workspace:/home/rprenger/workspace" \
-		 --ntasks-per-node 8 \
+     --container-image "nvcr.io/nvidia/pytorch:20.12-py3" \
+     --container-mounts "<DIRECTORIES TO MOUNT>" \
      --output=$DIR/logs/%x_%j_$DATETIME.log sh -c "${run_cmd}"
 
 set +x
-
