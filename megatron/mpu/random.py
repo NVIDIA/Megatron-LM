@@ -87,16 +87,15 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
 
 def gather_split_1d_tensor(tensor):
     """Opposite of above function, gather values from model parallel ranks."""
-    world_size = get_tensor_model_parallel_world_size()
-    numel = torch.numel(tensor)
-    numel_gathered = world_size * numel
+    numel_gathered = torch.numel(tensor) * \
+        get_tensor_model_parallel_world_size()
     gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
                            device=torch.cuda.current_device(),
                            requires_grad=False)
-    chunks = [gathered[i*numel:(i+1)*numel] for i in range(world_size)]
-    torch.distributed.all_gather(chunks, tensor,
-                                 group=get_tensor_model_parallel_group())
+    torch.distributed._all_gather_base(gathered, tensor,
+                                       group=get_tensor_model_parallel_group())
     return gathered
+
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
     '''Make a viewless tensor.
