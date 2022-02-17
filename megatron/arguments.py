@@ -347,6 +347,10 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+    
+    group.add_argument('--HIP', type=int, default=None, 
+                       help='Use HIP to compile or not')
+                                                
 
     return parser
 

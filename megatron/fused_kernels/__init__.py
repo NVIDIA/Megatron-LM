@@ -17,7 +17,9 @@ import os
 import pathlib
 import subprocess
 
+import torch
 from torch.utils import cpp_extension
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
 
 # Setting this param to a list has a problem of generating different
 # compilation commands (with diferent order of architectures) and
@@ -26,6 +28,83 @@ from torch.utils import cpp_extension
 # extra_cuda_cflags below
 os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
+
+def load_hip(args):
+
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    version_ge_1_1 = []
+    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR > 0):
+        version_ge_1_1 = ['-DVERSION_GE_1_1']
+    version_ge_1_3 = []
+    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR > 2):
+        version_ge_1_3 = ['-DVERSION_GE_1_3']
+    version_ge_1_5 = []
+    if (TORCH_MAJOR > 1) or (TORCH_MAJOR == 1 and TORCH_MINOR > 4):
+        version_ge_1_5 = ['-DVERSION_GE_1_5']
+    version_dependent_macros = version_ge_1_1 + version_ge_1_3 + version_ge_1_5
+
+    cc_flag = []
+
+    srcpath = pathlib.Path(__file__).parent.absolute()
+    buildpath = srcpath / 'build'
+    _create_build_dir(buildpath)
+    
+    hipcc_args = ['-O3'] + version_dependent_macros
+    def _cpp_extention_load_helper(name, sources, extra_hip_flags):
+        return cpp_extension.load(
+            name=name,
+            sources=sources,
+            build_directory=buildpath,
+            extra_include_paths=[this_dir],
+            extra_cflags=['-O3', '-D__HIP_PLATFORM_AMD__=1', '-DCMAKE_CXX_COMPILER=g++', '-DCMAKE_C_COMPILER=gcc'],
+            extra_cuda_cflags=['-O3', '-D__HIP_PLATFORM_AMD__=1'] + extra_hip_flags + cc_flag,
+            verbose=(args.rank == 0)
+        )
+        #Build Extension in a setup file
+        #return CUDAExtension(
+        #    name=name,
+        #    sources=sources,
+        #    include_dirs=[this_dir],
+        #    extra_compile_args={'cxx': ['-O3',] + version_dependent_macros,
+        #                        'nvcc': hipcc_args})
+
+    # ==============
+    # Fused softmax.
+    # ==============
+
+    if args.masked_softmax_fusion:
+        extra_hip_flags = []
+        extra_cuda_flags = ['-U__CUDA_NO_HALF_OPERATORS__',
+                            '-U__CUDA_NO_HALF_CONVERSIONS__',
+                            '--expt-relaxed-constexpr',
+                            '--expt-extended-lambda']
+        
+        # Upper triangular softmax.
+        sources=[srcpath / 'scaled_upper_triang_masked_softmax.cpp',
+                 srcpath / 'scaled_upper_triang_masked_softmax_cuda.cu']
+        scaled_upper_triang_masked_softmax_cuda = _cpp_extention_load_helper(
+            "scaled_upper_triang_masked_softmax_cuda",
+            sources, extra_hip_flags)
+
+        # Masked softmax.
+        sources=[srcpath / 'scaled_masked_softmax.cpp',
+                 srcpath / 'scaled_masked_softmax_cuda.cu']
+        scaled_masked_softmax_cuda = _cpp_extention_load_helper(
+            "scaled_masked_softmax_cuda", sources, extra_hip_flags)
+
+    # =================================
+    # Mixed precision fused layer norm.
+    # =================================
+
+    extra_hip_flags = []
+    extra_cuda_flags = ['-maxrregcount=50']
+    sources=[srcpath / 'layer_norm_cuda.cpp',
+             srcpath / 'layer_norm_cuda_kernel.cu']
+    fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
+        "fused_mix_prec_layer_norm_cuda", sources, extra_hip_flags)
 
 def load(args):
 

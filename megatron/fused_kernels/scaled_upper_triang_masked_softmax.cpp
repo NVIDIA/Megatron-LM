@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <cuda_fp16.h>
+#include <hip/hip_fp16.h>
 #include <torch/extension.h>
 #include <vector>
 

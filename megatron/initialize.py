@@ -68,7 +68,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         _set_random_seed(args.seed)
 
     # Set pytorch JIT layer fusion options.
-    _set_jit_fusion_options()
+    #_set_jit_fusion_options()
 
     args = get_args()
     if  args.lazy_mpu_init:
@@ -136,11 +136,17 @@ def _compile_dependencies():
     if torch.distributed.get_rank() == 0:
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
-        fused_kernels.load(args)
+        if args.HIP == 1:
+            fused_kernels.load_hip(args)
+        else:
+            fused_kernels.load(args)
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
-        fused_kernels.load(args)
+        if args.HIP == 1:
+            fused_kernels.load_hip(args)
+        else:
+            fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that
@@ -179,6 +185,7 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
+    
     # Call the init process
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
