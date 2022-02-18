@@ -1083,35 +1083,31 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 #     "model_shard" : str(model_shard),
                 # })
 
-        pax(0, {
-            "opt_group_shards" : self.opt_group_shards,
-            "main_param_shards" : self.main_param_shards,
-        })
+        # pax(0, {
+        #     "opt_group_shards" : self.opt_group_shards,
+        #     "main_param_shards" : self.main_param_shards,
+        # })
 
     def _copy_model_grads_to_main_grads(self):
 
         for group_index, group_shard in enumerate(self.opt_group_shards):
             for model_param, main_shard in group_shard["param_map"].items():
 
-                model_index, gbuf_dtype = self.param_gbuf_map[param]
+                model_index, dtype = self.param_gbuf_map[model_param]
                 model_shard = self.model_gbuf_shards \
-                    [model_index][gbuf_dtype]["param_map"][param]["world"]
+                    [model_index][dtype]["param_map"][model_param]["gbuf_world"]
 
                 assert main_shard.size == model_shard.size
 
                 # Copy from DDP's contiguous buffer to main shard's grad.
-                model_grad_tensor = \
-                    self.models[model_index]._grad_buffers[gbuf_dtype].data
-                main_grad_tensor = \
-                    self.main_param_shards[group_index].grad
+                model_grad = self.models[model_index]._grad_buffers[dtype].data
+                main_grad = self.main_param_shards[group_index].grad
 
                 # Copy sub-range within tensor.
-                model_grad_view = \
-                    model_grad_tensor[model_shard.start:model_shard.end]
-                main_grad_view = \
-                    main_grad_tensor[main_shard.start:main_shard.end]
+                model_view = model_grad[model_shard.start:model_shard.end]
+                main_view = main_grad[main_shard.start:main_shard.end]
 
-                main_grad_view.detach().copy_(model_grad_view)
+                main_view.detach().copy_(model_view)
 
                 # pax(0, {
                 #     "group_index" : group_index,
@@ -1146,22 +1142,21 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
     def _copy_main_params_to_model_params(self):
 
         for group_index, group_shard in enumerate(self.opt_group_shards):
-            for param, main_shard in group_shard["param_map"].items():
+            for model_param, main_shard in group_shard["param_map"].items():
 
-                model_index, gbuf_dtype = self.param_gbuf_map[param]
+                model_index, dtype = self.param_gbuf_map[model_param]
                 model_shard = self.model_gbuf_shards \
-                    [model_index][gbuf_dtype]["param_map"][param]["world"]
+                    [model_index][dtype]["param_map"][model_param]["gbuf_world"]
 
                 assert main_shard.size == model_shard.size
 
                 # Use DDP's contiguous buffer to temporarily hold params.
-                model_tensor = \
-                    self.models[model_index]._grad_buffers[gbuf_dtype].data
-                main_tensor = self.main_param_shards[group_index]
+                model_param = self.models[model_index]._grad_buffers[dtype].data
+                main_param = self.main_param_shards[group_index]
 
                 # Copy sub-range within tensor.
-                model_view = model_tensor[model_shard.start:model_shard.end]
-                main_view = main_tensor[main_shard.start:main_shard.end]
+                model_view = model_param[model_shard.start:model_shard.end]
+                main_view = main_param[main_shard.start:main_shard.end]
 
                 model_view.detach().copy_(main_view)
 
