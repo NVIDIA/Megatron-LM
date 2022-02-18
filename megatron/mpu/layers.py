@@ -175,8 +175,6 @@ class VocabParallelEmbedding(torch.nn.Module):
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
-            setattr(self.weight, 'fuse_gradient_accumulation',
-                    args.gradient_accumulation_fusion)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -241,7 +239,6 @@ class LinearWithGradAccumulationAndAsyncAllreduce(torch.autograd.Function):
             fused_dense_cuda.wgrad_gemm_accum_fp32(input, grad_output, weight.main_grad)
             grad_weight = None
         else:
-            # Matrix multiply with asynchronous all-reduce execution
             grad_weight = grad_output.t().matmul(input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
         if ctx.async_grad_allreduce:
@@ -327,8 +324,6 @@ class ColumnParallelLinear(torch.nn.Module):
                 args.async_tensor_model_parallel_allreduce and
                 world_size > 1)
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
-        setattr(self.weight, 'fuse_gradient_accumulation',
-                self.gradient_accumulation_fusion)
 
 
     def forward(self, input_):
@@ -431,8 +426,6 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
-        setattr(self.weight, 'fuse_gradient_accumulation',
-                self.gradient_accumulation_fusion)
 
 
     def forward(self, input_):

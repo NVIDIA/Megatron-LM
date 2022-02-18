@@ -541,7 +541,7 @@ def _add_training_args(parser):
                        'size is supported.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
-                       help='Disable fuisng gradient accumulation to weight '
+                       help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     return parser

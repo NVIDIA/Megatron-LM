@@ -31,7 +31,7 @@ void wgrad_gemm_accum_fp32(const at::Tensor input, const at::Tensor d_output, at
     int in_dim = input_2d.size(1);
     int out_dim = d_weight.size(0);
 
-    DISPATCH_HALF_AND_BFLOAT(input_2d.scalar_type(), "wgrad_gemm_accum_fp32",
+    DISPATCH_HALF_BFLOAT_AND_FLOAT(input_2d.scalar_type(), "wgrad_gemm_accum_fp32",
         int result = wgrad_gemm_accum_fp32_cuda<scalar_t>(
             input_2d.data_ptr<scalar_t>(),
             d_output_2d.data_ptr<scalar_t>(),
