@@ -26,6 +26,10 @@ from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 
+# >>>
+from lutil import pax, tp
+# <<<
+
 def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
@@ -66,6 +70,19 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
             grads.append(grad)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
             grads_for_norm.append(grad)
+        # >>>
+        # else:
+        #     pax(1, {
+        #         "grad_not_none" : grad_not_none,
+        #         "is_not_shared" : is_not_shared,
+        #         "is_not_tp_duplicate" : is_not_tp_duplicate,
+        #     })
+        # <<<
+
+    # pax(1, {
+    #     "grads" : grads,
+    #     "grads_for_norm" : grads_for_norm,
+    # })
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -88,6 +105,13 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
+            # >>>
+            # pax(1, {
+            #     # "fn" : amp_C.multi_tensor_l2norm,
+            #     "dummy_overflow_buf" : tp(dummy_overflow_buf),
+            #     "grads_for_norm" : grads_for_norm,
+            # })
+            # <<<
             grad_norm, _ = multi_tensor_applier(
                 amp_C.multi_tensor_l2norm,
                 dummy_overflow_buf,

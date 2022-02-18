@@ -21,6 +21,7 @@ from megatron.model import LayerNorm
 
 # >>>
 # from .distributed_fused_adam import DistributedFusedAdam
+from lutil import pax, tp
 # <<<
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 # >>>
@@ -94,14 +95,9 @@ def get_megatron_optimizer(model,
                                     lr_mult)
 
     # >>>
-    # from lutil import pax
+    # params = [ p for m in model for p in m.parameters() ]
     # pax(0, {
-    #     "model" : model,
-    #     # "param_groups" : param_groups,
-    #     # "param_groups / 0" : param_groups[0],
-    #     # "param_groups / 0 / params" : param_groups[0]["params"],
-    #     # "param_groups / 1" : param_groups[1],
-    #     # "param_groups / 1 / params" : param_groups[1]["params"],
+    #     "params" : [ (p.tensor_model_parallel, tp(p)) for p in params ],
     # })
     # <<<
 
