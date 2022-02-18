@@ -31,6 +31,7 @@ def save_checkpoint(queue, args):
         from megatron.checkpointing import save_checkpoint
         from megatron.global_vars import set_global_variables, get_args
         from megatron.model import ModelType
+        from megatron.tokenizer.tokenizer import _vocab_size_with_padding
         from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -91,6 +92,9 @@ def save_checkpoint(queue, args):
                 '--save-interval', '1',
                 '--save', args.save_dir
                 ]
+
+    if md.make_vocab_size_divisible_by is not None:
+        sys.argv.extend(['--make-vocab-size-divisible-by', str(md.make_vocab_size_divisible_by)])
     if md.params_dtype == torch.float16:
         sys.argv.append('--fp16')
     elif md.params_dtype == torch.bfloat16:
@@ -127,13 +131,33 @@ def save_checkpoint(queue, args):
     # Embeddings
     #-----------
     pos_embed = queue_get()
-    full_word_embed = queue_get()
+    orig_word_embed = queue_get()
 
-    # Tell Megatron what our full size is
-    margs.padded_vocab_size = full_word_embed.shape[0]
-    if margs.padded_vocab_size % args.target_tensor_parallel_size != 0:
-        print("source vocab size is not evenly divisble by target tensor parallel size")
-        exit(1)
+    # Deal with padding
+    if md.true_vocab_size is not None:
+        # figure out what our padded vocab size is
+        orig_vocab_size = orig_word_embed.shape[0]
+        margs.padded_vocab_size = _vocab_size_with_padding(md.true_vocab_size, margs)
+
+        # Cut out extra padding we don't need
+        if orig_vocab_size > margs.padded_vocab_size:
+            full_word_embed = orig_word_embed[0:margs.padded_vocab_size,:]
+
+        # Expanding embedding to larger size by replicating final entry
+        elif orig_vocab_size < margs.padded_vocab_size:
+            padding_size = margs.padded_vocab_size - orig_vocab_size
+
+            full_word_embed = torch.cat((
+                orig_word_embed,
+                orig_word_embed[-1].unsqueeze(0).expand(padding_size, -1)))
+
+        # Same size!
+        else:
+            full_word_embed = orig_word_embed
+    else:
+        print("Original vocab size not specified, leaving embedding table as-is. "
+              "If you've changed the tensor parallel size this could cause problems.")
+        full_word_embed = orig_word_embed
 
     # Split into new tensor model parallel sizes
     out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
@@ -143,6 +167,7 @@ def save_checkpoint(queue, args):
     post_process = args.target_pipeline_parallel_size == 1
     models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
     for tp_rank, model in enumerate(models):
+        print(f"word embeddings shape {model.language_model.embedding.word_embeddings.weight.shape}")
         model.language_model.embedding.word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
         model.language_model.embedding.position_embeddings.weight.data.copy_(pos_embed)
 

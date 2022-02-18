@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import types
@@ -7,6 +8,11 @@ import torch
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
 
+    group.add_argument('--true-vocab-size', type=int, default=None,
+                       help='original size of vocab, if specified will trim padding from embedding table.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file. If specified will use this to get vocab size and '
+                       'trim padding from the embedding table.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of deepspeed repository')
 
@@ -21,7 +27,7 @@ def _load_checkpoint(queue, args):
 
     try:
         from megatron.arguments import parse_args, validate_args
-        from megatron.global_vars import set_args, set_global_variables, rebuild_tokenizer
+        from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
         from megatron.model import ModelType
         from megatron import mpu, fused_kernels
@@ -111,6 +117,19 @@ def _load_checkpoint(queue, args):
     mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     fused_kernels.load(margs)
 
+    # Get true (non-padded) vocab size
+    if args.true_vocab_size is not None:
+        true_vocab_size = args.true_vocab_size
+    elif args.vocab_file is not None:
+        vocab = json.load(open(args.vocab_file))
+        true_vocab_size = len(vocab)
+        if args.true_vocab_size is not None and true_vocab_size != args.true_vocab_size:
+            print("Both --true-vocab-size and --vocab-file specified and the vocab size does not match, aborting.")
+            queue.put("exit")
+            exit(1)
+    else:
+        true_vocab_size = None
+
     # short aliases
     tp_size = margs.tensor_model_parallel_size
     pp_size = margs.pipeline_model_parallel_size
@@ -129,6 +148,8 @@ def _load_checkpoint(queue, args):
     md.bert_binary_head = margs.bert_binary_head
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
+    md.true_vocab_size = true_vocab_size
+    md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     queue.put(md)
 
     # Get first pipe stage
@@ -137,6 +158,7 @@ def _load_checkpoint(queue, args):
     models = get_models(tp_size, md.params_dtype, True, post_process)
 
     # Send embeddings
+
     word_embed = []
     for tp_rank in range(tp_size):
         if tp_rank == 0:
@@ -144,6 +166,7 @@ def _load_checkpoint(queue, args):
             queue.put(models[tp_rank].language_model.embedding.position_embeddings.weight.data)
         word_embed.append(models[tp_rank].language_model.embedding.word_embeddings.weight.data)
     full_word_embed = torch.cat(word_embed, dim=0)
+
     print("Sending word embeddings")
     queue.put(full_word_embed)
 
