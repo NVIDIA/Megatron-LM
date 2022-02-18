@@ -397,7 +397,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
             checkpoint_value = getattr(checkpoint_args, arg_name, None)
 
         if checkpoint_value is not None:
-            print(f"Setting {arg_name} to {checkpoint_value}")
+            print(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
             setattr(args, arg_name, checkpoint_value)
 
     _set_arg('num_layers')
