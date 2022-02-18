@@ -242,7 +242,7 @@ class ColumnParallelLinear(torch.nn.Module):
         input_size: first dimension of matrix A.
         output_size: second dimension of matrix A.
         bias: If true, add bias
-        gather_output: If true, call all-gether on output and make Y avaiable
+        gather_output: If true, call all-gather on output and make Y avaiable
                        to all GPUs, otherwise, every GPU will have its output
                        which is Y_i = XA_i
         init_method: method to initialize weights. Note that bias is always set

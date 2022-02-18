@@ -39,7 +39,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
-    parser = _add_vit_args(parser)
+    parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
 
@@ -71,6 +71,11 @@ def validate_args(args, defaults={}):
     args.pipeline_model_parallel_size = min(
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
+    args.transformer_pipeline_model_parallel_size = (
+        args.pipeline_model_parallel_size - 1
+        if args.standalone_embedding_stage else
+        args.pipeline_model_parallel_size
+    )
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
@@ -142,7 +147,7 @@ def validate_args(args, defaults={}):
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
         args.virtual_pipeline_model_parallel_size = \
-            (args.num_layers // args.pipeline_model_parallel_size) // \
+            (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.virtual_pipeline_model_parallel_size = None
@@ -250,17 +255,38 @@ def validate_args(args, defaults={}):
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
+
+    if args.weight_decay_incr_style == 'constant':
+        assert args.start_weight_decay is None
+        assert args.end_weight_decay is None
+        args.start_weight_decay = args.weight_decay
+        args.end_weight_decay = args.weight_decay
+    else:
+        assert args.start_weight_decay is not None
+        assert args.end_weight_decay is not None
+
+    TORCH_MAJOR = int(torch.__version__.split('.')[0])
+    TORCH_MINOR = int(torch.__version__.split('.')[1])
+    # Persistent fused layer norm.
+    if TORCH_MAJOR < 1 or (TORCH_MAJOR == 1 and TORCH_MINOR < 11):
+        args.no_persist_layer_norm = True
+        if args.rank == 0:
+            print('Persistent fused layer norm kernel is supported from '
+                  'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
+                  'Defaulting to no_persist_layer_norm=True')
+
     # Activation checkpointing.
     if args.distribute_checkpointed_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
             'checkpointed activations only across tensor model ' \
             'parallel groups'
         assert args.activations_checkpoint_method is not None, \
-            'for distribute-checkpointed-activations to work you '\
+            'for distributed checkpoint activations to work you '\
             'need to use a activation-checkpoint method '
-        assert args.num_layers_per_virtual_pipeline_stage is None, \
-            'currently distrobuted checkpoint activations only supported for ' \
-            'nointerleaved pipeline parallelism'
+        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+            'distributed checkpoint activations are supported for pytorch ' \
+            'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
+            'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
     _print_args(args)
     return args
@@ -372,6 +398,9 @@ def _add_logging_args(parser):
     group.add_argument('--log-memory-to-tensorboard',
                        action='store_true',
                        help='Enable memory logging to tensorboard.')
+    group.add_argument('--log-world-size-to-tensorboard',
+                       action='store_true',
+                       help='Enable world size logging to tensorboard.')
 
     return parser
 
@@ -385,6 +414,13 @@ def _add_regularization_args(parser):
                        help='Dropout probability for hidden state transformer.')
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='Weight decay coefficient for L2 regularization.')
+    group.add_argument('--start-weight-decay', type=float,
+                       help='Initial weight decay coefficient for L2 regularization.')
+    group.add_argument('--end-weight-decay', type=float,
+                       help='End of run weight decay coefficient for L2 regularization.')
+    group.add_argument('--weight-decay-incr-style', type=str, default='constant',
+                       choices=['constant', 'linear', 'cosine'],
+                       help='Weight decay increment function.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -467,6 +503,9 @@ def _add_training_args(parser):
                        'by this value.')
     group.add_argument('--exit-duration-in-mins', type=int, default=None,
                        help='Exit the program after this many minutes.')
+    group.add_argument('--exit-signal-handler', action='store_true',
+                       help='Dynamically save the checkpoint and shutdown the '
+                       'training if SIGTERM is received')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -491,6 +530,11 @@ def _add_training_args(parser):
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
                        'gradient compuation of a column-linear layer.')
+    group.add_argument('--no-persist-layer-norm', action='store_true',
+                       help='Disable using persistent fused layer norm kernel. '
+                       'This kernel supports only a set of hidden sizes. Please '
+                       'check persist_ln_hidden_sizes if your hidden '
+                       'size is supported.')
     return parser
 
 
@@ -500,6 +544,9 @@ def _add_initialization_args(parser):
     group.add_argument('--seed', type=int, default=1234,
                        help='Random seed used for python, numpy, '
                        'pytorch, and cuda.')
+    group.add_argument('--data-parallel-random-init', action='store_true',
+                       help='Enable random initialization of params '
+                       'across data parallel ranks')
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
@@ -540,13 +587,13 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
-    group.add_argument('--override-lr-scheduler', action='store_true',
+    group.add_argument('--override-opt_param-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
                        'number of iterations, and decay style from input '
                        'arguments and ignore values from checkpoints. Note'
                        'that all the above values will be reset.')
-    group.add_argument('--use-checkpoint-lr-scheduler', action='store_true',
+    group.add_argument('--use-checkpoint-opt_param-scheduler', action='store_true',
                        help='Use checkpoint to set the values of the scheduler '
                        '(learning rate, warmup iterations, minimum learning '
                        'rate, maximum number of iterations, and decay style '
@@ -668,6 +715,11 @@ def _add_distributed_args(parser):
                        help='Call torch.cuda.empty_cache() each iteration '
                        '(training and eval), to reduce fragmentation.'
                        '0=off, 1=moderate, 2=aggressive.')
+    group.add_argument('--standalone-embedding-stage', action='store_true',
+                       default=False, help='If set, *input* embedding layer '
+                       'is placed on its own pipeline stage, without any '
+                       'transformer layers. (For T5, this flag currently only '
+                       'affects the encoder embedding.)')
     return parser
 
 
@@ -814,16 +866,70 @@ def _add_biencoder_args(parser):
     return parser
 
 
-def _add_vit_args(parser):
-    group = parser.add_argument_group(title="vit")
+def _add_vision_args(parser):
+    group = parser.add_argument_group(title="vision")
 
+    # general vision arguements
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
-    group.add_argument('--img-dim', type=int, default=224,
-                       help='Image size for vision classification task')
+    group.add_argument('--img-h', type=int, default=224,
+                       help='Image height for vision classification task')
+    group.add_argument('--img-w', type=int, default=224,
+                       help='Image height for vision classification task')
     group.add_argument('--num-channels', type=int, default=3,
                        help='Number of channels in input image data')
     group.add_argument('--patch-dim', type=int, default=16,
-                       help='patch dimension used in vit')
+                       help='patch dimension')
+    group.add_argument('--classes-fraction', type=float, default=1.0,
+                       help='training with fraction of classes.')
+    group.add_argument('--data-per-class-fraction', type=float, default=1.0,
+                       help='training with fraction of data per class.')
+    group.add_argument('--no-data-sharding', action='store_false',
+                       help='Disable data sharding.',
+                       dest='data_sharding')
+    group.add_argument('--head-lr-mult', type=float, default=1.0,
+                       help='learning rate multiplier for head during finetuning')
+
+    # pretraining type and backbone selection`
+    group.add_argument('--vision-pretraining', action='store_true',
+                       help='flag to indicate vision pretraining')
+    group.add_argument('--vision-pretraining-type', type=str, default='classify',
+                       choices=['classify', 'inpaint', 'dino'],
+                       help='pretraining objectives')
+    group.add_argument('--vision-backbone-type', type=str, default='vit',
+                       choices=['vit', 'mit', 'swin'],
+                       help='backbone types types')
+    group.add_argument('--swin-backbone-type', type=str, default='tiny',
+                       choices=['tiny', 'base', 'h3'],
+                       help='pretraining objectives')
+    
+    # inpainting arguments
+    group.add_argument('--mask-type', type=str, default='random',
+                       choices=['random', 'row'],
+                       help='mask types')
+    group.add_argument('--mask-factor', type=float, default=1.0,
+                       help='mask size scaling parameter')
+ 
+    # dino arguments
+    group.add_argument('--iter-per-epoch', type=int, default=1250,
+                       help='iterations per epoch')
+    group.add_argument('--dino-local-img-size', type=int, default=96,
+                       help='Image size for vision classification task')
+    group.add_argument('--dino-local-crops-number', type=int, default=10,
+                       help='Number of local crops')
+    group.add_argument('--dino-head-hidden-size', type=int, default=2048,
+                       help='Hidden dimension size in dino head')
+    group.add_argument('--dino-bottleneck-size', type=int, default=256,
+                       help='Bottle neck dimension in dino head ')
+    group.add_argument('--dino-freeze-last-layer', type=float, default=1,
+                       help='Freezing last layer weights')
+    group.add_argument('--dino-norm-last-layer', action='store_true',
+                       help='Disable Norm in last layer.')
+    group.add_argument('--dino-warmup-teacher-temp', type=float, default=0.04,
+                       help='warump teacher temperature')
+    group.add_argument('--dino-teacher-temp', type=float, default=0.07,
+                       help='teacher temperature')
+    group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
+                       help='warmup teacher temperaure epochs')
 
     return parser

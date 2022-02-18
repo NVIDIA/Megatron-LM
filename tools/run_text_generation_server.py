@@ -78,4 +78,7 @@ if __name__ == "__main__":
         choice = torch.cuda.LongTensor(1)
         torch.distributed.broadcast(choice, 0)
         if choice[0].item() == 0:
-            generate_and_post_process(model)
+            try:
+                generate_and_post_process(model)
+            except ValueError as ve:
+                pass

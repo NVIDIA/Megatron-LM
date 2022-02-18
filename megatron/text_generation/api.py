@@ -35,7 +35,10 @@ def generate_and_post_process(model,
                               top_p_sampling=0.0,
                               temperature=1.0,
                               add_BOS=False,
-                              use_eod_token_for_early_termination=True):
+                              use_eod_token_for_early_termination=True,
+                              stop_on_double_eol=False,
+                              stop_on_eol=False,
+                              random_seed=-1):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -49,7 +52,10 @@ def generate_and_post_process(model,
         top_p_sampling=top_p_sampling,
         temperature=temperature,
         add_BOS=add_BOS,
-        use_eod_token_for_early_termination=use_eod_token_for_early_termination)
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination,
+        stop_on_double_eol=stop_on_double_eol,
+        stop_on_eol=stop_on_eol,
+        random_seed=random_seed)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -74,7 +80,10 @@ def generate(model,
              top_p_sampling=0.0,
              temperature=1.0,
              add_BOS=False,
-             use_eod_token_for_early_termination=True):
+             use_eod_token_for_early_termination=True,
+             stop_on_double_eol=False,
+             stop_on_eol=False,
+             random_seed=-1):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
        lengths: length of the prompt + generations. Note that we can
@@ -87,8 +96,11 @@ def generate(model,
     values = [tokens_to_generate,
               return_output_log_probs,
               top_k_sampling, top_p_sampling,
-              temperature, add_BOS, use_eod_token_for_early_termination]
-    values_float_tensor = broadcast_float_list(7, float_list=values)
+              temperature, add_BOS, use_eod_token_for_early_termination,
+              stop_on_double_eol,
+              stop_on_eol,
+              random_seed]
+    values_float_tensor = broadcast_float_list(10, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
@@ -96,6 +108,12 @@ def generate(model,
     temperature = values_float_tensor[4].item()
     add_BOS = bool(values_float_tensor[5].item())
     use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
+    stop_on_double_eol = bool(values_float_tensor[7].item())
+    stop_on_eol = bool(values_float_tensor[8].item())
+    random_seed = int(values_float_tensor[9].item())
+
+    if random_seed != -1:
+        torch.random.manual_seed(random_seed)
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcaseted to all ranks.
@@ -108,7 +126,7 @@ def generate(model,
     if tokens_to_generate == 0:
         return score_and_return_on_first_stage(
             model, context_tokens_tensor, context_length_tensor)
-
+    
     # Main inference function.
     # Note that the outputs are available on the first stage.
     return generate_tokens_probs_and_return_on_first_stage(
@@ -117,4 +135,6 @@ def generate(model,
         top_k=top_k_sampling,
         top_p=top_p_sampling,
         temperature=temperature,
-        use_eod_token_for_early_termination=use_eod_token_for_early_termination)
+        use_eod_token_for_early_termination=use_eod_token_for_early_termination,
+        stop_on_double_eol=stop_on_double_eol,
+        stop_on_eol=stop_on_eol)

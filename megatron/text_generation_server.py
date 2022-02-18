@@ -36,9 +36,6 @@ class MegatronGenerate(Resource):
      
     def put(self):
         args = get_args()
-        print("request IP: " + str(request.remote_addr))
-        print(json.dumps(request.get_json()),flush=True)
-        print("current time: ", datetime.datetime.now())
        
         if not "prompts" in request.get_json():
             return "prompts argument required", 400
@@ -101,20 +98,60 @@ class MegatronGenerate(Resource):
             add_BOS = request.get_json()["add_BOS"]
             if not isinstance(add_BOS, bool):
                 return "add_BOS must be a boolean value"
+        
+        if any([len(prompt) == 0 for prompt in prompts]) and not add_BOS:
+            return "Empty prompts require add_BOS=true"
 
+        stop_on_double_eol = False
+        if "stop_on_double_eol" in request.get_json():
+            stop_on_double_eol = request.get_json()["stop_on_double_eol"]
+            if not isinstance(stop_on_double_eol, bool):
+                return "stop_on_double_eol must be a boolean value"
+        
+        stop_on_eol = False
+        if "stop_on_eol" in request.get_json():
+            stop_on_eol = request.get_json()["stop_on_eol"]
+            if not isinstance(stop_on_eol, bool):
+                return "stop_on_eol must be a boolean value"
+
+        random_seed = -1
+        if "random_seed" in request.get_json():
+            random_seed = request.get_json()["random_seed"]
+            if not isinstance(random_seed, int):
+                return "random_seed must be integer"
+            if random_seed < 0: 
+                return "random_seed must be a positive integer"
+
+        no_log = False
+        if "no_log" in request.get_json():
+            no_log = request.get_json()["no_log"]
+            if not isinstance(no_log, bool):
+                return "no_log must be a boolean value"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
+            if not no_log:
+                print("request IP: " + str(request.remote_addr))
+                print(json.dumps(request.get_json()),flush=True)
+                print("start time: ", datetime.datetime.now())
             MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-            response, response_seg, response_logprobs, _ = \
-                generate_and_post_process(
-                    self.model,
-                    prompts=prompts,
-                    tokens_to_generate=tokens_to_generate,
-                    return_output_log_probs=logprobs,
-                    top_k_sampling=top_k,
-                    top_p_sampling=top_p,
-                    temperature=temperature,
-                    add_BOS=add_BOS,
-                    use_eod_token_for_early_termination=True)
+            try:
+                response, response_seg, response_logprobs, _ = \
+                    generate_and_post_process(
+                        self.model,
+                        prompts=prompts,
+                        tokens_to_generate=tokens_to_generate,
+                        return_output_log_probs=logprobs,
+                        top_k_sampling=top_k,
+                        top_p_sampling=top_p,
+                        temperature=temperature,
+                        add_BOS=add_BOS,
+                        use_eod_token_for_early_termination=True,
+                        stop_on_double_eol=stop_on_double_eol,
+                        stop_on_eol=stop_on_eol,
+                        random_seed=random_seed)
+            except ValueError as ve:
+                return "Length of prompt + tokens_to_generate longer than allowed"
+            print("end time: ", datetime.datetime.now())
         
         return jsonify({"text": response,
             "segments": response_seg,
