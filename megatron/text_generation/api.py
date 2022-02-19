@@ -158,11 +158,12 @@ def beam_search_and_post_process(model,
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
         tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, True)
-        return prompts_plus_generations, prompts_plus_generations_segments, tokens
+        scores = scores.cpu().numpy().tolist()
+        return prompts_plus_generations, prompts_plus_generations_segments, scores
 
     return None
 
-def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False)
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False):
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               beam_size,
