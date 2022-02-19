@@ -28,6 +28,7 @@ def save_checkpoint(queue, args):
         sys.path.insert(0, args.megatron_path)
 
     try:
+        from megatron.arguments import (parse_args, validate_args)
         from megatron.checkpointing import save_checkpoint
         from megatron.global_vars import set_global_variables, get_args
         from megatron.model import ModelType
@@ -45,7 +46,6 @@ def save_checkpoint(queue, args):
         return val
 
     md = queue_get()
-
 
     if args.target_tensor_parallel_size is None:
         if hasattr(md, 'previous_tensor_parallel_size'):
@@ -102,7 +102,10 @@ def save_checkpoint(queue, args):
 
     if md.model_type == 'BERT' and not md.bert_binary_head:
         sys.argv.append('--bert-no-binary-head')
-    set_global_variables()
+
+    margs = parse_args()
+    validate_args(margs)
+    set_global_variables(margs)
 
     # margs = megatron args
     margs = get_args()
@@ -157,6 +160,7 @@ def save_checkpoint(queue, args):
     else:
         print("Original vocab size not specified, leaving embedding table as-is. "
               "If you've changed the tensor parallel size this could cause problems.")
+        margs.padded_vocab_size = orig_word_embed.shape[0]
         full_word_embed = orig_word_embed
 
     # Split into new tensor model parallel sizes

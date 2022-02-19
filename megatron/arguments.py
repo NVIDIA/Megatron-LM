@@ -20,8 +20,7 @@ import os
 
 import torch
 
-def parse_args(extra_args_provider=None, defaults={},
-               ignore_unknown_args=False, validate=True):
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -53,14 +52,13 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
-    if validate:
-        return validate_args(args, defaults)
+    # Args from environment
+    args.rank = int(os.getenv('RANK', '0'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+        
     return args
 
 def validate_args(args, defaults={}):
-    # Distributed args.
-    args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -628,6 +626,9 @@ def _add_checkpointing_args(parser):
                        'can reduce startup time when definitely loading from a '
                        'checkpoint',
                        dest='perform_initialization')
+    group.add_argument('--use-checkpoint-args', action='store_true',
+                       help='Override any command line arguments with arguments '
+                       'from the checkpoint')
 
     return parser
 

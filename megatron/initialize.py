@@ -28,6 +28,8 @@ from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron import mpu
+from megatron.arguments import (parse_args, validate_args)
+from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
 from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
@@ -47,11 +49,18 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Make sure cuda is available.
         assert torch.cuda.is_available(), 'Megatron requires CUDA.'
 
-    # Parse args, build tokenizer, and set adlr-autoresume,
+    # Parse arguments
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+
+    if args.use_checkpoint_args or args_defaults.get('use_checkpoint_args', False):
+        assert args.load is not None, '--use-checkpoints-args requires --load argument'
+        load_args_from_checkpoint(args)
+
+    validate_args(args, args_defaults)
+        
+    # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    set_global_variables(extra_args_provider=extra_args_provider,
-                         args_defaults=args_defaults,
-                         ignore_unknown_args=ignore_unknown_args)
+    set_global_variables(args)
 
     # torch.distributed initialization
     def finish_mpu_init():

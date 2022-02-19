@@ -29,7 +29,7 @@ def _load_checkpoint(queue, args):
         from megatron.arguments import parse_args, validate_args
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
-        from megatron.model import ModelType
+        from megatron.model import ModelType, module
         from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
@@ -51,8 +51,14 @@ def _load_checkpoint(queue, args):
                 '--load', args.load_dir
                 ]
 
-    margs = parse_args(validate=False)
+    margs = parse_args()
     margs = load_args_from_checkpoint(margs)
+
+    # Arguments do sanity checks on the world size, but we don't care,
+    # so trick it into thinking we are plenty of processes
+    margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
+
+    margs = validate_args(margs)
 
     def check_for_arg(arg_name):
         if getattr(margs, arg_name, None) is None:
@@ -71,13 +77,6 @@ def _load_checkpoint(queue, args):
     check_for_arg('tokenizer_type')
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
-
-    # Arguments do sanity checks on the world size, but we don't care,
-    # so trick it into thinking we are plenty of processes
-    os.environ["WORLD_SIZE"] = f'{margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size}'
-
-    margs = validate_args(margs)
-
     check_for_arg('params_dtype')
 
     # Determine how to make our models
@@ -89,6 +88,9 @@ def _load_checkpoint(queue, args):
         margs.model_type = ModelType.encoder_or_decoder
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
+
+    # supress warning about torch.distributed not being initialized
+    module.MegatronModule.embedding_warning_printed = True
 
     def get_models(count, dtype, pre_process, post_process):
         # with concurrent.futures.ThreadPoolExecutor(max_workers=count) as executor:
@@ -105,14 +107,12 @@ def _load_checkpoint(queue, args):
             models.append(model_[0])
         return models
 
-    set_args(margs)
-
     if margs.num_layers_per_virtual_pipeline_stage is not None:
         print("Model with an interleaved pipeline schedule are not yet supported.")
         queue.put("exit")
         exit(1)
 
-    set_global_variables(parse_args=False)
+    set_global_variables(margs)
     mpu.initialize.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     fused_kernels.load(margs)

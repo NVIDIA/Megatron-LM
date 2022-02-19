@@ -72,16 +72,6 @@ class MegatronModule(torch.nn.Module):
         if args.pipeline_model_parallel_size == 1:
             return
 
-        if not torch.distributed.is_initialized():
-            if not getattr(MegatronModule, "embedding_warning_printed", False):
-                print("WARNING! Distributed processes aren't initialized, so "
-                      "word embeddings in the last layer are not initialized. "
-                      "If you are just manipulating a model this is fine, but "
-                      "this needs to be handled manually. If you are training "
-                      "something is definitely wrong.")
-                MegatronModule.embedding_warning_printed = True
-            return
-
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
         # one stage, the initial embedding layer and the head are on different
@@ -111,6 +101,16 @@ class MegatronModule(torch.nn.Module):
         if not mpu.is_pipeline_first_stage(ignore_virtual=True) and \
                 self.pre_process:
             self.language_model.embedding.zero_parameters()
+
+        if not torch.distributed.is_initialized():
+            if not getattr(MegatronModule, "embedding_warning_printed", False):
+                print("WARNING! Distributed processes aren't initialized, so "
+                      "word embeddings in the last layer are not initialized. "
+                      "If you are just manipulating a model this is fine, but "
+                      "this needs to be handled manually. If you are training "
+                      "something is definitely wrong.")
+                MegatronModule.embedding_warning_printed = True
+            return
 
         # Ensure that first and last stages have the same initial parameter
         # values.

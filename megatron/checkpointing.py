@@ -22,11 +22,12 @@ import numpy as np
 
 import torch
 
-from megatron import (get_args,
-                      mpu,
-                      print_rank_0,
-                      update_num_microbatches,
-                      utils)
+from megatron import (mpu,
+                      update_num_microbatches)
+from .global_vars import get_args
+from .utils import (unwrap_model,
+                    print_rank_0)
+
 
 _CHECKPOINT_VERSION = None
 
@@ -207,7 +208,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     args = get_args()
 
     # Only rank zero of the data parallel writes to the disk.
-    model = utils.unwrap_model(model)
+    model = unwrap_model(model)
 
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
@@ -386,8 +387,11 @@ def _load_base_checkpoint(load_dir, rank0=False):
     return state_dict, release
 
 def load_args_from_checkpoint(args, load_arg='load'):
-    """Set any arguments that are not currently set from the checkpoint
-    specified in the arguments.
+    """Set required arguments from the checkpoint specified in the
+    arguments.
+
+    Will overwrite arguments that have a non-None default value, but
+    will leave any arguments that default to None as set.
 
     Returns the same args NameSpace with the new values added/updated.
 
@@ -406,6 +410,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
         return args
 
     if 'args' not in state_dict:
+        print('Checkpoint provided does not have arguments saved.')
         return args
 
     checkpoint_args = state_dict['args']
@@ -422,7 +427,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
             checkpoint_value = getattr(checkpoint_args, arg_name, None)
 
         if checkpoint_value is not None:
-            print(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
+            print_rank_0(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
             setattr(args, arg_name, checkpoint_value)
 
     _set_arg('num_layers')
@@ -453,7 +458,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    model = utils.unwrap_model(model)
+    model = unwrap_model(model)
 
     state_dict, release = _load_base_checkpoint(load_dir, False)
 
@@ -574,7 +579,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
 
     args = get_args()
 
-    model = utils.unwrap_model(model)
+    model = unwrap_model(model)
 
     load_path = custom_load_path if custom_load_path is not None else args.load
 
