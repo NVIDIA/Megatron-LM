@@ -200,6 +200,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                                     top_p=top_p,
                                     temperature=temperature,
                                     vocab_size=tokenizer.vocab_size)
+                
                 # If a prompt length is smaller or equal th current context
                 # length, it means we have started generating tokens
                 started = lengths <= context_length
@@ -280,6 +281,74 @@ def generate_tokens_probs_and_return_on_first_stage(
 
     return tokens, generated_sequence_lengths, output_log_probs
 
+
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size):
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    batch_size = tokens.size(0)
+    assert(batch_size == 1)
+    prompt_length = lengths.item()
+    final_sequence_length = tokens.size(1)
+    final_sequence_length = min(final_sequence_length, args.max_position_embeddings)
+    
+    # If the context is too big, this happens
+    if prompt_length >= final_sequence_length:
+        raise ValueError("context length + tokens_to_generate too large")
+
+    # forward step.
+    forward_step = ForwardStep(model, beam_size, final_sequence_length)
+
+    if mpu.is_pipeline_last_stage():
+        scores = torch.zeros(beam_size,
+                             dtype=torch.float32,
+                             device=torch.cuda.current_device()).unsqueeze(1)
+    # =============
+    # Run infernece
+    # =============
+    with torch.no_grad():
+        tokens = tokens.repeat(beam_size, 1)
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
+        prev_context_length = 0
+        for context_length in range(prompt_length, final_sequence_length):
+
+            # Pick the slice that we need to pass through the network.
+            tokens2use = tokens[:, prev_context_length:context_length]
+            positions2use = position_ids[:, prev_context_length:context_length]
+            attention_mask2use = attention_mask[
+                ..., prev_context_length:context_length, :context_length]
+
+            # logits will be meanigful only in the last pipeline stage.
+            logits = forward_step(tokens2use, positions2use, attention_mask2use)
+            vocab_size = logits.size(2)
+
+            if mpu.is_pipeline_last_stage():
+                log_probs = F.log_softmax(logits, dim=2)
+                new_scores = log_probs[:, -1, :] + scores
+
+                if context_length == prompt_length:  # if this is the first one
+                    sorted_scores, indices = torch.sort(new_scores[0,:], descending=True)
+                else:
+                    sorted_scores, indices = torch.sort(new_scores.view(-1), descending=True)
+
+                best_batches = torch.div(indices[:beam_size], vocab_size, rounding_mode='floor')
+                best_words = indices[:beam_size] % vocab_size
+                
+                tokens = tokens[best_batches,:]
+                tokens[:, context_length] = best_words
+                scores = sorted_scores[:beam_size].unsqueeze(1)
+            
+            # Update the tokens on the first stage so the next input to
+            # the network is correct.
+            copy_from_last_to_first_pipeline_stage(batch_size, torch.int64,
+                                                   tokens[:, context_length])
+
+            # Update the context length for the next token generation.
+            prev_context_length = context_length
+    
+        copy_from_last_to_first_pipeline_stage(scores.size(0), torch.float32,
+                                               scores[:,0])
+    return tokens, scores
 
 
 def _build_attention_mask_and_position_ids(tokens):

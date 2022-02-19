@@ -128,6 +128,12 @@ class MegatronGenerate(Resource):
             if not isinstance(no_log, bool):
                 return "no_log must be a boolean value"
         
+        beam_search = False
+        if "beam_search" in request.get_json():
+            beam_search = request.get_json()["beam_search"]
+            if not isinstance(no_log, bool):
+                return "beam_search must be a boolean value"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
             if not no_log:
                 print("request IP: " + str(request.remote_addr))
