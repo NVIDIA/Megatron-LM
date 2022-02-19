@@ -530,6 +530,10 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--model-parallel-memory-opt', action='store_true',
+                       help='Enable model parallel memory optmization.')
+
+
     return parser
 
 

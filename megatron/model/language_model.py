@@ -40,7 +40,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     if parallel_output:
         return logits_parallel
 
-    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
+    return mpu.gather_along_last_dim_from_tensor_model_parallel_region(logits_parallel)
 
 
 def get_language_model(num_tokentypes, add_pooler,

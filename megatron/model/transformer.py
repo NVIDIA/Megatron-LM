@@ -628,6 +628,8 @@ class ParallelTransformer(MegatronModule):
         self.activations_checkpoint_num_layers = args.activations_checkpoint_num_layers
         self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
 
+        self.model_parallel_memory_opt = args.model_parallel_memory_opt
+
         # Number of layers.
         self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
@@ -771,6 +773,10 @@ class ParallelTransformer(MegatronModule):
             # Otherwise, leave it as is.
             else:
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
+
+            if self.model_parallel_memory_opt:
+                hidden_states = mpu.scatter_along_first_dim_to_tensor_model_parallel_region(hidden_states)
+
         else:
             # See set_input_tensor()
             hidden_states = self.input_tensor
@@ -820,9 +826,14 @@ class ParallelTransformer(MegatronModule):
         # Final layer norm.
         if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
-            hidden_states = hidden_states.transpose(0, 1).contiguous()
-            output = self.final_layernorm(hidden_states)
+            hidden_states = self.final_layernorm(hidden_states)
+
+            if self.model_parallel_memory_opt:
+                hidden_states = mpu.gather_along_first_dim_from_tensor_model_parallel_region(hidden_states)
+
+            output = hidden_states.transpose(0, 1).contiguous()
         else:
             output = hidden_states
+
 
         return output
