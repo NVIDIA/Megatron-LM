@@ -403,7 +403,8 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler):
+               model, optimizer, opt_param_scheduler,
+               ITERATION):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -441,7 +442,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer').start()
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(ITERATION)
     timers('optimizer').stop()
 
     # >>>
@@ -687,7 +688,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        train_data_iterator,
                        model,
                        optimizer,
-                       opt_param_scheduler)
+                       opt_param_scheduler
+                       # >>>
+                       ,ITERATION = iteration)
+                       # <<<
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
