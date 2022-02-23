@@ -49,6 +49,7 @@ from .initialize import get_virtual_pipeline_model_parallel_rank, set_virtual_pi
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
 
+from .layers import LinearWithGradAccumulationAndAsyncAllreduce
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding
