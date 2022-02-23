@@ -432,7 +432,7 @@ def train_step(forward_step_func, data_iterator,
     # >>>
     # Reduce gradients. (with distributed optimizer option, optimizer
     # now responsible for reducing gradients)
-    optimizer.reduce_gradients(model)
+    optimizer.reduce_grads(model)
     # <<<
 
     # >>>
