@@ -96,7 +96,10 @@ def generate_tokens_probs_and_return_on_first_stage(
         return_output_log_probs=False,
         top_k=0, top_p=0.0,
         temperature=1.0,
-        use_eod_token_for_early_termination=True):
+        use_eod_token_for_early_termination=True,
+        stop_on_double_eol=False,
+        stop_on_eol=False
+        ):
     """Main token generation function.
     Arguments:
         model: no interleaving is supported.
@@ -130,6 +133,10 @@ def generate_tokens_probs_and_return_on_first_stage(
     min_prompt_length = lengths.min().item()
     max_sequence_length = tokens.size(1)
     max_sequence_length = min(max_sequence_length, args.max_position_embeddings)
+    
+    # If the context is too big, this happens
+    if min_prompt_length >= max_sequence_length:
+        raise ValueError("context length + tokens_to_generate too large")
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_sequence_length)
@@ -227,8 +234,20 @@ def generate_tokens_probs_and_return_on_first_stage(
             # Check if all the sequences have hit the termination_id.
             done = None
             if mpu.is_pipeline_last_stage():
-                done_token = (new_sample == termination_id).byte() & \
-                    started.byte()
+                # TODO(rprenger) These stopping methods are tokenizer dependent
+                # instead tokenization should be in the inference loop so stop sequences can be used
+                if stop_on_double_eol:
+                    hit_double_eol = (new_sample == 628).byte() & started.byte()
+                    hit_two_eols = (new_sample == 198).byte() & (tokens[:, context_length-1] == 198).byte() & started.byte()
+                    done_token = hit_double_eol | hit_two_eols
+                elif stop_on_eol:
+                    hit_double_eol = (new_sample == 628).byte() & started.byte()
+                    hit_eol = (new_sample == 198).byte() & started.byte()
+                    done_token = hit_double_eol | hit_eol
+                else: 
+                    done_token = (new_sample == termination_id).byte() & \
+                        started.byte()
+                
                 just_finished = (done_token & ~is_generation_done).bool()
                 generated_sequence_lengths[just_finished.view(-1)] = \
                     context_length + 1

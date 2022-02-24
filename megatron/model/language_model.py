@@ -29,13 +29,19 @@ from megatron.model.utils import init_method_normal, scaled_init_method_normal
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
+    args = get_args()
     # Parallel logits.
-    input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
-    # Matrix multiply.
-    if bias is None:
-        logits_parallel = F.linear(input_parallel, word_embeddings_weight)
+    if args.async_tensor_model_parallel_allreduce:
+        input_parallel = input_
+        async_grad_allreduce = mpu.get_tensor_model_parallel_world_size() > 1
     else:
-        logits_parallel = F.linear(input_parallel, word_embeddings_weight, bias)
+        input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+        async_grad_allreduce = False
+    # Matrix multiply.
+    logits_parallel = mpu.LinearWithGradAccumulationAndAsyncAllreduce.apply(
+            input_parallel, word_embeddings_weight, bias,
+            args.gradient_accumulation_fusion,
+            async_grad_allreduce)
     # Gather if needed.
     if parallel_output:
         return logits_parallel
@@ -334,10 +340,6 @@ class TransformerLanguageModel(MegatronModule):
         # Decoder (usually set to False, True if part of an encoder-decoder
         # architecture and in decoder-only stage).
         if self.add_decoder:
-            # Temporary assertion until we verify correctness of pipeline parallelism
-            # implementation of T5.
-            assert args.pipeline_model_parallel_size == 1, \
-                'pipeline parallelism is not supported in the presence of decoder'
             self.decoder = ParallelTransformer(
                 self.init_method,
                 output_layer_init_method,

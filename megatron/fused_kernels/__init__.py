@@ -78,6 +78,12 @@ def load(args):
         scaled_masked_softmax_cuda = _cpp_extention_load_helper(
             "scaled_masked_softmax_cuda", sources, extra_cuda_flags)
 
+        # Softmax
+        sources=[srcpath / 'scaled_softmax.cpp',
+                 srcpath / 'scaled_softmax_cuda.cu']
+        scaled_softmax_cuda = _cpp_extention_load_helper(
+            "scaled_softmax_cuda", sources, extra_cuda_flags)
+
     # =================================
     # Mixed precision fused layer norm.
     # =================================
@@ -87,6 +93,16 @@ def load(args):
              srcpath / 'layer_norm_cuda_kernel.cu']
     fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
         "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags)
+
+    # =================================
+    # Fused gradient accumulation to weight gradient computation of linear layer
+    # =================================
+
+    if args.gradient_accumulation_fusion:
+        sources=[srcpath / 'fused_weight_gradient_dense.cpp',
+                 srcpath / 'fused_weight_gradient_dense.cu']
+        fused_dense_cuda = _cpp_extention_load_helper(
+            "fused_dense_cuda", sources, [])
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
