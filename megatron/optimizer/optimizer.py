@@ -103,7 +103,7 @@ class MegatronOptimizer(ABC):
         # >>>
         # pax(0, {
         #     "clip_grad" : clip_grad,
-        #     "params": [ (p.tensor_model_parallel, tp(p)) for p in params ],
+        #     # "params": [ (p.tensor_model_parallel, tp(p)) for p in params ],
         #     "grads" : [ p.grad for p in params ],
         # })
         # <<<
@@ -314,11 +314,12 @@ class BaseFloat16Optimizer(MegatronOptimizer):
                 return False, None, None
 
         # >>>
-        pax(0, {
-            "[LOC]" : "[** BEFORE CLIP **]",
-            "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
-            "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
-        })
+        # pax(0, {
+        #     "[LOC]" : "[** BEFORE CLIP **]",
+        #     "clip_grad" : self.clip_grad,
+        #     # "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
+        #     "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
+        # })
         # <<<
 
         # Clip the main gradients.
@@ -327,6 +328,14 @@ class BaseFloat16Optimizer(MegatronOptimizer):
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
+
+        # >>>
+        pax(1, {
+            "[LOC]" : "[** BEFORE NONZERO **]",
+            # "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
+            "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
+        })
+        # <<<
 
         # count the zeros in the grads
         num_zeros_in_grad = self.count_zeros() if \

@@ -79,10 +79,15 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
         #     })
         # <<<
 
-    # pax(1, {
+    # >>>
+    # pax(0, {
+    #     "[LOC]" : "[** BEFORE CALC NORM **]",
+    #     "max_norm" : max_norm,
+    #     "parameters" : parameters,
     #     "grads" : grads,
     #     "grads_for_norm" : grads_for_norm,
     # })
+    # <<<
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -127,11 +132,36 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm ** norm_type
 
+        # >>>
+        # pax(0, {
+        #     "[LOC]" : "[** CALC NORM **]",
+        #     "max_norm" : max_norm,
+        #     "norm_type" : norm_type,
+        #     "grad_norm" : tp(grad_norm),
+        #     "total_norm" : tp(total_norm),
+        # })
+        # <<<
+
         # Sum across all model-parallel GPUs.
+        # >>>
+        # torch.distributed.all_reduce(total_norm,
+        #                              op=torch.distributed.ReduceOp.SUM,
+        #                              group=mpu.get_model_parallel_group())
+        # +++
         torch.distributed.all_reduce(total_norm,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_model_parallel_group())
+                                     op=torch.distributed.ReduceOp.SUM)
+        # <<<
         total_norm = total_norm.item() ** (1.0 / norm_type)
+
+        # >>>
+        # pax(1, {
+        #     "[LOC]" : "[** CALC NORM **]",
+        #     "max_norm" : max_norm,
+        #     "norm_type" : norm_type,
+        #     "grad_norm" : tp(grad_norm),
+        #     "total_norm" : tp(total_norm),
+        # })
+        # <<<
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
