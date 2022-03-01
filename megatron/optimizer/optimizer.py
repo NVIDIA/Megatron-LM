@@ -32,7 +32,7 @@ from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 # >>>
 from lutil import pax, tp
 
-DEBUG_ITERATION = 1 # 10
+DEBUG_ITERATION = 0 # 10
 # <<<
 
 
@@ -98,16 +98,12 @@ class MegatronOptimizer(ABC):
         return params
 
 
-    def clip_grad_norm(self, clip_grad):
-        params = self.get_parameters()
+    def clip_grad_norm(self, clip_grad, ITERATION):
         # >>>
-        # pax(0, {
-        #     "clip_grad" : clip_grad,
-        #     # "params": [ (p.tensor_model_parallel, tp(p)) for p in params ],
-        #     "grads" : [ p.grad for p in params ],
-        # })
+        return
         # <<<
-        return clip_grad_norm_fp32(params, clip_grad)
+        params = self.get_parameters()
+        return clip_grad_norm_fp32(params, clip_grad, ITERATION = ITERATION)
 
 
     def count_zeros(self):
@@ -267,6 +263,73 @@ class BaseFloat16Optimizer(MegatronOptimizer):
 
         return found_inf_flag
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    @classmethod
+    def debug_general(cls, ITERATION, key, value):
+        from megatron import get_args
+        args = get_args()
+        my_rank = torch.distributed.get_rank()
+        if ITERATION != DEBUG_ITERATION:
+            return
+        for r in range(torch.distributed.get_world_size()):
+            if my_rank == r:
+                print("            + %4s; [r%d]; %s, %.12e." % ("fix" if args.use_distributed_optimizer else "main", my_rank, key, value))
+            torch.distributed.barrier()
+        torch.distributed.barrier()
+        # if my_rank == 0:
+        #     raise Exception("debug.")
+        # else:
+        #     exit(0)
+        exit(0)
+
+    def _debug_main(self, ITERATION, key0, key1, f, ff):
+        count = sum(
+            p.nelement()
+            for g in self.optimizer.param_groups
+            for p in g["params"]
+        )
+        return self.debug_general(
+            ITERATION,
+            "main/%s, %s [count %d]" % (key1, key0, count),
+            sum(ff(f(p))
+                for g in self.optimizer.param_groups
+                for p in g["params"]).item() / count,
+        )
+    # def debug_main_param_mean(self, ITERATION, key):
+    #     return self._debug_main(
+    #         ITERATION,
+    #         key,
+    #         "param mean",
+    #         lambda p : p,
+    #         torch.mean,
+    #     )
+    def debug_main_param_sum(self, ITERATION, key):
+        return self._debug_main(
+            ITERATION,
+            key,
+            "param sum",
+            # lambda p : p,
+            lambda p : torch.abs(p),
+            torch.sum,
+        )
+    # def debug_main_grad_mean(self, ITERATION, key):
+    #     return self._debug_main(
+    #         ITERATION,
+    #         key,
+    #         "grad mean",
+    #         lambda p : p.grad,
+    #         torch.mean,
+    #     )
+    def debug_main_grad_sum(self, ITERATION, key):
+        return self._debug_main(
+            ITERATION,
+            key,
+            "grad sum",
+            # lambda p : p.grad,
+            lambda p : torch.abs(p.grad),
+            torch.sum,
+        )
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     @torch.no_grad()
     def step(self, ITERATION):
@@ -279,17 +342,9 @@ class BaseFloat16Optimizer(MegatronOptimizer):
         timers('optimizer-copy-to-main-grad').stop()
 
         # >>>
-        # pax(0, {
-        #     "[LOC]" : "[** BEFORE UNSCALE **]",
-        #     "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
-        #     "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
-        # })
+        # self.debug_main_param_sum(ITERATION)
+        # self.debug_main_grad_sum(ITERATION)
         # <<<
-
-        # pax(0, {
-        #     "params" : self.get_parameters(), # self.main_param_shards,
-        #     "grads" : [ p.grad for p in self.get_parameters() ], # self.main_param_shards ],
-        # })
 
         # Do unscale, check for inf, and update grad scaler only for
         # the case that grad scaler is provided.
@@ -313,45 +368,24 @@ class BaseFloat16Optimizer(MegatronOptimizer):
                 })
                 return False, None, None
 
-        # >>>
-        # pax(0, {
-        #     "[LOC]" : "[** BEFORE CLIP **]",
-        #     "clip_grad" : self.clip_grad,
-        #     # "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
-        #     "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
-        # })
-        # <<<
-
         # Clip the main gradients.
         timers('optimizer-clip-main-grad').start()
         grad_norm = None
         if self.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.clip_grad)
+            grad_norm = self.clip_grad_norm(self.clip_grad, ITERATION)
         timers('optimizer-clip-main-grad').stop()
-
-        # >>>
-        pax(1, {
-            "[LOC]" : "[** BEFORE NONZERO **]",
-            # "param_group / params" : [ p for g in self.optimizer.param_groups for p in g["params"] ],
-            "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
-        })
-        # <<<
 
         # count the zeros in the grads
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
 
-        # >>>
-        pax(0, {
-            # "main params" : self.get_main_params(),
-            # "main grads" : self.get_main_grads(),
-            **{"param_groups / %d" % i : g for i, g in enumerate(self.optimizer.param_groups)},
-            "param_group / grads" : [ p.grad for g in self.optimizer.param_groups for p in g["params"] ],
-        })
-        # <<<
-
         # Step the optimizer.
         self.optimizer.step()
+
+        # >>>
+        # self.debug_main_param_sum(ITERATION, "after step.")
+        self.debug_main_grad_sum(ITERATION, "after step.")
+        # <<<
 
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params').start()
@@ -359,10 +393,8 @@ class BaseFloat16Optimizer(MegatronOptimizer):
         timers('optimizer-copy-main-to-model-params').stop()
 
         # >>>
-        # pax(1, {
-        #     "ITERATION" : ITERATION,
-        #     "model_params" : [ p for m in self.models for p in m.parameters() ],
-        # })
+        self.debug_main_param_sum(ITERATION, "after copy param.")
+        self.debug_main_grad_sum(ITERATION, "after copy param.")
         # <<<
 
         # Successful update.
@@ -674,12 +706,12 @@ class Float16OptimizerWithFloat16Params(BaseFloat16Optimizer):
         _multi_tensor_copy_this_to_that(this=main_data, that=model_data,
                                         overflow_buf=self._dummy_overflow_buf)
         # >>>
-        if ITERATION == DEBUG_ITERATION:
-            pax(0, {
-                "** branch **" : "** main. **",
-                "ITERATION" : ITERATION,
-                "model params" : [p for m in self.models for p in m.parameters()],
-            })
+        # if ITERATION == DEBUG_ITERATION:
+        #     pax(0, {
+        #         "** branch **" : "** main. **",
+        #         "ITERATION" : ITERATION,
+        #         "model params" : [p for m in self.models for p in m.parameters()],
+        #     })
         # <<<
 
 
@@ -1370,12 +1402,12 @@ class Float16DistributedOptimizer(BaseFloat16Optimizer):
                 # })
 
         # >>>
-        if ITERATION == DEBUG_ITERATION:
-            pax(0, {
-                "** branch **" : "** fix. **",
-                "ITERATION" : ITERATION,
-                "model params" : self.get_world_model_params(),
-            })
+        # if ITERATION == DEBUG_ITERATION:
+        #     pax(0, {
+        #         "** branch **" : "** fix. **",
+        #         "ITERATION" : ITERATION,
+        #         "model params" : self.get_world_model_params(),
+        #     })
         # <<<
 
 # <<<

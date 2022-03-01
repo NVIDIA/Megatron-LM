@@ -154,7 +154,7 @@ def get_megatron_optimizer(model,
         opt_ty = Float16DistributedOptimizer \
             if args.use_distributed_optimizer \
             else Float16OptimizerWithFloat16Params
-        return opt_ty(optimizer,
+        opt = opt_ty(optimizer,
                       args.clip_grad,
                       args.log_num_zeros_in_grad,
                       params_have_main_grad,
@@ -162,6 +162,11 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       grad_scaler,
                       model)
+        # >>>
+        # opt.debug_main_param_sum(0, "after init")
+        # opt.debug_main_grad_sum(0, "after init")
+        # <<<
+        return opt
         # <<<
 
     # FP32.

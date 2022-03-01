@@ -28,9 +28,10 @@ from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 # >>>
 from lutil import pax, tp
+DEBUG_ITERATION = 1
 # <<<
 
-def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
+def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -48,6 +49,10 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
+
+    # >>>
+    raise Exception("currently debugging ... don't call me.")
+    # <<<
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
@@ -80,13 +85,15 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
         # <<<
 
     # >>>
-    # pax(0, {
-    #     "[LOC]" : "[** BEFORE CALC NORM **]",
-    #     "max_norm" : max_norm,
-    #     "parameters" : parameters,
-    #     "grads" : grads,
-    #     "grads_for_norm" : grads_for_norm,
-    # })
+    # if ITERATION == DEBUG_ITERATION:
+    #     pax(0, {
+    #         "[LOC]" : "[** BEFORE CALC NORM **]",
+    #         "[ITERATION]" : ITERATION,
+    #         "max_norm" : max_norm,
+    #         "parameters" : parameters,
+    #         # "grads" : grads,
+    #         "grads_for_norm" : grads_for_norm,
+    #     })
     # <<<
 
     # Norm parameters.
@@ -133,34 +140,42 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
                 total_norm += grad_norm ** norm_type
 
         # >>>
-        # pax(0, {
-        #     "[LOC]" : "[** CALC NORM **]",
-        #     "max_norm" : max_norm,
-        #     "norm_type" : norm_type,
-        #     "grad_norm" : tp(grad_norm),
-        #     "total_norm" : tp(total_norm),
-        # })
+        # if ITERATION == DEBUG_ITERATION:
+        #     pax(0, {
+        #         "[LOC]" : "[** CALC NORM **]",
+        #         "[ITERATION]" : ITERATION,
+        #         "max_norm" : max_norm,
+        #         "norm_type" : norm_type,
+        #         "grad_norm" : tp(grad_norm),
+        #         "total_norm" : tp(total_norm),
+        #     })
         # <<<
 
         # Sum across all model-parallel GPUs.
         # >>>
-        # torch.distributed.all_reduce(total_norm,
-        #                              op=torch.distributed.ReduceOp.SUM,
-        #                              group=mpu.get_model_parallel_group())
+        from megatron import get_args
+        args = get_args()
+        if not args.use_distributed_optimizer:
+            torch.distributed.all_reduce(total_norm,
+                                         op=torch.distributed.ReduceOp.SUM,
+                                         group=mpu.get_model_parallel_group())
         # +++
-        torch.distributed.all_reduce(total_norm,
-                                     op=torch.distributed.ReduceOp.SUM)
+        else:
+            torch.distributed.all_reduce(total_norm,
+                                         op=torch.distributed.ReduceOp.SUM)
         # <<<
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
         # >>>
-        # pax(1, {
-        #     "[LOC]" : "[** CALC NORM **]",
-        #     "max_norm" : max_norm,
-        #     "norm_type" : norm_type,
-        #     "grad_norm" : tp(grad_norm),
-        #     "total_norm" : tp(total_norm),
-        # })
+        # if ITERATION == DEBUG_ITERATION:
+        #     pax(0, {
+        #         "[LOC]" : "[** AFTER REDUCE. **]",
+        #         "[ITERATION]" : ITERATION,
+        #         "max_norm" : max_norm,
+        #         "norm_type" : norm_type,
+        #         "grad_norm" : grad_norm.item(),
+        #         "total_norm" : total_norm,
+        #     })
         # <<<
 
     # Scale.
@@ -171,6 +186,18 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2):
                              dummy_overflow_buf,
                              [grads, grads],
                              clip_coeff)
+
+    # >>>
+    # # from pygit2 import Repository
+    # if ITERATION == DEBUG_ITERATION:
+    #     pax(1, {
+    #         "[LOC]" : "[** CLIP / FINAL **]",
+    #         "[ITERATION]" : ITERATION,
+    #         "grads" : grads,
+    #         "clip_coeff" : tp(clip_coeff),
+    #         # "repo" : Repository('.').head.shorthand,
+    #     })
+    # <<<
 
     return total_norm
 
