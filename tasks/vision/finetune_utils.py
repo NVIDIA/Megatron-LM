@@ -199,7 +199,6 @@ def _train(
                     process_non_loss_data_func,
                     False,
                 )
-                end_of_epoch_callback(model, epoch)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
