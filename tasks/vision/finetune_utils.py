@@ -147,7 +147,6 @@ def _train(
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
 
-            args.curr_iteration = iteration_
             # Ignore the iterations before starting value
             if iteration_ < start_iteration:
                 continue
