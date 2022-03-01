@@ -660,6 +660,7 @@ class ParallelTransformer(MegatronModule):
     def __init__(self, init_method, output_layer_init_method,
                  layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
+                 post_layer_norm=True, 
                  pre_process=True, post_process=True,
                  drop_path_rate=0.0):
         super(ParallelTransformer, self).__init__()
@@ -667,6 +668,7 @@ class ParallelTransformer(MegatronModule):
 
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
+        self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
         self.input_tensor = None
@@ -739,7 +741,7 @@ class ParallelTransformer(MegatronModule):
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if self.post_process:
+        if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
@@ -870,7 +872,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = hidden_states.transpose(0, 1).contiguous()
-            output = self.final_layernorm(hidden_states)
+            output = self.final_layernorm(hidden_states) if self.post_layer_norm else hidden_states
         else:
             output = hidden_states
 
