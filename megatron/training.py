@@ -52,7 +52,9 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
 
-
+# >>>
+from lutil import pax
+# <<<
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -433,6 +435,21 @@ def train_step(forward_step_func, data_iterator,
     # Reduce gradients. (with distributed optimizer option, optimizer
     # now responsible for reducing gradients)
     optimizer.reduce_grads(model)
+    # <<<
+
+    # >>>
+    # r = mpu.get_data_parallel_rank()
+    # w = mpu.get_data_parallel_world_size()
+    # gbufs = []
+    # for m in model:
+    #     for g in m._grad_buffers.values():
+    #         t = g.data
+    #         n = t.nelement()
+    #         shard = int(n / w)
+    #         start_index = r * shard
+    #         end_index = min(n, start_index + shard)
+    #         gbufs.append(t[start_index:end_index])
+    # pax(1, {"gbufs": gbufs})
     # <<<
 
     # >>>

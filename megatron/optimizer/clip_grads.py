@@ -222,9 +222,16 @@ def count_zeros_fp32(parameters):
             total_num_zeros = num_zeros + total_num_zeros
 
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(total_num_zeros,
-                                 op=torch.distributed.ReduceOp.SUM,
-                                 group=mpu.get_model_parallel_group())
+    # >>>
+    if args.use_distributed_optimizer:
+        torch.distributed.all_reduce(total_num_zeros,
+                                     op=torch.distributed.ReduceOp.SUM)
+    else:
+        torch.distributed.all_reduce(total_num_zeros,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_model_parallel_group())
+    # <<<
+
     total_num_zeros = total_num_zeros.item()
 
     return total_num_zeros
