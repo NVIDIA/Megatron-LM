@@ -115,7 +115,7 @@ class AnnealingLR(object):
         """Auxiliary function for checking the values in the checkpoint and
         setting them."""
         if self.override_lr_scheduler:
-            print_rank_0(' > overriding {} value to {}'.format(name, cls_value))
+            print_rank_0(' > overriding {} value to {}'.format(name, sd_value))
             return cls_value
 
         if not self.use_checkpoint_lr_scheduler:
