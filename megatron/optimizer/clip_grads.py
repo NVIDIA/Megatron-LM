@@ -155,14 +155,13 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
         # >>>
         from megatron import get_args
         args = get_args()
-        if not args.use_distributed_optimizer:
+        if args.use_distributed_optimizer:
+            torch.distributed.all_reduce(total_norm,
+                                         op=torch.distributed.ReduceOp.SUM)
+        else:
             torch.distributed.all_reduce(total_norm,
                                          op=torch.distributed.ReduceOp.SUM,
                                          group=mpu.get_model_parallel_group())
-        # +++
-        else:
-            torch.distributed.all_reduce(total_norm,
-                                         op=torch.distributed.ReduceOp.SUM)
         # <<<
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
@@ -223,9 +222,12 @@ def count_zeros_fp32(parameters):
 
     # Sum across all model-parallel GPUs.
     # >>>
+    from megatron import get_args
+    args = get_args()
     if args.use_distributed_optimizer:
         torch.distributed.all_reduce(total_num_zeros,
                                      op=torch.distributed.ReduceOp.SUM)
+        # pax({"total_num_zeros": total_num_zeros.item()})
     else:
         torch.distributed.all_reduce(total_num_zeros,
                                      op=torch.distributed.ReduceOp.SUM,

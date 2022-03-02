@@ -432,6 +432,10 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # >>>
+    # optimizer.debug_model(ITERATION, "before reduce grads.", 0)
+    # <<<
+
+    # >>>
     # Reduce gradients. (with distributed optimizer option, optimizer
     # now responsible for reducing gradients)
     optimizer.reduce_grads(model)
@@ -465,7 +469,11 @@ def train_step(forward_step_func, data_iterator,
     # >>>
     # Gather params gradients. (with distributed optimizer option, optimizer
     # now responsible for gathering updated params)
-    optimizer.gather_params()
+    optimizer.gather_params(ITERATION)
+    # <<<
+
+    # >>>
+    # optimizer.debug_model(ITERATION, "after gather params.", 0)
     # <<<
 
     # Update learning rate.
