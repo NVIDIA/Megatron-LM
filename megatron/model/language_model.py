@@ -29,8 +29,13 @@ from megatron.model.utils import init_method_normal, scaled_init_method_normal
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
+    args = get_args()
+    
     # Parallel logits.
-    input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+    if not args.model_parallel_memory_opt:
+        input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+    else:
+        input_parallel = input_
     # Matrix multiply.
     if bias is None:
         logits_parallel = F.linear(input_parallel, word_embeddings_weight)
@@ -40,7 +45,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     if parallel_output:
         return logits_parallel
 
-    return mpu.gather_along_last_dim_from_tensor_model_parallel_region(logits_parallel)
+    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
 def get_language_model(num_tokentypes, add_pooler,

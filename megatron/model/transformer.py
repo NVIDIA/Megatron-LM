@@ -447,7 +447,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.input_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm)
+            no_persist_layer_norm=args.no_persist_layer_norm,
+            sequence_parallel=args.model_parallel_memory_opt)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -464,7 +465,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.post_attention_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm)
+            no_persist_layer_norm=args.no_persist_layer_norm,
+            sequence_parallel=args.model_parallel_memory_opt)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -476,7 +478,8 @@ class ParallelTransformerLayer(MegatronModule):
             self.post_inter_attention_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm)
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=args.model_parallel_memory_opt)
 
         # MLP
         self.mlp = ParallelMLP(init_method,
@@ -697,7 +700,8 @@ class ParallelTransformer(MegatronModule):
             self.final_layernorm = LayerNorm(
                 args.hidden_size,
                 eps=args.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm)
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=args.model_parallel_memory_opt)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -775,7 +779,7 @@ class ParallelTransformer(MegatronModule):
                 hidden_states = hidden_states.transpose(0, 1).contiguous()
 
             if self.model_parallel_memory_opt:
-                hidden_states = mpu.scatter_along_first_dim_to_tensor_model_parallel_region(hidden_states)
+                hidden_states = mpu.scatter_to_sequence_parallel_region(hidden_states)
 
         else:
             # See set_input_tensor()
@@ -806,6 +810,9 @@ class ParallelTransformer(MegatronModule):
         if encoder_output is not None:
             encoder_output = encoder_output.transpose(0, 1).contiguous()
 
+            if self.model_parallel_memory_opt:
+                encoder_output = mpu.scatter_to_sequence_parallel_region(encoder_output)
+
         # Forward pass.
         if self.activations_checkpoint_method is not None:
             hidden_states = self._checkpointed_forward(hidden_states,
@@ -829,7 +836,7 @@ class ParallelTransformer(MegatronModule):
             hidden_states = self.final_layernorm(hidden_states)
 
             if self.model_parallel_memory_opt:
-                hidden_states = mpu.gather_along_first_dim_from_tensor_model_parallel_region(hidden_states)
+                hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
 
             output = hidden_states.transpose(0, 1).contiguous()
         else:

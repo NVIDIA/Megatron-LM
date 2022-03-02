@@ -32,7 +32,6 @@ def _reduce(input_):
     return input_
 
 
-
 def _split_along_last_dim(input_):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
@@ -50,6 +49,7 @@ def _split_along_last_dim(input_):
     output = input_list[rank].contiguous()
 
     return output
+
 
 def _split_along_first_dim(input_):
     """Split the tensor along its first dimension and keep the
@@ -174,7 +174,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
         return grad_output
 
 
-class _ScatterAlongLastDimToModelParallelRegion(torch.autograd.Function):
+class _ScatterToModelParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
@@ -190,7 +190,7 @@ class _ScatterAlongLastDimToModelParallelRegion(torch.autograd.Function):
         return _gather_along_last_dim(grad_output)
 
 
-class _GatherAlongLastDimFromModelParallelRegion(torch.autograd.Function):
+class _GatherFromModelParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatinate."""
 
     @staticmethod
@@ -203,10 +203,10 @@ class _GatherAlongLastDimFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return _reduce_scatter_along_last_dim(grad_output)
+        return _split_along_last_dim(grad_output)
 
 
-class _ScatterAlongFirstDimToModelParallelRegion(torch.autograd.Function):
+class _ScatterToSequenceParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
     @staticmethod
@@ -222,7 +222,7 @@ class _ScatterAlongFirstDimToModelParallelRegion(torch.autograd.Function):
         return _gather_along_first_dim(grad_output)
 
 
-class _GatherAlongFirstDimFromModelParallelRegion(torch.autograd.Function):
+class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from model parallel region and concatinate.""" #TODO
 
     @staticmethod
@@ -238,23 +238,7 @@ class _GatherAlongFirstDimFromModelParallelRegion(torch.autograd.Function):
         return _reduce_scatter_along_first_dim(grad_output)
 
 
-class _ReduceScatterAlongLastDimToModelParallelRegion(torch.autograd.Function):
-    """Reduce scatter the input from the model parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_):
-        return _reduce_scatter_along_last_dim(input_)
-    
-    @staticmethod
-    def forward(ctx, input_):
-        return _reduce_scatter_along_last_dim(input_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return _gather_along_last_dim(grad_output)
-
-
-class _ReduceScatterAlongFirstDimToModelParallelRegion(torch.autograd.Function):
+class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
     @staticmethod
@@ -282,25 +266,22 @@ def reduce_from_tensor_model_parallel_region(input_):
     return _ReduceFromModelParallelRegion.apply(input_)
 
 
-def scatter_along_last_dim_to_tensor_model_parallel_region(input_):
-    return _ScatterAlongLastDimToModelParallelRegion.apply(input_)
+def scatter_to_tensor_model_parallel_region(input_):
+    return _ScatterToModelParallelRegion.apply(input_)
 
 
-def gather_along_last_dim_from_tensor_model_parallel_region(input_):
-    return _GatherAlongLastDimFromModelParallelRegion.apply(input_)
+def gather_from_tensor_model_parallel_region(input_):
+    return _GatherFromModelParallelRegion.apply(input_)
 
 
-def scatter_along_first_dim_to_tensor_model_parallel_region(input_):
-    return _ScatterAlongFirstDimToModelParallelRegion.apply(input_)
+def scatter_to_sequence_parallel_region(input_):
+    return _ScatterToSequenceParallelRegion.apply(input_)
 
 
-def gather_along_first_dim_from_tensor_model_parallel_region(input_):
-    return _GatherAlongFirstDimFromModelParallelRegion.apply(input_)
+def gather_from_seqeuence_parallel_region(input_):
+    return _GatherFromSequenceParallelRegion.apply(input_)
 
 
-def reduce_scatter_along_first_dim_to_tensor_model_parallel_region(input_):
-    return _ReduceScatterAlongFirstDimToModelParallelRegion.apply(input_)
+def reduce_scatter_to_sequence_parallel_region(input_):
+    return _ReduceScatterToSequenceParallelRegion.apply(input_)
 
-
-def reduce_scatter_along_last_dim_to_tensor_model_parallel_region(input_):
-    return _ReduceScatterAlongLastDimToModelParallelRegion.apply(input_)

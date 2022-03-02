@@ -23,6 +23,7 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -417,6 +418,26 @@ def train_step(forward_step_func, data_iterator,
     # Empty unused memory
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
+
+    # All-reduce layernorm parameters across model parallel nodes
+    # when sequence parallelism is used
+    if args.get_tensor_model_parallel_world_size > 1 and \
+            args.model_parallel_memory_opt:
+        grads = []
+        for model_module in model:
+            unwrapped_model = unwrap_model( 
+                model_module, (torchDDP, LocalDDP, Float16Module))
+            for param in unwrapped_model.parameters():
+                if param.get_attr('sequence_parallel', False):
+                    assert param.requires_grad and param.grad is not None
+                    grads.append(param.grad.data)
+        coalesced = _flatten_dense_tensors(grads)
+        coalesced /= mpu.get_tensor_model_parallel_world_size()
+        torch.distributed.all_reduce(
+            coalesced, group=mpu.get_tensor_model_parallel_group())
+        for buf, synced in zip(grads, _unflatten_dense_tensors(
+                coalesced, grads)):
+            buf.copy_(synced)
 
     # All-reduce if needed.
     if args.DDP_impl == 'local':

@@ -29,11 +29,11 @@ from .initialize import get_tensor_model_parallel_rank
 from .initialize import get_tensor_model_parallel_world_size
 from .initialize import get_tensor_model_parallel_group
 from .mappings import copy_to_tensor_model_parallel_region
-from .mappings import gather_along_first_dim_from_tensor_model_parallel_region
-from .mappings import gather_along_last_dim_from_tensor_model_parallel_region
+from .mappings import gather_from_tensor_model_parallel_region
+from .mappings import gather_from_sequence_parallel_region
 from .mappings import reduce_from_tensor_model_parallel_region
-from .mappings import scatter_along_last_dim_to_tensor_model_parallel_region
-from .mappings import reduce_scatter_along_first_dim_to_tensor_model_parallel_region
+from .mappings import scatter_to_tensor_model_parallel_region
+from .mappings import reduce_scatter_to_sequence_parallel_region
 
 from .random import get_cuda_rng_tracker
 from .utils import divide
@@ -328,7 +328,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Set up backprop all-reduce.
             if self.model_parallel_memory_opt:
-                input_parallel = gather_along_first_dim_from_tensor_model_parallel_region(input_)
+                input_parallel = gather_from_sequence_parallel_region(input_)
             else:
                 input_parallel = copy_to_tensor_model_parallel_region(input_)
 
@@ -338,7 +338,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.model_parallel_memory_opt
-            output = gather_along_last_dim_from_tensor_model_parallel_region(output_parallel)
+            output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
@@ -433,12 +433,12 @@ class RowParallelLinear(torch.nn.Module):
             input_parallel = input_
         else:
             assert not self.model_parallel_memory_opt
-            input_parallel = scatter_along_last_dim_to_tensor_model_parallel_region(input_)
+            input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = F.linear(input_parallel, self.weight)
         # All-reduce across all the partitions.
         if self.model_parallel_memory_opt:
-            output_ = reduce_scatter_along_first_dim_to_tensor_model_parallel_region(output_parallel)
+            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:

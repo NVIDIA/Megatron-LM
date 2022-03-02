@@ -67,7 +67,9 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
 
 class MixedFusedLayerNorm(torch.nn.Module):
 
-  def __init__(self, normalized_shape, eps=1e-5, no_persist_layer_norm=True):
+  def __init__(self, normalized_shape, eps=1e-5,
+               no_persist_layer_norm=True,
+               sequence_parallel=False):
         super(MixedFusedLayerNorm, self).__init__()
 
         global fused_mix_prec_layer_norm_cuda
@@ -92,6 +94,11 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.bias = Parameter(torch.Tensor(*normalized_shape))
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
+        self.sequence_parallel = sequence_parallel
+        
+        # set sequence parallelism flag on weight and bias parameters
+        self.weight.sequence_parallel = self.sequence_parallel
+        self.bias.sequence_parallel = self.sequence_parallel
 
 
   def reset_parameters(self):
