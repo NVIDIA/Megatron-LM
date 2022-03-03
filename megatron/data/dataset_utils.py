@@ -334,10 +334,15 @@ def create_masked_lm_predictions(tokens,
                 continue
             # Note(mingdachen):
             # Skip current piece if they are covered in lm masking or previous ngrams.
+
+            skip = False
             for index_set in cand_index_set[0]:
                 for index in index_set:
                     if index in covered_indexes or index in select_indexes:
-                        continue
+                        skip = True
+                        
+            if skip:
+                continue
 
             n = np.random.choice(ngrams[:len(cand_index_set)],
                                  p=pvals[:len(cand_index_set)] /
