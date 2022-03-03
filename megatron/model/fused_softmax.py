@@ -81,6 +81,37 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
         return input_grads, None, None
 
 
+class ScaledSoftmax(torch.autograd.Function):
+    """
+    Fused operation which performs following two operations in sequence
+    1. Scale the tensor.
+    2. Perform softmax.
+    """
+
+    @staticmethod
+    def forward(ctx, inputs, scale):
+        import scaled_softmax_cuda
+
+        scale_t = torch.tensor([scale])
+
+        softmax_results = scaled_softmax_cuda.forward(
+            inputs, scale_t[0]
+        )
+        ctx.save_for_backward(softmax_results, scale_t)
+        return softmax_results
+
+    @staticmethod
+    def backward(ctx, output_grads):
+        import scaled_softmax_cuda
+
+        softmax_results, scale_t = ctx.saved_tensors
+
+        input_grads = scaled_softmax_cuda.backward(
+            output_grads, softmax_results, scale_t[0]
+        )
+        return input_grads, None, None
+
+
 class FusedScaleMaskSoftmax(nn.Module):
     """
     fused operation: scaling + mask + softmax
@@ -137,12 +168,11 @@ class FusedScaleMaskSoftmax(nn.Module):
         if (
             self.scaled_masked_softmax_fusion  # user want to fuse
             and self.input_in_float16  # input must be fp16
-            and mask is not None  # mask tensor must not be None
-            and 16 < sk <= 2048  # sk must be 16 ~ 2048
+            and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
             and attn_batches % 4 == 0  # np * b must be divisor of 4
         ):
-            if 0 <= sk <= 2048:
+            if 0 <= sk <= 4096:
                 batch_per_block = self.get_batch_per_block(sq, sk, b, np)
 
                 if self.attn_mask_type == AttnMaskType.causal:
@@ -166,7 +196,10 @@ class FusedScaleMaskSoftmax(nn.Module):
             return probs.view(b, np, sq, sk)
         else:
             # input is 4D tensor (b, np, sq, sk)
-            return ScaledMaskedSoftmax.apply(input, mask, scale)
+            if mask is not None:
+                return ScaledMaskedSoftmax.apply(input, mask, scale)
+            else:
+                return ScaledSoftmax.apply(input, scale)
 
     def forward_torch_softmax(self, input, mask):
         if self.input_in_float16 and self.softmax_in_fp32:
