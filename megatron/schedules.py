@@ -514,6 +514,21 @@ def get_tensor_shapes(rank, model_type):
     # Otherwise, send one tensor (pre-transpose).
     args = get_args()
     tensor_shapes = []
+
+    if args.model_parallel_memory_opt:
+        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+        if model_type == ModelType.encoder_and_decoder:
+            decoder_seq_length = args.decoder_seq_length // mpu.get_tensor_model_parallel_world_size()
+            if mpu.is_pipeline_stage_before_split(rank):
+                tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
+            else:
+                tensor_shapes.append((decoder_seq_length, args.micro_batch_size, args.hidden_size))
+                tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
+        else:
+            tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
+
+        return tensor_shapes
+
     if model_type == ModelType.encoder_and_decoder:
         if mpu.is_pipeline_stage_before_split(rank):
             # If next rank is after split, then need transpose for encoder_hidden_state.

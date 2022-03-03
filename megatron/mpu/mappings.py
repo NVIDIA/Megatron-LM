@@ -278,7 +278,7 @@ def scatter_to_sequence_parallel_region(input_):
     return _ScatterToSequenceParallelRegion.apply(input_)
 
 
-def gather_from_seqeuence_parallel_region(input_):
+def gather_from_sequence_parallel_region(input_):
     return _GatherFromSequenceParallelRegion.apply(input_)
 
 

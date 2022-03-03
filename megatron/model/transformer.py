@@ -619,6 +619,8 @@ class ParallelTransformer(MegatronModule):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
+        self.layer_type = layer_type
+        self.model_type = args.model_type
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
         self.pre_process = pre_process
@@ -629,7 +631,8 @@ class ParallelTransformer(MegatronModule):
         # Store activation checkpoiting flag.
         self.activations_checkpoint_method = args.activations_checkpoint_method
         self.activations_checkpoint_num_layers = args.activations_checkpoint_num_layers
-        self.distribute_checkpointed_activations = args.distribute_checkpointed_activations
+        self.distribute_checkpointed_activations = \
+            args.distribute_checkpointed_activations and not args.model_parallel_memory_opt
 
         self.model_parallel_memory_opt = args.model_parallel_memory_opt
 
@@ -807,9 +810,9 @@ class ParallelTransformer(MegatronModule):
         )
 
         # Transpose encoder output.
-        if encoder_output is not None:
+        if encoder_output is not None and \
+                not self.model_parallel_memory_opt:
             encoder_output = encoder_output.transpose(0, 1).contiguous()
-
             if self.model_parallel_memory_opt:
                 encoder_output = mpu.scatter_to_sequence_parallel_region(encoder_output)
 
@@ -835,10 +838,15 @@ class ParallelTransformer(MegatronModule):
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = self.final_layernorm(hidden_states)
 
-            if self.model_parallel_memory_opt:
-                hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
+            if self.layer_type==LayerType.encoder and \
+                    self.model_type==ModelType.encoder_and_decoder and \
+                    self.model_parallel_memory_opt:
+                output = hidden_states
+            else:
+                if self.model_parallel_memory_opt:
+                    hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
 
-            output = hidden_states.transpose(0, 1).contiguous()
+                output = hidden_states.transpose(0, 1).contiguous()
         else:
             output = hidden_states
 
