@@ -81,7 +81,7 @@ class MegatronModule(torch.nn.Module):
         # 2. Do an all-reduce between the first and last stage to ensure that
         #    the two copies of word_embeddings start off with the same
         #    parameter values.
-        # 3. In the training loop, before an all-reduce between the grads of
+        # 3. In the training loop perform an all-reduce between the grads of
         #    the two word_embeddings layers to ensure that every applied weight
         #    update is the same on both stages.
         if mpu.is_pipeline_last_stage() and \
