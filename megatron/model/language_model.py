@@ -31,7 +31,6 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
     args = get_args()
-
     # Parallel logits.
     if args.async_tensor_model_parallel_allreduce or\
             args.model_parallel_memory_opt:
