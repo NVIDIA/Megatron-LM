@@ -34,23 +34,21 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     # Parallel logits.
     if args.async_tensor_model_parallel_allreduce or\
             args.model_parallel_memory_opt:
-        input_parallel = input
+        input_parallel = input_
         model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
-            model_parallel
-        model_parallel_memory_opt = args.model_parallel_memory_opt and \
             model_parallel
     else:
         input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
         async_grad_allreduce = False
-        model_parallel_memory_opt = False
 
     # Matrix multiply.
     logits_parallel = mpu.LinearWithGradAccumulationAndAsyncCommunication.apply(
         input_parallel, word_embeddings_weight, bias,
         args.gradient_accumulation_fusion,
-        async_grad_allreduce, model_parallel_memory_opt)
+        async_grad_allreduce, None)
     # Gather if needed.
+
     if parallel_output:
         return logits_parallel
 

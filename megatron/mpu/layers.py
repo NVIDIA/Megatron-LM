@@ -299,12 +299,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.model_parallel_memory_opt:
             handle.wait()
-            return sub_grad_input, grad_weight, grad_bias
+            return sub_grad_input, grad_weight, grad_bias, None, None, None
 
         if ctx.async_grad_allreduce:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias
+        return grad_input, grad_weight, grad_bias, None, None, None
 
 
 class ColumnParallelLinear(torch.nn.Module):
@@ -504,9 +504,9 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.model_parallel_memory_opt
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = LinearWithGradAccumulationAndAsyncAllreduce.apply(
+        output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, None,
-            self.gradient_accumulation_fusion, None)
+            self.gradient_accumulation_fusion, None, None)
         # All-reduce across all the partitions.
         if self.model_parallel_memory_opt:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)

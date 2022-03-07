@@ -291,6 +291,11 @@ def parse_args(extra_args_provider=None, defaults={},
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
+
+    # model parallel memory optmization
+    if args.model_parallel_memory_opt:
+        assert not args.async_tensor_model_parallel_allreduce
+
     _print_args(args)
     return args
 

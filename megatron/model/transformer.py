@@ -881,7 +881,6 @@ class ParallelTransformer(MegatronModule):
                     enc_dec_attn_mask=enc_dec_attn_mask,
                     inference_params=inference_params)
 
-
         # Final layer norm.
         if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
@@ -898,6 +897,5 @@ class ParallelTransformer(MegatronModule):
                 output = hidden_states.transpose(0, 1).contiguous()
         else:
             output = hidden_states
-
 
         return output
