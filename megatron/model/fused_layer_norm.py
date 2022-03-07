@@ -97,8 +97,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.sequence_parallel = sequence_parallel
         
         # set sequence parallelism flag on weight and bias parameters
-        self.weight.sequence_parallel = self.sequence_parallel
-        self.bias.sequence_parallel = self.sequence_parallel
+        setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
+        setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
 
   def reset_parameters(self):

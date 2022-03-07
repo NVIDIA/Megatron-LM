@@ -26,21 +26,31 @@ from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
 
+
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
     args = get_args()
-    
+
     # Parallel logits.
-    if not args.model_parallel_memory_opt:
+    if args.async_tensor_model_parallel_allreduce or\
+            args.model_parallel_memory_opt:
+        input_parallel = input
+        model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
+        async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
+            model_parallel
+        model_parallel_memory_opt = args.model_parallel_memory_opt and \
+            model_parallel
+    else:
         input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
-    else:
-        input_parallel = input_
+        async_grad_allreduce = False
+        model_parallel_memory_opt = False
+
     # Matrix multiply.
-    if bias is None:
-        logits_parallel = F.linear(input_parallel, word_embeddings_weight)
-    else:
-        logits_parallel = F.linear(input_parallel, word_embeddings_weight, bias)
+    logits_parallel = mpu.LinearWithGradAccumulationAndAsyncCommunication.apply(
+        input_parallel, word_embeddings_weight, bias,
+        args.gradient_accumulation_fusion,
+        async_grad_allreduce, model_parallel_memory_opt)
     # Gather if needed.
     if parallel_output:
         return logits_parallel
