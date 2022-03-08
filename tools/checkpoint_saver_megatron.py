@@ -110,6 +110,14 @@ def save_checkpoint(queue, args):
     # margs = megatron args
     margs = get_args()
 
+    if hasattr(md, 'consumed_train_samples'):
+        margs.consumed_train_samples = md.consumed_train_samples
+        margs.consumed_valid_samples = md.consumed_valid_samples
+        print(f"Setting consumed_train_samples to {margs.consumed_train_samples}"
+              f" and consumed_valid_samples to {margs.consumed_valid_samples}")
+    else:
+        print("consumed_train_samples not provided.")
+
     # Determine how to make our models
     if md.model_type == 'GPT':
         from pretrain_gpt import model_provider

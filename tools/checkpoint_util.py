@@ -32,6 +32,10 @@ import os
 #     bert_binary_head - Used only if model_type is BERT
 #     previous_tensor_parallel_size - Optional
 #     previous_pipeline_parallel_size - Optional
+#     true_vocab_size
+#     make_vocab_size_divisble_by
+#     consumed_train_samples
+#     consumed_valid_samples
 # - Position embeddings
 # - Word embeddings
 # - For each transformer layer:
