@@ -437,18 +437,17 @@ def train_step(forward_step_func, data_iterator,
 
     # >>>
     # Reduce gradients.
-    optimizer.reduce_grads(args, timers) # model)
+    optimizer.reduce_grads(args, timers)
     # <<<
 
     # Update parameters.
     timers('optimizer').start()
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(ITERATION)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers, ITERATION)
     timers('optimizer').stop()
 
     # >>>
-    # Gather params gradients. (with distributed optimizer option, optimizer
-    # now responsible for gathering updated params)
-    optimizer.gather_params(ITERATION)
+    # Gather params.
+    optimizer.gather_params(args, timers, ITERATION)
     # <<<
 
     # >>>

@@ -177,10 +177,10 @@ class MegatronOptimizer(ABC):
 
 
     @abstractmethod
-    def step(self):
+    def step(self, args, timers):
         pass
 
-    def gather_params(self, ITERATION):
+    def gather_params(self, args, timers, ITERATION):
         pass
 
     def allreduce_word_embedding_grads(self):
@@ -400,9 +400,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     @torch.no_grad()
-    def step(self, ITERATION):
+    def step(self, args, timers, ITERATION):
 
-        timers = get_timers()
+        # timers = get_timers()
 
         # >>>
         # self.debug_model(ITERATION, "before copy grad.", 0)
@@ -720,7 +720,7 @@ class FP32Optimizer(MegatronOptimizer):
 
 
     @torch.no_grad()
-    def step(self):
+    def step(self, args, timers):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
 
