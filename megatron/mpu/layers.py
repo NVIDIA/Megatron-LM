@@ -215,7 +215,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.model_parallel_memory_opt = model_parallel_memory_opt
-        
+      
         if model_parallel_memory_opt:
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
@@ -487,6 +487,8 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias = Parameter(torch.empty(
                     self.output_size, device=torch.cuda.current_device(),
                     dtype=args.params_dtype))
+            setattr(self.bias, 'sequence_parallel', args.model_parallel_memory_opt)
+
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()
@@ -494,6 +496,7 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
         self.model_parallel_memory_opt = args.model_parallel_memory_opt
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+
 
 
     def forward(self, input_):

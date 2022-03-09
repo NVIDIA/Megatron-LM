@@ -188,6 +188,7 @@ class ParallelAttention(MegatronModule):
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
         self.params_dtype = args.params_dtype
+        self.model_parallel_memory_opt = args.model_parallel_memory_opt
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -391,7 +392,11 @@ class ParallelAttention(MegatronModule):
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-        with mpu.get_cuda_rng_tracker().fork():
+        
+        if not self.model_parallel_memory_opt:
+            with mpu.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
             attention_probs = self.attention_dropout(attention_probs)
 
         # =========================
@@ -865,32 +870,51 @@ class ParallelTransformer(MegatronModule):
             if self.model_parallel_memory_opt:
                 encoder_output = mpu.scatter_to_sequence_parallel_region(encoder_output)
 
-        # Forward pass.
-        if self.activations_checkpoint_method is not None:
-            hidden_states = self._checkpointed_forward(hidden_states,
-                                                       attention_mask,
-                                                       encoder_output,
-                                                       enc_dec_attn_mask)
+        if self.model_parallel_memory_opt:
+            with mpu.get_cuda_rng_tracker().fork():
+                # Forward pass.
+                if self.activations_checkpoint_method is not None:
+                    hidden_states = self._checkpointed_forward(hidden_states,
+                                                               attention_mask,
+                                                               encoder_output,
+                                                               enc_dec_attn_mask)
+                else:
+                    for index in range(self.num_layers):
+                        layer = self._get_layer(index)
+                        hidden_states = layer(
+                            hidden_states,
+                            attention_mask,
+                            encoder_output=encoder_output,
+                            enc_dec_attn_mask=enc_dec_attn_mask,
+                            inference_params=inference_params)
         else:
-            for index in range(self.num_layers):
-                layer = self._get_layer(index)
-                hidden_states = layer(
-                    hidden_states,
-                    attention_mask,
-                    encoder_output=encoder_output,
-                    enc_dec_attn_mask=enc_dec_attn_mask,
-                    inference_params=inference_params)
+            # Forward pass.
+            if self.activations_checkpoint_method is not None:
+                hidden_states = self._checkpointed_forward(hidden_states,
+                                                           attention_mask,
+                                                           encoder_output,
+                                                           enc_dec_attn_mask)
+            else:
+                for index in range(self.num_layers):
+                    layer = self._get_layer(index)
+                    hidden_states = layer(
+                        hidden_states,
+                        attention_mask,
+                        encoder_output=encoder_output,
+                        enc_dec_attn_mask=enc_dec_attn_mask,
+                        inference_params=inference_params)
 
         # Final layer norm.
         if self.post_process:
             # Reverting data format change [s b h] --> [b s h].
             hidden_states = self.final_layernorm(hidden_states)
 
-            if self.layer_type==LayerType.encoder and \
-                    self.model_type==ModelType.encoder_and_decoder and \
+            if self.layer_type == LayerType.encoder and \
+                    self.model_type == ModelType.encoder_and_decoder and \
                     self.model_parallel_memory_opt:
                 output = hidden_states
             else:
+
                 if self.model_parallel_memory_opt:
                     hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
 
