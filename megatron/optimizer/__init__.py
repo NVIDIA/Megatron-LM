@@ -25,11 +25,8 @@ from lutil import pax, tp
 # <<<
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 # >>>
-from .optimizer import (
-    Float16OptimizerWithFloat16Params,
-    Float16DistributedOptimizer,
-    FP32Optimizer,
-)
+from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
+from .distrib_optimizer import DistributedOptimizer
 # <<<
 
 def get_param_groups(modules,
