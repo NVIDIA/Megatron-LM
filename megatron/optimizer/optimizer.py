@@ -180,7 +180,9 @@ class MegatronOptimizer(ABC):
     def step(self, args, timers):
         pass
 
-    def gather_params(self, args, timers, ITERATION):
+    def gather_model_params(self, args, timers, ITERATION):
+        '''For the case of a non-distributed-optimizer, there is nothing to
+        do here.'''
         pass
 
     def allreduce_word_embedding_grads(self):
@@ -236,8 +238,7 @@ class MegatronOptimizer(ABC):
         self.allreduce_word_embedding_grads()
         self.allreduce_position_embedding_grads()
 
-    # def reduce_grads(self, model):
-    def reduce_grads(self, args, timers):
+    def reduce_model_grads(self, args, timers):
 
         # pax(0, {
         #     "*models" : self.models,

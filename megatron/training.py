@@ -437,7 +437,7 @@ def train_step(forward_step_func, data_iterator,
 
     # >>>
     # Reduce gradients.
-    optimizer.reduce_grads(args, timers)
+    optimizer.reduce_model_grads(args, timers)
     # <<<
 
     # Update parameters.
@@ -447,7 +447,7 @@ def train_step(forward_step_func, data_iterator,
 
     # >>>
     # Gather params.
-    optimizer.gather_params(args, timers, ITERATION)
+    optimizer.gather_model_params(args, timers, ITERATION)
     # <<<
 
     # >>>
@@ -464,7 +464,9 @@ def train_step(forward_step_func, data_iterator,
     else:
         skipped_iter = 1
 
-    # Empty unused memory
+    # >>>
+    # Empty unused memory.
+    # <<<
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 

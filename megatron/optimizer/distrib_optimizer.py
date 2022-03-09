@@ -381,21 +381,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return gbuf_view_items
 
-    # def reduce_grads(self, model):
-    def reduce_grads(self, args, timers):
-
-        # >>>
-        # from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-
-        # from megatron import get_args
-        # from megatron import get_timers
-        # from megatron.model import DistributedDataParallel as LocalDDP
-        # from megatron.model import Float16Module
-        # from megatron.utils import unwrap_model
-
-        # args = get_args()
-        # timers = get_timers()
-        # <<<
+    def reduce_model_grads(self, args, timers):
+        '''Note: this is a different order of reduction, versus the non-
+           distributed optimizer, which reduces: 1) all grads, 2) embedding
+           grads.
+        '''
 
         # All-reduce embedding grads.
         timers('backward-embedding-all-reduce').start()
@@ -420,7 +410,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         timers('backward-params-all-reduce').stop()
             
 
-    def gather_params(self, args, timers, ITERATION):
+    def gather_model_params(self, args, timers, ITERATION):
 
         # >>>
         # timers = get_timers()
@@ -454,8 +444,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # pax(0, {"gbuf_view_items": gbuf_view_items})
 
         # >>>
-        # self.debug_main(ITERATION, "after/inside gather_params.", 0)
-        # self.debug_model(ITERATION, "after/inside gather_params.", 0)
+        # self.debug_main(ITERATION, "after/inside gather_model_params.", 0)
+        # self.debug_model(ITERATION, "after/inside gather_model_params.", 0)
 
         # if ITERATION == 2:
         #     pax(1, {
