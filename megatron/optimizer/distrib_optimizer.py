@@ -321,45 +321,51 @@ class DistributedOptimizer(MegatronOptimizer):
         # Initialize main params.
         self._copy_model_params_to_main_params()
 
-    @staticmethod
-    def has_nan_debug(tensors):
-        if isinstance(tensors, torch.Tensor):
-            tensors = [ tensors ]
-        assert isinstance(tensors, list)
-        has_nans = [ (not torch.all(torch.isfinite(t)).item()) for t in tensors ]
-        has_nan = any(has_nans)
-        return has_nan
-    def get_local_model_param_views(self):
-        '''** FOR DEBUGGING. **'''
-        model_param_views = []
-        for group_index, opt_group_shard in enumerate(self.opt_group_shards):
-            for param, opt_shard in opt_group_shard["param_map"].items():
-                model_index, dtype = self.param_gbuf_map[param]
-                gbuf_shard_map = \
-                    self.model_gbuf_shards[model_index][dtype]["param_map"][param]
-                model_param_shard = gbuf_shard_map["param"]
-                model_param_views.append(
-                    param.view(-1)[model_param_shard.start:model_param_shard.end])
-        return model_param_views
-    def get_local_model_grad_views(self):
-        '''** FOR DEBUGGING. **'''
-        model_grad_views = []
-        for group_index, opt_group_shard in enumerate(self.opt_group_shards):
-            for param, opt_shard in opt_group_shard["param_map"].items():
-                model_index, dtype = self.param_gbuf_map[param]
-                gbuf = self.models[model_index]._grad_buffers[dtype].data
-                gbuf_shard_map = \
-                    self.model_gbuf_shards[model_index][dtype]["param_map"][param]
-                gbuf_world_shard = gbuf_shard_map["gbuf_world"]
-                model_grad_views.append(
-                    gbuf[gbuf_world_shard.start:gbuf_world_shard.end])
-        return model_grad_views
-    def get_world_model_params(self):
-        '''** FOR DEBUGGING. **'''
-        return [ p for m in self.models for p in m.parameters() ]
-    def get_world_model_grads(self):
-        '''** FOR DEBUGGING. **'''
-        return [ p.main_grad for p in self.get_world_model_params() ]
+    def get_model_parallel_group(self):
+        # >>>
+        # i.e., no param replication across this group
+        # <<<
+        return None
+
+    # @staticmethod
+    # def has_nan_debug(tensors):
+    #     if isinstance(tensors, torch.Tensor):
+    #         tensors = [ tensors ]
+    #     assert isinstance(tensors, list)
+    #     has_nans = [ (not torch.all(torch.isfinite(t)).item()) for t in tensors ]
+    #     has_nan = any(has_nans)
+    #     return has_nan
+    # def get_local_model_param_views(self):
+    #     '''** FOR DEBUGGING. **'''
+    #     model_param_views = []
+    #     for group_index, opt_group_shard in enumerate(self.opt_group_shards):
+    #         for param, opt_shard in opt_group_shard["param_map"].items():
+    #             model_index, dtype = self.param_gbuf_map[param]
+    #             gbuf_shard_map = \
+    #                 self.model_gbuf_shards[model_index][dtype]["param_map"][param]
+    #             model_param_shard = gbuf_shard_map["param"]
+    #             model_param_views.append(
+    #                 param.view(-1)[model_param_shard.start:model_param_shard.end])
+    #     return model_param_views
+    # def get_local_model_grad_views(self):
+    #     '''** FOR DEBUGGING. **'''
+    #     model_grad_views = []
+    #     for group_index, opt_group_shard in enumerate(self.opt_group_shards):
+    #         for param, opt_shard in opt_group_shard["param_map"].items():
+    #             model_index, dtype = self.param_gbuf_map[param]
+    #             gbuf = self.models[model_index]._grad_buffers[dtype].data
+    #             gbuf_shard_map = \
+    #                 self.model_gbuf_shards[model_index][dtype]["param_map"][param]
+    #             gbuf_world_shard = gbuf_shard_map["gbuf_world"]
+    #             model_grad_views.append(
+    #                 gbuf[gbuf_world_shard.start:gbuf_world_shard.end])
+    #     return model_grad_views
+    # def get_world_model_params(self):
+    #     '''** FOR DEBUGGING. **'''
+    #     return [ p for m in self.models for p in m.parameters() ]
+    # def get_world_model_grads(self):
+    #     '''** FOR DEBUGGING. **'''
+    #     return [ p.main_grad for p in self.get_world_model_params() ]
 
     def get_main_params(self):
         return [ g["params"][0] for g in self.optimizer.param_groups ]

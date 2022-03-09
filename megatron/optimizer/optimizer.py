@@ -182,7 +182,8 @@ class MegatronOptimizer(ABC):
     param_groups = property(_get_param_groups, _set_param_groups)
 
 
-class BaseFloat16Optimizer(MegatronOptimizer):
+# class BaseFloat16Optimizer(MegatronOptimizer):
+class MixedPrecisionOptimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
@@ -222,6 +223,10 @@ class BaseFloat16Optimizer(MegatronOptimizer):
             self._scale_one = torch.cuda.FloatTensor([1.0])
 
 
+    @abstractmethod
+    def get_model_parallel_group(self, state_dict):
+        pass
+
     def get_loss_scale(self):
         if self.grad_scaler is None:
             return self._scale_one
@@ -232,7 +237,7 @@ class BaseFloat16Optimizer(MegatronOptimizer):
         self._copy_model_params_to_main_params()
 
 
-    def _unscale_main_grads_and_check_for_nan(self):
+    def _unscale_main_grads_and_check_for_nan(self, group):
 
         # Collect main grads.
         main_grads = self._collect_main_grad_data_for_unscaling()
@@ -246,13 +251,14 @@ class BaseFloat16Optimizer(MegatronOptimizer):
             main_grads, self.found_inf, self.grad_scaler.inv_scale)
 
         # Update across all model parallel instances.
-        # >>>
+        if args.use_# >>>
         # torch.distributed.all_reduce(self.found_inf,
         #                              op=torch.distributed.ReduceOp.MAX,
         #                              group=mpu.get_model_parallel_group())
         # +++
         torch.distributed.all_reduce(self.found_inf,
-                                     op=torch.distributed.ReduceOp.MAX)
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=self.get_model_parallel_group())
         # <<<
 
         # Check for nan.
@@ -515,6 +521,10 @@ class Float16OptimizerWithFloat16Params(BaseFloat16Optimizer):
         #     "grads" : [ (param_is_not_tensor_parallel_duplicate(p.grad), tp(p.grad)) for p in params ],
         # })
         # <<<
+
+
+    def get_model_parallel_group(self):
+        return mpu.get_model_parallel_group())
 
 
     def zero_grad(self, set_to_none=True):
