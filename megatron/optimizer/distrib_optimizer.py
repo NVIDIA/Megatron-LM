@@ -17,8 +17,13 @@
 
 
 import math
+import torch
 
 from megatron import get_args
+from megatron import get_timers
+from megatron import mpu
+
+from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
 # >>>
 from lutil import pax, tp
@@ -40,7 +45,8 @@ class Shard:
 # class Float16DistributedOptimizer(Float16OptimizerWithFloat16Params):
 # class Float16DistributedOptimizer(MegatronOptimizer):
 # class Float16DistributedOptimizer(BaseFloat16Optimizer):
-class DistributedOptimizer(MegatronOptimizer):
+# class DistributedOptimizer(MegatronOptimizer):
+class DistributedOptimizer(MixedPrecisionOptimizer):
 
     @classmethod
     def get_model_gbuf_param_shard_map(cls, model, dtype, gbuf_world_shard):

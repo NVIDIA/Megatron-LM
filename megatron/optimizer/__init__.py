@@ -91,18 +91,6 @@ def get_megatron_optimizer(model,
                                     scale_lr_cond,
                                     lr_mult)
 
-    # >>>
-    # params = [ p for m in model for p in m.parameters() ]
-    # pax(0, {
-    #     "params" : [ (p.tensor_model_parallel, tp(p)) for p in params ],
-    # })
-    # <<<
-
-    # >>>
-    # if args.use_distributed_optimizer:
-    #     optimizer = DistributedFusedAdam(param_groups)
-    # elif args.optimizer == 'adam':
-    # <<<
     if args.optimizer == 'adam':
         optimizer = Adam(param_groups,
                          lr=args.lr,
@@ -123,7 +111,7 @@ def get_megatron_optimizer(model,
     if args.DDP_impl == 'local':
         params_have_main_grad = True
 
-    if args.fp16 or args.bf16:
+    if args.fp16 or args.bf16 or args.use_distributed_optimizer:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -148,10 +136,10 @@ def get_megatron_optimizer(model,
 
         # Megatron optimizer.
         # >>>
-        opt_ty = Float16DistributedOptimizer \
-            if args.use_distributed_optimizer \
-            else Float16OptimizerWithFloat16Params
-        opt = opt_ty(optimizer,
+        opt_ty = DistributedOptimizer \
+            if args.use_distributed_optimizer else \
+            Float16OptimizerWithFloat16Params
+        return opt_ty(optimizer,
                       args.clip_grad,
                       args.log_num_zeros_in_grad,
                       params_have_main_grad,
@@ -159,20 +147,16 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       grad_scaler,
                       model)
-        # >>>
-        # opt.debug_main_param_sum(0, "after init")
-        # opt.debug_main_grad_sum(0, "after init")
-        # <<<
-        return opt
         # <<<
 
     # FP32.
     # >>>
-    opt_ty = Float32DistributedOptimizer \
-        if args.use_distributed_optimizer \
-           else Float32Optimizer
-    return opt_ty(optimizer, args.clip_grad,
-                  args.log_num_zeros_in_grad,
-                  params_have_main_grad,
-                  args.use_contiguous_buffers_in_local_ddp)
+    # opt_ty = Float32DistributedOptimizer \
+    #     if args.use_distributed_optimizer \
+    #        else Float32Optimizer
+    # return opt_ty(optimizer, args.clip_grad,
     # <<<
+    return Float32Optimizer(optimizer, args.clip_grad,
+                            args.log_num_zeros_in_grad,
+                            params_have_main_grad,
+                            args.use_contiguous_buffers_in_local_ddp)

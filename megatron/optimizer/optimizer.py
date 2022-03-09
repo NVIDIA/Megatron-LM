@@ -98,14 +98,23 @@ class MegatronOptimizer(ABC):
         return params
 
 
+    def get_model_parallel_group(self):
+        '''Default returned here, but the distributed optimizer overrides this.'''
+        return mpu.get_model_parallel_group()
+
+
     def clip_grad_norm(self, clip_grad, ITERATION):
         params = self.get_parameters()
-        return clip_grad_norm_fp32(params, clip_grad, ITERATION = ITERATION)
+        return clip_grad_norm_fp32(
+            params, clip_grad,
+            model_parallel_group=self.get_model_parallel_group(),
+            ITERATION = ITERATION)
 
 
     def count_zeros(self):
         params = self.get_parameters()
-        return count_zeros_fp32(params)
+        return count_zeros_fp32(params,
+                                model_parallel_group=self.get_model_parallel_group())
 
 
     @abstractmethod
@@ -171,7 +180,7 @@ class MegatronOptimizer(ABC):
     def step(self):
         pass
 
-    def gather_params(self):
+    def gather_params(self, ITERATION):
         pass
 
     def reduce_grads(self, model):
@@ -282,10 +291,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self._scale_one = torch.cuda.FloatTensor([1.0])
 
 
-    @abstractmethod
-    def get_model_parallel_group(self, state_dict):
-        pass
-
     def get_loss_scale(self):
         if self.grad_scaler is None:
             return self._scale_one
@@ -296,7 +301,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self._copy_model_params_to_main_params()
 
 
-    def _unscale_main_grads_and_check_for_nan(self, group):
+    def _unscale_main_grads_and_check_for_nan(self):
 
         # Collect main grads.
         main_grads = self._collect_main_grad_data_for_unscaling()
@@ -526,10 +531,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # Leverage state_dict() and load_state_dict() to
         # recast preexisting per-param state tensors
         self.optimizer.load_state_dict(self.optimizer.state_dict())
-
-
-    def get_model_parallel_group(self):
-        return mpu.get_model_parallel_group()
 
 
     def zero_grad(self, set_to_none=True):

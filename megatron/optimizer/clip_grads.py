@@ -21,7 +21,9 @@ from torch._six import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from megatron import mpu
+# >>>
+# from megatron import mpu
+# <<<
 from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
@@ -31,7 +33,9 @@ from lutil import pax, tp
 DEBUG_ITERATION = 1
 # <<<
 
-def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
+def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
+                        model_parallel_group=None,
+                        ITERATION=None):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -45,13 +49,15 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
+        model_parallel_group (group): due to the nature of the distributed
+            optimizer, this is passed as an argument.
 
     Returns:
         Total norm of the parameters (viewed as a single vector).
     """
 
     # >>>
-    raise Exception("currently debugging ... don't call me.")
+    # raise Exception("currently debugging ... don't call me.")
     # <<<
 
     if isinstance(parameters, torch.Tensor):
@@ -75,26 +81,6 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
             grads.append(grad)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
             grads_for_norm.append(grad)
-        # >>>
-        # else:
-        #     pax(1, {
-        #         "grad_not_none" : grad_not_none,
-        #         "is_not_shared" : is_not_shared,
-        #         "is_not_tp_duplicate" : is_not_tp_duplicate,
-        #     })
-        # <<<
-
-    # >>>
-    # if ITERATION == DEBUG_ITERATION:
-    #     pax(0, {
-    #         "[LOC]" : "[** BEFORE CALC NORM **]",
-    #         "[ITERATION]" : ITERATION,
-    #         "max_norm" : max_norm,
-    #         "parameters" : parameters,
-    #         # "grads" : grads,
-    #         "grads_for_norm" : grads_for_norm,
-    #     })
-    # <<<
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -108,7 +94,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
         # Take max across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm_cuda,
                                      op=torch.distributed.ReduceOp.MAX,
-                                     group=mpu.get_model_parallel_group())
+                                     group=model_parallel_group)
         total_norm = total_norm_cuda[0].item()
 
     else:
@@ -117,13 +103,6 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            # >>>
-            # pax(1, {
-            #     # "fn" : amp_C.multi_tensor_l2norm,
-            #     "dummy_overflow_buf" : tp(dummy_overflow_buf),
-            #     "grads_for_norm" : grads_for_norm,
-            # })
-            # <<<
             grad_norm, _ = multi_tensor_applier(
                 amp_C.multi_tensor_l2norm,
                 dummy_overflow_buf,
@@ -139,18 +118,6 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm ** norm_type
 
-        # >>>
-        # if ITERATION == DEBUG_ITERATION:
-        #     pax(0, {
-        #         "[LOC]" : "[** CALC NORM **]",
-        #         "[ITERATION]" : ITERATION,
-        #         "max_norm" : max_norm,
-        #         "norm_type" : norm_type,
-        #         "grad_norm" : tp(grad_norm),
-        #         "total_norm" : tp(total_norm),
-        #     })
-        # <<<
-
         # Sum across all model-parallel GPUs.
         # >>>
         from megatron import get_args
@@ -161,21 +128,9 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
         else:
             torch.distributed.all_reduce(total_norm,
                                          op=torch.distributed.ReduceOp.SUM,
-                                         group=mpu.get_model_parallel_group())
+                                         group=model_parallel_group)
         # <<<
         total_norm = total_norm.item() ** (1.0 / norm_type)
-
-        # >>>
-        # if ITERATION == DEBUG_ITERATION:
-        #     pax(0, {
-        #         "[LOC]" : "[** AFTER REDUCE. **]",
-        #         "[ITERATION]" : ITERATION,
-        #         "max_norm" : max_norm,
-        #         "norm_type" : norm_type,
-        #         "grad_norm" : grad_norm.item(),
-        #         "total_norm" : total_norm,
-        #     })
-        # <<<
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
@@ -186,22 +141,10 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2, ITERATION=None):
                              [grads, grads],
                              clip_coeff)
 
-    # >>>
-    # # from pygit2 import Repository
-    # if ITERATION == DEBUG_ITERATION:
-    #     pax(1, {
-    #         "[LOC]" : "[** CLIP / FINAL **]",
-    #         "[ITERATION]" : ITERATION,
-    #         "grads" : grads,
-    #         "clip_coeff" : tp(clip_coeff),
-    #         # "repo" : Repository('.').head.shorthand,
-    #     })
-    # <<<
-
     return total_norm
 
 
-def count_zeros_fp32(parameters):
+def count_zeros_fp32(parameters, model_parallel_group):
 
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
@@ -231,7 +174,7 @@ def count_zeros_fp32(parameters):
     else:
         torch.distributed.all_reduce(total_num_zeros,
                                      op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_model_parallel_group())
+                                     group=model_parallel_group)
     # <<<
 
     total_num_zeros = total_num_zeros.item()
