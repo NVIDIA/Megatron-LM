@@ -436,29 +436,8 @@ def train_step(forward_step_func, data_iterator,
     # <<<
 
     # >>>
-    # Reduce gradients. (with distributed optimizer option, optimizer
-    # now responsible for reducing gradients)
-    optimizer.reduce_grads(model)
-    # <<<
-
-    # >>>
-    # r = mpu.get_data_parallel_rank()
-    # w = mpu.get_data_parallel_world_size()
-    # gbufs = []
-    # for m in model:
-    #     for g in m._grad_buffers.values():
-    #         t = g.data
-    #         n = t.nelement()
-    #         shard = int(n / w)
-    #         start_index = r * shard
-    #         end_index = min(n, start_index + shard)
-    #         gbufs.append(t[start_index:end_index])
-    # pax(1, {"gbufs": gbufs})
-    # <<<
-
-    # >>>
-    # from lutil import pax
-    # pax(0, {"optimizer": optimizer})
+    # Reduce gradients.
+    optimizer.reduce_grads(args, timers) # model)
     # <<<
 
     # Update parameters.

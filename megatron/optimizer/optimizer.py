@@ -183,33 +183,15 @@ class MegatronOptimizer(ABC):
     def gather_params(self, ITERATION):
         pass
 
-    def reduce_grads(self, model):
+    def allreduce_word_embedding_grads(self):
+        '''
+        All-reduce word embedding grads.
 
-        # >>>
-        from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+        Reduce grads across first and last stages to ensure that word_embeddings
+        parameters stay in sync. This should only run for models that support
+        pipelined model parallelism (BERT and GPT-2).
+        '''
 
-        from megatron import get_args
-        from megatron import get_timers
-        from megatron.model import DistributedDataParallel as LocalDDP
-        from megatron.model import Float16Module
-        from megatron.utils import unwrap_model
-
-        args = get_args()
-        timers = get_timers()
-        # <<<
-
-        # All-reduce if needed.
-        if args.DDP_impl == 'local':
-            timers('backward-params-all-reduce').start()
-            for model_module in model:
-                model_module.allreduce_gradients()
-            timers('backward-params-all-reduce').stop()
-
-        # All-reduce word_embeddings' grad across first and last stages to ensure
-        # that word_embeddings parameters stay in sync.
-        # This should only run for models that support pipelined model parallelism
-        # (BERT and GPT-2).
-        timers('backward-embedding-all-reduce').start()
         if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
                 mpu.get_pipeline_model_parallel_world_size() > 1:
             # >>>
@@ -232,15 +214,16 @@ class MegatronOptimizer(ABC):
                     grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
-        # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
-        # stages to ensure that position embeddings parameters stay in sync.
-        # This should only run for T5 models with pipeline parallelism
+    def allreduce_position_embedding_grads(self):
+        '''
+        All-reduce position_embeddings grad across first (encoder) and
+        split (decoder) stages to ensure that position embeddings parameters
+        stay in sync. This should only run for T5 models with pipeline
+        parallelism.
+        '''
         if mpu.is_rank_in_position_embedding_group() and \
                 mpu.get_pipeline_model_parallel_world_size() > 1 and \
                 args.pipeline_model_parallel_split_rank is not None:
-            # >>>
-            raise Exception("[main] ready for t5 sync?")
-            # <<<
             unwrapped_model = model[0]
             unwrapped_model = unwrap_model(
                 unwrapped_model, (torchDDP, LocalDDP, Float16Module))
@@ -248,7 +231,44 @@ class MegatronOptimizer(ABC):
                 'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
             torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+
+    def allreduce_embedding_grads(self):
+        self.allreduce_word_embedding_grads()
+        self.allreduce_position_embedding_grads()
+
+    # def reduce_grads(self, model):
+    def reduce_grads(self, args, timers):
+
+        # pax(0, {
+        #     "*models" : self.models,
+        #     "model" : model,
+        # })
+
+        # >>>
+        # from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+
+        # from megatron import get_args
+        # from megatron import get_timers
+        # from megatron.model import DistributedDataParallel as LocalDDP
+        # from megatron.model import Float16Module
+        # from megatron.utils import unwrap_model
+
+        # args = get_args()
+        # timers = get_timers()
+        # <<<
+
+        # All-reduce if needed.
+        if args.DDP_impl == 'local':
+            timers('backward-params-all-reduce').start()
+            for model_module in self.models:
+                model_module.allreduce_gradients()
+            timers('backward-params-all-reduce').stop()
+
+        # All-reduce embedding grads.
+        timers('backward-embedding-all-reduce').start()
+        self.allreduce_embedding_grads()
         timers('backward-embedding-all-reduce').stop()
+
 
 # class BaseFloat16Optimizer(MegatronOptimizer):
 class MixedPrecisionOptimizer(MegatronOptimizer):
