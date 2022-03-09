@@ -156,7 +156,8 @@ def get_megatron_optimizer(model,
     #        else Float32Optimizer
     # return opt_ty(optimizer, args.clip_grad,
     # <<<
-    return Float32Optimizer(optimizer, args.clip_grad,
-                            args.log_num_zeros_in_grad,
-                            params_have_main_grad,
-                            args.use_contiguous_buffers_in_local_ddp)
+    return FP32Optimizer(optimizer, args.clip_grad,
+                         args.log_num_zeros_in_grad,
+                         params_have_main_grad,
+                         args.use_contiguous_buffers_in_local_ddp,
+                         model)

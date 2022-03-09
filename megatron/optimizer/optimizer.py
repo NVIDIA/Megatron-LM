@@ -75,7 +75,8 @@ class MegatronOptimizer(ABC):
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
                  params_have_main_grad,
-                 use_contiguous_buffers_in_local_ddp):
+                 use_contiguous_buffers_in_local_ddp,
+                 models):
 
         """Input optimizer is the base optimizer for example Adam."""
         self.optimizer = optimizer
@@ -85,6 +86,10 @@ class MegatronOptimizer(ABC):
         self.log_num_zeros_in_grad = log_num_zeros_in_grad
         self.params_have_main_grad = params_have_main_grad
         self.use_contiguous_buffers_in_local_ddp = use_contiguous_buffers_in_local_ddp
+
+        # 'models' are retained for access to the contiguous grad buffers.
+        # (see distributed optimizer)
+        self.models = models
 
         if self.use_contiguous_buffers_in_local_ddp:
             assert self.params_have_main_grad, \
@@ -260,11 +265,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            models)
 
-        # >>>
-        self.models = models
-        # <<<
         self.bf16 = bf16
         self.grad_scaler = grad_scaler
         # None grad scaler is only supported for bf16.
@@ -381,8 +384,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self, args, timers, ITERATION):
-
-        # timers = get_timers()
 
         # >>>
         # self.debug_model(ITERATION, "before copy grad.", 0)
@@ -608,16 +609,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     if not self.use_contiguous_buffers_in_local_ddp:
                         model_param.main_grad = None
 
-        # >>>
-        # if ITERATION == DEBUG_ITERATION:
-        #     pax(0, {
-        #         "** branch **" : "** main. **",
-        #         "ITERATION" : ITERATION,
-        #         "model grads" :
-        #         [ p.main_grad for m in self.models for p in m.parameters() ],
-        #     })
-        # <<<
-
 
     def _copy_main_params_to_model_params(self, ITERATION):
         # Only needed for the float16 params.
@@ -679,11 +670,13 @@ class FP32Optimizer(MegatronOptimizer):
     def __init__(self, optimizer, clip_grad,
                  log_num_zeros_in_grad,
                  params_have_main_grad,
-                 use_contiguous_buffers_in_local_ddp):
+                 use_contiguous_buffers_in_local_ddp,
+                 models):
 
         super(FP32Optimizer, self).__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp)
+            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            models)
 
         self._scale = torch.cuda.FloatTensor([1.0])
 
@@ -700,7 +693,7 @@ class FP32Optimizer(MegatronOptimizer):
 
 
     @torch.no_grad()
-    def step(self, args, timers):
+    def step(self, args, timers, ITERATION):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
 
@@ -719,7 +712,7 @@ class FP32Optimizer(MegatronOptimizer):
         # Clip gradients.
         grad_norm = None
         if self.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.clip_grad)
+            grad_norm = self.clip_grad_norm(self.clip_grad, ITERATION)
 
         # count the zeros in the grads
         num_zeros_in_grad = self.count_zeros() if \
