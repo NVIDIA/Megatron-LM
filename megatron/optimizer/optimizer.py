@@ -196,9 +196,6 @@ class MegatronOptimizer(ABC):
 
         if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
                 mpu.get_pipeline_model_parallel_world_size() > 1:
-            # >>>
-            # raise Exception("[main] ready for weight sync?")
-            # <<<
             if mpu.is_pipeline_first_stage(ignore_virtual=True):
                 unwrapped_model = model[0]
             elif mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -240,29 +237,11 @@ class MegatronOptimizer(ABC):
 
     def reduce_model_grads(self, args, timers):
 
-        # pax(0, {
-        #     "*models" : self.models,
-        #     "model" : model,
-        # })
-
-        # >>>
-        # from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-
-        # from megatron import get_args
-        # from megatron import get_timers
-        # from megatron.model import DistributedDataParallel as LocalDDP
-        # from megatron.model import Float16Module
-        # from megatron.utils import unwrap_model
-
-        # args = get_args()
-        # timers = get_timers()
-        # <<<
-
         # All-reduce if needed.
         if args.DDP_impl == 'local':
             timers('backward-params-all-reduce').start()
-            for model_module in self.models:
-                model_module.allreduce_gradients()
+            for model in self.models:
+                model.allreduce_gradients()
             timers('backward-params-all-reduce').stop()
 
         # All-reduce embedding grads.
