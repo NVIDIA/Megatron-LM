@@ -15,6 +15,9 @@
 
 from abc import ABC
 from abc import abstractmethod
+# >>>
+import math
+# <<<
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -27,14 +30,16 @@ from .module import MegatronModule
 
 class MemoryBuffer:
 
-    def __init__(self, numel, dtype):
+    # >>>
+    def __init__(self, numel, numel_padded, dtype):
         self.numel = numel
+        self.numel_padded = numel_padded
         self.dtype = dtype
-        self.data = torch.zeros(self.numel,
+        self.data = torch.zeros(self.numel_padded,
                                 dtype=self.dtype,
                                 device=torch.cuda.current_device(),
                                 requires_grad=False)
-
+    # <<<
 
     def zero(self):
         """Reset the buffer to zero."""
@@ -132,6 +137,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # self._grad_buffer_param_offsets = defaultdict(dict)
             # self._grad_buffer_param_index_map = defaultdict(dict)
             self._grad_buffer_param_index_map = {}
+            data_parallel_world_size = mpu.get_data_parallel_world_size()
             # <<<
 
             # Simple function to define buffer type.
@@ -149,7 +155,31 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
             # Allocate the buffer.
             for dtype, num_elements in type_num_elements.items():
-                self._grad_buffers[dtype] = MemoryBuffer(num_elements, dtype)
+
+                # >>>
+                # If using distributed optimizer, pad memory buffer to be
+                # multiple of data_parallel_world_size. (This padding is done
+                # due to a constraint with the reduce_scatter op, which requires
+                # all tensors have equal size. See: optimizer.py.)
+                num_elements_padded = data_parallel_world_size * \
+                    int(math.ceil(num_elements / data_parallel_world_size))
+                # <<<
+
+                # Allocate grad buffer.
+                self._grad_buffers[dtype] = MemoryBuffer(num_elements,
+                                                         num_elements_padded,
+                                                         dtype)
+                # >>>
+                # from lutil import pax
+                # if True or num_elements % data_parallel_world_size != 0:
+                #     pax(0, {
+                #         "data_parallel_world_size" : data_parallel_world_size,
+                #         "num_elements" : num_elements,
+                #         "num_elements_padded" : num_elements_padded,
+                #         "modulo" : num_elements % data_parallel_world_size,
+                #         "grad buffer" : self._grad_buffers[dtype],
+                #     })
+                # <<<
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
