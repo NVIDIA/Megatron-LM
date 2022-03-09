@@ -309,37 +309,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         _zero_grad_group_helper(model_params, set_to_none = False)
         # _zero_grad_group_helper(params, set_to_none = False)
 
-    # def get_model_grad_buffer_dp_views(self):
-
-    #     # >>>
-    #     # ** only contiguous grad buffer supported, for now [ TEMPORARY ] **
-    #     args = get_args()
-    #     assert args.use_contiguous_buffers_in_local_ddp
-    #     # <<<
-
-    #     # Grad buffer views.
-    #     gbuf_view_items = []
-    #     for model_index, model in enumerate(self.models):
-    #         for dtype, gbuf_shard in self.model_gbuf_shards[model_index].items():
-    #             world_shards = gbuf_shard["world_all"]
-    #             gbuf = model._grad_buffers[dtype].data
-    #             gbuf_views = [ gbuf[s.start:s.end] for s in world_shards ]
-    #             gbuf_view_items.append((model_index, dtype, gbuf_views))
-
-    #             # pax(0, {
-    #             #     "world_shards" : world_shards,
-    #             #     "gbuf_views" : gbuf_views,
-    #             # })
-
-    #     pax(0, {
-    #         "gbuf_view_items" : gbuf_view_items,
-    #         **{
-    #             "views / %d" % i : item[2]
-    #             for i, item in enumerate(gbuf_view_items)
-    #         },
-    #     })
-
-    #     return gbuf_view_items
     def get_model_grad_buffer_dp_views(self):
 
         data_parallel_world_size = mpu.get_data_parallel_world_size()
