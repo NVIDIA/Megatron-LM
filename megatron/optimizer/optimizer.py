@@ -99,9 +99,6 @@ class MegatronOptimizer(ABC):
 
 
     def clip_grad_norm(self, clip_grad, ITERATION):
-        # >>>
-        return
-        # <<<
         params = self.get_parameters()
         return clip_grad_norm_fp32(params, clip_grad, ITERATION = ITERATION)
 
