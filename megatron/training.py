@@ -432,7 +432,7 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # >>>
-    # optimizer.debug_model(ITERATION, "before reduce grads.", 0)
+    # optimizer.debug_model(ITERATION, "before reduce grads.", 1)
     # <<<
 
     # >>>
@@ -451,7 +451,7 @@ def train_step(forward_step_func, data_iterator,
     # <<<
 
     # >>>
-    # optimizer.debug_model(ITERATION, "after gather params.", 0)
+    optimizer.debug_model(ITERATION, "after gather params.", 0)
     # <<<
 
     # Update learning rate.

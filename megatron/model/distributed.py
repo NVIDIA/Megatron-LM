@@ -126,19 +126,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # the case we use continuous buffers.
         # ===================================
         self._grad_buffers = None
-        # >>>
-        # from collections import defaultdict
-        # self._grad_buffer_param_offsets = None
         self._grad_buffer_param_index_map = None
-        # <<<
         if self.use_contiguous_buffers:
             self._grad_buffers = {}
-            # >>>
-            # self._grad_buffer_param_offsets = defaultdict(dict)
-            # self._grad_buffer_param_index_map = defaultdict(dict)
             self._grad_buffer_param_index_map = {}
             data_parallel_world_size = mpu.get_data_parallel_world_size()
-            # <<<
 
             # Simple function to define buffer type.
             def _get_buffer_type(param):
