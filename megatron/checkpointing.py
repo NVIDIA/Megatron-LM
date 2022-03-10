@@ -295,23 +295,6 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def get_iteration_release_from_tracker(load_dir):
-    # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
-
-    # If no tracker file, return iretation zero.
-    if not os.path.isfile(tracker_filename):
-        print_rank_0('WARNING: could not find the metadata file {} '.format(
-            tracker_filename))
-        print_rank_0('    will not load any checkpoints and will start from '
-                     'random')
-        return 0
-
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration, release = read_metadata(tracker_filename)
-    return iteration, release
-
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True, iteration=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -324,8 +307,22 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     model = utils.unwrap_model(model)
 
     if iteration is None:
-        iteration, release = get_iteration_release_from_tracker(load_dir)
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+
+        # If no tracker file, return iretation zero.
+        if not os.path.isfile(tracker_filename):
+            print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+            print_rank_0('    will not load any checkpoints and will start from '
+                        'random')
+            return 0
+
+        # Otherwise, read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration, release = read_metadata(tracker_filename)
     else:
+        # Iteration given as argument: do nothing
         release = False
 
     # Checkpoint.
