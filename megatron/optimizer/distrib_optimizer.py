@@ -334,7 +334,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # All-reduce embedding grads.
         timers('backward-embedding-all-reduce').start()
-        self.allreduce_embedding_grads()
+        self.allreduce_embedding_grads(args)
         timers('backward-embedding-all-reduce').stop()
 
         # Reduce-scatter all grads.
