@@ -479,6 +479,9 @@ def _add_training_args(parser):
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
+    group.add_argument('--checkpoint-attention', action='store_true',
+                       help='Checkpoint activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
     group.add_argument('--distribute-checkpointed-activations',
                        action='store_true',
                        help='If set, distribute checkpointed activations '
