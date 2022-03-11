@@ -457,7 +457,7 @@ def train_step(forward_step_func, data_iterator,
     # <<<
 
     # >>>
-    optimizer.debug_model(ITERATION, "after gather params.", 0)
+    # optimizer.debug_model(ITERATION, "after gather params.", 0)
     # <<<
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
