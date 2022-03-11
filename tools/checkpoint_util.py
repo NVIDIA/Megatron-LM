@@ -2,6 +2,7 @@ import argparse
 import importlib
 import torch.multiprocessing as mp
 import os
+import sys
 
 # A loader is a python file with at least two functions
 # - add_arguments - takes in a parser and adds any arguments needed
@@ -76,12 +77,10 @@ def load_plugin(plugin_type, name):
         try:
             plugin = importlib.import_module(module_name)
         except ModuleNotFoundError:
-            print(f"Unable to load {plugin_type} plugin {name}. Exiting.")
-            exit
+            sys.exit(f"Unable to load {plugin_type} plugin {name}. Exiting.")
 
     if not hasattr(plugin, 'add_arguments'):
-        print(f"{module_name} module is not a plugin. Exiting.")
-        exit
+        sys.exit(f"{module_name} module is not a plugin. Exiting.")
 
     print(f"Loaded {module_name} as the {plugin_type}.")
     return plugin
