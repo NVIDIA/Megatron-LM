@@ -177,12 +177,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def allocate_main_param_shards(cls, opt_group_shards):
 
         # Allocator method.
+        # >>>
         allocate_shard = lambda shard_size, dtype : torch.empty(
             (shard_size,),
             dtype = dtype,
             device = torch.cuda.current_device(),
             requires_grad = True)
-        
+        # allocate_shard = lambda shard_size, dtype : torch.zeros(
+        #     (shard_size,),
+        #     dtype = dtype,
+        #     device = torch.cuda.current_device(),
+        #     requires_grad = True)
+        # <<<
+
         # Allocate each group's param/grad shard.
         for group_index, group_shard in enumerate(opt_group_shards):
 

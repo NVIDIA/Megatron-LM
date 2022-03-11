@@ -453,7 +453,8 @@ def train_step(forward_step_func, data_iterator,
 
     # >>>
     # Gather params.
-    optimizer.gather_model_params(args, timers, ITERATION)
+    if update_successful:
+        optimizer.gather_model_params(args, timers, ITERATION)
     # <<<
 
     # >>>

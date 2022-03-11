@@ -330,6 +330,25 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Check for nan.
         found_inf_flag = (self.found_inf.item() > 0)
 
+        # >>>
+        # if self.grad_scaler.scale <= 131072:
+        #     pax(0, {
+        #         # "grad_scaler" : self.grad_scaler,
+        #         # "found_inf_flag" : found_inf_flag,
+        #         "model_params" : [
+        #             p
+        #             for m in self.models
+        #             for p in m.parameters()
+        #         ],
+        #         "model_grads" : [
+        #             p.main_grad
+        #             for m in self.models
+        #             for p in m.parameters()
+        #         ],
+        #         # "main_grads" : main_grads,
+        #     })
+        # <<<
+
         return found_inf_flag
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -410,6 +429,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-unscale-and-check-inf').start()
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
             timers('optimizer-unscale-and-check-inf').stop()
+
+            # >>>
+            
+            # <<<
 
             # We are done with scaling gradients
             # so we can update the loss scale.
