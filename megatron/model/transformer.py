@@ -116,6 +116,53 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
+class SwitchMLP(MegatronModule):
+    """
+    Routes input to one of N MLP "experts"
+    """
+    def __init__(self, init_method, output_layer_init_method):
+        super(SwitchMLP, self).__init__()
+        args = get_args()
+        self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
+        self.experts = torch.nn.ModuleList()
+        for i in range(args.num_experts):
+            self.experts.append(ParallelMLP(init_method, output_layer_init_method))
+
+    def forward(self, hidden_states):
+        # hidden_states: [b, s, h]
+        b = hidden_states.size(0)
+        s = hidden_states.size(1)
+        h = hidden_states.size(2)
+        route = self.router(hidden_states)
+        route = torch.nn.functional.softmax(route, dim=2)
+        max_prob, max_ind = torch.max(route, dim=2)
+        max_prob = torch.unsqueeze(max_prob, 2) # [b s 1]
+
+        # TODO (rprenger) TODO this could be made easier to read
+        # Converting [b, s, h] to [b*s, h].
+        # Each vector could be routed differently
+        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
+        max_prob = max_prob.view(-1, max_prob.size(2)) # [b*s 1]
+        max_ind = max_ind.view(-1) # [b*s]
+
+        output_total = torch.empty_like(hidden_states)
+        output_bias_total = torch.empty_like(hidden_states)
+        #TODO (rprenger) This does each expert in serial, but it could be parallelized
+        
+        for expert_num, expert in enumerate(self.experts):
+            local_indices = (max_ind == expert_num).nonzero()
+            hidden = hidden_states[local_indices,:]
+            output, output_bias = expert(hidden)
+            output_bias = output_bias.expand_as(output)
+            output_total[local_indices,:] = output
+            output_bias_total[local_indices,:] = output_bias
+
+        output_total = output_total*max_prob
+        output_bias_total = output_bias_total*max_prob
+        output_total = output_total.view(b, s, h)
+        output_bias_total = output_bias_total.view(b, s, h)
+
+        return output_total, output_bias_total
 
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
@@ -479,8 +526,10 @@ class ParallelTransformerLayer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        self.mlp = ParallelMLP(init_method,
-                               output_layer_init_method)
+        if args.num_experts is not None:
+            self.mlp = SwitchMLP(init_method, output_layer_init_method)
+        else:
+            self.mlp = ParallelMLP(init_method, output_layer_init_method)
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
@@ -579,6 +628,32 @@ class ParallelTransformerLayer(MegatronModule):
         return output
 
 
+class NoopTransformerLayer(MegatronModule):
+    """A single 'no-op' transformer layer.
+
+    The sole purpose of this layer is for when a standalone embedding layer
+    is used (i.e., args.standalone_embedding_stage == True). In this case,
+    zero transformer layers are assigned when pipeline rank == 0. Additionally,
+    when virtual pipeline rank >= 1, zero total model parameters are created
+    (virtual rank 0 contains the input embedding). This results in the model's
+    input and output tensors being the same, which causes an error when
+    performing certain memory optimiations on the output tensor (e.g.,
+    deallocating it). Thus, this layer disconnects the input from the output
+    via a clone. Since ranks containing a no-op layer are generally under-
+    utilized (both compute and memory), there's no worry of any performance
+    degredation.
+    """
+
+    def __init__(self, layer_number):
+        super().__init__()
+        self.layer_number = layer_number
+
+    def forward(self, hidden_states, attention_mask,
+                encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None):
+        return hidden_states.clone()
+
+
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -649,8 +724,20 @@ class ParallelTransformer(MegatronModule):
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
-        self.layers = torch.nn.ModuleList(
-            [build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        if self.num_layers == 0:
+            # When a standalone embedding stage is used (e.g.,
+            # args.standalone_embedding_stage == True), virtual pipeline ranks
+            # on pipeline rank 0 will have zero transformer layers assigned to
+            # them. This results in the model's input and output tensors to be
+            # the same, which will cause failure for certain output tensor
+            # optimizations (e.g., pipeline output deallocation). To remedy
+            # this, we assign a 'no-op' layer on these ranks, which will
+            # disconnect the input tensor from the output tensor.
+            self.num_layers = 1
+            self.layers = torch.nn.ModuleList([ NoopTransformerLayer(1) ])
+        else:
+            self.layers = torch.nn.ModuleList(
+                [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if self.post_process:
             # Final layer norm before output.
@@ -786,5 +873,5 @@ class ParallelTransformer(MegatronModule):
             output = self.final_layernorm(hidden_states)
         else:
             output = hidden_states
-        
+
         return output

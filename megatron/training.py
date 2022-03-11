@@ -21,7 +21,6 @@ import sys
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
-
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
@@ -51,6 +50,7 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
+from megatron.model.vision.knn_monitor import compute_feature_bank
 
 # >>>
 from lutil import pax
@@ -440,6 +440,12 @@ def train_step(forward_step_func, data_iterator,
     optimizer.reduce_model_grads(args, timers)
     # <<<
 
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0],
+                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+
     # Update parameters.
     timers('optimizer').start()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers, ITERATION)
@@ -453,6 +459,11 @@ def train_step(forward_step_func, data_iterator,
     # >>>
     optimizer.debug_model(ITERATION, "after gather params.", 0)
     # <<<
+
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0],
+                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
     if update_successful:
@@ -688,6 +699,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     report_memory_flag = True
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
+        args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -779,6 +791,9 @@ def evaluate(forward_step_func,
              verbose=False):
     """Evaluation."""
     args = get_args()
+
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        compute_feature_bank(model)
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
@@ -937,7 +952,6 @@ def build_train_valid_test_data_iterators(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
-
 
     # Build iterators.
     dl_type = args.dataloader_type
