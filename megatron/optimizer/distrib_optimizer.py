@@ -295,12 +295,64 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def get_main_grad(self, group_index):
         return self.get_main_param(group_index).grad
 
-    def load_state_dict(self):
-        raise Exception("hi.")
-    def reload_model_params(self):
-        raise Exception("hi.")
+    # def load_state_dict(self):
+    #     raise Exception("hi.")
+    # # def reload_model_params(self): # ... done in MixedPrecisionOptimizer
+    # #     raise Exception("hi.")
+    # def state_dict(self):
+    #     raise Exception("hi.")
     def state_dict(self):
-        raise Exception("hi.")
+        state_dict = {}
+        state_dict['optimizer'] = self.optimizer.state_dict()
+        if self.grad_scaler:
+            state_dict['grad_scaler'] = self.grad_scaler.state_dict()
+        state_dict['params'] = \
+            [ p for g in self.optimizer.param_groups for p in g["params"] ]
+        # pax(0, { # ... only called on model rank 0
+        #     # "optimizer" : self.optimizer,
+        #     "state_dict" : state_dict,
+        #     "state_dict / param_groups" : state_dict["optimizer"]["param_groups"],
+        #     "optimizer / groups" : self.optimizer.param_groups,
+        #     "state_dict / params" : [ p.shape for p in state_dict["params"] ],
+        #     "optimizer / params" :
+        #     [ p.shape for g in self.optimizer.param_groups for p in g["params"] ],
+        # })
+        return state_dict
+
+
+    def load_state_dict(self, state_dict):
+        # Optimizer.
+        optimizer_key = 'optimizer'
+        if optimizer_key not in state_dict:
+            optimizer_key = 'optimizer_state_dict'
+            print_rank_0('***WARNING*** loading optimizer from '
+                         'an old checkpoint ...')
+        self.optimizer.load_state_dict(state_dict[optimizer_key])
+
+        pax(0, {
+            "state_dict" : state_dict,
+            "params" : state_dict["params"],
+        })
+        # Grad scaler.
+        if 'grad_scaler' not in state_dict:
+            print_rank_0('***WARNING*** found an old checkpoint, will not '
+                         'load grad scaler ...')
+        else:
+            if self.grad_scaler:
+                self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
+            else:
+                print_rank_0('***WARNING*** fould the grad scaler in the '
+                             'checkpoint but it is None in the class. '
+                             'Skipping loading grad scaler ...')
+
+        # Copy data for the main params.
+        params_key = 'params'
+        assert params_key in state_dict, "key 'params' not in state_dict."
+        for current_group, saved_group in zip(
+                self.fp32_from_float16_groups,
+                state_dict[fp32_from_float16_params_key]):
+            for current_param, saved_param in zip(current_group, saved_group):
+                current_param.data.copy_(saved_param.data)
 
     def zero_grad(self, set_to_none=True):
 

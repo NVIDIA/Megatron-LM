@@ -81,7 +81,26 @@ def ensure_directory_exists(filename):
         os.makedirs(dirname)
 
 
-def get_checkpoint_name(checkpoints_path, iteration,
+# >>
+# def get_checkpoint_name(checkpoints_path, iteration,
+#                         release=False):
+#     """A unified checkpoint name."""
+#     if release:
+#         directory = 'release'
+#     else:
+#         directory = 'iter_{:07d}'.format(iteration)
+#     # Use both the tensor and pipeline MP rank.
+#     if mpu.get_pipeline_model_parallel_world_size() == 1:
+#         return os.path.join(checkpoints_path, directory,
+#                             'mp_rank_{:02d}'.format(
+#                                 mpu.get_tensor_model_parallel_rank()),
+#                             'model_optim_rng.pt')
+#     return os.path.join(checkpoints_path, directory,
+#                         'mp_rank_{:02d}_{:03d}'.format(
+#                             mpu.get_tensor_model_parallel_rank(),
+#                             mpu.get_pipeline_model_parallel_rank()),
+#                         'model_optim_rng.pt')
+def get_checkpoint_names(checkpoints_path, iteration,
                         release=False):
     """A unified checkpoint name."""
     if release:
@@ -89,16 +108,17 @@ def get_checkpoint_name(checkpoints_path, iteration,
     else:
         directory = 'iter_{:07d}'.format(iteration)
     # Use both the tensor and pipeline MP rank.
-    if mpu.get_pipeline_model_parallel_world_size() == 1:
-        return os.path.join(checkpoints_path, directory,
-                            'mp_rank_{:02d}'.format(
-                                mpu.get_tensor_model_parallel_rank()),
-                            'model_optim_rng.pt')
-    return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}_{:03d}'.format(
-                            mpu.get_tensor_model_parallel_rank(),
-                            mpu.get_pipeline_model_parallel_rank()),
-                        'model_optim_rng.pt')
+    common_path = os.path.join(
+        checkpoints_path,
+        directory,
+        "mp_rank_%02d_%03d_%03d" % (
+            mpu.get_tensor_model_parallel_rank(),
+            mpu.get_pipeline_model_parallel_rank(),
+            mpu.get_data_parallel_rank()))
+    model_name = os.path.join(common_path, "model_rng.pt")
+    optim_name = os.path.join(common_path, "optim.pt")
+    return model_name, optim_name
+# <<<
 
 
 def get_checkpoint_tracker_filename(checkpoints_path):
@@ -177,10 +197,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
-    # collect rng state across data parallel ranks
+    # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
-    if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
+    # Checkpoint file names.
+    model_checkpoint_name, optim_checkpoint_name = \
+        get_checkpoint_names(args.save, iteration)
+
+    # Save args, model, RNG.
+    if not torch.distributed.is_initialized() \
+       or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -194,21 +220,49 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)
                 state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
 
-        # Optimizer stuff.
-        if not args.no_save_optim:
-            if optimizer is not None:
-                state_dict['optimizer'] = optimizer.state_dict()
-            if opt_param_scheduler is not None:
-                state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+        # >>>
+        # # Optimizer stuff.
+        # if not args.no_save_optim:
+        #     if optimizer is not None:
+        #         state_dict['optimizer'] = optimizer.state_dict()
+        #     if opt_param_scheduler is not None:
+        #         state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+        # <<<
 
         # RNG states.
         if not args.no_save_rng:
             state_dict["rng_state"] = rng_state
 
         # Save.
-        checkpoint_name = get_checkpoint_name(args.save, iteration)
-        ensure_directory_exists(checkpoint_name)
-        torch.save(state_dict, checkpoint_name)
+        ensure_directory_exists(model_checkpoint_name)
+        torch.save(state_dict, model_checkpoint_name)
+
+    # >>>
+    # Save optimizer state.
+    if not args.no_save_optim \
+       and (not torch.distributed.is_initialized()
+            or mpu.get_data_parallel_rank() == 0
+            or args.use_distributed_optimizer):
+
+        # Optimizer stuff.
+        state_dict = {}
+        if optimizer is not None:
+            state_dict['optimizer'] = optimizer.state_dict()
+        if opt_param_scheduler is not None:
+            state_dict['opt_param_scheduler'] = opt_param_scheduler.state_dict()
+
+        # Save.
+        ensure_directory_exists(optim_checkpoint_name)
+        torch.save(state_dict, optim_checkpoint_name)
+        # >>>
+        # from lutil import pax
+        # pax({
+        #     "model_checkpoint_name" : model_checkpoint_name,
+        #     "optim_checkpoint_name" : optim_checkpoint_name,
+        #     "state_dict" : state_dict,
+        # })
+        # <<<
+    # <<<
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
@@ -322,12 +376,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     iteration, release = read_metadata(tracker_filename)
 
     # Checkpoint.
-    checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+    model_checkpoint_name, optim_checkpoint_name = \
+        get_checkpoint_names(load_dir, iteration, release)
     print_rank_0(f' loading checkpoint from {args.load} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        model_state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+        optim_state_dict = torch.load(optim_checkpoint_name, map_location='cpu')
     except ModuleNotFoundError:
         from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
@@ -336,7 +392,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             'megatron.fp16_deprecated.loss_scaler']
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
             'megatron.fp16_deprecated.loss_scaler']
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        model_state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+        optim_state_dict = torch.load(optim_checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException as e:
