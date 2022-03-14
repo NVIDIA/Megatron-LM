@@ -19,15 +19,10 @@ from apex.optimizers import FusedSGD as SGD
 from megatron import get_args
 from megatron.model import LayerNorm
 
-# >>>
-# from .distributed_fused_adam import DistributedFusedAdam
-from lutil import pax, tp
-# <<<
-from .grad_scaler import ConstantGradScaler, DynamicGradScaler
-# >>>
-from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 from .distrib_optimizer import DistributedOptimizer
-# <<<
+from .grad_scaler import ConstantGradScaler, DynamicGradScaler
+from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
+
 
 def get_param_groups(modules,
                      no_weight_decay_cond,
@@ -111,6 +106,10 @@ def get_megatron_optimizer(model,
     if args.DDP_impl == 'local':
         params_have_main_grad = True
 
+    # Mixed precision optimizer.
+    # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
+    #   from the MixedPrecisionOptimizer, which manages any optimizer where
+    #   the model params and main params are distinct.
     if args.fp16 or args.bf16 or args.use_distributed_optimizer:
 
         # Grad scaler:
@@ -120,9 +119,11 @@ def get_megatron_optimizer(model,
         #    otherwise we are running in bf16 with no loss-scale so
         #       leave it as None.
         grad_scaler = None
+
         # Constant loss scale.
         if args.loss_scale:
             grad_scaler = ConstantGradScaler(args.loss_scale)
+
         # Dynamic loss scale.
         else:
             if args.fp16:
@@ -135,7 +136,6 @@ def get_megatron_optimizer(model,
                     hysteresis=args.hysteresis)
 
         # Megatron optimizer.
-        # >>>
         opt_ty = DistributedOptimizer \
             if args.use_distributed_optimizer else \
             Float16OptimizerWithFloat16Params
@@ -147,15 +147,8 @@ def get_megatron_optimizer(model,
                       args.bf16,
                       grad_scaler,
                       model)
-        # <<<
 
     # FP32.
-    # >>>
-    # opt_ty = Float32DistributedOptimizer \
-    #     if args.use_distributed_optimizer \
-    #        else Float32Optimizer
-    # return opt_ty(optimizer, args.clip_grad,
-    # <<<
     return FP32Optimizer(optimizer, args.clip_grad,
                          args.log_num_zeros_in_grad,
                          params_have_main_grad,
