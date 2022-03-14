@@ -402,17 +402,17 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         sys.exit()
 
     # set checkpoint version
-    set_checkpoint_version(state_dict.get('checkpoint_version', 0))
+    set_checkpoint_version(model_state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
     if args.finetune or release:
         iteration = 0
     else:
         try:
-            iteration = state_dict['iteration']
+            iteration = model_state_dict['iteration']
         except KeyError:
             try:  # Backward compatible with older checkpoints
-                iteration = state_dict['total_iters']
+                iteration = model_state_dict['total_iters']
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '
                              'iteration from checkpoint {}, exiting'.format(
@@ -422,8 +422,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in state_dict:
-        checkpoint_args = state_dict['args']
+    if 'args' in model_state_dict:
+        checkpoint_args = model_state_dict['args']
         check_checkpoint_args(checkpoint_args)
         args.consumed_train_samples = getattr(checkpoint_args,
                                               'consumed_train_samples', 0)
@@ -435,11 +435,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Model.
     if len(model) == 1:
-        model[0].load_state_dict(state_dict['model'], strict=strict)
+        model[0].load_state_dict(model_state_dict['model'], strict=strict)
     else:
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
-            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+            model[i].load_state_dict(model_state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed
     checkpoint_version = get_checkpoint_version()
@@ -450,12 +450,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if not release and not args.finetune and not args.no_load_optim:
         try:
             if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                optimizer.load_state_dict(optim_state_dict['optimizer'])
             if opt_param_scheduler is not None:
                 if 'lr_scheduler' in state_dict: # backward compatbility
-                    opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
+                    opt_param_scheduler.load_state_dict(optim_state_dict['lr_scheduler'])
                 else:
-                    opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+                    opt_param_scheduler.load_state_dict(optim_state_dict['opt_param_scheduler'])
         except KeyError:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
