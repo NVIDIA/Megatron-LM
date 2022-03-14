@@ -135,11 +135,9 @@ def parse_args(extra_args_provider=None, defaults={},
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        # >>> [ temporarily turning off ]
-        # assert args.pipeline_model_parallel_size > 2, \
-        #     'pipeline-model-parallel size should be greater than 2 with ' \
-        #     'interleaved schedule'
-        # <<<
+        assert args.pipeline_model_parallel_size > 2, \
+            'pipeline-model-parallel size should be greater than 2 with ' \
+            'interleaved schedule'
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
@@ -183,13 +181,11 @@ def parse_args(extra_args_provider=None, defaults={},
                       'gradient accumulation. Setting gradient_accumulation_fusion '
                       'to False', flush=True)
 
-    # >>>
     # If we use the distributed optimizer, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is on.
     if args.use_distributed_optimizer:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    # <<<
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
