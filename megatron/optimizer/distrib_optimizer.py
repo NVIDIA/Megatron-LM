@@ -308,7 +308,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict['grad_scaler'] = self.grad_scaler.state_dict()
         # state_dict['params'] = \
         #     [ p for g in self.optimizer.param_groups for p in g["params"] ]
-        state_dict['groups'] = [g["params"] for g in self.optimizer.param_groups]
+        state_dict['groups'] = [g['params'] for g in self.optimizer.param_groups]
         # pax(0, { # ... only called on model rank 0
         #     # "optimizer" : self.optimizer,
         #     "state_dict" : state_dict,
@@ -348,20 +348,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Copy data for the main params.
         current_groups = [ g["params"] for g in self.optimizer.param_groups ]
-        params_key = 'params'
-        assert params_key in state_dict, "key 'params' not in state_dict."
+        assert "groups" in state_dict, "key 'groups' not in state_dict."
         # pax(0, {
         #     "state_dict" : state_dict,
         #     "current_groups" : current_groups,
         #     "saved_groups" : state_dict[params_key],
         # })
-        for current_group, saved_group in zip(
-                current_groups,
-                state_dict[params_key]):
-            pax(0, {
-                "current_group" : current_group,
-                "saved_group" : saved_group,
-            })
+        for current_group, saved_group in zip(current_groups, state_dict["groups"]):
+            # pax(0, {
+            #     "current_group" : current_group,
+            #     "saved_group" : saved_group,
+            # })
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
