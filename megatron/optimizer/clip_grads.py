@@ -26,8 +26,7 @@ from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 
 def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
-                        model_parallel_group=None,
-                        ITERATION=None):
+                        model_parallel_group=None):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -41,7 +40,7 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
         max_norm (float or int): max norm of the gradients
         norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
             infinity norm.
-        model_parallel_group (group): due to the nature of the distributed
+        model_parallel_group (group): given the nature of the distributed
             optimizer, this is passed as an argument.
 
     Returns:
