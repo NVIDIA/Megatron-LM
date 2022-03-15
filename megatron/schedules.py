@@ -651,14 +651,6 @@ def forward_backward_pipelining_without_interleaving(forward_step_func,
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            # >>>
-            if output_tensor[0]._base is not None:
-                # from lutil import pax
-                # pax({
-                #     "output tensor / 0" : output_tensor[0],
-                # })
-                raise Exception(">>>>>> r %d, output / 0 == view." % torch.distributed.get_rank())
-            # <<<
             deallocate_output_tensor(output_tensor[0])
 
     # Before running 1F1B, need to receive first forward tensor.

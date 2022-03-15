@@ -23,6 +23,8 @@ from torch.nn.parameter import Parameter
 from torch.nn import init
 import importlib
 
+from megatron.mpu import make_viewless_tensor
+
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
     HAVE_PERSIST_LAYER_NORM = True
@@ -100,35 +102,21 @@ class MixedFusedLayerNorm(torch.nn.Module):
     init.zeros_(self.bias)
 
 
-  # def forward(self, input):
-
-  #   if self.no_persist_layer_norm:
-  #       return FusedLayerNormAffineFunction.apply(
-  #         input, self.weight, self.bias, self.normalized_shape, self.eps)
-  #   else:
-  #       return FastLayerNormFN.apply(
-  #         input, self.weight, self.bias, self.eps)
   def forward(self, input):
 
     if self.no_persist_layer_norm:
-        result = FusedLayerNormAffineFunction.apply(
-            input, self.weight, self.bias, self.normalized_shape, self.eps)
+        return FusedLayerNormAffineFunction.apply(
+          input, self.weight, self.bias, self.normalized_shape, self.eps)
     else:
-        result = FastLayerNormFN.apply(
-            input, self.weight, self.bias, self.eps)
-        result = make_viewless_tensor(inp = input, requires_grad = input.requires_grad, keep_grad = True)
-    # >>>
-    # if torch.distributed.get_rank() == 3:
-    #     # from lutil import pax
-    #     # pax({"result": result})
-    #     from megatron import get_args
-    #     args = get_args()
-    #     raise Exception("r %d ... hid %d, persist %d, view %d." % (
-    #         torch.distributed.get_rank(),
-    #         args.hidden_size,
-    #         not args.no_persist_layer_norm,
-    #         result._base is not None,
-    #     ))
-    # <<<
-    return result
+        output = FastLayerNormFN.apply(
+          input, self.weight, self.bias, self.eps)
 
+        # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
+        # a populated '_base' field). This will result in schedule.py's
+        # deallocate_output_tensor() throwing an error, so a viewless tensor is
+        # created to prevent this.
+        output = make_viewless_tensor(inp = output,
+                                      requires_grad = input.requires_grad,
+                                      keep_graph = True)
+
+        return output

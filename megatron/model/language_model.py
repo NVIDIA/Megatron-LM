@@ -337,12 +337,6 @@ class TransformerLanguageModel(MegatronModule):
         else:
             self.encoder = None
 
-        # >>>
-        # if torch.distributed.get_rank() == 3:
-        #     print(self.encoder)
-        #     raise Exception("bye.")
-        # <<<
-
         # Decoder (usually set to False, True if part of an encoder-decoder
         # architecture and in decoder-only stage).
         if self.add_decoder:
