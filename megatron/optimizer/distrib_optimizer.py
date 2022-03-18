@@ -358,7 +358,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for view in gbuf_views:
                 assert view.nelement() == view_numel
 
-            chunk_numel_min = 1024**2
+            # chunk_numel_min = 1024
+            # chunk_numel_min = 16384
+            chunk_numel_min = 131072
+            # chunk_numel_min = 1048576
             chunk_numel_max = view_numel
             # chunk_numel_min_log = math.log(chunk_numel_min)
             # chunk_numel_max_log = math.log(chunk_numel_max)
