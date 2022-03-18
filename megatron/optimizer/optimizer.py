@@ -327,6 +327,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         from megatron import get_args
         args = get_args()
         my_rank = torch.distributed.get_rank()
+        DEBUG_ITERATION = ITERATION
         if ITERATION != DEBUG_ITERATION:
             return
         for r in range(torch.distributed.get_world_size()):
