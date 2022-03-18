@@ -737,7 +737,7 @@ def _add_distributed_args(parser):
                        help='Trade-off memory savings & iteration time, for '
                        'disributed optimizer\'s communication operations (i.e., '
                        '(reduce/gather). This value ranges from 0.0 (default, '
-                       'no memory savings) to 1.0 (max memory savings, at '
+                       'no memory savings) to 1.0 (max memory savings, at the '
                        'expense of iteration time).')
 
     return parser
