@@ -733,6 +733,12 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--disrib-opt-comm-mem-savings', default=0., type=float,
+                       help='Trade-off memory savings & iteration time, for '
+                       'disributed optimizer\'s communication operations (i.e., '
+                       '(reduce/gather). This value ranges from 0.0 (default, '
+                       'no memory savings) to 1.0 (max memory savings, at '
+                       'expense of iteration time).')
 
     return parser
 
