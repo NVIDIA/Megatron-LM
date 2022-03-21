@@ -68,6 +68,24 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
             grads.append(grad)
         if grad_not_none and is_not_shared and is_not_tp_duplicate:
             grads_for_norm.append(grad)
+        # >>>
+        else:
+            # from lutil import pax
+            # pax({"grad": grad})
+            from megatron import get_args
+            args = get_args()
+            for r in range(torch.distributed.get_world_size()):
+                if torch.distributed.get_rank() == r:
+                    print("collect: r %d, dist-op %d, np %d, ne %d, g %s" % (
+                        torch.distributed.get_rank(),
+                        args.use_distributed_optimizer,
+                        len(parameters),
+                        sum(t.nelement() for t in parameters),
+                        str(tuple(grad.shape)),
+                    ))
+                torch.distributed.barrier()
+            exit(0)
+        # <<<
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -100,6 +118,30 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
             # we need the pow(norm-type).
             total_norm = grad_norm ** norm_type
 
+            # >>>
+            from megatron import get_args
+            from lutil import pax
+            args = get_args()
+            for r in range(torch.distributed.get_world_size()):
+                if torch.distributed.get_rank() == r:
+                    print("compute: r %d, dist-op %d, gnorm %f ... p %d, g %d, gn %d" % (
+                        torch.distributed.get_rank(),
+                        args.use_distributed_optimizer,
+                        grad_norm.item(),
+                        sum(t.nelement() for t in parameters),
+                        sum(t.nelement() for t in grads),
+                        sum(t.nelement() for t in grads_for_norm),
+                    ))
+                torch.distributed.barrier()
+            exit(0)
+            # pax(2, {
+            #     "use distrib opt" : args.use_distributed_optimizer,
+            #     "norm_type" : norm_type,
+            #     "grad_norm" : grad_norm.item(),
+            #     "total_norm" : total_norm.item(),
+            # })
+            # <<<
+
         else:
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
@@ -110,6 +152,17 @@ def clip_grad_norm_fp32(parameters, max_norm, norm_type=2,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=model_parallel_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)
+
+        # >>>
+        from megatron import get_args
+        from lutil import pax
+        args = get_args()
+        pax(0, {
+            "use distrib opt" : args.use_distributed_optimizer,
+            "norm_type" : norm_type,
+            "total_norm" : total_norm,
+        })
+        # <<<
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
