@@ -112,6 +112,12 @@ class MegatronOptimizer(ABC):
                 params.append(param)
         return params
 
+    # >>>
+    @abstractmethod
+    # def get_grads_for_norm(self):
+    def _get_main_grads_for_grad_norm(self):
+        pass
+    # <<<
 
     def get_model_parallel_group(self):
         '''Default returned here, but the distributed optimizer overrides this.'''
@@ -119,20 +125,10 @@ class MegatronOptimizer(ABC):
 
 
     def clip_grad_norm(self, clip_grad):
-
-        # >>>
-        # model_params = [ p for m in self.models for p in m.parameters() ]
-        # optim_params = self.get_parameters()
-        # from lutil import pax
-        # pax(1, {
-        #     "model_params" : get_clippy(model_params),
-        #     "optim_params" : get_clippy(optim_params),
-        # })
-        # <<<
-
         params = self.get_parameters()
+        grads_for_norm = self._get_main_grads_for_grad_norm()
         return clip_grad_norm_fp32(
-            params, clip_grad,
+            params, grads_for_norm, clip_grad,
             model_parallel_group=self.get_model_parallel_group())
 
 
@@ -573,6 +569,36 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
 
+
+    def _get_main_grads_for_grad_norm(self):
+
+        # Filter parameters based on:
+        #   - grad should not be none
+        #   - parameter should not be shared
+        #   - should not be a replica due to tensor model parallelism
+        params = self.get_parameters()
+        # grads = []
+        grads_for_norm = []
+        for param in params:
+            grad = param.grad
+            grad_not_none = grad is not None
+            is_not_shared = param_is_not_shared(param)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            # if grad_not_none:
+            #     grad = param.grad.detach()
+            # if grad_not_none:
+            #     # Make sure the grads are in fp32
+            #     assert param.grad.type() == 'torch.cuda.FloatTensor'
+            #     grads.append(grad)
+            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+                grads_for_norm.append(grad)
+
+        # pax(0, {"grads_for_norm": [
+        #     str(tuple(g.shape))
+        #     for g in grads_for_norm
+        # ]})
+
+        return grads_for_norm
 
     def _collect_main_grad_data_for_unscaling(self):
 

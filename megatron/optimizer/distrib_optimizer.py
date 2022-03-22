@@ -198,7 +198,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     # >>>
     @classmethod
-    def get_grad_views_for_grad_norm(cls, opt_group_shards, optimizer):
+    def get_main_grad_views_for_grad_norm(cls, opt_group_shards, optimizer):
 
         grad_views = []
         # grad_views_SKIPPED = []
@@ -285,7 +285,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # <<<
 
         # Params for grad norm.
-        self.grad_views_for_grad_norm = self.get_grad_views_for_grad_norm(
+        self.main_grad_views_for_grad_norm = self.get_main_grad_views_for_grad_norm(
             self.opt_group_shards,
             self.optimizer)
 
@@ -343,6 +343,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return self.get_main_params()[group_index]
     def get_main_grad(self, group_index):
         return self.get_main_param(group_index).grad
+
+    # >>>
+    def _get_main_grads_for_grad_norm(self):
+        return self.main_grad_views_for_grad_norm
+    # <<<
 
     def state_dict(self):
         state_dict = {}
