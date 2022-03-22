@@ -72,6 +72,11 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     #         grads_for_norm.append(grad)
     # <<<
 
+    # >>>
+    # Grads.
+    grads = [ p.grad for p in parameters if p is not None ]
+    # <<<
+
     # Norm parameters.
     max_norm = float(max_norm)
     norm_type = float(norm_type)
@@ -115,14 +120,14 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
         # >>>
-        from megatron import get_args
-        from lutil import pax
-        args = get_args()
-        pax(0, {
-            "use distrib opt" : args.use_distributed_optimizer,
-            "norm_type" : norm_type,
-            "total_norm" : total_norm,
-        })
+        # from megatron import get_args
+        # from lutil import pax
+        # args = get_args()
+        # pax(0, {
+        #     "use distrib opt" : args.use_distributed_optimizer,
+        #     "norm_type" : norm_type,
+        #     "total_norm" : total_norm,
+        # })
         # <<<
 
     # Scale.
