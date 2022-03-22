@@ -22,9 +22,17 @@ import torch
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
+# >>>
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+# <<<
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
+# >>>
+from .optimizer import get_clippy
+from lutil import pax, tp
+# <<<
 
 class Shard:
     def __init__(self, start, end):
@@ -188,6 +196,45 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Update group's param.
             group_shard["orig_group"]["params"] = [ main_param ]
 
+    # >>>
+    @classmethod
+    def get_grad_views_for_grad_norm(cls, opt_group_shards, optimizer):
+
+        grad_views = []
+        # grad_views_SKIPPED = []
+        for group_index, opt_group_shard in enumerate(opt_group_shards):
+            opt_grad = optimizer.param_groups[group_index]["params"][0].grad
+            for param, shard in opt_group_shard["param_map"].items():
+                if param_is_not_shared(param) and \
+                   param_is_not_tensor_parallel_duplicate(param):
+                    
+                    grad_view = opt_grad[shard.start:shard.end]
+                    grad_views.append(grad_view)
+
+                # else:
+                #     grad_views_SKIPPED.append(opt_grad[shard.start:shard.end])
+
+        # >>>
+        # my_rank = torch.distributed.get_rank()
+        # for r in range(torch.distributed.get_world_size()):
+        #     if r == my_rank:
+        #         print("r %d, grad views %s." % (
+        #             my_rank,
+        #             ", ".join(str(tuple(g.shape)) for g in grad_views),
+        #         ))
+        #     torch.distributed.barrier()
+        # for r in range(torch.distributed.get_world_size()):
+        #     if r == my_rank:
+        #         print("r %d, SKIPPED %s." % (
+        #             my_rank,
+        #             ", ".join(str(tuple(g.shape)) for g in grad_views_SKIPPED),
+        #         ))
+        #     torch.distributed.barrier()
+        # exit(0)
+        # <<<
+
+        return grad_views
+    # <<<
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
@@ -226,6 +273,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Initialize main params.
         self._copy_model_params_to_main_params()
+
+        # >>> numel/nelem per rank >>>
+        # for r in range(torch.distributed.get_world_size()):
+        #     if r == torch.distributed.get_rank():
+        #         for m in self.models:
+        #             for b in m._grad_buffers.values():
+        #                 print("r %d, %d." % (r, b.data.nelement()))
+        #     torch.distributed.barrier()
+        # exit(0)
+        # <<<
+
+        # Params for grad norm.
+        self.grad_views_for_grad_norm = self.get_grad_views_for_grad_norm(
+            self.opt_group_shards,
+            self.optimizer)
+
 
     def get_model_parallel_group(self):
         return None
@@ -407,6 +470,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 group = data_parallel_group,
             )
         timers('backward-params-all-reduce').stop()
+
     def gather_model_params(self, args, timers):
 
         timers('backward-params-all-gather').start()

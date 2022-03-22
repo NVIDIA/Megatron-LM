@@ -31,6 +31,20 @@ from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
+# >>>
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+
+from lutil import pax
+        
+get_clippy = lambda params : [ "%d, %d, %d ... %s" % (
+    p.grad is not None,
+    param_is_not_shared(p),
+    param_is_not_tensor_parallel_duplicate(p),
+    str(tuple(p.shape)),
+) for p in params ]
+# <<<
+
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -105,6 +119,17 @@ class MegatronOptimizer(ABC):
 
 
     def clip_grad_norm(self, clip_grad):
+
+        # >>>
+        # model_params = [ p for m in self.models for p in m.parameters() ]
+        # optim_params = self.get_parameters()
+        # from lutil import pax
+        # pax(1, {
+        #     "model_params" : get_clippy(model_params),
+        #     "optim_params" : get_clippy(optim_params),
+        # })
+        # <<<
+
         params = self.get_parameters()
         return clip_grad_norm_fp32(
             params, clip_grad,
@@ -408,91 +433,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         timers('optimizer-clip-main-grad').start()
         grad_norm = None
         if self.clip_grad > 0.0:
-            # >>>
-            from megatron.model.module import param_is_not_shared
-            from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
-
-            def use_grad(p):
-                conditions = [
-                    p.grad is not None,
-                    param_is_not_shared(p),
-                    param_is_not_tensor_parallel_duplicate(p),
-                    # getattr(p, "shared", False),
-                ]
-                return all(conditions)
-
-            # def print_module(m, d):
-            #     ps = [ "%d/%s" % (
-            #         use_grad(p),
-            #         str(tuple(p.shape)),
-            #     ) for p in m.parameters(recurse = False) ]
-            #     ps = [
-            #         str(tuple(p))
-            #         for p in m.parameters(recurse = False)
-            #         if use_grad(p)
-            #     ]
-            #     print("%s %s | %s" % (".." * d, type(m).__name__, ", ".join(ps)))
-
-            # if torch.distributed.get_rank() == 0:
-
-            #     visited = []
-            #     queue = [ (m, 0) for m in self.models ]
-            #     while queue:
-            #         m, d = queue.pop()
-            #         visited.append((m, d))
-            #         # print_module(m, d)
-            #         queue.extend(reversed([ (mm, d + 1) for mm in m.children() ]))
-
-            #     for m, d in visited:
-            #         print_module(m, d)
-
-            for r in range(torch.distributed.get_world_size()):
-                if r == torch.distributed.get_rank():
-                    # print("r %d, %s" % (
-                    #     torch.distributed.get_rank(),
-                    #     "".join(
-                    #         "%d" % use_grad(p)
-                    #         for m in self.models
-                    #         for p in m.parameters()
-                    #     ),
-                    # ))
-                    # print("r %d [ d %d, t %d, p %d ] ... %s" % (
-                    #     torch.distributed.get_rank(),
-                    #     mpu.get_data_parallel_rank(),
-                    #     mpu.get_tensor_model_parallel_rank(),
-                    #     mpu.get_pipeline_model_parallel_rank(),
-                    #     ", ".join(str(tuple(p.shape)) for p in self.get_parameters() if not use_grad(p)),
-                    # ))
-                    print("r %d [ d %d, t %d, p %d ] ... %d, %d ... %s" % (
-                        torch.distributed.get_rank(),
-                        mpu.get_data_parallel_rank(),
-                        mpu.get_tensor_model_parallel_rank(),
-                        mpu.get_pipeline_model_parallel_rank(),
-                        sum(p.nelement()
-                            for p in self.get_parameters()
-                            if use_grad(p)),
-                        sum(p.nelement()
-                            for p in self.get_parameters()
-                            if not use_grad(p)),
-                        "".join(
-                            "%d" % use_grad(p)
-                            for p in self.get_parameters()
-                        ),
-                    ))
-                torch.distributed.barrier()
-            torch.distributed.barrier()
-            exit(0)
-            # <<<
-
             grad_norm = self.clip_grad_norm(self.clip_grad)
-
-            # >>>
-            from lutil import pax
-            pax(0, {
-                "use distrib opt" : args.use_distributed_optimizer,
-                "grad_norm" : grad_norm,
-            })
-            # <<<
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
@@ -607,6 +548,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # recast preexisting per-param state tensors
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        # >>>
+        # model_params = [ p for m in self.models for p in m.parameters() ]
+        # optim_params = self.get_parameters()
+        # model_params.sort(key = lambda p : p.nelement(), reverse = True)
+        # optim_params.sort(key = lambda p : p.nelement(), reverse = True)
+        # # assert len(model_params) == len(optim_params
+        # pax(7, {
+        #     "model_params" : get_clippy(model_params),
+        #     "optim_params" : get_clippy(optim_params),
+        # })
+        # <<<
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
