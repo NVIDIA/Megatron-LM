@@ -523,6 +523,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer-copy-to-main-grad')
     add_to_logging('optimizer-unscale-and-check-inf')
     add_to_logging('optimizer-clip-main-grad')
+    add_to_logging('optimizer-count-zeros')
+    add_to_logging('optimizer-inner-step')
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')

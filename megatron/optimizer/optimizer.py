@@ -435,11 +435,15 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
+        timers('optimizer-count-zeros').start()
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
+        timers('optimizer-count-zeros').stop()
 
         # Step the optimizer.
+        timers('optimizer-inner-step').start()
         self.optimizer.step()
+        timers('optimizer-inner-step').stop()
 
         # Update params from main params.
         timers('optimizer-copy-main-to-model-params').start()
