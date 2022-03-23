@@ -419,7 +419,9 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # Reduce gradients.
+    timers('reduce-model-grads').start()
     optimizer.reduce_model_grads(args, timers)
+    timers('reduce-model-grads').stop()
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -434,7 +436,9 @@ def train_step(forward_step_func, data_iterator,
 
     # Gather params.
     if update_successful:
+        timers('gather-model-params').start()
         optimizer.gather_model_params(args, timers)
+        timers('gather-model-params').stop()
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -527,6 +531,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer-inner-step')
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
+    add_to_logging('reduce-model-grads')
+    add_to_logging('gather-model-params')
     add_to_logging('batch-generator')
 
     # Calculate batch size.
