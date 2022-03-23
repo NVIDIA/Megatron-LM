@@ -715,6 +715,7 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
 
         # Copy main_grads to grads.
+        timers('optimizer-copy-to-main-grad').start()
         if self.params_have_main_grad:
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
@@ -725,18 +726,25 @@ class FP32Optimizer(MegatronOptimizer):
                     # persist and therefore should not be deallocated.)
                     if not self.use_contiguous_buffers_in_local_ddp:
                         param.main_grad = None
+        timers('optimizer-copy-to-main-grad').stop()
 
         # Clip gradients.
+        timers('optimizer-clip-main-grad').start()
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
+        timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
+        timers('optimizer-count-zeros').start()
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
+        timers('optimizer-count-zeros').stop()
 
         # Update parameters.
+        timers('optimizer-inner-step').start()
         self.optimizer.step()
+        timers('optimizer-inner-step').stop()
 
         # No overflow for FP32 optimizer.
         return True, grad_norm, num_zeros_in_grad
