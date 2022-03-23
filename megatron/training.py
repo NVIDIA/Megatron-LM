@@ -419,9 +419,9 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # Reduce gradients.
-    timers('reduce-model-grads').start()
+    timers('backward-reduce-model-grads').start()
     optimizer.reduce_model_grads(args, timers)
-    timers('reduce-model-grads').stop()
+    timers('backward-reduce-model-grads').stop()
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -436,9 +436,9 @@ def train_step(forward_step_func, data_iterator,
 
     # Gather params.
     if update_successful:
-        timers('gather-model-params').start()
+        timers('backward-gather-model-params').start()
         optimizer.gather_model_params(args, timers)
-        timers('gather-model-params').stop()
+        timers('backward-gather-model-params').stop()
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -524,6 +524,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-send-backward-recv')
     add_to_logging('backward-params-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
+    add_to_logging('backward-reduce-model-grads')
+    add_to_logging('backward-gather-model-params')
     add_to_logging('optimizer-copy-to-main-grad')
     add_to_logging('optimizer-unscale-and-check-inf')
     add_to_logging('optimizer-clip-main-grad')
@@ -531,8 +533,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer-inner-step')
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
-    add_to_logging('reduce-model-grads')
-    add_to_logging('gather-model-params')
     add_to_logging('batch-generator')
 
     # Calculate batch size.
