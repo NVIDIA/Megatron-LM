@@ -22,17 +22,11 @@ import torch
 from megatron import get_args
 from megatron import get_timers
 from megatron import mpu
-# >>>
 from megatron.model.module import param_is_not_shared
 from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
-# <<<
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
-# >>>
-from .optimizer import get_clippy
-from lutil import pax, tp
-# <<<
 
 class Shard:
     def __init__(self, start, end):
@@ -196,12 +190,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Update group's param.
             group_shard["orig_group"]["params"] = [ main_param ]
 
-    # >>>
     @classmethod
     def get_main_grad_views_for_grad_norm(cls, opt_group_shards, optimizer):
 
         grad_views = []
-        # grad_views_SKIPPED = []
         for group_index, opt_group_shard in enumerate(opt_group_shards):
             opt_grad = optimizer.param_groups[group_index]["params"][0].grad
             for param, shard in opt_group_shard["param_map"].items():
@@ -211,30 +203,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     grad_view = opt_grad[shard.start:shard.end]
                     grad_views.append(grad_view)
 
-                # else:
-                #     grad_views_SKIPPED.append(opt_grad[shard.start:shard.end])
-
-        # >>>
-        # my_rank = torch.distributed.get_rank()
-        # for r in range(torch.distributed.get_world_size()):
-        #     if r == my_rank:
-        #         print("r %d, grad views %s." % (
-        #             my_rank,
-        #             ", ".join(str(tuple(g.shape)) for g in grad_views),
-        #         ))
-        #     torch.distributed.barrier()
-        # for r in range(torch.distributed.get_world_size()):
-        #     if r == my_rank:
-        #         print("r %d, SKIPPED %s." % (
-        #             my_rank,
-        #             ", ".join(str(tuple(g.shape)) for g in grad_views_SKIPPED),
-        #         ))
-        #     torch.distributed.barrier()
-        # exit(0)
-        # <<<
-
         return grad_views
-    # <<<
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
@@ -274,16 +243,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Initialize main params.
         self._copy_model_params_to_main_params()
 
-        # >>> numel/nelem per rank >>>
-        # for r in range(torch.distributed.get_world_size()):
-        #     if r == torch.distributed.get_rank():
-        #         for m in self.models:
-        #             for b in m._grad_buffers.values():
-        #                 print("r %d, %d." % (r, b.data.nelement()))
-        #     torch.distributed.barrier()
-        # exit(0)
-        # <<<
-
         # Params for grad norm.
         self.main_grad_views_for_grad_norm = self.get_main_grad_views_for_grad_norm(
             self.opt_group_shards,
@@ -293,47 +252,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def get_model_parallel_group(self):
         return None
 
-    # >>>
-    # @staticmethod
-    # def has_nan_debug(tensors):
-    #     if isinstance(tensors, torch.Tensor):
-    #         tensors = [ tensors ]
-    #     assert isinstance(tensors, list)
-    #     has_nans = [ (not torch.all(torch.isfinite(t)).item()) for t in tensors ]
-    #     has_nan = any(has_nans)
-    #     return has_nan
-    # def get_local_model_param_views(self):
-    #     '''** FOR DEBUGGING. **'''
-    #     model_param_views = []
-    #     for group_index, opt_group_shard in enumerate(self.opt_group_shards):
-    #         for param, opt_shard in opt_group_shard["param_map"].items():
-    #             model_index, dtype = self.param_gbuf_map[param]
-    #             gbuf_shard_map = \
-    #                 self.model_gbuf_shards[model_index][dtype]["param_map"][param]
-    #             model_param_shard = gbuf_shard_map["param"]
-    #             model_param_views.append(
-    #                 param.view(-1)[model_param_shard.start:model_param_shard.end])
-    #     return model_param_views
-    # def get_local_model_grad_views(self):
-    #     '''** FOR DEBUGGING. **'''
-    #     model_grad_views = []
-    #     for group_index, opt_group_shard in enumerate(self.opt_group_shards):
-    #         for param, opt_shard in opt_group_shard["param_map"].items():
-    #             model_index, dtype = self.param_gbuf_map[param]
-    #             gbuf = self.models[model_index]._grad_buffers[dtype].data
-    #             gbuf_shard_map = \
-    #                 self.model_gbuf_shards[model_index][dtype]["param_map"][param]
-    #             gbuf_world_shard = gbuf_shard_map["gbuf_world"]
-    #             model_grad_views.append(
-    #                 gbuf[gbuf_world_shard.start:gbuf_world_shard.end])
-    #     return model_grad_views
-    # def get_world_model_params(self):
-    #     '''** FOR DEBUGGING. **'''
-    #     return [ p for m in self.models for p in m.parameters() ]
-    # def get_world_model_grads(self):
-    #     '''** FOR DEBUGGING. **'''
-    #     return [ p.main_grad for p in self.get_world_model_params() ]
-    # <<<
 
     def get_main_params(self):
         return [ g["params"][0] for g in self.optimizer.param_groups ]
@@ -344,10 +262,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def get_main_grad(self, group_index):
         return self.get_main_param(group_index).grad
 
-    # >>>
-    def _get_main_grads_for_grad_norm(self):
+
+    def get_main_grads_for_grad_norm(self):
         return self.main_grad_views_for_grad_norm
-    # <<<
+
 
     def state_dict(self):
         state_dict = {}
@@ -386,6 +304,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
+
     def zero_grad(self, set_to_none=True):
 
         # Collect model params.
@@ -396,6 +315,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Distributed optimizer requires contiguous buffer; don't set to None.
         _zero_grad_group_helper(model_params, set_to_none = False)
+
 
     def get_model_grad_buffer_dp_views(self):
 
@@ -410,53 +330,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_size = int(gbuf.numel_padded / data_parallel_world_size)
                 gbuf_views = [gbuf.data[(r*shard_size):((r+1)*shard_size)]
                               for r in range(data_parallel_world_size)]
-                # gbuf_view_items.append((model_index, dtype, gbuf_views))
                 gbuf_view_items.append((model_index, dtype, gbuf.data, gbuf_views))
 
         return gbuf_view_items
-    # >>>
-    # def get_model_grad_buffer_dp_views_SINGLE(self):
-
-    #     data_parallel_world_size = mpu.get_data_parallel_world_size()
-
-    #     # Grad buffer views.
-    #     gbuf_items = []
-    #     for model_index, model in enumerate(self.models):
-    #         for dtype, gbuf in model._grad_buffers.items():
-    #             gbuf_items.append((model_index, dtype, gbuf.data))
-
-    #     return gbuf_items
-    # <<<
-
-    # >>>
-    # def get_model_grad_buffer_dp_views_chunked(self, mem_savings_factor):
-
-    #     # Iterate grad buffers & chunk.
-    #     gbuf_view_items = self.get_model_grad_buffer_dp_views()
-    #     chunk_view_items = []
-    #     for model_index, dtype, gbuf_views in gbuf_view_items:
-
-    #         # ** Sanity check. ** (should be unnecessary; see comment above)
-    #         view_numel = gbuf_views[0].nelement()
-    #         for view in gbuf_views:
-    #             assert view.nelement() == view_numel
-
-    #         # Compute chunk size (via savings factor).
-    #         chunk_numel_min = 131072
-    #         chunk_numel_max = view_numel
-    #         chunk_numel = int(
-    #             mem_savings_factor * chunk_numel_min
-    #             + (1 - mem_savings_factor) * chunk_numel_max
-    #         )
-
-    #         # Chunk views.
-    #         for start_index in range(0, view_numel, chunk_numel):
-    #             end_index = min(view_numel, start_index + chunk_numel)
-    #             chunk_views = [ t[start_index:end_index] for t in gbuf_views ]
-    #             chunk_view_items.append((model_index, dtype, chunk_views))
-
-    #     return chunk_view_items
-    # <<<
 
     def reduce_model_grads(self, args, timers):
         '''Note: this is a different order of reduction, versus the non-
@@ -474,44 +350,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
         data_parallel_group = mpu.get_data_parallel_group()
-        mem_savings_factor = args.distrib_opt_comm_mem_savings
 
         # Scale grad buffers by '1 / data_parallel_world_size'.
         for model in self.models:
             for dtype, gbuf in model._grad_buffers.items():
                 gbuf.data /= data_parallel_world_size
 
-        # Reduce scatter all grads.
-        # >>>
-        # gbuf_view_items = \
-        #     self.get_model_grad_buffer_dp_views_chunked(mem_savings_factor)
-        # for model_index, dtype, gbuf_views in gbuf_view_items:
-        #     torch.distributed.reduce_scatter(
-        #         gbuf_views[data_parallel_rank],
-        #         gbuf_views,
-        #         group = data_parallel_group,
-        #     )
-        # +++
+        # Reduce-scatter all grads.
         gbuf_view_items = self.get_model_grad_buffer_dp_views()
-        # gbuf_view_items_SINGLE = self.get_model_grad_buffer_dp_views_SINGLE()
         for index, (model_index, dtype, gbuf, gbuf_views) in enumerate(gbuf_view_items):
-            # >>>
-            # pax(0, {
-            #     "gbuf_view" : gbuf_views[data_parallel_rank].shape,
-            #     "gbuf SINGLE" : gbuf_view_items_SINGLE[index][2].shape,
-            # })
-            # <<<
             torch.distributed._reduce_scatter_base(
                 gbuf_views[data_parallel_rank],
-                gbuf, # gbuf_view_items_SINGLE[index][2],
+                gbuf,
                 group = data_parallel_group,
             )
-            # torch.distributed.reduce_scatter(
-            #     gbuf_views[data_parallel_rank],
-            #     gbuf_views,
-            #     group = data_parallel_group,
-            # )
-        # <<<
+
         timers('backward-params-all-reduce').stop()
 
     def gather_model_params(self, args, timers):
@@ -520,32 +373,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_group = mpu.get_data_parallel_group()
-        mem_savings_factor = args.distrib_opt_comm_mem_savings
 
         # All-gather updated main params.
         # - All grad buffer views are guaranteed to have the same num elements
         #   across all data parallel ranks, with grad buffer padding that is done
         #   in distributed.py. Thus, all sub-views will have consistent start/end
         #   indexes across data parallel ranks.
-        # >>>
-        # gbuf_view_items = \
-        #     self.get_model_grad_buffer_dp_views_chunked(mem_savings_factor)
-        # for model_index, dtype, gbuf_views in gbuf_view_items:
-        #     torch.distributed.all_gather(
-        #         gbuf_views,
-        #         gbuf_views[data_parallel_rank],
-        #         group = data_parallel_group,
-        #     )
-        # +++
         gbuf_view_items = self.get_model_grad_buffer_dp_views()
-        # gbuf_view_items_SINGLE = self.get_model_grad_buffer_dp_views_SINGLE()
         for index, (model_index, dtype, gbuf, gbuf_views) in enumerate(gbuf_view_items):
             torch.distributed._all_gather_base(
-                gbuf, # gbuf_view_items_SINGLE[index][2],
+                gbuf,
                 gbuf_views[data_parallel_rank],
                 group = data_parallel_group,
             )
-        # <<<
 
         # Each model param now contains its updated values in its
         # '.main_grad' field.

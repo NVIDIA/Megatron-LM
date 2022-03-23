@@ -51,31 +51,8 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
-    # >>>
-    # # Filter parameters based on:
-    # #   - grad should not be none
-    # #   - parameter should not be shared
-    # #   - should not be a replica due to tensor model parallelism
-    # grads = []
-    # grads_for_norm = []
-    # for param in parameters:
-    #     grad_not_none = param.grad is not None
-    #     is_not_shared = param_is_not_shared(param)
-    #     is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-    #     if grad_not_none:
-    #         grad = param.grad.detach()
-    #     if grad_not_none:
-    #         # Make sure the grads are in fp32
-    #         assert param.grad.type() == 'torch.cuda.FloatTensor'
-    #         grads.append(grad)
-    #     if grad_not_none and is_not_shared and is_not_tp_duplicate:
-    #         grads_for_norm.append(grad)
-    # <<<
-
-    # >>>
     # Grads.
-    grads = [ p.grad for p in parameters if p is not None ]
-    # <<<
+    grads = [ p.grad.detach() for p in parameters if p.grad is not None ]
 
     # Norm parameters.
     max_norm = float(max_norm)
@@ -118,17 +95,6 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=model_parallel_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)
-
-        # >>>
-        # from megatron import get_args
-        # from lutil import pax
-        # args = get_args()
-        # pax(0, {
-        #     "use distrib opt" : args.use_distributed_optimizer,
-        #     "norm_type" : norm_type,
-        #     "total_norm" : total_norm,
-        # })
-        # <<<
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)

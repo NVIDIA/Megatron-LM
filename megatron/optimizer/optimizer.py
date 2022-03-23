@@ -27,23 +27,11 @@ from megatron import mpu
 from megatron import print_rank_0
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
+from megatron.model.module import param_is_not_shared
+from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
-
-# >>>
-from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
-
-from lutil import pax
-        
-get_clippy = lambda params : [ "%d, %d, %d ... %s" % (
-    p.grad is not None,
-    param_is_not_shared(p),
-    param_is_not_tensor_parallel_duplicate(p),
-    str(tuple(p.shape)),
-) for p in params ]
-# <<<
 
 
 def _zero_grad_group_helper(group, set_to_none):
@@ -112,12 +100,9 @@ class MegatronOptimizer(ABC):
                 params.append(param)
         return params
 
-    # >>>
     @abstractmethod
-    # def get_grads_for_norm(self):
-    def _get_main_grads_for_grad_norm(self):
+    def get_main_grads_for_grad_norm(self):
         pass
-    # <<<
 
     def get_model_parallel_group(self):
         '''Default returned here, but the distributed optimizer overrides this.'''
@@ -126,7 +111,7 @@ class MegatronOptimizer(ABC):
 
     def clip_grad_norm(self, clip_grad):
         params = self.get_parameters()
-        grads_for_norm = self._get_main_grads_for_grad_norm()
+        grads_for_norm = self.get_main_grads_for_grad_norm()
         return clip_grad_norm_fp32(
             params, grads_for_norm, clip_grad,
             model_parallel_group=self.get_model_parallel_group())
@@ -544,17 +529,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # recast preexisting per-param state tensors
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
-        # >>>
-        # model_params = [ p for m in self.models for p in m.parameters() ]
-        # optim_params = self.get_parameters()
-        # model_params.sort(key = lambda p : p.nelement(), reverse = True)
-        # optim_params.sort(key = lambda p : p.nelement(), reverse = True)
-        # # assert len(model_params) == len(optim_params
-        # pax(7, {
-        #     "model_params" : get_clippy(model_params),
-        #     "optim_params" : get_clippy(optim_params),
-        # })
-        # <<<
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -570,7 +544,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             _zero_grad_group_helper(group, set_to_none)
 
 
-    def _get_main_grads_for_grad_norm(self):
+    def get_main_grads_for_grad_norm(self):
 
         # Filter parameters based on:
         #   - grad should not be none
