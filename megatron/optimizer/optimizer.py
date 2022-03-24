@@ -277,7 +277,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 bf16, grad_scaler,
+                 fp16, bf16, grad_scaler,
                  models):
 
         super().__init__(
@@ -285,6 +285,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
             models)
 
+        self.fp16 = fp16
         self.bf16 = bf16
         self.grad_scaler = grad_scaler
 
@@ -481,12 +482,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 bf16, grad_scaler, models):
+                 fp16, bf16, grad_scaler, models):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-            bf16, grad_scaler, models)
+            fp16, bf16, grad_scaler, models)
 
         # ======================
         # main parameter stuff
