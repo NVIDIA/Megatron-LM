@@ -33,6 +33,10 @@ from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
+# >>>
+from lutil import pax, tp, print_seq
+# <<<
+
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -427,6 +431,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
+        print_seq("hi.")
         # Do unscale, check for inf, and update grad scaler only for
         # the case that grad scaler is provided.
         if self.grad_scaler:
@@ -569,18 +574,18 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
 
     # >>>
-    # def zero_grad(self, set_to_none=True):
-    #     """We only need to zero the model related parameters, i.e.,
-    #     float16_groups & fp32_from_fp32_groups. We additionally zero
-    #     fp32_from_float16_groups as a memory optimization to reduce
-    #     fragmentation; in the case of set_to_none==True, the space
-    #     used by this field can be safely deallocated at this point."""
-    #     for group in self.float16_groups:
-    #         _zero_grad_group_helper(group, set_to_none)
-    #     for group in self.fp32_from_float16_groups:
-    #         _zero_grad_group_helper(group, set_to_none)
-    #     for group in self.fp32_from_fp32_groups:
-    #         _zero_grad_group_helper(group, set_to_none)
+    def zero_grad(self, set_to_none=True):
+        """We only need to zero the model related parameters, i.e.,
+        float16_groups & fp32_from_fp32_groups. We additionally zero
+        fp32_from_float16_groups as a memory optimization to reduce
+        fragmentation; in the case of set_to_none==True, the space
+        used by this field can be safely deallocated at this point."""
+        for group in self.float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+        for group in self.fp32_from_float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+        for group in self.fp32_from_fp32_groups:
+            _zero_grad_group_helper(group, set_to_none)
     # <<<
 
 
