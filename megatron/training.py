@@ -52,6 +52,10 @@ from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
+# >>>
+from lutil import pax, tp, print_seq
+# <<<
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
