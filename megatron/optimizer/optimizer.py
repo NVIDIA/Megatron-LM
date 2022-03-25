@@ -556,7 +556,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
 
-    # >>>
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
         float16_groups & fp32_from_fp32_groups. We additionally zero
@@ -569,7 +568,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
-    # <<<
 
 
     def _collect_main_grad_data_for_unscaling(self):

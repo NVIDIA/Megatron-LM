@@ -227,7 +227,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                 # fp32 params.
-                elif param.type() == 'torch.cuda.FloatTensor':
+                elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1) \
                         [param_range.start:param_range.end]
                     full_fp32_params_this_group.append(model_param)
