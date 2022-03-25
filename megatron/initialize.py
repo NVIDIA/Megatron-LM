@@ -31,6 +31,8 @@ from megatron import mpu
 from megatron.global_vars import set_global_variables
 from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
+from megatron.model.transformer import bias_dropout_add_fused_train
+from megatron.model.fused_bias_gelu import bias_gelu
 
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
@@ -251,3 +253,41 @@ def _set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
+
+def warmup_jit_function():
+    """ Compilie JIT functions before the main training steps """
+    args = get_args()
+    if args.bf16:
+        p = torch.bfloat16
+    elif args.fp16:
+        p = torch.float16
+    else:
+        p = torch.float32
+
+    # Warmup fused bias+gelu
+    b = torch.rand(int(args.hidden_size * 4 / args.tensor_model_parallel_size),
+                   dtype=p, device='cuda')
+    x = torch.rand((args.seq_length, args.micro_batch_size,
+                    int(args.hidden_size * 4 / args.tensor_model_parallel_size)),
+                   dtype=p, device='cuda')
+    # Warmup JIT fusions with the input grad_enable state at both forward
+    # prop and recomputation
+    for b_grad, x_grad in zip([True, True], [False, True]):
+        b.requires_grad, x.requires_grad = b_grad, x_grad
+        for _ in range(5):
+            y = bias_gelu(b, x)
+    del b, x, y
+
+    # Warmup fused bias+dropout+add
+    input_size = (args.seq_length, args.micro_batch_size, args.hidden_size)
+    x = torch.rand(input_size, dtype=p, device='cuda')
+    r = torch.rand(input_size, dtype=p, device='cuda')
+    b = torch.rand((args.hidden_size), dtype=p, device='cuda').expand_as(r)
+    # Warmup JIT fusions with the input grad_enable state at both forward
+    # prop and recomputation
+    for x_grad, b_grad, r_grad in zip([False, True], [True, True], [True, True]):
+        x.requires_grad, b.requires_grad, r.requires_grad = x_grad, b_grad, r_grad
+        for _ in range(5):
+            y = bias_dropout_add_fused_train(x, b, r, 0.1)
+    del b, x, r, y
+    torch.cuda.empty_cache()

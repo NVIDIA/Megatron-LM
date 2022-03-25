@@ -564,13 +564,11 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
 
-            # re-enable torch grad to enable fused optimization.
-            with torch.enable_grad():
-                layernorm_input = bias_dropout_add_func(
-                    attention_output,
-                    attention_bias.expand_as(residual),
-                    residual,
-                    self.hidden_dropout)
+            layernorm_input = bias_dropout_add_func(
+                attention_output,
+                attention_bias.expand_as(residual),
+                residual,
+                self.hidden_dropout)
         else:
             out = torch.nn.functional.dropout(attention_output + attention_bias,
                                               p=self.hidden_dropout,
@@ -591,13 +589,11 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 residual = layernorm_input
 
-            # re-enable torch grad to enable fused optimization.
-            with torch.enable_grad():
-                layernorm_input = bias_dropout_add_func(
-                    attention_output,
-                    attention_bias.expand_as(residual),
-                    residual,
-                    self.hidden_dropout)
+            layernorm_input = bias_dropout_add_func(
+                attention_output,
+                attention_bias.expand_as(residual),
+                residual,
+                self.hidden_dropout)
 
             # Layer norm post the decoder attention
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
@@ -612,13 +608,11 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_input
 
         if self.drop_path is None:
-            # re-enable torch grad to enable fused optimization.
-            with torch.enable_grad():
-                output = bias_dropout_add_func(
-                    mlp_output,
-                    mlp_bias.expand_as(residual),
-                    residual,
-                    self.hidden_dropout)
+            output = bias_dropout_add_func(
+                mlp_output,
+                mlp_bias.expand_as(residual),
+                residual,
+                self.hidden_dropout)
         else:
             out = torch.nn.functional.dropout(mlp_output + mlp_bias,
                                               p=self.hidden_dropout,

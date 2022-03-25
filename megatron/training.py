@@ -42,6 +42,7 @@ from megatron.model import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
+from megatron.initialize import warmup_jit_function
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
@@ -99,6 +100,7 @@ def pretrain(train_valid_test_dataset_provider,
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
+    warmup_jit_function()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
