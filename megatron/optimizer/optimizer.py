@@ -122,14 +122,6 @@ class MegatronOptimizer(ABC):
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
-        # >>>
-        # from lutil import pax
-        # pax(0, {
-        #     "params" : params,
-        #     "grads_for_norm" : grads_for_norm,
-        # })
-        # <<<
-
         return grads_for_norm
 
 
@@ -141,16 +133,6 @@ class MegatronOptimizer(ABC):
     def clip_grad_norm(self, clip_grad):
         params = self.get_parameters()
         grads_for_norm = self.get_main_grads_for_grad_norm()
-        # >>>
-        from lutil import print_seq
-        # print_seq("params %d, ngrads %d." % (len(params), len(grads_for_norm)))
-        # print_seq([
-        #     "grads_for_norm / %d = %s." % (i, str(tuple(g.shape)))
-        #     for i, g in enumerate(grads_for_norm)
-        # ])
-        print_seq("grads_for_norm = %s." % ", ".join(
-            str(tuple(g.shape)) for g in grads_for_norm))
-        # <<<
         return clip_grad_norm_fp32(
             params, grads_for_norm, clip_grad,
             model_parallel_group=self.get_model_parallel_group())
