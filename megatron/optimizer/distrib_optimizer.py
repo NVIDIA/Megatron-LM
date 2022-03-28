@@ -235,6 +235,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         [param_range.start:param_range.end]
                     full_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
+                    mpu.copy_tensor_model_parallel_attributes(
+                        shard_model_param, model_param)
 
                 else:
                     raise TypeError('Wrapped parameters must be one of '
