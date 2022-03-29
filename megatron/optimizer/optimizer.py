@@ -122,7 +122,7 @@ class MegatronOptimizer(ABC):
 
 
     def get_model_parallel_group(self):
-        '''Default returned here, but the distributed optimizer overrides this.'''
+        """Default returned here, but the distributed optimizer overrides this."""
         return mpu.get_model_parallel_group()
 
 
@@ -205,19 +205,21 @@ class MegatronOptimizer(ABC):
 
 
     def gather_model_params(self, args, timers):
-        '''For the case of a non-distributed-optimizer, there is nothing to
-        do here.'''
+        """
+        For the case of a non-distributed-optimizer, there is nothing to
+        do here.
+        """
         pass
 
 
     def allreduce_word_embedding_grads(self, args):
-        '''
+        """
         All-reduce word embedding grads.
 
         Reduce grads across first and last stages to ensure that word_embeddings
         parameters stay in sync. This should only run for models that support
         pipelined model parallelism (BERT and GPT-2).
-        '''
+        """
 
         if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
                 mpu.get_pipeline_model_parallel_world_size() > 1:
@@ -240,12 +242,12 @@ class MegatronOptimizer(ABC):
 
 
     def allreduce_position_embedding_grads(self, args):
-        '''
+        """
         All-reduce position_embeddings grad across first (encoder) and
         split (decoder) stages to ensure that position embeddings parameters
         stay in sync. This should only run for T5 models with pipeline
         parallelism.
-        '''
+        """
         if mpu.is_rank_in_position_embedding_group() and \
                 mpu.get_pipeline_model_parallel_world_size() > 1 and \
                 args.pipeline_model_parallel_split_rank is not None:
@@ -259,13 +261,13 @@ class MegatronOptimizer(ABC):
 
 
     def allreduce_embedding_grads(self, args):
-        '''All-reduce both word and position embeddings.'''
+        """All-reduce both word and position embeddings."""
         self.allreduce_word_embedding_grads(args)
         self.allreduce_position_embedding_grads(args)
 
 
     def reduce_model_grads(self, args, timers):
-        '''All-reduce all grads, and all-reduce embeddings.'''
+        """All-reduce all grads, and all-reduce embeddings."""
 
         # All-reduce if needed.
         if args.DDP_impl == 'local':

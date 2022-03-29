@@ -29,9 +29,10 @@ from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
 
 class Range:
-    '''A range represents a start and end points for indexing a shard
+    """
+    A range represents a start and end points for indexing a shard
     from a full tensor.
-    '''
+    """
     def __init__(self, start, end):
         self.start = start
         self.end = end
@@ -43,7 +44,7 @@ class Range:
 
 
 class DistributedOptimizer(MixedPrecisionOptimizer):
-    '''Distributed optimizer, for all data types (fp16, bf16, and fp32).
+    """Distributed optimizer, for all data types (fp16, bf16, and fp32).
 
     Arguments:
         optimizer: base optimizer such as Adam or SGD
@@ -70,7 +71,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             always require a grad scaler.
         models: list of models (i.e., the virtual pipelining models). This
             is used by the distributed optimizer for mapping parameters.
-    '''
+    """
 
     @classmethod
     def build_model_gbuf_param_range_map(cls, model, dtype, gbuf_world_range):
@@ -155,8 +156,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     @classmethod
     def build_model_param_gbuf_map(cls, model_gbuf_ranges):
-        '''Create a reverse of the model_gbuf_ranges, for referencing in
-        opposite direction.'''
+        """
+        Create a reverse of the model_gbuf_ranges, for referencing in
+        opposite direction.
+        """
         param_gbuf_map = {}
         for model_index, model_gbuf_range_map in enumerate(model_gbuf_ranges):
             for dtype, gbuf_range_map in model_gbuf_range_map.items():
@@ -335,10 +338,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def get_model_param_range_map(self, param):
-        '''
+        """
         Given a model param, get the index sub-range of the param that this
         data-parallel rank owns.
-        '''
+        """
         model_index, dtype = self.model_param_gbuf_map[param]
         gbuf_range_map = self.model_gbuf_ranges[model_index][dtype]
         param_range_map = gbuf_range_map["param_map"][param]
@@ -346,10 +349,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def get_model_parallel_group(self):
+        """
+        With the distributed optimizer, the model parallel group is the
+        entire world.
+        """
         return None
 
 
     def state_dict(self):
+        """
+        The state dict must contain the fp32-from-float16 shards.
+        """
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
         if self.grad_scaler:
@@ -424,10 +434,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def reduce_model_grads(self, args, timers):
-        '''Note: this is a different order of reduction, versus the non-
-           distributed optimizer, which reduces: 1) all grads, 2) embedding
-           grads.
-        '''
+        """
+        Note: this is a different order of reduction, versus the non-
+        distributed optimizer, which reduces: 1) all grads, 2) embedding
+        grads.
+        """
 
         # All-reduce embedding grads.
         timers('backward-embedding-all-reduce').start()
