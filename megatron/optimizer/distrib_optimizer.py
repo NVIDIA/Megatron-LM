@@ -237,6 +237,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_params_this_group.append(shard_model_param)
                     mpu.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param)
+                    if hasattr(model_param, 'shared'):
+                        shard_model_param.shared = model_param.shared
 
                 else:
                     raise TypeError('Wrapped parameters must be one of '
