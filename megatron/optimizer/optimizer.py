@@ -33,10 +33,6 @@ from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
-# >>>
-from lutil import pax, tp, print_seq
-# <<<
-
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.
@@ -349,63 +345,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         return found_inf_flag
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # @classmethod
-    # def debug_base(cls, ITERATION, key, value):
-    #     from megatron import get_args
-    #     args = get_args()
-    #     my_rank = torch.distributed.get_rank()
-    #     DEBUG_ITERATION = ITERATION
-    #     if ITERATION != DEBUG_ITERATION:
-    #         return
-    #     for r in range(torch.distributed.get_world_size()):
-    #         if my_rank == r:
-    #             # prefix = "            + "
-    #             prefix = ""
-    #             print("%sbr/%s; [r%d, i%d]; %s, %.12e" % (prefix, "fix " if args.use_distributed_optimizer else "main", my_rank, ITERATION, key, value))
-    #         torch.distributed.barrier()
-    #     torch.distributed.barrier()
-    #     # if my_rank == 0:
-    #     #     raise Exception("debug.")
-    #     # else:
-    #     #     exit(0)
-    #     exit(0)
-    # def debug_model(self, ITERATION, key, use_grad):
-    #     use_grad = bool(use_grad)
-    #     tensors = [
-    #         (p.main_grad.float() if use_grad else p.float())
-    #         for m in self.models for p in m.parameters()
-    #     ]
-    #     count = sum(t.nelement() for t in tensors)
-    #     return self.debug_base(
-    #         ITERATION,
-    #         "model/%s, %s [count %d]" % (
-    #             "grad" if use_grad else "param",
-    #             key,
-    #             count,
-    #         ),
-    #         # sum(torch.sum(torch.abs(t)) for t in tensors).item() / count,
-    #         sum(torch.sum(torch.abs(t)) for t in tensors),
-    #     )
-    # def debug_main(self, ITERATION, key, use_grad):
-    #     use_grad = bool(use_grad)
-    #     tensors = [
-    #         p.grad if use_grad else p
-    #         for g in self.optimizer.param_groups
-    #         for p in g["params"]
-    #     ]
-    #     tensors = [ t.float() for t in tensors ]
-    #     count = sum(t.nelement() for t in tensors)
-    #     return self.debug_base(
-    #         ITERATION,
-    #         "main/%s, %s [count %d]" % (
-    #             "grad" if use_grad else "param",
-    #             key,
-    #             count,
-    #         ),
-    #         sum(torch.sum(torch.abs(t)) for t in tensors),
-    #     )
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     @torch.no_grad()
     def step(self, args, timers):

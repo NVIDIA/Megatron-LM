@@ -99,11 +99,6 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
                                      group=model_parallel_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
-        # >>>
-        # from lutil import pax, tp, print_seq
-        # print_seq("norm : grad %s, total %s." % (grad_norm.item(), total_norm))
-        # <<<
-
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:

@@ -27,10 +27,6 @@ from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
-# >>>
-from lutil import pax, tp, print_seq
-# <<<
-
 
 class Range:
 
@@ -363,14 +359,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         fp32_from_float16_groups as a memory optimization to reduce
         fragmentation; in the case of set_to_none==True, the space
         used by this field can be safely deallocated at this point."""
-        # >>>
-        # params = [ p for g in self.shard_fp32_groups for p in g ]
-        # pax(0, {
-        #     "shard_fp32_groups" : self.shard_fp32_groups,
-        #     "params" : params,
-        #     "grads" : [ p.grad for p in params ],
-        # })
-        # <<<
         for groups in (
                 self.full_float16_groups,
                 self.full_fp32_groups,
