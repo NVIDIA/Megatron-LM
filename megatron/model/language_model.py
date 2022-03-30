@@ -37,7 +37,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         input_parallel = input_
         model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
-            model_parallel
+            model_parallel and not args.model_parallel_memory_opt
     else:
         input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
         async_grad_allreduce = False
@@ -46,7 +46,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     logits_parallel = mpu.LinearWithGradAccumulationAndAsyncCommunication.apply(
         input_parallel, word_embeddings_weight, bias,
         args.gradient_accumulation_fusion,
-        async_grad_allreduce, None)
+        async_grad_allreduce, args.model_parallel_memory_opt)
     # Gather if needed.
 
     if parallel_output:
@@ -170,6 +170,8 @@ class Embedding(MegatronModule):
         else:
             self.tokentype_embeddings = None
 
+        self.fp32_residual_connection = args.fp32_residual_connection 
+        self.model_parallel_memory_opt = args.model_parallel_memory_opt
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
@@ -211,8 +213,23 @@ class Embedding(MegatronModule):
         else:
             assert self.tokentype_embeddings is None
 
+        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+        # If the input flag for fp32 residual connection is set, convert for float.
+        if self.fp32_residual_connection:
+            embeddings = embeddings.transpose(0, 1).contiguous().float()
+        # Otherwise, leave it as is.
+        else:
+            embeddings = embeddings.transpose(0, 1).contiguous()
+
+        if self.model_parallel_memory_opt:
+            embeddings = mpu.scatter_to_sequence_parallel_region(embeddings)
+            
         # Dropout.
-        embeddings = self.embedding_dropout(embeddings)
+        if self.model_parallel_memory_opt:
+            with mpu.get_cuda_rng_tracker().fork():
+                embeddings = self.embedding_dropout(embeddings)
+        else:
+            embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
 

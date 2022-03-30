@@ -264,6 +264,13 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                         if param in self.optimizer.state:
                             self.optimizer.state[main_param] \
                                 = self.optimizer.state.pop(param)
+                    
+                        #state = self.optimizer.state[main_param]
+                        #if len(state) == 0:
+                        #    # Exponential moving average of gradient values
+                        #    state['exp_avg'] = torch.zeros_like(main_param.data)
+                        #    # Exponential moving average of squared gradient values
+                        #    state['exp_avg_sq'] = torch.zeros_like(main_param.data)
 
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
@@ -284,8 +291,8 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
 
         # Leverage state_dict() and load_state_dict() to
         # recast preexisting per-param state tensors
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
-
+        # self.optimizer.load_state_dict(self.optimizer.state_dict())
+        
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,

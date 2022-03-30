@@ -18,7 +18,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args
+from megatron import get_timers, get_args, print_rank_last, print_rank_0
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
@@ -26,6 +26,8 @@ from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+
+_MATMUL_INPUT = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -41,7 +43,6 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
-
 
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample 
@@ -189,7 +190,18 @@ class CoreAttention(MegatronModule):
                                                     world_size)
         self.hidden_size_per_attention_head = mpu.divide(
             projection_size, args.num_attention_heads)
+        self.num_attention_heads_per_partition = mpu.divide(
+            args.num_attention_heads, world_size)
 
+        global _MATMUL_INPUT
+        if _MATMUL_INPUT is None:
+            _MATMUL_INPUT = torch.empty(
+                args.micro_batch_size * self.num_attention_heads_per_partition,
+                args.seq_length,
+                args.seq_length,
+                dtype=torch.bfloat16,
+                device=torch.cuda.current_device())
+        
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         if self.apply_query_key_layer_scaling:
@@ -230,16 +242,19 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting result tensor: [b * np, sq, sk]
-        matmul_result = torch.empty(
-            output_size[0]*output_size[1],
-            output_size[2],
-            output_size[3],
-            dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+        #matmul_result = torch.empty(
+        #    output_size[0]*output_size[1],
+        #    output_size[2],
+        #    output_size[3],
+        #    dtype=query_layer.dtype,
+        #    device=torch.cuda.current_device())
+
+        global _MATMUL_INPUT
+        matmul_input = _MATMUL_INPUT
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
-            matmul_result,
+            matmul_input,
             query_layer.transpose(0, 1),   # [b * np, sq, hn]
             key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
@@ -838,6 +853,7 @@ class ParallelTransformer(MegatronModule):
                     self.distribute_checkpointed_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 l += self.activations_checkpoint_num_layers
+
         elif self.activations_checkpoint_method == 'block':
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
@@ -869,25 +885,12 @@ class ParallelTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
-
         # Checks.
         if inference_params:
             assert self.activations_checkpoint_method is None, \
                 'inference does not work with activation checkpointing'
 
-        if self.pre_process:
-            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            # If the input flag for fp32 residual connection is set, convert for float.
-            if self.fp32_residual_connection:
-                hidden_states = hidden_states.transpose(0, 1).contiguous().float()
-            # Otherwise, leave it as is.
-            else:
-                hidden_states = hidden_states.transpose(0, 1).contiguous()
-
-            if self.model_parallel_memory_opt:
-                hidden_states = mpu.scatter_to_sequence_parallel_region(hidden_states)
-
-        else:
+        if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
@@ -908,16 +911,9 @@ class ParallelTransformer(MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = mpu.make_viewless_tensor(
             hidden_states,
-            requires_grad = True,
-            keep_graph = True,
+            requires_grad=True,
+            keep_graph=True,
         )
-
-        # Transpose encoder output.
-        if encoder_output is not None and \
-                not self.model_parallel_memory_opt:
-            encoder_output = encoder_output.transpose(0, 1).contiguous()
-            if self.model_parallel_memory_opt:
-                encoder_output = mpu.scatter_to_sequence_parallel_region(encoder_output)
 
         if self.model_parallel_memory_opt:
             with mpu.get_cuda_rng_tracker().fork():
@@ -928,6 +924,7 @@ class ParallelTransformer(MegatronModule):
                                                                encoder_output,
                                                                enc_dec_attn_mask)
                 else:
+                    total = 0
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
                         hidden_states = layer(
@@ -936,6 +933,7 @@ class ParallelTransformer(MegatronModule):
                             encoder_output=encoder_output,
                             enc_dec_attn_mask=enc_dec_attn_mask,
                             inference_params=inference_params)
+                         
         else:
             # Forward pass.
             if self.activations_checkpoint_method is not None:
@@ -955,20 +953,6 @@ class ParallelTransformer(MegatronModule):
 
         # Final layer norm.
         if self.post_process:
-            # Reverting data format change [s b h] --> [b s h].
             hidden_states = self.final_layernorm(hidden_states)
 
-            if self.layer_type == LayerType.encoder and \
-                    self.model_type == ModelType.encoder_and_decoder and \
-                    self.model_parallel_memory_opt:
-                output = hidden_states
-            else:
-
-                if self.model_parallel_memory_opt:
-                    hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
-
-                output = hidden_states.transpose(0, 1).contiguous()
-        else:
-            output = hidden_states
-
-        return output
+        return hidden_states

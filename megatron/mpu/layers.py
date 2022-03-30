@@ -41,11 +41,12 @@ from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args
 
-
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
                                       'partition_stride': 1}
 
+_TOTAL_INPUT = None
+_SUB_GRAD_INPUT = None
 
 def param_is_not_tensor_parallel_duplicate(param):
     return (hasattr(param, 'tensor_model_parallel') and
@@ -221,9 +222,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            total_input = torch.empty(dim_size, dtype=input.dtype,
-                                      device=torch.cuda.current_device(),
-                                      requires_grad=False)
+            #total_input = torch.empty(dim_size, dtype=input.dtype,
+            #                          device=torch.cuda.current_device(),
+            #                          requires_grad=False)
+            global _TOTAL_INPUT
+            total_input = _TOTAL_INPUT
             torch.distributed._all_gather_base(total_input, input,
                                                group=get_tensor_model_parallel_group())
         
@@ -246,9 +249,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            total_input = torch.empty(dim_size, dtype=input.dtype,
-                                      device=torch.cuda.current_device(),
-                                      requires_grad=False)
+            #total_input = torch.empty(dim_size, dtype=input.dtype,
+            #                          device=torch.cuda.current_device(),
+            #                          requires_grad=False)
+            global _TOTAL_INPUT
+            total_input = _TOTAL_INPUT
+
             handle = torch.distributed._all_gather_base(total_input, input,
                                            group=get_tensor_model_parallel_group(), async_op=True)
             # Delay the start of intput gradient computation shortly (3us) to have
@@ -279,8 +285,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             assert not ctx.async_grad_allreduce
             dim_size = list(input.size())
             sub_grad_input = torch.empty(dim_size, dtype=input.dtype,
-                             device=torch.cuda.current_device(),
-                             requires_grad=False)
+                                         device=torch.cuda.current_device(),
+                                         requires_grad=False)
             # reduce_scatter
             handle = torch.distributed._reduce_scatter_base(sub_grad_input, grad_input, 
                                                             group=get_tensor_model_parallel_group(),
@@ -390,6 +396,11 @@ class ColumnParallelLinear(torch.nn.Module):
         assert not self.async_tensor_model_parallel_allreduce or \
             not self.model_parallel_memory_opt
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
+        global _TOTAL_INPUT
+        if _TOTAL_INPUT is None:
+            _TOTAL_INPUT = torch.empty((args.seq_length, args.micro_batch_size, args.hidden_size), dtype=torch.bfloat16,
+                                       device=torch.cuda.current_device(),
+                                       requires_grad=False)
 
 
     def forward(self, input_):
