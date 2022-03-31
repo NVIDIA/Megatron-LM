@@ -123,6 +123,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self._grad_buffers = None
         if self.use_contiguous_buffers:
             self._grad_buffers = {}
+            self._expert_grads = []
 
             # Simple function to define buffer type.
             def _get_buffer_type(param):
@@ -132,7 +133,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # First calculate total number of elements per type.
             type_num_elements = {}
             for param in self.module.parameters():
-                if param.requires_grad:
+                if param.requires_grad and not getattr(param, 'expert_parallel', False):
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] = type_num_elements.get(dtype, 0) \
                                                + param.data.nelement()
@@ -146,9 +147,16 @@ class DistributedDataParallel(DistributedDataParallelBase):
             for param in self.module.parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
-                    type_num_elements[dtype] -= param.data.nelement()
-                    param.main_grad = self._grad_buffers[dtype].get(
-                        param.data.shape, type_num_elements[dtype])
+                    if not getattr(param, 'expert_parallel', False):
+                        type_num_elements[dtype] -= param.data.nelement()
+                        param.main_grad = self._grad_buffers[dtype].get(
+                            param.data.shape, type_num_elements[dtype])
+                    else:
+                        param.main_grad = torch.zeros(param.data.shape,
+                                                      dtype=dtype,
+                                                      device=torch.cuda.current_device(),
+                                                      requires_grad=False)
+                        self._expert_grads.append(param.main_grad)
 
             # Backward hook.
             # Accumalation function for the gradients. We need
@@ -183,6 +191,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
         assert self._grad_buffers is not None, 'buffers are not initialized.'
         for _, buffer_ in self._grad_buffers.items():
             buffer_.zero()
+        for expert_grad in self._expert_grads:
+            expert_grad.zero_()
 
 
     def broadcast_params(self):
