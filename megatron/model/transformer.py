@@ -74,7 +74,8 @@ class ParallelMLP(MegatronModule):
     state back into h hidden dimension.
     """
 
-    def __init__(self, init_method, output_layer_init_method):
+    def __init__(self, init_method, output_layer_init_method,
+                 is_expert=False):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
@@ -84,7 +85,8 @@ class ParallelMLP(MegatronModule):
             args.ffn_hidden_size,
             gather_output=False,
             init_method=init_method,
-            skip_bias_add=True)
+            skip_bias_add=True,
+            is_expert=is_expert)
 
         self.bias_gelu_fusion = args.bias_gelu_fusion
         self.activation_func = F.gelu
@@ -99,7 +101,8 @@ class ParallelMLP(MegatronModule):
             args.hidden_size,
             input_is_parallel=True,
             init_method=output_layer_init_method,
-            skip_bias_add=True)
+            skip_bias_add=True,
+            is_expert=is_expert)
 
     def forward(self, hidden_states):
 
@@ -117,6 +120,7 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
+
 class SwitchMLP(MegatronModule):
     """
     Routes input to one of N MLP "experts"
@@ -125,43 +129,76 @@ class SwitchMLP(MegatronModule):
         super(SwitchMLP, self).__init__()
         args = get_args()
         self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
-        self.experts = torch.nn.ModuleList()
-        for i in range(args.num_experts):
-            self.experts.append(ParallelMLP(init_method, output_layer_init_method))
+
+        assert args.num_experts % mpu.get_data_parallel_world_size() == 0
+        self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
+        local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
+        self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+  
+        self.local_experts = torch.nn.ModuleList()
+        for i in range(self.num_local_experts):
+            self.local_experts.append(ParallelMLP(init_method, output_layer_init_method, is_expert=True))
+
+    def gather_indices(self, local_indices):
+        """ Gather tensors and concatinate along the first dimension."""
+        world_size = torch.distributed.get_world_size()
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return local_indices
+
+        dim_size = list(local_indices.size())
+        dim_size[0] = dim_size[0] * world_size
+
+        # TODO pre allocate memory
+        output = torch.empty(dim_size, dtype=local_indices.dtype,
+                             device=torch.cuda.current_device())
+        torch.distributed._all_gather_base(output, local_indices.contiguous())
+        return output
 
     def forward(self, hidden_states):
         # hidden_states: [b, s, h]
-        b = hidden_states.size(0)
-        s = hidden_states.size(1)
+        s = hidden_states.size(0)
+        b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states)
         route = torch.nn.functional.softmax(route, dim=2)
         max_prob, max_ind = torch.max(route, dim=2)
-        max_prob = torch.unsqueeze(max_prob, 2) # [b s 1]
+        max_prob = torch.unsqueeze(max_prob, 2)  # [s b 1]
 
         # TODO (rprenger) TODO this could be made easier to read
-        # Converting [b, s, h] to [b*s, h].
+        # Converting [s, b, h] to [s*b, h].
         # Each vector could be routed differently
-        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
-        max_prob = max_prob.view(-1, max_prob.size(2)) # [b*s 1]
-        max_ind = max_ind.view(-1) # [b*s]
+        hidden_states = hidden_states.view(-1, hidden_states.size(2))  # [s*b h]
+        max_prob = max_prob.view(-1, max_prob.size(2))  # [s*b 1]
+        max_ind = max_ind.view(-1)  # [s*b]
 
-        output_total = torch.empty_like(hidden_states)
-        output_bias_total = torch.empty_like(hidden_states)
-        #TODO (rprenger) This does each expert in serial, but it could be parallelized
-        
-        for expert_num, expert in enumerate(self.experts):
-            local_indices = (max_ind == expert_num).nonzero()
-            hidden = hidden_states[local_indices,:]
+        global_hidden_states = \
+            mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
+        global_indices = self.gather_indices(max_ind)
+
+        output_total = torch.zeros_like(global_hidden_states)
+        output_bias_total = torch.zeros_like(global_hidden_states)
+        for expert_num, expert in enumerate(self.local_experts):
+            local_indices = (global_indices == expert_num).nonzero()
+            hidden = global_hidden_states[local_indices, :]
             output, output_bias = expert(hidden)
             output_bias = output_bias.expand_as(output)
-            output_total[local_indices,:] = output
-            output_bias_total[local_indices,:] = output_bias
+            output_total[local_indices, :] = output
+            output_bias_total[local_indices, :] = output_bias
+
+        output_total = \
+            mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+        output_bias_total = \
+            mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+
+        # bias is duplicated across tensor parallelism ranks; reduce scatter reduces bias across tensor parallel_ranks
+        output_bias_total = output_bias_total/mpu.get_tensor_model_parallel_world_size()
+
 
         output_total = output_total*max_prob
         output_bias_total = output_bias_total*max_prob
-        output_total = output_total.view(b, s, h)
-        output_bias_total = output_bias_total.view(b, s, h)
+        output_total = output_total.view(s, b, h)
+        output_bias_total = output_bias_total.view(s, b, h)
 
         return output_total, output_bias_total
 

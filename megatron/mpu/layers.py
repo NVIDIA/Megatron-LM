@@ -340,7 +340,8 @@ class ColumnParallelLinear(torch.nn.Module):
     def __init__(self, input_size, output_size, bias=True, gather_output=True,
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
-                 skip_bias_add=False):
+                 skip_bias_add=False,
+                 is_expert=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -351,6 +352,7 @@ class ColumnParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
+        self.is_expert = is_expert
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -392,6 +394,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 world_size > 1)
         self.model_parallel_memory_opt = (
                 args.model_parallel_memory_opt and
+                not self.is_expert and
                 world_size > 1)
         assert not self.async_tensor_model_parallel_allreduce or \
             not self.model_parallel_memory_opt
@@ -459,7 +462,8 @@ class RowParallelLinear(torch.nn.Module):
                  input_is_parallel=False,
                  init_method=init.xavier_normal_, stride=1,
                  keep_master_weight_for_test=False,
-                 skip_bias_add=False):
+                 skip_bias_add=False,
+                 is_expert=False):
         super(RowParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -470,6 +474,7 @@ class RowParallelLinear(torch.nn.Module):
         world_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
         self.skip_bias_add = skip_bias_add
+        self.is_expert = is_expert
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -523,7 +528,10 @@ class RowParallelLinear(torch.nn.Module):
             self.gradient_accumulation_fusion, None, None)
         # All-reduce across all the partitions.
         if self.model_parallel_memory_opt:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            if not self.is_expert:
+                output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            else:
+                output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:

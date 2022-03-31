@@ -135,6 +135,39 @@ def _reduce_scatter_along_last_dim(input_):
     output = _split_along_last_dim(output)
     return output
 
+def _gather_along_first_dim_moe(input_):
+    """Gather tensors and concatinate along the first dimension."""
+
+    world_size = torch.distributed.get_world_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size==1:
+        return input_
+
+    dim_size = list(input_.size())
+    dim_size[0] = dim_size[0] * world_size
+
+    output = torch.empty(dim_size, dtype=input_.dtype,
+                         device=torch.cuda.current_device())
+    torch.distributed._all_gather_base(output, input_.contiguous())
+
+    return output
+
+def _reduce_scatter_along_first_dim_moe(input_):
+    """Reduce-scatter the input tensor across model parallel group."""
+    world_size = torch.distributed.get_world_size()
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    assert dim_size[0] % world_size == 0
+    dim_size[0] = dim_size[0] // world_size
+   
+    output = torch.empty(dim_size, dtype=input_.dtype,
+                         device=torch.cuda.current_device())
+    torch.distributed._reduce_scatter_base(output, input_.contiguous())
+    return output
+
 
 class _CopyToModelParallelRegion(torch.autograd.Function):
     """Pass the input to the model parallel region."""
@@ -248,6 +281,38 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         return _gather_along_first_dim(grad_output)
 
 
+class _GatherFromSequenceParallelRegionToMOE(torch.autograd.Function):
+    """Gather the input from model parallel region and concatinate.""" #TODO
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _gather_along_first_dim_moe(input_)
+    
+    @staticmethod
+    def forward(ctx, input_):
+        return _gather_along_first_dim_moe(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _reduce_scatter_along_first_dim_moe(grad_output)
+
+class _ReduceScatterToSequenceParallelRegionFromMOE(torch.autograd.Function):
+    """Reduce scatter the input from the model parallel region."""
+
+    @staticmethod
+    def symbolic(graph, input_):
+        return _reduce_scatter_along_first_dim_moe(input_)
+    
+    @staticmethod
+    def forward(ctx, input_):
+        return _reduce_scatter_along_first_dim_moe(input_)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return _gather_along_first_dim_moe(grad_output)
+
+
+
 # -----------------
 # Helper functions.
 # -----------------
@@ -278,4 +343,14 @@ def gather_from_sequence_parallel_region(input_):
 
 def reduce_scatter_to_sequence_parallel_region(input_):
     return _ReduceScatterToSequenceParallelRegion.apply(input_)
+
+def gather_from_sequence_parallel_region_to_moe(input_):
+    return _GatherFromSequenceParallelRegionToMOE.apply(input_)
+
+
+def reduce_scatter_to_sequence_parallel_region_from_moe(input_):
+    return _ReduceScatterToSequenceParallelRegionFromMOE.apply(input_)
+
+
+
 
