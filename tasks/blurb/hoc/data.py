@@ -24,7 +24,8 @@ import numpy as np
 
 class HOCDataset(Dataset):
 
-    def __init__(self, dataset_name, datapaths, tokenizer, max_seq_length,ignore_index=-100, tasks=['I-PAR', 'I-INT', 'I-OUT']):
+    #def __init__(self, dataset_name, datapaths, tokenizer, max_seq_length,ignore_index=-100, tasks=['I-PAR', 'I-INT', 'I-OUT']):
+    def __init__(self, dataset_name, datapaths, tokenizer, max_seq_length):
         args = get_args()
         
         self.dataset_name = dataset_name

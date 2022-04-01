@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #BSUB -nnodes 2
-#BSUB -W 2:00
-#BSUB -P med106
+#BSUB -W 0:45
+#BSUB -P med107
 #BSUB -alloc_flags "smt4 nvme"
 #BSUB -J hoc_FULL
 #BSUB -o hoc_FULL.%J
@@ -13,10 +13,11 @@ set +x
 #module load open-ce/1.4.0-py38-0
 module load open-ce
 conda deactivate
-conda activate /gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch
-module list
+conda activate /gpfs/alpine/med106/world-shared/irl1/rhel8/myt_py1.11
 
 export OMP_NUM_THREADS=1
+ulimit -n 65536
+rm -f `find -name *lock`
 #export PYTHONPATH=$PYTHONPATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/megatron/fused_kernels
 #export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch/lib/python3.8/site-packages/torch/lib
 #export PATH=$PATH:/gpfs/alpine/med106/world-shared/irl1/rhel8/mytorch/lib/python3.8/site-packages/torch/include
@@ -35,16 +36,16 @@ VALID_DATA="/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/hocdata"
 #export VALID_DATA=picodata/dev.tsv
 
 export VOCAB_FILE=/gpfs/alpine/world-shared/med106/g8o/pubmed_bert-vocab.txt
-export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/finetune-HOC_BIG
-export PRETRAINED_CHECKPOINT=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/chkptt
+export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/finetune-pubmed_bert_1x1_b8
+export PRETRAINED_CHECKPOINT=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron/pubmed_bert_1x1_b8_chckpttt
 
 jsrun --smpiargs="-disable_gpu_hooks" -n $nnodes -r 1 -g 6 -a 6 -c 42 python tasks/main.py \
        --task HOC \
-       --tensor-model-parallel-size 2 \
-       --pipeline-model-parallel-size 2 \
-       --num-layers 24 \
-       --hidden-size 1024 \
-       --num-attention-heads 16 \
+       --tensor-model-parallel-size 1 \
+       --pipeline-model-parallel-size 1 \
+       --num-layers 12 \
+       --hidden-size 768 \
+       --num-attention-heads 12 \
        --seq-length 512 \
        --max-position-embeddings 512 \
        --fp16 \
@@ -64,6 +65,7 @@ jsrun --smpiargs="-disable_gpu_hooks" -n $nnodes -r 1 -g 6 -a 6 -c 42 python tas
        --micro-batch-size 4 \
        --lr 0.0001 \
        --lr-warmup-fraction 0.06 \
+       --num-workers 0 \
        --distributed-backend nccl
        #--DDP-impl torch \
 

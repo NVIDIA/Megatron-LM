@@ -73,7 +73,7 @@ def accuracy_func_provider(single_dataset_provider):
             for i in range(num_classes):
                 percent = float(correct[i]) * 100.0 / float(total)
                 print(' >> |epoch: {}| overall: correct / total = {} / {} = '
-                    '{:.4f} %'.format(epoch, correct[i], total, percent))
+                    '{:.4f} %'.format(epoch+1, correct[i], total, percent))
 
         if output_predictions and is_last_rank():
             assert args.load is not None
@@ -213,7 +213,7 @@ def calculate_correct_answers(name, model, dataloader,
             elapsed_time = time.time() - start_time
             print_rank_last(' > |epoch: {}| metrics for {}: correct / total '
                             '= {} / {} = {:.4f} %, elapsed time (sec): {:.3f}'.format(
-                                epoch, name, correct_ans[i], total_count,
+                                epoch+1, name, correct_ans[i], total_count,
                                 percent, elapsed_time))
 
         if output_predictions:

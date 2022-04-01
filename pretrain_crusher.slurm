@@ -1,12 +1,18 @@
 #!/bin/bash
 
 #SBATCH -A MED106_crusher
-#SBATCH -N 8
-#SBATCH -t 00:20:00
+#SBATCH -N 7
+#SBATCH -t 00:10:00
 #SBATCH -J crusher
 #SBATCH -o %x-%j.out
 #SBATCH -p batch
-#SBATCH --reservation=crusher-hack-2
+##SBATCH -w crusher138,crusher150,crusher151,crusher158,crusher159,crusher161
+##SBATCH -w crusher138,crusher150,crusher151,crusher158,crusher159,crusher160,crusher161
+##SBATCH -w crusher133,crusher138,crusher150,crusher151,crusher158,crusher159,crusher160,crusher161
+##SBATCH -w crusher129,crusher133,crusher138,crusher150,crusher151,crusher158,crusher159,crusher161
+#SBATCH -w crusher129,crusher133,crusher138,crusher150,crusher151,crusher158,crusher159
+##SBATCH -w crusher129,crusher131,crusher132,crusher133,crusher138,crusher139,crusher140,crusher150,crusher151,crusher158,crusher159,crusher160,crusher161
+##SBATCH --exclude=crusher134,crusher135,crusher136,crusher137,crusher146,crusher147,crusher148,crusher149,crusher006,crusher007,crusher011,crusher013,crusher152,crusher153,crusher156,crusher157,crusher017,crusher018,crusher056,crusher095
 
 set +x
 
@@ -27,7 +33,8 @@ export CXX=g++
 ranks_per_node=8
 gpus_per_rank=$((8/$ranks_per_node))
 ranks_total=$(($ranks_per_node*$SLURM_JOB_NUM_NODES))
-export LD_PRELOAD="/opt/cray/pe/gcc/11.2.0/snos/lib64/libstdc++.so.6 /gpfs/alpine/world-shared/bip214/rocm_smi_lib/build/rocm_smi/librocm_smi64.so"
+#export LD_PRELOAD="/opt/cray/pe/gcc/11.2.0/snos/lib64/libstdc++.so.6 /gpfs/alpine/world-shared/bip214/rocm_smi_lib/build/rocm_smi/librocm_smi64.so"
+export LD_PRELOAD="/opt/cray/pe/gcc/11.2.0/snos/lib64/libstdc++.so.6.0.29 /gpfs/alpine/world-shared/bip214/rocm_smi_lib/build/rocm_smi/librocm_smi64.so"
 export LD_PRELOAD="${LD_PRELOAD} ${CRAY_MPICH_ROOTDIR}/gtl/lib/libmpi_gtl_hsa.so"
 
 
@@ -164,5 +171,5 @@ export CHECKPOINT_PATH=/gpfs/alpine/med106/world-shared/irl1/rhel8/fork-megatron
 
 srun -u -n $ranks_total -c 8 --gpus-per-task=$gpus_per_rank --gpu-bind=closest bash -c "
 source export_DDP_vars.sh
-python pretrain_bert.py --tensor-model-parallel-size 2 --pipeline-model-parallel-size 2 --num-layers 24 --hidden-size 1024 --num-attention-heads 16 --micro-batch-size 2 --seq-length 512 --max-position-embeddings 512 --train-iters 2000 --lr-decay-iters 990 --save $CHECKPOINT_PATH --data-path $DATASET --vocab-file $VOCAB_FILE --data-impl mmap --split 949,50,1 --distributed-backend nccl --lr 0.0001 --min-lr 0.00001 --lr-decay-style linear --lr-warmup-fraction .01 --weight-decay 1e-2 --clip-grad 1.0 --log-interval 100 --save-interval 10000 --eval-interval 1000 --eval-iters 10 --HIP 1 --fp16" 
+python pretrain_bert.py --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --num-layers 24 --hidden-size 1024 --num-attention-heads 16 --micro-batch-size 2 --seq-length 512 --max-position-embeddings 512 --train-iters 2000 --lr-decay-iters 990 --save $CHECKPOINT_PATH --data-path $DATASET --vocab-file $VOCAB_FILE --data-impl mmap --split 949,50,1 --distributed-backend nccl --lr 0.0001 --min-lr 0.00001 --lr-decay-style linear --lr-warmup-fraction .01 --weight-decay 1e-2 --clip-grad 1.0 --log-interval 100 --save-interval 10000 --eval-interval 1000 --eval-iters 10 --HIP 1 --fp16" 
 

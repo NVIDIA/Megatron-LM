@@ -17,7 +17,11 @@
 #pragma once
 
 #include <assert.h>
+#if defined __HIP_PLATFORM_AMD__
+#include <hip/hip_fp16.h>
+#else
 #include <cuda_fp16.h>
+#endif
 #include <cfloat>
 #include <limits>
 #include <stdint.h>
