@@ -15,6 +15,7 @@
 
 """Transformer."""
 import math
+from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
@@ -531,6 +532,13 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
 
+        # Set bias+dropout+add fusion grad_enable execution handler.
+        TORCH_MAJOR = int(torch.__version__.split('.')[0])
+        TORCH_MINOR = int(torch.__version__.split('.')[1])
+        use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
+        self.bias_dropout_add_exec_handler = \
+                nullcontext if use_nvfuser else torch.enable_grad
+
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
@@ -564,11 +572,12 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
 
-            layernorm_input = bias_dropout_add_func(
-                attention_output,
-                attention_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                layernorm_input = bias_dropout_add_func(
+                    attention_output,
+                    attention_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
         else:
             out = torch.nn.functional.dropout(attention_output + attention_bias,
                                               p=self.hidden_dropout,
@@ -589,11 +598,12 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 residual = layernorm_input
 
-            layernorm_input = bias_dropout_add_func(
-                attention_output,
-                attention_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                layernorm_input = bias_dropout_add_func(
+                    attention_output,
+                    attention_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
 
             # Layer norm post the decoder attention
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
@@ -608,11 +618,12 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_input
 
         if self.drop_path is None:
-            output = bias_dropout_add_func(
-                mlp_output,
-                mlp_bias.expand_as(residual),
-                residual,
-                self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                output = bias_dropout_add_func(
+                    mlp_output,
+                    mlp_bias.expand_as(residual),
+                    residual,
+                    self.hidden_dropout)
         else:
             out = torch.nn.functional.dropout(mlp_output + mlp_bias,
                                               p=self.hidden_dropout,

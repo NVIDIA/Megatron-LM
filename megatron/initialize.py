@@ -66,9 +66,6 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
             print('> setting random seeds to {} ...'.format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
 
-    # Set pytorch JIT layer fusion options.
-    _set_jit_fusion_options()
-
     args = get_args()
     if  args.lazy_mpu_init:
         args.use_cpu_initialization=True
@@ -232,7 +229,7 @@ def write_args_to_tensorboard():
                             global_step=args.iteration)
 
 
-def _set_jit_fusion_options():
+def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
     # flags required to enable jit fusion kernels
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -253,41 +250,47 @@ def _set_jit_fusion_options():
         torch._C._jit_override_can_fuse_on_cpu(True)
         torch._C._jit_override_can_fuse_on_gpu(True)
 
+    _warmup_jit_function()
 
-def warmup_jit_function():
+
+def _warmup_jit_function():
     """ Compilie JIT functions before the main training steps """
     args = get_args()
     if args.bf16:
-        p = torch.bfloat16
+        dtype = torch.bfloat16
     elif args.fp16:
-        p = torch.float16
+        dtype = torch.float16
     else:
-        p = torch.float32
+        dtype = torch.float32
 
     # Warmup fused bias+gelu
-    b = torch.rand(int(args.hidden_size * 4 / args.tensor_model_parallel_size),
-                   dtype=p, device='cuda')
-    x = torch.rand((args.seq_length, args.micro_batch_size,
-                    int(args.hidden_size * 4 / args.tensor_model_parallel_size)),
-                   dtype=p, device='cuda')
-    # Warmup JIT fusions with the input grad_enable state at both forward
+    bias = torch.rand(args.ffn_hidden_size // args.tensor_model_parallel_size,
+                      dtype=dtype, device='cuda')
+    input = torch.rand((args.seq_length, args.micro_batch_size,
+                        args.ffn_hidden_size // args.tensor_model_parallel_size),
+                       dtype=dtype, device='cuda')
+    # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
-    for b_grad, x_grad in zip([True, True], [False, True]):
-        b.requires_grad, x.requires_grad = b_grad, x_grad
+    for bias_grad, input_grad in zip([True, True], [False, True]):
+        bias.requires_grad, input.requires_grad = bias_grad, input_grad
         for _ in range(5):
-            y = bias_gelu(b, x)
-    del b, x, y
+            output = bias_gelu(bias, input)
+    del bias, input, output
 
     # Warmup fused bias+dropout+add
-    input_size = (args.seq_length, args.micro_batch_size, args.hidden_size)
-    x = torch.rand(input_size, dtype=p, device='cuda')
-    r = torch.rand(input_size, dtype=p, device='cuda')
-    b = torch.rand((args.hidden_size), dtype=p, device='cuda').expand_as(r)
-    # Warmup JIT fusions with the input grad_enable state at both forward
+    input = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+                       dtype=dtype, device='cuda')
+    residual = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+                          dtype=dtype, device='cuda')
+    bias = torch.rand((args.hidden_size), dtype=dtype, device='cuda').expand_as(residual)
+    dropout_rate = 0.1
+    # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
-    for x_grad, b_grad, r_grad in zip([False, True], [True, True], [True, True]):
-        x.requires_grad, b.requires_grad, r.requires_grad = x_grad, b_grad, r_grad
+    for input_grad, bias_grad, residual_grad in zip([False, True], [True, True], [True, True]):
+        input.requires_grad = input_grad
+        bias.requires_grad = bias_grad
+        residual.requires_grad = residual_grad
         for _ in range(5):
-            y = bias_dropout_add_fused_train(x, b, r, 0.1)
-    del b, x, r, y
+            output = bias_dropout_add_fused_train(input, bias, residual, dropout_rate)
+    del bias, input, residual, output
     torch.cuda.empty_cache()
