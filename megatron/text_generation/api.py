@@ -163,7 +163,7 @@ def beam_search_and_post_process(model,
 
     return None
 
-def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False):
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256):
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               beam_size,
@@ -176,4 +176,4 @@ def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
     
-    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, beam_size)
+    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, beam_size, stop_token=stop_token)
