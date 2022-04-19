@@ -372,11 +372,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     if 'args' in state_dict:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
-        args.consumed_train_samples = getattr(checkpoint_args,
-                                              'consumed_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples)
-        args.consumed_valid_samples = getattr(checkpoint_args,
-                                              'consumed_valid_samples', 0)
+        if not args.finetune:
+            args.consumed_train_samples = getattr(checkpoint_args,
+                                                'consumed_train_samples', 0)
+            update_num_microbatches(consumed_samples=args.consumed_train_samples)
+            args.consumed_valid_samples = getattr(checkpoint_args,
+                                                'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
