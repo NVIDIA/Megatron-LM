@@ -268,6 +268,11 @@ def parse_args(extra_args_provider=None, defaults={},
             'distributed checkpoint activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+        
+    # Weights and Biases
+    if args.wandb_entity_name or args.wandb_project_name:
+        assert args.wandb_entity_name and args.wandb_project_name, \
+            "Both entity and project name must be set in order to report to wandb"
 
     _print_args(args)
     return args
@@ -382,6 +387,11 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
+    
+    group.add_argument('--wandb-entity-name', type=str, default=None,
+                        help="Name of wandb entity for reporting")
+    group.add_argument('--wandb-project-name', type=str, default=None,
+                        help="Name of wandb project")
 
     return parser
 
