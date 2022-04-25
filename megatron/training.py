@@ -849,6 +849,13 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+    
+    # Weights and biases reporting
+    if is_last_rank():
+        metrics = {
+            '{} validation'.format(key): total_loss_dict[key].item() for key in total_loss_dict
+        }
+        wandb.log(metrics, step=iteration)
 
     length = len(string) + 1
     print_rank_last('-' * length)
