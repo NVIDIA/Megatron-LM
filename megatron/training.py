@@ -602,7 +602,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             )
     
     # Weights and biases reporting
-    if (iteration % args.log_interval == 0) and is_last_rank():
+    if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
         metrics = {
             'learning-rate': learning_rate,
             'samples': args.consumed_train_samples,
@@ -851,7 +851,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   ppl, args.consumed_train_samples)
     
     # Weights and biases reporting
-    if is_last_rank():
+    if is_last_rank() and args.wandb_project_name:
         metrics = {
             '{} validation'.format(key): total_loss_dict[key].item() for key in total_loss_dict
         }

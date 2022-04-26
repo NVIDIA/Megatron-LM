@@ -234,6 +234,9 @@ def write_args_to_tensorboard():
 def init_wandb():
     args = get_args()
     if args.rank == (args.world_size - 1):
+        if not (args.wandb_entity_name and args.wandb_project_name):
+            print('> Skipping wandb init ...', flush=True)
+            return
         wandb.init(
             name=os.path.basename(args.save),
             entity=args.wandb_entity_name,
