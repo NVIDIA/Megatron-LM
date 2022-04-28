@@ -492,9 +492,9 @@ def _add_training_args(parser):
                        help='Checkpoint activatins to allow for training '
                        'with larger models, sequences, and batch sizes. '
                        'It is supported at two granularities 1) full: '
-                       'whole transformer layer is reverse checkpointed, '
+                       'whole transformer layer is checkpointed, '
                        '2) selective: core attention part of the transformer '
-                       'layer is reverse checkpointed.')
+                       'layer is checkpointed.')
     group.add_argument('--distribute-checkpointed-activations',
                        action='store_true',
                        help='If set, distribute checkpointed activations '
