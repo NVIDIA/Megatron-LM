@@ -91,18 +91,6 @@ def get_megatron_optimizer(model,
                          weight_decay=args.weight_decay,
                          betas=(args.adam_beta1, args.adam_beta2),
                          eps=args.adam_eps)
-
-        # preallocating state tensors to avoid fragmentation
-        for param_group in optimizer.param_groups:
-            for i, param in enumerate(param_group['params']):
-                if param.requires_grad:
-                    state = optimizer.state[param]
-                    if len(state) == 0:
-                        # Exponential moving average of gradient values
-                        state['exp_avg'] = torch.zeros_like(param.data, dtype=torch.float)
-                        # Exponential moving average of squared gradient values
-                        state['exp_avg_sq'] = torch.zeros_like(param.data, dtype=torch.float)
-
     elif args.optimizer == 'sgd':
         optimizer = SGD(param_groups,
                         lr=args.lr,
