@@ -15,6 +15,7 @@
 
 """Transformer."""
 import math
+import contextlib
 import torch
 import torch.nn.functional as F
 
@@ -27,7 +28,6 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
-_MATMUL_INPUT = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -167,6 +167,8 @@ class SwitchMLP(MegatronModule):
 
 
 class CoreAttention(MegatronModule):
+    matmul_input = None
+
     def __init__(self, layer_number,
                  attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__()
@@ -180,7 +182,7 @@ class CoreAttention(MegatronModule):
             self.attention_softmax_in_fp32 = True
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
-        self.model_parallel_memory_opt = args.model_parallel_memory_opt
+        self.sequence_parallel = args.sequence_parallel
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -193,15 +195,6 @@ class CoreAttention(MegatronModule):
         self.num_attention_heads_per_partition = mpu.divide(
             args.num_attention_heads, world_size)
 
-        global _MATMUL_INPUT
-        if _MATMUL_INPUT is None:
-            _MATMUL_INPUT = torch.empty(
-                args.micro_batch_size * self.num_attention_heads_per_partition,
-                args.seq_length,
-                args.seq_length,
-                dtype=torch.bfloat16,
-                device=torch.cuda.current_device())
-        
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         if self.apply_query_key_layer_scaling:
@@ -220,7 +213,7 @@ class CoreAttention(MegatronModule):
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
         self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
-        
+
     def forward(self, query_layer, key_layer,
                 value_layer, attention_mask):
 
@@ -241,20 +234,18 @@ class CoreAttention(MegatronModule):
         key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
 
-        # preallocting result tensor: [b * np, sq, sk]
-        #matmul_result = torch.empty(
-        #    output_size[0]*output_size[1],
-        #    output_size[2],
-        #    output_size[3],
-        #    dtype=query_layer.dtype,
-        #    device=torch.cuda.current_device())
-
-        global _MATMUL_INPUT
-        matmul_input = _MATMUL_INPUT
+        # preallocting input tensor: [b * np, sq, sk]
+        if CoreAttention.matmul_input is None:
+            CoreAttention.matmul_input = torch.empty(
+                output_size[0]*output_size[1],
+                output_size[2],
+                output_size[3],
+                dtype=query_layer.dtype,
+                device=torch.cuda.current_device())
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
-            matmul_input,
+            CoreAttention.matmul_input,
             query_layer.transpose(0, 1),   # [b * np, sq, hn]
             key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
@@ -273,7 +264,7 @@ class CoreAttention(MegatronModule):
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 
-        if not self.model_parallel_memory_opt:
+        if not self.sequence_parallel:
             with mpu.get_cuda_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
         else:
@@ -334,8 +325,6 @@ class ParallelAttention(MegatronModule):
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
         self.params_dtype = args.params_dtype
-        self.checkpoint_attention = args.checkpoint_attention
-        #assert args.activations_checkpoint_method is None
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -369,6 +358,7 @@ class ParallelAttention(MegatronModule):
 
         self.core_attention = CoreAttention(self.layer_number,
                                             self.attn_mask_type)
+        self.checkpoint_core_attention = args.checkpoint_granularity == 'selective'
 
         # Output.
         self.dense = mpu.RowParallelLinear(
@@ -491,7 +481,7 @@ class ParallelAttention(MegatronModule):
         # core attention computation
         # ==================================
 
-        if self.checkpoint_attention:
+        if self.checkpoint_core_attention:
             context_layer = self._checkpointed_attention_forward(
                 query_layer, key_layer, value_layer, attention_mask)
         else:
@@ -564,7 +554,7 @@ class ParallelTransformerLayer(MegatronModule):
             args.hidden_size,
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
-            sequence_parallel=args.model_parallel_memory_opt)
+            sequence_parallel=args.sequence_parallel)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -582,7 +572,7 @@ class ParallelTransformerLayer(MegatronModule):
             args.hidden_size,
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
-            sequence_parallel=args.model_parallel_memory_opt)
+            sequence_parallel=args.sequence_parallel)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -595,7 +585,7 @@ class ParallelTransformerLayer(MegatronModule):
                 args.hidden_size,
                 eps=args.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=args.model_parallel_memory_opt)
+                sequence_parallel=args.sequence_parallel)
 
         # MLP
         if args.num_experts is not None:
@@ -747,12 +737,13 @@ class ParallelTransformer(MegatronModule):
         self.drop_path_rate = drop_path_rate
 
         # Store activation checkpoiting flag.
-        self.activations_checkpoint_method = args.activations_checkpoint_method
-        self.activations_checkpoint_num_layers = args.activations_checkpoint_num_layers
+        self.checkpoint_granularity = args.checkpoint_granularity
+        self.checkpoint_method = args.checkpoint_method
+        self.checkpoint_num_layers = args.checkpoint_num_layers
         self.distribute_checkpointed_activations = \
-            args.distribute_checkpointed_activations and not args.model_parallel_memory_opt
+            args.distribute_checkpointed_activations and not args.sequence_parallel
 
-        self.model_parallel_memory_opt = args.model_parallel_memory_opt
+        self.sequence_parallel = args.sequence_parallel
 
         # Number of layers.
         self.num_layers = mpu.get_num_layers(
@@ -822,7 +813,7 @@ class ParallelTransformer(MegatronModule):
                 args.hidden_size,
                 eps=args.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=args.model_parallel_memory_opt)
+                sequence_parallel=args.sequence_parallel)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -842,24 +833,24 @@ class ParallelTransformer(MegatronModule):
                 return x_
             return custom_forward
 
-        if self.activations_checkpoint_method == 'uniform':
+        if self.checkpoint_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
             while l < self.num_layers:
                 hidden_states = mpu.checkpoint(
-                    custom(l, l + self.activations_checkpoint_num_layers),
+                    custom(l, l + self.checkpoint_num_layers),
                     self.distribute_checkpointed_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
-                l += self.activations_checkpoint_num_layers
+                l += self.checkpoint_num_layers
 
-        elif self.activations_checkpoint_method == 'block':
+        elif self.checkpoint_method == 'block':
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers):
-                if l < self.activations_checkpoint_num_layers:
+                if l < self.checkpoint_num_layers:
                     hidden_states = mpu.checkpoint(
                         custom(l, l + 1),
                         self.distribute_checkpointed_activations,
@@ -887,7 +878,7 @@ class ParallelTransformer(MegatronModule):
                 inference_params=None):
         # Checks.
         if inference_params:
-            assert self.activations_checkpoint_method is None, \
+            assert self.checkpoint_granularity is None, \
                 'inference does not work with activation checkpointing'
 
         if not self.pre_process:
@@ -915,28 +906,14 @@ class ParallelTransformer(MegatronModule):
             keep_graph=True,
         )
 
-        if self.model_parallel_memory_opt:
-            with mpu.get_cuda_rng_tracker().fork():
-                # Forward pass.
-                if self.activations_checkpoint_method is not None:
-                    hidden_states = self._checkpointed_forward(hidden_states,
-                                                               attention_mask,
-                                                               encoder_output,
-                                                               enc_dec_attn_mask)
-                else:
-                    total = 0
-                    for index in range(self.num_layers):
-                        layer = self._get_layer(index)
-                        hidden_states = layer(
-                            hidden_states,
-                            attention_mask,
-                            encoder_output=encoder_output,
-                            enc_dec_attn_mask=enc_dec_attn_mask,
-                            inference_params=inference_params)
-                         
+        if self.sequence_parallel:
+            rng_context = mpu.get_cuda_rng_tracker().fork()
         else:
+            rng_context = contextlib.nullcontext
+
+        with rng_context:
             # Forward pass.
-            if self.activations_checkpoint_method is not None:
+            if self.checkpoint_granularity == 'full':
                 hidden_states = self._checkpointed_forward(hidden_states,
                                                            attention_mask,
                                                            encoder_output,

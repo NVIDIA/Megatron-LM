@@ -422,7 +422,7 @@ def train_step(forward_step_func, data_iterator,
     # All-reduce layernorm parameters across model parallel nodes
     # when sequence parallelism is used
     if mpu.get_tensor_model_parallel_world_size() > 1 and \
-            args.model_parallel_memory_opt:
+            args.sequence_parallel:
         grads = []
         for model_module in model:
             unwrapped_model = unwrap_model( 
@@ -432,8 +432,6 @@ def train_step(forward_step_func, data_iterator,
                     grad = param.main_grad if args.DDP_impl == 'local' else param.grad
                     grads.append(grad.data)
         coalesced = _flatten_dense_tensors(grads)
-        #TODO VIJAY
-        #coalesced /= mpu.get_tensor_model_parallel_world_size()
         torch.distributed.all_reduce(
             coalesced, group=mpu.get_tensor_model_parallel_group())
         for buf, synced in zip(grads, _unflatten_dense_tensors(

@@ -59,7 +59,7 @@ def get_batch(data_iterator):
 
     # Unpack.
     tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].transpose(0,1).contiguous()
+    labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
     # Get the masks and postition ids.

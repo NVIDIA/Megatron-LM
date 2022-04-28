@@ -45,9 +45,6 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
                                       'partition_stride': 1}
 
-_TOTAL_INPUT = None
-_SUB_GRAD_INPUT = None
-
 def param_is_not_tensor_parallel_duplicate(param):
     return (hasattr(param, 'tensor_model_parallel') and
             param.tensor_model_parallel) or (
@@ -208,28 +205,32 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     Linear layer execution with asynchronous communication and gradient accumulation
     fusion in backprop.
     """
+    all_gather_buffer = None
+
     @staticmethod
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
-                async_grad_allreduce, model_parallel_memory_opt):
+                async_grad_allreduce, sequence_parallel):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
-        ctx.model_parallel_memory_opt = model_parallel_memory_opt
+        ctx.sequence_parallel = sequence_parallel
       
-        if model_parallel_memory_opt:
+        if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            #total_input = torch.empty(dim_size, dtype=input.dtype,
-            #                          device=torch.cuda.current_device(),
-            #                          requires_grad=False)
-            global _TOTAL_INPUT
-            total_input = _TOTAL_INPUT
-            torch.distributed._all_gather_base(total_input, input,
-                                               group=get_tensor_model_parallel_group())
-        
+            if LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer is None:
+                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer = \
+                    torch.empty(dim_size, dtype=input.dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False)
+            torch.distributed._all_gather_base(
+                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer,
+                input,
+                group=get_tensor_model_parallel_group())
+            total_input = LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer
         else:
             total_input = input
 
@@ -244,27 +245,25 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         
-        if ctx.model_parallel_memory_opt:
+        if ctx.sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            #total_input = torch.empty(dim_size, dtype=input.dtype,
-            #                          device=torch.cuda.current_device(),
-            #                          requires_grad=False)
-            global _TOTAL_INPUT
-            total_input = _TOTAL_INPUT
+            handle = torch.distributed._all_gather_base(
+                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer,
+                input,
+                group=get_tensor_model_parallel_group(), async_op=True)
 
-            handle = torch.distributed._all_gather_base(total_input, input,
-                                           group=get_tensor_model_parallel_group(), async_op=True)
             # Delay the start of intput gradient computation shortly (3us) to have
             # gather scheduled first and have GPU resources allocated
             _ = torch.empty(1, device=grad_output.device) + 1
+            total_input = LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer
         else:
             total_input = input
         grad_input = grad_output.matmul(weight)
 
-        if ctx.model_parallel_memory_opt:
+        if ctx.sequence_parallel:
             handle.wait()
 
         # Convert the tensor shapes to 2D for execution compatibility
@@ -281,7 +280,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # all-reduce scheduled first and have GPU resources allocated
             _ = torch.empty(1, device=grad_output.device) + 1
  
-        if ctx.model_parallel_memory_opt:
+        if ctx.sequence_parallel:
             assert not ctx.async_grad_allreduce
             dim_size = list(input.size())
             sub_grad_input = torch.empty(dim_size, dtype=input.dtype,
@@ -303,7 +302,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
 
-        if ctx.model_parallel_memory_opt:
+        if ctx.sequence_parallel:
             handle.wait()
             return sub_grad_input, grad_weight, grad_bias, None, None, None
 
@@ -390,34 +389,28 @@ class ColumnParallelLinear(torch.nn.Module):
         self.async_tensor_model_parallel_allreduce = (
                 args.async_tensor_model_parallel_allreduce and
                 world_size > 1)
-        self.model_parallel_memory_opt = (
-                args.model_parallel_memory_opt and
+        self.sequence_parallel = (
+                args.sequence_parallel and
                 world_size > 1)
         assert not self.async_tensor_model_parallel_allreduce or \
-            not self.model_parallel_memory_opt
+            not self.sequence_parallel
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
-        global _TOTAL_INPUT
-        if _TOTAL_INPUT is None:
-            _TOTAL_INPUT = torch.empty((args.seq_length, args.micro_batch_size, args.hidden_size), dtype=torch.bfloat16,
-                                       device=torch.cuda.current_device(),
-                                       requires_grad=False)
-
 
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
-                self.model_parallel_memory_opt:
+                self.sequence_parallel:
             input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
-            self.async_tensor_model_parallel_allreduce, self.model_parallel_memory_opt)
+            self.async_tensor_model_parallel_allreduce, self.sequence_parallel)
         if self.gather_output:
             # All-gather across the partitions.
-            assert not self.model_parallel_memory_opt
+            assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel
@@ -498,14 +491,14 @@ class RowParallelLinear(torch.nn.Module):
                 self.bias = Parameter(torch.empty(
                     self.output_size, device=torch.cuda.current_device(),
                     dtype=args.params_dtype))
-            setattr(self.bias, 'sequence_parallel', args.model_parallel_memory_opt)
+            setattr(self.bias, 'sequence_parallel', args.sequence_parallel)
 
             # Always initialize bias to zero.
             with torch.no_grad():
                 self.bias.zero_()
         else:
             self.register_parameter('bias', None)
-        self.model_parallel_memory_opt = args.model_parallel_memory_opt
+        self.sequence_parallel = args.sequence_parallel
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
 
 
@@ -515,14 +508,14 @@ class RowParallelLinear(torch.nn.Module):
         if self.input_is_parallel:
             input_parallel = input_
         else:
-            assert not self.model_parallel_memory_opt
+            assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
         output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
             input_parallel, self.weight, None,
             self.gradient_accumulation_fusion, None, None)
         # All-reduce across all the partitions.
-        if self.model_parallel_memory_opt:
+        if self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)

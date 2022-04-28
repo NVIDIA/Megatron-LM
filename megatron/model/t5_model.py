@@ -157,8 +157,11 @@ class T5Model(MegatronModule):
                                      self.word_embeddings_weight())
 
             if lm_labels is None:
-                return lm_logits
+                # [s b h] => [b s h]
+                return lm_logits.transpose(0,1).contiguous()
             else:
+                # [b s] => [s b]
+                lm_labels = lm_lables.transpose(0,1).contiguous()
                 if self.fp16_lm_cross_entropy:
                     assert lm_logits.dtype == torch.half
                     lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)

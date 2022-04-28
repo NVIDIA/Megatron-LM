@@ -103,12 +103,14 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+
     if args.checkpoint_activations:
-        args.activations_checkpoint_method = 'uniform'
+        args.checkpoint_granularity = 'full'
+        args.checkpoint_method = 'uniform'
         if args.rank == 0:
             print('--checkpoint-activations is no longer valid, '
-                  'use --activation-checkpoint-method instead. '
-                  'Defaulting to activation-checkpoint-method=uniform.')
+                  'use --checkpoint-granularity and --checkpoint-method  instead. '
+                  'Defaulting to checkpoint-granularity=full and checkpoint-method=uniform.')
     del args.checkpoint_activations
 
     # Set input defaults.
@@ -283,18 +285,26 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
             'checkpointed activations only across tensor model ' \
             'parallel groups'
-        assert args.activations_checkpoint_method is not None, \
+        assert args.checkpoint_granularity == 'full', \
+            'distributed checkpoint activations is only '\
+            'application to full checkpoint granularity'
+        assert args.checkpoint_method is not None, \
             'for distributed checkpoint activations to work you '\
-            'need to use a activation-checkpoint method '
+            'need to use a checkpoint method '
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
             'distributed checkpoint activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
-
-    # model parallel memory optmization
-    if args.model_parallel_memory_opt:
-        assert not args.async_tensor_model_parallel_allreduce
+    if args.checkpoint_granularity == 'selective':
+        assert args.checkpoint_method is None, \
+            'checkpoint method is not yet supported for ' \
+            'selective checkpointing granularity'
+        
+    # disable async_tensor_model_parallel_allreduce when
+    # model parallel memory optmization is enabled
+    if args.sequence_parallel:
+        args.async_tensor_model_parallel_allreduce = False
 
     _print_args(args)
     return args
@@ -476,30 +486,38 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
-    group.add_argument('--checkpoint-activations', action='store_true',
-                       help='Checkpoint activation to allow for training '
-                       'with larger models, sequences, and batch sizes.')
-    group.add_argument('--checkpoint-attention', action='store_true',
-                       help='Checkpoint activation to allow for training '
-                       'with larger models, sequences, and batch sizes.')
+
+    group.add_argument('--checkpoint-granularity', type=str, default=None,
+                       choices=['full', 'selective'],
+                       help='Checkpoint activatins to allow for training '
+                       'with larger models, sequences, and batch sizes. '
+                       'It is supported at two granularities 1) full: '
+                       'whole transformer layer is reverse checkpointed, '
+                       '2) selective: core attention part of the transformer '
+                       'layer is reverse checkpointed.')
     group.add_argument('--distribute-checkpointed-activations',
                        action='store_true',
                        help='If set, distribute checkpointed activations '
                        'across model parallel group.')
-    group.add_argument('--activations-checkpoint-method', type=str, default=None,
+    group.add_argument('--checkpoint-method', type=str, default=None,
                        choices=['uniform', 'block'],
                        help='1) uniform: uniformly divide the total number of '
                        'Transformer layers and checkpoint the input activation of '
-                       'each divided chunk, '
+                       'each divided chunk at specified granularity, '
                        '2) checkpoint the input activations of only a set number of '
                        'individual Transformer layers per pipeline stage and do the '
-                       'rest without any checkpointing'
+                       'rest without any checkpointing at specified granularity'
                        'default) do not apply activations checkpoint to any layers')
-    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
+    group.add_argument('--checkpoint-num-layers', type=int, default=1,
                        help='1) uniform: the number of Transformer layers in each '
                        'uniformly divided checkpoint unit, '
                        '2) block: the number of individual Transformer layers '
                        'to checkpoint within each pipeline stage.')
+
+    # deprecated
+    group.add_argument('--checkpoint-activations', action='store_true',
+                       help='Checkpoint activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -548,8 +566,8 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
-    group.add_argument('--model-parallel-memory-opt', action='store_true',
-                       help='Enable model parallel memory optmization.')
+    group.add_argument('--sequence-parallel', action='store_true',
+                       help='Enable sequence parallel optmization.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '

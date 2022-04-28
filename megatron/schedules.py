@@ -279,7 +279,7 @@ def forward_backward_pipelining_with_interleaving(forward_step_func,
     pipeline_parallel_rank = mpu.get_pipeline_model_parallel_rank()
 
     args = get_args()
-    if args.model_parallel_memory_opt:
+    if args.sequence_parallel:
         seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
         seq_length = args.seq_length
@@ -519,13 +519,13 @@ def get_tensor_shapes(rank, model_type):
     args = get_args()
     tensor_shapes = []
 
-    if args.model_parallel_memory_opt:
+    if args.sequence_parallel:
         seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
         seq_length = args.seq_length
 
     if model_type == ModelType.encoder_and_decoder:
-        if args.model_parallel_memory_opt:
+        if args.sequence_parallel:
             decoder_seq_length = args.decoder_seq_length // mpu.get_tensor_model_parallel_world_size()
         else:
             decoder_seq_length = args.decoder_seq_length

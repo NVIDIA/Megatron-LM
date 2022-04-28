@@ -62,7 +62,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
 
     override_scatter_gather_tensors_in_pipeline = False
     if args.scatter_gather_tensors_in_pipeline and \
-            not args.model_parallel_memory_opt:
+            not args.sequence_parallel:
         tensor_chunk_shape = reduce(operator.mul, tensor_shape, 1)
         if tensor_chunk_shape % mpu.get_tensor_model_parallel_world_size() == 0:
             tensor_chunk_shape = tensor_chunk_shape // \
@@ -95,7 +95,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     # Split tensor into smaller chunks if using scatter-gather optimization.
     if not override_scatter_gather_tensors_in_pipeline and \
             args.scatter_gather_tensors_in_pipeline and \
-            not args.model_parallel_memory_opt:
+            not args.sequence_parallel:
         if tensor_send_next is not None:
             tensor_send_next = mpu.split_tensor_into_1d_equal_chunks(tensor_send_next)
 
@@ -141,7 +141,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     # If using scatter-gather optimization, gather smaller chunks.
     if not override_scatter_gather_tensors_in_pipeline and \
             args.scatter_gather_tensors_in_pipeline and \
-            not args.model_parallel_memory_opt:
+            not args.sequence_parallel:
         if recv_prev:
             tensor_recv_prev = mpu.gather_split_1d_tensor(
                 tensor_recv_prev).view(tensor_shape).requires_grad_()

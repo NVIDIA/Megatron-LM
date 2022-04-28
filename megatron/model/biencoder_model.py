@@ -291,7 +291,7 @@ class PretrainedBertModel(MegatronModule):
         pool_mask = (input_ids == self.pad_id).unsqueeze(2)
 
         # Taking the representation of the [CLS] token of BERT
-        pooled_output = lm_output[:, 0, :]
+        pooled_output = lm_output[0, :, :]
 
         # Converting to float16 dtype
         pooled_output = pooled_output.to(lm_output.dtype)
