@@ -34,6 +34,7 @@ from .initialize import get_tensor_model_parallel_world_size
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
+_EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 
 
 def _set_cuda_rng_state(new_state, device=-1):
@@ -180,6 +181,9 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
     assert_viewless_tensor(tensor, extra_msg = "FYI, tensor._base has shape %s, and new_data_tensor has shape %s." % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape))
     tensor.data = new_data_tensor
 
+def get_expert_parallel_rng_tracker_name():
+    global _EXPERT_PARALLEL_RNG_TRACKER_NAME
+    return _EXPERT_PARALLEL_RNG_TRACKER_NAME
 
 class CudaRNGStatesTracker:
     """Tracker for the cuda RNG states.
@@ -298,6 +302,9 @@ def model_parallel_cuda_manual_seed(seed):
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
                                 tensor_model_parallel_seed)
 
+    expert_parallel_seed = seed + 100 * get_data_parallel_rank() + get_tensor_model_parallel_rank()
+    _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME,
+                                expert_parallel_seed)
 
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with

@@ -35,7 +35,7 @@ from .mappings import reduce_from_tensor_model_parallel_region
 from .mappings import scatter_to_tensor_model_parallel_region
 from .mappings import reduce_scatter_to_sequence_parallel_region
 
-from .random import get_cuda_rng_tracker
+from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
@@ -82,7 +82,8 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
 
 
 def _initialize_affine_weight_gpu(weight, init_method,
-                                  partition_dim, stride=1):
+                                  partition_dim, stride=1,
+                                  is_expert=False):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(tensor=weight,
@@ -90,8 +91,12 @@ def _initialize_affine_weight_gpu(weight, init_method,
                                          dim=partition_dim,
                                          stride=stride)
 
-    with get_cuda_rng_tracker().fork():
-        init_method(weight)
+    if not is_expert:
+        with get_cuda_rng_tracker().fork():
+            init_method(weight)
+    else:
+        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+            init_method(weight)
 
 
 def _initialize_affine_weight_cpu(weight, output_size, input_size,
@@ -372,7 +377,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.output_size_per_partition, self.input_size,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=0, stride=stride)
+                                          partition_dim=0, stride=stride,
+                                          is_expert=self.is_expert)
         setattr(self.weight, 'expert_parallel', self.is_expert)
 
         if bias:
@@ -497,7 +503,8 @@ class RowParallelLinear(torch.nn.Module):
                 self.output_size, self.input_size_per_partition,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=1, stride=stride)
+                                          partition_dim=1, stride=stride,
+                                          is_expert=self.is_expert)
         setattr(self.weight, 'expert_parallel', self.is_expert)
         if bias:
             if args.use_cpu_initialization:

@@ -179,7 +179,8 @@ class SwitchMLP(MegatronModule):
         output_total = torch.zeros_like(global_hidden_states)
         output_bias_total = torch.zeros_like(global_hidden_states)
         for expert_num, expert in enumerate(self.local_experts):
-            local_indices = (global_indices == expert_num).nonzero()
+            local_expert_index = self.local_expert_indices[expert_num]
+            local_indices = (global_indices == local_expert_index).nonzero()
             hidden = global_hidden_states[local_indices, :]
             output, output_bias = expert(hidden)
             output_bias = output_bias.expand_as(output)
