@@ -328,7 +328,7 @@ class BeamHypotheses(object):
             ret = self.worst_score >= cur_score
             return ret
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token):
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen=1):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -345,7 +345,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
     # forward step.
     forward_step = ForwardStep(model, beam_size, final_sequence_length)
 
-    hyp = BeamHypotheses(beam_size)
+    beam_hyp = BeamHypotheses(beam_size)
     done = False
     if mpu.is_pipeline_last_stage():
         scores = torch.zeros(beam_size,
@@ -392,7 +392,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
                         is_beam_token_worse_than_top_num_beams = beam_token_rank >= beam_size
                         if is_beam_token_worse_than_top_num_beams:
                             continue
-                        hyp.add(
+                        beam_hyp.add(
                             tokens[beam_id].clone(),
                             beam_score,
                             context_length + 1 - prompt_length
@@ -404,7 +404,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
                     if len(next_beams) == beam_size:
                         break
 
-                if hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
+                if beam_hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
                     done = True
                     break
                 
@@ -430,13 +430,14 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
         # if cannot find stop token, add open beams to hyps
         if not done:
             for beam_id in range(beam_size):
-                hyp.add(tokens[beam_id].clone(), scores[beam_id], context_length + 1 - prompt_length)
+                beam_hyp.add(tokens[beam_id].clone(), scores[beam_id], context_length + 1 - prompt_length)
 
         # rank based on scores
-        sorted_hyps = sorted(hyp.beams, key=lambda x: x[0], reverse=True)
-        scores, tokens = sorted_hyps[0]
-        scores = scores.unsqueeze(0)
-        tokens = tokens.unsqueeze(0)
+        sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0], reverse=True)
+        scores = [sorted_hyps[i][0] for i in range(num_return_gen)]
+        tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
+        scores = torch.stack(scores, dim=0)
+        tokens = torch.stack(tokens, dim=0)
 
     return tokens, scores
 
