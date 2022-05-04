@@ -434,6 +434,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
 
         # rank based on scores
         sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0], reverse=True)
+        num_return_gen = min(num_return_gen, len(sorted_hyps))
         scores = [sorted_hyps[i][0] for i in range(num_return_gen)]
         tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
         scores = torch.stack(scores, dim=0)
