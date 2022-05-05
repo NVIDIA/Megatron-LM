@@ -135,20 +135,28 @@ class MegatronGenerate(Resource):
             if not isinstance(no_log, bool):
                 return "no_log must be a boolean value"
         
-        beam_search = False
-        if "beam_search" in request.get_json():
-            beam_search = request.get_json()["beam_search"]
-            if not isinstance(no_log, bool):
-                return "beam_search must be a boolean value"
-        
-        beam_size = 4
-        if "beam_size" in request.get_json():
-            beam_size = request.get_json()["beam_size"]
-            if not isinstance(beam_size, int):
-                return "beam_size must be integer"
-            if beam_size < 1:
-                return "beam_size must be an integer > 1"
+        beam_width = None
+        if "beam_width" in request.get_json():
+            beam_width = request.get_json()["beam_width"]
+            if not isinstance(beam_width, int):
+                return "beam_width must be integer"
+            if beam_width < 1:
+                return "beam_width must be an integer > 1"
+            if len(prompts) > 1:
+                return "When doing beam_search, batch size must be 1"
 
+        stop_token=50256
+        if "stop_token" in request.get_json():
+            stop_token = request.get_json()["stop_token"]
+            if not isinstance(stop_token, int):
+                return "stop_token must be an integer"
+        
+        length_penalty = 1 
+        if "length_penalty" in request.get_json():
+            length_penalty = request.get_json()["length_penalty"]
+            if not isinstance(length_penalty, float):
+                return "length_penalty must be a float"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
             
             if not no_log:
@@ -157,15 +165,19 @@ class MegatronGenerate(Resource):
                 print("start time: ", datetime.datetime.now())
             
             try:
-                if beam_search:
+                if beam_width is not None:
                     MegatronGenerate.send_do_beam_search()  # Tell other ranks we're doing beam_search
                     response, response_seg, response_scores = \
                         beam_search_and_post_process(
                         self.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
-                        beam_size = beam_size,
-                        add_BOS=add_BOS)
+                        beam_size = beam_width,
+                        add_BOS=add_BOS,
+                        stop_token=stop_token,
+                        num_return_gen=beam_width,  # Returning whole beam
+                        length_penalty=length_penalty
+                        )
                     
                     return jsonify({"text": response,
                         "segments": response_seg,

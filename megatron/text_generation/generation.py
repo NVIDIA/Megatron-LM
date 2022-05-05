@@ -328,7 +328,7 @@ class BeamHypotheses(object):
             ret = self.worst_score >= cur_score
             return ret
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen=1):
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -345,7 +345,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
     # forward step.
     forward_step = ForwardStep(model, beam_size, final_sequence_length)
 
-    beam_hyp = BeamHypotheses(beam_size)
+    beam_hyp = BeamHypotheses(beam_size, length_penalty)
     done = False
     if mpu.is_pipeline_last_stage():
         scores = torch.zeros(beam_size,
