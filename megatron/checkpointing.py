@@ -91,13 +91,15 @@ def get_checkpoint_name(checkpoints_path, iteration,
     # Use both the tensor and pipeline MP rank.
     if mpu.get_pipeline_model_parallel_world_size() == 1:
         return os.path.join(checkpoints_path, directory,
-                            'mp_rank_{:02d}'.format(
-                                mpu.get_tensor_model_parallel_rank()),
+                'mp_rank_{:02d}_{:03d}'.format(
+                                mpu.get_tensor_model_parallel_rank(),
+                                mpu.get_data_parallel_rank()),
                             'model_optim_rng.pt')
     return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}_{:03d}'.format(
+            'mp_rank_{:02d}_{:03d}_{:03d}'.format(
                             mpu.get_tensor_model_parallel_rank(),
-                            mpu.get_pipeline_model_parallel_rank()),
+                            mpu.get_pipeline_model_parallel_rank(),
+                            mpu.get_data_parallel_rank()),
                         'model_optim_rng.pt')
 
 
@@ -180,7 +182,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     # collect rng state across data parallel ranks
     rng_state = get_rng_state()
 
-    if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
+    #if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
+    if True:
 
         # Arguments, iteration, and model.
         state_dict = {}
@@ -412,7 +415,6 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             if 'rng_state' in state_dict:
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
-
                     rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
                 else:
                     rng_state = state_dict['rng_state'][0]
