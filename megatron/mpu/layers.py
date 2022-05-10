@@ -218,7 +218,6 @@ class LinearWithGradAccumulationAndAsyncAllreduce(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        import fused_dense_cuda
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_input = grad_output.matmul(weight)
@@ -236,6 +235,7 @@ class LinearWithGradAccumulationAndAsyncAllreduce(torch.autograd.Function):
             # all-reduce scheduled first and have GPU resources allocated
             _ = torch.empty(1, device=grad_output.device) + 1
         if ctx.gradient_accumulation_fusion:
+            import fused_dense_cuda
             fused_dense_cuda.wgrad_gemm_accum_fp32(input, grad_output, weight.main_grad)
             grad_weight = None
         else:
