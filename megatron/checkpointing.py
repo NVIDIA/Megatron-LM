@@ -395,7 +395,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
-    if not release and not args.finetune and not args.no_load_optim:
+    # if not release and not args.finetune and not args.no_load_optim:
+    if not release and not args.no_load_optim:
         try:
             if optimizer is not None:
                 optimizer.load_state_dict(state_dict['optimizer'])
