@@ -30,6 +30,7 @@
 
 # code taken from 
 # https://github.com/pytorch/vision/blob/main/torchvision/datasets/cityscapes.py
+# modified it to change max label index from 255 to 19 (num_classes)
 
 import torch
 import json
