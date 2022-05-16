@@ -177,7 +177,7 @@ def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=
               stop_token,
               num_return_gen,
               length_penalty]
-    values_float_tensor = broadcast_float_list(3, float_list=values)
+    values_float_tensor = broadcast_float_list(6, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     beam_size = int(values_float_tensor[1].item())
     add_BOS = bool(values_float_tensor[2].item())

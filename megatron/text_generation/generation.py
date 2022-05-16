@@ -347,10 +347,9 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
 
     beam_hyp = BeamHypotheses(beam_size, length_penalty)
     done = False
-    if mpu.is_pipeline_last_stage():
-        scores = torch.zeros(beam_size,
-                             dtype=torch.float32,
-                             device=torch.cuda.current_device()).unsqueeze(1)
+    scores = torch.zeros(beam_size,
+                         dtype=torch.float32,
+                         device=torch.cuda.current_device()).unsqueeze(1)
     # =============
     # Run infernece
     # =============
@@ -368,9 +367,9 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
-            vocab_size = logits.size(2)
 
             if mpu.is_pipeline_last_stage():
+                vocab_size = logits.size(2)
                 log_probs = F.log_softmax(logits, dim=2)
                 new_scores = log_probs[:, -1, :] + scores
 

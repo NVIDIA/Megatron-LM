@@ -24,7 +24,7 @@ from megatron.text_generation import beam_search_and_post_process
 
 
 GENERATE_NUM = 0
-BEAM_NUM = 0
+BEAM_NUM = 1
 lock = threading.Lock()
 
 class MegatronGenerate(Resource):
