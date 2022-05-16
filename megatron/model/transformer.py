@@ -19,7 +19,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from megatron import get_timers, get_args, print_rank_last, print_rank_0
+from megatron import get_timers, get_args
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
