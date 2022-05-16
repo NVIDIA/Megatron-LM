@@ -229,7 +229,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                 prefix = 'iteration {}'.format(iteration)
                 evaluate_and_print_results(prefix, forward_step,
                                            valid_dataloader, model,
-                                           iteration, False)
+                                           iteration, None, False)
 
             # Exiting based on iterations
             if args.exit_interval and iteration % args.exit_interval == 0:

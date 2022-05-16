@@ -147,6 +147,7 @@ class VitBackbone(MegatronModule):
                  post_process=True,
                  class_token=True,
                  single_token_output=False,
+                 post_layer_norm=True,
                  drop_path_rate=0.0):
         super(VitBackbone, self).__init__(share_word_embeddings=False)
         args = get_args()
@@ -164,6 +165,7 @@ class VitBackbone(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.class_token = class_token
+        self.post_layer_norm = post_layer_norm
         self.hidden_size = args.hidden_size
         self.patch_dim = args.patch_dim
         self.img_h = args.img_h
@@ -217,6 +219,7 @@ class VitBackbone(MegatronModule):
             self.scaled_init_method,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            post_layer_norm=self.post_layer_norm,
             drop_path_rate=self.drop_path_rate
         )
 
