@@ -241,7 +241,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        import fused_dense_cuda
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         
@@ -296,6 +295,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         
 
         if ctx.gradient_accumulation_fusion:
+            import fused_dense_cuda
             fused_dense_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, weight.main_grad)
             grad_weight = None
         else:
