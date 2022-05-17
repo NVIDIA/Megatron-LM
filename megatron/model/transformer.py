@@ -750,8 +750,8 @@ class ParallelTransformer(MegatronModule):
         self.recompute_granularity = args.recompute_granularity
         self.recompute_method = args.recompute_method
         self.recompute_num_layers = args.recompute_num_layers
-        self.distribute_recomputed_activations = \
-            args.distribute_recomputed_activations and not args.sequence_parallel
+        self.distribute_saved_activations = \
+            args.distribute_saved_activations and not args.sequence_parallel
 
         self.sequence_parallel = args.sequence_parallel
 
@@ -851,7 +851,7 @@ class ParallelTransformer(MegatronModule):
             while l < self.num_layers:
                 hidden_states = mpu.checkpoint(
                     custom(l, l + self.recompute_num_layers),
-                    self.distribute_recomputed_activations,
+                    self.distribute_saved_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 l += self.recompute_num_layers
 
@@ -863,7 +863,7 @@ class ParallelTransformer(MegatronModule):
                 if l < self.recompute_num_layers:
                     hidden_states = mpu.checkpoint(
                         custom(l, l + 1),
-                        self.distribute_recomputed_activations,
+                        self.distribute_saved_activations,
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 else:
                     hidden_states = custom(l, l + 1)(

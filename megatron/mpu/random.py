@@ -307,10 +307,10 @@ class CheckpointFunction(torch.autograd.Function):
               tracked/set/reset.
     """
     @staticmethod
-    def forward(ctx, run_function, distribute_checkpointed_activations, *args):
+    def forward(ctx, run_function, distribute_saved_activations, *args):
         ctx.run_function = run_function
-        ctx.distribute_checkpointed_activations \
-            = distribute_checkpointed_activations
+        ctx.distribute_saved_activations \
+            = distribute_saved_activations
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -322,7 +322,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
-        if distribute_checkpointed_activations:
+        if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
                 args[0],
@@ -339,7 +339,7 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
         inputs = ctx.saved_tensors
-        if ctx.distribute_checkpointed_activations:
+        if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0],
                 gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
@@ -372,8 +372,8 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_checkpointed_activations, *args):
+def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function,
-                                    distribute_checkpointed_activations, *args)
+                                    distribute_saved_activations, *args)

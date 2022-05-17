@@ -286,7 +286,7 @@ def parse_args(extra_args_provider=None, defaults={},
                   'Defaulting to no_persist_layer_norm=True')
 
     # Activation recomputing.
-    if args.distribute_recomputed_activations:
+    if args.distribute_saved_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
             'recomputed activations only across tensor model ' \
             'parallel groups'
@@ -502,7 +502,7 @@ def _add_training_args(parser):
                        'whole transformer layer is recomputed, '
                        '2) selective: core attention part of the transformer '
                        'layer is recomputed.')
-    group.add_argument('--distribute-recomputed-activations',
+    group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
                        'across model parallel group.')
