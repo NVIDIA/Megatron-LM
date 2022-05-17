@@ -38,7 +38,7 @@ def _split_along_last_dim(input_):
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if world_size==1:
+    if world_size == 1:
         return input_
 
     # Split along last dimension.
@@ -57,15 +57,16 @@ def _split_along_first_dim(input_):
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if world_size==1:
+    if world_size == 1:
         return input_
 
     # Split along first dimension.
     dim_size = input_.size()[0]
-    assert dim_size % world_size == 0
+    assert dim_size % world_size == 0, \
+        "First dimension of the tensor should be divisible by tensor parallel size"
     local_dim_size = dim_size // world_size
     rank = get_tensor_model_parallel_rank()
-    dim_offset = rank * (local_dim_size)
+    dim_offset = rank * local_dim_size
 
     output = input_[dim_offset:dim_offset+local_dim_size].contiguous()
 
@@ -77,7 +78,7 @@ def _gather_along_last_dim(input_):
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if world_size==1:
+    if world_size == 1:
         return input_
 
     # Size and dimension.
@@ -99,7 +100,7 @@ def _gather_along_first_dim(input_):
 
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if world_size==1:
+    if world_size == 1:
         return input_
 
     dim_size = list(input_.size())
@@ -116,23 +117,19 @@ def _reduce_scatter_along_first_dim(input_):
     """Reduce-scatter the input tensor across model parallel group."""
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
-    if get_tensor_model_parallel_world_size() == 1:
+    if world_size == 1:
         return input_
 
     dim_size = list(input_.size())
-    assert dim_size[0] % world_size == 0
+    assert dim_size[0] % world_size == 0, \
+        "First dimension of the tensor should be divisible by tensor parallel size"
+    
     dim_size[0] = dim_size[0] // world_size
    
     output = torch.empty(dim_size, dtype=input_.dtype,
                          device=torch.cuda.current_device())
     torch.distributed._reduce_scatter_base(output, input_.contiguous(), 
                                            group=get_tensor_model_parallel_group())
-    return output
-
-
-def _reduce_scatter_along_last_dim(input_):
-    output = _reduce(input_)
-    output = _split_along_last_dim(output)
     return output
 
 

@@ -220,11 +220,9 @@ class Embedding(MegatronModule):
         if self.fp32_residual_connection:
             embeddings = embeddings.float()
 
-        if self.sequence_parallel:
-            embeddings = mpu.scatter_to_sequence_parallel_region(embeddings)
-            
         # Dropout.
         if self.sequence_parallel:
+            embeddings = mpu.scatter_to_sequence_parallel_region(embeddings)
             with mpu.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:

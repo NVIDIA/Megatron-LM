@@ -302,7 +302,7 @@ def parse_args(extra_args_provider=None, defaults={},
             'selective checkpointing granularity'
         
     # disable async_tensor_model_parallel_allreduce when
-    # model parallel memory optmization is enabled
+    # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
@@ -489,7 +489,7 @@ def _add_training_args(parser):
 
     group.add_argument('--checkpoint-granularity', type=str, default=None,
                        choices=['full', 'selective'],
-                       help='Checkpoint activatins to allow for training '
+                       help='Checkpoint activations to allow for training '
                        'with larger models, sequences, and batch sizes. '
                        'It is supported at two granularities 1) full: '
                        'whole transformer layer is checkpointed, '
@@ -567,7 +567,7 @@ def _add_training_args(parser):
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
     group.add_argument('--sequence-parallel', action='store_true',
-                       help='Enable sequence parallel optmization.')
+                       help='Enable sequence parallel optimization.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '

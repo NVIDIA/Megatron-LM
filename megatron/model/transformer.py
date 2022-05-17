@@ -130,21 +130,21 @@ class SwitchMLP(MegatronModule):
             self.experts.append(ParallelMLP(init_method, output_layer_init_method))
 
     def forward(self, hidden_states):
-        # hidden_states: [b, s, h]
-        b = hidden_states.size(0)
-        s = hidden_states.size(1)
+        # hidden_states: [s, b, h]
+        s = hidden_states.size(0)
+        b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states)
         route = torch.nn.functional.softmax(route, dim=2)
         max_prob, max_ind = torch.max(route, dim=2)
-        max_prob = torch.unsqueeze(max_prob, 2) # [b s 1]
+        max_prob = torch.unsqueeze(max_prob, 2) # [s b 1]
 
         # TODO (rprenger) TODO this could be made easier to read
-        # Converting [b, s, h] to [b*s, h].
+        # Converting [s, b, h] to [s*b, h].
         # Each vector could be routed differently
-        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
-        max_prob = max_prob.view(-1, max_prob.size(2)) # [b*s 1]
-        max_ind = max_ind.view(-1) # [b*s]
+        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [s*b h]
+        max_prob = max_prob.view(-1, max_prob.size(2)) # [s*b 1]
+        max_ind = max_ind.view(-1) # [s*b]
 
         output_total = torch.empty_like(hidden_states)
         output_bias_total = torch.empty_like(hidden_states)
@@ -160,14 +160,14 @@ class SwitchMLP(MegatronModule):
 
         output_total = output_total*max_prob
         output_bias_total = output_bias_total*max_prob
-        output_total = output_total.view(b, s, h)
-        output_bias_total = output_bias_total.view(b, s, h)
+        output_total = output_total.view(s, b, h)
+        output_bias_total = output_bias_total.view(s, b, h)
 
         return output_total, output_bias_total
 
 
 class CoreAttention(MegatronModule):
-    matmul_input = None
+    matmul_input_buffer = None
 
     def __init__(self, layer_number,
                  attn_mask_type=AttnMaskType.padding):
@@ -235,8 +235,8 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        if CoreAttention.matmul_input is None:
-            CoreAttention.matmul_input = torch.empty(
+        if CoreAttention.matmul_input_buffer is None:
+            CoreAttention.matmul_input_buffer = torch.empty(
                 output_size[0]*output_size[1],
                 output_size[2],
                 output_size[3],
@@ -245,7 +245,7 @@ class CoreAttention(MegatronModule):
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
-            CoreAttention.matmul_input,
+            CoreAttention.matmul_input_buffer,
             query_layer.transpose(0, 1),   # [b * np, sq, hn]
             key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
@@ -311,7 +311,7 @@ class CoreAttention(MegatronModule):
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
-    Self-attention layer takes input with size [b, s, h]
+    Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
     """
 
@@ -529,7 +529,7 @@ def bias_dropout_add_fused_inference(x: torch.Tensor,
 class ParallelTransformerLayer(MegatronModule):
     """A single transformer layer.
 
-    Transformer layer takes input with size [b, s, h] and returns an
+    Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
     """
 
@@ -603,7 +603,7 @@ class ParallelTransformerLayer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
-        # hidden_states: [b, s, h]
+        # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
@@ -882,6 +882,8 @@ class ParallelTransformer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
+        # hidden_states: [s, b, h]
+
         # Checks.
         if inference_params:
             assert self.checkpoint_granularity is None, \
