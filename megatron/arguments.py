@@ -273,6 +273,10 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.wandb_entity_name or args.wandb_project_name:
         assert args.wandb_entity_name and args.wandb_project_name, \
             "Both entity and project name must be set in order to report to wandb"
+    
+    # Local-rank from environment variable (if using torchrun)
+    if args.local_rank is None and "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
 
     _print_args(args)
     return args
