@@ -226,6 +226,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     torch.empty(dim_size, dtype=input.dtype,
                                 device=torch.cuda.current_device(),
                                 requires_grad=False)
+            else:
+                assert list(LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer.size()) == dim_size, \
+                    "buffer dimensions should remain same during the training run"
+
             torch.distributed._all_gather_base(
                 LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer,
                 input,

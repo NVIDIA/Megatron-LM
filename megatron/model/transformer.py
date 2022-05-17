@@ -242,6 +242,10 @@ class CoreAttention(MegatronModule):
                 output_size[3],
                 dtype=query_layer.dtype,
                 device=torch.cuda.current_device())
+        else:
+            assert CoreAttention.matmul_input_buffer.size() == \
+                    (output_size[0]*output_size[1], output_size[2], output_size[3]), \
+                "buffer dimensions should remain the same during the training run"
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -358,7 +362,7 @@ class ParallelAttention(MegatronModule):
 
         self.core_attention = CoreAttention(self.layer_number,
                                             self.attn_mask_type)
-        self.checkpoint_core_attention = args.checkpoint_granularity == 'selective'
+        self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         # Output.
         self.dense = mpu.RowParallelLinear(
@@ -743,11 +747,11 @@ class ParallelTransformer(MegatronModule):
         self.drop_path_rate = drop_path_rate
 
         # Store activation checkpoiting flag.
-        self.checkpoint_granularity = args.checkpoint_granularity
-        self.checkpoint_method = args.checkpoint_method
-        self.checkpoint_num_layers = args.checkpoint_num_layers
-        self.distribute_checkpointed_activations = \
-            args.distribute_checkpointed_activations and not args.sequence_parallel
+        self.recompute_granularity = args.recompute_granularity
+        self.recompute_method = args.recompute_method
+        self.recompute_num_layers = args.recompute_num_layers
+        self.distribute_recomputed_activations = \
+            args.distribute_recomputed_activations and not args.sequence_parallel
 
         self.sequence_parallel = args.sequence_parallel
 
@@ -839,33 +843,33 @@ class ParallelTransformer(MegatronModule):
                 return x_
             return custom_forward
 
-        if self.checkpoint_method == 'uniform':
+        if self.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
             while l < self.num_layers:
                 hidden_states = mpu.checkpoint(
-                    custom(l, l + self.checkpoint_num_layers),
-                    self.distribute_checkpointed_activations,
+                    custom(l, l + self.recompute_num_layers),
+                    self.distribute_recomputed_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
-                l += self.checkpoint_num_layers
+                l += self.recompute_num_layers
 
-        elif self.checkpoint_method == 'block':
+        elif self.recompute_method == 'block':
             # Checkpoint the input activation of only a set number of individual
             # Transformer layers and skip the rest.
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers):
-                if l < self.checkpoint_num_layers:
+                if l < self.recompute_num_layers:
                     hidden_states = mpu.checkpoint(
                         custom(l, l + 1),
-                        self.distribute_checkpointed_activations,
+                        self.distribute_recomputed_activations,
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
                 else:
                     hidden_states = custom(l, l + 1)(
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
         else:
-            raise ValueError("Invalid activation checkpoint method.")
+            raise ValueError("Invalid activation recompute method.")
 
         return hidden_states
 
@@ -886,7 +890,7 @@ class ParallelTransformer(MegatronModule):
 
         # Checks.
         if inference_params:
-            assert self.checkpoint_granularity is None, \
+            assert self.recompute_granularity is None, \
                 'inference does not work with activation checkpointing'
 
         if not self.pre_process:
@@ -921,7 +925,7 @@ class ParallelTransformer(MegatronModule):
 
         with rng_context:
             # Forward pass.
-            if self.checkpoint_granularity == 'full':
+            if self.recompute_granularity == 'full':
                 hidden_states = self._checkpointed_forward(hidden_states,
                                                            attention_mask,
                                                            encoder_output,
