@@ -115,7 +115,6 @@ def parse_args(extra_args_provider=None, defaults={},
 
     if args.recompute_activations:
         args.recompute_granularity = 'selective'
-        args.recompute_method = 'uniform'
     del args.recompute_activations
 
     # Set input defaults.
