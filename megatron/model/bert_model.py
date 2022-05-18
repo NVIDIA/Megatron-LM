@@ -114,13 +114,16 @@ def post_language_model_processing(lm_output, pooled_output,
         return lm_logits.transpose(0,1).contiguous(), binary_logits
     else:
         # [b s] => [s b]
-        lm_logits = lm_logits.transpose(0,1).contiguous()
+        lm_labels = lm_labels.transpose(0,1).contiguous()
+        # lm_logits : [s, b, h] and lm_labels: [s, b]
         if fp16_lm_cross_entropy:
             assert lm_logits.dtype == torch.half
             lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
         else:
             lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
                                                        lm_labels)
+        # [s, b] => [b s]
+        lm_loss = lm_loss.transpose(0,1).contiguous()
         return lm_loss, binary_logits
 
 

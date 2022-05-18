@@ -49,6 +49,9 @@ def post_language_model_processing(lm_output, labels, logit_weights,
             loss = mpu.vocab_parallel_cross_entropy(output, labels)
         else:
             loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
+        
+        # [s b] => [b, s]
+        loss = loss.transpose(0,1).contiguous()
         return loss
 
 

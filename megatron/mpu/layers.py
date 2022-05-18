@@ -205,7 +205,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     Linear layer execution with asynchronous communication and gradient accumulation
     fusion in backprop.
     """
-    all_gather_buffer = None
 
     @staticmethod
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
@@ -221,20 +220,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            if LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer is None:
-                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer = \
-                    torch.empty(dim_size, dtype=input.dtype,
-                                device=torch.cuda.current_device(),
-                                requires_grad=False)
-            else:
-                assert list(LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer.size()) == dim_size, \
-                    "buffer dimensions should remain same during the training run"
-
+            all_gather_buffer = \
+                torch.empty(dim_size, dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False)
             torch.distributed._all_gather_base(
-                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer,
+                all_gather_buffer,
                 input,
                 group=get_tensor_model_parallel_group())
-            total_input = LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer
+            total_input = all_gather_buffer
         else:
             total_input = input
 
@@ -253,15 +247,20 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
+            all_gather_buffer = \
+                torch.empty(dim_size, dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False)
+           
             handle = torch.distributed._all_gather_base(
-                LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer,
+                all_gather_buffer,
                 input,
                 group=get_tensor_model_parallel_group(), async_op=True)
 
             # Delay the start of intput gradient computation shortly (3us) to have
             # gather scheduled first and have GPU resources allocated
             _ = torch.empty(1, device=grad_output.device) + 1
-            total_input = LinearWithGradAccumulationAndAsyncCommunication.all_gather_buffer
+            total_input = all_gather_buffer
         else:
             total_input = input
         grad_input = grad_output.matmul(weight)
