@@ -107,8 +107,8 @@ def parse_args(extra_args_provider=None, defaults={},
         args.activations_checkpoint_method = 'uniform'
         if args.rank == 0:
             print('--checkpoint-activations is no longer valid, '
-                  'use --activation-checkpoint-method instead. '
-                  'Defaulting to activation-checkpoint-method=uniform.')
+                  'use --activations-checkpoint-method instead. '
+                  'Defaulting to activations-checkpoint-method=uniform.')
     del args.checkpoint_activations
 
     # Set input defaults.
