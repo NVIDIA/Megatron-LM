@@ -611,6 +611,9 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--finetune-from', type=str, default=None,
+                       help='Directory containing a model checkpoint for finetuning.'
+                       'Will be loaded if the `--load` directory contains no checkpoint')
 
     return parser
 

@@ -304,11 +304,23 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     args = get_args()
     load_dir = getattr(args, load_arg)
 
-    model = utils.unwrap_model(model)
-
     if iteration is None:
         # Read the tracker file and set the iteration.
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
+
+        # If no tracker file, and we are in finetuning, try to load from the `finetune_from` dir
+        if not os.path.isfile(tracker_filename) and args.finetune and load_arg != 'finetune_from':
+            print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+            print_rank_0('    will try to load from `--finetune-from` instead')
+            return load_checkpoint(model, optimizer, lr_scheduler, load_arg='finetune_from', strict=strict, iteration=iteration)
+        # If we are resuming an experiment: setting finetune to False.
+        elif load_arg != 'finetune_from':
+            args.finetune=False
+            print_rank_0(f"Resuming from {load_dir}")
+        # Finetuning
+        else:
+            print_rank_0(f"Finetuning from {load_dir}")
 
         # If no tracker file, return iretation zero.
         if not os.path.isfile(tracker_filename):
@@ -324,10 +336,12 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     else:
         # Iteration given as argument: do nothing
         release = False
+    
+    model = utils.unwrap_model(model)
 
     # Checkpoint.
     checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
-    print_rank_0(f' loading checkpoint from {args.load} at iteration {iteration}')
+    print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
@@ -395,13 +409,11 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     fix_query_key_value_ordering(model, checkpoint_version)
 
     # Optimizer.
-    # for finetuning: load optimizer but not lr_scheduler.
-    # if not release and not args.finetune and not args.no_load_optim:
-    if not release and not args.no_load_optim:
+    if not release and not args.finetune and not args.no_load_optim:
         try:
             if optimizer is not None:
                 optimizer.load_state_dict(state_dict['optimizer'])
-            if lr_scheduler is not None and not args.finetune:
+            if lr_scheduler is not None:
                 lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
         except KeyError:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
@@ -450,7 +462,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0(f'  successfully loaded checkpoint from {args.load} '
+    print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'at iteration {iteration}')
 
     return iteration
