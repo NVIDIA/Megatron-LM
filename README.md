@@ -20,7 +20,7 @@ Our codebase is capable of efficiently training very large (hundreds of billions
 
 ![Scaling Graph](images/Achieved_petaFLOPs.png)
 
-The following table shows both model and hardware FLOPs utilization for select configurations up to 1T parameters (see [our paper](https://arxiv.org/pdf/2205.05198) for a description of how these are calculated). Note that these numbers are also measured on benchmark runs and in this case are measured using a data parallel size of one.
+The following table shows both model (MFU) and hardware (HFU) FLOPs utilization for select configurations up to 1T parameters (see [our paper](https://arxiv.org/pdf/2205.05198) for a description of how these are calculated). As the model size increases, we achieve better GPU utilization and for the one trillion parameter model, we reach a MFU and HFU of 56.3% and 57.0%, respectively. Note that these numbers are also measured on benchmark runs and in this case are measured using a data parallel size of one. Data parallelism introduces some overhead due to the gradient all-reduce required between the data parallel groups. However, for large transformer models, this overhead is not large and can almost entirely eliminted by overlapping the gradient all-reduce with backpropagation.
 
 | Model Size | Model FLOPs Utilization | Hardware FLOPs Utilization |
 | :---: | :---: | :---: |
