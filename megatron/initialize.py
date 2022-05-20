@@ -278,9 +278,13 @@ def _warmup_jit_function():
     del bias, input, output
 
     # Warmup fused bias+dropout+add
-    input = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+    if args.sequence_parallel:
+        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+    else:
+        seq_length = args.seq_length
+    input = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
                        dtype=dtype, device='cuda')
-    residual = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+    residual = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
                           dtype=dtype, device='cuda')
     bias = torch.rand((args.hidden_size), dtype=dtype, device='cuda').expand_as(residual)
     dropout_rate = 0.1

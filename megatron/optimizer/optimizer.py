@@ -264,7 +264,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
                         if param in self.optimizer.state:
                             self.optimizer.state[main_param] \
                                 = self.optimizer.state.pop(param)
-
                     # fp32 params.
                     elif param.type() == 'torch.cuda.FloatTensor':
                         fp32_params_this_group.append(param)
@@ -281,10 +280,6 @@ class Float16OptimizerWithFloat16Params(MegatronOptimizer):
             self.fp32_from_float16_groups.append(
                 fp32_from_float16_params_this_group)
             self.fp32_from_fp32_groups.append(fp32_params_this_group)
-
-        # Leverage state_dict() and load_state_dict() to
-        # recast preexisting per-param state tensors
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
 
 
     def zero_grad(self, set_to_none=True):
