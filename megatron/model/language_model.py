@@ -104,11 +104,20 @@ class Pooler(MegatronModule):
 
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
+        args = get_args()
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        self.sequence_parallel = args.sequence_parallel
+
 
     def forward(self, hidden_states, sequence_index=0):
         # hidden_states: [s, b, h]
         # sequence_index: index of the token to pool.
+
+        # gather data along sequence dimensions
+        # same pooler is run on all tensor parallel nodes
+        if self.sequence_parallel:
+            hidden_states = mpu.gather_from_sequence_parallel_region(hidden_states)
+
         pooled = hidden_states[sequence_index, :, :]
         pooled = self.dense(pooled)
         pooled = torch.tanh(pooled)
@@ -412,7 +421,6 @@ class TransformerLanguageModel(MegatronModule):
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
 
-        args = get_args()
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
@@ -434,21 +442,8 @@ class TransformerLanguageModel(MegatronModule):
 
         if self.post_process:
             if self.add_pooler:
-                if args.sequence_parallel:
-                    # encoder output is split along sequence dimension
-                    # consider appropriate rank based on pooling sequence index
-                    # binary head loss is only computed in just one rank.
-                    seq_denom = args.seq_length // args.tensor_model_parallel_size
-                    seq_rank = mpu.get_tensor_model_parallel_rank()
-                    if pooling_sequence_index // seq_denom == seq_rank:
-                        pooled_output = self.pooler(
-                            encoder_output,
-                            pooling_sequence_index % seq_denom)
-                    else:
-                        pooled_output = None
-                else:
-                    pooled_output = self.pooler(encoder_output,
-                                                pooling_sequence_index)
+                pooled_output = self.pooler(encoder_output,
+                                            pooling_sequence_index)
 
         # output_enc_hidden refers to when we just need the encoder's
         # output. For example, it is helpful to compute
