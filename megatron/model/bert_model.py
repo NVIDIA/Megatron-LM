@@ -78,7 +78,12 @@ class BertLMHead(MegatronModule):
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        setattr(self.dense.weight, 'sequence_parallel', args.sequence_parallel)
+        setattr(self.dense.bias, 'sequence_parallel', args.sequence_parallel)
+
+        self.layernorm = LayerNorm(hidden_size, 
+                                   eps=layernorm_epsilon,
+                                   sequence_parallel=args.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -106,7 +111,7 @@ def post_language_model_processing(lm_output, pooled_output,
         lm_output, logit_weights)
 
     binary_logits = None
-    if binary_head is not None:
+    if binary_head is not None and pooled_output is not None:
         binary_logits = binary_head(pooled_output)
 
     if lm_labels is None:
