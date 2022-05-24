@@ -527,6 +527,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-send-forward-recv')
     add_to_logging('backward-send-backward-recv')
     add_to_logging('backward-params-all-reduce')
+    add_to_logging('backward-layernorm-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
     add_to_logging('backward-reduce-model-grads')
     add_to_logging('backward-gather-model-params')
