@@ -266,8 +266,37 @@ class MegatronOptimizer(ABC):
         self.allreduce_position_embedding_grads(args)
 
 
+    def allreduce_layernorm_grads(self, args):
+        """All-reduce layernorm grads (for sequence parallelism)."""
+
+        # All-reduce layernorm parameters across model parallel nodes
+        # when sequence parallelism is used
+        if mpu.get_tensor_model_parallel_world_size() > 1 and \
+                args.sequence_parallel:
+            raise Exception("hi.")
+            grads = []
+            for model_module in model:
+                unwrapped_model = unwrap_model( 
+                    model_module, (torchDDP, LocalDDP, Float16Module))
+                for param in unwrapped_model.parameters():
+                    if getattr(param, 'sequence_parallel', False):
+                        grad = param.main_grad if args.DDP_impl == 'local' else param.grad
+                        grads.append(grad.data)
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=mpu.get_tensor_model_parallel_group())
+            for buf, synced in zip(grads, _unflatten_dense_tensors(
+                    coalesced, grads)):
+                buf.copy_(synced)
+
+
     def reduce_model_grads(self, args, timers):
         """All-reduce all grads, and all-reduce embeddings."""
+
+        # All-reduce layer-norm grads (for sequence parallelism).
+        timers('backward-layernorm-all-reduce').start()
+        self.allreduce_layernorm_grads(args)
+        timers('backward-layernorm-all-reduce').stop()
 
         # All-reduce if needed.
         if args.DDP_impl == 'local':

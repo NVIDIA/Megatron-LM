@@ -527,9 +527,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         tensors are dynamically allocated.
 
         Note: this is a different order of reduction, versus the non-
-        distributed optimizer, which reduces: 1) all grads, 2) embedding
-        grads.
+        distributed optimizer, which reduces: 1) layernorm grads, 2) all
+        grads, 3) embedding grads.
         """
+
+        # All-reduce layer-norm grads (for sequence parallelism).
+        timers('backward-layernorm-all-reduce').start()
+        self.allreduce_layernorm_grads(args)
+        timers('backward-layernorm-all-reduce').stop()
 
         # All-reduce embedding grads.
         timers('backward-embedding-all-reduce').start()
