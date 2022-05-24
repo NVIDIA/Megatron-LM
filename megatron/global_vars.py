@@ -292,18 +292,21 @@ class Timers:
 
 
 class GlobalMemoryBuffer:
-    "Global buffer to avoid dynamic memory allocations"
+    """Global buffer to avoid dynamic memory allocations.
+    Caller should ensure that buffers of the same name 
+    are not used concurrently."""
 
     def __init__(self):
         self.buffer = {}
 
-    def allocate_tensor(self, tensor_shape, dtype):
+    def get_tensor(self, tensor_shape, dtype, name):
         required_len = reduce(operator.mul, tensor_shape, 1)
-        if self.buffer.get(dtype, None) is None or self.buffer[dtype].numel() < required_len:
-            self.buffer[dtype] = torch.empty(required_len,
-                                             dtype=dtype,
-                                             device=torch.cuda.current_device(),
-                                             requires_grad=False)
+        if self.buffer.get((name, dtype), None) is None or \
+                self.buffer[(name, dtype)].numel() < required_len:
+            self.buffer[(name, dtype)] = \
+                torch.empty(required_len,
+                            dtype=dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False)
 
-        return self.buffer[dtype][0:required_len].view(*tensor_shape)
-
+        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)

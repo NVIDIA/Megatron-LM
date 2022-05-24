@@ -221,7 +221,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = \
-                get_global_memory_buffer().allocate_tensor(dim_size, dtype=input.dtype)
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             torch.distributed._all_gather_base(
                 all_gather_buffer,
                 input,
@@ -246,7 +246,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = \
-                get_global_memory_buffer().allocate_tensor(dim_size, dtype=input.dtype)
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             handle = torch.distributed._all_gather_base(
                 all_gather_buffer,
                 input,
