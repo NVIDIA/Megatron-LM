@@ -19,7 +19,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from megatron import get_timers, get_args
+from megatron import get_timers, get_args, get_global_memory_buffer
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
@@ -234,12 +234,9 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = torch.empty(
-            output_size[0]*output_size[1],
-            output_size[2],
-            output_size[3],
-            dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+        matmul_input_buffer = get_global_memory_buffer().allocate_tensor(
+            (output_size[0]*output_size[1], output_size[2], output_size[3]),
+            dtype=query_layer.dtype)
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(

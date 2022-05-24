@@ -118,7 +118,7 @@ class Pooler(MegatronModule):
         if self.sequence_parallel:
             hidden_states = mpu.gather_from_sequence_parallel_region(
                 hidden_states,
-                to_model_parallel=False)
+                tensor_parallel_output_grad=False)
 
         pooled = hidden_states[sequence_index, :, :]
         pooled = self.dense(pooled)

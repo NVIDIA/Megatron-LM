@@ -18,7 +18,8 @@
 import os
 import sys
 import time
-
+from functools import reduce
+import operator
 import torch
 
 from megatron import dist_signal_handler
@@ -33,7 +34,7 @@ _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
-
+_GLOBAL_MEMORY_BUFFER = None
 
 def get_args():
     """Return arguments."""
@@ -77,14 +78,22 @@ def get_timers():
     _ensure_var_is_initialized(_GLOBAL_TIMERS, 'timers')
     return _GLOBAL_TIMERS
 
+
 def get_signal_handler():
     _ensure_var_is_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
     return _GLOBAL_SIGNAL_HANDLER
+
+
+def get_global_memory_buffer():
+    _ensure_var_is_initialized(_GLOBAL_MEMORY_BUFFER, 'global memory buffer')
+    return _GLOBAL_MEMORY_BUFFER
+
 
 def _set_signal_handler():
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
     _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
+
 
 def set_global_variables(extra_args_provider=None, args_defaults={},
                          ignore_unknown_args=False):
@@ -98,6 +107,7 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers()
+    _set_global_memory_buffer()
 
     if args.exit_signal_handler:
         _set_signal_handler()
@@ -181,6 +191,12 @@ def _set_timers():
     global _GLOBAL_TIMERS
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
     _GLOBAL_TIMERS = Timers()
+
+def _set_global_memory_buffer():
+    """Initialize global buffer"""
+    global _GLOBAL_MEMORY_BUFFER
+    _ensure_var_is_not_initialized(_GLOBAL_MEMORY_BUFFER, 'global memory buffer')
+    _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
 def _ensure_var_is_initialized(var, name):
@@ -273,3 +289,21 @@ class Timers:
                 print(string, flush=True)
         else:
             print(string, flush=True)
+
+
+class GlobalMemoryBuffer:
+    "Global buffer to avoid dynamic memory allocations"
+
+    def __init__(self):
+        self.buffer = {}
+
+    def allocate_tensor(self, tensor_shape, dtype):
+        required_len = reduce(operator.mul, tensor_shape, 1)
+        if self.buffer.get(dtype, None) is None or self.buffer[dtype].numel() < required_len:
+            self.buffer[dtype] = torch.empty(required_len,
+                                             dtype=dtype,
+                                             device=torch.cuda.current_device(),
+                                             requires_grad=False)
+
+        return self.buffer[dtype][0:required_len].view(*tensor_shape)
+
