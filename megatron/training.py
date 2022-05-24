@@ -23,7 +23,6 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_args
 from megatron import get_signal_handler
