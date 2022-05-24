@@ -152,19 +152,24 @@ class T5Model(MegatronModule):
 
         if self.post_process and self.add_decoder:
             decoder_output, encoder_output = lm_output
-            # Output.
+            # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
                                      self.word_embeddings_weight())
 
             if lm_labels is None:
-                return lm_logits
+                # [s b h] => [b s h]
+                return lm_logits.transpose(0,1).contiguous()
             else:
+                # [b s] => [s b]
+                lm_labels = lm_labels.transpose(0,1).contiguous()
                 if self.fp16_lm_cross_entropy:
                     assert lm_logits.dtype == torch.half
                     lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
                 else:
                     lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
                                                                lm_labels)
+                # [s b] => [b s]
+                lm_loss = lm_loss.transpose(0,1).contiguous()
             return lm_loss
         elif self.add_decoder and not self.add_encoder:
             decoder_output, encoder_output = lm_output

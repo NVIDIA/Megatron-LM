@@ -78,7 +78,12 @@ class BertLMHead(MegatronModule):
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        setattr(self.dense.weight, 'sequence_parallel', args.sequence_parallel)
+        setattr(self.dense.bias, 'sequence_parallel', args.sequence_parallel)
+
+        self.layernorm = LayerNorm(hidden_size,
+                                   eps=layernorm_epsilon,
+                                   sequence_parallel=args.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -110,14 +115,20 @@ def post_language_model_processing(lm_output, pooled_output,
         binary_logits = binary_head(pooled_output)
 
     if lm_labels is None:
-        return lm_logits, binary_logits
+        # [s b h] => [b s h]
+        return lm_logits.transpose(0,1).contiguous(), binary_logits
     else:
+        # [b s] => [s b]
+        lm_labels = lm_labels.transpose(0,1).contiguous()
+        # lm_logits : [s, b, h] and lm_labels: [s, b]
         if fp16_lm_cross_entropy:
             assert lm_logits.dtype == torch.half
             lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
         else:
             lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
                                                        lm_labels)
+        # [s, b] => [b s]
+        lm_loss = lm_loss.transpose(0,1).contiguous()
         return lm_loss, binary_logits
 
 

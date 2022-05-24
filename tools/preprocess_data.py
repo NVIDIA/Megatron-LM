@@ -122,8 +122,10 @@ def get_args():
                        choices=['lazy', 'cached', 'mmap'])
 
     group = parser.add_argument_group(title='runtime')
-    group.add_argument('--workers', type=int, default=1,
+    group.add_argument('--workers', type=int, required=True,
                        help='Number of worker processes to launch')
+    group.add_argument('--chunk-size', type=int, required=True,
+                       help='Chunk size assigned to each worker process')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
     args = parser.parse_args()
@@ -154,7 +156,7 @@ def main():
     encoder = Encoder(args)
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
-    encoded_docs = pool.imap(encoder.encode, fin, 25)
+    encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
     #encoded_docs = map(encoder.encode, fin)
 
     level = "document"

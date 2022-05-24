@@ -17,7 +17,6 @@ from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
-from megatron.model import LayerNorm
 
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
