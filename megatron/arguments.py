@@ -304,7 +304,13 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
             'selective recomputing granularity'
-        
+
+    # disable sequence parallelism when tp=1
+    # to avoid change in numerics when
+    # sequence_parallelism is enabled.
+    if args.tensor_model_parallel_size == 1:
+        args.sequence_parallel = False
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if args.sequence_parallel:

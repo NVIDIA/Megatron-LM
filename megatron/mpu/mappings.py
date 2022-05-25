@@ -217,19 +217,23 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
     """Gather the input from sequence parallel region and concatinate.""" 
 
     @staticmethod
-    def symbolic(graph, input_, to_model_parallel=True):
+    def symbolic(graph, input_, tensor_parallel_output_grad=True):
         return _gather_along_first_dim(input_)
     
     @staticmethod
-    def forward(ctx, input_, to_model_parallel=True):
-        ctx.to_model_parallel = to_model_parallel
+    def forward(ctx, input_, tensor_parallel_output_grad=True):
+        ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
         return _gather_along_first_dim(input_)
 
     @staticmethod
     def backward(ctx, grad_output):
-        to_model_parallel = ctx.to_model_parallel
+        tensor_parallel_output_grad = ctx.tensor_parallel_output_grad
 
-        if to_model_parallel:
+        # If the computation graph after the gather operation is
+        # in the tensor parallel mode, output gradients need to reduce 
+        # scattered and whereas if the computation is duplicated, 
+        # output gradients need to be scattered.
+        if tensor_parallel_output_grad:
             return _reduce_scatter_along_first_dim(grad_output), None
         else:
             return _split_along_first_dim(grad_output), None
@@ -275,8 +279,8 @@ def scatter_to_sequence_parallel_region(input_):
     return _ScatterToSequenceParallelRegion.apply(input_)
 
 
-def gather_from_sequence_parallel_region(input_, to_model_parallel=True):
-    return _GatherFromSequenceParallelRegion.apply(input_, to_model_parallel)
+def gather_from_sequence_parallel_region(input_, tensor_parallel_output_grad=True):
+    return _GatherFromSequenceParallelRegion.apply(input_, tensor_parallel_output_grad)
 
 
 def reduce_scatter_to_sequence_parallel_region(input_):

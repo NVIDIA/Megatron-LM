@@ -39,7 +39,7 @@ from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
-from megatron import get_args
+from megatron import get_args, get_global_memory_buffer
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -221,9 +221,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = \
-                torch.empty(dim_size, dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False)
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             torch.distributed._all_gather_base(
                 all_gather_buffer,
                 input,
@@ -248,10 +246,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size[0] = dim_size[0] * world_size
 
             all_gather_buffer = \
-                torch.empty(dim_size, dtype=input.dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False)
-           
+                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             handle = torch.distributed._all_gather_base(
                 all_gather_buffer,
                 input,
