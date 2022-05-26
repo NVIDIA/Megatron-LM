@@ -20,9 +20,11 @@ from flask import Flask, request, jsonify, current_app
 from flask_restful import Resource, Api
 from megatron import get_args
 from megatron.text_generation import generate_and_post_process
+from megatron.text_generation import beam_search_and_post_process
 
 
 GENERATE_NUM = 0
+BEAM_NUM = 1
 lock = threading.Lock()
 
 class MegatronGenerate(Resource):
@@ -34,6 +36,11 @@ class MegatronGenerate(Resource):
         choice = torch.cuda.LongTensor([GENERATE_NUM])
         torch.distributed.broadcast(choice, 0)
      
+    @staticmethod
+    def send_do_beam_search():
+        choice = torch.cuda.LongTensor([BEAM_NUM])
+        torch.distributed.broadcast(choice, 0)
+    
     def put(self):
         args = get_args()
        
@@ -128,15 +135,57 @@ class MegatronGenerate(Resource):
             if not isinstance(no_log, bool):
                 return "no_log must be a boolean value"
         
+        beam_width = None
+        if "beam_width" in request.get_json():
+            beam_width = request.get_json()["beam_width"]
+            if not isinstance(beam_width, int):
+                return "beam_width must be integer"
+            if beam_width < 1:
+                return "beam_width must be an integer > 1"
+            if len(prompts) > 1:
+                return "When doing beam_search, batch size must be 1"
+
+        stop_token=50256
+        if "stop_token" in request.get_json():
+            stop_token = request.get_json()["stop_token"]
+            if not isinstance(stop_token, int):
+                return "stop_token must be an integer"
+        
+        length_penalty = 1 
+        if "length_penalty" in request.get_json():
+            length_penalty = request.get_json()["length_penalty"]
+            if not isinstance(length_penalty, float):
+                return "length_penalty must be a float"
+        
         with lock:  # Need to get lock to keep multiple threads from hitting code
+            
             if not no_log:
                 print("request IP: " + str(request.remote_addr))
                 print(json.dumps(request.get_json()),flush=True)
                 print("start time: ", datetime.datetime.now())
-            MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
+            
             try:
-                response, response_seg, response_logprobs, _ = \
-                    generate_and_post_process(
+                if beam_width is not None:
+                    MegatronGenerate.send_do_beam_search()  # Tell other ranks we're doing beam_search
+                    response, response_seg, response_scores = \
+                        beam_search_and_post_process(
+                        self.model,
+                        prompts=prompts,
+                        tokens_to_generate=tokens_to_generate,
+                        beam_size = beam_width,
+                        add_BOS=add_BOS,
+                        stop_token=stop_token,
+                        num_return_gen=beam_width,  # Returning whole beam
+                        length_penalty=length_penalty
+                        )
+                    
+                    return jsonify({"text": response,
+                        "segments": response_seg,
+                        "scores": response_scores})
+                else:
+                    MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
+                    response, response_seg, response_logprobs, _ = \
+                        generate_and_post_process(
                         self.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
@@ -149,13 +198,15 @@ class MegatronGenerate(Resource):
                         stop_on_double_eol=stop_on_double_eol,
                         stop_on_eol=stop_on_eol,
                         random_seed=random_seed)
+
+                    return jsonify({"text": response,
+                        "segments": response_seg,
+                        "logprobs": response_logprobs})
+
             except ValueError as ve:
                 return "Length of prompt + tokens_to_generate longer than allowed"
             print("end time: ", datetime.datetime.now())
         
-        return jsonify({"text": response,
-            "segments": response_seg,
-            "logprobs": response_logprobs})
 
 class MegatronServer(object):
     def __init__(self, model):
