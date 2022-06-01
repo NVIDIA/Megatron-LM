@@ -124,7 +124,10 @@ def count_zeros_fp32(parameters, model_parallel_group):
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
-    total_num_zeros = 0.0
+    # >>>
+    # total_num_zeros = 0.0
+    total_num_zeros = torch.cuda.FloatTensor([0.0])
+    # <<<
     for param in parameters:
         grad_not_none = param.grad is not None
         is_not_shared = param_is_not_shared(param)
@@ -135,9 +138,18 @@ def count_zeros_fp32(parameters, model_parallel_group):
             total_num_zeros = num_zeros + total_num_zeros
 
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(total_num_zeros,
-                                 op=torch.distributed.ReduceOp.SUM,
-                                 group=model_parallel_group)
+    # >>>
+    try:
+        torch.distributed.all_reduce(total_num_zeros,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=model_parallel_group)
+    except:
+        from lutil import pax
+        pax({
+            "total_num_zeros" : total_num_zeros,
+            "parameters" : parameters,
+        })
+    # <<<
 
     total_num_zeros = total_num_zeros.item()
 
