@@ -20,7 +20,10 @@ import math
 import sys
 import time
 
-import wandb
+try:
+    import wandb
+except ModuleNotFoundError:
+    print('Wandb import failed', flush=True)
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
