@@ -45,6 +45,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_zero_args(parser)
     parser = _add_memoryopt_args(parser)
     parser = _add_activation_checkpoint_args(parser)
+    parser = _add_distillation_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -57,6 +58,9 @@ def parse_args(extra_args_provider=None, defaults={},
         args, _ = parser.parse_known_args()
     else:
         args = parser.parse_args()
+
+    # helper argument to set deepspeed pipeline parallel or not
+    args.ds_pipeline_enabled = not args.no_pipeline_parallel
 
     # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
@@ -72,6 +76,9 @@ def parse_args(extra_args_provider=None, defaults={},
         args.pipeline_model_parallel_size,
         (args.world_size // args.tensor_model_parallel_size))
     # Checks.
+    if args.no_pipeline_parallel:
+        assert args.pipeline_model_parallel_size == 1, \
+            "pipeline_model_parallel_size must be 1 if pipeline parallel is disabled"
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size is not'\
@@ -270,6 +277,14 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--num-experts', type=int, nargs='+', default=[1,],
+                           help='number of experts list, MoE related.')
+    group.add_argument('--mlp-type', type=str, default='standard',
+                           help='Only applicable when num-experts > 1, accepts [standard, residual]')
+    group.add_argument('--topk', type=int, default=1,
+                           help='Sets the k in TopK gating for MoE layers')
+    group.add_argument('--expert-interval', type=int, default=2,
+                           help='Use experts in every "expert-interval" layers')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -337,6 +352,10 @@ def _add_logging_args(parser):
                        action='store_true',
                        help='If set, write validation perplexity to '
                        'tensorboard.')
+    group.add_argument('--log-optimizer-states-to-tensorboard',
+                       action='store_true',
+                       help='If set, write various optimizer states to '
+                       'tensorboard. This feature may consume extra GPU memory.')
 
     return parser
 
@@ -436,16 +455,38 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--disable-moe-token-dropping', action='store_false',
+                       help='Disable MoE expert token dropping.',
+                       dest='moe_token_dropping')
+    group.add_argument('--moe-train-capacity-factor', type=float, default=1.0,
+                       help='The capacity of the MoE expert at training time')
+    group.add_argument('--moe-eval-capacity-factor', type=float, default=1.0,
+                       help='The capacity of the MoE expert at eval time.')
+    group.add_argument('--moe-min-capacity', type=int, default=4,
+                       help='The minimum capacity per MoE expert regardless of the capacity_factor.')
+    group.add_argument('--moe-loss-coeff', type=float, default=0.1,
+                       help='Scaling coefficient for adding MoE loss to model loss')
+    group.add_argument('--create-moe-param-group', action='store_true',
+                       help='Create separate groups for MoE params.'
+                       'This is necessary for techniques like ZeRO.')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
+    group.add_argument('--ds-inference', action='store_true',
+                       help='DeepSpeed inference engine being used')
     group.add_argument('--cpu-optimizer', action='store_true',
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--no-pipeline-parallel', action='store_true',
+                       help='Disable pipeline parallelism')
+    group.add_argument('--use-tutel', action='store_true',
+                       help='Use Tutel optimization for MoE')
+    group.add_argument('--inference', action='store_true',
+                       help='Very basic inference mode: not allocating optim/lr - requires ZERO_STAGE=0')
 
     return parser
 
@@ -493,6 +534,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
                        'learning rate over.')
+    group.add_argument('--lr-warmup-tokens', type=int, default=None,
+                       help='number of tokens to linearly warmup '
+                       'learning rate over.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
@@ -531,6 +575,8 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--no-load-lr-state', action='store_true',
+                       help='Do not load lr state when loading checkpoint.')   
     group.add_argument('--finetune', action='store_true',
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
@@ -584,6 +630,8 @@ def _add_distributed_args(parser):
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
+    group.add_argument('--moe-expert-parallel-size', type=int, default=1,
+                       help='Degree of the MoE expert parallelism.')
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
@@ -827,4 +875,31 @@ def _add_activation_checkpoint_args(parser):
                        help='does a synchronize at the beginning and end of each checkpointed layer.')
     group.add_argument('--profile-backward', action='store_true',
                        help='Enables backward pass profiling for checkpointed layers.')
+    return parser
+
+
+def _add_distillation_args(parser):
+    group = parser.add_argument_group('Knowledge distillation',
+                                      'Distillation Configurations')
+    
+    group.add_argument('--num-layers-teacher', type=int, default=None,
+                       help='Number of the teacher transformer layers.')                  
+    group.add_argument('--num-experts-teacher', type=int, nargs='+', default=[1,],
+                        help='number of teacher experts list, MoE related.')
+    group.add_argument('--hidden-size-teacher', type=int, default=None,
+                       help='Tansformer teacher hidden size.')
+    group.add_argument('--num-attention-heads-teacher', type=int, default=None,
+                       help='Number of teacher transformer attention heads.') 
+
+    group.add_argument('--mos', action='store_true',
+                       help='Enable Mixture-of-Students via knolwedge distillation.')
+    group.add_argument('--kd-alpha-ce', default=1, type=float)
+    group.add_argument('--kd-beta-ce', default=1, type=float)
+    group.add_argument('--kd-temp', default=1.0, type=float)
+    group.add_argument('--reset-iteration', action='store_true',
+                    help='Reset the iteration count.')
+    
+    group.add_argument('--load-teacher', type=str, default=None,
+                       help='Directory containing a teacher model checkpoint.')
+
     return parser

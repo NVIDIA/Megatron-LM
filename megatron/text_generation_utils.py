@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Utilities for generating text."""
-
+import time
 import copy
 import json
 import os
@@ -323,7 +323,7 @@ def generate_samples_interactive(model, print_frequency=24):
 
 
 
-def generate_samples_unconditional(model):
+def generate_samples_unconditional(model, latencies=[], model_latencies=[], single_token_latency=[]):
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -333,16 +333,20 @@ def generate_samples_unconditional(model):
                       for _ in range(args.micro_batch_size)]
     ctr = 0
     while True:
+        torch.cuda.synchronize()
         start_time = time.time()
         for token_stream in get_token_stream(model,
-                                             copy.deepcopy(context_tokens)):
+                                             copy.deepcopy(context_tokens), model_latencies=model_latencies, single_token_latency=single_token_latency):
             pass
+        torch.cuda.synchronize()
+        latencies.append(time.time() - start_time)
+        start_time = time.time()
         if mpu.is_pipeline_last_stage() and \
            mpu.get_tensor_model_parallel_rank() == 0:
-            if ctr % args.log_interval == 0:
-                print('Avg s/batch:',
-                      (time.time() - start_time) / min(args.log_interval, ctr + 1))
-                start_time = time.time()
+            #if ctr % args.log_interval == 0:
+            #    print('Avg s/batch:',
+            #          (time.time() - start_time) / min(args.log_interval, ctr + 1))
+            #    start_time = time.time()
             length = len(token_stream)
             token_batch = token_stream[0].cpu().numpy().tolist()
             length_batch = token_stream[1].cpu().numpy().tolist()
@@ -366,12 +370,12 @@ def generate_samples_unconditional(model):
             break
 
 
-def generate_and_write_samples_unconditional(model):
+def generate_and_write_samples_unconditional(model, latencies=[], single_token_latency=[], model_latencies=[]):
 
     args = get_args()
     assert args.genfile is not None
     with open(args.genfile, 'w') as f:
-        for datum in generate_samples_unconditional(model):
+        for datum in generate_samples_unconditional(model, latencies=latencies, model_latencies=model_latencies, single_token_latency=single_token_latency):
             if mpu.is_pipeline_last_stage() and \
                mpu.get_tensor_model_parallel_rank() == 0:
                 f.write(json.dumps(datum) + '\n')
@@ -388,7 +392,7 @@ def pad_batch(batch, pad_id, args):
     return batch, context_lengths
 
 
-def get_token_stream(model, context_tokens):
+def get_token_stream(model, context_tokens, model_latencies=[], single_token_latency=[]):
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -411,8 +415,19 @@ def get_token_stream(model, context_tokens):
 
     batch_token_iterator = sample_sequence_batch(model, context_tokens_tensor,
                                                  context_length_tensor,
-                                                 attention_mask, position_ids)
+                                                 attention_mask, position_ids, model_latencies=model_latencies)
+    
+    count = 0
+    
+    t0=time.time()
     for tokens, lengths in batch_token_iterator:
+        if count > 1:
+           torch.cuda.synchronize()
+           t_elapsed = time.time() - t0
+           single_token_latency.append(t_elapsed)
+        torch.cuda.synchronize()
+        t0=time.time()
+        count+=1
         context_length += 1
         if tokens is not None:
             yield tokens[:, :context_length], lengths
@@ -428,10 +443,12 @@ def switch(val1, val2, boolean):
 
 def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
                  layer_past=None, get_key_value=None,
-                 forward_method_parallel_output=None):
+                 forward_method_parallel_output=None, model_latencies=[]):
 
     # Hidden size changes when not using recompute, need to tell p2p_communicate
     # functions the correct size
+    torch.cuda.synchronize()
+    t0 = time.time()
     args = get_args()
     orig_seq_length = args.seq_length
     args.seq_length = tokens.shape[1]
@@ -441,7 +458,12 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     # Forward pass through the model.
     unwrapped_model = unwrap_model(
         model, (torchDDP, LocalDDP, Float16Module))
-    unwrapped_model.set_input_tensor(input_tensor)
+
+    if hasattr(unwrapped_model, 'set_input_tensor'):
+        unwrapped_model.set_input_tensor(input_tensor)
+    elif args.deepspeed or args.ds_inference:
+        unwrapped_model.module.set_input_tensor(input_tensor)
+
     output_tensor = model(tokens, position_ids, attention_mask,
                           tokentype_ids=tokentype_ids,
                           layer_past=layer_past,
@@ -454,6 +476,8 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
     send_forward(output_tensor)
 
     args.seq_length = orig_seq_length
+    torch.cuda.synchronize()
+    model_latencies.append(time.time()-t0)
     if get_key_value:
         return output_tensor, layer_past
     return output_tensor
@@ -461,7 +485,7 @@ def forward_step(model, tokens, position_ids, attention_mask, tokentype_ids,
 
 def sample_sequence_batch(model, context_tokens, context_lengths,
                           attention_mask, position_ids,
-                          maxlen=None, type_ids=None):
+                          maxlen=None, type_ids=None, model_latencies=[]):
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -522,7 +546,7 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                                                   layer_past=layer_past,
                                                   get_key_value=True,
                                                   tokentype_ids=types2use,
-                                                  forward_method_parallel_output=False)
+                                                  forward_method_parallel_output=False, model_latencies=model_latencies)
                 if mpu.is_pipeline_last_stage():
                     assert output is not None
                     logits = output[:, -1].view(batch_size, -1).contiguous()
@@ -535,7 +559,9 @@ def sample_sequence_batch(model, context_tokens, context_lengths,
                     logits /= args.temperature
                     logits = top_k_logits(logits, top_k=args.top_k,
                                           top_p=args.top_p)
-                    log_probs = F.softmax(logits, dim=-1)
+                    log_probs = torch.ones_like(logits) 
+                    #TODO: Fix this
+                    #log_probs = F.softmax(logits, dim=-1)
                     prev = torch.multinomial(log_probs, num_samples=1).view(-1)
 
                 started = context_lengths <= context_length

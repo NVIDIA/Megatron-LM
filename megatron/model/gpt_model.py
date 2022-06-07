@@ -71,7 +71,8 @@ class GPTModel(MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 return_moe_loss=True):
         super(GPTModel, self).__init__()
         args = get_args()
 
@@ -79,14 +80,14 @@ class GPTModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
-
+        self.return_moe_loss = return_moe_loss
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.causal,
             init_method=init_method_normal(args.init_method_std),
-            scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
+            num_experts=args.num_experts,
             pre_process=self.pre_process,
             post_process=self.post_process)
 
@@ -116,7 +117,7 @@ class GPTModel(MegatronModule):
                 # If got a None input, need to reset curriculum_seqlen on user side
                 args.curriculum_seqlen = args.seq_length
 
-        lm_output = self.language_model(
+        lm_output, *moe_losses = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -124,13 +125,16 @@ class GPTModel(MegatronModule):
             get_key_value=get_key_value)
 
         if self.post_process:
-            return post_language_model_processing(
-                lm_output, labels,
-                self.word_embeddings_weight(),
-                get_key_value,
-                self.parallel_output,
-                forward_method_parallel_output,
-                self.fp16_lm_cross_entropy)
+            lm_output = post_language_model_processing(
+                    lm_output, labels,
+                    self.word_embeddings_weight(),
+                    get_key_value,
+                    self.parallel_output,
+                    forward_method_parallel_output,
+                    self.fp16_lm_cross_entropy)
+        
+        if self.return_moe_loss:
+            return (lm_output, *moe_losses)
         else:
             return lm_output
 
@@ -138,9 +142,15 @@ class GPTModel(MegatronModule):
                                        keep_vars=False):
 
         state_dict_ = {}
-        state_dict_[self._language_model_key] \
-            = self.language_model.state_dict_for_save_checkpoint(
+        language_model_state_dict = self.language_model.state_dict_for_save_checkpoint(
                 destination, prefix, keep_vars)
+        # MoE states need to be handled separately by DeepSpeed engine, thus
+        # moving them to the top level dictionary
+        if "moe_state_dict" in language_model_state_dict:
+            for key in list(language_model_state_dict["moe_state_dict"].keys()):
+                state_dict_[key] = language_model_state_dict["moe_state_dict"].pop(key)
+            del language_model_state_dict["moe_state_dict"]
+        state_dict_[self._language_model_key] = language_model_state_dict
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
@@ -154,8 +164,15 @@ class GPTModel(MegatronModule):
         if self.post_process and not self.pre_process:
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
+        # Gather MoE states and move under language model
+        moe_state_dict = {}
+        for key in list(state_dict.keys()):
+            if 'expert' in key and 'moe.gate.wg.weight' not in key:
+                moe_state_dict[key] = state_dict.pop(key)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
+        if len(moe_state_dict) > 0:
+            state_dict["moe_state_dict"] = moe_state_dict
         self.language_model.load_state_dict(state_dict, strict=strict)
 
 

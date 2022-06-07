@@ -1,3 +1,8 @@
+## Megatron-DeepSpeed
+DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE, Curriculum Learning, 3D Parallelism, etc.
+
+------
+
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf) and [2](https://arxiv.org/pdf/2104.04473.pdf)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel (tensor and pipeline), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
@@ -67,6 +72,12 @@ GPT-345M: wget --content-disposition https://api.ngc.nvidia.com/v2/models/nvidia
 </pre>
 
 The models require vocabulary files to run. The BERT  WordPiece vocab file can be extracted from Google's pretrained BERT models: [uncased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-uncased-vocab.txt), [cased](https://s3.amazonaws.com/models.huggingface.co/bert/bert-large-cased-vocab.txt). The GPT [vocab file](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json) and [merge table](https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt) can be downloaded directly.
+
+Additional notes for DeepSpeed. We have added a helper script to download the checkpoints and make the example runnable.
+
+Steps to follow:
+ - bash ds_download_ckpt.sh -- this will download and extract the checkpoint and GPT merges and vocab files.
+ - bash examples/generate_text.sh -- this will generate examples using the 345m GPT model.
 
 # Usage
 

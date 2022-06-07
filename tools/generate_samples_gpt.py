@@ -15,6 +15,8 @@
 
 """Sample Generate GPT"""
 
+import deepspeed
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
@@ -31,15 +33,16 @@ from megatron.training import get_model
 from megatron.text_generation_utils import generate_and_write_samples_unconditional
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
-
+import deepspeed
+import torch
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
-                     pre_process=pre_process, post_process=post_process)
-
+                     pre_process=pre_process, post_process=post_process, 
+                     return_moe_loss=False) # we need to set "return_moe_loss" for the inference_mode
     return model
 
 
@@ -73,9 +76,38 @@ def add_text_generate_args(parser):
 
     return parser
 
+def print_latency(latency_set, title=""):
+    # 10 warmup queries
+    latency_set = latency_set[10:]
+    count = len(latency_set)
+    if count > 0:
+        latency_set.sort()
+        n50 = (count - 1) * 0.5 + 1
+        n90 = (count - 1) * 0.9 + 1
+        n95 = (count - 1) * 0.95 + 1
+        n99 = (count - 1) * 0.99 + 1
+        n999 = (count - 1) * 0.999 + 1
 
+        avg = sum(latency_set) / count
+        p50 = latency_set[int(n50) - 1]
+        p90 = latency_set[int(n90) - 1]
+        p95 = latency_set[int(n95) - 1]
+        p99 = latency_set[int(n99) - 1]
+        p999 = latency_set[int(n999) - 1]
+
+        print("====== latency stats {0} ======", title)
+        print("\tAvg Latency: {0:8.2f} ms".format(avg * 1000))
+        print("\tP50 Latency: {0:8.2f} ms".format(p50 * 1000))
+        print("\tP90 Latency: {0:8.2f} ms".format(p90 * 1000))
+        print("\tP95 Latency: {0:8.2f} ms".format(p95 * 1000))
+        print("\tP99 Latency: {0:8.2f} ms".format(p99 * 1000))
+        print("\t999 Latency: {0:8.2f} ms".format(p999 * 1000))
+        
 def main():
     """Main program."""
+    latencies = []
+    model_latencies = []
+    single_token_latency = []
 
     initialize_megatron(extra_args_provider=add_text_generate_args,
                         args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
@@ -83,6 +115,7 @@ def main():
                                        'no_load_optim': True})
 
     args = get_args()
+    
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -96,6 +129,10 @@ def main():
     assert len(model) == 1, "Above condition should have caught this"
     model = model[0]
 
+    if args.ds_inference:
+        model = ds_inference(model, args)
+        print('> DeepSpeed Inference engine initialized')
+
     # Generate samples.
     if args.num_samples == 0:
         args.micro_batch_size = 1
@@ -104,8 +141,27 @@ def main():
         else:
             generate_samples_interactive(model)
     else:
-        generate_and_write_samples_unconditional(model)
+        generate_and_write_samples_unconditional(model, latencies, single_token_latency, model_latencies)
+    
+    
+    #if torch.cuda.current_device() == 0:
+    if torch.distributed.get_rank() == 0:
+        print_latency(latencies)
+        print_latency(model_latencies, "model_latencies")
+        print_latency(single_token_latency, "single_token_latency")
 
+
+def ds_inference(model, args):
+    import megatron.model as mm
+    engine = deepspeed.init_inference(model=model,
+                                      mp_size=args.tensor_model_parallel_size, 
+                                      mpu=mpu,
+                                      dtype=torch.half,
+                                      replace_with_kernel_inject=True,
+                                      moe_experts=args.num_experts,
+                                      moe_type=args.mlp_type)
+    
+    return engine.module
 
 if __name__ == "__main__":
 

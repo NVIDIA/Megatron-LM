@@ -33,6 +33,8 @@ from deepspeed.runtime.utils import see_memory_usage
 import os
 import subprocess
 
+from torch import nn
+import torch.nn.functional as F
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -46,7 +48,7 @@ def model_provider(pre_process=True, post_process=True):
                              config_dict_or_path=args.deepspeed_config,
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
-        if args.deepspeed:
+        if args.deepspeed and not args.no_pipeline_parallel:
             model = GPTModelPipe(
                 num_tokentypes=0,
                 parallel_output=True
@@ -150,18 +152,44 @@ def get_batch_pipe(data):
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
+    args = get_args()
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
+    
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
+    if args.mos:
+        assert max(args.num_experts) > 1
+        loss = loss + moe_loss + mos_loss
+        return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'mos loss': mos_loss}
+    else:
+        if max(args.num_experts) <= 1:
+            return loss, {'lm loss': averaged_loss[0]}
+        else:
+            loss = loss + moe_loss
+            return loss, {'lm loss': averaged_loss[0], 'moe loss': moe_loss}
 
-    return loss, {'lm loss': averaged_loss[0]}
+def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask):
+    mos_loss = 0
+    alpha = args.kd_alpha_ce
+    beta = args.kd_beta_ce
+    kd_temp = args.kd_temp
+    
+    if teacher_model:
+        with torch.no_grad():
+            tea_output, *tea_other_losses = teacher_model(tokens, position_ids, attention_mask)
+            assert stu_output.size() == tea_output.size(), 'teacher and student output should match in size.'
 
+        student_logits = F.log_softmax(stu_output / kd_temp, dim=2)
+        tea_logits = F.softmax(tea_output / kd_temp, dim=2) # The target logits is expected to be probabilities. If we use log_softmax, then we need to set target_log to true when initializing the KLDivLoss.
+        mos_loss = kd_temp * kd_temp * nn.KLDivLoss(reduction='batchmean')(student_logits, tea_logits)
 
-def forward_step(data_iterator, model):
+        mos_loss = mos_loss.div(args.seq_length) * beta
+    return mos_loss
+
+def forward_step(data_iterator, model, teacher_model=None):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -172,12 +200,29 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    if args.mos:
+        # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
+        stu_output, *other_losses = model(tokens, position_ids, attention_mask)
+        output_tensor = mpu.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
+    else:
+        output_tensor, *other_losses = model(tokens, position_ids, attention_mask,
+                                            labels=labels)
     if args.curriculum_learning and args.curriculum_seqlen < args.seq_length:
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
-    return output_tensor, partial(loss_func, loss_mask)
+    moe_losses = []
+    for moe_loss in other_losses:
+        if moe_loss is not None:
+            moe_losses.append(moe_loss)
+    moe_loss = sum(moe_losses) * args.moe_loss_coeff
+
+    mos_loss = 0
+    if args.mos:
+        assert model.training
+        mos_loss = calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask)
+    
+    # Output_tensor stores the standard loss, loos_func calculates the total loss.
+    return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

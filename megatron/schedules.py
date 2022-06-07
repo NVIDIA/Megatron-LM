@@ -22,6 +22,7 @@ from megatron import get_num_microbatches
 from megatron import get_timers
 from megatron import mpu
 from megatron import p2p_communication
+from megatron import print_rank_0
 from megatron.utils import unwrap_model
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
@@ -38,7 +39,7 @@ def get_forward_backward_func():
     return forward_backward_func
 
 
-def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_reduced):
+def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_reduced, teacher_model=None):
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
@@ -57,11 +58,14 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     else:
         unwrapped_model.module.set_input_tensor(input_tensor)
 
-    output_tensor, loss_func = forward_step_func(data_iterator, model)
+    output_tensor, loss_func = forward_step_func(data_iterator, model, teacher_model)
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
         loss, loss_reduced = output_tensor
-        output_tensor = loss / get_num_microbatches()
+        if not args.no_pipeline_parallel:
+            output_tensor = loss / get_num_microbatches()
+        else:
+            output_tensor = loss
         losses_reduced.append(loss_reduced)
     timers('forward-compute').stop()
 
@@ -115,7 +119,7 @@ def dummy_handler():
 
 
 def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
-                                   optimizer, timers, forward_only):
+                                   optimizer, timers, forward_only, teacher_model=None):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
 
@@ -123,24 +127,35 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     assert len(model) == 1
     model = model[0]
 
+    if teacher_model:
+        teacher_model = teacher_model[0]
+
+    args = get_args()
+
     context_handler = dummy_handler
     if isinstance(model, torchDDP):
         context_handler = model.no_sync
+
+    if args.deepspeed:
+        model.set_gradient_accumulation_boundary(False)
 
     losses_reduced = []
     input_tensor, output_tensor_grad = None, None
     with context_handler():
         for i in range(get_num_microbatches() - 1):
             output_tensor = forward_step(forward_step_func, data_iterator, model,
-                                         input_tensor, losses_reduced)
+                                         input_tensor, losses_reduced, teacher_model)
             if not forward_only:
                 backward_step(optimizer, input_tensor, output_tensor,
                               output_tensor_grad, model)
 
+    if args.deepspeed:
+        model.set_gradient_accumulation_boundary(True)
+
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator, model,
-                                 input_tensor, losses_reduced)
+                                 input_tensor, losses_reduced, teacher_model)
     if not forward_only:
         backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model)
 
@@ -148,11 +163,14 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
 
 
 def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterator, model,
-                                                  optimizer, timers, forward_only):
+                                                  optimizer, timers, forward_only, teacher_model=None):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    
+    assert teacher_model is None, 'MoS has not been supported in pipeline parallelism'
+    
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     losses_reduced = []
@@ -371,11 +389,14 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
 
 def forward_backward_pipelining_without_interleaving(forward_step_func, data_iterator,
                                                      model, optimizer, timers,
-                                                     forward_only):
+                                                     forward_only, teacher_model=None):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    
+    assert teacher_model is None, 'MoS has not been supported in pipeline parallelism'
+    
     timers = get_timers()
 
     assert len(model) == 1
