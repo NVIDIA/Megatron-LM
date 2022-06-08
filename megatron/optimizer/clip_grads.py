@@ -56,7 +56,11 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
         grads_for_norm = [grads_for_norm]
 
     # Grads.
-    grads = [ p.grad.detach() for p in parameters if p.grad is not None ]
+    grads = []
+    for param in parameters:
+        if param.grad is not None:
+            assert param.grad.type() == 'torch.cuda.FloatTensor'
+            grads.append(param.grad.detach())
 
     # Norm parameters.
     max_norm = float(max_norm)
