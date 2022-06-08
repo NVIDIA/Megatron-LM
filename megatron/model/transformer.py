@@ -680,6 +680,17 @@ class ParallelTransformerLayer(MegatronModule):
                     mlp_bias.expand_as(residual),
                     residual,
                     self.hidden_dropout)
+
+            # Jit compiled function creates 'view' tensor. This tensor
+            # potentially gets saved in the MPU checkpoint function context,
+            # which rejects view tensors. While making a viewless tensor here
+            # won't result in memory savings (like the data loader, or
+            # p2p_communication), it serves to document the origin of this
+            # 'view' tensor.
+            output = mpu.make_viewless_tensor(inp = output,
+                                              requires_grad = output.requires_grad,
+                                              keep_graph = True)
+
         else:
             out = torch.nn.functional.dropout(mlp_output + mlp_bias,
                                               p=self.hidden_dropout,
