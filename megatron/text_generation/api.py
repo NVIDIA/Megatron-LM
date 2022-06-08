@@ -33,6 +33,8 @@ def generate_and_post_process(model,
                               return_output_log_probs=False,
                               top_k_sampling=0,
                               top_p_sampling=0.0,
+                              factual_decay=0.0,
+                              factual_bound=0.0,
                               temperature=1.0,
                               add_BOS=False,
                               use_eod_token_for_early_termination=True,
@@ -50,6 +52,8 @@ def generate_and_post_process(model,
         return_output_log_probs=return_output_log_probs,
         top_k_sampling=top_k_sampling,
         top_p_sampling=top_p_sampling,
+        factual_decay=factual_decay,
+        factual_bound=factual_bound,
         temperature=temperature,
         add_BOS=add_BOS,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
@@ -78,6 +82,8 @@ def generate(model,
              return_output_log_probs=False,
              top_k_sampling=0,
              top_p_sampling=0.0,
+             factual_decay=0.0,
+             factual_bound=0.0,
              temperature=1.0,
              add_BOS=False,
              use_eod_token_for_early_termination=True,
@@ -95,22 +101,24 @@ def generate(model,
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               return_output_log_probs,
-              top_k_sampling, top_p_sampling,
+              top_k_sampling, top_p_sampling, factual_decay, factual_bound,
               temperature, add_BOS, use_eod_token_for_early_termination,
               stop_on_double_eol,
               stop_on_eol,
               random_seed]
-    values_float_tensor = broadcast_float_list(10, float_list=values)
+    values_float_tensor = broadcast_float_list(12, float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
     top_p_sampling = values_float_tensor[3].item()
-    temperature = values_float_tensor[4].item()
-    add_BOS = bool(values_float_tensor[5].item())
-    use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
-    stop_on_double_eol = bool(values_float_tensor[7].item())
-    stop_on_eol = bool(values_float_tensor[8].item())
-    random_seed = int(values_float_tensor[9].item())
+    factual_decay = values_float_tensor[4].item()
+    factual_bound = values_float_tensor[5].item()
+    temperature = values_float_tensor[6].item()
+    add_BOS = bool(values_float_tensor[7].item())
+    use_eod_token_for_early_termination = bool(values_float_tensor[8].item())
+    stop_on_double_eol = bool(values_float_tensor[9].item())
+    stop_on_eol = bool(values_float_tensor[10].item())
+    random_seed = int(values_float_tensor[11].item())
 
     if random_seed != -1:
         torch.random.manual_seed(random_seed)
@@ -134,6 +142,8 @@ def generate(model,
         return_output_log_probs=return_output_log_probs,
         top_k=top_k_sampling,
         top_p=top_p_sampling,
+        factual_decay=factual_decay,
+        factual_bound=factual_bound,
         temperature=temperature,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,

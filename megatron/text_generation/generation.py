@@ -94,7 +94,7 @@ def score_and_return_on_first_stage(model, tokens, lengths):
 def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
         return_output_log_probs=False,
-        top_k=0, top_p=0.0,
+        top_k=0, top_p=0.0, factual_decay=0.0, factual_bound=0.0,
         temperature=1.0,
         use_eod_token_for_early_termination=True,
         stop_on_double_eol=False,
@@ -200,6 +200,11 @@ def generate_tokens_probs_and_return_on_first_stage(
                                     top_p=top_p,
                                     temperature=temperature,
                                     vocab_size=tokenizer.vocab_size)
+                if top_p > 0.0 and factual_decay > 0.0:
+                    top_p = top_p * factual_decay
+                    if factual_bound > 0.0:
+                        top_p = max(top_p, factual_bound)
+
                 # If a prompt length is smaller or equal th current context
                 # length, it means we have started generating tokens
                 started = lengths <= context_length

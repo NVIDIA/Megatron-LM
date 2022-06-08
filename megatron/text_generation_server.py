@@ -93,6 +93,26 @@ class MegatronGenerate(Resource):
             if not (0 <= top_p <= 1.0):
                 return "top_p must be less than or equal to 1.0"
         
+        factual_decay = 0.0
+        if "factual_decay" in request.get_json():
+            factual_decay = request.get_json()["factual_decay"]
+            if not (type(factual_decay) == float):
+                return "factual_decay must be a positive float less than or equal to 1.0"
+            if top_p == 0.0:
+                return "factual_decay cannot be set without top_p"
+            if not (0 <= factual_decay <= 1.0):
+                return "factual_decay must be less than or equal to 1.0"
+        
+        factual_bound = 0.0
+        if "factual_bound" in request.get_json():
+            factual_bound = request.get_json()["factual_bound"]
+            if not (type(factual_bound) == float):
+                return "factual_bound must be a positive float less than or equal to top_p"
+            if top_p == 0.0:
+                return "factual_bound cannot be set without top_p"
+            if not (0.0 < factual_bound <= top_p):
+                return "factual_bound must be greater than 0 and less than top_p"
+        
         add_BOS = False
         if "add_BOS" in request.get_json():
             add_BOS = request.get_json()["add_BOS"]
@@ -143,6 +163,8 @@ class MegatronGenerate(Resource):
                         return_output_log_probs=logprobs,
                         top_k_sampling=top_k,
                         top_p_sampling=top_p,
+                        factual_decay=factual_decay,
+                        factual_bound=factual_bound,
                         temperature=temperature,
                         add_BOS=add_BOS,
                         use_eod_token_for_early_termination=True,
