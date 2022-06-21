@@ -120,6 +120,20 @@ class ParallelMLP(MegatronModule):
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
+def sinkhorn(cost, tol=0.0001):
+    cost = torch.exp(cost)
+    d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
+    d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
+    
+    eps = 0.00000001
+    error = 1e9
+    d1_old = d1
+    while error > tol:
+        d0 = (1/d0.size(0))*1/(torch.sum(d1*cost,1) + eps)
+        d1 = (1/d1.size(0))*1/(torch.sum(d0.unsqueeze(1)*cost,0)+eps)
+        error = torch.mean(torch.abs(d1_old-d1))
+        d1_old = d1
+    return d1*cost*d0.unsqueeze(1)
 
 class SwitchMLP(MegatronModule):
     """
@@ -129,7 +143,6 @@ class SwitchMLP(MegatronModule):
         super(SwitchMLP, self).__init__()
         args = get_args()
         self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
-
         assert args.num_experts % mpu.get_data_parallel_world_size() == 0
         self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
         local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
@@ -157,25 +170,24 @@ class SwitchMLP(MegatronModule):
 
     def forward(self, hidden_states):
         # hidden_states: [b, s, h]
+        args = get_args()
         s = hidden_states.size(0)
         b = hidden_states.size(1)
         h = hidden_states.size(2)
-        route = self.router(hidden_states)
-        route = torch.nn.functional.softmax(route, dim=2)
-        max_prob, max_ind = torch.max(route, dim=2)
-        max_prob = torch.unsqueeze(max_prob, 2)  # [s b 1]
+        route = self.router(hidden_states).view(-1, args.num_experts)
+        with torch.no_grad():
+            sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
+            _, max_ind = torch.max(sinkroute, dim=1)
+        route = torch.sigmoid(route)
+        max_prob = torch.unsqueeze(route[torch.arange(route.size(0)), max_ind], 1)
+        hidden_states = hidden_states.view(-1, hidden_states.size(2)) # [b*s h]
 
         # TODO (rprenger) TODO this could be made easier to read
         # Converting [s, b, h] to [s*b, h].
         # Each vector could be routed differently
-        hidden_states = hidden_states.view(-1, hidden_states.size(2))  # [s*b h]
-        max_prob = max_prob.view(-1, max_prob.size(2))  # [s*b 1]
-        max_ind = max_ind.view(-1)  # [s*b]
-
         global_hidden_states = \
             mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
         global_indices = self.gather_indices(max_ind)
-
         output_total = torch.zeros_like(global_hidden_states)
         output_bias_total = torch.zeros_like(global_hidden_states)
         for expert_num, expert in enumerate(self.local_experts):
@@ -195,12 +207,10 @@ class SwitchMLP(MegatronModule):
         # bias is duplicated across tensor parallelism ranks; reduce scatter reduces bias across tensor parallel_ranks
         output_bias_total = output_bias_total/mpu.get_tensor_model_parallel_world_size()
 
-
         output_total = output_total*max_prob
         output_bias_total = output_bias_total*max_prob
         output_total = output_total.view(s, b, h)
         output_bias_total = output_bias_total.view(s, b, h)
-
         return output_total, output_bias_total
 
 
