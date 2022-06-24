@@ -120,17 +120,6 @@ def set_args(args):
     _GLOBAL_ARGS = args
 
 
-def _parse_args(extra_args_provider=None, defaults={},
-                ignore_unknown_args=False):
-    """Parse entire arguments."""
-    global _GLOBAL_ARGS
-    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-
-
-    _GLOBAL_ARGS = args
-    return _GLOBAL_ARGS
-
-
 def _build_num_microbatches_calculator(args):
 
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
