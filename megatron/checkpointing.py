@@ -81,24 +81,34 @@ def ensure_directory_exists(filename):
         os.makedirs(dirname)
 
 
-def get_checkpoint_name(checkpoints_path, iteration,
-                        release=False):
+def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
+                         release=False):
     """A unified checkpoint name."""
     if release:
         directory = 'release'
     else:
         directory = 'iter_{:07d}'.format(iteration)
-    # Use both the tensor and pipeline MP rank.
+    # Use both the tensor and pipeline MP rank. If using the distributed
+    # optimizer, then the optimizer's path must additionally include the
+    # data parallel rank.
     if mpu.get_pipeline_model_parallel_world_size() == 1:
-        return os.path.join(checkpoints_path, directory,
-                            'mp_rank_{:02d}'.format(
-                                mpu.get_tensor_model_parallel_rank()),
-                            'model_optim_rng.pt')
-    return os.path.join(checkpoints_path, directory,
-                        'mp_rank_{:02d}_{:03d}'.format(
-                            mpu.get_tensor_model_parallel_rank(),
-                            mpu.get_pipeline_model_parallel_rank()),
-                        'model_optim_rng.pt')
+        common_path = os.path.join(checkpoints_path, directory,
+                                   'mp_rank_{:02d}'.format(
+                                       mpu.get_tensor_model_parallel_rank()))
+    else:
+        common_path = os.path.join(checkpoints_path, directory,
+                                   'mp_rank_{:02d}_{:03d}'.format(
+                                       mpu.get_tensor_model_parallel_rank(),
+                                       mpu.get_pipeline_model_parallel_rank()))
+
+    if use_distributed_optimizer:
+        model_name = os.path.join(common_path, "model_rng.pt")
+        optim_name = os.path.join(
+            common_path + "_%03d" % mpu.get_data_parallel_rank(),
+            "optim.pt")
+    else:
+        model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
+    return model_name, optim_name
 
 
 def get_checkpoint_tracker_filename(checkpoints_path):
@@ -167,7 +177,7 @@ def get_rng_state():
     return rng_state_list
 
 
-def save_checkpoint(iteration, model, optimizer, lr_scheduler):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     """Save a model checkpoint."""
     args = get_args()
 
@@ -177,38 +187,64 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
     print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
 
-    # collect rng state across data parallel ranks
+    # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
-    if not torch.distributed.is_initialized() or mpu.get_data_parallel_rank() == 0:
+    # Checkpoint file names.
+    model_checkpoint_name, optim_checkpoint_name = \
+        get_checkpoint_names(args.save, iteration, args.use_distributed_optimizer)
+
+    # Collect args, model, RNG.
+    model_state_dict = {}
+    if not torch.distributed.is_initialized() \
+       or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
-        state_dict = {}
-        state_dict['args'] = args
-        state_dict['checkpoint_version'] = 3.0
-        state_dict['iteration'] = iteration
+        model_state_dict['args'] = args
+        model_state_dict['checkpoint_version'] = 3.0
+        model_state_dict['iteration'] = iteration
         if len(model) == 1:
-            state_dict['model'] = model[0].state_dict_for_save_checkpoint()
+            model_state_dict['model'] = model[0].state_dict_for_save_checkpoint()
         else:
             for i in range(len(model)):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)
-                state_dict['model%d' % i] = model[i].state_dict_for_save_checkpoint()
-
-        # Optimizer stuff.
-        if not args.no_save_optim:
-            if optimizer is not None:
-                state_dict['optimizer'] = optimizer.state_dict()
-            if lr_scheduler is not None:
-                state_dict['lr_scheduler'] = lr_scheduler.state_dict()
+                model_state_dict['model%d' % i] = \
+                    model[i].state_dict_for_save_checkpoint()
 
         # RNG states.
         if not args.no_save_rng:
-            state_dict["rng_state"] = rng_state
+            model_state_dict["rng_state"] = rng_state
 
-        # Save.
-        checkpoint_name = get_checkpoint_name(args.save, iteration)
-        ensure_directory_exists(checkpoint_name)
-        torch.save(state_dict, checkpoint_name)
+    # Collect optimizer state. (Optimizer is saved separately from the model, due
+    # to the conflicting data pattern when using the distributed optimizer.)
+    optim_state_dict = {}
+    if not args.no_save_optim \
+       and (not torch.distributed.is_initialized()
+            or mpu.get_data_parallel_rank() == 0
+            or args.use_distributed_optimizer):
+
+        # Optimizer stuff.
+        if optimizer is not None:
+            optim_state_dict['optimizer'] = optimizer.state_dict()
+        if opt_param_scheduler is not None:
+            optim_state_dict['opt_param_scheduler'] = \
+                opt_param_scheduler.state_dict()
+
+    # Save.
+    if args.use_distributed_optimizer:
+        # Save model separate from optimizer.
+        if model_state_dict:
+            ensure_directory_exists(model_checkpoint_name)
+            torch.save(model_state_dict, model_checkpoint_name)
+        if optim_state_dict:
+            ensure_directory_exists(optim_checkpoint_name)
+            torch.save(optim_state_dict, optim_checkpoint_name)
+    else:
+        # Save model and optimizer together.
+        state_dict = {**model_state_dict, **optim_state_dict}
+        if state_dict: # only saves if populated (i.e., inherits conditions above)
+            ensure_directory_exists(model_checkpoint_name)
+            torch.save(state_dict, model_checkpoint_name)
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
@@ -295,7 +331,8 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True, iteration=None):
+
+def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True, iteration=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -313,7 +350,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             print_rank_0('WARNING: could not find the metadata file {} '.format(
                 tracker_filename))
             print_rank_0('    will try to load from `--finetune-from` instead')
-            return load_checkpoint(model, optimizer, lr_scheduler, load_arg='finetune_from', strict=strict, iteration=iteration)
+            return load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='finetune_from', strict=strict, iteration=iteration)
         # If we are resuming an experiment: setting finetune to False.
         elif load_arg != 'finetune_from':
             args.finetune=False
@@ -340,12 +377,19 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     model = utils.unwrap_model(model)
 
     # Checkpoint.
-    checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+    model_checkpoint_name, optim_checkpoint_name = \
+        get_checkpoint_names(load_dir, iteration,
+                             args.use_distributed_optimizer,
+                             release)
     print_rank_0(f' loading checkpoint from {load_dir} at iteration {iteration}')
 
     # Load the checkpoint.
     try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        model_state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+        if args.use_distributed_optimizer:
+            optim_state_dict = torch.load(optim_checkpoint_name, map_location='cpu')
+        else:
+            optim_state_dict = model_state_dict
     except ModuleNotFoundError:
         from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
@@ -354,7 +398,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
             'megatron.fp16_deprecated.loss_scaler']
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
             'megatron.fp16_deprecated.loss_scaler']
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
+        model_state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+        optim_state_dict = torch.load(optim_checkpoint_name, map_location='cpu')
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException as e:
@@ -362,29 +407,29 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
         print_rank_0(e)
         sys.exit()
 
-    # set checkpoint version
-    set_checkpoint_version(state_dict.get('checkpoint_version', 0))
+    # Set checkpoint version.
+    set_checkpoint_version(model_state_dict.get('checkpoint_version', 0))
 
     # Set iteration.
     if args.finetune or release:
         iteration = 0
     else:
         try:
-            iteration = state_dict['iteration']
+            iteration = model_state_dict['iteration']
         except KeyError:
             try:  # Backward compatible with older checkpoints
-                iteration = state_dict['total_iters']
+                iteration = model_state_dict['total_iters']
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '
                              'iteration from checkpoint {}, exiting'.format(
-                                 checkpoint_name))
+                                 model_checkpoint_name))
                 sys.exit()
 
     # Check arguments.
     assert args.consumed_train_samples == 0
     assert args.consumed_valid_samples == 0
-    if 'args' in state_dict:
-        checkpoint_args = state_dict['args']
+    if 'args' in model_state_dict:
+        checkpoint_args = model_state_dict['args']
         check_checkpoint_args(checkpoint_args)
         if not args.finetune:
             args.consumed_train_samples = getattr(checkpoint_args,
@@ -397,11 +442,11 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
 
     # Model.
     if len(model) == 1:
-        model[0].load_state_dict(state_dict['model'], strict=strict)
+        model[0].load_state_dict(model_state_dict['model'], strict=strict)
     else:
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
-            model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+            model[i].load_state_dict(model_state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed
     checkpoint_version = get_checkpoint_version()
@@ -412,26 +457,29 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     if not release and not args.finetune and not args.no_load_optim:
         try:
             if optimizer is not None:
-                optimizer.load_state_dict(state_dict['optimizer'])
-            if lr_scheduler is not None:
-                lr_scheduler.load_state_dict(state_dict['lr_scheduler'])
+                optimizer.load_state_dict(optim_state_dict['optimizer'])
+            if opt_param_scheduler is not None:
+                if 'lr_scheduler' in optim_state_dict: # backward compatbility
+                    opt_param_scheduler.load_state_dict(optim_state_dict['lr_scheduler'])
+                else:
+                    opt_param_scheduler.load_state_dict(optim_state_dict['opt_param_scheduler'])
         except KeyError:
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(model_checkpoint_name))
             sys.exit()
 
     # rng states.
     if not release and not args.finetune and not args.no_load_rng:
         try:
-            if 'rng_state' in state_dict:
+            if 'rng_state' in model_state_dict:
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
 
-                    rng_state = state_dict['rng_state'][mpu.get_data_parallel_rank()]
+                    rng_state = model_state_dict['rng_state'][mpu.get_data_parallel_rank()]
                 else:
-                    rng_state = state_dict['rng_state'][0]
+                    rng_state = model_state_dict['rng_state'][0]
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
@@ -442,20 +490,20 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                 mpu.get_cuda_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
             else:  # backward compatability
-                random.setstate(state_dict['random_rng_state'])
-                np.random.set_state(state_dict['np_rng_state'])
-                torch.set_rng_state(state_dict['torch_rng_state'])
-                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+                random.setstate(model_state_dict['random_rng_state'])
+                np.random.set_state(model_state_dict['np_rng_state'])
+                torch.set_rng_state(model_state_dict['torch_rng_state'])
+                torch.cuda.set_rng_state(model_state_dict['cuda_rng_state'])
                 # Check for empty states array
-                if not state_dict['rng_tracker_states']:
+                if not model_state_dict['rng_tracker_states']:
                     raise KeyError
                 mpu.get_cuda_rng_tracker().set_states(
-                    state_dict['rng_tracker_states'])
+                    model_state_dict['rng_tracker_states'])
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(model_checkpoint_name))
             sys.exit()
 
     # Some utilities want to load a checkpoint without distributed being initialized
@@ -485,7 +533,9 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     with open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
-    checkpoint_name = get_checkpoint_name(load_path, iteration, False)
+    checkpoint_name, _ = get_checkpoint_names(load_path, iteration,
+                                              args.use_distributed_optimizer,
+                                              False)
     if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))

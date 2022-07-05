@@ -1,4 +1,4 @@
-image: gitlab-master.nvidia.com/dl/dgx/pytorch:20.12-py3-devel
+image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 test:
   script:
