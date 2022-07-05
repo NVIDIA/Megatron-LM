@@ -23,7 +23,10 @@ import numpy as np
 import torch
 from datetime import timedelta
 
-import wandb
+try:
+    import wandb
+except ModuleNotFoundError:
+    print('Wandb import failed', flush=True)
 
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
