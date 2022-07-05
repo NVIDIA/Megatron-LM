@@ -49,17 +49,21 @@ from .initialize import get_virtual_pipeline_model_parallel_rank, set_virtual_pi
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
 
+from .layers import LinearWithGradAccumulationAndAsyncCommunication
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .layers import VocabParallelEmbedding
 from .layers import (set_tensor_model_parallel_attributes,
                      set_defaults_if_not_set_tensor_model_parallel_attributes,
                      copy_tensor_model_parallel_attributes)
-                     
-from .mappings import copy_to_tensor_model_parallel_region
-from .mappings import gather_from_tensor_model_parallel_region
-from .mappings import reduce_from_tensor_model_parallel_region
-from .mappings import scatter_to_tensor_model_parallel_region
+ 
+from .mappings import  copy_to_tensor_model_parallel_region
+from .mappings import  reduce_from_tensor_model_parallel_region
+from .mappings import  scatter_to_tensor_model_parallel_region
+from .mappings import  gather_from_tensor_model_parallel_region
+from .mappings import  scatter_to_sequence_parallel_region
+from .mappings import  gather_from_sequence_parallel_region
+from .mappings import  reduce_scatter_to_sequence_parallel_region
 
 from .random import checkpoint
 from .random import get_cuda_rng_tracker
