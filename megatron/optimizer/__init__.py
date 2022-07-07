@@ -49,27 +49,36 @@ def _get_params_for_weight_decay_optimization(modules):
 def get_megatron_optimizer(model):
     args = get_args()
 
-    if args.cpu_optimizer:
-        raise NotImplementedError('need to add cpu adam')
-
     # Base optimizer.
     param_groups = _get_params_for_weight_decay_optimization(model)
     if args.create_moe_param_group:
         from deepspeed.moe.utils import is_moe_param, split_params_into_different_moe_groups_for_optimizer
         param_groups = split_params_into_different_moe_groups_for_optimizer(param_groups)
-    if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
-                         lr=args.lr,
-                         weight_decay=args.weight_decay,
-                         betas=(args.adam_beta1, args.adam_beta2),
-                         eps=args.adam_eps)
-    elif args.optimizer == 'sgd':
-        optimizer = SGD(param_groups,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        momentum=args.sgd_momentum)
+    
+    if args.cpu_optimizer:
+        assert args.optimizer == 'adam', 'CPU offloading is for Adam'
+        if args.cpu_torch_adam:
+            cpu_adam_optimizer = torch.optim.AdamW
+        else:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            cpu_adam_optimizer = DeepSpeedCPUAdam
+        optimizer = cpu_adam_optimizer(param_groups,
+                                       lr=args.lr,
+                                       weight_decay=args.weight_decay)
     else:
-        raise Exception('{} optimizer is not supported.'.format(
+        if args.optimizer == 'adam':
+            optimizer = Adam(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            betas=(args.adam_beta1, args.adam_beta2),
+                            eps=args.adam_eps)
+        elif args.optimizer == 'sgd':
+            optimizer = SGD(param_groups,
+                            lr=args.lr,
+                            weight_decay=args.weight_decay,
+                            momentum=args.sgd_momentum)
+        else:
+            raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
 
     if args.deepspeed:
