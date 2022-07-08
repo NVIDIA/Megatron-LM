@@ -137,17 +137,20 @@ def read_metadata(tracker_filename):
 
     # Get the max iteration retrieved across the ranks.
     iters_cuda = torch.cuda.LongTensor([iteration])
-    torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
+    
     max_iter = iters_cuda[0].item()
-
     # We should now have all the same iteration.
     # If not, print a warning and chose the maximum
     # iteration across all ranks.
-    if iteration != max_iter:
-        print('WARNING: on rank {} found iteration {} in the '
-              'metadata while max iteration across the ranks '
-              'is {}, replacing it with max iteration.'.format(
-                  rank, iteration, max_iter), flush=True)
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        if iteration != max_iter:
+            print('WARNING: on rank {} found iteration {} in the '
+                'metadata while max iteration across the ranks '
+                'is {}, replacing it with max iteration.'.format(
+                    rank, iteration, max_iter), flush=True)
     return max_iter, release
 
 
@@ -184,15 +187,21 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     # Only rank zero of the data parallel writes to the disk.
     model = utils.unwrap_model(model)
 
-    print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
-        iteration, args.save))
+    if iteration == "release":
+        print_rank_0('saving checkpoint at {:s} to {}'.format(
+            iteration, args.save))
+        release = True
+    else:
+        print_rank_0('saving checkpoint at iteration {:7d} to {}'.format(
+            iteration, args.save))
+        release = False
 
     # Collect rng state across data parallel ranks.
     rng_state = get_rng_state()
 
     # Checkpoint file names.
     model_checkpoint_name, optim_checkpoint_name = \
-        get_checkpoint_names(args.save, iteration, args.use_distributed_optimizer)
+        get_checkpoint_names(args.save, iteration, args.use_distributed_optimizer, release=release)
 
     # Collect args, model, RNG.
     model_state_dict = {}
@@ -203,6 +212,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         model_state_dict['args'] = args
         model_state_dict['checkpoint_version'] = 3.0
         model_state_dict['iteration'] = iteration
+
+        if not isinstance(model, list):
+            model = [model]
         if len(model) == 1:
             model_state_dict['model'] = model[0].state_dict_for_save_checkpoint()
         else:
@@ -250,8 +262,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}'.format(
-        iteration, args.save))
+    if release:
+        print_rank_0('  successfully saved checkpoint at {:s} to {}'.format(
+            iteration, args.save))
+    else:
+        print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}'.format(
+            iteration, args.save))
 
     # And update the latest iteration
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -403,7 +419,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '
                              'iteration from checkpoint {}, exiting'.format(
-                                 checkpoint_name))
+                                 model_checkpoint_name))
                 sys.exit()
 
     # Check arguments.
@@ -421,6 +437,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         print_rank_0('could not find arguments in the checkpoint ...')
 
     # Model.
+    if not isinstance(model, list):
+        model = [model]
     if len(model) == 1:
         model[0].load_state_dict(model_state_dict['model'], strict=strict)
     else:
@@ -447,7 +465,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(optim_checkpoint_name))
             sys.exit()
 
     # rng states.
@@ -483,7 +501,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(model_checkpoint_name))
             sys.exit()
 
     # Some utilities want to load a checkpoint without distributed being initialized

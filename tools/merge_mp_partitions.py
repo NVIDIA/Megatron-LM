@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Merge model parallel partitions."""
+"""Merge model (tensor and pipeline) parallel partitions."""
 
 import os
 import re
@@ -25,31 +25,12 @@ import torch
 
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint, save_checkpoint
-from megatron.checkpointing import ensure_directory_exists
-from megatron.checkpointing import get_checkpoint_name
+from megatron.checkpointing import read_metadata
+from megatron.checkpointing import get_checkpoint_names
 from megatron.checkpointing import get_checkpoint_version
 from megatron.checkpointing import get_checkpoint_tracker_filename
 from megatron.global_vars import set_global_variables, get_args
 from megatron.global_vars import rebuild_tokenizer
-
-
-def split_into_partitions(tensor, num_partitions, partition_dim, stride):
-
-    per_partition_size = mpu.utils.divide(tensor.size(partition_dim),
-                                          num_partitions)
-    per_partition_per_stride_size = mpu.utils.divide(per_partition_size, stride)
-
-    partitions_list = torch.split(tensor,
-                                  per_partition_per_stride_size,
-                                  dim=partition_dim)
-
-    partitions = []
-    for i in range(num_partitions):
-        partition = torch.cat(partitions_list[i::num_partitions],
-                              dim=partition_dim)
-        partitions.append(partition)
-
-    return partitions
 
 
 def merge_partitions(merged, partitions, partition_dim, stride):
@@ -107,7 +88,7 @@ def merge_partitions(merged, partitions, partition_dim, stride):
     return
 
 
-def get_model(model_type):
+def get_model(model_type, pre_process=True, post_process=True):
 
     if model_type == 'BERT':
         from pretrain_bert import model_provider
@@ -120,59 +101,24 @@ def get_model(model_type):
         if model_type == 'MNLI':
             num_classes = 3
         from megatron.model.classification import Classification
-        def model_provider():
+        def model_provider(pre_process, post_process):
             return Classification(num_classes=num_classes, num_tokentypes=2)
     else:
         raise Exception('unrecognized model type: {}'.format(model_type))
 
-    model = model_provider()
+    model = model_provider(pre_process=pre_process, post_process=post_process)
     model = model.half()
 
     return model
 
 
 def get_parallel_checkpoint_name(path):
-
     tracker_filename = get_checkpoint_tracker_filename(path)
-    iteration = 0
-    with open(tracker_filename, 'r') as f:
-        metastring = f.read().strip()
-        iteration = int(metastring)
-    assert iteration > 0
-    checkpoint_name = get_checkpoint_name(path, iteration)
-
+    iteration, release = read_metadata(tracker_filename)
+    checkpoint_name = get_checkpoint_names(path, iteration, use_distributed_optimizer=False, release=release)
+    if release:
+        iteration = "release"
     return checkpoint_name, iteration
-
-
-def test_split_merge():
-
-    print('testing split and merge ...')
-
-    #[QKV.ROW-COL]
-    tensor = torch.FloatTensor([[1.11, 1.12, 1.13, 1.14, 1.15],
-                                [1.21, 1.22, 1.23, 1.24, 1.25],
-                                [1.31, 1.32, 1.33, 1.34, 1.35],
-                                [1.41, 1.42, 1.43, 1.44, 1.45],
-                                [2.11, 2.12, 2.13, 2.14, 2.15],
-                                [2.21, 2.22, 2.23, 2.24, 2.25],
-                                [2.31, 2.32, 2.33, 2.34, 2.35],
-                                [2.41, 2.42, 2.43, 2.44, 2.45],
-                                [3.11, 3.12, 3.13, 3.14, 3.15],
-                                [3.21, 3.22, 3.23, 3.24, 3.25],
-                                [3.31, 3.32, 3.33, 3.34, 3.35],
-                                [3.41, 3.42, 3.43, 3.44, 3.45]])
-
-    num_partitions = 2
-    partition_dim = 0
-    stride = 3
-    partitions = split_into_partitions(tensor, num_partitions,
-                                       partition_dim, stride)
-
-    merged = torch.zeros_like(tensor)
-    merge_partitions(merged, partitions, partition_dim, stride)
-
-    max_error = (merged - tensor).abs().max()
-    print('  > max error (should be zero): {}'.format(max_error))
 
 
 def get_mp_merge_args(parser):
@@ -204,18 +150,13 @@ def main():
                                           'no_save_rng': True,
                                           'save_interval': 1})
     args = get_args()
-
-    if args.pipeline_model_parallel_size > 1:
-        print("Checkpoints with pipeline model parallelism are not currently supported.")
-        exit()
-
     model_type = args.model_type
     orig_tensor_model_parallel_size = args.tensor_model_parallel_size
     args.tensor_model_parallel_size = 1
     tokenizer = rebuild_tokenizer(args)
 
     print('\n merging model parallel partitions ...')
-    print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size))
+    print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size * args.pipeline_model_parallel_size))
     print(' > checkpoint path: {}'.format(args.load))
     print(' > model parameters:')
     print('    number of tokens ................ {} '.format(
@@ -234,115 +175,110 @@ def main():
     mpu.initialize.set_pipeline_model_parallel_world_size(1)
     mpu.initialize.set_pipeline_model_parallel_rank(0)
     merged_model = get_model(model_type)
+    
+    pp_partitions = []
+    for pp_rank in range(args.pipeline_model_parallel_size):
+        mpu.initialize.set_tensor_model_parallel_world_size(1)
+        mpu.initialize.set_tensor_model_parallel_rank(0)
+        mpu.initialize.set_pipeline_model_parallel_world_size(args.pipeline_model_parallel_size)
+        mpu.initialize.set_pipeline_model_parallel_rank(pp_rank)
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
 
-    # Build and load partitions.
-    partitions = []
-    iteration = 0
-    args.tensor_model_parallel_size = orig_tensor_model_parallel_size
-    tokenizer = rebuild_tokenizer(args)
-    mpu.initialize.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-    for rank in range(args.tensor_model_parallel_size):
-        # Reset these since load_checkpoint asserts they are 0, but we are loading
-        # multiple checkpoints in the same process and they get set each time
-        args.consumed_train_samples = 0
-        args.consumed_valid_samples = 0
+        args.tensor_model_parallel_size = 1
+        tokenizer = rebuild_tokenizer(args)
+        tp_merged_model = get_model(model_type, pre_process, post_process)
 
-        mpu.initialize.set_tensor_model_parallel_rank(rank)
-        checkpoint_name, iteration = get_parallel_checkpoint_name(args.load)
-        model_ = get_model(model_type)
-        print(f'> loading {checkpoint_name} ...')
-        load_checkpoint(model_, None, None)
-        print(f'> checkpoint version {get_checkpoint_version()}')
-        partitions.append(model_)
+        # Build and load partitions.
+        partitions = []
+        iteration = 0
+        args.tensor_model_parallel_size = orig_tensor_model_parallel_size
+        tokenizer = rebuild_tokenizer(args)
 
-    # Parameter generators so we can loop through them semiltaneouly.
-    merged_params_gen = merged_model.named_parameters()
-    partitions_params_gen = [partition.named_parameters()
-                             for partition in partitions]
-    while True:
-        try:
+        for tp_rank in range(args.tensor_model_parallel_size):
+            # Reset these since load_checkpoint asserts they are 0, but we are loading
+            # multiple checkpoints in the same process and they get set each time
+            args.consumed_train_samples = 0
+            args.consumed_valid_samples = 0
 
-            # Get the params and check names.
-            name, merged_param = next(merged_params_gen)
-            print(' > working on {} ...'.format(name))
-            print('     merged         type: {}, size: {}'.format(
-                merged_param.dtype, list(merged_param.size())))
-            partitions_param = []
-            for rank, partition_params_gen in enumerate(partitions_params_gen):
-                partition_name, partition_param = next(partition_params_gen)
-                assert partition_name == name
-                partitions_param.append(partition_param)
-                print('     partition {}    type: {}, size: {}'.format(
-                    rank, partition_param.dtype, list(partition_param.size())))
+            mpu.initialize.set_tensor_model_parallel_world_size(orig_tensor_model_parallel_size)
+            mpu.initialize.set_tensor_model_parallel_rank(tp_rank)
+            checkpoint_name, iteration = get_parallel_checkpoint_name(args.load)
+            model_ = get_model(model_type, pre_process, post_process)
+            print(f'> loading {checkpoint_name} ...')
+            load_checkpoint(model_, None, None)
+            print(f'> checkpoint version {get_checkpoint_version()}')
+            partitions.append(model_)
 
-            # For the non-parallel parameters, simply copy the rank 0 values.
-            if not hasattr(merged_param, 'tensor_model_parallel'):
-                print('     none-parallel parameter, simple copy from rank 0')
-                with torch.no_grad():
-                    merged_param.data.copy_(partitions_param[0].data)
-            # For parallel parameters, merge the values
-            else:
-                dim = merged_param.partition_dim
-                stride = merged_param.partition_stride
-                print(f'     parallel parameter merge with stride {stride} along '
-                      f'dimention {dim}')
-                merge_partitions(merged_param,
-                                 partitions_param,
-                                 dim,
-                                 stride)
+        # Parameter generators so we can loop through them semiltaneouly.
+        merged_params_gen = tp_merged_model.named_parameters()
+        partitions_params_gen = [partition.named_parameters()
+                                for partition in partitions]
+        while True:
+            try:
 
-        except StopIteration:
-            break
+                # Get the params and check names.
+                name, merged_param = next(merged_params_gen)
+                print(' > working on {} ...'.format(name))
+                print('     merged         type: {}, size: {}'.format(
+                    merged_param.dtype, list(merged_param.size())))
+                partitions_param = []
+                for rank, partition_params_gen in enumerate(partitions_params_gen):
+                    partition_name, partition_param = next(partition_params_gen)
+                    assert partition_name == name
+                    partitions_param.append(partition_param)
+                    print('     partition {}    type: {}, size: {}'.format(
+                        rank, partition_param.dtype, list(partition_param.size())))
 
-    partitions = []
-    args.tensor_model_parallel_size = 1
-    args.pipeline_model_parallel_size = args.target_pipeline_model_parallel_size
+                # For the non-parallel parameters, simply copy the rank 0 values.
+                if not hasattr(merged_param, 'tensor_model_parallel'):
+                    print('     none-parallel parameter, simple copy from rank 0')
+                    with torch.no_grad():
+                        merged_param.data.copy_(partitions_param[0].data)
+                # For parallel parameters, merge the values
+                else:
+                    dim = merged_param.partition_dim
+                    stride = merged_param.partition_stride
+                    print(f'     parallel parameter merge with stride {stride} along '
+                        f'dimention {dim}')
+                    merge_partitions(
+                        merged_param,
+                        partitions_param,
+                        dim,
+                        stride
+                    )
 
-    assert args.num_layers % args.pipeline_model_parallel_size == 0, \
-        'num_layers must be divisible by target pipeline model parallel size'
-    layers_per_part = args.num_layers // args.pipeline_model_parallel_size
-
-    tokenizer = rebuild_tokenizer(args)
-    mpu.initialize.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
-    mpu.initialize.set_tensor_model_parallel_rank(0)
-    mpu.initialize.set_pipeline_model_parallel_world_size(args.pipeline_model_parallel_size)
+            except StopIteration:
+                break
+        pp_partitions.append(tp_merged_model)
 
     # regex to parse out layer number from param name
     layer_re = re.compile('layers\.([0-9]+)')
+    layers_per_part = args.num_layers // args.pipeline_model_parallel_size
 
-    if args.pipeline_model_parallel_size > 1:
-        merged_params = {}
-        for name, merged_param in merged_model.named_parameters():
-            merged_params[name] = merged_param
+    merged_params = {}
+    for pp_rank, partition in enumerate(pp_partitions):
+        def update_layer_num(m):
+            # TODO! This assumes no interleaved pipeline execution
+            layer = int(m.group(1))
+            layer += pp_rank * layers_per_part
+            return f'layers.{layer}'
+        for name, partition_param in partition.named_parameters():
+            name = re.sub(layer_re, update_layer_num, name)
+            merged_params[name] = partition_param
 
-        for rank in range(args.pipeline_model_parallel_size):
-            mpu.initialize.set_pipeline_model_parallel_rank(rank)
-            model = get_model(model_type)
-            def update_layer_num(m):
-                # TODO! This assumes no interleaved pipeline execution
-                layer = int(m.group(1))
-                layer += rank * layers_per_part
-                return f'layers.{layer}'
+    for name, param in merged_model.named_parameters():
+        param.data.copy_(merged_params[name].data)
 
-            for dst_name, partition_param in model.named_parameters():
-                if dst_name == "word_embeddings.weight":
-                    # See comment in MegatronModule.initialize_word_embeddings()
-                    src_name = "language_model.embedding.word_embeddings.weight"
-                else:
-                    # Translate destination layer number (0-N for each partition)
-                    # to source layer number (single-model layer number)
-                    src_name = re.sub(layer_re, update_layer_num, dst_name)
-                print(f" > copying {src_name} to {dst_name} in rank {rank}'s model")
-                partition_param.data.copy_(merged_params[src_name].data)
-
-            partitions.append(model)
-    else:
-        partitions = [merged_model]
-
-    for rank, model in enumerate(partitions):
-        mpu.initialize.set_pipeline_model_parallel_rank(rank)
-        print(f"> saving rank {rank}'s model")
-        save_checkpoint(iteration, model, None, None)
+    args.tensor_model_parallel_size = 1
+    args.pipeline_model_parallel_size = 1
+    tokenizer = rebuild_tokenizer(args)
+    mpu.initialize.set_tensor_model_parallel_world_size(1)
+    mpu.initialize.set_tensor_model_parallel_rank(0)
+    mpu.initialize.set_pipeline_model_parallel_world_size(1)
+    mpu.initialize.set_pipeline_model_parallel_rank(0)
+    
+    save_checkpoint(iteration, merged_model, None, None)
 
     print('done :-)')
 

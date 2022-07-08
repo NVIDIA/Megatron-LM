@@ -75,8 +75,12 @@ class MixedFusedLayerNorm(torch.nn.Module):
         super(MixedFusedLayerNorm, self).__init__()
 
         global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-          "fused_mix_prec_layer_norm_cuda")
+        try:
+          fused_mix_prec_layer_norm_cuda = importlib.import_module(
+            "fused_mix_prec_layer_norm_cuda")
+        except:
+          fused_mix_prec_layer_norm_cuda = importlib.import_module(
+            "fused_layer_norm_cuda")
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
