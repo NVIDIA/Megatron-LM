@@ -21,7 +21,6 @@ import torch
 import apex
 import torch.nn.functional as F
 from megatron import get_args
-from megatron.model import LayerNorm
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import (
     get_linear_layer,

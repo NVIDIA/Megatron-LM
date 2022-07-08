@@ -28,6 +28,7 @@ from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.text_generation_server import MegatronServer
 from megatron.text_generation import generate_and_post_process
+from megatron.text_generation import beam_search_and_post_process
 import torch
 
 def model_provider(pre_process=True, post_process=True):
@@ -80,5 +81,10 @@ if __name__ == "__main__":
         if choice[0].item() == 0:
             try:
                 generate_and_post_process(model)
+            except ValueError as ve:
+                pass
+        elif choice[0].item() == 1:
+            try:
+                beam_search_and_post_process(model)
             except ValueError as ve:
                 pass
