@@ -1,5 +1,8 @@
 ## Megatron-DeepSpeed
-DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE, Curriculum Learning, 3D Parallelism, etc.
+DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE model training, Curriculum Learning, 3D Parallelism, and others.
+
+### Run on Azure and AzureML
+To try out DeepSpeed on Azure, this fork of Megatron offers easy-to-use recipes and bash scripts. We strongly recommend to start with AzureML recipe in the ```examples/azureml``` folder. If you have a custom infrastructure (e.g. HPC clusters) or Azure VM based environment, please refer to the bash scripts in the ```examples/azure``` folder. 
 
 ------
 
@@ -76,7 +79,8 @@ The models require vocabulary files to run. The BERT  WordPiece vocab file can b
 Additional notes for DeepSpeed. We have added a helper script to download the checkpoints and make the example runnable.
 
 Steps to follow:
- - bash ds_download_ckpt.sh -- this will download and extract the checkpoint and GPT merges and vocab files.
+ - bash dataset/download_ckpt.sh -- this will download and extract the checkpoint
+ - bash dataset/download_vocab.sh -- this will download GPT merges and vocab files.
  - bash examples/generate_text.sh -- this will generate examples using the 345m GPT model.
 
 # Usage

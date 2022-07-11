@@ -772,6 +772,26 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
+
+        seq_len = args.curriculum_seqlen if args.curriculum_learning else args.seq_length
+        hidden_size = args.hidden_size
+        num_layers = args.num_layers
+        vocab_size = args.padded_vocab_size
+
+        # Compute throughput.
+        samples_per_sec = batch_size / elapsed_time_per_iteration
+        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
+        tokens_per_sec = samples_per_sec * seq_len
+        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
+
+        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+        # https://arxiv.org/pdf/2104.04473.pdf).
+        # The factor of 4 is when used with activation check-pointing,
+        # otherwise it will be 3.
+        checkpoint_activations_factor = 4 if args.checkpoint_activations else 3
+        flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+        tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
+
         # only the last rank process has a non-None _GLOBAL_TENSORBOARD_WRITER
         if writer and is_last_rank():
             if args.log_timers_to_tensorboard:
@@ -812,6 +832,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
+        log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
+        log_string += ' TFLOPs: {:.2f} |'.format(tflops)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
