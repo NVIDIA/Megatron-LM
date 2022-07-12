@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Mapping
 import concurrent.futures
 import os
 import sys
@@ -38,12 +39,30 @@ def save_checkpoint(queue, args):
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
 
-    def queue_get():
+    def queue_get(name=None):
         val = queue.get()
         if val == "exit":
             print("Loader exited, exiting saver")
             exit(1)
+        if name is not None and args.checking and val["name"] != name:
+            val_name = val["name"]
+            print(f'Unexpected message. Expecting "{name}" but got "{val_name}". Exiting saver.')
+            exit(1)
+        if name is not None:
+            print(f"received {name}")
         return val
+
+    def check_message(msg):
+        if not args.checking:
+            return
+        msg_name = msg.pop("name")
+        if len(msg.keys()) > 0:
+            print(f"Unexpected values in {msg_name}:")
+            for key in msg.keys():
+                print(f"   {key}")
+            print(f"Exiting. If you want to ignore this, use the argument --no-checking.")
+            exit(1)
+
 
     md = queue_get()
 
@@ -141,8 +160,11 @@ def save_checkpoint(queue, args):
 
     # Embeddings
     #-----------
-    pos_embed = queue_get()
-    orig_word_embed = queue_get()
+    embeddings_msg = queue_get("embeddings")
+
+    pos_embed = embeddings_msg.pop("position embeddings")
+    orig_word_embed = embeddings_msg.pop("word embeddings")
+    check_message(embeddings_msg)
 
     # Deal with padding
     if md.true_vocab_size is not None:
@@ -185,6 +207,7 @@ def save_checkpoint(queue, args):
 
     # Transformer layers
     #-------------------
+    total_layer_num = 0
     for pp_rank in range(args.target_pipeline_parallel_size):
         # For later pipeline parallel ranks, make the new models
         if pp_rank > 0:
@@ -193,47 +216,47 @@ def save_checkpoint(queue, args):
             models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
 
         for layer in range(len(models[0].language_model.encoder.layers)):
-            # get full tensors
-            input_layernorm_weight = queue_get()
-            input_layernorm_bias = queue_get()
-            full_qkv_weight = queue_get()
-            full_qkv_bias = queue_get()
-            full_dense_weight = queue_get()
-            dense_bias = queue_get()
-            post_layernorm_weight = queue_get()
-            post_layernorm_bias = queue_get()
-            full_mlp_l0_weight = queue_get()
-            full_mlp_l0_bias = queue_get()
-            full_mlp_l1_weight = queue_get()
-            mlp_l1_bias = queue_get()
+            msg = queue_get(f"transformer layer {total_layer_num}")
+
+            # duplicated tensors
+            input_layernorm_weight = msg.pop("input layernorm weight")
+            input_layernorm_bias = msg.pop("input layernorm bias")
+            dense_bias = msg.pop("dense bias")
+            post_layernorm_weight = msg.pop("post layernorm weight")
+            post_layernorm_bias = msg.pop("post layernorm bias")
+            mlp_l1_bias = msg.pop("mlp l1 bias")
 
             # Split up the parallel tensors
-            out_qkv_weight = torch.chunk(full_qkv_weight, args.target_tensor_parallel_size, dim=0)
-            out_qkv_bias = torch.chunk(full_qkv_bias, args.target_tensor_parallel_size, dim=0)
-            out_dense_weight = torch.chunk(full_dense_weight, args.target_tensor_parallel_size, dim=1)
-            out_mlp_l0_weight = torch.chunk(full_mlp_l0_weight, args.target_tensor_parallel_size, dim=0)
-            out_mlp_l0_bias = torch.chunk(full_mlp_l0_bias, args.target_tensor_parallel_size, dim=0)
-            out_mlp_l1_weight = torch.chunk(full_mlp_l1_weight, args.target_tensor_parallel_size, dim=1)
+            qkv_weight = torch.chunk(msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0)
+            qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
+            dense_weight = torch.chunk(msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1)
+            mlp_l0_weight = torch.chunk(msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0)
+            mlp_l0_bias = torch.chunk(msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0)
+            mlp_l1_weight = torch.chunk(msg.pop("mlp l1 weight"), args.target_tensor_parallel_size, dim=1)
 
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
                 l = models[tp_rank].language_model.encoder.layers[layer]
                 l.input_layernorm.weight.data.copy_(input_layernorm_weight)
                 l.input_layernorm.bias.data.copy_(input_layernorm_bias)
-                l.self_attention.query_key_value.weight.data.copy_(out_qkv_weight[tp_rank])
-                l.self_attention.query_key_value.bias.data.copy_(out_qkv_bias[tp_rank])
-                l.self_attention.dense.weight.data.copy_(out_dense_weight[tp_rank])
+                l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
+                l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
+                l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
                 l.self_attention.dense.bias.data.copy_(dense_bias)
                 l.post_attention_layernorm.weight.data.copy_(post_layernorm_weight)
                 l.post_attention_layernorm.bias.data.copy_(post_layernorm_bias)
-                l.mlp.dense_h_to_4h.weight.data.copy_(out_mlp_l0_weight[tp_rank])
-                l.mlp.dense_h_to_4h.bias.data.copy_(out_mlp_l0_bias[tp_rank])
-                l.mlp.dense_4h_to_h.weight.data.copy_(out_mlp_l1_weight[tp_rank])
+                l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
+                l.mlp.dense_h_to_4h.bias.data.copy_(mlp_l0_bias[tp_rank])
+                l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
                 l.mlp.dense_4h_to_h.bias.data.copy_(mlp_l1_bias)
+            total_layer_num = total_layer_num + 1
+            check_message(msg)
+
 
         if post_process:
-            final_layernorm_weight = queue_get()
-            final_layernorm_bias = queue_get()
+            msg = queue_get("final layernorm")
+            final_layernorm_weight = msg.pop("weight")
+            final_layernorm_bias = msg.pop("bias")
             for tp_rank in range(args.target_tensor_parallel_size):
                 models[tp_rank].language_model.encoder.final_layernorm.weight.data.copy_(final_layernorm_weight)
                 models[tp_rank].language_model.encoder.final_layernorm.bias.data.copy_(final_layernorm_bias)
@@ -242,49 +265,56 @@ def save_checkpoint(queue, args):
                     models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
             del final_layernorm_weight
             del final_layernorm_bias
+            check_message(msg)
 
-            name = queue_get()
-            if name == "pooler":
+            msg = queue_get()
+            if msg != "done" and msg["name"] == "pooler":
                 if not hasattr(models[0].language_model, 'pooler'):
                     print("ERROR: got a pooler, but model does not have one")
                     exit(1)
-                pooler_weight = queue_get()
-                pooler_bias = queue_get()
+                print("received pooler")
+                pooler_weight = msg.pop("weight")
+                pooler_bias = msg.pop("bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
                     models[tp_rank].language_model.pooler.dense.weight.data.copy_(pooler_weight)
                     models[tp_rank].language_model.pooler.dense.bias.data.copy_(pooler_bias)
-                name = queue_get()
                 del pooler_weight
                 del pooler_bias
+                check_message(msg)
+                msg = queue_get()
 
-            if name == "lm head":
+            if msg != "done" and msg["name"] == "lm head":
                 if not hasattr(models[0], 'lm_head'):
                     print("ERROR: got an lm head, but model does not have one")
                     exit(1)
-                lm_head_dense_weight = queue_get()
-                lm_head_dense_bias = queue_get()
-                lm_head_layernorm_weight = queue_get()
-                lm_head_layernorm_bias = queue_get()
+                print("received lm head")
+                lm_head_dense_weight = msg.pop("dense weight")
+                lm_head_dense_bias = msg.pop("dense bias")
+                lm_head_layernorm_weight = msg.pop("layernorm weight")
+                lm_head_layernorm_bias = msg.pop("layernorm bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
                     models[tp_rank].lm_head.dense.weight.data.copy_(lm_head_dense_weight)
                     models[tp_rank].lm_head.dense.bias.data.copy_(lm_head_dense_bias)
                     models[tp_rank].lm_head.layernorm.weight.data.copy_(lm_head_layernorm_weight)
                     models[tp_rank].lm_head.layernorm.bias.data.copy_(lm_head_layernorm_bias)
-                name = queue_get()
+                check_message(msg)
+                msg = queue_get()
 
-            if name == "binary head":
+            if msg != "done" and msg["name"] == "binary head":
                 if not hasattr(models[0], 'binary_head'):
                     print("ERROR: got a binary head, but model does not have one")
                     exit(1)
-                binary_head_weight = queue_get()
-                binary_head_bias = queue_get()
+                print("received binary head")
+                binary_head_weight = msg.pop("weight")
+                binary_head_bias = msg.pop("bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
                     models[tp_rank].binary_head.weight.data.copy_(binary_head_weight)
                     models[tp_rank].binary_head.bias.data.copy_(binary_head_bias)
-                name = queue_get()
+                check_message(msg)
+                msg = queue_get()
 
-            if name != "done":
-                print("ERROR: got some more data but were expecting to be done")
+            if msg != "done":
+                print("ERROR: got some more data but was expecting to be done")
 
         for tp_rank in range(args.target_tensor_parallel_size):
             mpu.initialize.set_tensor_model_parallel_rank(tp_rank)

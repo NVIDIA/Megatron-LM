@@ -170,18 +170,20 @@ def _load_checkpoint(queue, args):
     md.consumed_valid_samples = consumed_valid_samples
     queue.put(md)
 
+    def queue_put(name, msg):
+        print(f"sending {name}")
+        msg["name"] = name
+        queue.put(msg)
+
     # Send embeddings
+    message = {
+        "position embeddings": models[0].language_model.embedding.position_embeddings.weight.data,
+        "word embeddings": torch.cat(
+            [models[tp_rank].language_model.embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
+            dim = 0)
+    }
 
-    word_embed = []
-    for tp_rank in range(tp_size):
-        if tp_rank == 0:
-            print("Sending position embeddings")
-            queue.put(models[tp_rank].language_model.embedding.position_embeddings.weight.data)
-        word_embed.append(models[tp_rank].language_model.embedding.word_embeddings.weight.data)
-    full_word_embed = torch.cat(word_embed, dim=0)
-
-    print("Sending word embeddings")
-    queue.put(full_word_embed)
+    queue_put("embeddings", message)
 
     total_layer_num = 0
     for pp_rank in range(pp_size):
@@ -190,23 +192,24 @@ def _load_checkpoint(queue, args):
             post_process = pp_rank == pp_size - 1
             models = get_models(tp_size, md.params_dtype, False, post_process)
         for layer_num in range(len(models[0].language_model.encoder.layers)):
+            message = {}
+
+            # Get non-parallel tensors from tp_rank 0
+            layer = models[0].language_model.encoder.layers[layer_num]
+            message["input layernorm weight"] = layer.input_layernorm.weight.data
+            message["input layernorm bias"] = layer.input_layernorm.bias.data
+            message["dense bias"] = layer.self_attention.dense.bias.data
+            message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
+            message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
+            message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
+
+            # Grab all parallel tensors for this layer
             qkv_weight = []
             qkv_bias = []
             dense_weight = []
             mlp_l0_weight = []
             mlp_l0_bias = []
             mlp_l1_weight = []
-
-            # Get non-parallel tensors from tp_rank 0
-            layer = models[0].language_model.encoder.layers[layer_num]
-            input_layernorm_weight = layer.input_layernorm.weight.data
-            input_layernorm_bias = layer.input_layernorm.bias.data
-            dense_bias = layer.self_attention.dense.bias.data
-            post_layernorm_weight = layer.post_attention_layernorm.weight.data
-            post_layernorm_bias = layer.post_attention_layernorm.bias.data
-            mlp_l1_bias = layer.mlp.dense_4h_to_h.bias.data
-
-            # Grab all parallel tensors for this layer
             for tp_rank, model in enumerate(models):
                 layer = model.language_model.encoder.layers[layer_num]
                 qkv_weight.append(layer.self_attention.query_key_value.weight.data)
@@ -216,47 +219,50 @@ def _load_checkpoint(queue, args):
                 mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
                 mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
 
-            # send everything in order while concatenating them
-            print(f"Sending layer {layer_num} of pipeline rank {pp_rank} (total layer {total_layer_num})")
-            queue.put(input_layernorm_weight)
-            queue.put(input_layernorm_bias)
-            queue.put(torch.cat(qkv_weight, dim=0))
-            queue.put(torch.cat(qkv_bias, dim=0))
-            queue.put(torch.cat(dense_weight, dim=1))
-            queue.put(dense_bias)
-            queue.put(post_layernorm_weight)
-            queue.put(post_layernorm_bias)
-            queue.put(torch.cat(mlp_l0_weight, dim=0))
-            queue.put(torch.cat(mlp_l0_bias, dim=0))
-            queue.put(torch.cat(mlp_l1_weight, dim=1))
-            queue.put(mlp_l1_bias)
+            # concat them
+            message["qkv weight"] = torch.cat(qkv_weight, dim=0)
+            message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+            message["dense weight"] = torch.cat(dense_weight, dim=1)
+            message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
+            message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
+            message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
+
+            queue_put(f"transformer layer {total_layer_num}", message)
 
             total_layer_num = total_layer_num + 1
 
     # Send final layernorm from tp_rank 0
-    print("Sending final layernorm")
-    queue.put(models[0].language_model.encoder.final_layernorm.weight.data)
-    queue.put(models[0].language_model.encoder.final_layernorm.bias.data)
+    message = {
+        "weight": models[0].language_model.encoder.final_layernorm.weight.data,
+        "bias": models[0].language_model.encoder.final_layernorm.bias.data
+    }
+    queue_put("final layernorm", message)
 
     # Send BERT lm head and binary head if it exists
     if md.model_type == 'BERT':
         print("Sending LM Pooler")
-        queue.put("pooler")
-        queue.put(models[0].language_model.pooler.dense.weight.data)
-        queue.put(models[0].language_model.pooler.dense.bias.data)
+        message = {
+            "weight": models[0].language_model.pooler.dense.weight.data,
+            "bias": models[0].language_model.pooler.dense.bias.data
+        }
+        queue_put("pooler", message)
 
-        print("Sending BERT LM head")
-        queue.put("lm head")
-        queue.put(models[0].lm_head.dense.weight.data)
-        queue.put(models[0].lm_head.dense.bias.data)
-        queue.put(models[0].lm_head.layernorm.weight.data)
-        queue.put(models[0].lm_head.layernorm.bias.data)
+        message = {
+            "dense weight": models[0].lm_head.dense.weight.data,
+            "dense bias": models[0].lm_head.dense.bias.data,
+            "layernorm weight": models[0].lm_head.layernorm.weight.data,
+            "layernorm bias": models[0].lm_head.layernorm.bias.data
+        }
+        queue_put("lm head", message)
 
         if md.bert_binary_head:
             print("Sending BERT Binary head")
             queue.put("binary head")
-            queue.put(models[0].binary_head.weight.data)
-            queue.put(models[0].binary_head.bias.data)
+            message = {
+                "weight": models[0].binary_head.weight.data,
+                "bias": models[0].binary_head.bias.data
+            }
+            queue_put("binary head", message)
     queue.put("done")
 
 def load_checkpoint(queue, args):

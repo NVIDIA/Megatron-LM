@@ -12,10 +12,12 @@ import sys
 # load_checkpoint
 
 # The loader and saver process are each given a queue, the loader
-# should load the checkpoint and send the weights in the following
-# order, the saver should receive them in this order and save the
-# checkpoints. Note that the weight sent over the queue are the full
-# model weights, nothing split.
+# should load the checkpoint and send the weights in messages in the
+# following order, the saver should receive them in this order and
+# save the checkpoints. A message consists of a python dictionary with
+# a "name" for error checking and an entry for each tensor as
+# indicated below. Note that the weight sent over the queue are the
+# full model weights, nothing split.
 
 # If the loader ever sends "exit" to the queue, that means something
 # went wrong and it is exiting.
@@ -37,35 +39,51 @@ import sys
 #     make_vocab_size_divisble_by
 #     consumed_train_samples
 #     consumed_valid_samples
-# - Position embeddings
-# - Word embeddings
-# - For each transformer layer:
-#   - input layernorm weights
-#   - input layernorm bias
-#   - qkv weight
-#   - qkv bias
-#   - dense weight
-#   - dense bias
-#   - post attention layernorm weight
-#   - post attention layernorm bias
-#   - mlp layer 0 (h to 4h) weight
-#   - mlp layer 0 (h to 4h) bias
-#   - mlp layer 1 (4h to h) weight
-#   - mlp layer 1 (4h to h) bias
-# - final layer norm weight
-# - final layer norm bias
-# - if present (i.e. for BERT):
-#   - "pooler"
-#   - LM Pooler weight
-#   - LM Pooler bias
-#   - "lm head"
-#   - LM head dense weight
-#   - LM head dense bias
-#   - LM head layernorm weight
-#   - LM head layernorm bias
-#   - "binary head"
-#   - BERT Binary head weight
-#   - BERT Binary head bias
+# messages
+# {
+#   "name": "embeddings"
+#   "position embeddings"
+#   "word embeddings"
+# }
+# (for each transformer layer):
+# {
+#   "name": "transformer layer N"
+#   "input layernorm weight"
+#   "input layernorm bias"
+#   "qkv weight"
+#   "qkv bias"
+#   "dense weight"
+#   "dense bias"
+#   "post layernorm weight"
+#   "post layernorm bias"
+#   "mlp l0 weight"
+#   "mlp l0 bias"
+#   "mlp l1 weight"
+#   "mlp l1 bias"
+# }
+# {
+#   "name": "final layer norm"
+#   "weight"
+#   "bias"
+# }
+# if present (i.e. for BERT):
+# {
+#   "name": "pooler"
+#   "weight"
+#   "bias"
+# }
+# {
+#   "name": "lm head"
+#   "dense weight"
+#   "dense bias"
+#   "layernorm weight"
+#   "layernorm bias"
+# }
+# {
+#   "name": "binary head"
+#   "weight"
+#   "bias"
+# }
 # - "done"
 
 def load_plugin(plugin_type, name):
@@ -103,6 +121,9 @@ def main():
                         help='Directory to save model checkpoint to')
     parser.add_argument('--max-queue-size', type=int, default=50,
                         help='Maximum number of tensors in the queue')
+    parser.add_argument('--no-checking', action='store_false',
+                        help='Do not perform checking on the name and ordering of weights',
+                        dest='checking')
 
     known_args, _ = parser.parse_known_args()
     loader = load_plugin('loader', known_args.loader)
