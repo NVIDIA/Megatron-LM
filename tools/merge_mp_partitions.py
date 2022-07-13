@@ -23,6 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 
 import torch
 
+from megatron import fused_kernels
 from megatron import mpu
 from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.checkpointing import ensure_directory_exists
@@ -214,6 +215,32 @@ def main():
     args.tensor_model_parallel_size = 1
     tokenizer = rebuild_tokenizer(args)
 
+    # load fused_mix_prec_layer_norm_cuda
+    assert 0 < torch.cuda.device_count(), f'Required at least 1 accelerator'
+    fused_kernels.load(args)
+
+    # torch DDP settings
+    # WORLD_SIZE ref.: https://github.com/NVIDIA/Megatron-LM#evaluation-and-tasks
+    os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", 'localhost')
+    os.environ["MASTER_PORT"] = os.getenv("MASTER_PORT", f'{8432}')
+    torch.distributed.init_process_group(
+        backend=args.distributed_backend,
+        world_size=args.tensor_model_parallel_size,
+        rank=args.rank,
+    )
+
+    # initialize data parallel group
+    if mpu.model_parallel_is_initialized():
+        print('model parallel is already initialized')
+    else:
+        print('initializing model parallel..')
+        mpu.initialize_model_parallel(
+            args.tensor_model_parallel_size,
+            args.pipeline_model_parallel_size,
+            args.virtual_pipeline_model_parallel_size,
+            args.pipeline_model_parallel_split_rank
+        )
+
     print('\n merging model parallel partitions ...')
     print(' > number of partitions: {}'.format(orig_tensor_model_parallel_size))
     print(' > checkpoint path: {}'.format(args.load))
@@ -251,7 +278,9 @@ def main():
         checkpoint_name, iteration = get_parallel_checkpoint_name(args.load)
         model_ = get_model(model_type)
         print(f'> loading {checkpoint_name} ...')
-        load_checkpoint(model_, None, None)
+        # a model -> a list
+        load_checkpoint([model_] if not hasattr(model_, '__len__') else model_,
+                        None, None)
         print(f'> checkpoint version {get_checkpoint_version()}')
         partitions.append(model_)
 
@@ -342,7 +371,10 @@ def main():
     for rank, model in enumerate(partitions):
         mpu.initialize.set_pipeline_model_parallel_rank(rank)
         print(f"> saving rank {rank}'s model")
-        save_checkpoint(iteration, model, None, None)
+        # a model -> a list
+        save_checkpoint(iteration,
+                        [model] if not hasattr(model, '__len__') else model,
+                        None, None)
 
     print('done :-)')
 
