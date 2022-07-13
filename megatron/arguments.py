@@ -249,6 +249,13 @@ def parse_args(extra_args_provider=None, defaults={},
 
     args.curriculum_learning = False
 
+    # AML
+    if args.aml_data_download_path is not None:
+        data_paths = []
+        for path in args.data_path:
+            data_paths.append(f"{args.aml_data_download_path}/{path}")
+        args.data_path = data_paths
+
     _print_args(args)
     return args
 
@@ -680,6 +687,8 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
+    group.add_argument('--aml-data-download-path', type=str, default=None,
+                       help='Path to mounted input dataset')
     group.add_argument('--data-path', nargs='*', default=None,
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'

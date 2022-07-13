@@ -100,7 +100,7 @@ def _compile_dependencies():
     # Compile dataset C++ code.
     # =========================
     # TODO: move this to ninja
-    if torch.distributed.get_rank() == 0:
+    if _is_rank_0():
         start_time = time.time()
         print('> compiling dataset index builder ...')
         from megatron.data.dataset_utils import compile_helper
@@ -131,7 +131,7 @@ def _compile_dependencies():
                   ' back to unfused kernel invocations.', flush=True)
     
     # Always build on rank zero first.
-    if torch.distributed.get_rank() == 0:
+    if _is_rank_0():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
         fused_kernels.load(args)
@@ -144,7 +144,7 @@ def _compile_dependencies():
     # rest of the program. We think this might ensure that
     # the lock is released.
     torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
+    if _is_rank_0():
         print('>>> done with compiling and loading fused kernels. '
               'Compilation time: {:.3f} seconds'.format(
                   time.time() - start_time), flush=True)
@@ -274,3 +274,15 @@ def _initialize_mem_buffs():
     # Initialize memory for checkpointed activations.
     if args.distribute_checkpointed_activations:
         mpu.init_checkpointed_activations_memory_buffer()
+
+def _is_rank_0():
+    """Check whether it is rank 0. For AML, check if it is rank 0 of a node"""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 or (
+            'AZUREML_EXPERIMENT_ID' in os.environ and torch.distributed.get_rank() % torch.cuda.device_count() == 0
+            ):
+            return True
+        else:
+            return False
+    else:
+        return True

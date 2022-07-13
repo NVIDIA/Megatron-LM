@@ -10,3 +10,6 @@ dist/
 
 # tmp files
 *.swp
+
+# AML workspace config file
+*config.json

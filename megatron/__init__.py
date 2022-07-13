@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 import torch
 
 from .package_info import (
@@ -54,3 +55,19 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+def is_aml():
+    # Are we running inside an Azure Machine Learning (AML) environment?
+    return 'AZUREML_EXPERIMENT_ID' in os.environ
+
+def is_rank_0():
+    """Check whether it is rank 0. For AML, check if it is rank 0 of a node"""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0 or (
+            is_aml() and torch.distributed.get_rank() % torch.cuda.device_count() == 0
+            ):
+            return True
+        else:
+            return False
+    else:
+        return True

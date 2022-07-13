@@ -23,6 +23,7 @@ import numpy as np
 import torch
 
 from megatron import (get_args,
+                      is_rank_0,
                       mpu,
                       print_rank_0,
                       update_num_microbatches,
@@ -184,7 +185,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
         iteration, args.save))
 
     # And update the latest iteration
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if is_rank_0():
         tracker_filename = get_checkpoint_tracker_filename(args.save)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
