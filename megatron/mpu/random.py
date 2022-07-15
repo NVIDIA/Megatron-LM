@@ -87,16 +87,20 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
 
 def gather_split_1d_tensor(tensor):
     """Opposite of above function, gather values from model parallel ranks."""
-    world_size = get_tensor_model_parallel_world_size()
-    numel = torch.numel(tensor)
-    numel_gathered = world_size * numel
+    numel_gathered = torch.numel(tensor) * \
+        get_tensor_model_parallel_world_size()
     gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
                            device=torch.cuda.current_device(),
                            requires_grad=False)
-    chunks = [gathered[i*numel:(i+1)*numel] for i in range(world_size)]
-    torch.distributed.all_gather(chunks, tensor,
-                                 group=get_tensor_model_parallel_group())
+    # TODO: This API is experimental in pytorch (as of Feb 2022) and
+    # this might break in future pytorch releases. We chose this API
+    # as opposed to torch.distributed.all_gather for efficiency reasons.
+    # This API calls directly NCCL all-gather versus the former does
+    # internal copies and can potentially cause slow down.
+    torch.distributed._all_gather_base(gathered, tensor,
+                                       group=get_tensor_model_parallel_group())
     return gathered
+
 
 def _kernel_make_viewless_tensor(inp, requires_grad):
     '''Make a viewless tensor.
@@ -303,10 +307,10 @@ class CheckpointFunction(torch.autograd.Function):
               tracked/set/reset.
     """
     @staticmethod
-    def forward(ctx, run_function, distribute_checkpointed_activations, *args):
+    def forward(ctx, run_function, distribute_saved_activations, *args):
         ctx.run_function = run_function
-        ctx.distribute_checkpointed_activations \
-            = distribute_checkpointed_activations
+        ctx.distribute_saved_activations \
+            = distribute_saved_activations
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -318,7 +322,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
-        if distribute_checkpointed_activations:
+        if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
                 args[0],
@@ -335,7 +339,7 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
         inputs = ctx.saved_tensors
-        if ctx.distribute_checkpointed_activations:
+        if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0],
                 gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
@@ -368,8 +372,8 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_checkpointed_activations, *args):
+def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function,
-                                    distribute_checkpointed_activations, *args)
+                                    distribute_saved_activations, *args)

@@ -279,8 +279,12 @@ def forward_backward_pipelining_with_interleaving(forward_step_func,
     pipeline_parallel_rank = mpu.get_pipeline_model_parallel_rank()
 
     args = get_args()
-    tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
-
+    if args.sequence_parallel:
+        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+    else:
+        seq_length = args.seq_length
+    tensor_shape = (seq_length, args.micro_batch_size, args.hidden_size)
+    
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
     num_microbatches = get_num_microbatches() * num_model_chunks
@@ -514,18 +518,25 @@ def get_tensor_shapes(rank, model_type):
     # Otherwise, send one tensor (pre-transpose).
     args = get_args()
     tensor_shapes = []
-    if model_type == ModelType.encoder_and_decoder:
-        if mpu.is_pipeline_stage_before_split(rank):
-            # If next rank is after split, then need transpose for encoder_hidden_state.
-            if mpu.is_pipeline_stage_before_split(rank+1):
-                tensor_shapes.append((args.seq_length, args.micro_batch_size, args.hidden_size))
-            else:
-                tensor_shapes.append((args.micro_batch_size, args.seq_length, args.hidden_size))
-        else:
-            tensor_shapes.append((args.decoder_seq_length, args.micro_batch_size, args.hidden_size))
-            tensor_shapes.append((args.micro_batch_size, args.seq_length, args.hidden_size))
+
+    if args.sequence_parallel:
+        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
-        tensor_shapes.append((args.seq_length, args.micro_batch_size, args.hidden_size))
+        seq_length = args.seq_length
+
+    if model_type == ModelType.encoder_and_decoder:
+        if args.sequence_parallel:
+            decoder_seq_length = args.decoder_seq_length // mpu.get_tensor_model_parallel_world_size()
+        else:
+            decoder_seq_length = args.decoder_seq_length
+
+        if mpu.is_pipeline_stage_before_split(rank):
+            tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
+        else:
+            tensor_shapes.append((decoder_seq_length, args.micro_batch_size, args.hidden_size))
+            tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
+    else:
+        tensor_shapes.append((seq_length, args.micro_batch_size, args.hidden_size))
     return tensor_shapes
 
 

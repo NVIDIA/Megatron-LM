@@ -39,7 +39,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
     parser = _add_biencoder_args(parser)
-    parser = _add_vit_args(parser)
+    parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
 
@@ -103,13 +103,19 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+
     if args.checkpoint_activations:
-        args.activations_checkpoint_method = 'uniform'
+        args.recompute_granularity = 'full'
+        args.recompute_method = 'uniform'
         if args.rank == 0:
             print('--checkpoint-activations is no longer valid, '
-                  'use --activation-checkpoint-method instead. '
-                  'Defaulting to activation-checkpoint-method=uniform.')
+                  'use --recompute-granularity and --recompute-method  instead. '
+                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
     del args.checkpoint_activations
+
+    if args.recompute_activations:
+        args.recompute_granularity = 'selective'
+    del args.recompute_activations
 
     # Set input defaults.
     for key in defaults:
@@ -170,6 +176,20 @@ def parse_args(extra_args_provider=None, defaults={},
     # If we do accumulation and all-reduces in fp32, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
     if args.accumulate_allreduce_grads_in_fp32:
+        assert args.DDP_impl == 'local'
+        assert args.use_contiguous_buffers_in_local_ddp
+    else:
+        if args.gradient_accumulation_fusion:
+            args.gradient_accumulation_fusion = False
+            if args.rank == 0:
+                print('Gradient accumulation fusion to linear layer weight '
+                      'gradient computation is supported only with fp32 '
+                      'gradient accumulation. Setting gradient_accumulation_fusion '
+                      'to False', flush=True)
+
+    # If we use the distributed optimizer, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
+    if args.use_distributed_optimizer:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
@@ -270,18 +290,37 @@ def parse_args(extra_args_provider=None, defaults={},
                   'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
                   'Defaulting to no_persist_layer_norm=True')
 
-    # Activation checkpointing.
-    if args.distribute_checkpointed_activations:
+    # Activation recomputing.
+    if args.distribute_saved_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
-            'checkpointed activations only across tensor model ' \
+            'recomputed activations only across tensor model ' \
             'parallel groups'
-        assert args.activations_checkpoint_method is not None, \
-            'for distributed checkpoint activations to work you '\
-            'need to use a activation-checkpoint method '
+        assert args.recompute_granularity == 'full', \
+            'distributed recompute activations is only '\
+            'application to full recompute granularity'
+        assert args.recompute_method is not None, \
+            'for distributed recompute activations to work you '\
+            'need to use a recompute method '
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
-            'distributed checkpoint activations are supported for pytorch ' \
+            'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+
+    if args.recompute_granularity == 'selective':
+        assert args.recompute_method is None, \
+            'recompute method is not yet supported for ' \
+            'selective recomputing granularity'
+
+    # disable sequence parallelism when tp=1
+    # to avoid change in numerics when
+    # sequence_parallelism is enabled.
+    if args.tensor_model_parallel_size == 1:
+        args.sequence_parallel = False
+
+    # disable async_tensor_model_parallel_allreduce when
+    # model parallel memory optimization is enabled
+    if args.sequence_parallel:
+        args.async_tensor_model_parallel_allreduce = False
 
     _print_args(args)
     return args
@@ -357,7 +396,8 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-
+    group.add_argument('--num-experts', type=int, default=None,
+                       help='Number of Experts in Switch Transformer (None means no Switch)')
     return parser
 
 
@@ -462,27 +502,40 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--recompute-activations', action='store_true',
+                       help='recompute activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
+    group.add_argument('--recompute-granularity', type=str, default=None,
+                       choices=['full', 'selective'],
+                       help='Checkpoint activations to allow for training '
+                       'with larger models, sequences, and batch sizes. '
+                       'It is supported at two granularities 1) full: '
+                       'whole transformer layer is recomputed, '
+                       '2) selective: core attention part of the transformer '
+                       'layer is recomputed.')
+    group.add_argument('--distribute-saved-activations',
+                       action='store_true',
+                       help='If set, distribute recomputed activations '
+                       'across model parallel group.')
+    group.add_argument('--recompute-method', type=str, default=None,
+                       choices=['uniform', 'block'],
+                       help='1) uniform: uniformly divide the total number of '
+                       'Transformer layers and recompute the input activation of '
+                       'each divided chunk at specified granularity, '
+                       '2) recompute the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any recomputing at specified granularity'
+                       'default) do not apply activations recompute to any layers')
+    group.add_argument('--recompute-num-layers', type=int, default=1,
+                       help='1) uniform: the number of Transformer layers in each '
+                       'uniformly divided recompute unit, '
+                       '2) block: the number of individual Transformer layers '
+                       'to recompute within each pipeline stage.')
+
+    # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--distribute-checkpointed-activations',
-                       action='store_true',
-                       help='If set, distribute checkpointed activations '
-                       'across model parallel group.')
-    group.add_argument('--activations-checkpoint-method', type=str, default=None,
-                       choices=['uniform', 'block'],
-                       help='1) uniform: uniformly divide the total number of '
-                       'Transformer layers and checkpoint the input activation of '
-                       'each divided chunk, '
-                       '2) checkpoint the input activations of only a set number of '
-                       'individual Transformer layers per pipeline stage and do the '
-                       'rest without any checkpointing'
-                       'default) do not apply activations checkpoint to any layers')
-    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
-                       help='1) uniform: the number of Transformer layers in each '
-                       'uniformly divided checkpoint unit, '
-                       '2) block: the number of individual Transformer layers '
-                       'to checkpoint within each pipeline stage.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -521,15 +574,23 @@ def _add_training_args(parser):
                        choices=['single', 'cyclic'],
                        help='Single pass vs multiple pass data loader')
     group.add_argument('--no-async-tensor-model-parallel-allreduce',
-                       action='store_true',
+                       action='store_false',
                        help='Disable asynchronous execution of '
                        'tensor-model-parallel all-reduce with weight '
-                       'gradient compuation of a column-linear layer.')
+                       'gradient compuation of a column-linear layer.',
+                       dest='async_tensor_model_parallel_allreduce')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--sequence-parallel', action='store_true',
+                       help='Enable sequence parallel optimization.')
+    group.add_argument('--no-gradient-accumulation-fusion',
+                       action='store_false',
+                       help='Disable fusing gradient accumulation to weight '
+                       'gradient computation of linear layers',
+                       dest='gradient_accumulation_fusion')
     return parser
 
 
@@ -710,6 +771,9 @@ def _add_distributed_args(parser):
                        'is placed on its own pipeline stage, without any '
                        'transformer layers. (For T5, this flag currently only '
                        'affects the encoder embedding.)')
+    group.add_argument('--use-distributed-optimizer', action='store_true',
+                       help='Use distributed optimizer.')
+
     return parser
 
 
@@ -856,9 +920,10 @@ def _add_biencoder_args(parser):
     return parser
 
 
-def _add_vit_args(parser):
-    group = parser.add_argument_group(title="vit")
+def _add_vision_args(parser):
+    group = parser.add_argument_group(title="vision")
 
+    # general vision arguements
     group.add_argument('--num-classes', type=int, default=1000,
                        help='num of classes in vision classificaiton task')
     group.add_argument('--img-h', type=int, default=224,
@@ -868,7 +933,7 @@ def _add_vit_args(parser):
     group.add_argument('--num-channels', type=int, default=3,
                        help='Number of channels in input image data')
     group.add_argument('--patch-dim', type=int, default=16,
-                       help='patch dimension used in vit')
+                       help='patch dimension')
     group.add_argument('--classes-fraction', type=float, default=1.0,
                        help='training with fraction of classes.')
     group.add_argument('--data-per-class-fraction', type=float, default=1.0,
@@ -876,5 +941,49 @@ def _add_vit_args(parser):
     group.add_argument('--no-data-sharding', action='store_false',
                        help='Disable data sharding.',
                        dest='data_sharding')
+    group.add_argument('--head-lr-mult', type=float, default=1.0,
+                       help='learning rate multiplier for head during finetuning')
+
+    # pretraining type and backbone selection`
+    group.add_argument('--vision-pretraining', action='store_true',
+                       help='flag to indicate vision pretraining')
+    group.add_argument('--vision-pretraining-type', type=str, default='classify',
+                       choices=['classify', 'inpaint', 'dino'],
+                       help='pretraining objectives')
+    group.add_argument('--vision-backbone-type', type=str, default='vit',
+                       choices=['vit', 'mit', 'swin'],
+                       help='backbone types types')
+    group.add_argument('--swin-backbone-type', type=str, default='tiny',
+                       choices=['tiny', 'base', 'h3'],
+                       help='pretraining objectives')
+    
+    # inpainting arguments
+    group.add_argument('--mask-type', type=str, default='random',
+                       choices=['random', 'row'],
+                       help='mask types')
+    group.add_argument('--mask-factor', type=float, default=1.0,
+                       help='mask size scaling parameter')
+ 
+    # dino arguments
+    group.add_argument('--iter-per-epoch', type=int, default=1250,
+                       help='iterations per epoch')
+    group.add_argument('--dino-local-img-size', type=int, default=96,
+                       help='Image size for vision classification task')
+    group.add_argument('--dino-local-crops-number', type=int, default=10,
+                       help='Number of local crops')
+    group.add_argument('--dino-head-hidden-size', type=int, default=2048,
+                       help='Hidden dimension size in dino head')
+    group.add_argument('--dino-bottleneck-size', type=int, default=256,
+                       help='Bottle neck dimension in dino head ')
+    group.add_argument('--dino-freeze-last-layer', type=float, default=1,
+                       help='Freezing last layer weights')
+    group.add_argument('--dino-norm-last-layer', action='store_true',
+                       help='Disable Norm in last layer.')
+    group.add_argument('--dino-warmup-teacher-temp', type=float, default=0.04,
+                       help='warump teacher temperature')
+    group.add_argument('--dino-teacher-temp', type=float, default=0.07,
+                       help='teacher temperature')
+    group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
+                       help='warmup teacher temperaure epochs')
 
     return parser
