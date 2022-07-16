@@ -518,10 +518,14 @@ class RowParallelLinear(torch.nn.Module):
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
-            output = output_ + self.bias if self.bias is not None else output_
+            if self.bias is not None:
+                bias = copy_to_tensor_model_parallel_region(self.bias) \
+                    if self.sequence_parallel else self.bias
+                output = output_ + bias
+            else:
+                output = output_
             output_bias = None
         else:
             output = output_
             output_bias = self.bias
         return output, output_bias
-
