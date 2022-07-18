@@ -204,7 +204,7 @@ class MegatronGenerate(Resource):
                         "logprobs": response_logprobs})
 
             except ValueError as ve:
-                return "Length of prompt + tokens_to_generate longer than allowed"
+                return ve.args[0]
             print("end time: ", datetime.datetime.now())
         
 
