@@ -22,7 +22,8 @@ from megatron import mpu
 from .communication import broadcast_float_list
 from .generation import (
         generate_tokens_probs_and_return_on_first_stage,
-        score_and_return_on_first_stage)
+        score_and_return_on_first_stage,
+        beam_search_and_return_on_first_stage)
 from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
@@ -148,3 +149,54 @@ def generate(model,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol)
+
+def beam_search_and_post_process(model,
+                                 prompts=None,
+                                 tokens_to_generate=0,
+                                 beam_size=0,
+                                 add_BOS=False,
+                                 stop_token=50256,
+                                 num_return_gen=1,
+                                 length_penalty=1):
+    """Run beam search and post-process outputs, i.e., detokenize,
+    move to cpu and convert to list."""
+
+    # Main inference.
+    tokens, scores = beam_search(model,
+                                 prompts=prompts,
+                                 tokens_to_generate=tokens_to_generate,
+                                 beam_size=beam_size,
+                                 add_BOS=add_BOS,
+                                 stop_token=stop_token,
+                                 num_return_gen=num_return_gen,
+                                 length_penalty=length_penalty)
+    # Only post-process on first stage.
+    if mpu.is_pipeline_first_stage():
+        lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
+        tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, True)
+        scores = scores.cpu().numpy().tolist()
+        return prompts_plus_generations, prompts_plus_generations_segments, scores
+
+    return None
+
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1):
+    # Make sure input params are avaialble to all ranks.
+    values = [tokens_to_generate,
+              beam_size,
+              add_BOS,
+              stop_token,
+              num_return_gen,
+              length_penalty]
+    values_float_tensor = broadcast_float_list(6, float_list=values)
+    tokens_to_generate = int(values_float_tensor[0].item())
+    beam_size = int(values_float_tensor[1].item())
+    add_BOS = bool(values_float_tensor[2].item())
+    stop_token = int(values_float_tensor[3].item())
+    num_return_gen = int(values_float_tensor[4].item())
+    length_penalty = values_float_tensor[5].item()
+
+    context_tokens_tensor, context_length_tensor = tokenize_prompts(
+        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
+    
+    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, 
+            beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty)

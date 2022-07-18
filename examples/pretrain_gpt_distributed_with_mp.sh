@@ -19,6 +19,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --tensor-model-parallel-size 2 \
        --pipeline-model-parallel-size 2 \
+       --sequence-parallel \
        --num-layers 24 \
        --hidden-size 1024 \
        --num-attention-heads 16 \

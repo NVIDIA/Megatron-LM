@@ -26,6 +26,7 @@ from .communication import (
     broadcast_from_last_to_first_pipeline_stage)
 from .forward_step import ForwardStep
 from .sampling import sample
+from .beam_utils import BeamHypotheses
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
@@ -262,7 +263,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                                                       tensor=done)
             if use_eod_token_for_early_termination and done:
                 break
-
+            
     # ===================================================
     # Update the length of based on max generated length.
     # ===================================================
@@ -285,6 +286,131 @@ def generate_tokens_probs_and_return_on_first_stage(
 
     return tokens, generated_sequence_lengths, output_log_probs
 
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty):
+    args = get_args()
+    tokenizer = get_tokenizer()
+
+    batch_size = tokens.size(0)
+    assert(batch_size == 1)
+    prompt_length = lengths.item()
+    final_sequence_length = tokens.size(1)
+    final_sequence_length = min(final_sequence_length, args.max_position_embeddings)
+    
+    # If the context is too big, this happens
+    if prompt_length >= final_sequence_length:
+        raise ValueError("context length + tokens_to_generate too large")
+
+    # forward step.
+    forward_step = ForwardStep(model, beam_size, final_sequence_length)
+
+    beam_hyp = BeamHypotheses(beam_size, length_penalty)
+    best_batches = None
+    done = torch.zeros(1, dtype=torch.uint8, device=torch.cuda.current_device())
+    scores = torch.zeros(beam_size,
+                         dtype=torch.float32,
+                         device=torch.cuda.current_device()).unsqueeze(1)
+    scores_size_tensor, tokens_size_tensor = None, None
+    # =============
+    # Run infernece
+    # =============
+    with torch.no_grad():
+        tokens = tokens.repeat(beam_size, 1)
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
+        prev_context_length = 0
+        for context_length in range(prompt_length, final_sequence_length):
+
+            # Pick the slice that we need to pass through the network.
+            tokens2use = tokens[:, prev_context_length:context_length]
+            positions2use = position_ids[:, prev_context_length:context_length]
+            attention_mask2use = attention_mask[
+                ..., prev_context_length:context_length, :context_length]
+
+            # logits will be meanigful only in the last pipeline stage.
+            logits = forward_step(tokens2use, positions2use, attention_mask2use)
+
+            if mpu.is_pipeline_last_stage():
+                vocab_size = logits.size(2)
+                log_probs = F.log_softmax(logits, dim=2)
+                new_scores = log_probs[:, -1, :] + scores
+
+                if context_length == prompt_length:  # if this is the first one
+                    sorted_scores, indices = torch.sort(new_scores[0,:], descending=True)
+                else:
+                    sorted_scores, indices = torch.sort(new_scores.view(-1), descending=True)
+
+                best_beam_ids = torch.div(indices[: 2 * beam_size], vocab_size).trunc().long()
+                best_words = indices[:2 * beam_size] % vocab_size
+                best_scores = sorted_scores[: 2 * beam_size]
+
+                next_beams = []
+                for beam_token_rank, (token_id, beam_score, beam_id) in enumerate(
+                    zip(best_words, best_scores, best_beam_ids)
+                ):
+                    if token_id.item() == stop_token:
+                        # if beam_token does not belong to top num_beams tokens, it should not be added
+                        is_beam_token_worse_than_top_num_beams = beam_token_rank >= beam_size
+                        if is_beam_token_worse_than_top_num_beams:
+                            continue
+                        beam_hyp.add(
+                            tokens[beam_id].clone(),
+                            beam_score,
+                            context_length + 1 - prompt_length
+                        )
+                    else:
+                        # add next predicted token since it is not eos_token
+                        next_beams.append((token_id, beam_score, beam_id))
+
+                    if len(next_beams) == beam_size:
+                        break
+
+                if beam_hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
+                    done = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+            
+                best_batches = tokens.new([item[2] for item in next_beams])
+                tokens = tokens[best_batches,:]
+                tokens[:, context_length] = tokens.new([item[0] for item in next_beams])
+                scores = scores.new([item[1] for item in next_beams]).unsqueeze(1)
+          
+            # torch.distributed.barrier()
+            done = broadcast_from_last_pipeline_stage(1, torch.uint8, done)
+            if done:
+                break
+
+            # Update the tokens on the first stage so the next input to
+            # the network is correct.
+            copy_from_last_to_first_pipeline_stage(tokens.size(), torch.int64,
+                                                   tokens)
+
+            # set inference key values to make it consistent with best beam index
+            best_batches = broadcast_from_last_pipeline_stage(beam_size, torch.int64, best_batches)
+            forward_step.inference_params.swap_key_value_dict(best_batches)
+
+            # Update the context length for the next token generation.
+            prev_context_length = context_length
+
+        if mpu.is_pipeline_last_stage():
+            # if cannot find stop token, add open beams to hyps
+            if not done:
+                for beam_id in range(beam_size):
+                    beam_hyp.add(tokens[beam_id].clone(), scores[beam_id], context_length + 1 - prompt_length)
+
+            # rank based on scores
+            sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0], reverse=True)
+            num_return_gen = min(num_return_gen, len(sorted_hyps))
+            scores = [sorted_hyps[i][0] for i in range(num_return_gen)]
+            tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
+            scores = torch.stack(scores, dim=0)
+            tokens = torch.stack(tokens, dim=0)
+            scores_size_tensor = torch.tensor(scores.shape, dtype=torch.int64, device=torch.cuda.current_device())
+            tokens_size_tensor = torch.tensor(tokens.shape, dtype=torch.int64, device=torch.cuda.current_device())
+
+        scores_size_tensor = broadcast_from_last_pipeline_stage(1, torch.int64, scores_size_tensor)
+        tokens_size_tensor = broadcast_from_last_pipeline_stage(2, torch.int64, tokens_size_tensor)
+
+        scores = broadcast_from_last_to_first_pipeline_stage(tuple(scores_size_tensor), torch.float32, scores)
+        tokens = broadcast_from_last_to_first_pipeline_stage(tuple(tokens_size_tensor), torch.int64, tokens)
+
+    return tokens, scores
 
 
 def _build_attention_mask_and_position_ids(tokens):

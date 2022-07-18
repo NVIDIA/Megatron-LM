@@ -20,8 +20,7 @@ import os
 
 import torch
 
-def parse_args(extra_args_provider=None, defaults={},
-               ignore_unknown_args=False):
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -53,9 +52,13 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
-    # Distributed args.
+    # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+        
+    return args
+
+def validate_args(args, defaults={}):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -103,13 +106,19 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+
     if args.checkpoint_activations:
-        args.activations_checkpoint_method = 'uniform'
+        args.recompute_granularity = 'full'
+        args.recompute_method = 'uniform'
         if args.rank == 0:
             print('--checkpoint-activations is no longer valid, '
-                  'use --activation-checkpoint-method instead. '
-                  'Defaulting to activation-checkpoint-method=uniform.')
+                  'use --recompute-granularity and --recompute-method  instead. '
+                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
     del args.checkpoint_activations
+
+    if args.recompute_activations:
+        args.recompute_granularity = 'selective'
+    del args.recompute_activations
 
     # Set input defaults.
     for key in defaults:
@@ -180,6 +189,12 @@ def parse_args(extra_args_provider=None, defaults={},
                       'gradient computation is supported only with fp32 '
                       'gradient accumulation. Setting gradient_accumulation_fusion '
                       'to False', flush=True)
+
+    # If we use the distributed optimizer, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
+    if args.use_distributed_optimizer:
+        assert args.DDP_impl == 'local'
+        assert args.use_contiguous_buffers_in_local_ddp
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
@@ -278,18 +293,37 @@ def parse_args(extra_args_provider=None, defaults={},
                   'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
                   'Defaulting to no_persist_layer_norm=True')
 
-    # Activation checkpointing.
-    if args.distribute_checkpointed_activations:
+    # Activation recomputing.
+    if args.distribute_saved_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
-            'checkpointed activations only across tensor model ' \
+            'recomputed activations only across tensor model ' \
             'parallel groups'
-        assert args.activations_checkpoint_method is not None, \
-            'for distributed checkpoint activations to work you '\
-            'need to use a activation-checkpoint method '
+        assert args.recompute_granularity == 'full', \
+            'distributed recompute activations is only '\
+            'application to full recompute granularity'
+        assert args.recompute_method is not None, \
+            'for distributed recompute activations to work you '\
+            'need to use a recompute method '
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
-            'distributed checkpoint activations are supported for pytorch ' \
+            'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+
+    if args.recompute_granularity == 'selective':
+        assert args.recompute_method is None, \
+            'recompute method is not yet supported for ' \
+            'selective recomputing granularity'
+
+    # disable sequence parallelism when tp=1
+    # to avoid change in numerics when
+    # sequence_parallelism is enabled.
+    if args.tensor_model_parallel_size == 1:
+        args.sequence_parallel = False
+
+    # disable async_tensor_model_parallel_allreduce when
+    # model parallel memory optimization is enabled
+    if args.sequence_parallel:
+        args.async_tensor_model_parallel_allreduce = False
 
     _print_args(args)
     return args
@@ -471,27 +505,40 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--recompute-activations', action='store_true',
+                       help='recompute activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
+    group.add_argument('--recompute-granularity', type=str, default=None,
+                       choices=['full', 'selective'],
+                       help='Checkpoint activations to allow for training '
+                       'with larger models, sequences, and batch sizes. '
+                       'It is supported at two granularities 1) full: '
+                       'whole transformer layer is recomputed, '
+                       '2) selective: core attention part of the transformer '
+                       'layer is recomputed.')
+    group.add_argument('--distribute-saved-activations',
+                       action='store_true',
+                       help='If set, distribute recomputed activations '
+                       'across model parallel group.')
+    group.add_argument('--recompute-method', type=str, default=None,
+                       choices=['uniform', 'block'],
+                       help='1) uniform: uniformly divide the total number of '
+                       'Transformer layers and recompute the input activation of '
+                       'each divided chunk at specified granularity, '
+                       '2) recompute the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any recomputing at specified granularity'
+                       'default) do not apply activations recompute to any layers')
+    group.add_argument('--recompute-num-layers', type=int, default=1,
+                       help='1) uniform: the number of Transformer layers in each '
+                       'uniformly divided recompute unit, '
+                       '2) block: the number of individual Transformer layers '
+                       'to recompute within each pipeline stage.')
+
+    # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--distribute-checkpointed-activations',
-                       action='store_true',
-                       help='If set, distribute checkpointed activations '
-                       'across model parallel group.')
-    group.add_argument('--activations-checkpoint-method', type=str, default=None,
-                       choices=['uniform', 'block'],
-                       help='1) uniform: uniformly divide the total number of '
-                       'Transformer layers and checkpoint the input activation of '
-                       'each divided chunk, '
-                       '2) checkpoint the input activations of only a set number of '
-                       'individual Transformer layers per pipeline stage and do the '
-                       'rest without any checkpointing'
-                       'default) do not apply activations checkpoint to any layers')
-    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
-                       help='1) uniform: the number of Transformer layers in each '
-                       'uniformly divided checkpoint unit, '
-                       '2) block: the number of individual Transformer layers '
-                       'to checkpoint within each pipeline stage.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -540,6 +587,8 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--sequence-parallel', action='store_true',
+                       help='Enable sequence parallel optimization.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '
@@ -633,6 +682,14 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--no-initialization', action='store_false',
+                       help='Do not perform initialization when building model, '
+                       'can reduce startup time when definitely loading from a '
+                       'checkpoint',
+                       dest='perform_initialization')
+    group.add_argument('--use-checkpoint-args', action='store_true',
+                       help='Override any command line arguments with arguments '
+                       'from the checkpoint')
 
     return parser
 
@@ -725,6 +782,9 @@ def _add_distributed_args(parser):
                        'is placed on its own pipeline stage, without any '
                        'transformer layers. (For T5, this flag currently only '
                        'affects the encoder embedding.)')
+    group.add_argument('--use-distributed-optimizer', action='store_true',
+                       help='Use distributed optimizer.')
+
     return parser
 
 
