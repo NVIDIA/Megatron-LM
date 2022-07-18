@@ -24,7 +24,6 @@ import torch
 
 from megatron import dist_signal_handler
 from megatron.tokenizer import build_tokenizer
-from .arguments import parse_args
 from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
@@ -95,12 +94,15 @@ def _set_signal_handler():
     _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
 
 
-def set_global_variables(extra_args_provider=None, args_defaults={},
-                         ignore_unknown_args=False):
+
+def set_global_variables(args):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
-    args = _parse_args(extra_args_provider=extra_args_provider,
-                       defaults=args_defaults,
-                       ignore_unknown_args=ignore_unknown_args)
+
+    assert args is not None
+
+    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    set_args(args)
+
     _build_num_microbatches_calculator(args)
     if args.vocab_file:
         _ = _build_tokenizer(args)
@@ -111,17 +113,11 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
 
     if args.exit_signal_handler:
         _set_signal_handler()
+    
 
-
-def _parse_args(extra_args_provider=None, defaults={},
-                ignore_unknown_args=False):
-    """Parse entire arguments."""
+def set_args(args):
     global _GLOBAL_ARGS
-    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
-                              defaults=defaults,
-                              ignore_unknown_args=ignore_unknown_args)
-    return _GLOBAL_ARGS
+    _GLOBAL_ARGS = args
 
 
 def _build_num_microbatches_calculator(args):

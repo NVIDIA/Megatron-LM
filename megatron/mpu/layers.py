@@ -167,15 +167,17 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 dtype=args.params_dtype))
-            _initialize_affine_weight_cpu(
-                self.weight, self.num_embeddings, self.embedding_dim,
-                self.num_embeddings_per_partition, 0, init_method)
+            if args.perform_initialization:
+                _initialize_affine_weight_cpu(
+                    self.weight, self.num_embeddings, self.embedding_dim,
+                    self.num_embeddings_per_partition, 0, init_method)
         else:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=0, stride=1)
+            if args.perform_initialization:
+                _initialize_affine_weight_gpu(self.weight, init_method,
+                                              partition_dim=0, stride=1)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -330,7 +332,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
         skip_bias_add: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip 
+                       can be fused with other elementwise operations. we skip
                        adding bias but instead return it.
     """
 
@@ -358,16 +360,18 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
                                                 dtype=args.params_dtype))
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight, self.output_size, self.input_size,
-                self.output_size_per_partition, 0, init_method,
-                stride=stride, return_master_weight=keep_master_weight_for_test)
+            if args.perform_initialization:
+                self.master_weight = _initialize_affine_weight_cpu(
+                    self.weight, self.output_size, self.input_size,
+                    self.output_size_per_partition, 0, init_method,
+                    stride=stride, return_master_weight=keep_master_weight_for_test)
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size_per_partition, self.input_size,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=0, stride=stride)
+            if args.perform_initialization:
+                _initialize_affine_weight_gpu(self.weight, init_method,
+                                              partition_dim=0, stride=stride)
 
         if bias:
             if args.use_cpu_initialization:
@@ -471,16 +475,18 @@ class RowParallelLinear(torch.nn.Module):
             self.weight = Parameter(torch.empty(self.output_size,
                                                 self.input_size_per_partition,
                                                 dtype=args.params_dtype))
-            self.master_weight = _initialize_affine_weight_cpu(
-                self.weight, self.output_size, self.input_size,
-                self.input_size_per_partition, 1, init_method,
-                stride=stride, return_master_weight=keep_master_weight_for_test)
+            if args.perform_initialization:
+                self.master_weight = _initialize_affine_weight_cpu(
+                    self.weight, self.output_size, self.input_size,
+                    self.input_size_per_partition, 1, init_method,
+                    stride=stride, return_master_weight=keep_master_weight_for_test)
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size, self.input_size_per_partition,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            _initialize_affine_weight_gpu(self.weight, init_method,
-                                          partition_dim=1, stride=stride)
+            if args.perform_initialization:
+                _initialize_affine_weight_gpu(self.weight, init_method,
+                                              partition_dim=1, stride=stride)
         if bias:
             if args.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(self.output_size,
@@ -524,4 +530,3 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
-

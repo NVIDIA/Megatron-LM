@@ -24,7 +24,6 @@ from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
 from megatron import get_args
-from megatron import print_rank_0
 from megatron import get_adlr_autoresume
 from megatron import mpu
 from megatron.model.module import param_is_not_shared
@@ -204,3 +203,22 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
+def print_rank_0(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+def is_last_rank():
+    return torch.distributed.get_rank() == (
+        torch.distributed.get_world_size() - 1)
+
+def print_rank_last(message):
+    """If distributed is initialized, print only on last rank."""
+    if torch.distributed.is_initialized():
+        if is_last_rank():
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
