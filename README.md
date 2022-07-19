@@ -40,6 +40,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [GPT Pretraining](#gpt-pretraining)
       * [T5 Pretraining](#t5-pretraining)
       * [Distributed Pretraining](#distributed-pretraining)
+      * [Activation Checkpointing and Recomputation](#activation-checkpointing-and-recomputation)
       * [GPT-3 Example](#gpt-3-example)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
