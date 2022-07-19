@@ -41,6 +41,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [T5 Pretraining](#t5-pretraining)
       * [Distributed Pretraining](#distributed-pretraining)
       * [Activation Checkpointing and Recomputation](#activation-checkpointing-and-recomputation)
+      * [Distributed Optimizer](#distributed-optimizer)
       * [GPT-3 Example](#gpt-3-example)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
@@ -316,6 +317,21 @@ For cases where memory is very tight, `full` checkpointing saves just the inputs
 * Uniform method uniformly divides the Transformer layers into groups of layers and stores the input activations of each group in the memory. The baseline group size is 1 and, in this case, the input activation of each Transformer layer is checkpointed. When the GPU memory is insufficient, increasing the number of layers per group reduces the memory usage thus enables running a bigger model. For example, when using the number of layers per group of 4, the input activation of each group of 4 Transformer layers is checkpointed.
 
 * Block method checkpoints the input activations of a set number of individual Transformer layers per pipeline stage and do the rest of layers without any checkpointing. This method can be used to skip checkpointing some Transformer layers until the GPU memory is fully used, which is applicable only when there is unused GPU memory. Checkpointing fewer transformer layers avoids unnecessary activation recomputation in the backprop thus improves training performance. For example, when we specify 5 layers to checkpoint of 8 layers per pipeline stage, the input activations of only the first 5 Transformer layers are checkpointed and activation recomputation for the rest 3 layers is not needed in the backprop.
+
+
+## Distributed Optimizer
+
+Usage: `--use-distributed-optimizer`. Compatible with all model and data types.
+
+The distributed optimizer is a memory savings technique, whereby the optimizer state is evenly distributed across data parallel ranks (versus the traditional method of replicating the optimizer state across data parallel ranks). As described in https://arxiv.org/abs/1910.02054, our implementation distributes all optimizer state that does not overlap with the model state. For example, when using fp16 model params, the distributed optimizer maintains its own separate copy of fp32 main params & grads, which are distributed across DP ranks. When using bf16 model params, however, the distributed optimizer's fp32 main grads are the same as the model's fp32 grads, and so the grads in this case are not distributed.
+
+Theoretical memory savings vary depending on the combination of the model's param dtype and grad dtype. In our implementation, the theoretical number of bytes per parameter is (where 'd' is the data parallel size):
+
+| | Non-distributed optim | Distributed optim |
+|-|-|-|
+| float16 param, float16 grads | 20 | 4 + 16/d |
+| float16 param, fp32 grads | 18 | 6 + 12/d |
+| fp32 param, fp32 grads | 16 | 8 + 8/d |
 
 
 ## GPT-3 Example
