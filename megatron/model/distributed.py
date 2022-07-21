@@ -71,14 +71,13 @@ class DistributedDataParallelBase(MegatronModule, ABC):
         return self.module(*inputs, **kwargs)
 
 
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
-        return self.module.state_dict(destination, prefix, keep_vars)
+    def state_dict(self, prefix='', keep_vars=False):
+        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
-        return self.module.state_dict_for_save_checkpoint(destination, prefix,
-                                                          keep_vars)
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        return self.module.state_dict_for_save_checkpoint(prefix=prefix,
+                                                          keep_vars=keep_vars)
 
 
     def load_state_dict(self, state_dict, strict=True):

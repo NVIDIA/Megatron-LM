@@ -243,20 +243,20 @@ class Embedding(MegatronModule):
 
         return embeddings
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load."""
 
         state_dict_ = {}
         state_dict_[self._word_embeddings_key] \
-            = self.word_embeddings.state_dict(destination, prefix, keep_vars)
+            = self.word_embeddings.state_dict(prefix=prefix,
+                                              keep_vars=keep_vars)
         state_dict_[self._position_embeddings_key] \
-            = self.position_embeddings.state_dict(
-                destination, prefix, keep_vars)
+            = self.position_embeddings.state_dict(prefix=prefix,
+                                                  keep_vars=keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
-                = self.tokentype_embeddings.state_dict(
-                    destination, prefix, keep_vars)
+                = self.tokentype_embeddings.state_dict(prefix=prefix,
+                                                       keep_vars=keep_vars)
 
         return state_dict_
 
@@ -478,28 +478,27 @@ class TransformerLanguageModel(MegatronModule):
         else:
             return decoder_output, encoder_output
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load."""
 
         state_dict_ = {}
         if self.pre_process:
             state_dict_[self._embedding_key] \
-                = self.embedding.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.embedding.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                keep_vars=keep_vars)
         if self.add_encoder:
             state_dict_[self._encoder_key] \
-                = self.encoder.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.encoder.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
         if self.post_process:
             if self.add_pooler:
                 state_dict_[self._pooler_key] \
-                    = self.pooler.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                    = self.pooler.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         if self.add_decoder:
             state_dict_[self._decoder_key] \
-                = self.decoder.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.decoder.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
 
         return state_dict_
 
