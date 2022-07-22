@@ -29,4 +29,11 @@ class AttnType(enum.Enum):
 
 class AttnMaskType(enum.Enum):
     padding = 1
-    causal = 2
+    causal = 2 # Overrides `attention_mask` to be a lower triangular matrix
+    prefix = 3
+    custom = 4 # Forces one to pass an `attention_mask` that's 1 if we need to mask. Tensor that can be broadcast to [micro_batch_size, n_head, seq_length, seq_length]
+
+class PositionEmbeddingType(enum.Enum):
+    rotary = 1 # NOTE: this one is not used so far, however for future compatibility the enum left as is
+    absolute = 2
+    alibi = 3

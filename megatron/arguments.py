@@ -20,6 +20,8 @@ import os
 
 import torch
 
+from megatron.model.enums import PositionEmbeddingType
+
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
     """Parse all arguments."""
@@ -256,10 +258,21 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    # NOTE: this was before integrating alibi
+    # if args.seq_length is not None:
+    #     assert args.max_position_embeddings >= args.seq_length
+    # if args.decoder_seq_length is not None:
+    #     assert args.max_position_embeddings >= args.decoder_seq_length
+
+    if args.position_embedding_type == PositionEmbeddingType.absolute or args.position_embedding_type == PositionEmbeddingType.alibi:
+        assert args.max_position_embeddings is not None
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+    else:
+        assert args.max_position_embeddings is None
+        
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
