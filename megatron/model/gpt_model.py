@@ -226,15 +226,30 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         else:
             self.specs.append(lambda x: x.transpose(0, 1).contiguous())
 
+        num_experts = args.num_experts
+        assert len(num_experts) == 1 or len(num_experts) == self.num_layers // args.expert_interval, \
+                        'num_experts must be either a single value or a list of the same length as the number of MoE layers'
+
+        # Create the list of MoE experts
+        if len(num_experts) == 1:
+            num_experts = num_experts * (args.num_layers // args.expert_interval)
+
         for layer_idx in range(args.num_layers):
+            layer_num = layer_idx + 1
+            if layer_num % args.expert_interval == 0:
+                n_e = num_experts[(layer_num-1) // args.expert_interval]
+            else:
+                n_e = 1
+            print(f"Layer number {layer_idx} and Number of experts {n_e}")
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     init_method=init_method,
                     output_layer_init_method=scaled_init_method_normal(args.init_method_std,
                                                                        args.num_layers),
-                    layer_number=layer_idx,
-                    self_attn_mask_type=AttnMaskType.causal))
-                
+                    layer_number=layer_num,
+                    self_attn_mask_type=AttnMaskType.causal,
+                    num_experts=n_e),
+                    )
         
         # Undo data format change
         self.specs.append(lambda x: x.transpose(0, 1).contiguous())

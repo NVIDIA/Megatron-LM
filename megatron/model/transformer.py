@@ -443,7 +443,6 @@ class ParallelTransformerLayer(MegatronModule):
                 eps=args.layernorm_epsilon)
 
         self.num_experts = num_experts
-        # MLP
         if self.num_experts <= 1:
             self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
@@ -452,14 +451,15 @@ class ParallelTransformerLayer(MegatronModule):
                 moe_mp_size = 1
             else:
                 moe_mp_size = dist.get_world_size() // self.num_experts
-            
+            ep_size = min(args.moe_expert_parallel_size, mpu.get_data_parallel_world_size())
+
             self.mlp = MoE(args.hidden_size,
                             ParallelMLP(init_method,
                                 output_layer_init_method=output_layer_init_method,
                                 MOE=True,
                                 MoE_mp_size=moe_mp_size),
                             num_experts=self.num_experts, 
-                            ep_size=args.moe_expert_parallel_size,
+                            ep_size=ep_size,
                             k=args.topk,
                             use_residual=(args.mlp_type == 'residual'),
                             capacity_factor=args.moe_train_capacity_factor,
@@ -543,7 +543,6 @@ class ParallelTransformerLayer(MegatronModule):
             mlp_output, mlp_bias = self.mlp(layernorm_output)
         else:
             mlp_output, moe_loss, _ = self.mlp(layernorm_output)
-
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -595,13 +594,17 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
             hidden_states, attention_mask = inputs, self._args.attn_mask
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
-            return super().forward(hidden_states, attention_mask, **kwargs)[0]
-        elif len(inputs) == 2:
+            out, moe_loss =  super().forward(hidden_states, attention_mask, **kwargs)
+            self.stashed_moe_loss = moe_loss * get_args().moe_loss_coeff
+            return out
+        elif len(inputs) == 1 + self.layer_number:
             # Attention mask is an activation.
             hidden_states, attention_mask = inputs[0], inputs[1]
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
-            return super().forward(*inputs, **kwargs)[0], attention_mask
+            out, moe_loss =  super().forward(hidden_states, attention_mask, **kwargs)
+            self.stashed_moe_loss = moe_loss * get_args().moe_loss_coeff
+            return out, attention_mask
         else:
             raise RuntimeError('Received more inputs than understood.')
 
