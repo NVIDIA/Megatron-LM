@@ -49,7 +49,7 @@ options=" \
 	--init-method-std 0.006 \
 	--tensorboard-dir <TENSORBOARD DIRECTORY> \
         --fp16 \
-	--activations-checkpoint-method uniform "
+	--recompute-method uniform "
 
 
 run_cmd="python -u ${DIR}/pretrain_gpt.py $@ ${options}"

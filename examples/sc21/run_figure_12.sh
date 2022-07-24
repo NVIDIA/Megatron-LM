@@ -16,9 +16,9 @@ GBS=12
 
 # Set interleaved schedule options.
 if [ ${INTERLEAVED} == "YES" ]; then
-    MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform --num-layers-per-virtual-pipeline-stage 2 "
+    MEGATRON_EXTRA_PARAMS="--recompute-method uniform --num-layers-per-virtual-pipeline-stage 2 "
 elif [ ${INTERLEAVED} == "NO" ]; then
-    MEGATRON_EXTRA_PARAMS="--activations-checkpoint-method uniform "
+    MEGATRON_EXTRA_PARAMS="--recompute-method uniform "
 else
     echo "Invalid configuration"
     exit 1

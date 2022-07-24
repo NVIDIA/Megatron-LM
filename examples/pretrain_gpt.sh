@@ -33,7 +33,7 @@ python pretrain_gpt.py \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
        --lr-warmup-fraction .01 \
-       --activations-checkpoint-method uniform \
+       --recompute-method uniform \
        --log-interval 100 \
        --save-interval 10000 \
        --eval-interval 1000 \
