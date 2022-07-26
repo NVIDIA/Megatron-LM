@@ -3,7 +3,7 @@ import math
 import torch
 from torch.nn import LayerNorm
 
-from megatron.model.enums import AttnMaskType
+from megatron.enums import AttnMaskType
 from megatron.model.fused_layer_norm import MixedFusedLayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.utils import attention_mask_func

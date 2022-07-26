@@ -27,7 +27,7 @@ from megatron import (get_args,
                       print_rank_0,
                       update_num_microbatches,
                       utils)
-from megatron.model.enums import PositionEmbeddingType
+from megatron.enums import PositionEmbeddingType
 
 _CHECKPOINT_VERSION = None
 

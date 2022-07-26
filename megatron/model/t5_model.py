@@ -21,7 +21,7 @@ from megatron import (
     get_args,
     mpu
 )
-from megatron.model.enums import AttnMaskType
+from megatron.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits, get_language_model
 from megatron.model.transformer import LayerNorm
 from megatron.model.utils import (

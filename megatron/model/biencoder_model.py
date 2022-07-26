@@ -8,7 +8,7 @@ from megatron.checkpointing import get_checkpoint_tracker_filename
 from megatron.checkpointing import get_checkpoint_name
 from megatron import mpu, get_tokenizer
 from megatron.model.bert_model import bert_position_ids
-from megatron.model.enums import AttnMaskType
+from megatron.enums import AttnMaskType
 from megatron.model.language_model import get_language_model
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal

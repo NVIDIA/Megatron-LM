@@ -20,7 +20,7 @@ import os
 
 import torch
 
-from megatron.model.enums import PositionEmbeddingType
+from megatron.enums import PositionEmbeddingType
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):

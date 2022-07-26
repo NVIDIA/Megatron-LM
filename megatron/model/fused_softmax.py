@@ -16,7 +16,7 @@
 
 import torch
 import torch.nn as nn
-from megatron.model.enums import AttnMaskType
+from megatron.enums import AttnMaskType
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
