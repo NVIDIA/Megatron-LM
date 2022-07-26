@@ -23,7 +23,6 @@ from megatron import mpu
 
 def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
                  tensor_shape,
-                 use_ring_exchange=False,
                  dtype_=None):
     """Communicate tensors between stages. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
@@ -40,8 +39,6 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
         tensor_shape: shape of tensor to receive (this method assumes that all
                       tensors sent and received in a single function call are
                       the same shape).
-        use_ring_exchange: boolean for whether torch.distributed.ring_exchange()
-                           API should be used.
         dtype_: optional, this is used when the tensor that needs to be
                 communicated is different from args.params_dtype.
     Returns:
@@ -103,7 +100,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
             tensor_send_prev = mpu.split_tensor_into_1d_equal_chunks(tensor_send_prev)
 
     # Send tensors in both the forward and backward directions as appropriate.
-    if use_ring_exchange:
+    if args.use_ring_exchange_p2p:
         torch.distributed.ring_exchange(tensor_send_prev=tensor_send_prev,
                                         tensor_recv_prev=tensor_recv_prev,
                                         tensor_send_next=tensor_send_next,
@@ -135,8 +132,8 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
-    # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
+        # To protect against race condition when using batch_isend_irecv().
+        torch.cuda.synchronize()
 
     # If using scatter-gather optimization, gather smaller chunks.
     if not override_scatter_gather_tensors_in_pipeline and \

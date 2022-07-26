@@ -761,6 +761,10 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
+    group.add_argument('--use-ring-exchange-p2p', action='store_true',
+                       default=False, help='If set, use custom-built ring exchange '
+                       'for p2p communications. Note that this option will require '
+                       'a custom built image that support ring-exchange p2p.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
