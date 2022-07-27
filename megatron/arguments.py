@@ -21,6 +21,7 @@ import os
 import torch
 
 from megatron.enums import PositionEmbeddingType
+import megatron
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -284,6 +285,10 @@ def parse_args(extra_args_provider=None, defaults={},
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
+    # Activation function
+    if args.glu_activation is not None and args.bias_gelu_fusion:
+        raise ValueError("if glu-activation is used, please set --no-bias-gelu-fusion")
+
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
         assert args.end_weight_decay is None
@@ -418,6 +423,15 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+    group.add_argument('--position-embedding-type', type=lambda x: PositionEmbeddingType[x],
+                       choices=list(PositionEmbeddingType),
+                       default=PositionEmbeddingType.absolute,
+                       help='Define position embedding type ("absolute" | "rotary" | "alibi"). "absolute" by default.'
+                       )
+    group.add_argument('--glu-activation', type=str,
+                       choices=megatron.model.glu_activations.GLU_ACTIVATIONS.keys(),
+                       help='GLU activations to use.'
+                       )
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     return parser
