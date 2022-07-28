@@ -7,7 +7,7 @@ from megatron.model.enums import AttnMaskType
 from megatron.model.fused_layer_norm import MixedFusedLayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.utils import attention_mask_func
-
+from megatron.fused_kernels import load
 
 def test_load_fused_kernels():
     try:
@@ -279,6 +279,90 @@ def test_layer_norm():
         )
 
 
+def attention_mask_func(attention_scores, attention_mask):
+    attention_scores.masked_fill_(attention_mask, -10000.0)
+    return attention_scores
+
+
+def forward_torch_softmax(input, mask, scale):
+    input = input * scale
+    mask_output = attention_mask_func(input, mask) if mask is not None else input
+    probs = torch.nn.Softmax(dim=-1)(mask_output)
+    return probs
+
+
+def test_masked_softmax_forward():
+    import scaled_masked_softmax_cuda
+
+    batch = 2
+    attn = 16
+    scale_t = torch.tensor([1.0])
+    for qlen in [128, 256, 1024, 2048, 4096]:
+        for klen in [128, 256, 1024, 2048]:
+            inputs = torch.normal(0, 2, (batch, attn, qlen, klen), dtype=torch.float16, device='cuda:0')
+            masks = torch.randint(0, 2, (batch, 1, qlen, klen), dtype=torch.bool, device='cuda:0')
+            softmax_results = scaled_masked_softmax_cuda.forward(inputs, masks, scale_t[0].item())
+            softmax_results_torch = forward_torch_softmax(inputs, masks, scale_t[0].item())
+            error = (softmax_results_torch - softmax_results).abs().max()
+            assert error < 1e-3
+
+def test_masked_softmax_backward():
+    import scaled_masked_softmax_cuda
+
+    batch = 2
+    attn = 16
+    scale_t = torch.tensor([1.0])
+    for qlen in [128, 256, 1024, 2048, 4096]:
+        for klen in [128, 256, 1024, 2048]:
+            inputs = torch.normal(0, 2, (batch, attn, qlen, klen), dtype=torch.float16, device='cuda:0')
+            backward = torch.rand_like(inputs, dtype=torch.float16, device='cuda:0')
+            masks = torch.randint(0, 2, (batch, 1, qlen, klen), dtype=torch.bool, device='cuda:0')
+            softmax_results = scaled_masked_softmax_cuda.forward(inputs, masks, scale_t[0].item())
+            back_grad = scaled_masked_softmax_cuda.backward(backward, softmax_results, scale_t[0].item())
+
+            inputs.requires_grad = True
+            softmax_results_torch = forward_torch_softmax(inputs, masks, scale_t[0].item())
+            softmax_results_torch.backward(backward)
+            error = (back_grad - inputs.grad).abs().max()
+            assert error < 1e-3
+
+
+def test_allmasked_softmax_forward():
+    import scaled_masked_softmax_cuda 
+
+    batch = 2
+    attn = 16
+    scale_t = torch.tensor([1.0])
+    for qlen in [128, 256, 1024, 2048, 4096]:
+        for klen in [128, 256, 1024, 2048]:
+            inputs = torch.normal(0, 2, (batch, attn, qlen, klen), dtype=torch.float16, device='cuda:0')
+            masks = torch.ones((batch, 1, qlen, klen), dtype=torch.bool, device='cuda:0')
+            softmax_results = scaled_masked_softmax_cuda.forward(inputs, masks, scale_t[0].item())
+            softmax_results_torch = torch.zeros_like(inputs)
+            error = (softmax_results_torch - softmax_results).abs().max()
+            assert error == 0.0
+
+
+def test_allmasked_softmax_backward():
+    import scaled_masked_softmax_cuda
+    
+    batch = 2
+    attn = 16
+    scale_t = torch.tensor([1.0])
+    for qlen in [128, 256, 1024, 2048, 4096]:
+        for klen in [128, 256, 1024, 2048]:
+            inputs = torch.normal(0, 2, (batch, attn, qlen, klen), dtype=torch.float16, device='cuda:0')
+            backward = torch.rand_like(inputs, dtype=torch.float16, device='cuda:0')
+            masks = torch.ones((batch, 1, qlen, klen), dtype=torch.bool, device='cuda:0')
+            softmax_results = scaled_masked_softmax_cuda.forward(inputs, masks, scale_t[0].item())
+            back_grad = scaled_masked_softmax_cuda.backward(backward, softmax_results, scale_t[0].item())
+            inputs.requires_grad = True
+            softmax_results_torch = forward_torch_softmax(inputs, masks, scale_t[0].item())
+            softmax_results_torch.backward(backward)
+            error = (back_grad - inputs.grad).abs().max()
+            assert error < 1e-3
+
+
 if __name__ == "__main__":
     try:
         from transformers import BertTokenizer, GPT2Tokenizer
@@ -294,6 +378,11 @@ if __name__ == "__main__":
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
 
+    load()
+    test_masked_softmax_forward()
+    test_masked_softmax_backward()
+    test_allmasked_softmax_forward()
+    test_allmasked_softmax_backward()
     test_load_fused_kernels()
     test_fused_softmax()
     test_fused_upper_triangle_mask_softmax()

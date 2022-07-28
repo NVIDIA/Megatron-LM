@@ -293,6 +293,13 @@ __global__ void scaled_masked_softmax_warp_forward(
     }
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Max>(max_value);
 
+    // compute scale value to account for full mask
+    acc_t scale_value[WARP_BATCH];
+    #pragma unroll
+    for (int i = 0;  i < WARP_BATCH;  ++i) {
+        scale_value[i] = (max_value[i] == -10000.0) ? 0.0 : 1.0;
+    }
+
     acc_t sum[WARP_BATCH] { 0.0f };
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
@@ -316,7 +323,7 @@ __global__ void scaled_masked_softmax_warp_forward(
             if (element_index < element_count) {
                 #pragma unroll
                 for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
-                    out[element] = elements[i][it + element] / sum[i];
+                    out[element] = elements[i][it + element] * scale_value[i] / sum[i];
                 }
                 copy_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE, out);  
             } else {
