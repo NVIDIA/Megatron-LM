@@ -170,6 +170,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             and self.input_in_float16  # input must be fp16
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
+            and sk % 4 == 0  # sk must be divisor of 4 
             and attn_batches % 4 == 0  # np * b must be divisor of 4
         ):
             if 0 <= sk <= 4096:
