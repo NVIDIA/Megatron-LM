@@ -226,3 +226,19 @@ def flops_calculator(model, args, iteration_time):
     effective_tera_flops_per_gpu = giga_flops_per_model_per_train_step / (iteration_time * 1000.0 * gpus_per_model)
 
     print_rank_0(f"Effective Tera Flops per GPU: {round(effective_tera_flops_per_gpu, 2)} and total parameters {round(approx_parameters_in_billions, 3)} B")
+
+def throughput_calculator(model, args, iteration_time):
+    gpus_per_model = torch.distributed.get_world_size(group = mpu.get_model_parallel_group())
+    batch_size = args.micro_batch_size * get_num_microbatches()
+    samples_per_model = batch_size * args.seq_length
+    model_replica_count = torch.distributed.get_world_size() / gpus_per_model
+    approx_parameters_in_billions = get_parameters_in_billions(model)
+    samples_per_second = samples_per_model * model_replica_count / (iteration_time * 1000.0)
+    print_rank_0(f'Samples per second: {round(samples_per_second, 2)} and total parameters {round(approx_parameters_in_billions, 3)} B')
+
+def checkpoint_throughput_calculator(model, latency_second):
+    approx_parameters_in_billions = get_parameters_in_billions(model)
+    checkpoint_multiplier = 14  # fp16 weights (2), fp32 weights (4), fp32 momentum (4), fp32 variance (4)
+    checkpoint_GB = approx_parameters_in_billions * checkpoint_multiplier
+    GB_per_second = checkpoint_GB / latency_second
+    print_rank_0(f"Checkpoint Save GB: {round(checkpoint_GB, 3)}, GB/Sec: {round(GB_per_second,2)}, Latency(second): {round(latency_second, 3)}")

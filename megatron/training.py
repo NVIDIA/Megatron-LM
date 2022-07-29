@@ -51,7 +51,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
-from megatron.utils import report_memory, flops_calculator
+from megatron.utils import report_memory, flops_calculator, throughput_calculator, checkpoint_throughput_calculator
 
 import deepspeed
 
@@ -636,6 +636,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
+    add_to_logging('save-checkpoint')
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
@@ -844,6 +845,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
         flops_calculator(model, args, elapsed_time)
+        throughput_calculator(model, args, elapsed_time)
 
     return report_memory_flag
 
@@ -857,6 +859,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     save_checkpoint(iteration, model, optimizer, lr_scheduler)
     torch.distributed.barrier()
     timers('save-checkpoint').stop()
+    checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
 
