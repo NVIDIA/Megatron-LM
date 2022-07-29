@@ -873,6 +873,9 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--expert-model-parallelism', action='store_true',
+                       default=False, help='Enable expert model paralleism within'
+                       'the data parallel group')
 
     return parser
 

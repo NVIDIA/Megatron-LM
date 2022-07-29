@@ -78,6 +78,16 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
+def set_expert_model_parallel_attributes(tensor, is_parallel):
+    assert not hasattr(tensor, 'expert_model_parallel')
+    setattr(tensor, 'expert_model_parallel', is_parallel)
+
+
+def param_is_expert_model_parallel(param):
+    return (hasattr(param, 'expert_model_parallel') and
+            param.expert_model_parallel)
+
+
 def _initialize_affine_weight_gpu(weight, init_method,
                                   partition_dim, stride=1):
     """Initialize affine weight for model parallel on GPU."""
@@ -294,7 +304,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                                                             async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
-
 
         if ctx.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
