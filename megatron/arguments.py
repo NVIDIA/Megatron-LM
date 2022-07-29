@@ -43,7 +43,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-        
+
     return args
 
 def validate_args(args, defaults={}):
@@ -333,7 +333,6 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
@@ -344,6 +343,10 @@ def validate_args(args, defaults={}):
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
+    # Expert model parallelism assume local DDP and contiguous buffers.
+    if args.expert_model_parallelism:
+        assert args.DDP_impl == 'local'
+        assert args.use_contiguous_buffers_in_local_ddp
 
     _print_args(args)
     return args
@@ -411,7 +414,7 @@ def _add_inference_args(parser):
                        'Allows us to throw an error before OOM crashes server')
     return parser
 
-    
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -1081,14 +1084,14 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-    
+
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
- 
+
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,
                        help='iterations per epoch')
