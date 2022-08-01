@@ -635,6 +635,9 @@ def _add_distributed_args(parser):
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
+    group.add_argument('--enable-expert-tensor-parallelism', action='store_true',
+                        default=False,
+                        help="use tensor parallelism for expert layers in MoE")
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--moe-expert-parallel-size', type=int, default=1,

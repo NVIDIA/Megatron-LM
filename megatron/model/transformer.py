@@ -59,7 +59,7 @@ class ParallelMLP(MegatronModule):
     applied.
     """
 
-    def __init__(self, init_method, output_layer_init_method, MOE=False, MoE_mp_size=1):
+    def __init__(self, init_method, output_layer_init_method, moe=False, enable_expert_tensor_parallelism=False):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
@@ -70,8 +70,9 @@ class ParallelMLP(MegatronModule):
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
-            MOE=MOE,
-            MoE_mp_size=MoE_mp_size)
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+            )
 
         self.bias_gelu_fusion = args.bias_gelu_fusion
         self.activation_func = F.gelu
@@ -87,9 +88,8 @@ class ParallelMLP(MegatronModule):
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
-            MOE=MOE,
-            MoE_mp_size=MoE_mp_size)
-
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism)
 
     def forward(self, hidden_states):
 
@@ -448,16 +448,12 @@ class ParallelTransformerLayer(MegatronModule):
             self.mlp = ParallelMLP(init_method,
                                output_layer_init_method)
         else:
-            if not args.ds_inference or self.num_experts > dist.get_world_size():
-                moe_mp_size = 1
-            else:
-                moe_mp_size = dist.get_world_size() // self.num_experts
-            
+            enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
             self.mlp = MoE(args.hidden_size,
                             ParallelMLP(init_method,
                                 output_layer_init_method=output_layer_init_method,
-                                MOE=True,
-                                MoE_mp_size=moe_mp_size),
+                                moe=True,
+                                enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
                             num_experts=self.num_experts, 
                             ep_size=args.moe_expert_parallel_size,
                             k=args.topk,
@@ -465,7 +461,8 @@ class ParallelTransformerLayer(MegatronModule):
                             capacity_factor=args.moe_train_capacity_factor,
                             eval_capacity_factor=args.moe_eval_capacity_factor,
                             min_capacity=args.moe_min_capacity,
-                            drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel)
+                            drop_tokens=args.moe_token_dropping, use_tutel=args.use_tutel,
+                            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism) 
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
