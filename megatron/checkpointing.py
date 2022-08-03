@@ -85,17 +85,22 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
     if pipeline_rank is None:
         pipeline_rank = mpu.get_pipeline_model_parallel_rank()
 
+    # If we're using expert parallelism we need to include the data parallel
+    # rank in the path for both model and optim.
+    args = get_args()
+    expert_parallel = args.expert_model_parallelism
+
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
     # data parallel rank.
-    if not pipeline_parallel:
-        common_path = os.path.join(checkpoints_path, directory,
-                            f'mp_rank_{tensor_rank:02d}')
-    else:
-        common_path = os.path.join(checkpoints_path, directory,
-                        f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
+    rank_dir = f'mp_rank_{tensor_rank:02d}'
+    if expert_parallel:
+        rank_dir += f"_{mpu.get_data_parallel_rank():03d}"
+    if pipeline_parallel:
+        rank_dir += f"_{pipeline_rank:03d}"
+    common_path = os.path.join(checkpoints_path, directory, rank_dir)
 
-    if use_distributed_optimizer:
+    if use_distributed_optimizer and not expert_parallel:
         model_name = os.path.join(common_path, "model_rng.pt")
         optim_name = os.path.join(
             common_path + "_%03d" % mpu.get_data_parallel_rank(),
@@ -447,7 +452,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
 
     # For args we only care about model state dict
     state_dict = model_state_dict
-    
+
     if not state_dict:
         print_rank_0('Checkpoint not found to provide arguments, using provided arguments.')
         return args
