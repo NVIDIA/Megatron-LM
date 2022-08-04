@@ -10,6 +10,7 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron import get_args
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
@@ -262,7 +263,7 @@ class MegatronOptimizer(ABC):
                 args.sequence_parallel:
             grads = []
             for model_module in self.models:
-                unwrapped_model = unwrap_model( 
+                unwrapped_model = unwrap_model(
                     model_module, (torchDDP, LocalDDP, Float16Module))
                 for param in unwrapped_model.parameters():
                     if getattr(param, 'sequence_parallel', False):
@@ -397,6 +398,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=self.get_model_parallel_group())
 
+        # Update across all data parallel instances if we're using expert
+        # model parallelism.
+        if get_args().expert_model_parallelism:
+            torch.distributed.all_reduce(self.found_inf,
+                                         op=torch.distributed.ReduceOp.MAX,
+                                         group=mpu.get_data_parallel_group())
+
         # Check for nan.
         found_inf_flag = (self.found_inf.item() > 0)
 
@@ -405,7 +413,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def step(self, args, timers):
-
         # Copy gradients from model params to main params.
         timers('optimizer-copy-to-main-grad', log_level=1).start(
             barrier=args.barrier_with_L1_time)
@@ -530,6 +537,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Copy tensor model parallel attributes.
                         tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
                                                                               param)
+                        tensor_parallel.copy_expert_model_parallel_attributes(main_param,
+                                                                              param)
+
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
                         # Replace the optimizer params with the new fp32 copy.
@@ -573,7 +583,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
 
     def _collect_main_grad_data_for_unscaling(self):
-
         main_grads = []
 
         # fp32 params from float16 ones.
@@ -587,7 +596,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             for main_param in main_group:
                 if main_param.grad is not None:
                     main_grads.append(main_param.grad.data)
-        
         return main_grads
 
 

@@ -88,6 +88,12 @@ def param_is_expert_model_parallel(param):
             param.expert_model_parallel)
 
 
+def copy_expert_model_parallel_attributes(destination_tensor, source_tensor):
+    if hasattr(source_tensor, 'expert_model_parallel'):
+        setattr(destination_tensor, 'expert_model_parallel',
+                getattr(source_tensor,'expert_model_parallel'))
+
+
 def _initialize_affine_weight_gpu(weight, init_method,
                                   partition_dim, stride=1):
     """Initialize affine weight for model parallel on GPU."""

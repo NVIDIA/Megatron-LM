@@ -348,6 +348,12 @@ def validate_args(args, defaults={}):
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
+        # Expert model parallelism does not work with the distributed optimizer
+        # yet. The distributed optimizer assumes that all of the parameters to
+        # optimize are in the contiguous gradient buffer but this is not true
+        # when we are using expert model parallelism.
+        assert not args.use_distributed_optimizer
+
     _print_args(args)
     return args
 
