@@ -142,7 +142,9 @@ def forward_step(forward_step_func,
             data = loss_func(output_tensor, non_loss_data=True)
             forward_data_store.append(data)
     elif args.model_type == ModelType.encoder_or_decoder_with_lbl:
-        lbl_loss = loss_func()[0]
+        lbl_loss, lbl_loss_reduced = loss_func()
+        lbl_loss = lbl_loss / get_num_microbatches()
+        forward_data_store.append(lbl_loss_reduced)
 
     if timers is not None:
         timers('forward-compute').stop()
@@ -198,6 +200,7 @@ def backward_step(optimizer, input_tensor, output_tensor,
     if mpu.is_pipeline_last_stage():
         custom_backward(output_tensor[0], output_tensor_grad[0])
     elif args.model_type == ModelType.encoder_or_decoder_with_lbl:
+        output_tensor[1] = optimizer.scale_loss(output_tensor[1])
         custom_backward(output_tensor[0], output_tensor_grad[0], lbl_loss=output_tensor[1])
     else:
         custom_backward(output_tensor[0], output_tensor_grad[0])
