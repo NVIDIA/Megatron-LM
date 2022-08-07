@@ -791,9 +791,6 @@ def evaluate(forward_step_func,
         iteration = 0
         while iteration < args.eval_iters:
             iteration += 1
-            if verbose and iteration % args.log_interval == 0:
-                print_rank_0('Evaluating iter {}/{}'.format(iteration,
-                                                            args.eval_iters))
 
             forward_backward_func = get_forward_backward_func()
             loss_dicts = forward_backward_func(
@@ -804,7 +801,8 @@ def evaluate(forward_step_func,
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if mpu.is_pipeline_last_stage(ignore_virtual=True) or \
+                    args.model_type == ModelType.encoder_or_decoder_with_lbl:
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
@@ -826,6 +824,13 @@ def evaluate(forward_step_func,
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+
+    # Sum LBLs across pipeline-model-parallel shards.
+    if args.model_type == ModelType.encoder_or_decoder_with_lbl:
+        assert "load balancing loss" in total_loss_dict
+        torch.distributed.all_reduce(
+            total_loss_dict["load balancing loss"],
+            group=mpu.get_pipeline_model_parallel_group())
 
     return total_loss_dict, collected_non_loss_data
 
