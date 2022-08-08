@@ -51,7 +51,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
-from megatron.utils import report_memory, flops_calculator
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
 
 import deepspeed
 
@@ -636,11 +636,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
+    add_to_logging('save-checkpoint')
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
         get_num_microbatches()
-
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
 
@@ -772,25 +772,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
-
         seq_len = args.curriculum_seqlen if args.curriculum_learning else args.seq_length
         hidden_size = args.hidden_size
         num_layers = args.num_layers
         vocab_size = args.padded_vocab_size
 
+        samples_per_sec, tflops, approx_parameters_in_billions = throughput_calculator(model, args, elapsed_time, total_iterations)
+
         # Compute throughput.
-        samples_per_sec = batch_size / elapsed_time_per_iteration
         samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
         tokens_per_sec = samples_per_sec * seq_len
         tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
-
-        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
-        # https://arxiv.org/pdf/2104.04473.pdf).
-        # The factor of 4 is when used with activation check-pointing,
-        # otherwise it will be 3.
-        checkpoint_activations_factor = 4 if args.checkpoint_activations else 3
-        flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
-        tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
 
         # only the last rank process has a non-None _GLOBAL_TENSORBOARD_WRITER
         if writer and is_last_rank():
@@ -843,7 +835,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
-        flops_calculator(model, args, elapsed_time)
+
 
     return report_memory_flag
 
@@ -857,6 +849,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
     save_checkpoint(iteration, model, optimizer, lr_scheduler)
     torch.distributed.barrier()
     timers('save-checkpoint').stop()
+    checkpoint_throughput_calculator(model, timers('save-checkpoint').elapsed(reset=False))
     timers.log(['save-checkpoint'])
 
 
