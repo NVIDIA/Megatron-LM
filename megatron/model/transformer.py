@@ -26,7 +26,7 @@ from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_linear_layer
 
 
 """ We use the following notation throughout this file:
@@ -214,11 +214,12 @@ class CoreAttention(MegatronModule):
         self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
 
     def forward(self, query_layer, key_layer,
-                value_layer, attention_mask):
+                value_layer, attention_mask, expand_key_value=False):
 
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
+        np = query_layer.size(2)
 
         # [b, np, sq, sk]
         output_size = (query_layer.size(1),
@@ -229,9 +230,15 @@ class CoreAttention(MegatronModule):
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
+        # [sk, b, 1, hn] -> [sk, b * np, hn]
+        # TODO: Check that we indeed get the speedup at inference. Isn't the reshape memory allocation a bottleneck?
+        if expand_key_value:
+            key_layer = key_layer.expand(output_size[3], output_size[0], np, -1)
+            key_layer = key_layer.reshape(output_size[3], output_size[0] * np, -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3],
-                                   output_size[0] * output_size[1], -1)
+        else:
+            key_layer = key_layer.view(output_size[3],
+                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = get_global_memory_buffer().get_tensor(
@@ -274,13 +281,18 @@ class CoreAttention(MegatronModule):
 
         # context layer shape: [b, np, sq, hn]
         output_size = (value_layer.size(1),
-                       value_layer.size(2),
+                       np,
                        query_layer.size(0),
                        value_layer.size(3))
 
-        # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0),
-                                       output_size[0] * output_size[1], -1)
+        # [sk, b, 1, hn] -> [sk, b * np, hn]
+        if expand_key_value:
+            value_layer = value_layer.expand(value_layer.size(0), value_layer.size(1), np, -1)
+            value_layer = value_layer.reshape(value_layer.size(0), value_layer.size(1) * np, -1)
+        else:
+            # change view [sk, b * np, hn]
+            value_layer = value_layer.view(value_layer.size(0),
+                                        output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1],
@@ -320,6 +332,7 @@ class ParallelAttention(MegatronModule):
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
         self.params_dtype = args.params_dtype
+        self.attention_head_type = args.attention_head_type
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -331,12 +344,28 @@ class ParallelAttention(MegatronModule):
             args.num_attention_heads, world_size)
 
         # Strided linear layer.
-        if attention_type == AttnType.self_attn:
+        if attention_type == AttnType.self_attn and self.attention_head_type == 'multihead':
             self.query_key_value = mpu.ColumnParallelLinear(
                 args.hidden_size,
                 3 * projection_size,
                 gather_output=False,
                 init_method=init_method)
+        elif attention_type == AttnType.self_attn and self.attention_head_type == 'multiquery':
+            self.query = mpu.ColumnParallelLinear(
+                args.hidden_size,
+                projection_size,
+                gather_output=False,
+                init_method=init_method)
+            # In MultiQuery attention, keys and values are shared across heads
+            # Use args.kv_channels instead of projection_size
+            # No `.fork()` so the rng tracker is shared across tensor-parallel processes.
+            # with mpu.get_cuda_rng_tracker():
+            self.key_value = get_linear_layer(
+                args.hidden_size,
+                2 * args.kv_channels,
+                init_method=init_method)
+            print(f"KV WEIGHT {layer_number}", self.key_value.weight)
+        # TODO: add elif block for cross_attn and multiquery?
         else:
             assert attention_type == AttnType.cross_attn
             self.query = mpu.ColumnParallelLinear(
@@ -364,7 +393,7 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
-                                        value_layer, attention_mask):
+                                        value_layer, attention_mask, expand_key_value):
         """Forward method with activation checkpointing."""
         def custom_forward(*inputs):
             query_layer = inputs[0]
@@ -372,7 +401,7 @@ class ParallelAttention(MegatronModule):
             value_layer = inputs[2]
             attention_mask = inputs[3]
             output_ = self.core_attention(query_layer, key_layer,
-                                          value_layer, attention_mask)
+                                          value_layer, attention_mask, expand_key_value)
             return output_
 
         hidden_states = mpu.checkpoint(
@@ -385,10 +414,11 @@ class ParallelAttention(MegatronModule):
         return torch.empty(
             inference_max_sequence_len,
             batch_size,
-            self.num_attention_heads_per_partition,
+            self.num_attention_heads_per_partition if self.attention_head_type == "multihead" else 1,
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
             device=torch.cuda.current_device())
+
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None):
@@ -415,7 +445,7 @@ class ParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
 
-        if self.attention_type == AttnType.self_attn:
+        if self.attention_type == AttnType.self_attn and self.attention_head_type == 'multihead':
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
@@ -429,6 +459,33 @@ class ParallelAttention(MegatronModule):
             (query_layer,
              key_layer,
              value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
+        elif self.attention_type == AttnType.self_attn and self.attention_head_type == 'multiquery':
+            # Attention heads [sq, b, h] --> [sq, b, (2 * hn)]
+            mixed_kv_layer = self.key_value(hidden_states)
+
+            # [sq, b, (2 * hn)] --> [sq, b, np (expanded), 2 * hn]
+            # new_tensor_shape = mixed_kv_layer.size()[:-1] + \
+            #     (self.num_attention_heads_per_partition,
+            #      2 * self.hidden_size_per_attention_head)
+            # mixed_kv_layer = mixed_kv_layer.unsqueeze(2).expand(*new_tensor_shape)
+
+            # [sq, b, (2 * hn)] --> [sq, b, 1, 2 * hn]
+            new_tensor_shape = mixed_kv_layer.size()[:-1] + \
+                (1,
+                 2 * self.hidden_size_per_attention_head)
+            mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
+
+            # [sq, b, np, 2 * hn] --> 2 [sq, b, np, hn]
+            (key_layer,
+             value_layer) = mpu.split_tensor_along_last_dim(mixed_kv_layer, 2)
+
+            # Attention head [sq, b, h] --> [sq, b, np * hn]
+            query_layer, _ = self.query(hidden_states)
+            # [sq, b, np * hn] --> [sq, b, np, hn]
+            new_tensor_shape = query_layer.size()[:-1] + \
+                (self.num_attention_heads_per_partition,
+                 self.hidden_size_per_attention_head)
+            query_layer = query_layer.view(*new_tensor_shape)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -478,10 +535,10 @@ class ParallelAttention(MegatronModule):
 
         if self.checkpoint_core_attention:
             context_layer = self._checkpointed_attention_forward(
-                query_layer, key_layer, value_layer, attention_mask)
+                query_layer, key_layer, value_layer, attention_mask, expand_key_value=True)
         else:
             context_layer = self.core_attention(
-                query_layer, key_layer, value_layer, attention_mask)
+                query_layer, key_layer, value_layer, attention_mask, expand_key_value=True)
 
         # =================
         # Output. [sq, b, h]
