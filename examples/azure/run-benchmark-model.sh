@@ -62,7 +62,7 @@ cat <<EOT > $DS_CONFIG
     "stage": 3,
     "stage3_max_live_parameters": 3e9,
     "stage3_max_reuse_distance": 3e9,
-    "stage3_param_persitence_threshold": 1e5,
+    "stage3_param_persistence_threshold": 1e5,
     "stage3_prefetch_bucket_size": 5e7,
     "contiguous_gradients": true,
     "overlap_comm": true,
