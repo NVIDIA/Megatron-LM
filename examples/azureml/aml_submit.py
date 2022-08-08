@@ -137,7 +137,7 @@ ds_config = {
       "stage": 3,
       "stage3_max_live_parameters": 3e9,
       "stage3_max_reuse_distance": 3e9,
-      "stage3_param_persitence_threshold": 1e5,
+      "stage3_param_persistence_threshold": 1e5,
       "stage3_prefetch_bucket_size": 5e7,
       "contiguous_gradients": True,
       "overlap_comm": True,
