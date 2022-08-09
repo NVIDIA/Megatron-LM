@@ -463,9 +463,22 @@ def train_step(forward_step_func, data_iterator,
             args.model_type == ModelType.encoder_or_decoder_with_lbl:
         # Average loss across microbatches.
         loss_reduced = {}
-        for key in losses_reduced[0]:
-            losses_reduced_for_key = [x[key] for x in losses_reduced]
+        # Get all keys; looking at first element in losses_reduced is insufficient with
+        # virtual stages and models with LBL since only the last virtual stage in the
+        # last physical stage has the true loss and the LBL, while all other stages have
+        # LBL only.
+        keys = set()
+        for i in range(len(losses_reduced)):
+            for key in losses_reduced[i]:
+                keys.add(key)
+        for key in keys:
+            losses_reduced_for_key = [x[key] for x in losses_reduced if key in x]
             loss_reduced[key] = sum(losses_reduced_for_key) / len(losses_reduced_for_key)
+            # Load balancing losses need to be summed across virtual stages (not averaged),
+            # so multiply back the number of virtual stages in a physical stage.
+            if key == "load balancing loss":
+                if args.virtual_pipeline_model_parallel_size is not None:
+                    loss_reduced[key] *= args.virtual_pipeline_model_parallel_size
 
         # Sum LBLs across pipeline-model-parallel shards.
         if args.model_type == ModelType.encoder_or_decoder_with_lbl:
