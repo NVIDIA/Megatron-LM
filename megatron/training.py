@@ -378,6 +378,8 @@ def setup_model_and_optimizer(model_provider_func,
         torch.distributed.barrier()
         timers('load-checkpoint').start()
         args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
+        if args.no_load_optim:
+            optimizer.reload_model_params()
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
