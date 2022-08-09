@@ -248,6 +248,7 @@ def parse_args(extra_args_provider=None, defaults={},
             'need to enable checkpoint-activations'
 
     args.curriculum_learning = False
+    args.compression_training = False
 
     # AML
     if args.aml_data_download_path is not None:
@@ -905,6 +906,8 @@ def _add_distillation_args(parser):
 
     group.add_argument('--mos', action='store_true',
                        help='Enable Mixture-of-Students via knolwedge distillation.')
+    group.add_argument('--kd', action='store_true',
+                       help='Enable knolwedge distillation.')
     group.add_argument('--kd-alpha-ce', default=1, type=float)
     group.add_argument('--kd-beta-ce', default=1, type=float)
     group.add_argument('--kd-temp', default=1.0, type=float)

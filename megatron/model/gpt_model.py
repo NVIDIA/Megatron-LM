@@ -108,7 +108,8 @@ class GPTModel(MegatronModule):
                 # input_ids, position_ids, labels have size [batch size, seqlen]
                 input_ids = input_ids[:, :curriculum_seqlen].contiguous()
                 position_ids = position_ids[:, :curriculum_seqlen].contiguous()
-                labels = labels[:, :curriculum_seqlen].contiguous()
+                if labels is not None:
+                    labels = labels[:, :curriculum_seqlen].contiguous()
 
                 # attention_mask has size [1, 1, seqlen, seqlen]
                 attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()

@@ -146,7 +146,8 @@ def get_batch_pipe(data):
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
         tokens = tokens[:, :args.curriculum_seqlen].contiguous()
         position_ids = position_ids[:, :args.curriculum_seqlen].contiguous()
-        labels = labels[:, :args.curriculum_seqlen].contiguous()
+        if labels is not None:
+            labels = labels[:, :args.curriculum_seqlen].contiguous()
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
 
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
@@ -160,10 +161,14 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
     
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
-    if args.mos:
-        assert max(args.num_experts) > 1
+    if args.mos or args.kd:
+        # assert max(args.num_experts) >= 1
         loss = loss + moe_loss + mos_loss
-        return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'mos loss': mos_loss}
+        if args.mos:
+            return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'mos loss': mos_loss}
+        elif args.kd:
+            return loss, {'total loss': loss, 'lm loss': averaged_loss[0], 'moe loss': moe_loss, 'kd loss': mos_loss}
+        print_rank_0('>>> total loss: {}, lm loss {}, kd loss {}'.format(loss, averaged_loss[0], mos_loss))
     else:
         if max(args.num_experts) <= 1:
             return loss, {'lm loss': averaged_loss[0]}
@@ -179,11 +184,19 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
     
     if teacher_model:
         with torch.no_grad():
+            if args.curriculum_learning and args.curriculum_seqlen < args.seq_length:
+                assert args.curriculum_seqlen is not None
+                curriculum_seqlen = args.curriculum_seqlen
+                tokens = tokens[:, :curriculum_seqlen].contiguous()
+                position_ids = position_ids[:, :curriculum_seqlen].contiguous()
+                attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
+                # No need to truncate labels as we do not need it for the teacher logits
             tea_output, *tea_other_losses = teacher_model(tokens, position_ids, attention_mask)
-            assert stu_output.size() == tea_output.size(), 'teacher and student output should match in size.'
+            assert stu_output.size() == tea_output.size(), 'teacher and student output should match in size. Student: {}, Teacher: {}, CL seq length {}'.format(stu_output.size(), tea_output.size(), args.curriculum_seqlen)
 
         student_logits = F.log_softmax(stu_output / kd_temp, dim=2)
         tea_logits = F.softmax(tea_output / kd_temp, dim=2) # The target logits is expected to be probabilities. If we use log_softmax, then we need to set target_log to true when initializing the KLDivLoss.
+
         mos_loss = kd_temp * kd_temp * nn.KLDivLoss(reduction='batchmean')(student_logits, tea_logits)
 
         mos_loss = mos_loss.div(args.seq_length) * beta
@@ -200,9 +213,12 @@ def forward_step(data_iterator, model, teacher_model=None):
         data_iterator)
     timers('batch-generator').stop()
 
-    if args.mos:
+    if args.mos or args.kd:
         # The forward func can return either the loss or the logits, depending on whether passing in the labels or not.
         stu_output, *other_losses = model(tokens, position_ids, attention_mask)
+        if args.curriculum_learning and args.curriculum_seqlen < args.seq_length:
+            assert args.curriculum_seqlen is not None
+            labels = labels[:, :args.curriculum_seqlen].contiguous()
         output_tensor = mpu.vocab_parallel_cross_entropy(stu_output.contiguous().float(), labels)
     else:
         output_tensor, *other_losses = model(tokens, position_ids, attention_mask,
@@ -217,7 +233,7 @@ def forward_step(data_iterator, model, teacher_model=None):
     moe_loss = sum(moe_losses) * args.moe_loss_coeff
 
     mos_loss = 0
-    if args.mos:
+    if args.mos or args.kd:
         assert model.training
         mos_loss = calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask)
     

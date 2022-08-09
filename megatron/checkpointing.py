@@ -58,7 +58,7 @@ def check_checkpoint_args(checkpoint_args):
                             arg_name, checkpoint_value, args_value)
         assert checkpoint_value == args_value, error_message
 
-    if not args.mos:
+    if not args.mos and not args.kd:
         _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
@@ -169,6 +169,7 @@ def save_checkpoint(iteration, model, optimizer, lr_scheduler):
 
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
+        
         # Trim off the filename and mp_rank_* directory.
         for _ in range(3):
             checkpoint_name = os.path.dirname(checkpoint_name)
@@ -309,7 +310,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                         tracker_filename))
                     sys.exit()
 
-        if not args.mos:
+        if not args.mos and not args.kd:
             assert iteration > 0 or release, 'error parsing metadata file {}'.format(
                 tracker_filename)
 
@@ -342,6 +343,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
     # Set iteration.
     if args.finetune or release or args.reset_iteration or load_only_weights:
         iteration = 0
+        # Make DeepSpeed engine aware of this reset of iteration
+        model[0].global_steps = 0
     else:
         try:
             iteration = state_dict['iteration']
@@ -357,7 +360,8 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load', strict=True
                 sys.exit()
 
     # Check arguments.
-    if not load_only_weights:
+    reset_train_valid_samples = args.reset_iteration
+    if not load_only_weights and not reset_train_valid_samples:
         assert args.consumed_train_samples == 0
         assert args.consumed_valid_samples == 0
         if 'args' in state_dict:
