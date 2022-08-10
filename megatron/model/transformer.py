@@ -215,7 +215,7 @@ class CoreAttention(MegatronModule):
 
     def forward(self, query_layer, key_layer,
                 value_layer, attention_mask, expand_key_value=False):
-
+        timers = get_timers()
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
@@ -230,27 +230,30 @@ class CoreAttention(MegatronModule):
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
-        # [sk, b, 1, hn] -> [sk, b * np, hn]
-        # TODO: Check that we indeed get the speedup at inference. Isn't the reshape memory allocation a bottleneck?
+        timers("CoreAttention: K view/reshape").start()
         if expand_key_value:
+            # [sk, b, 1, hn] -> [sk, b * np, hn]
             key_layer = key_layer.expand(output_size[3], output_size[0], np, -1)
             key_layer = key_layer.reshape(output_size[3], output_size[0] * np, -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
         else:
+            # [sk, b, np, hn] -> [sk, b * np, hn]
             key_layer = key_layer.view(output_size[3],
                                     output_size[0] * output_size[1], -1)
+        timers("CoreAttention: K view/reshape").stop()
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = get_global_memory_buffer().get_tensor(
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
             query_layer.dtype, "mpu")
 
+        timers("CoreAttention: QK matmul").start()
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
             query_layer.transpose(0, 1),   # [b * np, sq, hn]
             key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0, alpha=(1.0/self.norm_factor))
+        timers("CoreAttention: QK matmul").stop()
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -259,6 +262,7 @@ class CoreAttention(MegatronModule):
         # Attention probs and dropout
         # ===========================
 
+        timers("CoreAttention: Softmax, dropout").start()
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores,
                                                   attention_mask)
@@ -271,6 +275,7 @@ class CoreAttention(MegatronModule):
                 attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
+        timers("CoreAttention: Softmax, dropout").stop()
 
         # =========================
         # Context layer. [sq, b, hp]
@@ -285,6 +290,7 @@ class CoreAttention(MegatronModule):
                        query_layer.size(0),
                        value_layer.size(3))
 
+        timers("CoreAttention: V view/reshape").start()
         # [sk, b, 1, hn] -> [sk, b * np, hn]
         if expand_key_value:
             value_layer = value_layer.expand(value_layer.size(0), value_layer.size(1), np, -1)
@@ -293,19 +299,137 @@ class CoreAttention(MegatronModule):
             # change view [sk, b * np, hn]
             value_layer = value_layer.view(value_layer.size(0),
                                         output_size[0] * output_size[1], -1)
+        timers("CoreAttention: V view/reshape").stop()
 
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1],
                                                output_size[2], -1)
 
+        timers("CoreAttention: V matmul").start()
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        timers("CoreAttention: V matmul").stop()
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
 
+        timers("CoreAttention: context contiguous").start()
         # [b, np, sq, hn] --> [sq, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+        timers("CoreAttention: context contiguous").stop()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + \
+            (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer
+
+
+class MultiQueryCoreAttention(CoreAttention):
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def forward(self, query_layer, key_layer, value_layer, attention_mask, expand_key_value=False):
+        timers = get_timers()
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+        sq = query_layer.size(0)
+        bs = query_layer.size(1)
+        np = query_layer.size(2)
+
+        sk = key_layer.size(0)
+        # Only one head for key and values
+        assert key_layer.size(2) == 1 and value_layer.size(2) == 1
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1),
+                       query_layer.size(2),
+                       query_layer.size(0),
+                       key_layer.size(0))
+
+        
+        timers("CoreAttention: K view/reshape").start()
+        # [sq, b, np, hn] -> [b, np * sq, hn]
+        query_layer = query_layer.permute([1, 2, 0, 3]).reshape(bs, np * sq, -1)
+        # [sk, b, 1, hn] -> [b, hn, sk]
+        key_layer = key_layer.squeeze(2).permute(1, 2, 0)
+        # [sk, b, 1, hn] -> [sk, b * np, hn]
+        # key_layer = key_layer.expand(output_size[3], output_size[0], np, -1)
+        # key_layer = key_layer.reshape(output_size[3], output_size[0] * np, -1)
+
+        # preallocting input tensor: [b, np * sq, sk]
+        matmul_input_buffer = get_global_memory_buffer().get_tensor(
+            (bs, np * sq, sk),
+            query_layer.dtype, "mpu")
+        timers("CoreAttention: K view/reshape").stop()
+
+        timers("CoreAttention: QK matmul").start()
+        # Raw attention scores. [b, np * sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer,   # [b, np * sq, hn]
+            key_layer,  # [b, hn, sk]
+            beta=0.0, alpha=(1.0/self.norm_factor))
+        timers("CoreAttention: QK matmul").stop()
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(bs, np, sq, sk)
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+
+        timers("CoreAttention: Softmax, dropout").start()
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = self.scale_mask_softmax(attention_scores,
+                                                  attention_mask)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+
+        if not self.sequence_parallel:
+            with mpu.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
+            attention_probs = self.attention_dropout(attention_probs)
+        timers("CoreAttention: Softmax, dropout").stop()
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1),
+                       np,
+                       query_layer.size(0),
+                       value_layer.size(3))
+
+        timers("CoreAttention: V view/reshape").start()
+        # [sk, b, 1, hn] -> [b, sk, hn]
+        value_layer = value_layer.squeeze(2).transpose(0, 1)
+        timers("CoreAttention: V view/reshape").stop()
+
+        # change view [b, np * sq, sk]
+        attention_probs = attention_probs.view(bs, np * sq, -1)
+
+        timers("CoreAttention: V matmul").start()
+        # matmul: [b, np * sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer)
+        timers("CoreAttention: V matmul").stop()
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(bs, np, sq, -1)
+
+        timers("CoreAttention: context contiguous").start()
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+        timers("CoreAttention: context contiguous").stop()
 
         # [sq, b, np, hn] --> [sq, b, hp]
         new_context_layer_shape = context_layer.size()[:-2] + \
@@ -380,8 +504,11 @@ class ParallelAttention(MegatronModule):
                 gather_output=False,
                 init_method=init_method)
 
-        self.core_attention = CoreAttention(self.layer_number,
-                                            self.attn_mask_type)
+        if self.attention_head_type == 'multihead':
+            self.core_attention = CoreAttention(self.layer_number,
+                                                self.attn_mask_type)
+        else:
+            self.core_attention = MultiQueryCoreAttention(self.layer_number, self.attn_mask_type)
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         # Output.
@@ -423,10 +550,11 @@ class ParallelAttention(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None):
         # hidden_states: [sq, b, h]
-
+        timers = get_timers()
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
+        timers("inference_params init").start()
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -440,11 +568,13 @@ class ParallelAttention(MegatronModule):
             else:
                 inference_key_memory, inference_value_memory = \
                     inference_params.key_value_memory_dict[self.layer_number]
+        timers("inference_params init").stop()
 
         # =====================
         # Query, Key, and Value
         # =====================
 
+        timers("KV forward").start()
         if self.attention_type == AttnType.self_attn and self.attention_head_type == 'multihead':
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
@@ -486,6 +616,8 @@ class ParallelAttention(MegatronModule):
                 (self.num_attention_heads_per_partition,
                  self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
+
+            # [sq, b, np, hn] -> [b, np * sq, hn]
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -508,9 +640,14 @@ class ParallelAttention(MegatronModule):
                  self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
 
+        timers("KV forward").stop()
+
         # ==================================
         # Adjust key and value for inference
         # ==================================
+
+
+        timers("Inference params").start()
 
         if inference_params:
             batch_start = inference_params.batch_size_offset
@@ -528,10 +665,14 @@ class ParallelAttention(MegatronModule):
                 :sequence_end, batch_start:batch_end, ...]
             value_layer = inference_value_memory[
                 :sequence_end, batch_start:batch_end, ...]
+        
+        timers("Inference params").stop()
 
         # ==================================
         # core attention computation
         # ==================================
+
+        timers("Core attention forward").start()
 
         if self.checkpoint_core_attention:
             context_layer = self._checkpointed_attention_forward(
@@ -539,12 +680,15 @@ class ParallelAttention(MegatronModule):
         else:
             context_layer = self.core_attention(
                 query_layer, key_layer, value_layer, attention_mask, expand_key_value=True)
+        timers("Core attention forward").stop()
 
         # =================
         # Output. [sq, b, h]
         # =================
 
+        timers("dense").start()
         output, bias = self.dense(context_layer)
+        timers("dense").stop()
 
         return output, bias
 
@@ -655,16 +799,19 @@ class ParallelTransformerLayer(MegatronModule):
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
+        timers = get_timers()
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
+        timers("attention forward").start()
         attention_output, attention_bias = \
             self.self_attention(
                 layernorm_output,
                 attention_mask,
                 inference_params=inference_params)
+        timers("attention forward").stop()
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -722,7 +869,9 @@ class ParallelTransformerLayer(MegatronModule):
             layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
 
         # MLP.
+        timers("MLP forward").start()
         mlp_output, mlp_bias = self.mlp(layernorm_output)
+        timers("MLP forward").stop()
 
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -946,6 +1095,9 @@ class ParallelTransformer(MegatronModule):
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None):
         # hidden_states: [s, b, h]
+        timers = get_timers()
+
+        timers("Transformer forward").start()
 
         # Checks.
         if inference_params:
@@ -1002,5 +1154,7 @@ class ParallelTransformer(MegatronModule):
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
+
+        timers("Transformer forward").stop()
 
         return hidden_states
