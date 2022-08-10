@@ -123,7 +123,7 @@ def segmentation():
         timers = get_timers()
 
         # Get the batch.
-        timers("batch generator").start()
+        timers("batch generator", log_level=2).start()
         import types
         if isinstance(batch, types.GeneratorType):
             batch_ = next(batch)

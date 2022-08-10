@@ -63,7 +63,7 @@ def orqa(Dataset):
         tokenizer = get_tokenizer()
 
         # Get the batch.
-        timers('batch generator').start()
+        timers('batch generator', log_level=2).start()
         try:
             batch_ = next(batch)
         except BaseException:

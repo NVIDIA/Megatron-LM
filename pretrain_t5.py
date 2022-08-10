@@ -126,7 +126,7 @@ def forward_step(data_iterator, model):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch generator', log_level=2).start()
     tokens_enc, tokens_dec, loss_mask, lm_labels, enc_mask, dec_mask, enc_dec_mask \
         = get_batch(data_iterator)
     timers('batch generator').stop()

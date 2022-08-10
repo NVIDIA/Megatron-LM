@@ -411,6 +411,32 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
+    group.add_argument('--timing-log-level', type=int,
+                       default=0, choices=range(0,3),
+                       help='Granularity level to measure and report timing. '
+                       '   0: report only iteration time and make sure timing '
+                       '      does not introduce extra overhead.'
+                       '   1: report timing for operations that are executed '
+                       '      very limited times (basically once) during '
+                       '      each iteration (such as gradient all-reduce) '
+                       '   2: report timing for operations that migh be '
+                       '      executed numerous times during each iteration. '
+                       'Note that setting the level to 1 or 2 might '
+                       'cause increase in iteration time.')
+    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
+                       help='If not set, use barrier with level 1 time '
+                       'measurements. Note that this is up to the user '
+                       'to make sure calling barrier with their timers '
+                       'will not result in hangs. This can happen if for '
+                       'example the user adds a level 1 timer that is not '
+                       'called by all ranks.',
+                       dest='barrier_with_L1_time')
+    group.add_argument('--timing-log-option', type=str, default='minmax',
+                       choices=['max', 'minmax', 'all'],
+                       help='Options for logging timing:'
+                       '  max: report the max timing across all ranks'
+                       '  minmax: report min and max timings across all ranks'
+                       '  all: report timings of all ranks.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,

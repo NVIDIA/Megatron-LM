@@ -67,7 +67,7 @@ def _cross_entropy_forward_step(batch, model):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator').start()
+    timers('batch-generator', log_level=2).start()
     try:
         batch_ = next(batch)
     except BaseException:
@@ -178,7 +178,7 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
     report_memory_flag = True
 
     # For each remaining epoch
-    timers('interval-time').start()
+    timers('interval-time', log_level=0).start(barrier=True)
     for epoch in range(start_epoch, args.epochs):
         print_rank_0('working on epoch {} ...'.format(epoch + 1))
 
@@ -261,7 +261,7 @@ def finetune(train_valid_datasets_provider, model_provider,
         'batch size scaling is not supported for finetuning'
 
     # Train and validation data loaders.
-    timers('train/valid/test dataset/dataloder').start()
+    timers('train/valid/test dataset/dataloder', log_level=0).start()
     if args.epochs > 0:
         train_dataset, valid_dataset = train_valid_datasets_provider()
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
@@ -271,21 +271,21 @@ def finetune(train_valid_datasets_provider, model_provider,
     timers('train/valid/test dataset/dataloder').stop()
 
     # Build calback function.
-    timers('callback function').start()
+    timers('callback function', log_level=0).start()
     end_of_epoch_callback = None
     if end_of_epoch_callback_provider is not None:
         end_of_epoch_callback = end_of_epoch_callback_provider()
     timers('callback function').stop()
 
     # Build model, optimizer and learning rate scheduler.
-    timers('model and optimizer').start()
+    timers('model and optimizer', log_level=0).start()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider, model_type)
     timers('model and optimizer').stop()
 
     # If pretrained checkpoint is provided and we have not trained for
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
-    timers('pretrained checkpoint').start()
+    timers('pretrained checkpoint', log_level=0).start(barrier=True)
     if args.iteration == 0 and args.pretrained_checkpoint is not None:
         original_load = args.load
         args.load = args.pretrained_checkpoint
@@ -302,7 +302,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # Print setup timing.
     print_rank_0('done with setups ...')
     timers.log(['train/valid/test dataset/dataloder', 'callback function',
-                'model and optimizer', 'pretrained checkpoint'])
+                'model and optimizer', 'pretrained checkpoint'], barrier=True)
     print_rank_0('training ...')
 
     # Finetune the model.
