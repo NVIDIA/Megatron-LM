@@ -77,7 +77,7 @@ def forward_step(data_iterator, model):
     timers = get_timers()
 
     # Get the batch.
-    timers("batch-generator").start()
+    timers("batch-generator", log_level=2).start()
     (
         images,
         labels,

@@ -532,17 +532,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # All-reduce layer-norm grads (for sequence parallelism).
-        timers('backward-layernorm-all-reduce').start()
+        timers('layernorm-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_layernorm_grads(args)
-        timers('backward-layernorm-all-reduce').stop()
+        timers('layernorm-grads-all-reduce').stop()
 
         # All-reduce embedding grads.
-        timers('backward-embedding-all-reduce').start()
+        timers('embedding-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
-        timers('backward-embedding-all-reduce').stop()
+        timers('embedding-grads-all-reduce').stop()
 
         # Reduce-scatter setup.
-        timers('backward-params-all-reduce').start()
+        timers('grads-reduce-scatter', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
         data_parallel_group = mpu.get_data_parallel_group()
@@ -563,7 +566,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 group = data_parallel_group,
             )
 
-        timers('backward-params-all-reduce').stop()
+        timers('grads-reduce-scatter').stop()
 
 
     def gather_model_params(self, args, timers):
@@ -575,7 +578,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         can be copied from param.main_grad to param.
         """
 
-        timers('backward-params-all-gather').start()
+        timers('params-all-gather', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
 
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_group = mpu.get_data_parallel_group()
@@ -602,7 +606,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for param in param_map:
                     param.detach().copy_(param.main_grad)
 
-        timers('backward-params-all-gather').stop()
+        timers('params-all-gather').stop()
 
 
     def _collect_main_grad_data_for_unscaling(self):

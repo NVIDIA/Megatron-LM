@@ -294,21 +294,24 @@ class MegatronOptimizer(ABC):
         """All-reduce all grads, and all-reduce embeddings."""
 
         # All-reduce layer-norm grads (for sequence parallelism).
-        timers('backward-layernorm-all-reduce').start()
+        timers('layernorm-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_layernorm_grads(args)
-        timers('backward-layernorm-all-reduce').stop()
+        timers('layernorm-grads-all-reduce').stop()
 
         # All-reduce if needed.
         if args.DDP_impl == 'local':
-            timers('backward-params-all-reduce').start()
+            timers('grads-all-reduce', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
             for model in self.models:
                 model.allreduce_gradients()
-            timers('backward-params-all-reduce').stop()
+            timers('grads-all-reduce').stop()
 
         # All-reduce embedding grads.
-        timers('backward-embedding-all-reduce').start()
+        timers('embedding-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
-        timers('backward-embedding-all-reduce').stop()
+        timers('embedding-grads-all-reduce').stop()
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -416,7 +419,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self, args, timers):
 
         # Copy gradients from model params to main params.
-        timers('optimizer-copy-to-main-grad').start()
+        timers('optimizer-copy-to-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
@@ -425,7 +429,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler:
 
             # Unscale and check for inf/nan.
-            timers('optimizer-unscale-and-check-inf').start()
+            timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
             timers('optimizer-unscale-and-check-inf').stop()
 
@@ -438,25 +443,29 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 return False, None, None
 
         # Clip the main gradients.
-        timers('optimizer-clip-main-grad').start()
+        timers('optimizer-clip-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # Count the zeros in the grads.
-        timers('optimizer-count-zeros').start()
+        timers('optimizer-count-zeros', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
 
         # Step the optimizer.
-        timers('optimizer-inner-step').start()
+        timers('optimizer-inner-step', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
 
         # Update params from main params.
-        timers('optimizer-copy-main-to-model-params').start()
+        timers('optimizer-copy-main-to-model-params', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
 
@@ -725,7 +734,8 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
 
         # Copy main_grads to grads.
-        timers('optimizer-copy-to-main-grad').start()
+        timers('optimizer-copy-to-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         if self.params_have_main_grad:
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
@@ -739,20 +749,23 @@ class FP32Optimizer(MegatronOptimizer):
         timers('optimizer-copy-to-main-grad').stop()
 
         # Clip gradients.
-        timers('optimizer-clip-main-grad').start()
+        timers('optimizer-clip-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
-        timers('optimizer-count-zeros').start()
+        timers('optimizer-count-zeros', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
 
         # Update parameters.
-        timers('optimizer-inner-step').start()
+        timers('optimizer-inner-step', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
 

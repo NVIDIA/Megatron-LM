@@ -134,7 +134,7 @@ def forward_step(data_iterator, model):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator').start()
+    timers('batch-generator', log_level=2).start()
     query_tokens, query_mask, \
     context_tokens, context_mask, context_indices = get_ict_batch(data_iterator)
     timers('batch-generator').stop()
