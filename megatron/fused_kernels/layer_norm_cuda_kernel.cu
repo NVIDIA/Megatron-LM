@@ -246,14 +246,25 @@ void cuWelfordMuSigma2(
     }
   }
 }
-
+#ifndef __HIP_PLATFORM_HCC__
 template<typename U> U rsqrt(U v) {
+#else
+template<typename U> __device__ U rsqrt(U v) {
+#endif
   return U(1) / sqrt(v);
 }
+#ifndef __HIP_PLATFORM_HCC__
 template<> float rsqrt(float v) {
+#else
+template<> __device__ float rsqrt(float v) {
+#endif
   return rsqrtf(v);
 }
+#ifndef __HIP_PLATFORM_HCC__
 template<> double rsqrt(double v) {
+#else
+template<> __device__ double rsqrt(double v) {
+#endif
   return rsqrt(v);
 }
 
@@ -304,7 +315,11 @@ void cuApplyLayerNorm(
   // 1) blockDim.x == warpSize
   // 2) Tensors are contiguous
   //
+#ifndef __HIP_PLATFORM_HCC__
   for (auto i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+#else
+  for (int i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+#endif
     SharedMemory<U> shared;
     U* buf = shared.getPointer();
     U mu,sigma2;
@@ -543,7 +558,11 @@ void cuComputeGradInput(
     const V* gamma,
     T* grad_input)
 {
+#ifndef __HIP_PLATFORM_HCC__
   for (auto i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+#else
+  for (int i1=blockIdx.y; i1 < n1; i1 += gridDim.y) {
+#endif
     U sum_loss1 = U(0);
     U sum_loss2 = U(0);
     const U c_mean = mean[i1];
