@@ -174,6 +174,7 @@ def parse_args(extra_args_provider=None, defaults={},
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
     args.consumed_train_tokens = 0
+    args.custom_token_counting = False
 
     # Iteration-based training.
     if args.train_iters:

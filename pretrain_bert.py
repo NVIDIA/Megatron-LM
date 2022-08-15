@@ -36,6 +36,7 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building BERT model ...')
 
     args = get_args()
+    args.custom_token_counting = True
     num_tokentypes = 2 if args.bert_binary_head else 0
     model = BertModel(
         num_tokentypes=num_tokentypes,
@@ -108,6 +109,11 @@ def forward_step(data_iterator, model):
     tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
         data_iterator)
     timers('batch-generator').stop()
+
+    effective_train_tokens = torch.count_nonzero(padding_mask)
+    torch.distributed.all_reduce(effective_train_tokens,
+        group=mpu.get_data_parallel_group())
+    args.consumed_train_tokens += effective_train_tokens.item()
 
     if not args.bert_binary_head:
         types = None

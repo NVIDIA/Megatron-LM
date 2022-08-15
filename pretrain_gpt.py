@@ -202,7 +202,7 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
         mos_loss = mos_loss.div(args.seq_length) * beta
     return mos_loss
 
-def forward_step(data_iterator, model, teacher_model=None):
+def forward_step(data_iterator, model):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -235,7 +235,9 @@ def forward_step(data_iterator, model, teacher_model=None):
     mos_loss = 0
     if args.mos or args.kd:
         assert model.training
-        mos_loss = calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, attention_mask)
+        if args.teacher_forward and args.teacher_model is not None:
+            mos_loss = calculate_mos_loss(args, stu_output,
+                args.teacher_model[0], tokens, position_ids, attention_mask)
     
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
     return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)

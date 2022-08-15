@@ -47,7 +47,7 @@ def get_language_model(num_tokentypes, add_pooler,
                        encoder_attn_mask_type, init_method=None,
                        scaled_init_method=None, add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
-                       pre_process=True, post_process=True, num_experts=1):
+                       pre_process=True, post_process=True, num_experts=[1]):
     """Build language model and return along with the key to save."""
     args = get_args()
 
@@ -312,7 +312,7 @@ class TransformerLanguageModel(MegatronModule):
                  add_pooler=False,
                  pre_process=True,
                  post_process=True,
-                 num_experts=1):
+                 num_experts=[1]):
         super(TransformerLanguageModel, self).__init__()
         args = get_args()
 

@@ -152,9 +152,13 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
-    teacher_model = None
+    # args.teacher_model is used as global variable to pass the teacher model
+    # for knowledge distillation. Users do not need to set it in the command
+    # line to use kd, but users do need to provide teacher model configurations
+    # like args.num_layers_teacher as described in setup_teacher_model()
+    args.teacher_model = None
     if args.mos or args.kd: # Set up teacher model
-        teacher_model = setup_teacher_model(args, model_provider)
+        args.teacher_model = setup_teacher_model(args, model_provider)
 
     # Print setup timing.
     print_rank_0('done with setup ...')
@@ -165,8 +169,7 @@ def pretrain(train_valid_test_dataset_provider,
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, lr_scheduler,
-                          train_data_iterator, valid_data_iterator, 
-                          teacher_model=teacher_model)
+                          train_data_iterator, valid_data_iterator)
     print_datetime('after training is done')
 
     if args.do_valid:
@@ -193,7 +196,7 @@ def pretrain(train_valid_test_dataset_provider,
         prefix = 'the end of training for test data'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
-                                   0, True)
+                                   0, True, test=True)
 
 def update_train_iters(args):
 
@@ -508,7 +511,7 @@ def setup_model_and_optimizer(model_provider_func, teacher=False):
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, lr_scheduler, teacher_model=None):
+               model, optimizer, lr_scheduler):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -539,9 +542,16 @@ def train_step(forward_step_func, data_iterator,
             forward_backward_func = forward_backward_pipelining_without_interleaving
     else:
         forward_backward_func = forward_backward_no_pipelining
+    if args.mos or args.kd:
+        # args.teacher_forward is used as global variable to enable kd loss
+        # calculation in forward pass. Users do not need to set it in the
+        # command line to use kd.
+        args.teacher_forward = True
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
-        optimizer, timers, forward_only=False, teacher_model=teacher_model)
+        optimizer, timers, forward_only=False)
+    if args.mos or args.kd:
+        args.teacher_forward = False
 
     # All-reduce if needed.
     if not args.deepspeed and args.DDP_impl == 'local':
@@ -897,7 +907,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, lr_scheduler):
 
 
 def train(forward_step_func, model, optimizer, lr_scheduler,
-          train_data_iterator, valid_data_iterator, teacher_model=None):
+          train_data_iterator, valid_data_iterator):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -936,18 +946,20 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
                        train_data_iterator,
                        model,
                        optimizer,
-                       lr_scheduler,
-                       teacher_model=teacher_model)
+                       lr_scheduler)
         iteration += 1
         args.iteration = iteration
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
         args.consumed_train_samples += new_samples
-        if args.curriculum_learning:
-            args.consumed_train_tokens += new_samples * args.curriculum_seqlen
-        else:
-            args.consumed_train_tokens += new_samples * args.seq_length
+        if not args.custom_token_counting:
+            # Models like BERT have padding thus need special token counting.
+            # See example in ../../pretrain_bert.py.
+            if args.curriculum_learning:
+                args.consumed_train_tokens += new_samples * args.curriculum_seqlen
+            else:
+                args.consumed_train_tokens += new_samples * args.seq_length
 
         # Logging.
         if args.deepspeed:
@@ -1089,7 +1101,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
-                               iteration, verbose=False):
+                               iteration, verbose=False, test=False):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
     writer = get_tensorboard_writer()
@@ -1101,21 +1113,22 @@ def evaluate_and_print_results(prefix, forward_step_func,
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
         if writer and is_last_rank():
-            writer.add_scalar(f'lm-loss-validation/{key} validation',
+            data_type = 'test' if test else 'validation'
+            writer.add_scalar(f'lm-loss-validation/{key} {data_type}',
                               total_loss_dict[key].item(),
                               iteration)
-            writer.add_scalar(f'lm-loss-validation/{key} validation vs samples',
+            writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs samples',
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
-            writer.add_scalar(f'lm-loss-validation/{key} validation vs tokens',
+            writer.add_scalar(f'lm-loss-validation/{key} {data_type} vs tokens',
                               total_loss_dict[key].item(),
                               args.consumed_train_tokens)
             if args.log_validation_ppl_to_tensorboard:
-                writer.add_scalar(f'lm-loss-validation/{key} validation ppl', ppl,
+                writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl', ppl,
                                   iteration)
-                writer.add_scalar(f'lm-loss-validation/{key} validation ppl vs samples',
+                writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs samples',
                                   ppl, args.consumed_train_samples)
-                writer.add_scalar(f'lm-loss-validation/{key} validation ppl vs tokens',
+                writer.add_scalar(f'lm-loss-validation/{key} {data_type} ppl vs tokens',
                                   ppl, args.consumed_train_tokens)
 
     length = len(string) + 1

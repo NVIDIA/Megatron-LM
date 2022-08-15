@@ -39,7 +39,7 @@ def get_forward_backward_func():
     return forward_backward_func
 
 
-def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_reduced, teacher_model=None):
+def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_reduced):
     """Forward step for passed-in model.
 
     If first stage, input tensor is obtained from data_iterator, otherwise
@@ -58,7 +58,11 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
     else:
         unwrapped_model.module.set_input_tensor(input_tensor)
 
-    output_tensor, loss_func = forward_step_func(data_iterator, model, teacher_model)
+    # Note: it's recommended to NOT add any new argument to forward_step_func()
+    # because it is an abstract API used by many different models and tasks.
+    # Changing this API requires changing it in all models/tasks. Instead,
+    # it's recommended to use args to pass additional arguments.
+    output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
         loss, loss_reduced = output_tensor
@@ -119,16 +123,13 @@ def dummy_handler():
 
 
 def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
-                                   optimizer, timers, forward_only, teacher_model=None):
+                                   optimizer, timers, forward_only):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
 
     Returns dictionary with losses."""
     assert len(model) == 1
     model = model[0]
-
-    if teacher_model:
-        teacher_model = teacher_model[0]
 
     args = get_args()
 
@@ -144,7 +145,7 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     with context_handler():
         for i in range(get_num_microbatches() - 1):
             output_tensor = forward_step(forward_step_func, data_iterator, model,
-                                         input_tensor, losses_reduced, teacher_model)
+                                         input_tensor, losses_reduced)
             if not forward_only:
                 backward_step(optimizer, input_tensor, output_tensor,
                               output_tensor_grad, model)
@@ -155,7 +156,7 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator, model,
-                                 input_tensor, losses_reduced, teacher_model)
+                                 input_tensor, losses_reduced)
     if not forward_only:
         backward_step(optimizer, input_tensor, output_tensor, output_tensor_grad, model)
 
@@ -163,13 +164,11 @@ def forward_backward_no_pipelining(forward_step_func, data_iterator, model,
 
 
 def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterator, model,
-                                                  optimizer, timers, forward_only, teacher_model=None):
+                                                  optimizer, timers, forward_only):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
-    
-    assert teacher_model is None, 'MoS has not been supported in pipeline parallelism'
     
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
@@ -389,13 +388,11 @@ def forward_backward_pipelining_with_interleaving(forward_step_func, data_iterat
 
 def forward_backward_pipelining_without_interleaving(forward_step_func, data_iterator,
                                                      model, optimizer, timers,
-                                                     forward_only, teacher_model=None):
+                                                     forward_only):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
-    
-    assert teacher_model is None, 'MoS has not been supported in pipeline parallelism'
     
     timers = get_timers()
 

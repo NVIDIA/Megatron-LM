@@ -183,7 +183,7 @@ class BertModel(MegatronModule):
         )
 
         if self.post_process and self.add_binary_head:
-            lm_output, pooled_output = lm_output
+            lm_output, pooled_output = lm_output[0], lm_output[1]
         else:
             pooled_output = None
 

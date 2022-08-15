@@ -79,7 +79,7 @@ class Classification(MegatronModule):
         )
 
         if self.post_process:
-            _, pooled_output = lm_output
+            _, pooled_output = lm_output[0], lm_output[1]
             classification_output = self.classification_dropout(pooled_output)
             classification_logits = self.classification_head(classification_output)
 

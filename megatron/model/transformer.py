@@ -662,12 +662,12 @@ class ParallelTransformer(MegatronModule):
             # Each stage gets a contiguous set of layers.
             offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
             
-        assert len(num_experts) == 1 or len(num_experts) == self.num_layers // args.expert_interval, \
+        assert len(num_experts) == 1 or len(num_experts) == args.num_layers // args.expert_interval, \
         'num_experts must be either a single value or a list of the same length as the number of MoE layers'
 
         # Create the list of MoE experts
         if len(num_experts) == 1:
-            num_experts = num_experts * (self.num_layers // args.expert_interval)
+            num_experts = num_experts * (args.num_layers // args.expert_interval)
 
         self.layers = []
         # Build the layers

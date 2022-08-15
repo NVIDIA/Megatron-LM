@@ -195,10 +195,13 @@ def _train(model, optimizer, lr_scheduler, forward_step,
             params_norm = None
             if args.log_params_norm:
                 params_norm = calc_params_l2_norm(model)
+            if args.deepspeed:
+                loss_scale = model[0].optimizer.cur_scale
+            else:
+                loss_scale = optimizer.get_loss_scale().item()
             report_memory_flag = training_log(losses_dict, losses_dict_sum,
                                               optimizer.param_groups[0]['lr'],
-                                              iteration,
-                                              optimizer.get_loss_scale().item(),
+                                              iteration, loss_scale,
                                               report_memory_flag, skipped_iter,
                                               grad_norm, params_norm, num_zeros_in_grad)
 
@@ -271,8 +274,10 @@ def finetune(train_valid_datasets_provider, model_provider,
         _ = load_checkpoint(model, None, None)
         args.load = original_load
         # This is critical when only model is loaded. We should make sure
-        # main parameters are also updated.
-        optimizer.reload_model_params()
+        # main parameters are also updated. When DeepSpeed is enabled,
+        # DeepSpeed engine will handle this.
+        if not args.deepspeed:
+            optimizer.reload_model_params()
     timers('pretrained checkpoint').stop()
 
     # Print setup timing.
