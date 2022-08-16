@@ -44,7 +44,7 @@ torch::Tensor fwd_cuda(
   const int attn_heads = input.size(1);
   const int query_seq_len = input.size(2);
   const int key_seq_len = input.size(3);
-  TORCH_INTERNAL_ASSERT(key_seq_len <= 4096);
+  TORCH_INTERNAL_ASSERT(key_seq_len <= 8192);
   TORCH_INTERNAL_ASSERT(query_seq_len > 1);
   TORCH_INTERNAL_ASSERT(pad_batches == 1 || pad_batches == batches);
   TORCH_INTERNAL_ASSERT(mask.size(1) == 1);
@@ -82,7 +82,7 @@ torch::Tensor bwd_cuda(
     torch::Tensor const& output_grads_, 
     torch::Tensor const& softmax_results_, 
     float scale_factor)  {
-	
+
   auto output_grads = output_grads_.contiguous();
   auto softmax_results = softmax_results_.contiguous();
 

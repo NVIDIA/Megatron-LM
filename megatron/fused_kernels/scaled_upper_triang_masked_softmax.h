@@ -340,7 +340,7 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 8192 );
     if (softmax_elements == 0) {
         return;
     } else {
@@ -431,7 +431,7 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 8192 );
     if (softmax_elements == 0) {
        return;
     } else {

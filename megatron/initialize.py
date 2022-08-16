@@ -126,7 +126,7 @@ def _compile_dependencies():
         args.micro_batch_size
     # Constraints on sequence length and attn_batch_size to enable warp based
     # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = seq_len > 16 and seq_len <=4096 and \
+    custom_kernel_constraint = seq_len > 16 and seq_len <=8192 and \
         seq_len % 4 == 0 and attn_batch_size % 4 == 0
     # Print a warning.
     if not ((args.fp16 or args.bf16) and
