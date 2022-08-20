@@ -90,7 +90,7 @@ class MultipleChoice(MegatronModule):
             tokentype_ids=tokentype_ids
         )
         if self.post_process:
-            _, pooled_output = lm_output
+            _, pooled_output = lm_output[0], lm_output[1]
             multichoice_output = self.multichoice_dropout(pooled_output)
             multichoice_logits = self.multichoice_head(multichoice_output)
 
