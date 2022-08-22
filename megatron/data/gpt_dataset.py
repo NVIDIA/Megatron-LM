@@ -21,7 +21,7 @@ import time
 import numpy as np
 import torch
 
-from megatron import mpu, print_rank_0
+from megatron import mpu, get_args, print_rank_0
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
@@ -212,7 +212,12 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     shuffle_idx_filename = _filename + '_shuffle_idx.npy'
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0:
+    args = get_args()
+    if args.distributed_file_system:
+        is_index_mapper = torch.distributed.get_rank() == 0
+    else:
+        is_index_mapper = args.local_rank == 0
+    if is_index_mapper:
         if (not os.path.isfile(doc_idx_filename)) or \
            (not os.path.isfile(sample_idx_filename)) or \
            (not os.path.isfile(shuffle_idx_filename)):

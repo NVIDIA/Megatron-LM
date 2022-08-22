@@ -662,8 +662,12 @@ def get_samples_mapping(indexed_dataset,
     indexmap_filename += '.npy'
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0 and \
-       not os.path.isfile(indexmap_filename):
+    args = get_args()
+    if args.distributed_file_system:
+        is_index_mapper = torch.distributed.get_rank() == 0
+    else:
+        is_index_mapper = args.local_rank == 0
+    if is_index_mapper and not os.path.isfile(indexmap_filename):
         print(' > WARNING: could not find index map file {}, building '
               'the indices on rank 0 ...'.format(indexmap_filename))
 

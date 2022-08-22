@@ -784,6 +784,11 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--no-distributed-file-system',
+                       action='store_false',
+                       help='Assume there is no shared file system (i.e., each node has an isolated disk).',
+                       dest='distributed_file_system')
+
 
     return parser
 

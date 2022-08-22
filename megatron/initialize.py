@@ -59,7 +59,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         load_args_from_checkpoint(args)
 
     validate_args(args, args_defaults)
-        
+
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
     set_global_variables(args)
@@ -69,21 +69,21 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed()
-        
+
         # Random seeds for reproducibility.
         if args.rank == 0:
             print('> setting random seeds to {} ...'.format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
 
     args = get_args()
-    if  args.lazy_mpu_init:
+    if args.lazy_mpu_init:
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
         # We only set basic DDP globals    
         set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        set_tensor_model_parallel_rank(args.rank)    
+        set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -106,8 +106,13 @@ def _compile_dependencies():
     # =========================
     # Compile dataset C++ code.
     # =========================
+    if args.distributed_file_system:
+        is_compile_worker = torch.distributed.get_rank() == 0
+    else:
+        is_compile_worker = args.local_rank == 0
+
     # TODO: move this to ninja
-    if torch.distributed.get_rank() == 0:
+    if is_compile_worker:
         start_time = time.time()
         print('> compiling dataset index builder ...')
         from megatron.data.dataset_utils import compile_helper
@@ -136,9 +141,9 @@ def _compile_dependencies():
             print('WARNING: constraints for invoking optimized'
                   ' fused softmax kernel are not met. We default'
                   ' back to unfused kernel invocations.', flush=True)
-    
+
     # Always build on rank zero first.
-    if torch.distributed.get_rank() == 0:
+    if is_compile_worker:
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
         fused_kernels.load(args)
@@ -151,7 +156,7 @@ def _compile_dependencies():
     # rest of the program. We think this might ensure that
     # the lock is released.
     torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
+    if is_compile_worker:
         print('>>> done with compiling and loading fused kernels. '
               'Compilation time: {:.3f} seconds'.format(
                   time.time() - start_time), flush=True)
