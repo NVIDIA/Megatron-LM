@@ -293,7 +293,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         iteration, args.save))
 
     # And update the latest iteration
-    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    if not torch.distributed.is_initialized():
+        is_iteration_tracker = True
+    else:
+        if args.distributed_file_system:
+            is_iteration_tracker = torch.distributed.get_rank() == 0
+        else:
+            is_iteration_tracker = args.local_rank == 0
+    if is_iteration_tracker:
         tracker_filename = get_checkpoint_tracker_filename(args.save)
         with open(tracker_filename, 'w') as f:
             f.write(str(iteration))
