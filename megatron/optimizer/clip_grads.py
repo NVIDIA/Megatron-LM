@@ -66,6 +66,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
 
     # Calculate norm.
     if norm_type == inf:
+        # NOTE: 'inf' norm not yet implemented for expert parallelism.
         assert not ep_grads_for_norm
         total_norm = max(grad.abs().max() for grad in grads_for_norm)
         total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
