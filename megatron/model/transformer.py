@@ -475,6 +475,7 @@ class ParallelAttention(MegatronModule):
                 gather_output=False,
                 init_method=init_method)
         elif attention_type == AttnType.self_attn and self.attention_head_type == 'multiquery':
+            # TODO: Find a way to merge the query and key-value computations?
             self.query = mpu.ColumnParallelLinear(
                 args.hidden_size,
                 projection_size,
@@ -488,9 +489,7 @@ class ParallelAttention(MegatronModule):
                 args.hidden_size,
                 2 * args.kv_channels,
                 init_method=init_method)
-            print(f"KV WEIGHT {layer_number}", self.key_value.weight)
-        # TODO: add elif block for cross_attn and multiquery?
-        else:
+        elif attention_type == AttnType.cross_attn and self.attention_head_type == 'multihead':
             assert attention_type == AttnType.cross_attn
             self.query = mpu.ColumnParallelLinear(
                 args.hidden_size,
@@ -503,6 +502,8 @@ class ParallelAttention(MegatronModule):
                 2 * projection_size,
                 gather_output=False,
                 init_method=init_method)
+        else:
+            raise NotImplementedError("Multiquery attention not implemented for cross-attention.")
 
         if self.attention_head_type == 'multihead':
             self.core_attention = CoreAttention(self.layer_number,
