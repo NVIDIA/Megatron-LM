@@ -214,7 +214,7 @@ class CoreAttention(MegatronModule):
         self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
 
     def forward(self, query_layer, key_layer,
-                value_layer, attention_mask, expand_key_value=False):
+                value_layer, attention_mask):
         timers = get_timers()
         # ===================================
         # Raw attention scores. [b, np, s, s]
@@ -231,14 +231,9 @@ class CoreAttention(MegatronModule):
         query_layer = query_layer.view(output_size[2],
                                        output_size[0] * output_size[1], -1)
         timers("CoreAttention: K view/reshape").start()
-        if expand_key_value:
-            # [sk, b, 1, hn] -> [sk, b * np, hn]
-            key_layer = key_layer.expand(output_size[3], output_size[0], np, -1)
-            key_layer = key_layer.reshape(output_size[3], output_size[0] * np, -1)
-        else:
-            # [sk, b, np, hn] -> [sk, b * np, hn]
-            key_layer = key_layer.view(output_size[3],
-                                    output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3],
+                                   output_size[0] * output_size[1], -1)
         timers("CoreAttention: K view/reshape").stop()
 
         # preallocting input tensor: [b * np, sq, sk]
@@ -291,14 +286,9 @@ class CoreAttention(MegatronModule):
                        value_layer.size(3))
 
         timers("CoreAttention: V view/reshape").start()
-        # [sk, b, 1, hn] -> [sk, b * np, hn]
-        if expand_key_value:
-            value_layer = value_layer.expand(value_layer.size(0), value_layer.size(1), np, -1)
-            value_layer = value_layer.reshape(value_layer.size(0), value_layer.size(1) * np, -1)
-        else:
-            # change view [sk, b * np, hn]
-            value_layer = value_layer.view(value_layer.size(0),
-                                        output_size[0] * output_size[1], -1)
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0),
+                                       output_size[0] * output_size[1], -1)
         timers("CoreAttention: V view/reshape").stop()
 
         # change view [b * np, sq, sk]
@@ -331,7 +321,7 @@ class MultiQueryCoreAttention(CoreAttention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask, expand_key_value=False):
+    def forward(self, query_layer, key_layer, value_layer, attention_mask):
         timers = get_timers()
         # ===================================
         # Raw attention scores. [b, np, s, s]
@@ -521,7 +511,7 @@ class ParallelAttention(MegatronModule):
             skip_bias_add=True)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
-                                        value_layer, attention_mask, expand_key_value):
+                                        value_layer, attention_mask):
         """Forward method with activation checkpointing."""
         def custom_forward(*inputs):
             query_layer = inputs[0]
@@ -529,7 +519,7 @@ class ParallelAttention(MegatronModule):
             value_layer = inputs[2]
             attention_mask = inputs[3]
             output_ = self.core_attention(query_layer, key_layer,
-                                          value_layer, attention_mask, expand_key_value)
+                                          value_layer, attention_mask)
             return output_
 
         hidden_states = mpu.checkpoint(
@@ -677,10 +667,10 @@ class ParallelAttention(MegatronModule):
 
         if self.checkpoint_core_attention:
             context_layer = self._checkpointed_attention_forward(
-                query_layer, key_layer, value_layer, attention_mask, expand_key_value=True)
+                query_layer, key_layer, value_layer, attention_mask)
         else:
             context_layer = self.core_attention(
-                query_layer, key_layer, value_layer, attention_mask, expand_key_value=True)
+                query_layer, key_layer, value_layer, attention_mask)
         timers("Core attention forward").stop()
 
         # =================
