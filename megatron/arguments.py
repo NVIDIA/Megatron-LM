@@ -454,6 +454,9 @@ def _add_logging_args(parser):
                         help="Name of wandb entity for reporting")
     group.add_argument('--wandb-project-name', type=str, default=None,
                         help="Name of wandb project")
+    group.add_argument('--transformer-timers', action='store_true',
+                        help="If set, activate the timers within the transformer layers."
+                        "Only for debugging, as this slows down the model.")
 
     return parser
 
