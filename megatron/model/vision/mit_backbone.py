@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from functools import partial
 from torch.nn.init import trunc_normal_
 from megatron.model.transformer import DropPath
-from megatron.model import LayerNorm
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 
 
 class Mlp(nn.Module):
