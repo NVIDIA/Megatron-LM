@@ -254,6 +254,7 @@ class CoreAttention(MegatronModule):
                 (output_size[0]*output_size[1], output_size[2], output_size[3]),
                 query_layer.dtype, "mpu")
         else:
+            # alibi: (batch_size * num_attention_heads, 1, max_seq_len)
             matmul_input_buffer = alibi[:output_size[0]*output_size[1], :, :output_size[3]]
 
         # Raw attention scores. [b * np, sq, sk]
@@ -342,7 +343,7 @@ class MultiQueryCoreAttention(CoreAttention):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+    def forward(self, query_layer, key_layer, value_layer, attention_mask, alibi):
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
@@ -368,17 +369,39 @@ class MultiQueryCoreAttention(CoreAttention):
         # key_layer = key_layer.expand(output_size[3], output_size[0], np, -1)
         # key_layer = key_layer.reshape(output_size[3], output_size[0] * np, -1)
 
-        # preallocting input tensor: [b, np * sq, sk]
-        matmul_input_buffer = get_global_memory_buffer().get_tensor(
-            (bs, np * sq, sk),
-            query_layer.dtype, "mpu")
+        if alibi is None:
+            # preallocting input tensor: [b, np * sq, sk]
+            matmul_input_buffer = get_global_memory_buffer().get_tensor(
+                (bs, np * sq, sk),
+                query_layer.dtype, "mpu")
+        else:
+            # alibi: (batch_size * num_attention_heads, 1, max_seq_len)
+            # TODO: ideally, alibi would have the shape: (1, num_heads * sq, sk)
+            matmul_input_buffer = alibi[:bs * np, :, :sk].view(bs, np, sk)
+            matmul_input_buffer = matmul_input_buffer.repeat(1, sq, 1)  # [b, np * sq, sk]
 
-        # Raw attention scores. [b, np * sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_input_buffer,
-            query_layer,   # [b, np * sq, hn]
-            key_layer,  # [b, hn, sk]
-            beta=0.0, alpha=(1.0/self.norm_factor))
+        if alibi is None:
+            # Raw attention scores. [b, np * sq, sk]
+            matmul_result = torch.baddbmm(
+                matmul_input_buffer,
+                query_layer,   # [b, np * sq, hn]
+                key_layer,  # [b, hn, sk]
+                beta=0.0, alpha=(1.0/self.norm_factor))
+        else:
+            if not hasattr(self, "logged_alibi"):
+                print("Using Alibi.")
+                self.logged_alibi = True
+
+            if self.apply_query_key_layer_scaling:
+                beta = 1.0 / self.layer_number
+            else:
+                beta = 1.0
+
+            matmul_result = torch.baddbmm(
+                matmul_input_buffer,
+                query_layer,
+                key_layer,
+                beta=beta, alpha=(1.0 / self.norm_factor))
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(bs, np, sq, sk)
