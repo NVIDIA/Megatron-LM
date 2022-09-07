@@ -24,7 +24,6 @@ import torch
 
 from megatron import dist_signal_handler
 from megatron.tokenizer import build_tokenizer
-from .arguments import parse_args
 from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
@@ -116,6 +115,7 @@ def set_global_variables(extra_args_provider=None, args_defaults={},
 def _parse_args(extra_args_provider=None, defaults={},
                 ignore_unknown_args=False):
     """Parse entire arguments."""
+    from .arguments import parse_args
     global _GLOBAL_ARGS
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
     _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
