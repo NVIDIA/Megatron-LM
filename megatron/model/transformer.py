@@ -228,12 +228,8 @@ class CoreAttention(MegatronModule):
         self.attention_dropout = torch.nn.Dropout(args.attention_dropout)
 
     def forward(self, query_layer, key_layer,
-<<<<<<< HEAD
-                value_layer, attention_mask):
-=======
                 value_layer, attention_mask, alibi):
 
->>>>>>> load-iter
         # ===================================
         # Raw attention scores. [b, np, s, s]
         # ===================================
