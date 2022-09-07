@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-from megatron.enums import LayerType, AttnMaskType, PositionEmbeddingType
+from megatron.model.enums import LayerType, AttnMaskType, PositionEmbeddingType
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal

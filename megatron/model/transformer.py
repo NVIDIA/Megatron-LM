@@ -23,7 +23,7 @@ from torch import nn
 from megatron import get_timers, get_args, get_global_memory_buffer
 from megatron import mpu
 from .module import MegatronModule
-from megatron.enums import AttnMaskType, ModelType, LayerType, AttnType, PositionEmbeddingType
+from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType, PositionEmbeddingType
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
