@@ -61,7 +61,12 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-    _compare('position_embedding_type')
+    try:
+        _compare('position_embedding_type')
+    except AttributeError as e:
+        print_rank_0(f"  Warning, trying to load an old checkpoint: {e}")
+        assert args.position_embedding_type == PositionEmbeddingType.absolute, \
+            f"Checkpoint uses PositionEmbeddingType.absolute, but input argument value was: {args.position_embedding_type}"
     # with alibi we can change `max_position_embeddings`
     if args.position_embedding_type != PositionEmbeddingType.alibi:
         _compare('max_position_embeddings')
