@@ -105,17 +105,17 @@ class GPTModel(MegatronModule):
         else:
             return lm_output
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+                prefix=prefix, keep_vars=keep_vars)
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
-                = self.word_embeddings.state_dict(destination, prefix, keep_vars)
+                = self.word_embeddings.state_dict(prefix=prefix,
+                                                  keep_vars=keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):

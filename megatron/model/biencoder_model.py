@@ -139,25 +139,23 @@ class BiEncoderModel(MegatronModule):
                               token_types)
         return logits
 
-    def state_dict_for_save_checkpoint(self, destination=None, \
-        prefix='', keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
         if self.biencoder_shared_query_context_model:
             state_dict_[self._model_key] = \
-                self.model.state_dict_for_save_checkpoint(destination,
-                                                          prefix,
-                                                          keep_vars)
+                self.model.state_dict_for_save_checkpoint(
+                    prefix=prefix, keep_vars=keep_vars)
         else:
             if self.use_query_model:
                 state_dict_[self._query_key] = \
                     self.query_model.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                        prefix=prefix, keep_vars=keep_vars)
 
             if self.use_context_model:
                 state_dict_[self._context_key] = \
                     self.context_model.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                        prefix=prefix, keep_vars=keep_vars)
 
         return state_dict_
 
@@ -302,19 +300,19 @@ class PretrainedBertModel(MegatronModule):
 
         return pooled_output
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+                prefix=prefix, keep_vars=keep_vars)
 
         if self.biencoder_projection_dim > 0:
             state_dict_[self._projection_enc_key] = \
-                self.projection_enc.state_dict(destination, prefix, keep_vars)
+                self.projection_enc.state_dict(prefix=prefix,
+                                               keep_vars=keep_vars)
 
         return state_dict_
 
