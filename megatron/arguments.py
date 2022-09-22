@@ -839,6 +839,21 @@ def _add_data_args(parser):
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
+    group.add_argument('--train-data-path', nargs='*', default=None,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--valid-data-path', nargs='*', default=None,
+                       help='Path to the validation dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--test-data-path', nargs='*', default=None,
+                       help='Path to the test dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
