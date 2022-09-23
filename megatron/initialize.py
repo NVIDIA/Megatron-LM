@@ -15,6 +15,7 @@ from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
 from megatron import mpu
+from megatron import core
 from megatron.arguments import (parse_args, validate_args)
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
@@ -187,6 +188,14 @@ def _initialize_distributed():
                                           args.pipeline_model_parallel_size,
                                           args.virtual_pipeline_model_parallel_size,
                                           args.pipeline_model_parallel_split_rank)
+            core.initialize_model_parallel(args.tensor_model_parallel_size,
+                                           args.pipeline_model_parallel_size,
+                                           args.virtual_pipeline_model_parallel_size,
+                                           args.pipeline_model_parallel_split_rank)
+            print(f'> initialized tensor model parallel with size '
+                  f'{core.get_tensor_model_parallel_world_size()}')
+            print(f'> initialized pipeline model parallel with size '
+                  f'{core.get_pipeline_model_parallel_world_size()}')
 
 
 def _init_autoresume():
