@@ -219,7 +219,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            mpu.model_parallel_cuda_manual_seed(seed)
+            core.tensor_parallel.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 

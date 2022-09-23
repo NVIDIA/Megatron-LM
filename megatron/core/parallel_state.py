@@ -5,6 +5,8 @@
 import torch
 from typing import Optional
 
+from .utils import GlobalMemoryBuffer
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -42,7 +44,8 @@ _PIPELINE_GLOBAL_RANKS = None
 # rank when broadcasting weights from src to all other data parallel ranks
 _DATA_PARALLEL_GLOBAL_RANKS = None
 
-
+# Memory buffers to avoid dynamic memory allocation
+_GLOBAL_MEMORY_BUFFER = None
 
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
@@ -194,6 +197,12 @@ def initialize_model_parallel(
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+
+    # Initialize global memory buffer
+    # This isn't really "parallel state" but there isn't another good place to
+    # put this. If we end up with a more generic initialization of megatron-core
+    # we could stick it there
+    _set_global_memory_buffer()
 
 
 def model_parallel_is_initialized():
@@ -505,6 +514,18 @@ def get_data_parallel_world_size():
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
     return torch.distributed.get_rank(group=get_data_parallel_group())
+
+def _set_global_memory_buffer():
+    """Initialize global buffer"""
+    global _GLOBAL_MEMORY_BUFFER
+    assert _GLOBAL_MEMORY_BUFFER is None, 'global memory buffer is already initialized'
+    _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
+
+def get_global_memory_buffer():
+    assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
+    return _GLOBAL_MEMORY_BUFFER
+
+
 
 def destroy_model_parallel():
     """Set the groups to none."""

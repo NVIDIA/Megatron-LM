@@ -11,7 +11,7 @@ from megatron import get_timers
 from megatron import mpu
 from megatron import print_rank_0
 from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 

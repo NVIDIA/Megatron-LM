@@ -4,8 +4,6 @@
 
 import os
 import sys
-from functools import reduce
-import operator
 import torch
 
 from megatron import dist_signal_handler
@@ -20,7 +18,6 @@ _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
-_GLOBAL_MEMORY_BUFFER = None
 
 def get_args():
     """Return arguments."""
@@ -70,11 +67,6 @@ def get_signal_handler():
     return _GLOBAL_SIGNAL_HANDLER
 
 
-def get_global_memory_buffer():
-    _ensure_var_is_initialized(_GLOBAL_MEMORY_BUFFER, 'global memory buffer')
-    return _GLOBAL_MEMORY_BUFFER
-
-
 def _set_signal_handler():
     global _GLOBAL_SIGNAL_HANDLER
     _ensure_var_is_not_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
@@ -96,7 +88,6 @@ def set_global_variables(args):
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
-    _set_global_memory_buffer()
 
     if args.exit_signal_handler:
         _set_signal_handler()
@@ -176,13 +167,6 @@ def _set_timers(args):
     _GLOBAL_TIMERS = Timers(args.timing_log_level, args.timing_log_option)
 
 
-def _set_global_memory_buffer():
-    """Initialize global buffer"""
-    global _GLOBAL_MEMORY_BUFFER
-    _ensure_var_is_not_initialized(_GLOBAL_MEMORY_BUFFER, 'global memory buffer')
-    _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
-
-
 def _ensure_var_is_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is not None, '{} is not initialized.'.format(name)
@@ -194,22 +178,3 @@ def _ensure_var_is_not_initialized(var, name):
 
 
 
-class GlobalMemoryBuffer:
-    """Global buffer to avoid dynamic memory allocations.
-    Caller should ensure that buffers of the same name 
-    are not used concurrently."""
-
-    def __init__(self):
-        self.buffer = {}
-
-    def get_tensor(self, tensor_shape, dtype, name):
-        required_len = reduce(operator.mul, tensor_shape, 1)
-        if self.buffer.get((name, dtype), None) is None or \
-                self.buffer[(name, dtype)].numel() < required_len:
-            self.buffer[(name, dtype)] = \
-                torch.empty(required_len,
-                            dtype=dtype,
-                            device=torch.cuda.current_device(),
-                            requires_grad=False)
-
-        return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)

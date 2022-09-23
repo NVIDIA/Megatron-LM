@@ -8,6 +8,7 @@ from torch.nn.parameter import Parameter
 
 from megatron import get_args
 from megatron import mpu
+from megatron import core
 
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
@@ -76,9 +77,12 @@ class MegatronModule(torch.nn.Module):
             self._word_embeddings_for_head_key = 'word_embeddings_for_head'
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
-            self.word_embeddings = mpu.VocabParallelEmbedding(
+            self.word_embeddings = core.tensor_parallel.VocabParallelEmbedding(
                 args.padded_vocab_size, args.hidden_size,
-                init_method=init_method_normal(args.init_method_std))
+                init_method=init_method_normal(args.init_method_std),
+                params_dtype=args.params_dtype,
+                use_cpu_initialization=args.use_cpu_initialization,
+                perform_initialization=args.perform_initialization)
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 

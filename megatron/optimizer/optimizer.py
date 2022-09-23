@@ -12,11 +12,12 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_timers
 from megatron import mpu
+from megatron import core
 from megatron import print_rank_0
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
@@ -527,8 +528,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Create a copy
                         main_param = param.detach().clone().float()
                         # Copy tensor model parallel attributes.
-                        mpu.copy_tensor_model_parallel_attributes(main_param,
-                                                                  param)
+                        core.tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
+                                                                                   param)
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
                         # Replace the optimizer params with the new fp32 copy.
