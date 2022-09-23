@@ -8,7 +8,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import socket
 from megatron import get_args
 from megatron import print_rank_0
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel

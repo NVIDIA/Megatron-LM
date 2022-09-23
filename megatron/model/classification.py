@@ -5,7 +5,6 @@
 import torch
 
 from megatron import get_args, print_rank_last
-from megatron import mpu
 from megatron.model.enums import AttnMaskType
 from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
 from megatron.model.language_model import get_language_model

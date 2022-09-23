@@ -47,10 +47,6 @@ _DATA_PARALLEL_GLOBAL_RANKS = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-def is_unitialized():
-    """Useful for code segments that may be accessed with or without mpu initialization"""
-    return _DATA_PARALLEL_GROUP is None
-
 
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,

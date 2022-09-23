@@ -11,13 +11,11 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_timers
-from megatron import mpu
-from megatron import core
 from megatron import print_rank_0
+from megatron.core import mpu, tensor_parallel
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
-from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
@@ -103,7 +101,7 @@ class MegatronOptimizer(ABC):
             grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
@@ -528,8 +526,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Create a copy
                         main_param = param.detach().clone().float()
                         # Copy tensor model parallel attributes.
-                        core.tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
-                                                                                   param)
+                        tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
+                                                                              param)
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
                         # Replace the optimizer params with the new fp32 copy.

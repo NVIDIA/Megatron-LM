@@ -17,6 +17,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 
+from .utils import (
+    split_tensor_into_1d_equal_chunks,
+    gather_split_1d_tensor,
+)
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -54,38 +58,6 @@ def _set_cuda_rng_state(new_state, device=-1):
 
     _lazy_call(cb)
 
-
-def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
-    """Break a tensor into equal 1D chunks."""
-    partition_size = torch.numel(tensor) // \
-        get_tensor_model_parallel_world_size()
-    start_index = partition_size * get_tensor_model_parallel_rank()
-    end_index = start_index + partition_size
-    if new_buffer:
-        data = torch.empty(partition_size, dtype=tensor.dtype,
-                           device=torch.cuda.current_device(),
-                           requires_grad=False)
-        data.copy_(tensor.view(-1)[start_index:end_index])
-    else:
-        data = tensor.view(-1)[start_index:end_index]
-    return data
-    
-
-def gather_split_1d_tensor(tensor):
-    """Opposite of above function, gather values from model parallel ranks."""
-    numel_gathered = torch.numel(tensor) * \
-        get_tensor_model_parallel_world_size()
-    gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
-                           device=torch.cuda.current_device(),
-                           requires_grad=False)
-    # TODO: This API is experimental in pytorch (as of Feb 2022) and
-    # this might break in future pytorch releases. We chose this API
-    # as opposed to torch.distributed.all_gather for efficiency reasons.
-    # This API calls directly NCCL all-gather versus the former does
-    # internal copies and can potentially cause slow down.
-    torch.distributed._all_gather_base(gathered, tensor,
-                                       group=get_tensor_model_parallel_group())
-    return gathered
 
 
 class CudaRNGStatesTracker:

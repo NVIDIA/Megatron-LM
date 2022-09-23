@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset, BatchSampler
 
-from megatron import print_rank_0, get_args, get_tokenizer, mpu
+from megatron import print_rank_0, get_args, get_tokenizer
 from megatron.data.biencoder_dataset_utils import make_attention_mask
 
 def get_nq_dataset(qa_data, split):

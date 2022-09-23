@@ -6,7 +6,8 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron import get_args, get_timers
-from megatron import mpu, print_rank_0, print_rank_last
+from megatron import print_rank_0, print_rank_last
+from megatron.core import mpu
 from tasks.vision.finetune_utils import finetune
 from tasks.vision.finetune_utils import build_data_loader
 from megatron.utils import average_losses_across_data_parallel_group

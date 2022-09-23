@@ -9,8 +9,8 @@ import numpy as np
 
 import torch
 
-from megatron import (core,
-                      update_num_microbatches)
+from megatron import update_num_microbatches
+from megatron.core import mpu, tensor_parallel
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -79,11 +79,11 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
 
     # Use both the tensor and pipeline MP rank.
     if pipeline_parallel is None:
-        pipeline_parallel = (core.get_pipeline_model_parallel_world_size() > 1)
+        pipeline_parallel = (mpu.get_pipeline_model_parallel_world_size() > 1)
     if tensor_rank is None:
-        tensor_rank = core.get_tensor_model_parallel_rank()
+        tensor_rank = mpu.get_tensor_model_parallel_rank()
     if pipeline_rank is None:
-        pipeline_rank = core.get_pipeline_model_parallel_rank()
+        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
@@ -98,7 +98,7 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
     if use_distributed_optimizer:
         model_name = os.path.join(common_path, "model_rng.pt")
         optim_name = os.path.join(
-            common_path + "_%03d" % core.get_data_parallel_rank(),
+            common_path + "_%03d" % mpu.get_data_parallel_rank(),
             "optim.pt")
     else:
         model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
@@ -185,18 +185,18 @@ def get_rng_state():
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
         'cuda_rng_state': torch.cuda.get_rng_state(),
-        'rng_tracker_states': core.tensor_parallel.get_cuda_rng_tracker().get_states()}
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
     rng_state_list = None
     if torch.distributed.is_initialized() and \
-            core.get_data_parallel_world_size() > 1 and \
+            mpu.get_data_parallel_world_size() > 1 and \
             args.data_parallel_random_init:
         rng_state_list = \
-            [None for i in range(core.get_data_parallel_world_size())]
+            [None for i in range(mpu.get_data_parallel_world_size())]
         torch.distributed.all_gather_object(
             rng_state_list,
             rng_state,
-            group=core.get_data_parallel_group())
+            group=mpu.get_data_parallel_group())
     else:
         rng_state_list = [rng_state]
 
@@ -223,7 +223,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     # Collect args, model, RNG.
     model_state_dict = {}
     if not torch.distributed.is_initialized() \
-       or core.get_data_parallel_rank() == 0:
+       or mpu.get_data_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         model_state_dict['args'] = args
@@ -233,7 +233,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
             model_state_dict['model'] = model[0].state_dict_for_save_checkpoint()
         else:
             for i in range(len(model)):
-                core.set_virtual_pipeline_model_parallel_rank(i)
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
                 model_state_dict['model%d' % i] = \
                     model[i].state_dict_for_save_checkpoint()
 
@@ -246,7 +246,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     optim_state_dict = {}
     if not args.no_save_optim \
        and (not torch.distributed.is_initialized()
-            or core.get_data_parallel_rank() == 0
+            or mpu.get_data_parallel_rank() == 0
             or args.use_distributed_optimizer):
 
         # Optimizer stuff.
@@ -548,7 +548,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         model[0].load_state_dict(model_state_dict['model'], strict=strict)
     else:
         for i in range(len(model)):
-            core.set_virtual_pipeline_model_parallel_rank(i)
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
             model[i].load_state_dict(model_state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed
@@ -580,7 +580,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # access rng_state for data parallel rank
                 if args.data_parallel_random_init:
 
-                    rng_state = model_state_dict['rng_state'][core.get_data_parallel_rank()]
+                    rng_state = model_state_dict['rng_state'][mpu.get_data_parallel_rank()]
                 else:
                     rng_state = model_state_dict['rng_state'][0]
                 random.setstate(rng_state['random_rng_state'])
@@ -590,7 +590,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
-                core.tensor_parallel.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
             else:  # backward compatability
                 random.setstate(model_state_dict['random_rng_state'])
@@ -600,7 +600,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not model_state_dict['rng_tracker_states']:
                     raise KeyError
-                core.tensor_parallel.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     model_state_dict['rng_tracker_states'])
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
@@ -640,7 +640,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
                                               args.use_distributed_optimizer,
                                               release=False)
 
-    if core.get_data_parallel_rank() == 0:
+    if mpu.get_data_parallel_rank() == 0:
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
@@ -656,7 +656,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     model[0].load_state_dict(ret_state_dict)
     torch.distributed.barrier()
 
-    if core.get_data_parallel_rank() == 0:
+    if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))
 
     return model

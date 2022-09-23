@@ -10,7 +10,7 @@ import torch
 
 from megatron import get_args
 from megatron import print_rank_last, is_last_rank
-from megatron import mpu
+from megatron.core import mpu
 from megatron.schedules import get_forward_backward_func
 from tasks.finetune_utils import build_data_loader
 from tasks.finetune_utils import process_batch

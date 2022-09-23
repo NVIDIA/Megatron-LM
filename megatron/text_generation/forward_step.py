@@ -6,9 +6,8 @@ from collections.abc import Iterable
 
 import torch
 
-from megatron import (
-    get_args,
-    mpu)
+from megatron import get_args
+from megatron.core import mpu
 from .communication import (
     send_to_next_pipeline_rank,
     recv_from_prev_pipeline_rank_)

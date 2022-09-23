@@ -5,7 +5,7 @@
 
 import torch
 
-from megatron import mpu
+from megatron.core import mpu
 from .communication import broadcast_float_list
 from .generation import (
         generate_tokens_probs_and_return_on_first_stage,

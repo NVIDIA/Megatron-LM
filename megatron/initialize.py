@@ -14,13 +14,10 @@ from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
-from megatron import mpu
-from megatron import core
+from megatron.core import mpu, tensor_parallel
 from megatron.arguments import (parse_args, validate_args)
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
-from megatron.mpu import (set_tensor_model_parallel_rank,
-                          set_tensor_model_parallel_world_size)
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
@@ -65,13 +62,14 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     args = get_args()
     if  args.lazy_mpu_init:
+        # TODO is this still a necessary option?
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals    
-        set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        # We only set basic DDP globals
+        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        set_tensor_model_parallel_rank(args.rank)    
+        mpu.set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -147,7 +145,7 @@ def _compile_dependencies():
 
 
 def _initialize_distributed():
-    """Initialize torch.distributed and mpu."""
+    """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
     device_count = torch.cuda.device_count()
@@ -185,17 +183,14 @@ def _initialize_distributed():
             print('model parallel is already initialized')
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
-                                          args.pipeline_model_parallel_size,
-                                          args.virtual_pipeline_model_parallel_size,
-                                          args.pipeline_model_parallel_split_rank)
-            core.initialize_model_parallel(args.tensor_model_parallel_size,
                                            args.pipeline_model_parallel_size,
                                            args.virtual_pipeline_model_parallel_size,
                                            args.pipeline_model_parallel_split_rank)
-            print(f'> initialized tensor model parallel with size '
-                  f'{core.get_tensor_model_parallel_world_size()}')
-            print(f'> initialized pipeline model parallel with size '
-                  f'{core.get_pipeline_model_parallel_world_size()}')
+            if args.rank == 0:
+                print(f'> initialized tensor model parallel with size '
+                      f'{mpu.get_tensor_model_parallel_world_size()}')
+                print(f'> initialized pipeline model parallel with size '
+                      f'{mpu.get_pipeline_model_parallel_world_size()}')
 
 
 def _init_autoresume():
@@ -219,7 +214,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            core.tensor_parallel.model_parallel_cuda_manual_seed(seed)
+            tensor_parallel.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 

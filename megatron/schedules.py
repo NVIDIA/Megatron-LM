@@ -8,8 +8,8 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron import get_args
 from megatron import get_num_microbatches
 from megatron import get_timers
-from megatron import mpu
 from megatron import p2p_communication
+from megatron.core import mpu
 from megatron.utils import unwrap_model
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module

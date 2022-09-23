@@ -5,6 +5,7 @@ from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    set_tensor_model_parallel_attributes,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     copy_tensor_model_parallel_attributes,
     param_is_not_tensor_parallel_duplicate,
@@ -23,10 +24,14 @@ from .mappings import (
 from .random import (
     checkpoint,
     get_cuda_rng_tracker,
-    model_parallel_cuda_manual_seed
+    model_parallel_cuda_manual_seed,
 )
 
-from .utils import split_tensor_along_last_dim
+from .utils import (
+    split_tensor_along_last_dim,
+    split_tensor_into_1d_equal_chunks,
+    gather_split_1d_tensor,
+)
 
 __all__ = [
     # cross_entropy.py

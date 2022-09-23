@@ -8,8 +8,7 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
-from megatron import mpu
-from megatron import core
+from megatron.core import tensor_parallel
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel, ModelType
 from megatron.training import pretrain
@@ -43,7 +42,7 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    data_b = core.tensor_parallel.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     tokens_ = data_b['text'].long()

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
-from megatron import mpu
+from megatron.core import mpu
 from megatron.data.biencoder_dataset_utils import get_ict_batch
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import ModelType

@@ -6,10 +6,9 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from megatron import get_timers, get_args
-from megatron.core import get_global_memory_buffer
-from megatron import core
+from megatron import get_timers, get_args, core
 from .module import MegatronModule
+from megatron.core import mpu, tensor_parallel
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
@@ -79,7 +78,7 @@ class ParallelMLP(MegatronModule):
 
 
         # Project to 4h.
-        self.dense_h_to_4h = core.tensor_parallel.ColumnParallelLinear(
+        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             args.hidden_size,
             args.ffn_hidden_size,
             gather_output=False,
@@ -96,7 +95,7 @@ class ParallelMLP(MegatronModule):
             self.activation_func = erf_gelu
 
         # Project back to h.
-        self.dense_4h_to_h = core.tensor_parallel.RowParallelLinear(
+        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             args.ffn_hidden_size,
             args.hidden_size,
             input_is_parallel=True,
@@ -189,7 +188,7 @@ class CoreAttention(MegatronModule):
         projection_size = args.kv_channels * args.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = core.get_tensor_model_parallel_world_size()
+        world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = core.utils.divide(projection_size,
                                                            world_size)
         self.hidden_size_per_attention_head = core.utils.divide(
@@ -237,7 +236,7 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = get_global_memory_buffer().get_tensor(
+        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
             query_layer.dtype, "mpu")
 
@@ -263,7 +262,7 @@ class CoreAttention(MegatronModule):
         # seem a bit unusual, but is taken from the original Transformer paper.
 
         if not self.sequence_parallel:
-            with core.tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_cuda_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
@@ -327,7 +326,7 @@ class ParallelAttention(MegatronModule):
         projection_size = args.kv_channels * args.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = core.get_tensor_model_parallel_world_size()
+        world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
             projection_size, args.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
@@ -335,7 +334,7 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = core.tensor_parallel.ColumnParallelLinear(
+            self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 3 * projection_size,
                 gather_output=False,
@@ -344,7 +343,7 @@ class ParallelAttention(MegatronModule):
                 **_args_to_kwargs())
         else:
             assert attention_type == AttnType.cross_attn
-            self.query = core.tensor_parallel.ColumnParallelLinear(
+            self.query = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 projection_size,
                 gather_output=False,
@@ -353,7 +352,7 @@ class ParallelAttention(MegatronModule):
                 **_args_to_kwargs())
 
 
-            self.key_value = core.tensor_parallel.ColumnParallelLinear(
+            self.key_value = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 2 * projection_size,
                 gather_output=False,
@@ -366,7 +365,7 @@ class ParallelAttention(MegatronModule):
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         # Output.
-        self.dense = core.tensor_parallel.RowParallelLinear(
+        self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
             args.hidden_size,
             input_is_parallel=True,
@@ -386,7 +385,7 @@ class ParallelAttention(MegatronModule):
                                           value_layer, attention_mask)
             return output_
 
-        hidden_states = core.tensor_parallel.checkpoint(
+        hidden_states = tensor_parallel.checkpoint(
             custom_forward,
             False, query_layer, key_layer, value_layer, attention_mask)
 
@@ -439,7 +438,7 @@ class ParallelAttention(MegatronModule):
             # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
             (query_layer,
              key_layer,
-             value_layer) = core.tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -452,7 +451,7 @@ class ParallelAttention(MegatronModule):
 
             # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
             (key_layer,
-             value_layer) = core.tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
+             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
 
             # Attention head [sq, b, h] --> [sq, b, hp]
             query_layer, _ = self.query(hidden_states)
@@ -769,7 +768,7 @@ class ParallelTransformer(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         # Number of layers.
-        self.num_layers = core.get_num_layers(
+        self.num_layers = mpu.get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
 
         self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, args.num_layers)]
@@ -799,21 +798,21 @@ class ParallelTransformer(MegatronModule):
             # layers to stages like (each list is a model chunk):
             # Stage 0: [0, 1]  [4, 5]
             # Stage 1: [2, 3]  [6, 7]
-            offset = core.get_virtual_pipeline_model_parallel_rank() * (
+            offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 args.num_layers // args.virtual_pipeline_model_parallel_size) + \
-                (core.get_pipeline_model_parallel_rank() * self.num_layers)
+                (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
-                    core.get_pipeline_model_parallel_world_size() > 1:
-                pipeline_rank = core.get_pipeline_model_parallel_rank()
+                    mpu.get_pipeline_model_parallel_world_size() > 1:
+                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
                 else:
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = core.get_pipeline_model_parallel_rank() * self.num_layers
+                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
@@ -862,7 +861,7 @@ class ParallelTransformer(MegatronModule):
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
             while l < self.num_layers:
-                hidden_states = core.tensor_parallel.checkpoint(
+                hidden_states = tensor_parallel.checkpoint(
                     custom(l, l + self.recompute_num_layers),
                     self.distribute_saved_activations,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
@@ -874,7 +873,7 @@ class ParallelTransformer(MegatronModule):
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers):
                 if l < self.recompute_num_layers:
-                    hidden_states = core.tensor_parallel.checkpoint(
+                    hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + 1),
                         self.distribute_saved_activations,
                         hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
@@ -932,7 +931,7 @@ class ParallelTransformer(MegatronModule):
         )
 
         if self.sequence_parallel:
-            rng_context = core.tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 

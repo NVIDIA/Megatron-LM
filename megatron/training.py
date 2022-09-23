@@ -19,8 +19,7 @@ from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
 from megatron import update_num_microbatches
-from megatron import mpu
-from megatron import core
+from megatron.core import mpu, tensor_parallel
 from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
@@ -258,7 +257,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
-            core.tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:

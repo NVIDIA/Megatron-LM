@@ -9,7 +9,7 @@ import torch
 
 from megatron import get_args
 from megatron import print_rank_0, print_rank_last
-from megatron import mpu
+from megatron.core import mpu
 from megatron.schedules import get_forward_backward_func
 from tasks.vision.finetune_utils import build_data_loader
 from tasks.vision.finetune_utils import process_batch

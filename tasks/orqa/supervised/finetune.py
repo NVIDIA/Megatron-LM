@@ -9,8 +9,8 @@ import math
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, get_timers, get_tokenizer
-from megatron import mpu, print_rank_0
+from megatron import get_args, get_timers, get_tokenizer, print_rank_0
+from megatron.core import mpu
 from megatron.indexer import IndexBuilder
 from megatron.model.biencoder_model import biencoder_model_provider
 from megatron.utils import average_losses_across_data_parallel_group

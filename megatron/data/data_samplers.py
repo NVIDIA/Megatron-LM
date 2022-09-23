@@ -8,7 +8,7 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset
 from megatron import get_args
-from megatron import mpu
+from megatron.core import mpu
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):

@@ -5,7 +5,8 @@
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, get_tokenizer, mpu
+from megatron import get_args, get_tokenizer
+from megatron.core import mpu
 from megatron.utils import get_ltor_masks_and_position_ids
 from .communication import (
     copy_from_last_to_first_pipeline_stage,

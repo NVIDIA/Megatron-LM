@@ -34,7 +34,8 @@ def save_checkpoint(queue, args):
         from megatron.global_vars import set_global_variables, get_args
         from megatron.model import ModelType
         from megatron.tokenizer.tokenizer import _vocab_size_with_padding
-        from megatron import mpu, fused_kernels
+        from megatron import fused_kernels
+        from megatron.core import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
@@ -152,10 +153,10 @@ def save_checkpoint(queue, args):
         return models
 
     # fake initializing distributed
-    mpu.initialize.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
-    mpu.initialize.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
-    mpu.initialize.set_tensor_model_parallel_rank(0)
-    mpu.initialize.set_pipeline_model_parallel_rank(0)
+    mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
+    mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
+    mpu.set_tensor_model_parallel_rank(0)
+    mpu.set_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
 
     # Embeddings
@@ -197,7 +198,7 @@ def save_checkpoint(queue, args):
     out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
 
     # Make models for first pipeline stage and fill in embeddings
-    mpu.initialize.set_pipeline_model_parallel_rank(0)
+    mpu.set_pipeline_model_parallel_rank(0)
     post_process = args.target_pipeline_parallel_size == 1
     models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
     for tp_rank, model in enumerate(models):
@@ -211,7 +212,7 @@ def save_checkpoint(queue, args):
     for pp_rank in range(args.target_pipeline_parallel_size):
         # For later pipeline parallel ranks, make the new models
         if pp_rank > 0:
-            mpu.initialize.set_pipeline_model_parallel_rank(pp_rank)
+            mpu.set_pipeline_model_parallel_rank(pp_rank)
             post_process = pp_rank == args.target_pipeline_parallel_size - 1
             models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
 
@@ -317,6 +318,6 @@ def save_checkpoint(queue, args):
                 print("ERROR: got some more data but was expecting to be done")
 
         for tp_rank in range(args.target_tensor_parallel_size):
-            mpu.initialize.set_tensor_model_parallel_rank(tp_rank)
+            mpu.set_tensor_model_parallel_rank(tp_rank)
             save_checkpoint(md.iteration, [models[tp_rank]], None, None)
     print("Done!")

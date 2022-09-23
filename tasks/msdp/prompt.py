@@ -6,10 +6,10 @@ import json
 import torch
 import requests
 from nltk import word_tokenize
-from megatron import mpu
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
+from megatron.core import mpu
 from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.checkpointing import load_checkpoint

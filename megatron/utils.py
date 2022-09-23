@@ -10,11 +10,13 @@ from torch.nn.parallel import DistributedDataParallel as torchDDP
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from megatron import get_args
-from megatron import get_adlr_autoresume
-from megatron import mpu
-from megatron.model.module import param_is_not_shared
+from megatron import (
+    get_args,
+    get_adlr_autoresume,
+)
+from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.model.module import param_is_not_shared
 
 
 def unwrap_model(model, module_instances=(torchDDP)):
