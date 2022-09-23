@@ -2,9 +2,6 @@
 
 """Model parallel utility interface."""
 
-
-from .data import broadcast_data
-
 from .initialize import is_unitialized
 from .initialize import destroy_model_parallel
 from .initialize import get_data_parallel_group
