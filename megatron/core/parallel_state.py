@@ -308,53 +308,6 @@ def get_pipeline_model_parallel_rank():
     return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
 
 
-def get_num_layers(args, is_encoder_and_decoder_model):
-    """Compute the number of transformer layers resident on the current rank."""
-    if get_pipeline_model_parallel_world_size() > 1:
-        if is_encoder_and_decoder_model:
-            assert args.pipeline_model_parallel_split_rank is not None
-
-            # When a standalone embedding stage is used, a rank is taken from
-            # the encoder's ranks, to be used for the encoder's embedding
-            # layer. This way, the rank referenced by the 'split rank' remains
-            # the same whether or not a standalone embedding stage is used.
-            num_ranks_in_encoder = (
-                args.pipeline_model_parallel_split_rank - 1
-                if args.standalone_embedding_stage else
-                args.pipeline_model_parallel_split_rank
-            )
-            num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
-            assert args.num_layers % num_ranks_in_encoder == 0, \
-                    'num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.num_layers, num_ranks_in_encoder)
-            assert args.num_layers % num_ranks_in_decoder == 0, \
-                    'num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.num_layers, num_ranks_in_decoder)
-            if is_pipeline_stage_before_split():
-                num_layers = (
-                    0
-                    if args.standalone_embedding_stage
-                    and get_pipeline_model_parallel_rank() == 0 else
-                    args.num_layers // num_ranks_in_encoder
-                )
-            else:
-                num_layers = args.num_layers // num_ranks_in_decoder
-        else:
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
-
-            # When a standalone embedding stage is used, all transformer layers
-            # are divided among pipeline rank >= 1, while on pipeline rank 0,
-            # ranks either contain the input embedding layer (virtual pp rank 0),
-            # or no layers at all (virtual pp rank >= 1).
-            num_layers = (
-                0
-                if args.standalone_embedding_stage
-                and get_pipeline_model_parallel_rank() == 0 else
-                args.num_layers // args.transformer_pipeline_model_parallel_size
-            )
-    else:
-        num_layers = args.num_layers
-    return num_layers
-
 
 def is_pipeline_first_stage(ignore_virtual=False):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""

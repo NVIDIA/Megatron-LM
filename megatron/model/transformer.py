@@ -736,6 +736,54 @@ class NoopTransformerLayer(MegatronModule):
         return hidden_states.clone()
 
 
+def _get_num_layers(args, is_encoder_and_decoder_model):
+    """Compute the number of transformer layers resident on the current rank."""
+    if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if is_encoder_and_decoder_model:
+            assert args.pipeline_model_parallel_split_rank is not None
+
+            # When a standalone embedding stage is used, a rank is taken from
+            # the encoder's ranks, to be used for the encoder's embedding
+            # layer. This way, the rank referenced by the 'split rank' remains
+            # the same whether or not a standalone embedding stage is used.
+            num_ranks_in_encoder = (
+                args.pipeline_model_parallel_split_rank - 1
+                if args.standalone_embedding_stage else
+                args.pipeline_model_parallel_split_rank
+            )
+            num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
+            assert args.num_layers % num_ranks_in_encoder == 0, \
+                    'num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.num_layers, num_ranks_in_encoder)
+            assert args.num_layers % num_ranks_in_decoder == 0, \
+                    'num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.num_layers, num_ranks_in_decoder)
+            if mpu.is_pipeline_stage_before_split():
+                num_layers = (
+                    0
+                    if args.standalone_embedding_stage
+                    and mpu.get_pipeline_model_parallel_rank() == 0 else
+                    args.num_layers // num_ranks_in_encoder
+                )
+            else:
+                num_layers = args.num_layers // num_ranks_in_decoder
+        else:
+            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'num_layers must be divisible by transformer_pipeline_model_parallel_size'
+
+            # When a standalone embedding stage is used, all transformer layers
+            # are divided among pipeline rank >= 1, while on pipeline rank 0,
+            # ranks either contain the input embedding layer (virtual pp rank 0),
+            # or no layers at all (virtual pp rank >= 1).
+            num_layers = (
+                0
+                if args.standalone_embedding_stage
+                and mpu.get_pipeline_model_parallel_rank() == 0 else
+                args.num_layers // args.transformer_pipeline_model_parallel_size
+            )
+    else:
+        num_layers = args.num_layers
+    return num_layers
+
+
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -768,7 +816,7 @@ class ParallelTransformer(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         # Number of layers.
-        self.num_layers = mpu.get_num_layers(
+        self.num_layers = _get_num_layers(
             args, args.model_type == ModelType.encoder_and_decoder)
 
         self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, args.num_layers)]
