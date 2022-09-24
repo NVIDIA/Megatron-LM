@@ -428,18 +428,23 @@ def get_data_parallel_src_rank():
 
 
 def get_pipeline_model_parallel_first_rank():
+    """Return the global rank of the first process in the pipeline for the
+    current tensor parallel group"""
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
     return _PIPELINE_GLOBAL_RANKS[0]
 
 
 def get_pipeline_model_parallel_last_rank():
+    """Return the global rank of the last process in the pipeline for the
+    current tensor parallel group"""
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
     return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
 def get_pipeline_model_parallel_next_rank():
+    """Return the global rank that follows the caller in the pipeline"""
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
@@ -448,6 +453,7 @@ def get_pipeline_model_parallel_next_rank():
 
 
 def get_pipeline_model_parallel_prev_rank():
+    """Return the global rank that preceeds the caller in the pipeline"""
     assert _PIPELINE_GLOBAL_RANKS is not None, \
         "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
@@ -471,9 +477,9 @@ def _set_global_memory_buffer():
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 def get_global_memory_buffer():
+    """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
     return _GLOBAL_MEMORY_BUFFER
-
 
 
 def destroy_model_parallel():
@@ -502,3 +508,5 @@ def destroy_model_parallel():
     _MPU_TENSOR_MODEL_PARALLEL_RANK = None
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
+    global _GLOBAL_MEMORY_BUFFER
+    _GLOBAL_MEMORY_BUFFER = None
