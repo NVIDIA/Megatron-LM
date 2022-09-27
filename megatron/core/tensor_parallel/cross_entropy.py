@@ -22,7 +22,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
                                      op=torch.distributed.ReduceOp.MAX,
                                      group=get_tensor_model_parallel_group())
         # Subtract the maximum value.
-        vocab_parallel_logits.sub_(logits_max.unsqueeze(dim=-1))
+        vocab_parallel_logits = vocab_parallel_logits - logits_max.unsqueeze(dim=-1)
 
         # Get the partition's vocab indecies
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -99,6 +99,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         # Retreive tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
+        label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
 
         # All the inputs have softmax as thier gradient.
         grad_input = softmax
@@ -109,8 +110,16 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # Add the gradient from matching classes.
         arange_1d = torch.arange(start=0, end=grad_2d.size()[0],
                                  device=grad_2d.device)
-        grad_2d[arange_1d, masked_target_1d] -= (
-            1.0 - target_mask.view(-1).float())
+
+        softmax_update = 1.0 - target_mask.view(-1).float()
+
+        if label_smoothing > 0:
+            smoothing = label_smoothing * vocab_size / (vocab_size - 1)
+            grad_2d[arange_1d, masked_target_1d] -= (1.0 - smoothing) * softmax_update
+            average_grad = 1 / vocab_size
+            grad_2d[arange_1d, :] -= smoothing * average_grad
+        else:
+            grad_2d[arange_1d, masked_target_1d] -= softmax_update
 
         # Finally elementwise multiplication with the output gradients.
         grad_input.mul_(grad_output.unsqueeze(dim=-1))
