@@ -442,21 +442,22 @@ class ColumnParallelLinear(torch.nn.Module):
 
         if gradient_accumulation_fusion:
             if not _grad_accum_fusion_available:
-                # Basically, megatron.core users are expected to install APEX's
-                # `--cpp_ext` and `--cuda_ext`. The example installation command is as follows:
-                # `pip install --global-option="--cpp_ext" --global-option="--cuda_ext ."
-                # at the root of APEX repository.
-                warnings.warn(
-                    "`gradient_accumulation_fusion` is set to `True` but "
-                    "the custom CUDA extension of `fused_weight_gradient_mlp_cuda` module not "
-                    "found. Thus `gradient_accumulation_fusion` set to `False`. "
-                    "Note that the extension requires CUDA>=11."
+                raise RuntimeError(
+                    "ColumnParallelLinear was called with gradient_accumulation_fusion set "
+                    "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+                    "module is not found. To use gradient_accumulation_fusion you must "
+                    "install APEX with --cpp_ext and --cuda_ext. For example: "
+                    "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+                    "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                    "gradient accumulation fusion."
                 )
-                gradient_accumulation_fusion = False
         self.gradient_accumulation_fusion = gradient_accumulation_fusion
 
         if self.async_tensor_model_parallel_allreduce and self.sequence_parallel_enabled:
-            raise RuntimeError("`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` cannot be enabled at the same time.")
+            raise RuntimeError(
+                "`async_tensor_model_parallel_allreduce` and `sequence_parallel_enabled` "
+                "cannot be enabled at the same time."
+            )
 
 
     def forward(self, input_):
