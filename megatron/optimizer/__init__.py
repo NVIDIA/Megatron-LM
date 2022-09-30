@@ -145,6 +145,7 @@ def get_megatron_optimizer(model,
                       args.use_contiguous_buffers_in_local_ddp,
                       args.fp16,
                       args.bf16,
+                      args.params_dtype,
                       grad_scaler,
                       model)
 
