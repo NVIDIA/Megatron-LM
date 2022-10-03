@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Finetune utilities."""
 
@@ -136,7 +123,7 @@ def _train(
     report_memory_flag = True
 
     # For each remaining epoch
-    timers("interval-time").start()
+    timers("interval-time", log_level=0).start(barrier=True)
     for epoch in range(start_epoch, args.epochs):
         print_rank_0("working on epoch {} ...".format(epoch + 1))
 
@@ -218,7 +205,7 @@ def finetune(
     timers = get_timers()
 
     # Train and validation data loaders.
-    timers("train/valid/test dataset/dataloder").start()
+    timers("train/valid/test dataset/dataloder", log_level=0).start()
     if args.epochs > 0:
         train_dataset, valid_dataset = train_valid_datasets_provider()
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
@@ -227,14 +214,14 @@ def finetune(
     timers("train/valid/test dataset/dataloder").stop()
 
     # Build calback function.
-    timers("callback function").start()
+    timers("callback function", log_level=0).start()
     end_of_epoch_callback = None
     if end_of_epoch_callback_provider is not None:
         end_of_epoch_callback = end_of_epoch_callback_provider()
     timers("callback function").stop()
 
     # Build model, optimizer and learning rate scheduler.
-    timers("model and optimizer").start()
+    timers("model and optimizer", log_level=0).start()
     model, optimizer, opt_param_scheduler = \
         setup_model_and_optimizer(
             model_provider,
@@ -246,7 +233,7 @@ def finetune(
     # If pretrained checkpoint is provided and we have not trained for
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
-    timers("pretrained checkpoint").start()
+    timers("pretrained checkpoint", log_level=0).start(barrier=True)
     if args.iteration == 0 and args.pretrained_checkpoint is not None:
         if args.pretrained_checkpoint_type == 'default':
             original_load = args.load

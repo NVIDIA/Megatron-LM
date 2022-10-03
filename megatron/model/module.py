@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron Module"""
 
@@ -43,11 +30,10 @@ class MegatronModule(torch.nn.Module):
         self.share_word_embeddings = share_word_embeddings
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Use this function to override the state dict for
         saving checkpoints."""
-        return self.state_dict(destination, prefix, keep_vars)
+        return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
 
     def word_embeddings_weight(self):
@@ -198,14 +184,13 @@ class Float16Module(MegatronModule):
         return outputs
 
 
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
-        return self.module.state_dict(destination, prefix, keep_vars)
+    def state_dict(self, prefix='', keep_vars=False):
+        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
-        return self.module.state_dict_for_save_checkpoint(destination, prefix,
-                                                          keep_vars)
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        return self.module.state_dict_for_save_checkpoint(prefix=prefix,
+                                                          keep_vars=keep_vars)
 
 
     def load_state_dict(self, state_dict, strict=True):

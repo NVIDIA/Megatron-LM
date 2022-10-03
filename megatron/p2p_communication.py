@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from functools import reduce
 import operator
@@ -163,7 +150,7 @@ def recv_forward(tensor_shape=None, dtype_=None, timers=None):
         input_tensor = None
     else:
         if timers is not None:
-            timers('forward-recv').start()
+            timers('forward-recv', log_level=2).start()
         input_tensor, _ = _communicate(
             tensor_send_next=None,
             tensor_send_prev=None,
@@ -182,7 +169,7 @@ def recv_backward(tensor_shape=None, timers=None):
         output_tensor_grad = None
     else:
         if timers is not None:
-            timers('backward-recv').start()
+            timers('backward-recv', log_level=2).start()
         _, output_tensor_grad = _communicate(
             tensor_send_next=None,
             tensor_send_prev=None,
@@ -199,7 +186,7 @@ def send_forward(output_tensor, tensor_shape=None, dtype_=None, timers=None):
 
     if not mpu.is_pipeline_last_stage():
         if timers is not None:
-            timers('forward-send').start()
+            timers('forward-send', log_level=2).start()
         _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
@@ -215,7 +202,7 @@ def send_backward(input_tensor_grad, tensor_shape=None, timers=None):
     """Send tensor to previous rank in pipeline (backward send)."""
     if not mpu.is_pipeline_first_stage():
         if timers is not None:
-            timers('backward-send').start()
+            timers('backward-send', log_level=2).start()
         _communicate(
             tensor_send_next=None,
             tensor_send_prev=input_tensor_grad,
@@ -232,7 +219,7 @@ def send_forward_recv_backward(output_tensor, tensor_shape=None, timers=None):
         output_tensor_grad = None
     else:
         if timers is not None:
-            timers('forward-send-backward-recv').start()
+            timers('forward-send-backward-recv', log_level=2).start()
         _, output_tensor_grad = _communicate(
             tensor_send_next=output_tensor,
             tensor_send_prev=None,
@@ -250,7 +237,7 @@ def send_backward_recv_forward(input_tensor_grad, tensor_shape=None, timers=None
         input_tensor = None
     else:
         if timers is not None:
-            timers('backward-send-forward-recv').start()
+            timers('backward-send-forward-recv', log_level=2).start()
         input_tensor, _ = _communicate(
             tensor_send_next=None,
             tensor_send_prev=input_tensor_grad,
@@ -265,7 +252,7 @@ def send_backward_recv_forward(input_tensor_grad, tensor_shape=None, timers=None
 def send_forward_recv_forward(output_tensor, recv_prev, tensor_shape=None, timers=None):
     """Batched recv from previous rank and send to next rank in pipeline."""
     if timers is not None:
-        timers('forward-send-forward-recv').start()
+        timers('forward-send-forward-recv', log_level=2).start()
     input_tensor, _ = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=None,
@@ -280,7 +267,7 @@ def send_forward_recv_forward(output_tensor, recv_prev, tensor_shape=None, timer
 def send_backward_recv_backward(input_tensor_grad, recv_next, tensor_shape=None, timers=None):
     """Batched recv from next rank and send to previous rank in pipeline."""
     if timers is not None:
-        timers('backward-send-backward-recv').start()
+        timers('backward-send-backward-recv', log_level=2).start()
     _, output_tensor_grad = _communicate(
         tensor_send_next=None,
         tensor_send_prev=input_tensor_grad,
@@ -297,7 +284,8 @@ def send_forward_backward_recv_forward_backward(
         recv_next, tensor_shape=None, timers=None):
     """Batched send and recv with previous and next ranks in pipeline."""
     if timers is not None:
-        timers('forward-backward-send-forward-backward-recv').start()
+        timers('forward-backward-send-forward-backward-recv',
+               log_level=2).start()
     input_tensor, output_tensor_grad = _communicate(
         tensor_send_next=output_tensor,
         tensor_send_prev=input_tensor_grad,
