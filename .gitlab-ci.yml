@@ -2,9 +2,13 @@ image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 test:
   script:
-    - pytest --junitxml=report.xml tests
+    - coverage run -m pytest --cov-report term --cov=megatron/core tests/
+    - coverage report
+    - coverage xml
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
-    when: always
     reports:
-      junit: report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
     
