@@ -70,6 +70,8 @@ def get_datasets_weights_and_num_samples(data_prefix,
                 [int(math.ceil(val * weight * 1.005))
                 for val in train_valid_test_num_samples])
     else:
+        # Used when separate dataset files are provided for train,
+        # valid and test
         datasets_train_valid_test_num_samples = [
             int(math.ceil(train_valid_test_num_samples * weight * 1.005))
             for weight in weights]
