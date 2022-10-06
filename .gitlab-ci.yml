@@ -4,6 +4,8 @@ test:
   tags:
     - docker
   script:
+    - source /home/shanmugamr/test_env/bin/activate
+    - nvidia-smi
     - torchrun --nproc_per_node=2  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
   artifacts:
     paths:
