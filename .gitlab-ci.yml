@@ -1,8 +1,5 @@
 image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
-[runners.docker]
-    gpus = "all"
-
 test:
   tags:
     - docker
