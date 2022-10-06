@@ -296,6 +296,12 @@ def set_pipeline_model_parallel_rank(rank):
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = rank
 
 
+def set_pipeline_model_parallel_split_rank(rank):
+    """Set pipeline model parallel split rank."""
+    global _MPU_PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    _MPU_PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
+
+
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
