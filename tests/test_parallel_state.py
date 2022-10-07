@@ -113,7 +113,6 @@ def test_get_tensor_model_parallel_src_rank():
     ps.destroy_model_parallel()
 
 """
-
 def test_get_virtual_pipeline_model_parallel_world_size():
     ps.initialize_model_parallel(pipeline_model_parallel_size=world_size)
     ps.set_virtual_pipeline_model_parallel_rank(world_size)
