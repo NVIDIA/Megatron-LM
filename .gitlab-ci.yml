@@ -5,7 +5,7 @@ test:
     - docker_gpu_enabled
   script:
     - nvidia-smi
-    - torchrun --nproc_per_node=2  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/'
+    - torchrun --nproc_per_node=2  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
