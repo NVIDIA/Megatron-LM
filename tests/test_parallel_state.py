@@ -120,8 +120,6 @@ def test_get_virtual_pipeline_model_parallel_world_size():
     assert(ps.get_virtual_pipeline_model_parallel_world_size() == world_size)
     ps.destroy_model_parallel()
 
-
-
 def test_is_rank_in_embedding_group():
     assert(ps.is_rank_in_embedding_group(ignore_virtual=True) == (rank in ps._EMBEDDING_GLOBAL_RANKS))
     if rank in ps._EMBEDDING_GLOBAL_RANKS:
