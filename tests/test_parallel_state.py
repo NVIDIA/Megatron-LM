@@ -124,21 +124,12 @@ def test_get_tensor_model_parallel_src_rank():
     assert(ps.get_tensor_model_parallel_src_rank() == ((rank // world_size) * world_size))
     ps.destroy_model_parallel()
 
-def test_global_memory_buffer():
-    ps._GLOBAL_MEMORY_BUFFER = None
-    ps._set_global_memory_buffer()
-    assert(ps.get_global_memory_buffer() is not None)
-
-
 """
-
 def test_get_virtual_pipeline_model_parallel_world_size():
     initialize_model_parallel(pipeline_model_parallel_size=world_size)
     ps.set_virtual_pipeline_model_parallel_rank(world_size)
     assert(ps.get_virtual_pipeline_model_parallel_world_size() == world_size)
     ps.destroy_model_parallel()
-
-
 
 def test_is_rank_in_embedding_group():
     assert(ps.is_rank_in_embedding_group(ignore_virtual=True) == (rank in ps._EMBEDDING_GLOBAL_RANKS))
