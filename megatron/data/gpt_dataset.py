@@ -81,12 +81,13 @@ def build_train_valid_test_datasets(data_prefix, data_impl,
                 blending_test_dataset)
     else:
         print_rank_0("Separate data paths provided for train, valid & test. Split string will be ignored.")
-        assert (train_data_prefix is not None)
+
         train_dataset, valid_dataset, test_dataset = None, None, None
         # Single dataset.
-        train_dataset = build_dataset("train", train_data_prefix, data_impl,
-                                    train_valid_test_num_samples[0], seq_length, seed,
-                                    skip_warmup)
+        if train_data_prefix is not None:
+            train_dataset = build_dataset("train", train_data_prefix, data_impl,
+                                        train_valid_test_num_samples[0], seq_length, seed,
+                                        skip_warmup)
 
         if valid_data_prefix is not None:
             valid_dataset = build_dataset("valid", valid_data_prefix, data_impl,
