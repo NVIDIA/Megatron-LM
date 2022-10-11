@@ -225,6 +225,15 @@ def validate_args(args, defaults={}):
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
 
+    if args.num_layers is not None:
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
+        args.encoder_num_layers = args.num_layers
+    else:
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
+        args.num_layers = args.encoder_num_layers
+
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
@@ -352,6 +361,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--encoder-num-layers', type=int, default=None,
+                       help='Number of encoder transformer layers.')
+    group.add_argument('--decoder-num-layers', type=int, default=None,
+                       help='Number of decoder transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
