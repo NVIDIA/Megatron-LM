@@ -226,10 +226,12 @@ def validate_args(args, defaults={}):
                 'and lr-warmup-samples'
 
     if args.num_layers is not None:
-        assert args.encoder_num_layers is None
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
         args.encoder_num_layers = args.num_layers
     else:
-        assert args.encoder_num_layers is not None
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
         args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
