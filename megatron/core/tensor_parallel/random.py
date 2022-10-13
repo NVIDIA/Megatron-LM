@@ -22,6 +22,8 @@ from .utils import (
     gather_split_1d_tensor,
 )
 
+from megatron.core.utils import safely_set_viewless_tensor_data
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
