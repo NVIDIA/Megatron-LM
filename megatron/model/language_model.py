@@ -167,7 +167,8 @@ class Embedding(MegatronModule):
                 max_position_embeddings, self.hidden_size)
             self._position_embeddings_key = 'position_embeddings'
             # Initialize the position embeddings.
-            self.init_method(self.position_embeddings.weight)
+            if args.perform_initialization:
+                self.init_method(self.position_embeddings.weight)
         else:
             self.position_embeddings = None
 
@@ -180,7 +181,8 @@ class Embedding(MegatronModule):
             self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes,
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
-            self.init_method(self.tokentype_embeddings.weight)
+            if args.perform_initialization:
+                self.init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 

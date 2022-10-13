@@ -40,6 +40,8 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [GPT Pretraining](#gpt-pretraining)
       * [T5 Pretraining](#t5-pretraining)
       * [Distributed Pretraining](#distributed-pretraining)
+      * [Activation Checkpointing and Recomputation](#activation-checkpointing-and-recomputation)
+      * [Distributed Optimizer](#distributed-optimizer)
       * [GPT-3 Example](#gpt-3-example)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
@@ -317,6 +319,21 @@ For cases where memory is very tight, `full` checkpointing saves just the inputs
 * Block method checkpoints the input activations of a set number of individual Transformer layers per pipeline stage and do the rest of layers without any checkpointing. This method can be used to skip checkpointing some Transformer layers until the GPU memory is fully used, which is applicable only when there is unused GPU memory. Checkpointing fewer transformer layers avoids unnecessary activation recomputation in the backprop thus improves training performance. For example, when we specify 5 layers to checkpoint of 8 layers per pipeline stage, the input activations of only the first 5 Transformer layers are checkpointed and activation recomputation for the rest 3 layers is not needed in the backprop.
 
 
+## Distributed Optimizer
+
+Usage: `--use-distributed-optimizer`. Compatible with all model and data types.
+
+The distributed optimizer is a memory savings technique, whereby the optimizer state is evenly distributed across data parallel ranks (versus the traditional method of replicating the optimizer state across data parallel ranks). As described in [ZeRO: Memory Optimizations Toward Training Trillion Parameter Models](https://arxiv.org/abs/1910.02054), our implementation distributes all optimizer state that does not overlap with the model state. For example, when using fp16 model params, the distributed optimizer maintains its own separate copy of fp32 main params & grads, which are distributed across DP ranks. When using bf16 model params, however, the distributed optimizer's fp32 main grads are the same as the model's fp32 grads, and so the grads in this case are not distributed (although the fp32 main params are still distributed, as they are separate from the bf16 model params).
+
+Theoretical memory savings vary depending on the combination of the model's param dtype and grad dtype. In our implementation, the theoretical number of bytes per parameter is (where 'd' is the data parallel size):
+
+| | Non-distributed optim | Distributed optim |
+|-|-|-|
+| fp16 param, fp16 grads | 20 | 4 + 16/d |
+| bf16 param, fp32 grads | 18 | 6 + 12/d |
+| fp32 param, fp32 grads | 16 | 8 + 8/d |
+
+
 ## GPT-3 Example
 
 In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to configure Megatron to run [GPT-3](https://arxiv.org/abs/2005.14165) with 175 billion parameters on 1024 GPUs. The script is designed for [slurm](https://slurm.schedmd.com/documentation.html) with [pyxis](https://github.com/NVIDIA/pyxis) plugin but can be easily adopted to any other scheduler. It uses 8-way and 16-way tensor and pipeline parallelism, respectively. With options `global-batch-size 1536` and `rampup-batch-size 16 16 5859375`, the training will start with global batch size 16 and linearly increase the global batch size to 1536 over 5,859,375 samples with incrmeental steps 16. The training dataset can be either a single set or a multiple datasets combined with a set of weights.
@@ -410,29 +427,15 @@ python tools/create_doc_index.py \
 
 We provide several command line arguments, detailed in the scripts listed below, to handle various zero-shot and fine-tuned downstream tasks. However, you can also finetune your model from a pretrained checkpoint on other corpora as desired. To do so, simply add the `--finetune` flag and adjust the input files and training parameters within the original training script. The iteration count will be reset to zero, and the optimizer and internal state will be reinitialized. If the fine-tuning is interrupted for any reason, be sure to remove the `--finetune` flag before continuing, otherwise the training will start again from the beginning.
 
-Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on a single GPU in downstream tasks. The following script accomplishes this. Currently only tensor model parallelism is supported on input and pipeline model parallelism on the output. This example reads in a model with 2-way tensor model parallelism and writes out a model with 2-way pipeline model parallelism.
+Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on fewer GPUs in downstream tasks. The following script accomplishes this. This example reads in a GPT model with 4-way tensor and 4-way pipeline model parallelism and writes out a model with 2-way tensor and 2-way pipeline model parallelism.
 
 <pre>
-TENSOR_MODEL_PARALLEL_SIZE=2
-TARGET_PIPELINE_MODEL_PARALLEL_SIZE=2
-
-VOCAB_FILE=bert-vocab.txt
-CHECKPOINT_PATH=checkpoints/bert_345m
-
-WORLD_SIZE=$TENSOR_MODEL_PARALLEL_SIZE python tools/merge_mp_partitions.py \
-        --model-type BERT \
-        --tensor-model-parallel-size $TENSOR_MODEL_PARALLEL_SIZE \
-        --pipeline-model-parallel-size 1 \
-        --target-pipeline-model-parallel-size $TARGET_PIPELINE_MODEL_PARALLEL_SIZE \
-        --tokenizer-type BertWordPieceLowerCase \
-        --vocab-file $VOCAB_FILE \
-        --num-layers 24 \
-        --hidden-size 1024 \
-        --num-attention-heads 16 \
-        --seq-length 512 \
-        --max-position-embeddings 512 \
-        --load $CHECKPOINT_PATH
-        --save $CHECKPOINT_PATH/merged
+python tools/checkpoint_util.py \
+        --model-type GPT \
+        --load-dir checkpoints/gpt3_tp4_pp4 \
+        --save-dir checkpoints/gpt3_tp2_pp2 \
+        --target-tensor-parallel-size 2 \
+        --target-pipeline-paralle-size 2
 
 </pre>
 
