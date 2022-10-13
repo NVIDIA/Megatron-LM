@@ -197,6 +197,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     """
     # Number of tokens in each epoch and number of required epochs.
     tokens_per_epoch = _num_tokens(documents, sizes)
+    print_rank_0(f' > Tokens per epoch: {tokens_per_epoch}')
     num_epochs = _num_epochs(tokens_per_epoch, seq_length, num_samples)
     # rng state
     np_rng = np.random.RandomState(seed=seed)

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-from megatron.model.enums import LayerType, AttnMaskType
+from megatron.model.enums import LayerType, AttnMaskType, PositionEmbeddingType
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
@@ -132,8 +132,6 @@ class Embedding(MegatronModule):
     Arguments:
         hidden_size: hidden size
         vocab_size: vocabulary size
-        max_sequence_length: maximum size of sequence. This
-                             is used for positional embedding
         embedding_dropout_prob: dropout probability for embeddings
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
@@ -143,7 +141,6 @@ class Embedding(MegatronModule):
     def __init__(self,
                  hidden_size,
                  vocab_size,
-                 max_sequence_length,
                  embedding_dropout_prob,
                  init_method,
                  num_tokentypes=0):
@@ -162,12 +159,18 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.position_embeddings = torch.nn.Embedding(
-            max_sequence_length, self.hidden_size)
-        self._position_embeddings_key = 'position_embeddings'
-        # Initialize the position embeddings.
-        if args.perform_initialization:
-            self.init_method(self.position_embeddings.weight)
+        self.position_embedding_type = args.position_embedding_type
+        if self.position_embedding_type == PositionEmbeddingType.absolute:
+            max_position_embeddings = args.max_position_embeddings
+            assert max_position_embeddings is not None
+            self.position_embeddings = torch.nn.Embedding(
+                max_position_embeddings, self.hidden_size)
+            self._position_embeddings_key = 'position_embeddings'
+            # Initialize the position embeddings.
+            if args.perform_initialization:
+                self.init_method(self.position_embeddings.weight)
+        else:
+            self.position_embeddings = None
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -192,8 +195,9 @@ class Embedding(MegatronModule):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
         self.word_embeddings.weight.shared = True
-        self.position_embeddings.weight.data.fill_(0)
-        self.position_embeddings.weight.shared = True
+        if self.position_embeddings is not None:
+            self.position_embeddings.weight.data.fill_(0)
+            self.position_embeddings.weight.shared = True
         if self.num_tokentypes > 0:
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
@@ -218,8 +222,14 @@ class Embedding(MegatronModule):
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings = words_embeddings + position_embeddings
+        embeddings = words_embeddings
+
+        if self.position_embedding_type == PositionEmbeddingType.absolute:
+            assert self.position_embeddings is not None
+            embeddings = embeddings + self.position_embeddings(position_ids)
+        else:
+            assert self.position_embeddings is None
+
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
@@ -250,9 +260,10 @@ class Embedding(MegatronModule):
         state_dict_ = {}
         state_dict_[self._word_embeddings_key] \
             = self.word_embeddings.state_dict(destination, prefix, keep_vars)
-        state_dict_[self._position_embeddings_key] \
-            = self.position_embeddings.state_dict(
-                destination, prefix, keep_vars)
+        if self.position_embedding_type == PositionEmbeddingType.absolute:
+            state_dict_[self._position_embeddings_key] \
+                = self.position_embeddings.state_dict(
+                    destination, prefix, keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
                 = self.tokentype_embeddings.state_dict(
@@ -276,16 +287,17 @@ class Embedding(MegatronModule):
         self.word_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Position embedding.
-        if self._position_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._position_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'position_embeddings' in key:
-                    state_dict_[key.split('position_embeddings.')[1]] \
-                        = state_dict[key]
-        self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+        if self.position_embedding_type == PositionEmbeddingType.absolute:
+            if self._position_embeddings_key in state_dict:
+                state_dict_ = state_dict[self._position_embeddings_key]
+            else:
+                # for backward compatibility.
+                state_dict_ = {}
+                for key in state_dict.keys():
+                    if 'position_embeddings' in key:
+                        state_dict_[key.split('position_embeddings.')[1]] \
+                            = state_dict[key]
+            self.position_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Tokentype embedding.
         if self.num_tokentypes > 0:
@@ -349,7 +361,6 @@ class TransformerLanguageModel(MegatronModule):
         if self.pre_process:
             self.embedding = Embedding(self.hidden_size,
                                        args.padded_vocab_size,
-                                       args.max_position_embeddings,
                                        args.hidden_dropout,
                                        self.init_method,
                                        self.num_tokentypes)

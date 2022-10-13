@@ -27,6 +27,7 @@ from megatron import (mpu,
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
+from megatron.model.enums import PositionEmbeddingType
 
 
 _CHECKPOINT_VERSION = None
@@ -61,8 +62,16 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-    if args.vocab_file:
+    try:
+        _compare('position_embedding_type')
+    except AttributeError as e:
+        print_rank_0(f"  Warning, trying to load an old checkpoint: {e}")
+        assert args.position_embedding_type == PositionEmbeddingType.absolute, \
+            f"Checkpoint uses PositionEmbeddingType.absolute, but input argument value was: {args.position_embedding_type}"
+    # with alibi we can change `max_position_embeddings`
+    if args.position_embedding_type != PositionEmbeddingType.alibi:
         _compare('max_position_embeddings')
+    if args.vocab_file:
         _compare('make_vocab_size_divisible_by')
         _compare('padded_vocab_size')
         _compare('tokenizer_type')
@@ -370,28 +379,28 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False):
+def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False, iteration=None, release=None):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
     """
 
-
     # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+    if iteration is None and release is None:
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
 
-    # If no tracker file, return nothing
-    if not os.path.isfile(tracker_filename):
-        if not rank0:
-            print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-            print_rank_0('    will not load any checkpoints and will start from '
-                         'random')
-        return None, None, False
+        # If no tracker file, return nothing
+        if not os.path.isfile(tracker_filename):
+            if not rank0:
+                print_rank_0('WARNING: could not find the metadata file {} '.format(
+                    tracker_filename))
+                print_rank_0('    will not load any checkpoints and will start from '
+                             'random')
+            return None, None, False
 
-    # Otherwise, read the tracker file and either set the iteration or
-    # mark it as a release checkpoint.
-    iteration, release = read_metadata(tracker_filename)
+        # Otherwise, read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration, release = read_metadata(tracker_filename)
 
     # Checkpoint.
     if rank0:
@@ -505,7 +514,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     return args
 
 
-def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
+def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True, iteration=None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -513,13 +522,56 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
+    
+    # Determine from which directory we'll try to load
+    # ======
+    if iteration is None:
+        # Read the tracker file and set the iteration.
+        tracker_filename = get_checkpoint_tracker_filename(load_dir)
+        
+        # If we can directly load from load_dir, we resume an experiment
+        if os.path.isfile(tracker_filename) and load_arg != 'finetune_from':
+            args.finetune=False
+            print_rank_0(f"Resuming from {load_dir}")
+        # Finetuning from a pretrained model
+        elif os.path.isfile(tracker_filename) and load_arg == 'finetune_from':
+            assert arg.finetune
+            print_rank_0(f"Finetuning from {load_dir}")
+        else:
+            assert not os.path.isfile(tracker_filename)
+            # No tracker file and we are in finetuning, try to load from the `finetune_from` dir
+            if args.finetune:
+                print_rank_0('WARNING: could not find the metadata file {} '.format(
+                tracker_filename))
+                print_rank_0('    will try to load from `--finetune-from` instead')
+                load_dir = getattr(args, 'finetune_from')
+                tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            # If no tracker file, return iteration zero.
+            if not os.path.isfile(tracker_filename):
+                print_rank_0('WARNING: could not find the metadata file {} '.format(
+                    tracker_filename))
+                print_rank_0('    will not load any checkpoints and will start from '
+                            'random')
+                return 0
+        
+        assert os.path.isfile(tracker_filename)
+        
+        # read the tracker file and either set the iteration or
+        # mark it as a release checkpoint.
+        iteration, release = read_metadata(tracker_filename)
+    else:
+        # Iteration given as argument: do nothing
+        release = False
+    # =======
 
     model = unwrap_model(model)
 
     model_state_dict, optim_state_dict, release = \
         _load_base_checkpoint(load_dir,
                               use_distributed_optimizer=args.use_distributed_optimizer,
-                              rank0=False)
+                              rank0=False,
+                              iteration=iteration,
+                              release=release)
 
     if model_state_dict is None:
         return 0
@@ -539,7 +591,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             except KeyError:
                 print_rank_0('A metadata file exists but unable to load '
                              'iteration from checkpoint {}, exiting'.format(
-                                 checkpoint_name))
+                                 model_checkpoint_name))
                 sys.exit()
 
     # Check arguments.
@@ -548,11 +600,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if 'args' in model_state_dict:
         checkpoint_args = model_state_dict['args']
         check_checkpoint_args(checkpoint_args)
-        args.consumed_train_samples = getattr(checkpoint_args,
-                                              'consumed_train_samples', 0)
-        update_num_microbatches(consumed_samples=args.consumed_train_samples)
-        args.consumed_valid_samples = getattr(checkpoint_args,
-                                              'consumed_valid_samples', 0)
+        if not args.finetune:
+            args.consumed_train_samples = getattr(checkpoint_args,
+                                                'consumed_train_samples', 0)
+            update_num_microbatches(consumed_samples=args.consumed_train_samples)
+            args.consumed_valid_samples = getattr(checkpoint_args,
+                                                'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
@@ -583,7 +636,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             print_rank_0('Unable to load optimizer from checkpoint {}. '
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(model_checkpoint_name))
             sys.exit()
 
     # rng states.
@@ -619,14 +672,14 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
-                         'exiting ...'.format(checkpoint_name))
+                         'exiting ...'.format(model_checkpoint_name))
             sys.exit()
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    print_rank_0(f'  successfully loaded checkpoint from {args.load} '
+    print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'at iteration {iteration}')
 
     return iteration
@@ -657,7 +710,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
     ret_state_dict = state_dict['model']
 
     if only_query_model:

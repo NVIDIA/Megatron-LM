@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.nn.init import trunc_normal_
 from megatron.model.transformer import DropPath
 from megatron import get_args
-from megatron.model import LayerNorm
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 import numpy as np
 from math import sqrt
 

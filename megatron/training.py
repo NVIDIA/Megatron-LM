@@ -19,6 +19,11 @@ from datetime import datetime
 import math
 import sys
 import time
+
+try:
+    import wandb
+except ModuleNotFoundError:
+    print('Wandb import failed', flush=True)
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
@@ -40,7 +45,7 @@ from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import ModelType
 from megatron.optimizer import get_megatron_optimizer
-from megatron.initialize import initialize_megatron
+from megatron.initialize import init_wandb, initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
@@ -381,6 +386,9 @@ def setup_model_and_optimizer(model_provider_func,
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
+        # This is critical when only model is loaded. We should make sure
+        # main parameters are also updated.
+        optimizer.reload_model_params()
     else:
         args.iteration = 0
 
@@ -601,6 +609,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+    
+    # Weights and biases reporting
+    if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
+        metrics = {
+            'learning-rate': learning_rate,
+            'samples': args.consumed_train_samples,
+            'loss-scale': loss_scale,
+            'grad-norm': grad_norm,
+            **loss_dict
+        }
+        wandb.log(metrics, step=iteration)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
@@ -670,6 +689,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Write args to tensorboard
     write_args_to_tensorboard()
+
+    # Init Weights and Biases
+    init_wandb()
 
     # Turn on training mode which enables dropout.
     for model_module in model:
@@ -855,6 +877,13 @@ def evaluate_and_print_results(prefix, forward_step_func,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+    
+    # Weights and biases reporting
+    if is_last_rank() and args.wandb_project_name:
+        metrics = {
+            '{} validation'.format(key): total_loss_dict[key].item() for key in total_loss_dict
+        }
+        wandb.log(metrics, step=iteration)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)

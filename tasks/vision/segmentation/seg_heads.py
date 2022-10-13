@@ -18,7 +18,7 @@ import torch
 import apex
 import torch.nn.functional as F
 from megatron import get_args
-from megatron.model import LayerNorm
+from megatron.model.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 from megatron.model.module import MegatronModule
 from megatron.model.vision.utils import resize
 

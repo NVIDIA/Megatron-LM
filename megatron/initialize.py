@@ -23,6 +23,11 @@ import numpy as np
 import torch
 from datetime import timedelta
 
+try:
+    import wandb
+except ModuleNotFoundError:
+    print('Wandb import failed', flush=True)
+
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -236,6 +241,20 @@ def write_args_to_tensorboard():
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)),
                             global_step=args.iteration)
+
+def init_wandb():
+    args = get_args()
+    if args.rank == (args.world_size - 1):
+        if not (args.wandb_entity_name and args.wandb_project_name):
+            print('> Skipping wandb init ...', flush=True)
+            return
+        wandb.init(
+            name=os.path.basename(args.save),
+            entity=args.wandb_entity_name,
+            project=args.wandb_project_name,
+            group="mini_cluster",
+            config=args
+        )
 
 
 def set_jit_fusion_options():

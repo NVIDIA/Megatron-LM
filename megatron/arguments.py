@@ -20,6 +20,10 @@ import os
 
 import torch
 
+import megatron
+from megatron.model.enums import PositionEmbeddingType
+
+
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
@@ -259,10 +263,21 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    # NOTE: this was before integrating alibi
+    # if args.seq_length is not None:
+    #     assert args.max_position_embeddings >= args.seq_length
+    # if args.decoder_seq_length is not None:
+    #     assert args.max_position_embeddings >= args.decoder_seq_length
+
+    if args.position_embedding_type == PositionEmbeddingType.absolute or args.position_embedding_type == PositionEmbeddingType.alibi:
+        assert args.max_position_embeddings is not None
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+    else:
+        assert args.max_position_embeddings is None
+        
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
@@ -273,6 +288,10 @@ def validate_args(args, defaults={}):
     if args.fp32_residual_connection:
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
+
+    # Activation function
+    if args.glu_activation is not None and args.bias_gelu_fusion:
+        raise ValueError("if glu-activation is used, please set --no-bias-gelu-fusion")
 
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None
@@ -308,6 +327,15 @@ def validate_args(args, defaults={}):
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+        
+    # Weights and Biases
+    if args.wandb_entity_name or args.wandb_project_name:
+        assert args.wandb_entity_name and args.wandb_project_name, \
+            "Both entity and project name must be set in order to report to wandb"
+    
+    # Local-rank from environment variable (if using torchrun)
+    if args.local_rank is None and "LOCAL_RANK" in os.environ:
+        args.local_rank = int(os.environ["LOCAL_RANK"])
 
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
@@ -377,6 +405,10 @@ def _add_network_size_args(parser):
                        'attention. This is set to '
                        '   args.hidden_size // args.num_attention_heads '
                        'if not provided.')
+    group.add_argument('--attention-head-type', type=str, default='multihead',
+                       choices=['multihead', 'multiquery'],
+                       help='Type of attention heads. `multihead` is the standard multi-head attention.'
+                       '`multiquery` shares the values and keys across attention heads')
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
@@ -399,6 +431,15 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
+    group.add_argument('--position-embedding-type', type=lambda x: PositionEmbeddingType[x],
+                       choices=list(PositionEmbeddingType),
+                       default=PositionEmbeddingType.absolute,
+                       help='Define position embedding type ("absolute" | "rotary" | "alibi"). "absolute" by default.'
+                       )
+    group.add_argument('--glu-activation', type=str,
+                       choices=megatron.model.glu_activations.GLU_ACTIVATIONS.keys(),
+                       help='GLU activations to use.'
+                       )
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     return parser
@@ -439,6 +480,14 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
+    
+    group.add_argument('--wandb-entity-name', type=str, default=None,
+                        help="Name of wandb entity for reporting")
+    group.add_argument('--wandb-project-name', type=str, default=None,
+                        help="Name of wandb project")
+    group.add_argument('--transformer-timers', action='store_true',
+                        help="If set, activate the timers within the transformer layers."
+                        "Only for debugging, as this slows down the model.")
 
     return parser
 
@@ -690,6 +739,9 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-checkpoint-args', action='store_true',
                        help='Override any command line arguments with arguments '
                        'from the checkpoint')
+    group.add_argument('--finetune-from', type=str, default=None,
+                       help='Directory containing a model checkpoint for finetuning.'
+                       'Will be loaded if the `--load` directory contains no checkpoint')
 
     return parser
 
