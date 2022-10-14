@@ -90,8 +90,14 @@ class OptimizerParamScheduler(object):
         # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
         if self.num_steps > self.lr_decay_steps:
             return self.min_lr
-        
+
         # If we are done with the warmup period, use the decay style.
+        if self.lr_decay_style == 'inverse-square-root':
+            warmup_steps = max(self.lr_warmup_steps, 1)
+            num_steps = max(self.num_steps, 1)
+            lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
+            return max(self.min_lr, lr)
+
         num_steps_ = self.num_steps - self.lr_warmup_steps
         decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
         decay_ratio = float(num_steps_) / float(decay_steps_)
