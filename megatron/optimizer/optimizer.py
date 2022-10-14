@@ -321,6 +321,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             is using a contiguous buffer to hold the model grads.
         fp16: if true, the model is running in fp16.
         bf16: if true, the model is running in bfloat16.
+        params_dtype: used by distributed optimizer.
         grad_scaler: used for scaling gradients. Note that this can be
             None. This case happens when `bf16 = True` and we don't
             use any loss scale. Note that for `bf16 = True`, we can have
@@ -332,7 +333,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, grad_scaler,
+                 fp16, bf16, params_dtype, grad_scaler,
                  models):
 
         super().__init__(
@@ -342,6 +343,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         self.fp16 = fp16
         self.bf16 = bf16
+        self.params_dtype = params_dtype
         self.grad_scaler = grad_scaler
 
         # None grad scaler is only supported for bf16.
@@ -491,12 +493,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-            fp16, bf16, grad_scaler, models)
+            fp16, bf16, params_dtype, grad_scaler, models)
 
         # ======================
         # main parameter stuff

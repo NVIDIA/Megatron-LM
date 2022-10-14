@@ -337,7 +337,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models):
         """
         See top of class definition for argument descriptions.
 
@@ -351,7 +351,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-            fp16, bf16, grad_scaler, models)
+            fp16, bf16, params_dtype, grad_scaler, models)
 
         # Verify that contiguous buffers are being used.
         # - Note: this should already be checked in arguments.py.
@@ -379,6 +379,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ) = self.build_model_and_main_param_groups(self.model_gbuf_ranges,
                                                    self.model_param_gbuf_map,
                                                    self.opt_group_ranges)
+
+        # Initialize param buffers.
+        # - These are views on the DDP model's grad buffers, that share
+        #   storage & have their own dtype. This is safe because the param
+        #   dtype size is always <= grad dtype size.
+        self.param_buffers = []
+        for model_index, model in enumerate(self.models):
+            current_param_buffers = {}
+            for dtype, grad_buffer in model._grad_buffers.items():
+                param_buffer = torch.tensor(grad_buffer.data.storage()._untyped(),
+                                            dtype = params_dtype,
+                                            device = grad_buffer.data.device)
+                param_buffer = param_buffer[:grad_buffer.numel_padded]
+                current_param_buffers[dtype] = param_buffer
+            self.param_buffers.append(current_param_buffers)
 
         # Update optimizer groups.
         # - Also, leverage state_dict() and load_state_dict() to
@@ -474,36 +489,48 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 _zero_grad_group_helper(group, set_to_none)
 
 
-    def get_model_grad_buffer_dp_views(self):
+    @staticmethod
+    def get_model_buffer_dp_views(model_buffers):
         """
-        Get shard views of each of the DDP's grad buffers.
+        Get shard views of each of the DDP's param/grad buffers.
 
         In this nested list, the top level is grouped by the virtual model
-        index and the grad buffer's data type. The sub-level is a list of
-        shards of that grad buffer, where each shard in the list represents
-        a contiguous view of the grad buffer, that is owned by a data-parallel
+        index and the buffer's data type. The sub-level is a list of
+        shards of that buffer, where each shard in the list represents
+        a contiguous view of the buffer, that is owned by a data-parallel
         rank. The shard boundary does not respect parameter boundaries, and
         so the elements of some parameters are split across data parallel
         ranks.
 
-        Additionally, return references to the entire grad buffers, for use
+        Additionally, return references to the entire buffers, for use
         in _reduce_scatter_base and _all_gather_base.
         """
 
         data_parallel_world_size = mpu.get_data_parallel_world_size()
 
-        # Grad buffer views.
-        gbuf_view_items = []
-        for model_index, model in enumerate(self.models):
-            for dtype, gbuf in model._grad_buffers.items():
+        # Buffer views.
+        view_items = []
+        for model_index, buffers in enumerate(model_buffers):
+            for dtype, buf in buffers.items():
 
-                assert gbuf.numel_padded % data_parallel_world_size == 0
-                shard_size = int(gbuf.numel_padded / data_parallel_world_size)
-                gbuf_views = [gbuf.data[(r*shard_size):((r+1)*shard_size)]
-                              for r in range(data_parallel_world_size)]
-                gbuf_view_items.append((model_index, dtype, gbuf.data, gbuf_views))
+                assert buf.numel() % data_parallel_world_size == 0
+                shard_size = int(buf.numel() / data_parallel_world_size)
+                buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
+                             for r in range(data_parallel_world_size)]
+                view_items.append((model_index, dtype, buf, buf_views))
 
-        return gbuf_view_items
+        return view_items
+
+
+    def get_model_grad_buffer_dp_views(self):
+        return self.get_model_buffer_dp_views([
+            {dtype : mem_buffer.data}
+            for model in self.models
+            for dtype, mem_buffer in model._grad_buffers.items()])
+
+
+    def get_model_param_buffer_dp_views(self):
+        return self.get_model_buffer_dp_views(self.param_buffers)
 
 
     def reduce_model_grads(self, args, timers):
@@ -560,9 +587,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         All-gather updated model params.
 
-        The DDP's grad buffer is used for the all-gather, and thus no
+        The DDP's param buffer is used for the all-gather, and thus no
         tensors are dynamically allocated. After the all-gather, the params
-        can be copied from param.main_grad to param.
+        can be copied from the param buffer to the param.
         """
 
         timers('params-all-gather', log_level=1).start(
@@ -572,26 +599,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_group = mpu.get_data_parallel_group()
 
         # All-gather updated main params.
-        # - All grad buffer views are guaranteed to have the same num elements
-        #   across all data parallel ranks, with grad buffer padding that is done
-        #   in distributed.py. Thus, all sub-views will have consistent start/end
-        #   indexes across data parallel ranks.
-        gbuf_view_items = self.get_model_grad_buffer_dp_views()
-        for index, (model_index, dtype, gbuf, gbuf_views) \
-            in enumerate(gbuf_view_items):
+        # - All param buffer views are guaranteed to have the same num elements
+        #   across all data parallel ranks, due to grad buffer padding that is
+        #   done in distributed.py, and extended to the param buffers. Thus,
+        #   all sub-views will have consistent start/end indexes across data
+        #   parallel ranks.
+        pbuf_view_items = self.get_model_param_buffer_dp_views()
+        for index, (model_index, dtype, pbuf, pbuf_views) \
+            in enumerate(pbuf_view_items):
 
             torch.distributed._all_gather_base(
-                gbuf,
-                gbuf_views[data_parallel_rank],
+                pbuf,
+                pbuf_views[data_parallel_rank],
                 group = data_parallel_group,
             )
 
-        # Each model param now contains its updated values in its
-        # '.main_grad' field.
-        for model in self.models:
+        # Copy from param buffer to each param.
+        for model_id, model in enumerate(self.models):
             for dtype, param_map in model._grad_buffer_param_index_map.items():
-                for param in param_map:
-                    param.detach().copy_(param.main_grad)
+                for param, buf_range in param_map.items():
+                    param_buf = self.param_buffers[model_id][dtype]
+                    param_buf_shard = param_buf[buf_range[0]:buf_range[1]]
+                    param.view(-1).detach().copy_(param_buf_shard)
 
         timers('params-all-gather').stop()
 
@@ -671,14 +700,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                                          model_group):
 
                     param_range_map = self.get_model_param_range_map(model_param)
-                    param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
+                    world_range = param_range_map["gbuf_world"]
 
-                    model_grad = model_param.main_grad
-                    shard_model_grad = model_grad.view(-1) \
-                        [param_range.start:param_range.end]
+                    assert world_range.size == shard_main_param.nelement()
 
-                    shard_model_grad.data.copy_(shard_main_param)
+                    model_id, dtype = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.param_buffers[model_id][dtype]
+
+                    shard_model_param = model_param_buffer.view(-1) \
+                        [world_range.start:world_range.end]
+
+                    shard_model_param.data.copy_(shard_main_param)
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups,

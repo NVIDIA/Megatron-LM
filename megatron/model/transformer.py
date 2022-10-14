@@ -736,9 +736,9 @@ class NoopTransformerLayer(MegatronModule):
         return hidden_states.clone()
 
 
-def _get_num_layers(args, is_encoder_and_decoder_model):
+def _get_num_layers(args, is_encoder_and_decoder_model, is_decoder=False):
     """Compute the number of transformer layers resident on the current rank."""
-    if mpu.get_pipeline_model_parallel_world_size() > 1:
+    if get_pipeline_model_parallel_world_size() > 1:
         if is_encoder_and_decoder_model:
             assert args.pipeline_model_parallel_split_rank is not None
 
@@ -752,20 +752,21 @@ def _get_num_layers(args, is_encoder_and_decoder_model):
                 args.pipeline_model_parallel_split_rank
             )
             num_ranks_in_decoder = args.transformer_pipeline_model_parallel_size - num_ranks_in_encoder
-            assert args.num_layers % num_ranks_in_encoder == 0, \
-                    'num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.num_layers, num_ranks_in_encoder)
-            assert args.num_layers % num_ranks_in_decoder == 0, \
-                    'num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.num_layers, num_ranks_in_decoder)
-            if mpu.is_pipeline_stage_before_split():
+            assert args.encoder_num_layers % num_ranks_in_encoder == 0, \
+                    'encoder_num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.encoder_num_layers, num_ranks_in_encoder)
+            assert args.decoder_num_layers % num_ranks_in_decoder == 0, \
+                    'decoder_num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.decoder_num_layers, num_ranks_in_decoder)
+            if is_pipeline_stage_before_split():
                 num_layers = (
                     0
                     if args.standalone_embedding_stage
-                    and mpu.get_pipeline_model_parallel_rank() == 0 else
-                    args.num_layers // num_ranks_in_encoder
+                    and get_pipeline_model_parallel_rank() == 0 else
+                    args.encoder_num_layers // num_ranks_in_encoder
                 )
             else:
-                num_layers = args.num_layers // num_ranks_in_decoder
+                num_layers = args.decoder_num_layers // num_ranks_in_decoder
         else:
+            assert args.num_layers == args.encoder_num_layers
             assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                 'num_layers must be divisible by transformer_pipeline_model_parallel_size'
 
@@ -776,11 +777,14 @@ def _get_num_layers(args, is_encoder_and_decoder_model):
             num_layers = (
                 0
                 if args.standalone_embedding_stage
-                and mpu.get_pipeline_model_parallel_rank() == 0 else
+                and get_pipeline_model_parallel_rank() == 0 else
                 args.num_layers // args.transformer_pipeline_model_parallel_size
             )
     else:
-        num_layers = args.num_layers
+        if not is_decoder:
+            num_layers = args.encoder_num_layers
+        else:
+            num_layers = args.decoder_num_layers
     return num_layers
 
 
@@ -817,7 +821,9 @@ class ParallelTransformer(MegatronModule):
 
         # Number of layers.
         self.num_layers = _get_num_layers(
-            args, args.model_type == ModelType.encoder_and_decoder)
+            args,
+            args.model_type == ModelType.encoder_and_decoder,
+            layer_type == LayerType.decoder)
 
         self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, args.num_layers)]
 
