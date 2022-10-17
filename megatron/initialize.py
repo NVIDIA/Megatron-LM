@@ -189,11 +189,13 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
-    # Call the init process
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        timeout=timedelta(minutes=10))
+        # Include this torch.distributed.init_process_group() code in the `else` branch because
+        # we do not want to reinitialize if torch.distributed.is_initialized() returns True
+        # Call the init process
+        torch.distributed.init_process_group(
+            backend=args.distributed_backend,
+            world_size=args.world_size, rank=args.rank,
+            timeout=timedelta(minutes=10))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
