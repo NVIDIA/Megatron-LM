@@ -15,6 +15,10 @@ from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal
+from megatron.model.enums import LayerType, AttnMaskType, PositionEmbeddingType
+from megatron.model.transformer import ParallelTransformer
+from megatron.model.utils import get_linear_layer
+from megatron.model.utils import init_method_normal, scaled_init_method_normal
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
@@ -161,8 +165,14 @@ class Embedding(MegatronModule):
         # Position embedding (serial).
         self.add_position_embedding = args.add_position_embedding
         if self.add_position_embedding:
+            self.position_embedding_type = args.position_embedding_type
+            if self.position_embedding_type == PositionEmbeddingType.absolute:
+                max_position_embeddings = args.max_position_embeddings
+                assert max_position_embeddings is not None
+            else:
+                max_position_embeddings = max_sequence_length
             self.position_embeddings = torch.nn.Embedding(
-                max_sequence_length, self.hidden_size)
+                max_position_embeddings, self.hidden_size)
             self._position_embeddings_key = 'position_embeddings'
             # Initialize the position embeddings.
             if args.perform_initialization:

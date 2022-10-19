@@ -10,6 +10,11 @@ import numpy as np
 import torch
 from datetime import timedelta
 
+try:
+    import wandb
+except ModuleNotFoundError:
+    print('Wandb import failed', flush=True)
+
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
@@ -170,11 +175,13 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
-    # Call the init process
-    torch.distributed.init_process_group(
-        backend=args.distributed_backend,
-        world_size=args.world_size, rank=args.rank,
-        timeout=timedelta(minutes=args.distributed_timeout_minutes))
+        # Include this torch.distributed.init_process_group() code in the `else` branch because
+        # we do not want to reinitialize if torch.distributed.is_initialized() returns True
+        # Call the init process
+        torch.distributed.init_process_group(
+            backend=args.distributed_backend,
+            world_size=args.world_size, rank=args.rank,
+            timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
@@ -227,6 +234,20 @@ def write_args_to_tensorboard():
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)),
                             global_step=args.iteration)
+
+def init_wandb():
+    args = get_args()
+    if args.rank == (args.world_size - 1):
+        if not (args.wandb_entity_name and args.wandb_project_name):
+            print('> Skipping wandb init ...', flush=True)
+            return
+        wandb.init(
+            name=os.path.basename(args.save),
+            entity=args.wandb_entity_name,
+            project=args.wandb_project_name,
+            group="mini_cluster",
+            config=args
+        )
 
 
 def set_jit_fusion_options():

@@ -251,6 +251,19 @@ class MegatronOptimizer(ABC):
         """All-reduce both word and position embeddings."""
         self.allreduce_word_embedding_grads(args)
         self.allreduce_position_embedding_grads(args)
+    
+    def allreduce_key_value_grads(self, args):
+        # TODO: models[0] ?
+        unwrapped_model = self.models[0]
+        unwrapped_model = unwrap_model(
+                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+        for layer in unwrapped_model.language_model.encoder.layers:
+            kv_weight = layer.self_attention.key_value.weight
+            if args.DDP_impl == 'local':
+                grad = kv_weight.main_grad
+            else:
+                grad = kv_weight.grad
+            torch.distributed.all_reduce(grad, group=mpu.get_tensor_model_parallel_group())
 
 
     def allreduce_layernorm_grads(self, args):
@@ -298,6 +311,13 @@ class MegatronOptimizer(ABC):
             barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
         timers('embedding-grads-all-reduce').stop()
+
+        # All-reduce key-value grads if needed.
+        if args.attention_head_type == "multiquery":
+            timers('backward-key-value-all-reduce').start()
+            self.allreduce_key_value_grads(args)
+            timers('backward-key-value-all-reduce').stop()
+
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
