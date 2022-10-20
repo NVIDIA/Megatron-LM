@@ -28,6 +28,7 @@ def generate_and_post_process(model,
                               use_eod_token_for_early_termination=True,
                               stop_on_double_eol=False,
                               stop_on_eol=False,
+                              prevent_newline_after_colon=False,
                               random_seed=-1):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
@@ -47,6 +48,7 @@ def generate_and_post_process(model,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
+        prevent_newline_after_colon=prevent_newline_after_colon,
         random_seed=random_seed)
 
     # Only post-process on first stage.
@@ -77,6 +79,7 @@ def generate(model,
              use_eod_token_for_early_termination=True,
              stop_on_double_eol=False,
              stop_on_eol=False,
+             prevent_newline_after_colon=False,
              random_seed=-1):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
@@ -93,8 +96,9 @@ def generate(model,
               temperature, add_BOS, use_eod_token_for_early_termination,
               stop_on_double_eol,
               stop_on_eol,
+              prevent_newline_after_colon,
               random_seed]
-    values_float_tensor = broadcast_float_list(12, float_list=values)
+    values_float_tensor = broadcast_float_list(len(values), float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
@@ -106,7 +110,8 @@ def generate(model,
     use_eod_token_for_early_termination = bool(values_float_tensor[8].item())
     stop_on_double_eol = bool(values_float_tensor[9].item())
     stop_on_eol = bool(values_float_tensor[10].item())
-    random_seed = int(values_float_tensor[11].item())
+    prevent_newline_after_colon = bool(values_float_tensor[11].item())
+    random_seed = int(values_float_tensor[12].item())
 
     if random_seed != -1:
         torch.random.manual_seed(random_seed)
@@ -135,7 +140,8 @@ def generate(model,
         temperature=temperature,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
-        stop_on_eol=stop_on_eol)
+        stop_on_eol=stop_on_eol,
+        prevent_newline_after_colon=prevent_newline_after_colon)
 
 def beam_search_and_post_process(model,
                                  prompts=None,
@@ -144,7 +150,8 @@ def beam_search_and_post_process(model,
                                  add_BOS=False,
                                  stop_token=50256,
                                  num_return_gen=1,
-                                 length_penalty=1):
+                                 length_penalty=1,
+                                 prevent_newline_after_colon=False):
     """Run beam search and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -156,7 +163,8 @@ def beam_search_and_post_process(model,
                                  add_BOS=add_BOS,
                                  stop_token=stop_token,
                                  num_return_gen=num_return_gen,
-                                 length_penalty=length_penalty)
+                                 length_penalty=length_penalty,
+                                 prevent_newline_after_colon=prevent_newline_after_colon)
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
@@ -166,24 +174,27 @@ def beam_search_and_post_process(model,
 
     return None
 
-def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1):
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1, prevent_newline_after_colon=False):
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               beam_size,
               add_BOS,
               stop_token,
               num_return_gen,
-              length_penalty]
-    values_float_tensor = broadcast_float_list(6, float_list=values)
+              length_penalty,
+              prevent_newline_after_colon]
+    values_float_tensor = broadcast_float_list(len(values), float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     beam_size = int(values_float_tensor[1].item())
     add_BOS = bool(values_float_tensor[2].item())
     stop_token = int(values_float_tensor[3].item())
     num_return_gen = int(values_float_tensor[4].item())
     length_penalty = values_float_tensor[5].item()
+    prevent_newline_after_colon = values_float_tensor[6].item()
 
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
     
     return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, 
-            beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty)
+            beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty,
+            prevent_newline_after_colon=prevent_newline_after_colon)
