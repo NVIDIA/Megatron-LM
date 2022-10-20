@@ -93,7 +93,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         temperature=1.0,
         use_eod_token_for_early_termination=True,
         stop_on_double_eol=False,
-        stop_on_eol=False
+        stop_on_eol=False,
+        prevent_newline_after_colon=True
         ):
     """Main token generation function.
     Arguments:
@@ -111,6 +112,7 @@ def generate_tokens_probs_and_return_on_first_stage(
         temperature: sampling temperature.
         use_eod_token_for_early_termination: if True, do early termination if
             all the sequences have reached this token.
+        prevent_newline_after_colon: if True, it will disable generating new line \n after :
     Note: Outside of model, other parameters only need to be available on
           rank 0.
     Outputs: Note that is size is adjusted to a lower value than
@@ -186,6 +188,8 @@ def generate_tokens_probs_and_return_on_first_stage(
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
             if mpu.is_pipeline_last_stage():
+                if prevent_newline_after_colon:
+                    logits[tokens2use[:, -1] == tokenizer.tokenize(':')[0], -1, tokenizer.tokenize('\n')[0]] = -1e10 # disable "\n" after ":"
                 # Always the last stage should have an output.
                 assert logits is not None
 
@@ -281,7 +285,7 @@ def generate_tokens_probs_and_return_on_first_stage(
 
     return tokens, generated_sequence_lengths, output_log_probs
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty):
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty, prevent_newline_after_colon=True):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -324,6 +328,8 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
             if mpu.is_pipeline_last_stage():
+                if prevent_newline_after_colon:
+                    logits[tokens2use[:, -1] == tokenizer.tokenize(':')[0], -1, tokenizer.tokenize('\n')[0]] = -1e10 # disable "\n" after ":"
                 vocab_size = logits.size(2)
                 log_probs = F.log_softmax(logits, dim=2)
                 new_scores = log_probs[:, -1, :] + scores
