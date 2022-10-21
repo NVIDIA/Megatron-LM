@@ -474,14 +474,16 @@ class TransformerLanguageModel(MegatronModule):
                 enc_dec_attn_mask=None, tokentype_ids=None,
                 inference_params=None,
                 pooling_sequence_index=0,
-                enc_hidden_states=None, output_enc_hidden=False):
+                enc_hidden_states=None, output_enc_hidden=False, encoder_input=None,):
 
         # Encoder embedding.
-        if self.pre_process:
+        if self.pre_process and encoder_input is None:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:
-            encoder_input = None
+            # this allows for Prompt learning as it required directly sending the encoder_input
+            # encoder_input = None 
+            pass
 
         # Retriever embedding.
         if self.add_retriever and self.pre_process:
