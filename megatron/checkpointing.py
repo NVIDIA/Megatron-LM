@@ -9,8 +9,8 @@ import numpy as np
 
 import torch
 
-from megatron import (mpu,
-                      update_num_microbatches)
+from megatron import update_num_microbatches
+from megatron.core import mpu, tensor_parallel
 from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
@@ -185,7 +185,7 @@ def get_rng_state():
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
         'cuda_rng_state': torch.cuda.get_rng_state(),
-        'rng_tracker_states': mpu.get_cuda_rng_tracker().get_states()}
+        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
 
     rng_state_list = None
     if torch.distributed.is_initialized() and \
@@ -590,7 +590,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
-                mpu.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
             else:  # backward compatability
                 random.setstate(model_state_dict['random_rng_state'])
@@ -600,7 +600,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 # Check for empty states array
                 if not model_state_dict['rng_tracker_states']:
                     raise KeyError
-                mpu.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_cuda_rng_tracker().set_states(
                     model_state_dict['rng_tracker_states'])
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '

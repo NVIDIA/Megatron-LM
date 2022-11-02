@@ -30,7 +30,8 @@ def _load_checkpoint(queue, args):
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
         from megatron.model import ModelType, module
-        from megatron import mpu, fused_kernels
+        from megatron.core import mpu
+        from megatron import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -99,7 +100,7 @@ def _load_checkpoint(queue, args):
         nonlocal consumed_valid_samples
         models = []
         for rank in range(count):
-            mpu.initialize.set_tensor_model_parallel_rank(rank)
+            mpu.parallel_state.set_tensor_model_parallel_rank(rank)
             model_ = [model_provider(pre_process, post_process).to(dtype)]
             margs.consumed_train_samples = 0
             margs.consumed_valid_samples = 0
@@ -123,8 +124,8 @@ def _load_checkpoint(queue, args):
         exit(1)
 
     set_global_variables(margs)
-    mpu.initialize.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
-    mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
+    mpu.parallel_state.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
+    mpu.parallel_state.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
@@ -162,7 +163,7 @@ def _load_checkpoint(queue, args):
     md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
 
     # Get first pipe stage
-    mpu.initialize.set_pipeline_model_parallel_rank(0)
+    mpu.parallel_state.set_pipeline_model_parallel_rank(0)
     post_process = pp_size == 1
     models = get_models(tp_size, md.params_dtype, True, post_process)
 
@@ -188,7 +189,7 @@ def _load_checkpoint(queue, args):
     total_layer_num = 0
     for pp_rank in range(pp_size):
         if pp_rank > 0:
-            mpu.initialize.set_pipeline_model_parallel_rank(pp_rank)
+            mpu.parallel_state.set_pipeline_model_parallel_rank(pp_rank)
             post_process = pp_rank == pp_size - 1
             models = get_models(tp_size, md.params_dtype, False, post_process)
         for layer_num in range(len(models[0].language_model.encoder.layers)):

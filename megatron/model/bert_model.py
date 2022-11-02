@@ -5,7 +5,7 @@
 import torch
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
@@ -61,7 +61,7 @@ class BertLMHead(MegatronModule):
         args = get_args()
 
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        mpu.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+        tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
@@ -110,10 +110,10 @@ def post_language_model_processing(lm_output, pooled_output,
         # lm_logits : [s, b, h] and lm_labels: [s, b]
         if fp16_lm_cross_entropy:
             assert lm_logits.dtype == torch.half
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits, lm_labels)
         else:
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
-                                                       lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                        lm_labels)
         # [s, b] => [b s]
         lm_loss = lm_loss.transpose(0,1).contiguous()
         return lm_loss, binary_logits

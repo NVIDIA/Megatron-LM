@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 
 from megatron import get_args, print_rank_0
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_biencoder_checkpoint
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_wiki_dataset
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_batch

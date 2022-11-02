@@ -168,14 +168,6 @@ def validate_args(args, defaults={}):
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    else:
-        if args.gradient_accumulation_fusion:
-            args.gradient_accumulation_fusion = False
-            if args.rank == 0:
-                print('Gradient accumulation fusion to linear layer weight '
-                      'gradient computation is supported only with fp32 '
-                      'gradient accumulation. Setting gradient_accumulation_fusion '
-                      'to False', flush=True)
 
     # If we use the distributed optimizer, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is on.
@@ -320,6 +312,18 @@ def validate_args(args, defaults={}):
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
+
+
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if args.sequence_parallel:
+            raise RuntimeError(
+                "Using sequence parallelism requires setting the environment variable "
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+        if args.async_tensor_model_parallel_allreduce:
+            raise RuntimeError(
+                "Using async gradient all reduce requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
 
     _print_args(args)
     return args

@@ -9,7 +9,7 @@ import torch
 from megatron import get_args, get_num_microbatches
 from megatron import print_rank_0
 from megatron import get_timers
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import ModelType

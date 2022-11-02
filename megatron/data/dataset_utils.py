@@ -28,9 +28,9 @@ import torch
 
 from megatron import (
     get_args,
-    mpu,
     print_rank_0
 )
+from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 

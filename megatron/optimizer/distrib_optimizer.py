@@ -8,10 +8,9 @@ import torch
 
 from megatron import get_args
 from megatron import get_timers
-from megatron import mpu
 from megatron import print_rank_0
+from megatron.core import mpu, tensor_parallel
 from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
@@ -290,9 +289,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_model_param = model_param.detach().view(-1) \
                         [param_range.start:param_range.end]
                     shard_main_param = shard_model_param.clone().float()
-                    mpu.copy_tensor_model_parallel_attributes(
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param)
-                    mpu.copy_tensor_model_parallel_attributes(
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_main_param, model_param)
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
@@ -309,7 +308,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         [param_range.start:param_range.end]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
-                    mpu.copy_tensor_model_parallel_attributes(
+                    tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param)
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared

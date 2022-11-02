@@ -9,7 +9,7 @@ from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
 from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
+from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
 
 def clip_grad_norm_fp32(parameters, grads_for_norm,

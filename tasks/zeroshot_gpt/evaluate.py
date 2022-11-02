@@ -9,7 +9,7 @@ import torch
 from megatron import get_args
 from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.model import GPTModel
 from megatron.training import get_model
@@ -93,7 +93,7 @@ def forward_step(batch, model, eval_metric):
     if mpu.is_pipeline_last_stage():
         # For loss, return the unreduced loss.
         if eval_metric == 'loss':
-            losses = mpu.vocab_parallel_cross_entropy(
+            losses = mpu.tensor_parallel.vocab_parallel_cross_entropy(
                 output.contiguous().float(), labels.contiguous())
             loss = torch.sum(
                 losses.view(-1) * loss_mask.contiguous().view(-1).float())

@@ -5,7 +5,7 @@
 import torch
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import tensor_parallel
 from .module import MegatronModule
 
 from .enums import AttnMaskType
@@ -33,9 +33,9 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         labels = labels.transpose(0,1).contiguous()
         if fp16_lm_cross_entropy:
             assert output.dtype == torch.half
-            loss = mpu.vocab_parallel_cross_entropy(output, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
         else:
-            loss = mpu.vocab_parallel_cross_entropy(output.float(), labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
         
         # [s b] => [b, s]
         loss = loss.transpose(0,1).contiguous()

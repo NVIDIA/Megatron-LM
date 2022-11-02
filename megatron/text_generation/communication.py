@@ -5,7 +5,7 @@
 
 import torch
 
-from megatron import mpu
+from megatron.core import mpu
 
 
 

@@ -8,7 +8,8 @@ import time
 import numpy as np
 import torch
 
-from megatron import mpu, print_rank_0
+from megatron import print_rank_0
+from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_

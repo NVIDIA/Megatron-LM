@@ -1,6 +1,7 @@
 import torch.nn.functional as F
 import torch
-from megatron import print_rank_0, get_args, mpu
+from megatron import print_rank_0, get_args
+from megatron.core import mpu
 from megatron.data.vit_dataset import ClassificationTransform
 from megatron.data.image_folder import ImageFolder
 

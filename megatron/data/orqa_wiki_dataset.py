@@ -9,7 +9,8 @@ import random
 import torch
 from torch.utils.data import Dataset
 
-from megatron import print_rank_0, get_args, get_tokenizer, mpu
+from megatron import print_rank_0, get_args, get_tokenizer
+from megatron.core import tensor_parallel
 from megatron.data.biencoder_dataset_utils import make_attention_mask
 
 def get_open_retrieval_wiki_dataset():
@@ -32,7 +33,7 @@ def get_open_retrieval_batch(data_iterator):
 
     # Broadcast data.
     data = None if data_iterator is None else next(data_iterator)
-    data_b = mpu.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     row_id = data_b['row_id'].long()

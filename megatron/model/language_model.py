@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import mpu, tensor_parallel
 from .module import MegatronModule
 from megatron.model.enums import LayerType, AttnMaskType
 from megatron.model.transformer import ParallelTransformer
@@ -26,20 +26,23 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
             model_parallel and not args.sequence_parallel
     else:
-        input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+        input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
         async_grad_allreduce = False
 
     # Matrix multiply.
-    logits_parallel = mpu.LinearWithGradAccumulationAndAsyncCommunication.apply(
-        input_parallel, word_embeddings_weight, bias,
-        args.gradient_accumulation_fusion,
-        async_grad_allreduce, args.sequence_parallel)
+    logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
+        input=input_parallel,
+        weight=word_embeddings_weight,
+        bias=bias,
+        gradient_accumulation_fusion=args.gradient_accumulation_fusion,
+        async_grad_allreduce=async_grad_allreduce,
+        sequence_parallel_enabled=args.sequence_parallel)
     # Gather if needed.
 
     if parallel_output:
         return logits_parallel
 
-    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
+    return tensor_parallel.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
 def get_language_model(num_tokentypes, add_pooler,
@@ -103,7 +106,7 @@ class Pooler(MegatronModule):
         # gather data along sequence dimensions
         # same pooler is run on all tensor parallel nodes
         if self.sequence_parallel:
-            hidden_states = mpu.gather_from_sequence_parallel_region(
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
                 hidden_states,
                 tensor_parallel_output_grad=False)
 
@@ -143,9 +146,13 @@ class Embedding(MegatronModule):
         args = get_args()
 
         # Word embeddings (parallel).
-        self.word_embeddings = mpu.VocabParallelEmbedding(
+        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             vocab_size, self.hidden_size,
-            init_method=self.init_method)
+            init_method=self.init_method,
+            params_dtype=args.params_dtype,
+            use_cpu_initialization=args.use_cpu_initialization,
+            perform_initialization=args.perform_initialization
+        )
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
@@ -222,8 +229,8 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
-            embeddings = mpu.scatter_to_sequence_parallel_region(embeddings)
-            with mpu.get_cuda_rng_tracker().fork():
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)

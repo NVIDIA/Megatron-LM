@@ -9,9 +9,9 @@ import torch
 from megatron import (
     get_args,
     get_timers,
-    mpu,
     print_rank_0
 )
+from megatron.core import tensor_parallel
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import T5Model, ModelType
 from megatron.training import pretrain
@@ -80,7 +80,7 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    data_b = mpu.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     tokens_enc = data_b['text_enc'].long()
