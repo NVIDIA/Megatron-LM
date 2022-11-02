@@ -21,7 +21,7 @@ import time
 import numpy as np
 import torch
 
-from megatron import mpu, print_rank_0
+from megatron import mpu, print_rank_0, get_args, get_tokenizer
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
@@ -152,6 +152,10 @@ class GPTDataset(torch.utils.data.Dataset):
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name, data_prefix, documents, self.indexed_dataset.sizes,
             num_samples, seq_length, seed)
+        
+        self.args = get_args()
+        self.tokenizer = get_tokenizer()
+        self.np_rng = np.random.RandomState(seed=seed) # rng state for FIM
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
@@ -183,8 +187,44 @@ class GPTDataset(torch.utils.data.Dataset):
                 self.doc_idx[doc_index_l],
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
+        
+        # Code from: https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L109
+        # TODO(Hailey): can merge the code below this line with code above this line.
+        # TODO(Hailey), cont: above already iterates through loop, so just add the permuting in there?
+        sample = np.array(sample, dtype=np.int64)
+        # # print(sample, sample.shape)
+        # # do FIM here, if enabled
+        fim_rate = self.args.fim_rate
 
-        return {'text': np.array(sample, dtype=np.int64)}
+        if fim_rate != 0:
+            assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
+
+            eod = self.tokenizer.eod
+
+            segment_breaks = np.argwhere(sample == eod) # split sample by document
+
+            if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
+                curr_start_position = 0
+                for loc in np.nditer(segment_breaks):
+                    # print(loc - curr_start_position, flush=True)
+                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                    # try:
+                    if loc - curr_start_position > 10: # sometimes examples start with EOD or are too short. so avoid this case
+                        sample[curr_start_position:loc], self.np_rng = \
+                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer)
+                    # except ValueError:
+                    #     # print(loc - curr_start_position, flush=True)
+                    #     pass
+
+                    curr_start_position = loc + 1 # jump over the EOD token
+                # TODO: Check that we are not skipping the last subsequence (after the last eod)?
+            else:
+                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer)
+        
+        # end FIM-specific code
+
+        return {"text": sample}
+        # return {'text': np.array(sample, dtype=np.int64)}
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
@@ -429,3 +469,66 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
     np_rng.shuffle(shuffle_idx_last)
 
     return np.concatenate((shuffle_idx_first, shuffle_idx_last))
+
+
+# From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
+def permute(sample, np_rng, args, tokenizer):
+    """
+    Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
+    Maintain the same sample length (if transform creates a few extra tokens, drop them).
+    """
+    fim_rate = args.fim_rate
+
+    # hardcode these for now. TODO(Hailey): should add a way to access all mask tokens in a tokenizer easily.
+    # TODO(Hailey): also, check to ensure there's not an off-by-one error here. 
+    # TODO(Hailey): when testing models trained with this workaround, need to add special tokens w/ the correct indices to the tokenizer.
+
+    # TODO: Add special tokens to tokenizer._GPT2BPETokenizer? Then we could create a new `GPT2BPETokenizerWithFIM` tokenizer type
+    suffix_tok_id, prefix_tok_id, middle_tok_id = 50277, 50278, 50279
+
+    if np_rng.binomial(1, fim_rate): # sample bernoulli dist
+
+        contents = tokenizer.detokenize(sample)
+        
+        try:
+            boundaries = list(np_rng.randint(low=1, high=len(contents) - 1, size=2))
+            boundaries.sort()
+        except ValueError as e:
+            print(len(contents), contents)
+            print(e)
+            raise e
+
+        prefix = contents[:boundaries[0]]
+        middle = contents[boundaries[0]:boundaries[1]]
+        suffix = contents[boundaries[1]:]
+
+
+        suffix = np.array([suffix_tok_id, *tokenizer.tokenize(suffix)])
+        prefix = np.array([prefix_tok_id, *tokenizer.tokenize(prefix)])
+        middle = np.array([middle_tok_id, *tokenizer.tokenize(middle)])
+        
+        # need to make same length as the input
+        new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0]
+        diff = new_length - sample.shape[0]
+
+        # print(new_length, sample.shape, suffix.shape, diff)
+        if diff > 0: # too long
+            # TODO: How to prevent this from happening? 
+            if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
+                return sample, np_rng
+            suffix = suffix[:suffix.shape[0] - diff]
+        elif diff < 0: # too short
+            # TODO: Does this really happen in practice? pad is not used by the GPT2 BPE tokenizer.
+            suffix = np.concatenate([suffix, np.full((-1 * diff), tokenizer.pad)])
+
+        new_sample = np.concatenate([ # TODO(Hailey): add a branch here + a param to select SPM or PSM mode
+            suffix,
+            prefix,
+            middle,
+        ])
+    else:
+        # don't do FIM preproc
+        new_sample = sample
+
+
+    return new_sample, np_rng
