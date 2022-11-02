@@ -41,9 +41,15 @@ class MegatronGenerate(Resource):
             return "sentences is no longer used.  Replace with prompts", 400
 
         prompts = request.get_json()["prompts"]
+        if not isinstance(prompts, list):
+            return "prompts is not a list of strings", 400
+
+        if len(prompts) == 0:
+            return "prompts is empty", 400
+        
         if len(prompts) > 128:
             return "Maximum number of prompts is 128", 400
-
+        
         tokens_to_generate = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "tokens_to_generate" in request.get_json():
             tokens_to_generate = request.get_json()["tokens_to_generate"]
