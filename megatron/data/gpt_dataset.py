@@ -498,30 +498,61 @@ def permute(sample, np_rng, args, tokenizer):
         middle = contents[boundaries[0]:boundaries[1]]
         suffix = contents[boundaries[1]:]
 
+        prefix = np.array([*tokenizer.tokenize(prefix)])
+        middle = np.array([*tokenizer.tokenize(middle)])
+        suffix = np.array([*tokenizer.tokenize(suffix)])
 
-        suffix = np.array([suffix_tok_id, *tokenizer.tokenize(suffix)])
-        prefix = np.array([prefix_tok_id, *tokenizer.tokenize(prefix)])
-        middle = np.array([middle_tok_id, *tokenizer.tokenize(middle)])
-        
-        # need to make same length as the input
-        new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0]
+        # TODO: here we truncate each given segment to fit the same length as it was before
+        # A consequence is that we never reach the end of a file?
+        # Should we rather truncate at the context-level? 
+        # need to make same length as the input. Take the 3 sentinel tokens into account
+        new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0] + 3
         diff = new_length - sample.shape[0]
-
-        # print(new_length, sample.shape, suffix.shape, diff)
         if diff > 0: # too long
             # TODO: How to prevent this from happening? 
             if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
                 return sample, np_rng
             suffix = suffix[:suffix.shape[0] - diff]
         elif diff < 0: # too short
-            # TODO: Does this really happen in practice? pad is not used by the GPT2 BPE tokenizer.
-            suffix = np.concatenate([suffix, np.full((-1 * diff), tokenizer.pad)])
+            raise ValueError("It is not clear how this can happen and how to handle it")
+        
+        if np_rng.binomial(1, args.fim_spm_rate):
+            # SPM (variant 2 from FIM paper)
+            new_sample = np.concatenate([
+                [prefix_tok_id, suffix_tok_id], suffix,
+                [middle_tok_id], prefix, middle
+            ])
+        else:
+            # PSM
+            new_sample = np.concatenate([
+                [prefix_tok_id], prefix,
+                [suffix_tok_id], suffix,
+                [middle_tok_id], middle
+            ])
 
-        new_sample = np.concatenate([ # TODO(Hailey): add a branch here + a param to select SPM or PSM mode
-            suffix,
-            prefix,
-            middle,
-        ])
+        # suffix = np.array([suffix_tok_id, *tokenizer.tokenize(suffix)])
+        # prefix = np.array([prefix_tok_id, *tokenizer.tokenize(prefix)])
+        # middle = np.array([middle_tok_id, *tokenizer.tokenize(middle)])
+        
+        # # need to make same length as the input
+        # new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0]
+        # diff = new_length - sample.shape[0]
+
+        # # print(new_length, sample.shape, suffix.shape, diff)
+        # if diff > 0: # too long
+        #     # TODO: How to prevent this from happening? 
+        #     if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
+        #         return sample, np_rng
+        #     suffix = suffix[:suffix.shape[0] - diff]
+        # elif diff < 0: # too short
+        #     # TODO: Does this really happen in practice? pad is not used by the GPT2 BPE tokenizer.
+        #     suffix = np.concatenate([suffix, np.full((-1 * diff), tokenizer.pad)])
+
+        # new_sample = np.concatenate([ # TODO(Hailey): add a branch here + a param to select SPM or PSM mode
+        #     suffix,
+        #     prefix,
+        #     middle,
+        # ])
     else:
         # don't do FIM preproc
         new_sample = sample
