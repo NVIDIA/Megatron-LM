@@ -29,7 +29,8 @@ def generate_and_post_process(model,
                               stop_on_double_eol=False,
                               stop_on_eol=False,
                               prevent_newline_after_colon=False,
-                              random_seed=-1):
+                              random_seed=-1,
+                              return_tokens=False):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -51,6 +52,8 @@ def generate_and_post_process(model,
         prevent_newline_after_colon=prevent_newline_after_colon,
         random_seed=random_seed)
 
+    if return_tokens:
+        return tokens
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         tokens, prompts_plus_generations, prompts_plus_generations_segments = \
@@ -151,7 +154,8 @@ def beam_search_and_post_process(model,
                                  stop_token=50256,
                                  num_return_gen=1,
                                  length_penalty=1,
-                                 prevent_newline_after_colon=False):
+                                 prevent_newline_after_colon=False,
+                                 return_tokens=False):
     """Run beam search and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
 
@@ -165,6 +169,8 @@ def beam_search_and_post_process(model,
                                  num_return_gen=num_return_gen,
                                  length_penalty=length_penalty,
                                  prevent_newline_after_colon=prevent_newline_after_colon)
+    if return_tokens:
+        return tokens
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
         lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 

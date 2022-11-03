@@ -27,6 +27,8 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         parallel_output)
 
     if labels is None:
+        # gather along the vocab dimension
+        output = mpu.gather_from_tensor_model_parallel_region(output)
         # [s b h] => [b s h]
         return output.transpose(0,1).contiguous()
     else:
@@ -41,6 +43,8 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         # [s b] => [b, s]
         loss = loss.transpose(0,1).contiguous()
         if return_logits:
+            # gather along the vocab dimension
+            output = mpu.gather_from_tensor_model_parallel_region(output)
             return loss, output.transpose(0,1).contiguous()
         else:
             return loss
