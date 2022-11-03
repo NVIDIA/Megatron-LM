@@ -26,6 +26,7 @@ from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.tokenizer.tokenizer import FIM_MIDDLE, FIM_PREFIX, FIM_SUFFIX
 
 
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
@@ -479,12 +480,7 @@ def permute(sample, np_rng, args, tokenizer):
     """
     fim_rate = args.fim_rate
 
-    # hardcode these for now. TODO(Hailey): should add a way to access all mask tokens in a tokenizer easily.
-    # TODO(Hailey): also, check to ensure there's not an off-by-one error here. 
-    # TODO(Hailey): when testing models trained with this workaround, need to add special tokens w/ the correct indices to the tokenizer.
-
-    # TODO: Add special tokens to tokenizer._GPT2BPETokenizer? Then we could create a new `GPT2BPETokenizerWithFIM` tokenizer type
-    suffix_tok_id, prefix_tok_id, middle_tok_id = 50277, 50278, 50279
+    suffix_tok_id, prefix_tok_id, middle_tok_id = (tokenizer.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE])
 
     if np_rng.binomial(1, fim_rate): # sample bernoulli dist
 
