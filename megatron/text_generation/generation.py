@@ -81,7 +81,7 @@ def score_and_return_on_first_stage(model, tokens, lengths):
     # Broadcast to the first pipeline stage.
     # ======================================
     output_log_probs = broadcast_from_last_pipeline_stage(
-        output_log_probs_size, torch.float32, output_log_probs)
+        output_log_probs_size, torch.float32, output_log_probs.contiguous())
     
     return tokens, lengths, output_log_probs
 
@@ -280,9 +280,9 @@ def generate_tokens_probs_and_return_on_first_stage(
     if return_output_log_probs:
         output_log_probs_size = (batch_size, context_length)
         output_log_probs = broadcast_from_last_pipeline_stage(
-            output_log_probs_size, torch.float32, output_log_probs)
+            output_log_probs_size, torch.float32, output_log_probs.contiguous())
     tokens_size = (batch_size, context_length + 1)
-    tokens = broadcast_from_last_pipeline_stage(tokens_size, torch.int64, tokens)
+    tokens = broadcast_from_last_pipeline_stage(tokens_size, torch.int64, tokens.contiguous())
 
     return tokens, generated_sequence_lengths, output_log_probs
 
@@ -409,8 +409,8 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
         scores_size_tensor = broadcast_from_last_pipeline_stage(1, torch.int64, scores_size_tensor)
         tokens_size_tensor = broadcast_from_last_pipeline_stage(2, torch.int64, tokens_size_tensor)
 
-        scores = broadcast_from_last_pipeline_stage(tuple(scores_size_tensor), torch.float32, scores)
-        tokens = broadcast_from_last_pipeline_stage(tuple(tokens_size_tensor), torch.int64, tokens)
+        scores = broadcast_from_last_pipeline_stage(tuple(scores_size_tensor), torch.float32, scores.contiguous())
+        tokens = broadcast_from_last_pipeline_stage(tuple(tokens_size_tensor), torch.int64, tokens.contiguous())
 
     return tokens, scores
 
