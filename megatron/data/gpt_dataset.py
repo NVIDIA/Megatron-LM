@@ -15,6 +15,7 @@
 
 """GPT style dataset."""
 
+import itertools
 import os
 import time
 
@@ -136,6 +137,8 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
 
     return indexed_dataset
 
+SEGMENT_OK = 0
+SEGMENT_TOO_SHORT = 0
 
 class GPTDataset(torch.utils.data.Dataset):
 
@@ -195,7 +198,10 @@ class GPTDataset(torch.utils.data.Dataset):
         sample = np.array(sample, dtype=np.int64)
         # # print(sample, sample.shape)
         # # do FIM here, if enabled
+        # TODO: Do we handle the following point from FIM paper?
+        # To transform data in the character space for context-level FIM, the tokenized documents have to be decoded back into strings before FIM augmentation. Depending on the vocabulary, some care has to be given to ensure decoding does not introduce any spurious characters into training. For example, utf-8 characters are encoded as multiple tokens with a BPE vocabulary; they can result in fragments from chunking and fail to decode. To prevent unforeseen errors midway through training, we encourage checking for these fragments at the beginning or end of a context and removing them.
         fim_rate = self.args.fim_rate
+        global SEGMENT_OK, SEGMENT_TOO_SHORT
 
         if fim_rate != 0:
             assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
@@ -206,24 +212,29 @@ class GPTDataset(torch.utils.data.Dataset):
 
             if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
                 curr_start_position = 0
-                for loc in np.nditer(segment_breaks):
+                # Also permute the segment after the last EOD
+                for loc in itertools.chain.from_iterable((np.nditer(segment_breaks), [len(sample)])):
                     # print(loc - curr_start_position, flush=True)
                     # permute {prefix, suffix, middle} or {suffix, prefix, middle}
                     # try:
                     if loc - curr_start_position > 10: # sometimes examples start with EOD or are too short. so avoid this case
                         sample[curr_start_position:loc], self.np_rng = \
                             permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer)
+                        # SEGMENT_OK += 1
+                        # print(f"SEGMENT TOO SHORT fraction: {SEGMENT_TOO_SHORT / (SEGMENT_TOO_SHORT + SEGMENT_OK)}")
+                    else:
+                        SEGMENT_TOO_SHORT += 1
+                        # print(f"SEGMENT TOO SHORT fraction: {SEGMENT_TOO_SHORT / (SEGMENT_TOO_SHORT + SEGMENT_OK)}")
                     # except ValueError:
                     #     # print(loc - curr_start_position, flush=True)
                     #     pass
 
                     curr_start_position = loc + 1 # jump over the EOD token
-                # TODO: Check that we are not skipping the last subsequence (after the last eod)?
             else:
                 sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer)
         
         # end FIM-specific code
-
+        print(sample, flush=True)
         return {"text": sample}
         # return {'text': np.array(sample, dtype=np.int64)}
 
@@ -473,7 +484,7 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
 
 
 # From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
-def permute(sample, np_rng, args, tokenizer):
+def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
     """
     Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
     Maintain the same sample length (if transform creates a few extra tokens, drop them).
@@ -487,7 +498,10 @@ def permute(sample, np_rng, args, tokenizer):
         contents = tokenizer.detokenize(sample)
         
         try:
-            boundaries = list(np_rng.randint(low=1, high=len(contents) - 1, size=2))
+            # A boundary can be =0 (prefix will be empty)
+            # a boundary can be =len(contents) (suffix will be empty)
+            # The two boundaries can be equal (middle will be empty)
+            boundaries = list(np_rng.randint(low=0, high=len(contents) + 1, size=2))
             boundaries.sort()
         except ValueError as e:
             print(len(contents), contents)
@@ -506,15 +520,16 @@ def permute(sample, np_rng, args, tokenizer):
         # A consequence is that we never reach the end of a file?
         # Should we rather truncate at the context-level? 
         # need to make same length as the input. Take the 3 sentinel tokens into account
-        new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0] + 3
-        diff = new_length - sample.shape[0]
-        if diff > 0: # too long
-            # TODO: How to prevent this from happening? 
-            if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
-                return sample, np_rng
-            suffix = suffix[:suffix.shape[0] - diff]
-        elif diff < 0: # too short
-            raise ValueError("It is not clear how this can happen and how to handle it")
+        if truncate_or_pad:
+            new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0] + 3
+            diff = new_length - sample.shape[0]
+            if diff > 0: # too long
+                # TODO: How to prevent this from happening? 
+                if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
+                    return sample, np_rng
+                suffix = suffix[:suffix.shape[0] - diff]
+            elif diff < 0: # too short
+                raise ValueError("It is not clear how this can happen and how to handle it")
         
         if np_rng.binomial(1, args.fim_spm_rate):
             # SPM (variant 2 from FIM paper)
