@@ -217,7 +217,7 @@ class GPTDataset(torch.utils.data.Dataset):
                     # print(loc - curr_start_position, flush=True)
                     # permute {prefix, suffix, middle} or {suffix, prefix, middle}
                     # try:
-                    if loc - curr_start_position > 10: # sometimes examples start with EOD or are too short. so avoid this case
+                    if loc - curr_start_position > 0:
                         sample[curr_start_position:loc], self.np_rng = \
                             permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer)
                         # SEGMENT_OK += 1
@@ -512,9 +512,9 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
         middle = contents[boundaries[0]:boundaries[1]]
         suffix = contents[boundaries[1]:]
 
-        prefix = np.array([*tokenizer.tokenize(prefix)])
-        middle = np.array([*tokenizer.tokenize(middle)])
-        suffix = np.array([*tokenizer.tokenize(suffix)])
+        prefix = np.array([*tokenizer.tokenize(prefix)], dtype=np.int64)
+        middle = np.array([*tokenizer.tokenize(middle)], dtype=np.int64)
+        suffix = np.array([*tokenizer.tokenize(suffix)], dtype=np.int64)
 
         # TODO: here we truncate each given segment to fit the same length as it was before
         # A consequence is that we never reach the end of a file?
@@ -571,6 +571,5 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
     else:
         # don't do FIM preproc
         new_sample = sample
-
 
     return new_sample, np_rng
