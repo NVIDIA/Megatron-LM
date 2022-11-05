@@ -137,8 +137,6 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
 
     return indexed_dataset
 
-SEGMENT_OK = 0
-SEGMENT_TOO_SHORT = 0
 
 class GPTDataset(torch.utils.data.Dataset):
 
@@ -202,7 +200,6 @@ class GPTDataset(torch.utils.data.Dataset):
         # TODO: Do we handle the following point from FIM paper?
         # To transform data in the character space for context-level FIM, the tokenized documents have to be decoded back into strings before FIM augmentation. Depending on the vocabulary, some care has to be given to ensure decoding does not introduce any spurious characters into training. For example, utf-8 characters are encoded as multiple tokens with a BPE vocabulary; they can result in fragments from chunking and fail to decode. To prevent unforeseen errors midway through training, we encourage checking for these fragments at the beginning or end of a context and removing them.
         fim_rate = self.args.fim_rate
-        global SEGMENT_OK, SEGMENT_TOO_SHORT
 
         if fim_rate != 0:
             assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
@@ -231,7 +228,7 @@ class GPTDataset(torch.utils.data.Dataset):
 
                 sample = np.concatenate(new_samples)
             else:
-                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer)
+                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
         
         # Truncate or pad sequence to max-length
         diff = sample.shape[0] - sample_len
@@ -498,7 +495,7 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
     """
     fim_rate = args.fim_rate
 
-    suffix_tok_id, prefix_tok_id, middle_tok_id = (tokenizer.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE])
+    suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
 
     if np_rng.binomial(1, fim_rate): # sample bernoulli dist
 
@@ -523,20 +520,19 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
         middle = np.array([*tokenizer.tokenize(middle)], dtype=np.int64)
         suffix = np.array([*tokenizer.tokenize(suffix)], dtype=np.int64)
 
-        # TODO: here we truncate each given segment to fit the same length as it was before
+        # here we truncate each given segment to fit the same length as it was before
         # A consequence is that we never reach the end of a file?
-        # Should we rather truncate at the context-level? 
-        # need to make same length as the input. Take the 3 sentinel tokens into account
+        # we should rather truncate at the context-level
         if truncate_or_pad:
+            # need to make same length as the input. Take the 3 sentinel tokens into account
             new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0] + 3
             diff = new_length - sample.shape[0]
             if diff > 0: # too long
-                # TODO: How to prevent this from happening? 
                 if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
                     return sample, np_rng
                 suffix = suffix[:suffix.shape[0] - diff]
             elif diff < 0: # too short
-                raise ValueError("It is not clear how this can happen and how to handle it")
+                suffix = np.concatenate([suffix, np.full((-1 * diff), pad_tok_id)])
         
         if np_rng.binomial(1, args.fim_spm_rate):
             # SPM (variant 2 from FIM paper)
@@ -551,30 +547,7 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
                 [suffix_tok_id], suffix,
                 [middle_tok_id], middle
             ])
-
-        # suffix = np.array([suffix_tok_id, *tokenizer.tokenize(suffix)])
-        # prefix = np.array([prefix_tok_id, *tokenizer.tokenize(prefix)])
-        # middle = np.array([middle_tok_id, *tokenizer.tokenize(middle)])
         
-        # # need to make same length as the input
-        # new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0]
-        # diff = new_length - sample.shape[0]
-
-        # # print(new_length, sample.shape, suffix.shape, diff)
-        # if diff > 0: # too long
-        #     # TODO: How to prevent this from happening? 
-        #     if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
-        #         return sample, np_rng
-        #     suffix = suffix[:suffix.shape[0] - diff]
-        # elif diff < 0: # too short
-        #     # TODO: Does this really happen in practice? pad is not used by the GPT2 BPE tokenizer.
-        #     suffix = np.concatenate([suffix, np.full((-1 * diff), tokenizer.pad)])
-
-        # new_sample = np.concatenate([ # TODO(Hailey): add a branch here + a param to select SPM or PSM mode
-        #     suffix,
-        #     prefix,
-        #     middle,
-        # ])
     else:
         # don't do FIM preproc
         new_sample = sample
