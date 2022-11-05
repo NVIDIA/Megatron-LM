@@ -27,7 +27,7 @@ from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
-from megatron.tokenizer.tokenizer import FIM_MIDDLE, FIM_PREFIX, FIM_SUFFIX
+from megatron.tokenizer.tokenizer import FIM_MIDDLE, FIM_PAD, FIM_PREFIX, FIM_SUFFIX
 
 
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
@@ -196,6 +196,7 @@ class GPTDataset(torch.utils.data.Dataset):
         # TODO(Hailey): can merge the code below this line with code above this line.
         # TODO(Hailey), cont: above already iterates through loop, so just add the permuting in there?
         sample = np.array(sample, dtype=np.int64)
+        sample_len = sample.shape[0]
         # # print(sample, sample.shape)
         # # do FIM here, if enabled
         # TODO: Do we handle the following point from FIM paper?
@@ -207,34 +208,40 @@ class GPTDataset(torch.utils.data.Dataset):
             assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
 
             eod = self.tokenizer.eod
+            pad = self.tokenizer.tokenizer.special_tokens[FIM_PAD]
 
             segment_breaks = np.argwhere(sample == eod) # split sample by document
 
             if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
                 curr_start_position = 0
-                # Also permute the segment after the last EOD
-                for loc in itertools.chain.from_iterable((np.nditer(segment_breaks), [len(sample)])):
-                    # print(loc - curr_start_position, flush=True)
-                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                    # try:
+                new_samples = []
+                for loc in np.nditer(segment_breaks):
+                    # Only permute non-empty segments.
                     if loc - curr_start_position > 0:
-                        sample[curr_start_position:loc], self.np_rng = \
-                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer)
-                        # SEGMENT_OK += 1
-                        # print(f"SEGMENT TOO SHORT fraction: {SEGMENT_TOO_SHORT / (SEGMENT_TOO_SHORT + SEGMENT_OK)}")
-                    else:
-                        SEGMENT_TOO_SHORT += 1
-                        # print(f"SEGMENT TOO SHORT fraction: {SEGMENT_TOO_SHORT / (SEGMENT_TOO_SHORT + SEGMENT_OK)}")
-                    # except ValueError:
-                    #     # print(loc - curr_start_position, flush=True)
-                    #     pass
+                        # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                        permuted, self.np_rng = \
+                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                        new_samples += [permuted, [eod]]
 
                     curr_start_position = loc + 1 # jump over the EOD token
+                # Permute the segment after the last EOD
+                permuted, self.np_rng = \
+                    permute(sample[curr_start_position:], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                new_samples.append(permuted)
+
+                sample = np.concatenate(new_samples)
             else:
                 sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer)
         
+        # Truncate or pad sequence to max-length
+        diff = sample.shape[0] - sample_len
+        if diff > 0: # too long
+            sample = sample[:sample_len]
+        elif diff < 0: # too short
+            sample = np.concatenate([sample, np.full((-1 * diff), pad)])
+
+        assert sample.shape[0] == sample_len
         # end FIM-specific code
-        print(sample, flush=True)
         return {"text": sample}
         # return {'text': np.array(sample, dtype=np.int64)}
 
