@@ -8,6 +8,7 @@ from azureml.core import Dataset, Environment, Experiment, ScriptRunConfig, Work
 from azureml.core.compute import ComputeTarget, AmlCompute
 from azureml.core.compute_target import ComputeTargetException
 from azureml.core.runconfig import PyTorchConfiguration
+from azureml.core.environment import DockerBuildContext
 
 # Check core SDK version number
 print("SDK version:", azureml.core.VERSION)
@@ -64,15 +65,9 @@ merge_file = merge_file_dataset.as_download()
 #-------------------------------------------------------------------------------
 # Setup training environment
 #-------------------------------------------------------------------------------
-megatron_ds_env = Environment.from_dockerfile(name='megatron-ds-ptca', dockerfile='Dockerfile.dockerfile')
-megatron_ds_env.register(ws).build(ws).wait_for_completion()  # Comment this out if environment already exists
 
-megatron_ds_env.environment_variables['NCCL_DEBUG'] = 'WARN'
-megatron_ds_env.environment_variables['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-megatron_ds_env.environment_variables['NCCL_SOCKET_IFNAME'] = 'eth0'
-megatron_ds_env.environment_variables['NCCL_IB_PCI_RELAXED_ORDERING']='1'
-megatron_ds_env.environment_variables['UCX_TLS']='tcp'
-megatron_ds_env.environment_variables['UCX_NET_DEVICES']='eth0'
+megatron_ds_env = Environment.from_docker_build_context(name='megatron-ds-curated-acpt', docker_build_context=DockerBuildContext.from_local_directory(workspace = ws, path = '.', dockerfile_path='Dockerfile.dockerfile'))
+megatron_ds_env.register(ws).build(ws).wait_for_completion()  # Comment this out if environment already exists
 
 #-------------------------------------------------------------------------------
 # Training Settings and Arguments
@@ -186,6 +181,13 @@ megatron_ds_src = ScriptRunConfig(source_directory='../../',
                       compute_target=compute_target,
                       environment=megatron_ds_env,
                       distributed_job_config=distr_config)
+
+megatron_ds_src.run_config.environment_variables['NCCL_DEBUG'] = 'WARN'
+megatron_ds_src.run_config.environment_variables['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+megatron_ds_src.run_config.environment_variables['NCCL_SOCKET_IFNAME'] = 'eth0'
+megatron_ds_src.run_config.environment_variables['NCCL_IB_PCI_RELAXED_ORDERING']='1'
+megatron_ds_src.run_config.environment_variables['UCX_TLS']='tcp'
+megatron_ds_src.run_config.environment_variables['UCX_NET_DEVICES']='eth0'
 
 #-------------------------------------------------------------------------------
 # Submit experiment
