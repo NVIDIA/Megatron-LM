@@ -31,6 +31,7 @@ try:
 except ImportError:
     nltk_available = False
 
+from datasets import load_dataset
 from megatron.tokenizer import build_tokenizer
 from megatron.data import indexed_dataset
 
@@ -74,9 +75,8 @@ class Encoder(object):
 
         else:
             Encoder.splitter = IdentitySplitter()
-
-    def encode(self, json_line):
-        data = json.loads(json_line)
+    
+    def _encode_data(self, data):
         ids = {}
         for key in self.args.json_keys:
             text = data[key]
@@ -88,7 +88,17 @@ class Encoder(object):
             if len(doc_ids) > 0 and self.args.append_eod:
                 doc_ids[-1].append(Encoder.tokenizer.eod)
             ids[key] = doc_ids
+        return ids
+
+    def encode(self, json_line):
+        data = json.loads(json_line)
+        ids = self._encode_data(data)
         return ids, len(json_line)
+    
+    def encode_hf(self, sample):
+        ids = self._encode_data(sample)
+        return ids, 1
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -147,8 +157,6 @@ def main():
     args = get_args()
     startup_start = time.time()
 
-    print("Opening", args.input)
-    fin = open(args.input, 'r', encoding='utf-8')
 
     if nltk_available and args.split_sentences:
         nltk.download("punkt", quiet=True)
@@ -156,8 +164,17 @@ def main():
     encoder = Encoder(args)
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
-    encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
-    #encoded_docs = map(encoder.encode, fin)
+    print("Opening", args.input)
+
+    if args.input.endswith(".jsonl"):
+        print("Input is a jsonl file")
+        fin = open(args.input, 'r', encoding='utf-8')
+        encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
+        #encoded_docs = map(encoder.encode, fin)
+    else:
+        print("Input is not a jsonl file, will try to load from HF datasets")
+        ds = load_dataset(args.input, use_auth_token=True, streaming=True, split="train")
+        encoded_docs = pool.imap(encoder.encode_hf, ds, args.chunk_size)
 
     level = "document"
     if args.split_sentences:
