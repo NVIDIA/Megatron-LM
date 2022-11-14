@@ -28,7 +28,7 @@ from .forward_step import ForwardStep
 from .sampling import sample
 from .beam_utils import BeamHypotheses
 
-MAX_TOKENS_TO_OOM = 12000  # (rprenger) Perfect value depends on hardware and network
+MAX_TOKENS_TO_OOM = 128000  # (rprenger) Perfect value depends on hardware and network
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
