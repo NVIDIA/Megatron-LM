@@ -23,17 +23,18 @@ def test_load_fused_kernels():
 
 
 def test_fused_softmax():
-    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
+    bert = BertModel.from_pretrained("bert-base-cased", max_position_embeddings=8192, ignore_mismatched_sizes=True).cuda().half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
-        "hi hi hi hi hi hi hi hi hi hi hi hi hi"  # 32
+        "hi hi hi hi hi hi hi hi hi hi hi hi hi" * 256  # 32 * 256
     )
 
     tokens = tokenizer(
         [test_text] * 4,
         return_tensors="pt",
     )
+    print("tokens :", tokens["input_ids"].shape)
 
     embedding_output = bert.embeddings(
         input_ids=tokens["input_ids"].cuda(),
@@ -121,17 +122,18 @@ def test_fused_softmax():
 
 
 def test_fused_upper_triangle_mask_softmax():
-    gpt = GPT2Model.from_pretrained("gpt2").cuda().half()
+    gpt = GPT2Model.from_pretrained("gpt2", max_position_embeddings=8192, ignore_mismatched_sizes=True).cuda().half()
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
-        "hi hi hi hi hi hi hi"  # 24
+        "hi hi hi hi hi hi hi"  * 256 # 24 * 256
     )
 
     tokens = tokenizer(
         [test_text] * 4,
         return_tensors="pt",
     )
+    print("tokens :", tokens["input_ids"].shape)
 
     attention_mask = tokens["attention_mask"].cuda()
     attention_mask = attention_mask.view(attention_mask.size(0), -1)
@@ -221,17 +223,18 @@ def test_fused_upper_triangle_mask_softmax():
 
 
 def test_layer_norm():
-    bert = BertModel.from_pretrained("bert-base-cased").cuda().half()
+    bert = BertModel.from_pretrained("bert-base-cased", max_position_embeddings=8192, ignore_mismatched_sizes=True).cuda().half()
     tokenizer = BertTokenizer.from_pretrained("bert-base-cased")
     test_text = (
         "Hello. How are you? I am fine thank you and you? yes Good. "
-        "hi hi hi hi hi hi hi hi hi hi hi hi hi"  # 32
+        "hi hi hi hi hi hi hi hi hi hi hi hi hi" * 256  # 32
     )
 
     tokens = tokenizer(
         [test_text] * 4,
         return_tensors="pt",
     )
+    print("tokens :", tokens["input_ids"].shape)
 
     # [bsz, seq_len, d_model]
     embedding_output = (
