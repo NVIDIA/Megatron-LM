@@ -57,11 +57,12 @@ from megatron.utils import calc_params_l2_norm
 from megatron.schedules import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
+from megatron.utils import barrier
 
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
-    torch.distributed.barrier()
+    barrier()
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
@@ -380,10 +381,10 @@ def setup_model_and_optimizer(model_provider_func,
         timers = get_timers()
         # Extra barrier is added to make sure all ranks report the
         # max time.
-        torch.distributed.barrier()
+        barrier()
         timers('load-checkpoint').start()
         args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
-        torch.distributed.barrier()
+        barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
         # This is critical when only model is loaded. We should make sure
@@ -672,10 +673,10 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
-    torch.distributed.barrier()
+    barrier()
     timers('save-checkpoint').start()
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
-    torch.distributed.barrier()
+    barrier()
     timers('save-checkpoint').stop()
     timers.log(['save-checkpoint'])
 
@@ -782,7 +783,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
-            torch.distributed.barrier()
+            barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
             sys.exit()
 

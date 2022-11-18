@@ -28,6 +28,7 @@ from .global_vars import get_args
 from .utils import (unwrap_model,
                     print_rank_0)
 from megatron.model.enums import PositionEmbeddingType
+from megatron.utils import barrier
 
 
 _CHECKPOINT_VERSION = None
@@ -291,12 +292,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         # Save model and optimizer together.
         state_dict = {**model_state_dict, **optim_state_dict}
         if state_dict: # only saves if populated (i.e., inherits conditions above)
+            print("Trying to save ...", flush=True)
             ensure_directory_exists(model_checkpoint_name)
             torch.save(state_dict, model_checkpoint_name)
 
     # Wait so everyone is done (necessary)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        barrier()
 
     print_rank_0('  successfully saved checkpoint at iteration {:7d} to {}'.format(
         iteration, args.save))
@@ -309,7 +311,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        barrier()
 
 def _transpose_first_dim(t, num_splits, num_splits_first, model):
     input_shape = t.size()
@@ -677,7 +679,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        barrier()
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'at iteration {iteration}')

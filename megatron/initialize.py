@@ -40,6 +40,7 @@ from megatron.mpu import (set_tensor_model_parallel_rank,
                           set_tensor_model_parallel_world_size)
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
+from megatron.utils import barrier
 
 
 def initialize_megatron(extra_args_provider=None, args_defaults={},
@@ -147,15 +148,15 @@ def _compile_dependencies():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
         fused_kernels.load(args)
-        torch.distributed.barrier()
+        barrier()
     else:
-        torch.distributed.barrier()
+        barrier()
         fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that
     # the lock is released.
-    torch.distributed.barrier()
+    barrier()
     if torch.distributed.get_rank() == 0:
         print('>>> done with compiling and loading fused kernels. '
               'Compilation time: {:.3f} seconds'.format(
@@ -213,9 +214,9 @@ def _init_autoresume():
     """Set autoresume start time."""
     autoresume = get_adlr_autoresume()
     if autoresume:
-        torch.distributed.barrier()
+        barrier()
         autoresume.init()
-        torch.distributed.barrier()
+        barrier()
 
 
 def _set_random_seed(seed_, data_parallel_random_init=False):

@@ -19,6 +19,7 @@ import sys
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from torch.distributed import BarrierOptions, GroupMember
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
@@ -132,7 +133,7 @@ def check_adlr_autoresume_termination(iteration, model,
     args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
-    torch.distributed.barrier()
+    barrier()
     if autoresume.termination_requested():
         if args.save:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -222,3 +223,14 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def barrier():
+    args = get_args()
+
+    opts = BarrierOptions()
+    opts.device_ids = [args.local_rank]
+
+    group = GroupMember.WORLD
+    work = group.barrier(opts=opts)
+    work.wait()
