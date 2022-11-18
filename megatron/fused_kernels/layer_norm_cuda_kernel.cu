@@ -76,7 +76,8 @@ void cuWelfordMuSigma2(
   const int i1,
   U& mu,
   U& sigma2,
-  U* buf) 
+  U* buf,
+  const int GPU_WARP_SIZE)
 {
   // Assumptions:
   // 1) blockDim.x == warpSize
@@ -106,12 +107,11 @@ void cuWelfordMuSigma2(
       cuWelfordOnlineSum<U>(curr,mu,sigma2,count);
     }
     // intra-warp reductions
-    for (int l = 0;  l <= 4;  ++l) {
-      int srcLaneB = (threadIdx.x+(1<<l))&31;
-      U muB = WARP_SHFL(mu, srcLaneB);
-      U countB = WARP_SHFL(count, srcLaneB);
-      U sigma2B = WARP_SHFL(sigma2, srcLaneB);
-      cuChanOnlineSum<U>(muB,sigma2B,countB,mu,sigma2,count);
+    for (int stride = GPU_WARP_SIZE / 2; stride > 0; stride /= 2) {
+      U sigma2B = WARP_SHFL_DOWN(sigma2, stride);
+      U muB = WARP_SHFL_DOWN(mu, stride);
+      U countB = WARP_SHFL_DOWN(count, stride);
+      cuChanOnlineSum<U>(muB, sigma2B, countB, mu, sigma2, count);
     }
     // threadIdx.x == 0 has correct values for each warp
     // inter-warp reductions
@@ -160,7 +160,8 @@ void cuWelfordMuSigma2(
   const int i1,
   float& mu,
   float& sigma2,
-  float* buf) 
+  float* buf,
+  const int GPU_WARP_SIZE)
 {
   // Assumptions:
   // 1) blockDim.x == warpSize
@@ -201,12 +202,11 @@ void cuWelfordMuSigma2(
       cuWelfordOnlineSum(curr,mu,sigma2,count);
     }
     // intra-warp reductions
-    for (int l = 0;  l <= 4;  ++l) {
-      int srcLaneB = (threadIdx.x+(1<<l))&31;
-      float muB = WARP_SHFL(mu, srcLaneB);
-      float countB = WARP_SHFL(count, srcLaneB);
-      float sigma2B = WARP_SHFL(sigma2, srcLaneB);
-      cuChanOnlineSum(muB,sigma2B,countB,mu,sigma2,count);
+    for (int stride = GPU_WARP_SIZE / 2; stride > 0; stride /= 2) {
+      float sigma2B = WARP_SHFL_DOWN(sigma2, stride);
+      float muB = WARP_SHFL_DOWN(mu, stride);
+      float countB = WARP_SHFL_DOWN(count, stride);
+      cuChanOnlineSum(muB, sigma2B, countB, mu, sigma2, count);
     }
     // threadIdx.x == 0 has correct values for each warp
     // inter-warp reductions
@@ -308,7 +308,8 @@ void cuApplyLayerNorm(
   const int n2,
   const U epsilon,
   const V* __restrict__ gamma,
-  const V* __restrict__ beta
+  const V* __restrict__ beta,
+  const int GPU_WARP_SIZE
   ) 
 {
   // Assumptions:
@@ -323,7 +324,7 @@ void cuApplyLayerNorm(
     SharedMemory<U> shared;
     U* buf = shared.getPointer();
     U mu,sigma2;
-    cuWelfordMuSigma2(vals,n1,n2,i1,mu,sigma2,buf);
+    cuWelfordMuSigma2(vals,n1,n2,i1,mu,sigma2,buf,GPU_WARP_SIZE);
     const T* lvals = vals + i1*n2;
     V* ovals = output_vals + i1*n2;
     U c_invvar = rsqrt(sigma2 + epsilon);
@@ -686,7 +687,11 @@ void HostApplyLayerNorm(
     )
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    const dim3 threads(32,4,1);
+    const int warp_size = at::cuda::warp_size();
+    dim3 threads(warp_size,4,1);
+#ifndef __HIP_PLATFORM_HCC__
+    threads.y = 1;
+#endif
     const uint64_t maxGridY =
       at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks(1, std::min((uint64_t)n1, maxGridY), 1);
@@ -701,7 +706,9 @@ void HostApplyLayerNorm(
 		    input,
 		    n1,n2,
 		    U(epsilon),
-            gamma,beta);
+                    gamma,
+		    beta,
+		    warp_size);
 }
 
 
@@ -754,11 +761,16 @@ void HostLayerNormGradient(
     )
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int warp_size = at::cuda::warp_size();
 
     if (gamma != NULL && beta != NULL) {
       // compute grad_gamma(j) and grad_beta(j)
+#ifndef __HIP_PLATFORM_HCC__
+      const int part_size = warp_size;
+#else
       const int part_size = 16;
-      const dim3 threads2(32,4,1);
+#endif
+      const dim3 threads2(warp_size,4,1);
       const dim3 blocks2((n2+threads2.x-1)/threads2.x,part_size,1);
       const int nshared2_a = 2 * sizeof(U) * threads2.y * threads2.y *
 	(threads2.x + 1);
@@ -777,7 +789,7 @@ void HostLayerNormGradient(
 		      part_grad_gamma.DATA_PTR<U>(),
 		      part_grad_beta.DATA_PTR<U>());
 
-      const dim3 threads3(32,8,1);
+      const dim3 threads3(warp_size,8,1);
       const dim3 blocks3((n2+threads2.x-1)/threads2.x,1,1);
       const int nshared3 = threads3.x * threads3.y * sizeof(U);
       cuComputeGradGammaBeta<<<blocks3, threads3, nshared3, stream>>>(
@@ -793,7 +805,10 @@ void HostLayerNormGradient(
     const uint64_t maxGridY =
       at::cuda::getCurrentDeviceProperties()->maxGridSize[1];
     const dim3 blocks1(1, std::min((uint64_t)n1, maxGridY), 1);
-    const dim3 threads1(32,4,1);
+    dim3 threads1(warp_size,4,1);
+#ifndef __HIP_PLATFORM_HCC__
+    threads1.y = 2;
+#endif
     int nshared =
 	    threads1.y > 1 ?
 	    threads1.y*threads1.x*sizeof(U) :
