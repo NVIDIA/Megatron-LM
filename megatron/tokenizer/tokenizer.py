@@ -290,6 +290,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
                                        special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+        self.special_tokens = self.tokenizer.special_tokens
 
     @property
     def vocab_size(self):
@@ -325,7 +326,10 @@ class _HFTokenizer(AbstractTokenizer):
         self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace', max_len=None)
         self.tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
         self.eod_id = self.tokenizer.vocab[EOD]
-
+        # Token->id mapping for additional special-tokens
+        self.special_tokens = {
+            tok: self.tokenizer.vocab[tok] for tok in special_tokens
+        }
         self._inv_vocab = {v: k for k, v in self.tokenizer.vocab.items()}
 
     @property
