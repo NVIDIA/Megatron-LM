@@ -15,17 +15,19 @@
 
 """GPT style dataset."""
 
+import itertools
 import os
 import time
 
 import numpy as np
 import torch
 
-from megatron import mpu, print_rank_0
+from megatron import mpu, print_rank_0, get_args, get_tokenizer
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.tokenizer.tokenizer import FIM_MIDDLE, FIM_PAD, FIM_PREFIX, FIM_SUFFIX
 
 
 def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
@@ -152,6 +154,10 @@ class GPTDataset(torch.utils.data.Dataset):
         self.doc_idx, self.sample_idx, self.shuffle_idx = _build_index_mappings(
             self.name, data_prefix, documents, self.indexed_dataset.sizes,
             num_samples, seq_length, seed)
+        
+        self.args = get_args()
+        self.tokenizer = get_tokenizer()
+        self.np_rng = np.random.RandomState(seed=seed) # rng state for FIM
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
@@ -183,8 +189,58 @@ class GPTDataset(torch.utils.data.Dataset):
                 self.doc_idx[doc_index_l],
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
+        
+        # Code from: https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L109
+        # TODO(Hailey): can merge the code below this line with code above this line.
+        # TODO(Hailey), cont: above already iterates through loop, so just add the permuting in there?
+        sample = np.array(sample, dtype=np.int64)
+        sample_len = sample.shape[0]
+        # # print(sample, sample.shape)
+        # # do FIM here, if enabled
+        # TODO: Do we handle the following point from FIM paper?
+        # To transform data in the character space for context-level FIM, the tokenized documents have to be decoded back into strings before FIM augmentation. Depending on the vocabulary, some care has to be given to ensure decoding does not introduce any spurious characters into training. For example, utf-8 characters are encoded as multiple tokens with a BPE vocabulary; they can result in fragments from chunking and fail to decode. To prevent unforeseen errors midway through training, we encourage checking for these fragments at the beginning or end of a context and removing them.
+        fim_rate = self.args.fim_rate
 
-        return {'text': np.array(sample, dtype=np.int64)}
+        if fim_rate != 0:
+            assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
+
+            eod = self.tokenizer.eod
+            pad = self.tokenizer.tokenizer.special_tokens[FIM_PAD]
+
+            segment_breaks = np.argwhere(sample == eod) # split sample by document
+
+            if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
+                curr_start_position = 0
+                new_samples = []
+                for loc in np.nditer(segment_breaks):
+                    # Only permute non-empty segments.
+                    if loc - curr_start_position > 0:
+                        # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                        permuted, self.np_rng = \
+                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                        new_samples += [permuted, [eod]]
+
+                    curr_start_position = loc + 1 # jump over the EOD token
+                # Permute the segment after the last EOD
+                permuted, self.np_rng = \
+                    permute(sample[curr_start_position:], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                new_samples.append(permuted)
+
+                sample = np.concatenate(new_samples)
+            else:
+                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+        
+        # Truncate or pad sequence to max-length
+        diff = sample.shape[0] - sample_len
+        if diff > 0: # too long
+            sample = sample[:sample_len]
+        elif diff < 0: # too short
+            sample = np.concatenate([sample, np.full((-1 * diff), pad)])
+
+        assert sample.shape[0] == sample_len
+        # end FIM-specific code
+        return {"text": sample}
+        # return {'text': np.array(sample, dtype=np.int64)}
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
@@ -429,3 +485,71 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
     np_rng.shuffle(shuffle_idx_last)
 
     return np.concatenate((shuffle_idx_first, shuffle_idx_last))
+
+
+# From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
+def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
+    """
+    Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
+    Maintain the same sample length (if transform creates a few extra tokens, drop them).
+    """
+    fim_rate = args.fim_rate
+
+    suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
+
+    if np_rng.binomial(1, fim_rate): # sample bernoulli dist
+
+        contents = tokenizer.detokenize(sample)
+        
+        try:
+            # A boundary can be =0 (prefix will be empty)
+            # a boundary can be =len(contents) (suffix will be empty)
+            # The two boundaries can be equal (middle will be empty)
+            boundaries = list(np_rng.randint(low=0, high=len(contents) + 1, size=2))
+            boundaries.sort()
+        except ValueError as e:
+            print(len(contents), contents)
+            print(e)
+            raise e
+
+        prefix = contents[:boundaries[0]]
+        middle = contents[boundaries[0]:boundaries[1]]
+        suffix = contents[boundaries[1]:]
+
+        prefix = np.array([*tokenizer.tokenize(prefix)], dtype=np.int64)
+        middle = np.array([*tokenizer.tokenize(middle)], dtype=np.int64)
+        suffix = np.array([*tokenizer.tokenize(suffix)], dtype=np.int64)
+
+        # here we truncate each given segment to fit the same length as it was before
+        # A consequence is that we never reach the end of a file?
+        # we should rather truncate at the context-level
+        if truncate_or_pad:
+            # need to make same length as the input. Take the 3 sentinel tokens into account
+            new_length = suffix.shape[0] + prefix.shape[0] + middle.shape[0] + 3
+            diff = new_length - sample.shape[0]
+            if diff > 0: # too long
+                if suffix.shape[0] <= diff: # if there's no space to truncate the suffix: stop and report it. atm i should have stopped this from happening
+                    return sample, np_rng
+                suffix = suffix[:suffix.shape[0] - diff]
+            elif diff < 0: # too short
+                suffix = np.concatenate([suffix, np.full((-1 * diff), pad_tok_id)])
+        
+        if np_rng.binomial(1, args.fim_spm_rate):
+            # SPM (variant 2 from FIM paper)
+            new_sample = np.concatenate([
+                [prefix_tok_id, suffix_tok_id], suffix,
+                [middle_tok_id], prefix, middle
+            ])
+        else:
+            # PSM
+            new_sample = np.concatenate([
+                [prefix_tok_id], prefix,
+                [suffix_tok_id], suffix,
+                [middle_tok_id], middle
+            ])
+        
+    else:
+        # don't do FIM preproc
+        new_sample = sample
+
+    return new_sample, np_rng

@@ -281,7 +281,7 @@ class GPT2Tokenizer(object):
         return self.convert_tokens_to_ids(self.tokenize(text))
 
     def decode(self, tokens):
-        text = ''.join([self.decoder[token] for token in tokens])
+        text = ''.join(self.convert_ids_to_tokens(tokens))
         text = bytearray([self.byte_decoder[c] for c in text]).decode('utf-8', errors=self.errors)
         return text
 

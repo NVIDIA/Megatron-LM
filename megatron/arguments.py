@@ -898,7 +898,8 @@ def _add_data_args(parser):
                        default=None,
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer',
+                                'GPT2BPETokenizerWithFIM'],
                        help='What type of tokenizer to use.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
@@ -910,6 +911,11 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--fim-rate', type=float, default=0.,
+                       help='Probability to convert a training sample into a "Fill-in-the-Middle" format. Must be between 0 and 1.')
+    group.add_argument('--fim-spm-rate', type=float, default=0.5,
+                       help='Probability that the a FIM sample uses the SPM format over the PSM format. '
+                       'At 1, exclusively train with SPM. At 0, exclusively train with PSM')
 
     return parser
 

@@ -22,6 +22,11 @@ from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 
+FIM_PREFIX = "<fim-prefix>"
+FIM_MIDDLE = "<fim-middle>"
+FIM_SUFFIX = "<fim-suffix>"
+FIM_PAD = "<fim-pad>"
+
 def build_tokenizer(args):
     """Initialize tokenizer."""
     if args.rank == 0:
@@ -41,6 +46,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+    elif args.tokenizer_type == 'GPT2BPETokenizerWithFIM':
+        assert args.merge_file is not None
+        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -260,12 +268,13 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""
 
-    def __init__(self, vocab_file, merge_file):
+    def __init__(self, vocab_file, merge_file, special_tokens=None):
         name = 'GPT2 BPE'
         super().__init__(name)
 
+        special_tokens = special_tokens if special_tokens is not None else []
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
-                                       special_tokens=[], max_len=None)
+                                       special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
     @property
