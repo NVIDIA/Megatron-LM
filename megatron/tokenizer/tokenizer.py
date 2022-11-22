@@ -27,6 +27,8 @@ FIM_PREFIX = "<fim-prefix>"
 FIM_MIDDLE = "<fim-middle>"
 FIM_SUFFIX = "<fim-suffix>"
 FIM_PAD = "<fim-pad>"
+EOD = "<|endoftext|>"
+
 
 def build_tokenizer(args):
     """Initialize tokenizer."""
@@ -35,7 +37,10 @@ def build_tokenizer(args):
               flush=True)
 
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None
+    if args.tokenizer_type in ['BertWordPieceLowerCase', 'BertWordPieceCase', 'GPT2BPETokenizer', 'GPT2BPETokenizerWithFIM']:
+        assert args.vocab_file is not None
+    else:
+        assert args.tokenizer_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
@@ -52,15 +57,17 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
     elif args.tokenizer_type == "TokenizerFromFile":
         assert args.tokenizer_file is not None
-        tokenizer = _HFTokenizer(args.tokenizer_file)
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD])
     elif args.tokenizer_type == "TokenizerFromFileWithFIM":
         assert args.tokenizer_file is not None
-        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[EOD, FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
 
     # Add vocab size.
+    # TODO: For most tokenizers, vocab_size does not take special_tokens into account. 
+    # Might cause an issue if vocab_size + len(special_tokens) exceeds padded_vocab_size?
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                       args)
 
@@ -315,21 +322,23 @@ class _HFTokenizer(AbstractTokenizer):
         super().__init__(name)
 
         special_tokens = special_tokens if special_tokens is not None else []
-        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace',
-                                       special_tokens=special_tokens, max_len=None)
-        self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace', max_len=None)
+        self.tokenizer.add_special_tokens({'additional_special_tokens': special_tokens})
+        self.eod_id = self.tokenizer.vocab[EOD]
+
+        self._inv_vocab = {v: k for k, v in self.tokenizer.vocab.items()}
 
     @property
     def vocab_size(self):
-        return len(self.tokenizer.encoder)
+        return self.tokenizer.vocab_size
 
     @property
     def vocab(self):
-        return self.tokenizer.encoder
+        return self.tokenizer.vocab
 
     @property
     def inv_vocab(self):
-        return self.tokenizer.decoder
+        return self._inv_vocab
 
     def tokenize(self, text):
         return self.tokenizer.encode(text)
