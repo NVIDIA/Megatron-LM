@@ -18,6 +18,7 @@
 from abc import ABC
 from abc import abstractmethod
 
+from transformers import PreTrainedTokenizerFast
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
@@ -49,6 +50,12 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPT2BPETokenizerWithFIM':
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
+    elif args.tokenizer_type == "TokenizerFromFile":
+        assert args.tokenizer_file is not None
+        tokenizer = _HFTokenizer(args.tokenizer_file)
+    elif args.tokenizer_type == "TokenizerFromFileWithFIM":
+        assert args.tokenizer_file is not None
+        tokenizer = _HFTokenizer(args.tokenizer_file, special_tokens=[FIM_PREFIX, FIM_MIDDLE, FIM_SUFFIX, FIM_PAD])
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -274,6 +281,41 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
         special_tokens = special_tokens if special_tokens is not None else []
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
+                                       special_tokens=special_tokens, max_len=None)
+        self.eod_id = self.tokenizer.encoder['<|endoftext|>']
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer.encoder)
+
+    @property
+    def vocab(self):
+        return self.tokenizer.encoder
+
+    @property
+    def inv_vocab(self):
+        return self.tokenizer.decoder
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+
+
+class _HFTokenizer(AbstractTokenizer):
+    """HF Tokenizer."""
+
+    def __init__(self, tokenizer_file, special_tokens=None):
+        name = 'HF Tokenizer'
+        super().__init__(name)
+
+        special_tokens = special_tokens if special_tokens is not None else []
+        self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_file, errors='replace',
                                        special_tokens=special_tokens, max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
