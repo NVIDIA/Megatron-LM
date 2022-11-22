@@ -330,7 +330,7 @@ class _HFTokenizer(AbstractTokenizer):
 
     @property
     def vocab_size(self):
-        return self.tokenizer.vocab_size
+        return len(self.tokenizer)
 
     @property
     def vocab(self):
