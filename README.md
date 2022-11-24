@@ -459,6 +459,12 @@ curl 'http://localhost:5000/api' -X 'PUT' -H 'Content-Type: application/json; ch
 
 See [megatron/text_generation_server.py](megatron/text_generation_server.py) for more API options.
 
+### Detoxify GPT via Self-generation
+We include an example in `examples/detxoify_lm/` to detoxify language models by leveraging the generative power of language models.
+
+See [examples/detxoify_lm/README.md](examples/detxoify_lm/README.md) for step-by-step tutorials on how to perform domain-adaptive training and detoxify LM using self-generated corpus. 
+
+
 ## GPT Evaluation
 We include example scripts for GPT evaluation on WikiText perplexity evaluation and LAMBADA Cloze accuracy.
 
