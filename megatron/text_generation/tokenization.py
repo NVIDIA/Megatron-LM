@@ -43,10 +43,11 @@ def detokenize_generations(tokens_gpu_tensor,
         if return_segments:
             words = []
             for token in sequence_tokens:
-                word = tokenizer.tokenizer.decoder[token]
-                word = bytearray(
-                    [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                        'utf-8', errors='replace')
+                # word = tokenizer.tokenizer.decoder[token]
+                # word = bytearray(
+                #     [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                #         'utf-8', errors='replace')
+                word = tokenizer.detokenize([token])
                 words.append(word)
             prompts_plus_generations_segments.append(words)
 
