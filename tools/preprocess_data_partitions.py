@@ -174,6 +174,7 @@ class Partition(object):
             self.print_processing_stats(i, proc_start, total_bytes_processed)
         
         fin.close()
+        builders[key].finalize(output_idx_files[key])
 
 
 def get_args():
@@ -219,9 +220,8 @@ def get_args():
     args = parser.parse_args()
     args.keep_empty = False
 
-    if (args.tokenizer_type.lower().startswith('bert')
-        if not args.split_sentences:
-            print("Are you sure you don't want to split sentences?")
+    if args.tokenizer_type.lower().startswith('bert') and not args.split_sentences:
+        print("Are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
     args.rank = 1
@@ -265,7 +265,11 @@ def main():
     if args.partitions == 1:
         file_name, extension = os.path.splitext(args.input)
         sentence_split_file = file_name + "_ss" + extension
-        in_ss_out_names.append((args.input, sentence_split_file, args.output_prefix))
+        file_names = {
+            'partition': args.input,
+            'sentence_split': sentence_split_file,
+            'output_prefix': args.output_prefix}
+        in_ss_out_names.append(file_names)
     else:
         in_file_names = glob.glob(args.input)
 
@@ -358,7 +362,7 @@ def main():
             full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
                                                              key, level)
             builders[key].merge_file_(full_partition_output_prefix)
-        builder[key].finalize(output_idx_files[key])
+        builders[key].finalize(output_idx_files[key])
 
 
 if __name__ == '__main__':

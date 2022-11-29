@@ -15,8 +15,10 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
+    if args.tokenizer_type != 'SentencePieceTokenizer':
+        assert args.vocab_file is not None
+
     # Select and instantiate the tokenizer.
-    assert args.vocab_file is not None
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
