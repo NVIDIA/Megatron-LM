@@ -12,7 +12,7 @@ from tools.hf_transformers.modeling_gpt2_mq import GPT2LMHeadCustomModel
 ####################################################################################################
 
 
-def convert_megatron_checkpoint(args, input_state_dict, config):
+def convert_megatron_checkpoint(input_state_dict, config):
     # The converted output model.
     output_state_dict = {}
 
@@ -216,28 +216,13 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
 ####################################################################################################
 
 
-def main():
-    # Create the argument parser.
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--print-checkpoint-structure", action="store_true")
-    parser.add_argument(
-        "--path_to_checkpoint",
-        type=str,
-        help="Path to the `.pt` checkpoint file",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        help="Ouptut directory where HF checkpoint will be written",
-    )
-    args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
+def main(path_to_checkpoint, output_dir, print_checkpoint_structure):
+    os.makedirs(output_dir, exist_ok=True)
 
     # Load the model.
     # the .zip is very optional, let's keep it for backward compatibility
-    print(f"Extracting PyTorch state dictionary from {args.path_to_checkpoint}")
-    input_state_dict = torch.load(args.path_to_checkpoint, map_location="cpu")
+    print(f"Extracting PyTorch state dictionary from {path_to_checkpoint}")
+    input_state_dict = torch.load(path_to_checkpoint, map_location="cpu")
 
     ds_args = input_state_dict.get("args", None)
 
@@ -284,10 +269,10 @@ def main():
 
     # Convert.
     print("Converting")
-    output_state_dict = convert_megatron_checkpoint(args, input_state_dict, config)
+    output_state_dict = convert_megatron_checkpoint(input_state_dict, config)
 
     # Print the structure of converted state dict.
-    if args.print_checkpoint_structure:
+    if print_checkpoint_structure:
         recursive_print(None, output_state_dict)
 
     # Add tokenizer class info to config
@@ -312,7 +297,7 @@ def main():
     GPT2LMHeadCustomModel.register_for_auto_class("AutoModelForCausalLM")
     hf_model = GPT2LMHeadCustomModel(config)
     hf_model.load_state_dict(output_state_dict)
-    hf_model.save_pretrained(args.output_dir)
+    hf_model.save_pretrained(output_dir)
 
     # Store the state_dict to file.
     # print(f'Saving checkpoint to "{output_checkpoint_file}"')
@@ -320,4 +305,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Create the argument parser.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--print-checkpoint-structure", action="store_true")
+    parser.add_argument(
+        "--path_to_checkpoint",
+        type=str,
+        help="Path to the `.pt` checkpoint file",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        help="Ouptut directory where HF checkpoint will be written",
+    )
+    args = parser.parse_args()
+
+    main(args.path_to_checkpoint, args.output_dir, args.print_checkpoint_structure)
