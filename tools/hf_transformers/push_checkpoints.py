@@ -4,6 +4,14 @@ import subprocess
 import argparse
 
 
+"""
+Script to upload Megatron checkpoints to a HF repo on the Hub.
+
+The script clones/creates a repo on the Hub, checks out a branch `--branch_name`,
+and converts each `iter_` checkpoint and saves it as a commit on that branch.
+"""
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_dir", type=str, help="Path where repository is cloned to locally.")
