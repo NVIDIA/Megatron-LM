@@ -308,15 +308,6 @@ def main():
     tokenizer_class = type(tokenizer).__name__
     config.tokenizer_class = tokenizer_class
 
-    # Store the config to file.
-    print("Saving config")
-    config.save_pretrained(args.output_dir)
-
-    # Save tokenizer based on args
-    print(f"Adding {tokenizer_class} tokenizer files")
-    tokenizer.save_pretrained(args.output_dir)
-
-
     # Save custom model
     GPT2CustomConfig.register_for_auto_class()
     GPT2LMHeadCustomModel.register_for_auto_class("AutoModelForCausalLM")
