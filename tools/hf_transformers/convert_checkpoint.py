@@ -223,7 +223,7 @@ def main():
     parser.add_argument(
         "--path_to_checkpoint",
         type=str,
-        help="Path to the checkpoint file (.zip archive or direct .pt file)",
+        help="Path to the `.pt` checkpoint file",
     )
     parser.add_argument(
         "--output-dir",
@@ -285,7 +285,6 @@ def main():
     # Convert.
     print("Converting")
     output_state_dict = convert_megatron_checkpoint(args, input_state_dict, config)
-    # TODO: also set `scale_attn_weights` and `scale_attn_by_inverse_layer_idx` ?
 
     # Print the structure of converted state dict.
     if args.print_checkpoint_structure:
@@ -313,7 +312,6 @@ def main():
     GPT2LMHeadCustomModel.register_for_auto_class("AutoModelForCausalLM")
     hf_model = GPT2LMHeadCustomModel(config)
     hf_model.load_state_dict(output_state_dict)
-    hf_model.push_to_hub("custom_gpt2_mqa")
     hf_model.save_pretrained(args.output_dir)
 
     # Store the state_dict to file.
