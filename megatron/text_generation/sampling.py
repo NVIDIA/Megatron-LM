@@ -10,13 +10,11 @@ Part of this code is inspired by:
 import torch
 
 
-
 def modify_logits_for_top_k_filtering(logits, top_k):
     """Set the logits for none top-k values to -inf."""
 
     filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
-    logits.masked_fill_(filter_, float('-Inf'))
-
+    logits.masked_fill_(filter_, float("-Inf"))
 
 
 def modify_logits_for_top_p_filtering(logits, top_p):
@@ -38,12 +36,11 @@ def modify_logits_for_top_p_filtering(logits, top_p):
 
     # Fill in the filtered part
     filter_ = filter_.scatter(1, sorted_indices, filter_)
-    logits.masked_fill_(filter_, float('-Inf'))
-
+    logits.masked_fill_(filter_, float("-Inf"))
 
 
 def sample(logits, top_k=0, top_p=0.0, temperature=1.0, vocab_size=None):
-    """ Sample and generate a token.
+    """Sample and generate a token.
     Note: logits has the dimension [b, v] where b is the batch size
           and v is the vocabulary size.
     If vocab_size is provided, we will make sure the sample that is
@@ -52,14 +49,12 @@ def sample(logits, top_k=0, top_p=0.0, temperature=1.0, vocab_size=None):
     """
 
     # Check logits for consistency.
-    assert logits.ndim == 2, 'expected the logits to be of [b, v] shape.'
-    assert logits.type() == 'torch.cuda.FloatTensor', \
-        'input logits should be floats.'
-
+    assert logits.ndim == 2, "expected the logits to be of [b, v] shape."
+    assert logits.type() == "torch.cuda.FloatTensor", "input logits should be floats."
 
     # Greedy is just simple argmax.
     if top_k == 1:
-        assert top_p == 0.0, 'cannot set both greedy and top-p samplings.'
+        assert top_p == 0.0, "cannot set both greedy and top-p samplings."
         samples = torch.argmax(logits, dim=-1)
 
     # Top-k or top-p sampling.
@@ -71,14 +66,14 @@ def sample(logits, top_k=0, top_p=0.0, temperature=1.0, vocab_size=None):
             logits.div_(temperature)
 
         if top_k > 1:
-            assert top_p == 0.0, 'cannot set both top-k and top-p samplings.'
-            assert top_k <= logits.size(1), 'top-k is larger than logit size.'
+            assert top_p == 0.0, "cannot set both top-k and top-p samplings."
+            assert top_k <= logits.size(1), "top-k is larger than logit size."
             if vocab_size:
-                assert top_k < vocab_size, 'top-k is larger than vocab size.'
+                assert top_k < vocab_size, "top-k is larger than vocab size."
             modify_logits_for_top_k_filtering(logits, top_k)
 
         elif top_p > 0.0:
-            assert top_p <= 1.0, 'top-p should be in (0, 1].'
+            assert top_p <= 1.0, "top-p should be in (0, 1]."
             modify_logits_for_top_p_filtering(logits, top_p)
 
         # After filtering, we need to recalculate the distribution.

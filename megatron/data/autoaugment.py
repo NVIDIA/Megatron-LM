@@ -39,9 +39,7 @@ Reference:
 import random
 
 import numpy as np
-from PIL import Image
-from PIL import ImageEnhance
-from PIL import ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 _MAX_LEVEL = 10  # Maximum integer strength of an augmentation, if applicable.
 
@@ -192,9 +190,7 @@ class SubPolicy:
             "translateY": np.linspace(0, 150 / 331, num_levels),
             "rotate": np.linspace(0, 30, num_levels),
             "color": np.linspace(0.0, 0.9, num_levels),
-            "posterize": np.round(np.linspace(8, 4, num_levels), 0).astype(
-                np.int
-            ),
+            "posterize": np.round(np.linspace(8, 4, num_levels), 0).astype(np.int),
             "solarize": np.linspace(256, 0, num_levels),  # range [0, 256]
             "contrast": np.linspace(0.0, 0.9, num_levels),
             "sharpness": np.linspace(0.0, 0.9, num_levels),
@@ -275,21 +271,17 @@ class SubPolicy:
             "color": lambda img, magnitude: ImageEnhance.Color(img).enhance(
                 1 + magnitude * random.choice([-1, 1])
             ),
-            "posterize": lambda img, magnitude: ImageOps.posterize(
-                img, magnitude
+            "posterize": lambda img, magnitude: ImageOps.posterize(img, magnitude),
+            "solarize": lambda img, magnitude: ImageOps.solarize(img, magnitude),
+            "contrast": lambda img, magnitude: ImageEnhance.Contrast(img).enhance(
+                1 + magnitude * random.choice([-1, 1])
             ),
-            "solarize": lambda img, magnitude: ImageOps.solarize(
-                img, magnitude
+            "sharpness": lambda img, magnitude: ImageEnhance.Sharpness(img).enhance(
+                1 + magnitude * random.choice([-1, 1])
             ),
-            "contrast": lambda img, magnitude: ImageEnhance.Contrast(
-                img
-            ).enhance(1 + magnitude * random.choice([-1, 1])),
-            "sharpness": lambda img, magnitude: ImageEnhance.Sharpness(
-                img
-            ).enhance(1 + magnitude * random.choice([-1, 1])),
-            "brightness": lambda img, magnitude: ImageEnhance.Brightness(
-                img
-            ).enhance(1 + magnitude * random.choice([-1, 1])),
+            "brightness": lambda img, magnitude: ImageEnhance.Brightness(img).enhance(
+                1 + magnitude * random.choice([-1, 1])
+            ),
             "autocontrast": lambda img, magnitude: ImageOps.autocontrast(img),
             "equalize": lambda img, magnitude: ImageOps.equalize(img),
             "invert": lambda img, magnitude: ImageOps.invert(img),

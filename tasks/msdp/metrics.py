@@ -1,17 +1,17 @@
-
 # The following code is adapted from
-# https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/metrics.py, 
-# which is licensed under the MIT license. More details on the license can be 
+# https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/metrics.py,
+# which is licensed under the MIT license. More details on the license can be
 # found at https://github.com/facebookresearch/ParlAI/blob/master/LICENSE.
 
 """Provides standard metric evaluations for dialog."""
 
+import re
 from collections import Counter
 from typing import List
-import numpy as np
-import re
 
-re_art = re.compile(r'\b(a|an|the)\b')
+import numpy as np
+
+re_art = re.compile(r"\b(a|an|the)\b")
 re_punc = re.compile(r'[!"#$%&()*+,-./:;<=>?@\[\]\\^`{|}~_\']')
 
 
@@ -20,9 +20,9 @@ def normalize_answer(s):
     Lower text and remove punctuation, articles and extra whitespace.
     """
     s = s.lower()
-    s = re_punc.sub(' ', s)
-    s = re_art.sub(' ', s)
-    s = ' '.join(s.split())
+    s = re_punc.sub(" ", s)
+    s = re_art.sub(" ", s)
+    s = " ".join(s.split())
     return s
 
 
@@ -59,12 +59,12 @@ class F1Metric:
 
         precision, recall, f1 = F1Metric._prec_recall_f1_score(g_tokens, a_tokens)
         return precision, recall, f1
-        
+
     @staticmethod
     def compute_all_pairs(guesses: List[str], answers: List[str]):
         # additional augment:
         assert len(guesses) == len(answers)
-        
+
         precision_list, recall_list, f1_list = [], [], []
         for guess, answer in zip(guesses, answers):
             precision, recall, f1 = F1Metric.compute_each_pair(guess, answer)
@@ -73,5 +73,5 @@ class F1Metric:
             precision_list.append(precision)
             recall_list.append(recall)
             f1_list.append(f1)
-        
+
         return np.mean(precision_list), np.mean(recall_list), np.mean(f1_list)

@@ -2,14 +2,18 @@
 
 """Pretrain VIT"""
 
+from functools import partial
+
 import torch
 import torch.nn.functional as F
-from functools import partial
+
 from megatron import get_args, get_timers, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model import ModelType
-from megatron.model.vision.classification import VitClassificationModel
-from megatron.model.vision.classification import MitClassificationModel
+from megatron.model.vision.classification import (
+    MitClassificationModel,
+    VitClassificationModel,
+)
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
@@ -19,19 +23,24 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
 
-    if args.vision_backbone_type == 'vit':
+    if args.vision_backbone_type == "vit":
         print_rank_0("building VIT model ...")
-        model = VitClassificationModel(num_classes=args.num_classes,
-                                       pre_process=pre_process,
-                                       post_process=post_process)
-    elif args.vision_backbone_type == 'mit':
+        model = VitClassificationModel(
+            num_classes=args.num_classes,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
+    elif args.vision_backbone_type == "mit":
         print_rank_0("building MIT model ...")
-        model = MitClassificationModel(num_classes=args.num_classes,
-                                       pre_process=pre_process,
-                                       post_process=post_process)
+        model = MitClassificationModel(
+            num_classes=args.num_classes,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
     else:
-        raise Exception('{} vision backbone is not supported.'.format(
-                              args.vision_backbone_type))
+        raise Exception(
+            "{} vision backbone is not supported.".format(args.vision_backbone_type)
+        )
     return model
 
 
@@ -76,16 +85,14 @@ def forward_step(data_iterator, model):
 
     return output_tensor, partial(loss_func, labels)
 
+
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print_rank_0(
-        "> building train, validation, and test datasets " "for VIT ..."
-    )
+    print_rank_0("> building train, validation, and test datasets " "for VIT ...")
     train_ds, valid_ds = build_train_valid_datasets(
-        data_path=args.data_path,
-        image_size=(args.img_h, args.img_w)
+        data_path=args.data_path, image_size=(args.img_h, args.img_w)
     )
     print_rank_0("> finished creating VIT datasets ...")
 
@@ -99,5 +106,5 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={'dataloader_type': 'cyclic', 'vision_pretraining': True}
+        args_defaults={"dataloader_type": "cyclic", "vision_pretraining": True},
     )

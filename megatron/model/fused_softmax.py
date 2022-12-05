@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+
 from megatron.model.enums import AttnMaskType
 
 
@@ -81,9 +82,7 @@ class ScaledSoftmax(torch.autograd.Function):
 
         scale_t = torch.tensor([scale])
 
-        softmax_results = scaled_softmax_cuda.forward(
-            inputs, scale_t[0]
-        )
+        softmax_results = scaled_softmax_cuda.forward(inputs, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
 
@@ -157,7 +156,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             and self.input_in_float16  # input must be fp16
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
-            and sk % 4 == 0  # sk must be divisor of 4 
+            and sk % 4 == 0  # sk must be divisor of 4
             and attn_batches % 4 == 0  # np * b must be divisor of 4
         ):
             if 0 <= sk <= 4096:

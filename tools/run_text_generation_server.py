@@ -3,48 +3,67 @@
 """Sample Generate GPT"""
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir)))
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+)
 import socket
-from megatron import get_args
-from megatron import print_rank_0
-from megatron.core import mpu
+
+import torch
+
+from megatron import get_args, print_rank_0
 from megatron.checkpointing import load_checkpoint
+from megatron.core import mpu
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
-from megatron.training import get_model
+from megatron.text_generation import (
+    beam_search_and_post_process,
+    generate_and_post_process,
+)
 from megatron.text_generation_server import MegatronServer
-from megatron.text_generation import generate_and_post_process
-from megatron.text_generation import beam_search_and_post_process
-import torch
+from megatron.training import get_model
+
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
-    print_rank_0('building GPT model ...')
-    model = GPTModel(num_tokentypes=0, parallel_output=False, pre_process=pre_process, post_process=post_process)
+    print_rank_0("building GPT model ...")
+    model = GPTModel(
+        num_tokentypes=0,
+        parallel_output=False,
+        pre_process=pre_process,
+        post_process=post_process,
+    )
 
     return model
 
-def add_text_generate_args(parser):
-    group = parser.add_argument_group(title='text generation')
 
-    group.add_argument("--temperature", type=float, default=1.0,
-                       help='Sampling temperature.')
-    group.add_argument("--top_p", type=float, default=0.0,
-                       help='Top p sampling.')
-    group.add_argument("--top_k", type=int, default=0,
-                       help='Top k sampling.')
-    group.add_argument("--out-seq-length", type=int, default=1024,
-                       help='Size of the output generated text.')
+def add_text_generate_args(parser):
+    group = parser.add_argument_group(title="text generation")
+
+    group.add_argument(
+        "--temperature", type=float, default=1.0, help="Sampling temperature."
+    )
+    group.add_argument("--top_p", type=float, default=0.0, help="Top p sampling.")
+    group.add_argument("--top_k", type=int, default=0, help="Top k sampling.")
+    group.add_argument(
+        "--out-seq-length",
+        type=int,
+        default=1024,
+        help="Size of the output generated text.",
+    )
     return parser
 
 
 if __name__ == "__main__":
-    initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
-                                       'no_load_rng': True,
-                                       'no_load_optim': True})
+    initialize_megatron(
+        extra_args_provider=add_text_generate_args,
+        args_defaults={
+            "tokenizer_type": "GPT2BPETokenizer",
+            "no_load_rng": True,
+            "no_load_optim": True,
+        },
+    )
 
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:

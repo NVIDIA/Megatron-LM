@@ -1,6 +1,6 @@
 # BSD 3-Clause License
 #
-# Copyright (c) Soumith Chintala 2016, 
+# Copyright (c) Soumith Chintala 2016,
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -28,17 +28,18 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# code taken from 
+# code taken from
 # https://github.com/pytorch/vision/blob/main/torchvision/datasets/folder.py
 # added support for classes_fraction and data_per_class_fraction
 
-from torchvision.datasets import VisionDataset
-from PIL import Image
-
 import os
 import os.path
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+
 import numpy as np
+from PIL import Image
+from torchvision.datasets import VisionDataset
+
 
 def has_file_allowed_extension(filename: str, extensions: Tuple[str, ...]) -> bool:
     """Checks if a file is an allowed extension.
@@ -88,10 +89,14 @@ def make_dataset(
     both_none = extensions is None and is_valid_file is None
     both_something = extensions is not None and is_valid_file is not None
     if both_none or both_something:
-        raise ValueError("Both extensions and is_valid_file cannot be None or not None at the same time")
+        raise ValueError(
+            "Both extensions and is_valid_file cannot be None or not None at the same time"
+        )
     if extensions is not None:
+
         def is_valid_file(x: str) -> bool:
             return has_file_allowed_extension(x, cast(Tuple[str, ...], extensions))
+
     is_valid_file = cast(Callable[[str], bool], is_valid_file)
     for target_class in sorted(class_to_idx.keys()):
         class_index = class_to_idx[target_class]
@@ -106,7 +111,9 @@ def make_dataset(
                     item = path, class_index
                     local_instances.append(item)
 
-        instances.extend(local_instances[0:int(len(local_instances) * data_per_class_fraction)])
+        instances.extend(
+            local_instances[0 : int(len(local_instances) * data_per_class_fraction)]
+        )
 
     return instances
 
@@ -140,26 +147,29 @@ class DatasetFolder(VisionDataset):
     """
 
     def __init__(
-            self,
-            root: str,
-            loader: Callable[[str], Any],
-            extensions: Optional[Tuple[str, ...]] = None,
-            transform: Optional[Callable] = None,
-            target_transform: Optional[Callable] = None,
-            classes_fraction=1.0,
-            data_per_class_fraction=1.0,
-            is_valid_file: Optional[Callable[[str], bool]] = None,
+        self,
+        root: str,
+        loader: Callable[[str], Any],
+        extensions: Optional[Tuple[str, ...]] = None,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        classes_fraction=1.0,
+        data_per_class_fraction=1.0,
+        is_valid_file: Optional[Callable[[str], bool]] = None,
     ) -> None:
-        super(DatasetFolder, self).__init__(root, transform=transform,
-                                            target_transform=target_transform)
+        super(DatasetFolder, self).__init__(
+            root, transform=transform, target_transform=target_transform
+        )
         self.classes_fraction = classes_fraction
         self.data_per_class_fraction = data_per_class_fraction
         classes, class_to_idx = self._find_classes(self.root)
-        samples = self.make_dataset(self.root,
-                                    class_to_idx,
-                                    self.data_per_class_fraction,
-                                    extensions,
-                                    is_valid_file)
+        samples = self.make_dataset(
+            self.root,
+            class_to_idx,
+            self.data_per_class_fraction,
+            extensions,
+            is_valid_file,
+        )
         if len(samples) == 0:
             msg = "Found 0 files in subfolders of: {}\n".format(self.root)
             if extensions is not None:
@@ -182,11 +192,13 @@ class DatasetFolder(VisionDataset):
         extensions: Optional[Tuple[str, ...]] = None,
         is_valid_file: Optional[Callable[[str], bool]] = None,
     ) -> List[Tuple[str, int]]:
-        return make_dataset(directory,
-                            class_to_idx,
-                            data_per_class_fraction,
-                            extensions=extensions,
-                            is_valid_file=is_valid_file)
+        return make_dataset(
+            directory,
+            class_to_idx,
+            data_per_class_fraction,
+            extensions=extensions,
+            is_valid_file=is_valid_file,
+        )
 
     def _find_classes(self, dir: str) -> Tuple[List[str], Dict[str, int]]:
         """
@@ -199,7 +211,7 @@ class DatasetFolder(VisionDataset):
             No class is a subdirectory of another.
         """
         all_classes = [d.name for d in os.scandir(dir) if d.is_dir()]
-        classes = all_classes[0:int(len(all_classes) * self.classes_fraction)]
+        classes = all_classes[0 : int(len(all_classes) * self.classes_fraction)]
         classes.sort()
         class_to_idx = {cls_name: i for i, cls_name in enumerate(classes)}
         return classes, class_to_idx
@@ -231,19 +243,30 @@ class DatasetFolder(VisionDataset):
         return len(self.samples)
 
 
-IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')
+IMG_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".ppm",
+    ".bmp",
+    ".pgm",
+    ".tif",
+    ".tiff",
+    ".webp",
+)
 
 
 def pil_loader(path: str) -> Image.Image:
     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
-    with open(path, 'rb') as f:
+    with open(path, "rb") as f:
         img = Image.open(f)
-        return img.convert('RGB')
+        return img.convert("RGB")
 
 
 # TODO: specify the return type
 def accimage_loader(path: str) -> Any:
     import accimage
+
     try:
         return accimage.Image(path)
     except IOError:
@@ -253,7 +276,8 @@ def accimage_loader(path: str) -> Any:
 
 def default_loader(path: str) -> Any:
     from torchvision import get_image_backend
-    if get_image_backend() == 'accimage':
+
+    if get_image_backend() == "accimage":
         return accimage_loader(path)
     else:
         return pil_loader(path)
@@ -283,20 +307,23 @@ class ImageFolder(DatasetFolder):
     """
 
     def __init__(
-            self,
-            root: str,
-            transform: Optional[Callable] = None,
-            target_transform: Optional[Callable] = None,
-            classes_fraction=1.0,
-            data_per_class_fraction=1.0,
-            loader: Callable[[str], Any] = default_loader,
-            is_valid_file: Optional[Callable[[str], bool]] = None,
+        self,
+        root: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        classes_fraction=1.0,
+        data_per_class_fraction=1.0,
+        loader: Callable[[str], Any] = default_loader,
+        is_valid_file: Optional[Callable[[str], bool]] = None,
     ):
-        super(ImageFolder, self).__init__(root, loader, IMG_EXTENSIONS if is_valid_file is None else None,
-                                          transform=transform,
-                                          target_transform=target_transform,
-                                          classes_fraction=classes_fraction,
-                                          data_per_class_fraction=data_per_class_fraction,
-                                          is_valid_file=is_valid_file)
+        super(ImageFolder, self).__init__(
+            root,
+            loader,
+            IMG_EXTENSIONS if is_valid_file is None else None,
+            transform=transform,
+            target_transform=target_transform,
+            classes_fraction=classes_fraction,
+            data_per_class_fraction=data_per_class_fraction,
+            is_valid_file=is_valid_file,
+        )
         self.imgs = self.samples
-

@@ -5,14 +5,12 @@
 
 import torch
 
-
 from megatron import get_tokenizer
+
 from .communication import broadcast_int_list, broadcast_tensor
 
 
-def detokenize_generations(tokens_gpu_tensor,
-                           lengths_gpu_tensor,
-                           return_segments):
+def detokenize_generations(tokens_gpu_tensor, lengths_gpu_tensor, return_segments):
     """Detokenize the generated tokens."""
 
     tokenizer = get_tokenizer()
@@ -25,27 +23,24 @@ def detokenize_generations(tokens_gpu_tensor,
     lengths = lengths_gpu_tensor.cpu().numpy().tolist()
     for sequence_tokens, length in zip(tokens, lengths):
         sequence_tokens = sequence_tokens[:length]
-        prompts_plus_generations.append(
-            tokenizer.detokenize(sequence_tokens))
+        prompts_plus_generations.append(tokenizer.detokenize(sequence_tokens))
         if return_segments:
             words = []
             for token in sequence_tokens:
                 word = tokenizer.tokenizer.decoder[token]
                 word = bytearray(
-                    [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                        'utf-8', errors='replace')
+                    [tokenizer.tokenizer.byte_decoder[c] for c in word]
+                ).decode("utf-8", errors="replace")
                 words.append(word)
             prompts_plus_generations_segments.append(words)
 
     if return_segments:
-        return tokens, prompts_plus_generations, \
-            prompts_plus_generations_segments
+        return tokens, prompts_plus_generations, prompts_plus_generations_segments
 
     return tokens, prompts_plus_generations
 
 
-def tokenize_prompts(prompts=None, tokens_to_generate=None,
-                     add_BOS=None, rank=0):
+def tokenize_prompts(prompts=None, tokens_to_generate=None, add_BOS=None, rank=0):
     """Tokenize prompts and make them avaiable on all ranks."""
 
     # On all ranks set to None so we can pass them to functions
@@ -58,11 +53,15 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
         assert prompts is not None
         assert tokens_to_generate is not None
         # Tensor of tokens padded and their unpadded length.
-        prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor = \
-            _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS)
+        (
+            prompts_tokens_cuda_long_tensor,
+            prompts_length_cuda_long_tensor,
+        ) = _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS)
         # We need the sizes of these tensors for the boradcast
-        sizes_list = [prompts_tokens_cuda_long_tensor.size(0), # Batch size
-                      prompts_tokens_cuda_long_tensor.size(1)] # Sequence lenght
+        sizes_list = [
+            prompts_tokens_cuda_long_tensor.size(0),  # Batch size
+            prompts_tokens_cuda_long_tensor.size(1),
+        ]  # Sequence lenght
 
     # First, broadcast the sizes.
     sizes_tensor = broadcast_int_list(2, int_list=sizes_list, rank=rank)
@@ -71,28 +70,30 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
     # and length tensors.
     sizes = sizes_tensor.tolist()
     prompts_tokens_cuda_long_tensor = broadcast_tensor(
-        sizes, torch.int64, tensor=prompts_tokens_cuda_long_tensor, rank=rank)
+        sizes, torch.int64, tensor=prompts_tokens_cuda_long_tensor, rank=rank
+    )
     prompts_length_cuda_long_tensor = broadcast_tensor(
-        sizes[0], torch.int64, tensor=prompts_length_cuda_long_tensor,
-        rank=rank)
+        sizes[0], torch.int64, tensor=prompts_length_cuda_long_tensor, rank=rank
+    )
 
     return prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor
 
 
 def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     """Given a set of prompts and number of tokens to generate:
-        - tokenize prompts
-        - set the sequence length to be the max of length of prompts
-          plus the number of tokens we would like to generate
-        - pad all the sequences to this length so we can convert them
-          into a 2D tensor.
+    - tokenize prompts
+    - set the sequence length to be the max of length of prompts
+      plus the number of tokens we would like to generate
+    - pad all the sequences to this length so we can convert them
+      into a 2D tensor.
     """
 
     # Tokenize all the prompts.
     tokenizer = get_tokenizer()
     if add_BOS:
-        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt)
-                          for prompt in prompts]
+        prompts_tokens = [
+            [tokenizer.eod] + tokenizer.tokenize(prompt) for prompt in prompts
+        ]
     else:
         prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
 

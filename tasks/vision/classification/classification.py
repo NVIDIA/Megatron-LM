@@ -2,15 +2,16 @@
 
 """Vision-classification finetuning/evaluation."""
 
-import torch.nn.functional as F
 from functools import partial
-from megatron import get_args, get_timers
-from megatron import print_rank_0
-from megatron.model.vision.classification import VitClassificationModel
+
+import torch.nn.functional as F
+
+from megatron import get_args, get_timers, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
+from megatron.model.vision.classification import VitClassificationModel
+from megatron.utils import average_losses_across_data_parallel_group
 from tasks.vision.classification.eval_utils import accuracy_func_provider
 from tasks.vision.finetune_utils import finetune
-from megatron.utils import average_losses_across_data_parallel_group
 
 
 def classification():
@@ -30,8 +31,12 @@ def classification():
 
         print_rank_0("building classification model for ImageNet ...")
 
-        return VitClassificationModel(num_classes=args.num_classes, finetune=True,
-                                      pre_process=pre_process, post_process=post_process)
+        return VitClassificationModel(
+            num_classes=args.num_classes,
+            finetune=True,
+            pre_process=pre_process,
+            post_process=post_process,
+        )
 
     def process_batch(batch):
         """Process batch and produce inputs for the model."""
@@ -48,7 +53,7 @@ def classification():
         # Reduce loss for logging.
         averaged_loss = average_losses_across_data_parallel_group([loss])
 
-        return loss, {'lm loss': averaged_loss[0]}
+        return loss, {"lm loss": averaged_loss[0]}
 
     def _cross_entropy_forward_step(batch, model):
         """Simple forward step with cross-entropy loss."""
@@ -65,7 +70,7 @@ def classification():
 
         # Forward model.
         output_tensor = model(images)
-      
+
         return output_tensor, partial(cross_entropy_loss_func, labels)
 
     """Finetune/evaluate."""
@@ -76,6 +81,6 @@ def classification():
         end_of_epoch_callback_provider=accuracy_func_provider,
     )
 
+
 def main():
     classification()
-

@@ -13,21 +13,20 @@ def get_world_size():
 
 def get_device(local_rank=None):
     backend = torch.distributed.get_backend()
-    if backend == 'nccl':
+    if backend == "nccl":
         if local_rank is None:
-            device = torch.device('cuda')
+            device = torch.device("cuda")
         else:
-            device = torch.device(f'cuda:{local_rank}')
-    elif backend == 'gloo':
-        device = torch.device('cpu')
+            device = torch.device(f"cuda:{local_rank}")
+    elif backend == "gloo":
+        device = torch.device("cpu")
     else:
         raise RuntimeError
     return device
 
 
 def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
-    if not torch.distributed.is_available() or \
-       not torch.distributed.is_initialized():
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return [item]
 
     device = get_device(local_rank)
@@ -52,9 +51,7 @@ class DistributedSignalHandler:
         self.sig = sig
 
     def signals_received(self):
-        all_received = all_gather_item(
-            self._signal_received, dtype=torch.int32
-        )
+        all_received = all_gather_item(self._signal_received, dtype=torch.int32)
         return all_received
 
     def __enter__(self):

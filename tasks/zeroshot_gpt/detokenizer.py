@@ -55,9 +55,9 @@ def lambada_detokenizer(string):
 
 
 _DETOKENIZERS = {
-    'ptb': ptb_detokenizer,
-    'wiki': wikitext_detokenizer,
-    'lambada': lambada_detokenizer,
+    "ptb": ptb_detokenizer,
+    "wiki": wikitext_detokenizer,
+    "lambada": lambada_detokenizer,
 }
 
 

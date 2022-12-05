@@ -8,15 +8,17 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_src_rank,
 )
 
-
 _MAX_DATA_DIM = 5
 
 
 def _check_data_types(keys, data, target_dtype):
     """Check that all the keys have the same target data type."""
     for key in keys:
-        assert data[key].dtype == target_dtype, '{} has data type {} which '\
-            'is different than {}'.format(key, data[key].dtype, target_dtype)
+        assert (
+            data[key].dtype == target_dtype
+        ), "{} has data type {} which " "is different than {}".format(
+            key, data[key].dtype, target_dtype
+        )
 
 
 def _build_key_size_numel_dictionaries(keys, data):
@@ -28,7 +30,7 @@ def _build_key_size_numel_dictionaries(keys, data):
     if get_tensor_model_parallel_rank() == 0:
         offset = 0
         for key in keys:
-            assert data[key].dim() < max_dim, 'you should increase MAX_DATA_DIM'
+            assert data[key].dim() < max_dim, "you should increase MAX_DATA_DIM"
             size = data[key].size()
             for i, s in enumerate(size):
                 sizes[i + offset] = s
@@ -36,8 +38,11 @@ def _build_key_size_numel_dictionaries(keys, data):
 
     # Move to GPU and broadcast.
     sizes_cuda = torch.cuda.LongTensor(sizes)
-    torch.distributed.broadcast(sizes_cuda, get_tensor_model_parallel_src_rank(),
-                                group=get_tensor_model_parallel_group())
+    torch.distributed.broadcast(
+        sizes_cuda,
+        get_tensor_model_parallel_src_rank(),
+        group=get_tensor_model_parallel_group(),
+    )
 
     # Move back to cpu and unpack.
     sizes_cpu = sizes_cuda.cpu()
@@ -74,8 +79,7 @@ def broadcast_data(keys, data, datatype):
     """
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
-    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys,
-                                                                          data)
+    key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data)
 
     # Pack on rank zero.
     if get_tensor_model_parallel_rank() == 0:
@@ -83,15 +87,19 @@ def broadcast_data(keys, data, datatype):
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
         flatten_data = torch.cat(
-            [data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+            [data[key].contiguous().view(-1) for key in keys], dim=0
+        ).cuda()
     else:
-        flatten_data = torch.empty(total_numel,
-                                   device=torch.cuda.current_device(),
-                                   dtype=datatype)
+        flatten_data = torch.empty(
+            total_numel, device=torch.cuda.current_device(), dtype=datatype
+        )
 
     # Broadcast
-    torch.distributed.broadcast(flatten_data, get_tensor_model_parallel_src_rank(),
-                                group=get_tensor_model_parallel_group())
+    torch.distributed.broadcast(
+        flatten_data,
+        get_tensor_model_parallel_src_rank(),
+        group=get_tensor_model_parallel_group(),
+    )
 
     # Unpack
     output = {}

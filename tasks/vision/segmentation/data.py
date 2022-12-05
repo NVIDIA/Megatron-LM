@@ -1,21 +1,22 @@
-import random
-import os
 import math
+import os
+import random
+
 import mmcv
-import torch
 import numpy as np
+import torch
 import torchvision.transforms as T
-from torchvision import datasets
+from PIL import Image, ImageOps
 from torch.utils.data import Dataset
+from torchvision import datasets
+
+import tasks.vision.segmentation.transforms as ET
+from megatron import get_args
 from megatron.data.autoaugment import ImageNetPolicy
 from tasks.vision.segmentation.cityscapes import Cityscapes
-import tasks.vision.segmentation.transforms as ET
-from megatron.data.autoaugment import ImageNetPolicy
-from megatron import get_args
-from PIL import Image, ImageOps
 
 
-class VitSegmentationJointTransform():
+class VitSegmentationJointTransform:
     def __init__(self, train=True, resolution=None):
         self.train = train
         if self.train:
@@ -29,7 +30,7 @@ class VitSegmentationJointTransform():
         return img, mask
 
 
-class VitSegmentationImageTransform():
+class VitSegmentationImageTransform:
     def __init__(self, train=True, resolution=None):
         args = get_args()
         self.train = train
@@ -38,25 +39,29 @@ class VitSegmentationImageTransform():
         self.mean_std = args.mean_std
         if self.train:
             assert resolution is not None
-            self.transform = T.Compose([
-                ET.PhotoMetricDistortion(),
-                T.ToTensor(),
-                T.Normalize(*self.mean_std),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    ET.PhotoMetricDistortion(),
+                    T.ToTensor(),
+                    T.Normalize(*self.mean_std),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
         else:
-            self.transform = T.Compose([
-                T.ToTensor(),
-                T.Normalize(*self.mean_std),
-                T.ConvertImageDtype(self.data_type)
-            ])
+            self.transform = T.Compose(
+                [
+                    T.ToTensor(),
+                    T.Normalize(*self.mean_std),
+                    T.ConvertImageDtype(self.data_type),
+                ]
+            )
 
     def __call__(self, input):
         output = self.transform(input)
         return output
 
 
-class VitSegmentationTargetTransform():
+class VitSegmentationTargetTransform:
     def __init__(self, train=True, resolution=None):
         self.train = train
 
@@ -66,11 +71,7 @@ class VitSegmentationTargetTransform():
 
 
 class RandomSeedSegmentationDataset(Dataset):
-    def __init__(self,
-                 dataset,
-                 joint_transform,
-                 image_transform,
-                 target_transform):
+    def __init__(self, dataset, joint_transform, image_transform, target_transform):
 
         args = get_args()
         self.base_seed = args.seed
@@ -107,45 +108,47 @@ def build_cityscapes_train_valid_datasets(data_path, image_size):
     args.color_table = Cityscapes.color_table
     args.mean_std = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-    train_joint_transform = \
-        VitSegmentationJointTransform(train=True, resolution=image_size)
-    val_joint_transform = \
-        VitSegmentationJointTransform(train=False, resolution=image_size)
-    train_image_transform = \
-        VitSegmentationImageTransform(train=True, resolution=image_size)
-    val_image_transform = \
-        VitSegmentationImageTransform(train=False, resolution=image_size)
-    train_target_transform = \
-        VitSegmentationTargetTransform(train=True, resolution=image_size)
-    val_target_transform = \
-        VitSegmentationTargetTransform(train=False, resolution=image_size)
+    train_joint_transform = VitSegmentationJointTransform(
+        train=True, resolution=image_size
+    )
+    val_joint_transform = VitSegmentationJointTransform(
+        train=False, resolution=image_size
+    )
+    train_image_transform = VitSegmentationImageTransform(
+        train=True, resolution=image_size
+    )
+    val_image_transform = VitSegmentationImageTransform(
+        train=False, resolution=image_size
+    )
+    train_target_transform = VitSegmentationTargetTransform(
+        train=True, resolution=image_size
+    )
+    val_target_transform = VitSegmentationTargetTransform(
+        train=False, resolution=image_size
+    )
 
     # training dataset
     train_data = Cityscapes(
-        root=data_path[0],
-        split='train',
-        mode='fine',
-        resolution=image_size
+        root=data_path[0], split="train", mode="fine", resolution=image_size
     )
     train_data = RandomSeedSegmentationDataset(
         train_data,
         joint_transform=train_joint_transform,
         image_transform=train_image_transform,
-        target_transform=train_target_transform)
+        target_transform=train_target_transform,
+    )
 
     # validation dataset
     val_data = Cityscapes(
-        root=data_path[0],
-        split='val',
-        mode='fine',
-        resolution=image_size
+        root=data_path[0], split="val", mode="fine", resolution=image_size
     )
 
     val_data = RandomSeedSegmentationDataset(
         val_data,
         joint_transform=val_joint_transform,
         image_transform=val_image_transform,
-        target_transform=val_target_transform)
+        target_transform=val_target_transform,
+    )
 
     return train_data, val_data
 

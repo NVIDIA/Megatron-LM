@@ -4,17 +4,20 @@
 
 import torch
 from torch.nn.init import trunc_normal_
+
 from megatron import get_args
-from megatron.model.utils import get_linear_layer
-from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
-from megatron.model.vision.mit_backbone import mit_b3_avg
 from megatron.model.module import MegatronModule
+from megatron.model.utils import get_linear_layer
+from megatron.model.vision.mit_backbone import mit_b3_avg
+from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
+
 
 class VitClassificationModel(MegatronModule):
     """Vision Transformer Model."""
 
-    def __init__(self, num_classes, finetune=False,
-                 pre_process=True, post_process=True):
+    def __init__(
+        self, num_classes, finetune=False, pre_process=True, post_process=True
+    ):
         super(VitClassificationModel, self).__init__()
         args = get_args()
 
@@ -26,17 +29,15 @@ class VitClassificationModel(MegatronModule):
         self.backbone = VitBackbone(
             pre_process=self.pre_process,
             post_process=self.post_process,
-            single_token_output=True
+            single_token_output=True,
         )
-        
+
         if self.post_process:
             if not self.finetune:
                 self.head = VitMlpHead(self.hidden_size, self.num_classes)
             else:
                 self.head = get_linear_layer(
-                    self.hidden_size,
-                    self.num_classes,
-                    torch.nn.init.zeros_
+                    self.hidden_size, self.num_classes, torch.nn.init.zeros_
                 )
 
     def set_input_tensor(self, input_tensor):
@@ -55,8 +56,7 @@ class VitClassificationModel(MegatronModule):
 class MitClassificationModel(MegatronModule):
     """Mix vision Transformer Model."""
 
-    def __init__(self, num_classes,
-                 pre_process=True, post_process=True):
+    def __init__(self, num_classes, pre_process=True, post_process=True):
         super(MitClassificationModel, self).__init__()
         args = get_args()
 
@@ -69,7 +69,7 @@ class MitClassificationModel(MegatronModule):
 
     def _init_weights(self, m):
         if isinstance(m, torch.nn.Linear):
-            trunc_normal_(m.weight, std=.02)
+            trunc_normal_(m.weight, std=0.02)
             if isinstance(m, torch.nn.Linear) and m.bias is not None:
                 torch.nn.init.constant_(m.bias, 0)
 
