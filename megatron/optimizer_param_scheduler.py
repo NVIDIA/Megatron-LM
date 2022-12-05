@@ -52,9 +52,7 @@ class OptimizerParamScheduler(object):
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
-            assert not self.use_checkpoint_opt_param_scheduler, (
-                "both override and " "use-checkpoint are set."
-            )
+            assert not self.use_checkpoint_opt_param_scheduler, "both override and " "use-checkpoint are set."
 
         # Set the learning rate
         self.step(0)
@@ -79,11 +77,7 @@ class OptimizerParamScheduler(object):
         elif self.wd_incr_style == "cosine":
             coeff = 0.5 * (math.cos(math.pi * (1 - incr_ratio)) + 1.0)
         else:
-            raise Exception(
-                "{} weight decay increment style is not supported.".format(
-                    self.wd_incr_style
-                )
-            )
+            raise Exception("{} weight decay increment style is not supported.".format(self.wd_incr_style))
 
         return self.start_wd + coeff * delta_wd
 
@@ -122,9 +116,7 @@ class OptimizerParamScheduler(object):
         elif self.lr_decay_style == "cosine":
             coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
         else:
-            raise Exception(
-                "{} decay style is not supported.".format(self.lr_decay_style)
-            )
+            raise Exception("{} decay style is not supported.".format(self.lr_decay_style))
 
         return self.min_lr + coeff * delta_lr
 
@@ -175,9 +167,7 @@ class OptimizerParamScheduler(object):
             max_lr_ = sd["max_lr"]
         self.max_lr = self._check_and_set(self.max_lr, max_lr_, "learning rate")
 
-        self.min_lr = self._check_and_set(
-            self.min_lr, sd["min_lr"], "minimum learning rate"
-        )
+        self.min_lr = self._check_and_set(self.min_lr, sd["min_lr"], "minimum learning rate")
 
         if "warmup_iter" in sd:
             lr_warmup_steps_ = sd["warmup_iter"]
@@ -185,9 +175,7 @@ class OptimizerParamScheduler(object):
             lr_warmup_steps_ = sd["warmup_steps"]
         else:
             lr_warmup_steps_ = sd["lr_warmup_steps"]
-        self.lr_warmup_steps = self._check_and_set(
-            self.lr_warmup_steps, lr_warmup_steps_, "warmup iterations"
-        )
+        self.lr_warmup_steps = self._check_and_set(self.lr_warmup_steps, lr_warmup_steps_, "warmup iterations")
 
         if "end_iter" in sd:
             lr_decay_steps_ = sd["end_iter"]
@@ -195,17 +183,13 @@ class OptimizerParamScheduler(object):
             lr_decay_steps_ = sd["decay_steps"]
         else:
             lr_decay_steps_ = sd["lr_decay_steps"]
-        self.lr_decay_steps = self._check_and_set(
-            self.lr_decay_steps, lr_decay_steps_, "total number of iterations"
-        )
+        self.lr_decay_steps = self._check_and_set(self.lr_decay_steps, lr_decay_steps_, "total number of iterations")
 
         if "decay_style" in sd:
             lr_decay_style_ = sd["decay_style"]
         else:
             lr_decay_style_ = sd["lr_decay_style"]
-        self.lr_decay_style = self._check_and_set(
-            self.lr_decay_style, lr_decay_style_, "learning rate decay style"
-        )
+        self.lr_decay_style = self._check_and_set(self.lr_decay_style, lr_decay_style_, "learning rate decay style")
 
         if "num_iters" in sd:
             num_steps = sd["num_iters"]
@@ -214,17 +198,11 @@ class OptimizerParamScheduler(object):
         self.step(increment=num_steps)
 
         if "start_wd" in sd:
-            self.start_wd = self._check_and_set(
-                self.start_wd, sd["start_wd"], "start weight decay"
-            )
-            self.end_wd = self._check_and_set(
-                self.end_wd, sd["end_wd"], "end weight decay"
-            )
+            self.start_wd = self._check_and_set(self.start_wd, sd["start_wd"], "start weight decay")
+            self.end_wd = self._check_and_set(self.end_wd, sd["end_wd"], "end weight decay")
             self.wd_incr_steps = self._check_and_set(
                 self.wd_incr_steps,
                 sd["wd_incr_steps"],
                 "total number of weight decay iterations",
             )
-            self.wd_incr_style = self._check_and_set(
-                self.wd_incr_style, sd["wd_incr_style"], "weight decay incr style"
-            )
+            self.wd_incr_style = self._check_and_set(self.wd_incr_style, sd["wd_incr_style"], "weight decay incr style")

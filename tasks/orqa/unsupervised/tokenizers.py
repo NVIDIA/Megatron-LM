@@ -171,8 +171,7 @@ class SimpleTokenizer(Tokenizer):
         )
         if len(kwargs.get("annotators", {})) > 0:
             logger.warning(
-                "%s only tokenizes! Skipping annotators: %s"
-                % (type(self).__name__, kwargs.get("annotators"))
+                "%s only tokenizes! Skipping annotators: %s" % (type(self).__name__, kwargs.get("annotators"))
             )
         self.annotators = set()
 

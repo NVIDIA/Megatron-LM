@@ -15,11 +15,7 @@ sys.path.append("../..")
 def test_broadcast_data(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
-        print(
-            "> testing broadcast_data with model parallel size {} ...".format(
-                tensor_model_parallel_size
-            )
-        )
+        print("> testing broadcast_data with model parallel size {} ...".format(tensor_model_parallel_size))
 
     mpu.initialize_model_parallel(tensor_model_parallel_size)
     torch.manual_seed(1234 + mpu.get_data_parallel_rank())
@@ -45,9 +41,7 @@ def test_broadcast_data(tensor_model_parallel_size):
         data = None
 
     data_utils._check_data_types(keys, data_t, torch.int64)
-    key_size, key_numel, total_numel = data_utils._build_key_size_numel_dictionaries(
-        keys, data
-    )
+    key_size, key_numel, total_numel = data_utils._build_key_size_numel_dictionaries(keys, data)
     for key in keys:
         assert key_size[key] == key_size_t[key]
     total_numel_t = 0

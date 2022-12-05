@@ -33,9 +33,7 @@ def add_arguments(parser):
 def _load_checkpoint(queue, args):
 
     # Search in directory above this
-    sys.path.append(
-        os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-    )
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
@@ -47,9 +45,7 @@ def _load_checkpoint(queue, args):
         from megatron.global_vars import set_args, set_global_variables
         from megatron.model import ModelType, module
     except ModuleNotFoundError:
-        print(
-            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."
-        )
+        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
         exit(1)
 
@@ -76,9 +72,7 @@ def _load_checkpoint(queue, args):
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
-    margs.world_size = (
-        margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
-    )
+    margs.world_size = margs.tensor_model_parallel_size * margs.pipeline_model_parallel_size
 
     margs = validate_args(margs)
 
@@ -148,12 +142,8 @@ def _load_checkpoint(queue, args):
         exit(1)
 
     set_global_variables(margs)
-    mpu.parallel_state.set_tensor_model_parallel_world_size(
-        margs.tensor_model_parallel_size
-    )
-    mpu.parallel_state.set_pipeline_model_parallel_world_size(
-        margs.pipeline_model_parallel_size
-    )
+    mpu.parallel_state.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
+    mpu.parallel_state.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
@@ -163,9 +153,7 @@ def _load_checkpoint(queue, args):
         vocab = json.load(open(args.vocab_file))
         true_vocab_size = len(vocab)
         if args.true_vocab_size is not None and true_vocab_size != args.true_vocab_size:
-            print(
-                "Both --true-vocab-size and --vocab-file specified and the vocab size does not match, aborting."
-            )
+            print("Both --true-vocab-size and --vocab-file specified and the vocab size does not match, aborting.")
             queue.put("exit")
             exit(1)
     else:
@@ -208,14 +196,9 @@ def _load_checkpoint(queue, args):
 
     # Send embeddings
     message = {
-        "position embeddings": models[
-            0
-        ].language_model.embedding.position_embeddings.weight.data,
+        "position embeddings": models[0].language_model.embedding.position_embeddings.weight.data,
         "word embeddings": torch.cat(
-            [
-                models[tp_rank].language_model.embedding.word_embeddings.weight.data
-                for tp_rank in range(tp_size)
-            ],
+            [models[tp_rank].language_model.embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
             dim=0,
         ),
     }
@@ -236,9 +219,7 @@ def _load_checkpoint(queue, args):
             message["input layernorm weight"] = layer.input_layernorm.weight.data
             message["input layernorm bias"] = layer.input_layernorm.bias.data
             message["dense bias"] = layer.self_attention.dense.bias.data
-            message[
-                "post layernorm weight"
-            ] = layer.post_attention_layernorm.weight.data
+            message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
             message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
             message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
 

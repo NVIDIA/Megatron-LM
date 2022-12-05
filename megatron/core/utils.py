@@ -9,9 +9,7 @@ from megatron.core import parallel_state
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
-    assert numerator % denominator == 0, "{} is not divisible by {}".format(
-        numerator, denominator
-    )
+    assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
 
 
 def divide(numerator, denominator):
@@ -31,10 +29,7 @@ class GlobalMemoryBuffer:
 
     def get_tensor(self, tensor_shape, dtype, name):
         required_len = reduce(operator.mul, tensor_shape, 1)
-        if (
-            self.buffer.get((name, dtype), None) is None
-            or self.buffer[(name, dtype)].numel() < required_len
-        ):
+        if self.buffer.get((name, dtype), None) is None or self.buffer[(name, dtype)].numel() < required_len:
             self.buffer[(name, dtype)] = torch.empty(
                 required_len,
                 dtype=dtype,

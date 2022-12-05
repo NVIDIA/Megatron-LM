@@ -29,11 +29,7 @@ class GaussianBlur(object):
         if not do_it:
             return img
 
-        return img.filter(
-            ImageFilter.GaussianBlur(
-                radius=random.uniform(self.radius_min, self.radius_max)
-            )
-        )
+        return img.filter(ImageFilter.GaussianBlur(radius=random.uniform(self.radius_min, self.radius_max)))
 
 
 class Solarization(object):
@@ -92,11 +88,7 @@ class InpaintingTransform:
         self.mask_type = args.mask_type
         self.image_size = image_size
         self.patch_size = args.patch_dim
-        self.mask_size = int(
-            self.mask_factor
-            * (image_size[0] / self.patch_size)
-            * (image_size[1] / self.patch_size)
-        )
+        self.mask_size = int(self.mask_factor * (image_size[0] / self.patch_size) * (image_size[1] / self.patch_size))
         self.train = train
         assert args.fp16 or args.bf16
         self.data_type = torch.half if args.fp16 else torch.bfloat16
@@ -140,9 +132,7 @@ class InpaintingTransform:
                 y = torch.clamp(y + action_list[r][1], min=0, max=img_size_patch - 1)
                 x_offset = x * patch_size
                 y_offset = y * patch_size
-                mask[
-                    x_offset : x_offset + patch_size, y_offset : y_offset + patch_size
-                ] = 1
+                mask[x_offset : x_offset + patch_size, y_offset : y_offset + patch_size] = 1
         else:
             assert mask_type == "row"
             count = 0
@@ -160,9 +150,7 @@ class InpaintingTransform:
 
     def __call__(self, input):
         trans_input = self.transform(input)
-        mask = self.gen_mask(
-            self.image_size, self.mask_size, self.mask_type, self.patch_size
-        )
+        mask = self.gen_mask(self.image_size, self.mask_size, self.mask_type, self.patch_size)
         mask = mask.unsqueeze(dim=0)
         return trans_input, mask
 
@@ -176,11 +164,7 @@ class DinoTransform(object):
             [
                 T.RandomHorizontalFlip(p=0.5),
                 T.RandomApply(
-                    [
-                        T.ColorJitter(
-                            brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1
-                        )
-                    ],
+                    [T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
                     p=0.8,
                 ),
                 T.RandomGrayscale(p=0.2),
@@ -207,9 +191,7 @@ class DinoTransform(object):
         scale_const = 0.4
         self.global_transform1 = T.Compose(
             [
-                T.RandomResizedCrop(
-                    image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC
-                ),
+                T.RandomResizedCrop(image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC),
                 flip_and_color_jitter,
                 GaussianBlur(1.0),
                 normalize,
@@ -218,9 +200,7 @@ class DinoTransform(object):
         # second global crop
         self.global_transform2 = T.Compose(
             [
-                T.RandomResizedCrop(
-                    image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC
-                ),
+                T.RandomResizedCrop(image_size, scale=(scale_const, 1), interpolation=Image.BICUBIC),
                 flip_and_color_jitter,
                 GaussianBlur(0.1),
                 Solarization(0.2),
@@ -264,11 +244,7 @@ def build_train_valid_datasets(data_path, image_size=224):
         train_transform = DinoTransform(image_size, train=True)
         val_transform = ClassificationTransform(image_size, train=False)
     else:
-        raise Exception(
-            "{} vit pretraining type is not supported.".format(
-                args.vit_pretraining_type
-            )
-        )
+        raise Exception("{} vit pretraining type is not supported.".format(args.vit_pretraining_type))
 
     # training dataset
     train_data_path = data_path[0] if len(data_path) <= 2 else data_path[2]

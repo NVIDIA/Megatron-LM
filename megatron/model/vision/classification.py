@@ -15,9 +15,7 @@ from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
 class VitClassificationModel(MegatronModule):
     """Vision Transformer Model."""
 
-    def __init__(
-        self, num_classes, finetune=False, pre_process=True, post_process=True
-    ):
+    def __init__(self, num_classes, finetune=False, pre_process=True, post_process=True):
         super(VitClassificationModel, self).__init__()
         args = get_args()
 
@@ -36,9 +34,7 @@ class VitClassificationModel(MegatronModule):
             if not self.finetune:
                 self.head = VitMlpHead(self.hidden_size, self.num_classes)
             else:
-                self.head = get_linear_layer(
-                    self.hidden_size, self.num_classes, torch.nn.init.zeros_
-                )
+                self.head = get_linear_layer(self.hidden_size, self.num_classes, torch.nn.init.zeros_)
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""

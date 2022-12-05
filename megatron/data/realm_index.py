@@ -112,9 +112,7 @@ class OpenRetreivalDataStore(object):
         shutil.rmtree(self.temp_dir_name, ignore_errors=True)
 
         print(
-            "Finished merging {} shards for a total of {} embeds".format(
-                len(shard_names), len(self.embed_data)
-            ),
+            "Finished merging {} shards for a total of {} embeds".format(len(shard_names), len(self.embed_data)),
             flush=True,
         )
 
@@ -154,18 +152,12 @@ class FaissMIPSIndex(object):
             config.useFloat16 = True
             gpu_index = faiss.index_cpu_to_all_gpus(cpu_index, co=config)
             self.mips_index = faiss.IndexIDMap(gpu_index)
-            if (
-                not mpu.model_parallel_is_initialized()
-                or mpu.get_data_parallel_rank() == 0
-            ):
+            if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
                 print(">> Initialized index on GPU", flush=True)
         else:
             # CPU index supports IDs so wrap with IDMap
             self.mips_index = faiss.IndexIDMap(cpu_index)
-            if (
-                not mpu.model_parallel_is_initialized()
-                or mpu.get_data_parallel_rank() == 0
-            ):
+            if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
                 print(">> Initialized index on CPU", flush=True)
 
         # if we were constructed with a BlockData, then automatically load it
@@ -226,9 +218,7 @@ class FaissMIPSIndex(object):
 
         if reconstruct:
             # get the vectors themselves
-            top_k_block_embeds = self.mips_index.search_and_reconstruct(
-                query_embeds, top_k
-            )
+            top_k_block_embeds = self.mips_index.search_and_reconstruct(query_embeds, top_k)
             return top_k_block_embeds
         else:
             # get distances and indices of closest vectors

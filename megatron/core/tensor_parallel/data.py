@@ -14,9 +14,7 @@ _MAX_DATA_DIM = 5
 def _check_data_types(keys, data, target_dtype):
     """Check that all the keys have the same target data type."""
     for key in keys:
-        assert (
-            data[key].dtype == target_dtype
-        ), "{} has data type {} which " "is different than {}".format(
+        assert data[key].dtype == target_dtype, "{} has data type {} which " "is different than {}".format(
             key, data[key].dtype, target_dtype
         )
 
@@ -86,13 +84,9 @@ def broadcast_data(keys, data, datatype):
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat(
-            [data[key].contiguous().view(-1) for key in keys], dim=0
-        ).cuda()
+        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
     else:
-        flatten_data = torch.empty(
-            total_numel, device=torch.cuda.current_device(), dtype=datatype
-        )
+        flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
 
     # Broadcast
     torch.distributed.broadcast(

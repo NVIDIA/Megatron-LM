@@ -63,9 +63,7 @@ class T5Dataset(torch.utils.data.Dataset):
         self.bos_id = tokenizer.bos_token_id
         self.eos_id = tokenizer.eos_token_id
         self.sentinel_tokens = tokenizer.additional_special_tokens_ids
-        assert (
-            len(self.sentinel_tokens) > 0
-        ), "Provide the argument --vocab-extra-ids 100 to the script"
+        assert len(self.sentinel_tokens) > 0, "Provide the argument --vocab-extra-ids 100 to the script"
 
     def __len__(self):
         return self.samples_mapping.shape[0]
@@ -149,13 +147,7 @@ def build_training_sample(
 
     # Masking.
     max_predictions_per_seq = masked_lm_prob * max_num_tokens
-    (
-        tokens,
-        masked_positions,
-        masked_labels,
-        _,
-        masked_spans,
-    ) = create_masked_lm_predictions(
+    (tokens, masked_positions, masked_labels, _, masked_spans,) = create_masked_lm_predictions(
         tokens,
         vocab_id_list,
         vocab_id_to_token_dict,
@@ -171,15 +163,7 @@ def build_training_sample(
     )
 
     # Padding.
-    (
-        tokens_enc,
-        tokens_dec_in,
-        labels,
-        enc_mask,
-        dec_mask,
-        enc_dec_mask,
-        loss_mask,
-    ) = pad_and_convert_to_numpy(
+    (tokens_enc, tokens_dec_in, labels, enc_mask, dec_mask, enc_dec_mask, loss_mask,) = pad_and_convert_to_numpy(
         tokens,
         masked_positions,
         masked_labels,

@@ -34,9 +34,7 @@ def add_arguments(parser):
 def save_checkpoint(queue, args):
 
     # Search in directory above this
-    sys.path.append(
-        os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-    )
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
 
@@ -49,9 +47,7 @@ def save_checkpoint(queue, args):
         from megatron.model import ModelType
         from megatron.tokenizer.tokenizer import _vocab_size_with_padding
     except ModuleNotFoundError:
-        print(
-            "Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting."
-        )
+        print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
 
     def queue_get(name=None):
@@ -61,9 +57,7 @@ def save_checkpoint(queue, args):
             exit(1)
         if name is not None and args.checking and val["name"] != name:
             val_name = val["name"]
-            print(
-                f'Unexpected message. Expecting "{name}" but got "{val_name}". Exiting saver.'
-            )
+            print(f'Unexpected message. Expecting "{name}" but got "{val_name}". Exiting saver.')
             exit(1)
         if name is not None:
             print(f"received {name}")
@@ -77,9 +71,7 @@ def save_checkpoint(queue, args):
             print(f"Unexpected values in {msg_name}:")
             for key in msg.keys():
                 print(f"   {key}")
-            print(
-                f"Exiting. If you want to ignore this, use the argument --no-checking."
-            )
+            print(f"Exiting. If you want to ignore this, use the argument --no-checking.")
             exit(1)
 
     md = queue_get()
@@ -106,13 +98,8 @@ def save_checkpoint(queue, args):
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
-    if (
-        args.target_tensor_parallel_size is not None
-        and args.target_pipeline_parallel_size is not None
-    ):
-        os.environ[
-            "WORLD_SIZE"
-        ] = f"{args.target_tensor_parallel_size * args.target_pipeline_parallel_size}"
+    if args.target_tensor_parallel_size is not None and args.target_pipeline_parallel_size is not None:
+        os.environ["WORLD_SIZE"] = f"{args.target_tensor_parallel_size * args.target_pipeline_parallel_size}"
 
     # We want all arguments to come from us
     sys.argv = [
@@ -151,9 +138,7 @@ def save_checkpoint(queue, args):
     ]
 
     if md.make_vocab_size_divisible_by is not None:
-        sys.argv.extend(
-            ["--make-vocab-size-divisible-by", str(md.make_vocab_size_divisible_by)]
-        )
+        sys.argv.extend(["--make-vocab-size-divisible-by", str(md.make_vocab_size_divisible_by)])
     if md.params_dtype == torch.float16:
         sys.argv.append("--fp16")
     elif md.params_dtype == torch.bfloat16:
@@ -192,9 +177,7 @@ def save_checkpoint(queue, args):
         raise Exception(f"unrecognized model type: {args.model_type}")
 
     def get_models(count, dtype, pre_process, post_process):
-        models = [
-            model_provider(pre_process, post_process).to(dtype) for _ in range(count)
-        ]
+        models = [model_provider(pre_process, post_process).to(dtype) for _ in range(count)]
         return models
 
     # fake initializing distributed
@@ -245,23 +228,15 @@ def save_checkpoint(queue, args):
         full_word_embed = orig_word_embed
 
     # Split into new tensor model parallel sizes
-    out_word_embed = torch.chunk(
-        full_word_embed, args.target_tensor_parallel_size, dim=0
-    )
+    out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
 
     # Make models for first pipeline stage and fill in embeddings
     mpu.set_pipeline_model_parallel_rank(0)
     post_process = args.target_pipeline_parallel_size == 1
-    models = get_models(
-        args.target_tensor_parallel_size, md.params_dtype, True, post_process
-    )
+    models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
     for tp_rank, model in enumerate(models):
-        print(
-            f"word embeddings shape {model.language_model.embedding.word_embeddings.weight.shape}"
-        )
-        model.language_model.embedding.word_embeddings.weight.data.copy_(
-            out_word_embed[tp_rank]
-        )
+        print(f"word embeddings shape {model.language_model.embedding.word_embeddings.weight.shape}")
+        model.language_model.embedding.word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
         model.language_model.embedding.position_embeddings.weight.data.copy_(pos_embed)
 
     # Transformer layers
@@ -272,9 +247,7 @@ def save_checkpoint(queue, args):
         if pp_rank > 0:
             mpu.set_pipeline_model_parallel_rank(pp_rank)
             post_process = pp_rank == args.target_pipeline_parallel_size - 1
-            models = get_models(
-                args.target_tensor_parallel_size, md.params_dtype, False, post_process
-            )
+            models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
 
         for layer in range(len(models[0].language_model.encoder.layers)):
             msg = queue_get(f"transformer layer {total_layer_num}")
@@ -288,24 +261,12 @@ def save_checkpoint(queue, args):
             mlp_l1_bias = msg.pop("mlp l1 bias")
 
             # Split up the parallel tensors
-            qkv_weight = torch.chunk(
-                msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0
-            )
-            qkv_bias = torch.chunk(
-                msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0
-            )
-            dense_weight = torch.chunk(
-                msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1
-            )
-            mlp_l0_weight = torch.chunk(
-                msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0
-            )
-            mlp_l0_bias = torch.chunk(
-                msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0
-            )
-            mlp_l1_weight = torch.chunk(
-                msg.pop("mlp l1 weight"), args.target_tensor_parallel_size, dim=1
-            )
+            qkv_weight = torch.chunk(msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0)
+            qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
+            dense_weight = torch.chunk(msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1)
+            mlp_l0_weight = torch.chunk(msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0)
+            mlp_l0_bias = torch.chunk(msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0)
+            mlp_l1_weight = torch.chunk(msg.pop("mlp l1 weight"), args.target_tensor_parallel_size, dim=1)
 
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
@@ -330,19 +291,11 @@ def save_checkpoint(queue, args):
             final_layernorm_weight = msg.pop("weight")
             final_layernorm_bias = msg.pop("bias")
             for tp_rank in range(args.target_tensor_parallel_size):
-                models[
-                    tp_rank
-                ].language_model.encoder.final_layernorm.weight.data.copy_(
-                    final_layernorm_weight
-                )
-                models[tp_rank].language_model.encoder.final_layernorm.bias.data.copy_(
-                    final_layernorm_bias
-                )
+                models[tp_rank].language_model.encoder.final_layernorm.weight.data.copy_(final_layernorm_weight)
+                models[tp_rank].language_model.encoder.final_layernorm.bias.data.copy_(final_layernorm_bias)
                 if pp_rank != 0:
                     # Copy word embeddings to final pipeline rank
-                    models[tp_rank].word_embeddings.weight.data.copy_(
-                        out_word_embed[tp_rank]
-                    )
+                    models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
             del final_layernorm_weight
             del final_layernorm_bias
             check_message(msg)
@@ -356,12 +309,8 @@ def save_checkpoint(queue, args):
                 pooler_weight = msg.pop("weight")
                 pooler_bias = msg.pop("bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].language_model.pooler.dense.weight.data.copy_(
-                        pooler_weight
-                    )
-                    models[tp_rank].language_model.pooler.dense.bias.data.copy_(
-                        pooler_bias
-                    )
+                    models[tp_rank].language_model.pooler.dense.weight.data.copy_(pooler_weight)
+                    models[tp_rank].language_model.pooler.dense.bias.data.copy_(pooler_bias)
                 del pooler_weight
                 del pooler_bias
                 check_message(msg)
@@ -377,16 +326,10 @@ def save_checkpoint(queue, args):
                 lm_head_layernorm_weight = msg.pop("layernorm weight")
                 lm_head_layernorm_bias = msg.pop("layernorm bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
-                    models[tp_rank].lm_head.dense.weight.data.copy_(
-                        lm_head_dense_weight
-                    )
+                    models[tp_rank].lm_head.dense.weight.data.copy_(lm_head_dense_weight)
                     models[tp_rank].lm_head.dense.bias.data.copy_(lm_head_dense_bias)
-                    models[tp_rank].lm_head.layernorm.weight.data.copy_(
-                        lm_head_layernorm_weight
-                    )
-                    models[tp_rank].lm_head.layernorm.bias.data.copy_(
-                        lm_head_layernorm_bias
-                    )
+                    models[tp_rank].lm_head.layernorm.weight.data.copy_(lm_head_layernorm_weight)
+                    models[tp_rank].lm_head.layernorm.bias.data.copy_(lm_head_layernorm_bias)
                 check_message(msg)
                 msg = queue_get()
 

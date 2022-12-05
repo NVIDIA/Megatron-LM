@@ -108,29 +108,15 @@ def build_cityscapes_train_valid_datasets(data_path, image_size):
     args.color_table = Cityscapes.color_table
     args.mean_std = ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 
-    train_joint_transform = VitSegmentationJointTransform(
-        train=True, resolution=image_size
-    )
-    val_joint_transform = VitSegmentationJointTransform(
-        train=False, resolution=image_size
-    )
-    train_image_transform = VitSegmentationImageTransform(
-        train=True, resolution=image_size
-    )
-    val_image_transform = VitSegmentationImageTransform(
-        train=False, resolution=image_size
-    )
-    train_target_transform = VitSegmentationTargetTransform(
-        train=True, resolution=image_size
-    )
-    val_target_transform = VitSegmentationTargetTransform(
-        train=False, resolution=image_size
-    )
+    train_joint_transform = VitSegmentationJointTransform(train=True, resolution=image_size)
+    val_joint_transform = VitSegmentationJointTransform(train=False, resolution=image_size)
+    train_image_transform = VitSegmentationImageTransform(train=True, resolution=image_size)
+    val_image_transform = VitSegmentationImageTransform(train=False, resolution=image_size)
+    train_target_transform = VitSegmentationTargetTransform(train=True, resolution=image_size)
+    val_target_transform = VitSegmentationTargetTransform(train=False, resolution=image_size)
 
     # training dataset
-    train_data = Cityscapes(
-        root=data_path[0], split="train", mode="fine", resolution=image_size
-    )
+    train_data = Cityscapes(root=data_path[0], split="train", mode="fine", resolution=image_size)
     train_data = RandomSeedSegmentationDataset(
         train_data,
         joint_transform=train_joint_transform,
@@ -139,9 +125,7 @@ def build_cityscapes_train_valid_datasets(data_path, image_size):
     )
 
     # validation dataset
-    val_data = Cityscapes(
-        root=data_path[0], split="val", mode="fine", resolution=image_size
-    )
+    val_data = Cityscapes(root=data_path[0], split="val", mode="fine", resolution=image_size)
 
     val_data = RandomSeedSegmentationDataset(
         val_data,

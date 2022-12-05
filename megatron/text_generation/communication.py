@@ -121,9 +121,7 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
             if is_last_stage:
                 tensor_ = tensor.contiguous()
             else:
-                tensor_ = torch.empty(
-                    size, dtype=dtype, device=torch.cuda.current_device()
-                )
+                tensor_ = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
         # Broadcast from last stage into the first stage.
         torch.distributed.broadcast(tensor_, src, group)
         # Update the first stage tensor
@@ -151,9 +149,7 @@ def broadcast_list(size, dtype, list_values=None, rank=0):
 
     tensor = None
     if torch.distributed.get_rank() == rank:
-        tensor = torch.tensor(
-            list_values, dtype=dtype, device=torch.cuda.current_device()
-        )
+        tensor = torch.tensor(list_values, dtype=dtype, device=torch.cuda.current_device())
 
     return broadcast_tensor(size, dtype, tensor=tensor, rank=rank)
 

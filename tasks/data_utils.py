@@ -53,9 +53,7 @@ def build_tokens_types_paddings_from_text(text_a, text_b, tokenizer, max_seq_len
     )
 
 
-def build_tokens_types_paddings_from_ids(
-    text_a_ids, text_b_ids, max_seq_length, cls_id, sep_id, pad_id
-):
+def build_tokens_types_paddings_from_ids(text_a_ids, text_b_ids, max_seq_length, cls_id, sep_id, pad_id):
     """Build token types and paddings, trim if needed, and pad if needed."""
 
     ids = []

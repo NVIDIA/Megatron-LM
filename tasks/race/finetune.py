@@ -15,9 +15,7 @@ def train_valid_datasets_provider():
     tokenizer = get_tokenizer()
 
     train_dataset = RaceDataset("training", args.train_data, tokenizer, args.seq_length)
-    valid_dataset = RaceDataset(
-        "validation", args.valid_data, tokenizer, args.seq_length
-    )
+    valid_dataset = RaceDataset("validation", args.valid_data, tokenizer, args.seq_length)
 
     return train_dataset, valid_dataset
 
@@ -26,9 +24,7 @@ def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0("building multichoice model for RACE ...")
-    model = MultipleChoice(
-        num_tokentypes=2, pre_process=pre_process, post_process=post_process
-    )
+    model = MultipleChoice(num_tokentypes=2, pre_process=pre_process, post_process=post_process)
 
     return model
 

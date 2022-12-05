@@ -65,9 +65,7 @@ def generate_and_post_process(
 
         if return_output_log_probs:
             output_log_probs = output_log_probs.cpu().numpy().tolist()
-            for i, (prob, seg) in enumerate(
-                zip(output_log_probs, prompts_plus_generations_segments)
-            ):
+            for i, (prob, seg) in enumerate(zip(output_log_probs, prompts_plus_generations_segments)):
                 output_log_probs[i] = prob[: len(seg) - 1]
 
         return (
@@ -149,9 +147,7 @@ def generate(
     )
 
     if tokens_to_generate == 0:
-        return score_and_return_on_first_stage(
-            model, context_tokens_tensor, context_length_tensor
-        )
+        return score_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor)
 
     # Main inference function.
     # Note that the outputs are available on the first stage.
@@ -200,9 +196,7 @@ def beam_search_and_post_process(
     )
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
-        lengths = tokens.size(1) * torch.ones(
-            beam_size, dtype=torch.int64, device=torch.cuda.current_device()
-        )
+        lengths = tokens.size(1) * torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device())
         (
             tokens,
             prompts_plus_generations,

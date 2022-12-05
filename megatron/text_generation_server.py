@@ -54,17 +54,13 @@ class MegatronGenerate(Resource):
         if len(prompts) > 128:
             return "Maximum number of prompts is 128", 400
 
-        tokens_to_generate = (
-            64  # Choosing hopefully sane default.  Full sequence is slow
-        )
+        tokens_to_generate = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "tokens_to_generate" in request.get_json():
             tokens_to_generate = request.get_json()["tokens_to_generate"]
             if not isinstance(tokens_to_generate, int):
                 return "tokens_to_generate must be an integer greater than 0"
             if tokens_to_generate < 0:
-                return (
-                    "tokens_to_generate must be an integer greater than or equal to 0"
-                )
+                return "tokens_to_generate must be an integer greater than or equal to 0"
 
         logprobs = False
         if "logprobs" in request.get_json():
@@ -79,13 +75,9 @@ class MegatronGenerate(Resource):
         if "temperature" in request.get_json():
             temperature = request.get_json()["temperature"]
             if not (type(temperature) == int or type(temperature) == float):
-                return (
-                    "temperature must be a positive number less than or equal to 100.0"
-                )
+                return "temperature must be a positive number less than or equal to 100.0"
             if not (0.0 < temperature <= 100.0):
-                return (
-                    "temperature must be a positive number less than or equal to 100.0"
-                )
+                return "temperature must be a positive number less than or equal to 100.0"
 
         top_k = 0.0
         if "top_k" in request.get_json():
@@ -119,9 +111,7 @@ class MegatronGenerate(Resource):
         if "top_p_bound" in request.get_json():
             top_p_bound = request.get_json()["top_p_bound"]
             if not (type(top_p_bound) == float):
-                return (
-                    "top_p_bound must be a positive float less than or equal to top_p"
-                )
+                return "top_p_bound must be a positive float less than or equal to top_p"
             if top_p == 0.0:
                 return "top_p_bound cannot be set without top_p"
             if not (0.0 < top_p_bound <= top_p):
@@ -150,9 +140,7 @@ class MegatronGenerate(Resource):
 
         prevent_newline_after_colon = False
         if "prevent_newline_after_colon" in request.get_json():
-            prevent_newline_after_colon = request.get_json()[
-                "prevent_newline_after_colon"
-            ]
+            prevent_newline_after_colon = request.get_json()["prevent_newline_after_colon"]
             if not isinstance(prevent_newline_after_colon, bool):
                 return "prevent_newline_after_colon must be a boolean value"
 
@@ -202,11 +190,7 @@ class MegatronGenerate(Resource):
             try:
                 if beam_width is not None:
                     MegatronGenerate.send_do_beam_search()  # Tell other ranks we're doing beam_search
-                    (
-                        response,
-                        response_seg,
-                        response_scores,
-                    ) = beam_search_and_post_process(
+                    (response, response_seg, response_scores,) = beam_search_and_post_process(
                         self.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
@@ -227,12 +211,7 @@ class MegatronGenerate(Resource):
                     )
                 else:
                     MegatronGenerate.send_do_generate()  # Tell other ranks we're doing generate
-                    (
-                        response,
-                        response_seg,
-                        response_logprobs,
-                        _,
-                    ) = generate_and_post_process(
+                    (response, response_seg, response_logprobs, _,) = generate_and_post_process(
                         self.model,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,

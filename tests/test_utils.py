@@ -16,12 +16,8 @@ def test_divide_improperly():
 
 def test_global_memory_buffer():
     global_memory_buffer = util.GlobalMemoryBuffer()
-    obtained_tensor = global_memory_buffer.get_tensor(
-        (3, 2), torch.float32, "test_tensor"
-    )
-    expected_tensor = torch.empty(
-        (3, 2), dtype=torch.float32, device=torch.cuda.current_device()
-    )
+    obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
+    expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
     assert torch.equal(obtained_tensor, expected_tensor)
 
 

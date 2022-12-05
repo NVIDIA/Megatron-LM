@@ -45,11 +45,7 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
 
         input_, weight_, bias_, mean, invvar = ctx.saved_tensors
         grad_input = grad_weight = grad_bias = None
-        (
-            grad_input,
-            grad_weight,
-            grad_bias,
-        ) = fused_mix_prec_layer_norm_cuda.backward_affine(
+        (grad_input, grad_weight, grad_bias,) = fused_mix_prec_layer_norm_cuda.backward_affine(
             grad_output.contiguous(),
             mean,
             invvar,
@@ -74,9 +70,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
         super(MixedFusedLayerNorm, self).__init__()
 
         global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-            "fused_mix_prec_layer_norm_cuda"
-        )
+        fused_mix_prec_layer_norm_cuda = importlib.import_module("fused_mix_prec_layer_norm_cuda")
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -107,10 +101,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
             49152,
             65536,
         ]
-        if (
-            normalized_shape not in persist_ln_hidden_sizes
-            or not HAVE_PERSIST_LAYER_NORM
-        ):
+        if normalized_shape not in persist_ln_hidden_sizes or not HAVE_PERSIST_LAYER_NORM:
             no_persist_layer_norm = True
 
         if isinstance(normalized_shape, numbers.Integral):
@@ -135,9 +126,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
     def forward(self, input):
 
         if self.no_persist_layer_norm:
-            return FusedLayerNormAffineFunction.apply(
-                input, self.weight, self.bias, self.normalized_shape, self.eps
-            )
+            return FusedLayerNormAffineFunction.apply(input, self.weight, self.bias, self.normalized_shape, self.eps)
         else:
             output = FastLayerNormFN.apply(input, self.weight, self.bias, self.eps)
 
@@ -145,8 +134,6 @@ class MixedFusedLayerNorm(torch.nn.Module):
             # a populated '_base' field). This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
-            output = make_viewless_tensor(
-                inp=output, requires_grad=input.requires_grad, keep_graph=True
-            )
+            output = make_viewless_tensor(inp=output, requires_grad=input.requires_grad, keep_graph=True)
 
             return output

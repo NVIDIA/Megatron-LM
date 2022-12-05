@@ -34,10 +34,7 @@ def get_model_provider(eval_metric):
         elif eval_metric == "accuracy":
             parallel_output = False
         else:
-            raise NotImplementedError(
-                "output type for {} evaluation metric "
-                "is not supported.".format(eval_metric)
-            )
+            raise NotImplementedError("output type for {} evaluation metric " "is not supported.".format(eval_metric))
 
         print_rank_0("building GPT model ...")
         model = GPTModel(
@@ -96,9 +93,7 @@ def forward_step(batch, model, eval_metric):
     if mpu.is_pipeline_last_stage():
         # For loss, return the unreduced loss.
         if eval_metric == "loss":
-            losses = mpu.tensor_parallel.vocab_parallel_cross_entropy(
-                output.contiguous().float(), labels.contiguous()
-            )
+            losses = mpu.tensor_parallel.vocab_parallel_cross_entropy(output.contiguous().float(), labels.contiguous())
             loss = torch.sum(losses.view(-1) * loss_mask.contiguous().view(-1).float())
             return loss
 
@@ -110,10 +105,7 @@ def forward_step(batch, model, eval_metric):
             correct = correct.prod(-1)
             return correct.sum()
 
-        raise NotImplementedError(
-            "forward method for evaluation metric {} "
-            "is not implemented.".format(eval_metric)
-        )
+        raise NotImplementedError("forward method for evaluation metric {} " "is not implemented.".format(eval_metric))
     return None
 
 
@@ -135,9 +127,7 @@ def evaluate(data_loader, model, eval_metric):
 
             # Reduce across processes.
             if mpu.is_pipeline_last_stage():
-                torch.distributed.all_reduce(
-                    output, group=mpu.get_data_parallel_group()
-                )
+                torch.distributed.all_reduce(output, group=mpu.get_data_parallel_group())
 
                 total_output += output
 
@@ -172,10 +162,7 @@ def evaluate_and_print_results(task, data_loader, model, eval_metric):
             string += "avg accuracy: {:.4E}".format(acc)
 
         else:
-            raise NotImplementedError(
-                "evaluation method for {} metric is not "
-                "implemented yet.".format(eval_metric)
-            )
+            raise NotImplementedError("evaluation method for {} metric is not " "implemented yet.".format(eval_metric))
 
         length = len(string) + 1
         print("-" * length)
@@ -208,9 +195,7 @@ def main():
 
     # Data stuff.
     dataset = build_dataset(args.task)
-    dataloader = build_data_loader(
-        dataset, args.micro_batch_size, args.num_workers, drop_last=False
-    )
+    dataloader = build_data_loader(dataset, args.micro_batch_size, args.num_workers, drop_last=False)
 
     # Run evaluation.
     evaluate_and_print_results(args.task, dataloader, model, eval_metric)

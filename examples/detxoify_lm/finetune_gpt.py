@@ -10,11 +10,7 @@ from functools import partial
 
 import torch
 
-sys.path.append(
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
-    )
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
 from megatron import get_args, get_timers, get_tokenizer, mpu, print_rank_0
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.gpt_dataset import build_train_valid_test_datasets

@@ -56,9 +56,7 @@ def calc_params_l2_norm(model):
     )
     norm_2 = norm * norm
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(
-        norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_model_parallel_group()
-    )
+    torch.distributed.all_reduce(norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_model_parallel_group())
     return norm_2.item() ** 0.5
 
 
@@ -66,9 +64,7 @@ def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(averaged_losses, group=mpu.get_data_parallel_group())
-    averaged_losses = averaged_losses / torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group()
-    )
+    averaged_losses = averaged_losses / torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
     return averaged_losses
 
@@ -78,13 +74,9 @@ def report_memory(name):
     mega_bytes = 1024.0 * 1024.0
     string = name + " memory (MB)"
     string += " | allocated: {}".format(torch.cuda.memory_allocated() / mega_bytes)
-    string += " | max allocated: {}".format(
-        torch.cuda.max_memory_allocated() / mega_bytes
-    )
+    string += " | max allocated: {}".format(torch.cuda.max_memory_allocated() / mega_bytes)
     string += " | reserved: {}".format(torch.cuda.memory_reserved() / mega_bytes)
-    string += " | max reserved: {}".format(
-        torch.cuda.max_memory_reserved() / mega_bytes
-    )
+    string += " | max reserved: {}".format(torch.cuda.max_memory_reserved() / mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -101,9 +93,7 @@ def print_params_min_max_norm(optimizer, iteration):
             min_ = param.data.min()
             max_ = param.data.max()
             norm = torch.linalg.norm(param.data)
-            string += "{:7d}, {:4d}, {:4d}, {:2d}, ".format(
-                iteration, rank, index, int(param.tensor_model_parallel)
-            )
+            string += "{:7d}, {:4d}, {:4d}, {:2d}, ".format(iteration, rank, index, int(param.tensor_model_parallel))
             string += "{:.6E}, {:.6E}, {:.6E}\n".format(min_, max_, norm)
     print(string, flush=True)
 
@@ -126,9 +116,7 @@ def check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_sch
         sys.exit(0)
 
 
-def get_ltor_masks_and_position_ids(
-    data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss
-):
+def get_ltor_masks_and_position_ids(data, eod_token, reset_position_ids, reset_attention_mask, eod_mask_loss):
     """Build masks and position id for left to right model."""
 
     # Extract batch size and sequence length.
@@ -139,9 +127,9 @@ def get_ltor_masks_and_position_ids(
         att_mask_batch = micro_batch_size
     else:
         att_mask_batch = 1
-    attention_mask = torch.tril(
-        torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)
-    ).view(att_mask_batch, 1, seq_length, seq_length)
+    attention_mask = torch.tril(torch.ones((att_mask_batch, seq_length, seq_length), device=data.device)).view(
+        att_mask_batch, 1, seq_length, seq_length
+    )
 
     # Loss mask.
     loss_mask = torch.ones(data.size(), dtype=torch.float, device=data.device)

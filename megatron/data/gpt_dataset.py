@@ -48,9 +48,7 @@ def build_train_valid_test_datasets(
 
         # Blending dataset.
         # Parse the values.
-        output = get_datasets_weights_and_num_samples(
-            data_prefix, train_valid_test_num_samples
-        )
+        output = get_datasets_weights_and_num_samples(data_prefix, train_valid_test_num_samples)
         prefixes, weights, datasets_train_valid_test_num_samples = output
 
         # Build individual datasets.
@@ -87,9 +85,7 @@ def build_train_valid_test_datasets(
 
         return (blending_train_dataset, blending_valid_dataset, blending_test_dataset)
     else:
-        print_rank_0(
-            "Separate data paths provided for train, valid & test. Split string will be ignored."
-        )
+        print_rank_0("Separate data paths provided for train, valid & test. Split string will be ignored.")
 
         train_dataset, valid_dataset, test_dataset = None, None, None
         # Single dataset.
@@ -129,9 +125,7 @@ def build_train_valid_test_datasets(
         return (train_dataset, valid_dataset, test_dataset)
 
 
-def build_dataset(
-    dataset_name, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup
-):
+def build_dataset(dataset_name, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup):
     dataset = None
     if len(data_prefix) == 1:
         dataset = _build_dataset(
@@ -170,9 +164,7 @@ def build_dataset(
     return dataset
 
 
-def _build_dataset(
-    dataset_name, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup
-):
+def _build_dataset(dataset_name, data_prefix, data_impl, num_samples, seq_length, seed, skip_warmup):
     """
     Build dataset. This method is called when individual
     train, valid, test datasets are provided
@@ -228,9 +220,7 @@ def _build_train_valid_test_datasets(
         print_rank_0("    {}:".format(name))
         print_rank_0(
             "     document indices in [{}, {}) total of {} "
-            "documents".format(
-                splits[index], splits[index + 1], splits[index + 1] - splits[index]
-            )
+            "documents".format(splits[index], splits[index + 1], splits[index + 1] - splits[index])
         )
 
     print_split_stats("train", 0)
@@ -240,9 +230,7 @@ def _build_train_valid_test_datasets(
     def build_dataset(index, name):
         dataset = None
         if splits[index + 1] > splits[index]:
-            documents = np.arange(
-                start=splits[index], stop=splits[index + 1], step=1, dtype=np.int32
-            )
+            documents = np.arange(start=splits[index], stop=splits[index + 1], step=1, dtype=np.int32)
             dataset = GPTDataset(
                 name,
                 data_prefix,
@@ -267,10 +255,7 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
 
     start_time = time.time()
     indexed_dataset = make_indexed_dataset(data_prefix, data_impl, skip_warmup)
-    print_rank_0(
-        " > finished creating indexed dataset in {:4f} "
-        "seconds".format(time.time() - start_time)
-    )
+    print_rank_0(" > finished creating indexed dataset in {:4f} " "seconds".format(time.time() - start_time))
     print_rank_0("    number of documents: {}".format(indexed_dataset.sizes.shape[0]))
 
     return indexed_dataset
@@ -328,24 +313,18 @@ class GPTDataset(torch.utils.data.Dataset):
             )
         else:
             # Otherwise, get the rest of the initial document.
-            sample_list = [
-                self.indexed_dataset.get(self.doc_idx[doc_index_f], offset=offset_f)
-            ]
+            sample_list = [self.indexed_dataset.get(self.doc_idx[doc_index_f], offset=offset_f)]
             # Loop over all in between documents and add the entire document.
             for i in range(doc_index_f + 1, doc_index_l):
                 sample_list.append(self.indexed_dataset.get(self.doc_idx[i]))
             # And finally add the relevant portion of last document.
-            sample_list.append(
-                self.indexed_dataset.get(self.doc_idx[doc_index_l], length=offset_l + 1)
-            )
+            sample_list.append(self.indexed_dataset.get(self.doc_idx[doc_index_l], length=offset_l + 1))
             sample = np.concatenate(sample_list)
 
         return {"text": np.array(sample, dtype=np.int64)}
 
 
-def _build_index_mappings(
-    name, data_prefix, documents, sizes, num_samples, seq_length, seed
-):
+def _build_index_mappings(name, data_prefix, documents, sizes, num_samples, seq_length, seed):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
     sample-idx: is the start document index and document offset for each
@@ -376,10 +355,7 @@ def _build_index_mappings(
             or (not os.path.isfile(shuffle_idx_filename))
         ):
 
-            print_rank_0(
-                " > WARNING: could not find index map files, building "
-                "the indices on rank 0 ..."
-            )
+            print_rank_0(" > WARNING: could not find index map files, building " "the indices on rank 0 ...")
 
             # For the last epoch, decide whether include the entire epoch
             # in the global shuffle or not.
@@ -389,20 +365,15 @@ def _build_index_mappings(
             if num_epochs == 1:
                 separate_last_epoch = False
                 print(
-                    " > only one epoch required, setting "
-                    "separate_last_epoch to False",
+                    " > only one epoch required, setting " "separate_last_epoch to False",
                     flush=True,
                 )
 
             else:
                 # Get the number of samples for the last epoch
-                num_samples_from_epochs_minus_one = (
-                    (num_epochs - 1) * tokens_per_epoch - 1
-                ) // seq_length
+                num_samples_from_epochs_minus_one = ((num_epochs - 1) * tokens_per_epoch - 1) // seq_length
                 last_epoch_num_samples = num_samples - num_samples_from_epochs_minus_one
-                assert (
-                    last_epoch_num_samples >= 0
-                ), "last epoch number of samples should be non-negative."
+                assert last_epoch_num_samples >= 0, "last epoch number of samples should be non-negative."
                 num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
                 assert last_epoch_num_samples < (
                     num_samples_per_epoch + 1
@@ -411,9 +382,7 @@ def _build_index_mappings(
                 # seperate out the epoch and treat it differently.
                 # Note: the 80% number is just based on common sense and can
                 # be adjusted if needed.
-                separate_last_epoch = last_epoch_num_samples < int(
-                    0.80 * num_samples_per_epoch
-                )
+                separate_last_epoch = last_epoch_num_samples < int(0.80 * num_samples_per_epoch)
                 if separate_last_epoch:
                     string = (
                         " > last epoch number of samples ({}) is smaller "
@@ -436,8 +405,7 @@ def _build_index_mappings(
             doc_idx = _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch)
             np.save(doc_idx_filename, doc_idx, allow_pickle=True)
             print_rank_0(
-                " > elasped time to build and save doc-idx mapping "
-                "(seconds): {:4f}".format(time.time() - start_time)
+                " > elasped time to build and save doc-idx mapping " "(seconds): {:4f}".format(time.time() - start_time)
             )
             # sample-idx.
             start_time = time.time()
@@ -447,9 +415,7 @@ def _build_index_mappings(
 
             assert doc_idx.dtype == np.int32
             assert sizes.dtype == np.int32
-            sample_idx = helpers.build_sample_idx(
-                sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch
-            )
+            sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch)
             # sample_idx = _build_sample_idx(sizes, doc_idx, seq_length,
             #                               num_epochs, tokens_per_epoch)
             np.save(sample_idx_filename, sample_idx, allow_pickle=True)
@@ -465,9 +431,7 @@ def _build_index_mappings(
                 num_samples_ = num_samples_from_epochs_minus_one
             else:
                 num_samples_ = sample_idx.shape[0] - 1
-            shuffle_idx = _build_shuffle_idx(
-                num_samples_, sample_idx.shape[0] - 1, np_rng
-            )
+            shuffle_idx = _build_shuffle_idx(num_samples_, sample_idx.shape[0] - 1, np_rng)
             np.save(shuffle_idx_filename, shuffle_idx, allow_pickle=True)
             print_rank_0(
                 " > elasped time to build and save shuffle-idx mapping"
@@ -493,9 +457,7 @@ def _build_index_mappings(
     sample_idx = np.load(sample_idx_filename, allow_pickle=True, mmap_mode="r")
     print_rank_0(" > loading shuffle-idx mapping from {}".format(shuffle_idx_filename))
     shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True, mmap_mode="r")
-    print_rank_0(
-        "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
-    )
+    print_rank_0("    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time))
     print_rank_0("    total number of samples: {}".format(sample_idx.shape[0]))
     print_rank_0("    total number of epochs: {}".format(num_epochs))
 
@@ -589,8 +551,7 @@ def _build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch):
 def _build_shuffle_idx(num_samples, total_size, np_rng):
     """Build the range [0, size) and shuffle."""
     print(
-        " > building shuffle index with split [0, {}) and [{}, {}) "
-        "...".format(num_samples, num_samples, total_size),
+        " > building shuffle index with split [0, {}) and [{}, {}) " "...".format(num_samples, num_samples, total_size),
         flush=True,
     )
 
@@ -603,9 +564,7 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
     if num_samples == total_size:
         return shuffle_idx_first
 
-    shuffle_idx_last = np.arange(
-        start=num_samples, stop=total_size, step=1, dtype=dtype_
-    )
+    shuffle_idx_last = np.arange(start=num_samples, stop=total_size, step=1, dtype=dtype_)
     np_rng.shuffle(shuffle_idx_last)
 
     return np.concatenate((shuffle_idx_first, shuffle_idx_last))

@@ -34,13 +34,9 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     send_prev_shape_tensor = None
     send_next_shape_tensor = None
     if recv_prev:
-        recv_prev_shape_tensor = torch.empty(
-            (3), device=torch.cuda.current_device(), dtype=torch.int64
-        )
+        recv_prev_shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
     if recv_next:
-        recv_next_shape_tensor = torch.empty(
-            (3), device=torch.cuda.current_device(), dtype=torch.int64
-        )
+        recv_next_shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
     if tensor_send_prev is not None:
         send_prev_shape_tensor = torch.tensor(
             tensor_send_prev.size(),
@@ -112,9 +108,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     return recv_prev_shape, recv_next_shape
 
 
-def _communicate(
-    tensor_send_next, tensor_send_prev, recv_prev, recv_next, tensor_shape, dtype_=None
-):
+def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next, tensor_shape, dtype_=None):
     """Communicate tensors between stages. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
 
@@ -153,9 +147,7 @@ def _communicate(
             recv_prev_shape = tensor_shape
             recv_next_shape = tensor_shape
     else:
-        recv_prev_shape, recv_next_shape = _communicate_shapes(
-            tensor_send_next, tensor_send_prev, recv_prev, recv_next
-        )
+        recv_prev_shape, recv_next_shape = _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next)
 
     override_scatter_gather_tensors_in_pipeline = False
     if args.scatter_gather_tensors_in_pipeline and not args.sequence_parallel:
@@ -165,12 +157,8 @@ def _communicate(
             recv_prev_chunk_shape % mpu.get_tensor_model_parallel_world_size() == 0
             and recv_next_chunk_shape % mpu.get_tensor_model_parallel_world_size() == 0
         ):
-            recv_prev_chunk_shape = (
-                recv_prev_chunk_shape // mpu.get_tensor_model_parallel_world_size()
-            )
-            recv_next_chunk_shape = (
-                recv_next_chunk_shape // mpu.get_tensor_model_parallel_world_size()
-            )
+            recv_prev_chunk_shape = recv_prev_chunk_shape // mpu.get_tensor_model_parallel_world_size()
+            recv_next_chunk_shape = recv_next_chunk_shape // mpu.get_tensor_model_parallel_world_size()
         else:
             recv_prev_chunk_shape = recv_prev_shape
             recv_next_chunk_shape = recv_next_shape
@@ -210,14 +198,10 @@ def _communicate(
         and not args.sequence_parallel
     ):
         if tensor_send_next is not None:
-            tensor_send_next = core.tensor_parallel.split_tensor_into_1d_equal_chunks(
-                tensor_send_next
-            )
+            tensor_send_next = core.tensor_parallel.split_tensor_into_1d_equal_chunks(tensor_send_next)
 
         if tensor_send_prev is not None:
-            tensor_send_prev = core.tensor_parallel.split_tensor_into_1d_equal_chunks(
-                tensor_send_prev
-            )
+            tensor_send_prev = core.tensor_parallel.split_tensor_into_1d_equal_chunks(tensor_send_prev)
 
     # Send tensors in both the forward and backward directions as appropriate.
     if args.use_ring_exchange_p2p:
@@ -273,23 +257,15 @@ def _communicate(
     ):
         if recv_prev:
             tensor_recv_prev = (
-                core.tensor_parallel.gather_split_1d_tensor(tensor_recv_prev)
-                .view(recv_prev_shape)
-                .requires_grad_()
+                core.tensor_parallel.gather_split_1d_tensor(tensor_recv_prev).view(recv_prev_shape).requires_grad_()
             )
-            tensor_recv_prev = core.utils.make_viewless_tensor(
-                tensor_recv_prev, requires_grad=True, keep_graph=False
-            )
+            tensor_recv_prev = core.utils.make_viewless_tensor(tensor_recv_prev, requires_grad=True, keep_graph=False)
 
         if recv_next:
             tensor_recv_next = (
-                core.tensor_parallel.gather_split_1d_tensor(tensor_recv_next)
-                .view(recv_next_shape)
-                .requires_grad_()
+                core.tensor_parallel.gather_split_1d_tensor(tensor_recv_next).view(recv_next_shape).requires_grad_()
             )
-            tensor_recv_next = core.utils.make_viewless_tensor(
-                tensor_recv_next, requires_grad=True, keep_graph=False
-            )
+            tensor_recv_next = core.utils.make_viewless_tensor(tensor_recv_next, requires_grad=True, keep_graph=False)
 
     return tensor_recv_prev, tensor_recv_next
 
@@ -422,9 +398,7 @@ def send_forward_recv_forward(output_tensor, recv_prev, tensor_shape=None, timer
     return input_tensor
 
 
-def send_backward_recv_backward(
-    input_tensor_grad, recv_next, tensor_shape=None, timers=None
-):
+def send_backward_recv_backward(input_tensor_grad, recv_next, tensor_shape=None, timers=None):
     """Batched recv from next rank and send to previous rank in pipeline."""
     if timers is not None:
         timers("backward-send-backward-recv", log_level=2).start()

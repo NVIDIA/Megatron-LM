@@ -11,9 +11,7 @@ from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model.module import param_is_not_shared
 
 
-def clip_grad_norm_fp32(
-    parameters, grads_for_norm, max_norm, norm_type=2, model_parallel_group=None
-):
+def clip_grad_norm_fp32(parameters, grads_for_norm, max_norm, norm_type=2, model_parallel_group=None):
     """Clips gradient norm of an iterable of parameters whose gradients
        are in fp32.
 
@@ -90,18 +88,14 @@ def clip_grad_norm_fp32(
                 total_norm += grad_norm**norm_type
 
         # Sum across all model-parallel GPUs.
-        torch.distributed.all_reduce(
-            total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
-        )
+        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
         dummy_overflow_buf = torch.cuda.IntTensor([0])
-        multi_tensor_applier(
-            amp_C.multi_tensor_scale, dummy_overflow_buf, [grads, grads], clip_coeff
-        )
+        multi_tensor_applier(amp_C.multi_tensor_scale, dummy_overflow_buf, [grads, grads], clip_coeff)
 
     return total_norm
 
@@ -126,9 +120,7 @@ def count_zeros_fp32(parameters, model_parallel_group):
             total_num_zeros = num_zeros + total_num_zeros
 
     # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(
-        total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group
-    )
+    torch.distributed.all_reduce(total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=model_parallel_group)
 
     total_num_zeros = total_num_zeros.item()
 

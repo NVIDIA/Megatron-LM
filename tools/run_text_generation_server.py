@@ -4,9 +4,7 @@
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import socket
 
 import torch
@@ -41,9 +39,7 @@ def model_provider(pre_process=True, post_process=True):
 def add_text_generate_args(parser):
     group = parser.add_argument_group(title="text generation")
 
-    group.add_argument(
-        "--temperature", type=float, default=1.0, help="Sampling temperature."
-    )
+    group.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
     group.add_argument("--top_p", type=float, default=0.0, help="Top p sampling.")
     group.add_argument("--top_k", type=int, default=0, help="Top k sampling.")
     group.add_argument(

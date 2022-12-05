@@ -23,9 +23,7 @@ def segmentation():
         """Build train and validation dataset."""
         args = get_args()
 
-        train_ds, valid_ds = build_train_valid_datasets(
-            data_path=args.data_path, image_size=(args.img_h, args.img_w)
-        )
+        train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
         return train_ds, valid_ds
 
     def model_provider(pre_process=True, post_process=True):
@@ -91,9 +89,7 @@ def segmentation():
         # print_rank_0("images size = {}".format(images.size()))
 
         if not model.training:
-            output_tensor = torch.cat(
-                [model(image) for image in torch.split(images, args.micro_batch_size)]
-            )
+            output_tensor = torch.cat([model(image) for image in torch.split(images, args.micro_batch_size)])
         else:
             output_tensor = model(images)
 
@@ -115,9 +111,7 @@ def segmentation():
             probs = logits.contiguous().float().softmax(dim=1)
             max_probs, preds = torch.max(probs, 1)
             preds = preds.int()
-            preds, labels = slidingjoins(
-                preds, max_probs, labels, slices_info, img_size
-            )
+            preds, labels = slidingjoins(preds, max_probs, labels, slices_info, img_size)
             _, performs = CFMatrix()(preds, labels, args.ignore_index)
 
             loss_dict["performs"] = performs
@@ -135,9 +129,7 @@ def segmentation():
             assert not model.training
             images, labels, slices_info, img_size = slidingcrops(images, labels)
             # Forward model.
-            output_tensor = torch.cat(
-                [model(image) for image in torch.split(images, args.micro_batch_size)]
-            )
+            output_tensor = torch.cat([model(image) for image in torch.split(images, args.micro_batch_size)])
 
             return output_tensor, partial(loss_func, labels, slices_info, img_size)
 
@@ -179,9 +171,7 @@ def segmentation():
         """Provide function that calculates accuracies."""
         args = get_args()
 
-        train_ds, valid_ds = build_train_valid_datasets(
-            data_path=args.data_path, image_size=(args.img_h, args.img_w)
-        )
+        train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
         dataloader = build_data_loader(
             valid_ds,
             args.micro_batch_size,
@@ -193,10 +183,7 @@ def segmentation():
         def metrics_func(model, epoch):
             print_rank_0("calculating metrics ...")
             iou, miou = calculate_correct_answers(model, dataloader, epoch)
-            print_rank_last(
-                " >> |epoch: {}| overall: iou = {},"
-                "miou = {:.4f} %".format(epoch, iou, miou * 100.0)
-            )
+            print_rank_last(" >> |epoch: {}| overall: iou = {}," "miou = {:.4f} %".format(epoch, iou, miou * 100.0))
 
         return metrics_func
 

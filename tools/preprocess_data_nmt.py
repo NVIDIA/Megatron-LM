@@ -8,9 +8,7 @@ import multiprocessing
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import time
 
 import torch
@@ -52,9 +50,7 @@ def get_args():
         ],
         help="What type of tokenizer to use.",
     )
-    group.add_argument(
-        "--vocab-file", type=str, default=None, help="Path to the vocab file"
-    )
+    group.add_argument("--vocab-file", type=str, default=None, help="Path to the vocab file")
     group.add_argument(
         "--merge-file",
         type=str,
@@ -69,14 +65,10 @@ def get_args():
         required=True,
         help="Path to binary output file without suffix",
     )
-    group.add_argument(
-        "--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"]
-    )
+    group.add_argument("--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"])
 
     group = parser.add_argument_group(title="runtime")
-    group.add_argument(
-        "--workers", type=int, default=1, help="Number of worker processes to launch"
-    )
+    group.add_argument("--workers", type=int, default=1, help="Number of worker processes to launch")
     group.add_argument(
         "--log-interval",
         type=int,
@@ -111,9 +103,7 @@ def main():
     print(f"Output prefix: {args.output_prefix}")
     output_bin_file = "{}.bin".format(args.output_prefix)
     output_idx_file = "{}.idx".format(args.output_prefix)
-    builder = indexed_dataset.make_builder(
-        output_bin_file, impl=args.dataset_impl, vocab_size=tokenizer.vocab_size
-    )
+    builder = indexed_dataset.make_builder(output_bin_file, impl=args.dataset_impl, vocab_size=tokenizer.vocab_size)
 
     startup_end = time.time()
     proc_start = time.time()

@@ -25,9 +25,7 @@ def test_initialize__and_destroy_model_parallel():
         )
     with pytest.raises(RuntimeError):
         assert ps.initialize_model_parallel(virtual_pipeline_model_parallel_size=2)
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=2, pipeline_model_parallel_size=4
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
 
     assert ps.model_parallel_is_initialized()
     assert ps.get_model_parallel_group() is not None
@@ -39,9 +37,7 @@ def test_initialize__and_destroy_model_parallel():
 
 
 def test_pipeline_parallel_initializations():
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=2, pipeline_model_parallel_size=4
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
     assert ps.get_pipeline_model_parallel_first_rank() == rank % 2
     assert ps.get_data_parallel_src_rank() == rank
     assert ps.get_pipeline_model_parallel_next_rank() == ((rank + 2) % world_size)
@@ -112,7 +108,5 @@ def test_virtual_pipeline_model_parallel_rank():
 
 def test_get_tensor_model_parallel_src_rank():
     Utils.initialize_model_parallel(tensor_model_parallel_size=world_size)
-    assert ps.get_tensor_model_parallel_src_rank() == (
-        (rank // world_size) * world_size
-    )
+    assert ps.get_tensor_model_parallel_src_rank() == ((rank // world_size) * world_size)
     Utils.destroy_model_parallel()

@@ -8,9 +8,7 @@ import multiprocessing
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import time
 
 import torch
@@ -96,9 +94,7 @@ def get_args():
         default=["text"],
         help="space separate listed of keys to extract from json",
     )
-    group.add_argument(
-        "--split-sentences", action="store_true", help="Split documents into sentences."
-    )
+    group.add_argument("--split-sentences", action="store_true", help="Split documents into sentences.")
     group.add_argument(
         "--keep-newlines",
         action="store_true",
@@ -118,9 +114,7 @@ def get_args():
         ],
         help="What type of tokenizer to use.",
     )
-    group.add_argument(
-        "--vocab-file", type=str, default=None, help="Path to the vocab file"
-    )
+    group.add_argument("--vocab-file", type=str, default=None, help="Path to the vocab file")
     group.add_argument(
         "--merge-file",
         type=str,
@@ -146,9 +140,7 @@ def get_args():
         required=True,
         help="Path to binary output file without suffix",
     )
-    group.add_argument(
-        "--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"]
-    )
+    group.add_argument("--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"])
 
     group = parser.add_argument_group(title="runtime")
     group.add_argument(
@@ -174,9 +166,7 @@ def get_args():
 
     if args.tokenizer_type.lower().startswith("bert"):
         if not args.split_sentences:
-            print(
-                "Bert tokenizer detected, are you sure you don't want to split sentences?"
-            )
+            print("Bert tokenizer detected, are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
     args.rank = 0

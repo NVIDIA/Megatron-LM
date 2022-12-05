@@ -34,13 +34,9 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == "SentencePieceTokenizer":
         assert args.tokenizer_model is not None
-        tokenizer = _SentencePieceTokenizer(
-            args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids
-        )
+        tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
     else:
-        raise NotImplementedError(
-            "{} tokenizer is not " "implemented.".format(args.tokenizer_type)
-        )
+        raise NotImplementedError("{} tokenizer is not " "implemented.".format(args.tokenizer_type))
 
     # Add vocab size.
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size, args)
@@ -94,39 +90,27 @@ class AbstractTokenizer(ABC):
         pass
 
     def detokenize(self, token_ids):
-        raise NotImplementedError(
-            "detokenizer is not implemented for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("detokenizer is not implemented for {} " "tokenizer".format(self.name))
 
     @property
     def cls(self):
-        raise NotImplementedError(
-            "CLS is not provided for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("CLS is not provided for {} " "tokenizer".format(self.name))
 
     @property
     def sep(self):
-        raise NotImplementedError(
-            "SEP is not provided for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("SEP is not provided for {} " "tokenizer".format(self.name))
 
     @property
     def pad(self):
-        raise NotImplementedError(
-            "PAD is not provided for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("PAD is not provided for {} " "tokenizer".format(self.name))
 
     @property
     def eod(self):
-        raise NotImplementedError(
-            "EOD is not provided for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("EOD is not provided for {} " "tokenizer".format(self.name))
 
     @property
     def mask(self):
-        raise NotImplementedError(
-            "MASK is not provided for {} " "tokenizer".format(self.name)
-        )
+        raise NotImplementedError("MASK is not provided for {} " "tokenizer".format(self.name))
 
 
 class _BertWordPieceTokenizer(AbstractTokenizer):
@@ -158,9 +142,7 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         # (dsachan) Add additional special tokens
         # These can be used as sentinel tokens in T5 model inputs
         additional_special_tokens = []
-        additional_special_tokens.extend(
-            ["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)]
-        )
+        additional_special_tokens.extend(["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)])
         self.add_additional_special_tokens(additional_special_tokens)
 
     def add_token(self, token):
@@ -267,9 +249,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         name = "GPT2 BPE"
         super().__init__(name)
 
-        self.tokenizer = GPT2Tokenizer(
-            vocab_file, merge_file, errors="replace", special_tokens=[], max_len=None
-        )
+        self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors="replace", special_tokens=[], max_len=None)
         self.eod_id = self.tokenizer.encoder["<|endoftext|>"]
 
     @property

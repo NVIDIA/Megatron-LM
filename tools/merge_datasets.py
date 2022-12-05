@@ -3,9 +3,7 @@ import json
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 from megatron.data import indexed_dataset
 
@@ -32,18 +30,14 @@ def main(args):
     builder = None
     for prefix in sorted(prefixes):
         if builder is None:
-            dataset = indexed_dataset.make_dataset(
-                os.path.join(args.input, prefix), "infer"
-            )
+            dataset = indexed_dataset.make_dataset(os.path.join(args.input, prefix), "infer")
 
             if isinstance(dataset, indexed_dataset.MMapIndexedDataset):
                 builder = indexed_dataset.MMapIndexedDatasetBuilder(
                     args.output_prefix + ".bin", dtype=dataset._index.dtype
                 )
             else:
-                builder = indexed_dataset.IndexedDatasetBuilder(
-                    args.output_prefix + ".bin"
-                )
+                builder = indexed_dataset.IndexedDatasetBuilder(args.output_prefix + ".bin")
 
             del dataset
 
@@ -73,9 +67,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    assert os.path.isdir(
-        args.input
-    ), f"ERROR: {args.input} is not a directory or does not exist"
+    assert os.path.isdir(args.input), f"ERROR: {args.input} is not a directory or does not exist"
 
     assert os.path.isdir(
         os.path.dirname(args.output_prefix)

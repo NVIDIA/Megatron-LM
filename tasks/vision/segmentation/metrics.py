@@ -127,9 +127,7 @@ class CFMatrix(object):
                 y_false_ch = torch.zeros(batch_size, img_rows, img_cols)
                 y_pred_ch = torch.zeros(batch_size, img_rows, img_cols)
                 y_true_ch[y_true == ch] = 1
-                y_false_ch[
-                    torch.logical_and((y_true != ch), (y_true != ignore_index))
-                ] = 1
+                y_false_ch[torch.logical_and((y_true != ch), (y_true != ignore_index))] = 1
                 y_pred_ch[y_pred == ch] = 1
                 nb_tp = _get_tp(y_pred_ch, y_true_ch)
                 nb_fp = torch.sum(y_false_ch * y_pred_ch).float()
@@ -295,9 +293,7 @@ class F1Score(object):
                 nb_fn = _get_fn(y_pred_ch, y_true_ch)
                 _precision = nb_tp / (nb_tp + nb_fp + esp)
                 _recall = nb_tp / (nb_tp + nb_fn + esp)
-                performs[int(ch)] = (
-                    2 * _precision * _recall / (_precision + _recall + esp)
-                )
+                performs[int(ch)] = 2 * _precision * _recall / (_precision + _recall + esp)
             mperforms = sum([i * j for (i, j) in zip(performs, weights)])
         return mperforms, performs
 
@@ -329,9 +325,7 @@ class Kappa(object):
             nb_fn = _get_fn(y_pred, y_true)
             nb_total = nb_tp + nb_fp + nb_tn + nb_fn
             Po = (nb_tp + nb_tn) / nb_total
-            Pe = (
-                (nb_tp + nb_fp) * (nb_tp + nb_fn) + (nb_fn + nb_tn) * (nb_fp + nb_tn)
-            ) / (nb_total**2)
+            Pe = ((nb_tp + nb_fp) * (nb_tp + nb_fn) + (nb_fn + nb_tn) * (nb_fp + nb_tn)) / (nb_total**2)
             mperforms = (Po - Pe) / (1 - Pe + esp)
             performs = None
         else:
@@ -350,10 +344,7 @@ class Kappa(object):
                 nb_fn = _get_fn(y_pred_ch, y_true_ch)
                 nb_total = nb_tp + nb_fp + nb_tn + nb_fn
                 Po = (nb_tp + nb_tn) / nb_total
-                Pe = (
-                    (nb_tp + nb_fp) * (nb_tp + nb_fn)
-                    + (nb_fn + nb_tn) * (nb_fp + nb_tn)
-                ) / (nb_total**2)
+                Pe = ((nb_tp + nb_fp) * (nb_tp + nb_fn) + (nb_fn + nb_tn) * (nb_fp + nb_tn)) / (nb_total**2)
                 performs[int(ch)] = (Po - Pe) / (1 - Pe + esp)
             mperforms = sum([i * j for (i, j) in zip(performs, weights)])
         return mperforms, performs
@@ -453,12 +444,7 @@ class SSIM(object):
         return "SSIM"
 
     def gaussian(self, w_size, sigma):
-        gauss = torch.Tensor(
-            [
-                math.exp(-((x - w_size // 2) ** 2) / float(2 * sigma**2))
-                for x in range(w_size)
-            ]
-        )
+        gauss = torch.Tensor([math.exp(-((x - w_size // 2) ** 2) / float(2 * sigma**2)) for x in range(w_size)])
         return gauss / gauss.sum()
 
     def create_window(self, w_size, channel=1):
@@ -500,15 +486,9 @@ class SSIM(object):
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
 
-        sigma1_sq = (
-            F.conv2d(y_pred * y_pred, window, padding=padd, groups=channel) - mu1_sq
-        )
-        sigma2_sq = (
-            F.conv2d(y_true * y_true, window, padding=padd, groups=channel) - mu2_sq
-        )
-        sigma12 = (
-            F.conv2d(y_pred * y_true, window, padding=padd, groups=channel) - mu1_mu2
-        )
+        sigma1_sq = F.conv2d(y_pred * y_pred, window, padding=padd, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(y_true * y_true, window, padding=padd, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(y_pred * y_true, window, padding=padd, groups=channel) - mu1_mu2
 
         C1 = (0.01 * L) ** 2
         C2 = (0.03 * L) ** 2

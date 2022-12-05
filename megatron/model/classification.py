@@ -18,9 +18,7 @@ from .module import MegatronModule
 
 
 class Classification(MegatronModule):
-    def __init__(
-        self, num_classes, num_tokentypes=2, pre_process=True, post_process=True
-    ):
+    def __init__(self, num_classes, num_tokentypes=2, pre_process=True, post_process=True):
         super(Classification, self).__init__(share_word_embeddings=False)
         args = get_args()
 
@@ -34,9 +32,7 @@ class Classification(MegatronModule):
             add_pooler=True,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(
-                args.init_method_std, args.num_layers
-            ),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -44,9 +40,7 @@ class Classification(MegatronModule):
         # Multi-choice head.
         if self.post_process:
             self.classification_dropout = torch.nn.Dropout(args.hidden_dropout)
-            self.classification_head = get_linear_layer(
-                args.hidden_size, self.num_classes, init_method
-            )
+            self.classification_head = get_linear_layer(args.hidden_size, self.num_classes, init_method)
             self._classification_head_key = "classification_head"
 
     def set_input_tensor(self, input_tensor):
@@ -82,28 +76,22 @@ class Classification(MegatronModule):
         add an extra key."""
 
         state_dict_ = {}
-        state_dict_[
-            self._language_model_key
-        ] = self.language_model.state_dict_for_save_checkpoint(
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             prefix=prefix, keep_vars=keep_vars
         )
         if self.post_process:
-            state_dict_[
-                self._classification_head_key
-            ] = self.classification_head.state_dict(prefix=prefix, keep_vars=keep_vars)
+            state_dict_[self._classification_head_key] = self.classification_head.state_dict(
+                prefix=prefix, keep_vars=keep_vars
+            )
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
 
-        self.language_model.load_state_dict(
-            state_dict[self._language_model_key], strict=strict
-        )
+        self.language_model.load_state_dict(state_dict[self._language_model_key], strict=strict)
         if self.post_process:
             if self._classification_head_key in state_dict:
-                self.classification_head.load_state_dict(
-                    state_dict[self._classification_head_key], strict=strict
-                )
+                self.classification_head.load_state_dict(state_dict[self._classification_head_key], strict=strict)
             else:
                 print_rank_last(
                     "***WARNING*** could not find {} in the checkpoint, "

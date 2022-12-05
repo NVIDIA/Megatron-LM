@@ -39,9 +39,7 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_):
     # if the size are different than the max, extend the tensor
     # accordingly
     if max_length > current_length:
-        padding = tuple([0] * (input_.dim() * 2 - 1)) + tuple(
-            [max_length - current_length]
-        )
+        padding = tuple([0] * (input_.dim() * 2 - 1)) + tuple([max_length - current_length])
         input_ = F.pad(input=input_, pad=padding)
 
     return input_
@@ -87,15 +85,9 @@ def orqa(Dataset):
             context_list.append(tokenizer.decode(context_tokens[i].tolist()))
 
         if neg_context_tokens is not None:
-            neg_context_tokens = check_and_append_tensor_for_gather(
-                group, rank, world_size, neg_context_tokens
-            )
-            neg_context_mask = check_and_append_tensor_for_gather(
-                group, rank, world_size, neg_context_mask
-            )
-            neg_context_types = check_and_append_tensor_for_gather(
-                group, rank, world_size, neg_context_types
-            )
+            neg_context_tokens = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_tokens)
+            neg_context_mask = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_mask)
+            neg_context_types = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_types)
 
         if neg_context_tokens is not None:
             context_tokens = torch.cat([context_tokens, neg_context_tokens])
@@ -111,9 +103,7 @@ def orqa(Dataset):
             context_mask,
             context_types,
         )
-        return output_tensor, partial(
-            cross_entropy_loss_func, query_tokens, context_tokens
-        )
+        return output_tensor, partial(cross_entropy_loss_func, query_tokens, context_tokens)
 
     def cross_entropy_loss_func(query_tokens, context_tokens, output_tensor):
         args = get_args()
@@ -154,9 +144,7 @@ def orqa(Dataset):
             all_query_logits = query_logits
             all_context_logits = context_logits
 
-        retrieval_scores = torch.matmul(
-            all_query_logits, torch.transpose(all_context_logits, 0, 1)
-        )
+        retrieval_scores = torch.matmul(all_query_logits, torch.transpose(all_context_logits, 0, 1))
         # Scaling the retrieval scores
         if args.retriever_score_scaling:
             retrieval_scores = retrieval_scores / math.sqrt(args.hidden_size)
@@ -184,9 +172,7 @@ def orqa(Dataset):
         correct_predictions_count = (max_idxs == labels).sum().float()
 
         # Reduce loss for logging.
-        reduced_loss = average_losses_across_data_parallel_group(
-            [loss, correct_predictions_count]
-        )
+        reduced_loss = average_losses_across_data_parallel_group([loss, correct_predictions_count])
 
         # Loss scaling for correct losses in Supervised Retrieval
         loss = loss * mpu.get_data_parallel_world_size()
@@ -237,9 +223,7 @@ def orqa(Dataset):
         tokenizer = get_tokenizer()
 
         name = datapath[0].split("/")[-1].split(".")[0]
-        return Dataset(
-            name, datapath, tokenizer, args.retriever_seq_length, evaluate=True
-        )
+        return Dataset(name, datapath, tokenizer, args.retriever_seq_length, evaluate=True)
 
     def metrics_func_provider():
         """Provide metrics callback function."""

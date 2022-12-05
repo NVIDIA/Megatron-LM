@@ -106,8 +106,7 @@ def _compile_dependencies():
 
         compile_helper()
         print(
-            ">>> done with dataset index builder. Compilation time: {:.3f} "
-            "seconds".format(time.time() - start_time),
+            ">>> done with dataset index builder. Compilation time: {:.3f} " "seconds".format(time.time() - start_time),
             flush=True,
         )
 
@@ -117,23 +116,12 @@ def _compile_dependencies():
 
     # Custom kernel constraints check.
     seq_len = args.seq_length
-    attn_batch_size = (
-        args.num_attention_heads / args.tensor_model_parallel_size
-    ) * args.micro_batch_size
+    attn_batch_size = (args.num_attention_heads / args.tensor_model_parallel_size) * args.micro_batch_size
     # Constraints on sequence length and attn_batch_size to enable warp based
     # optimization and upper triangular optimization (for causal mask)
-    custom_kernel_constraint = (
-        seq_len > 16
-        and seq_len <= 4096
-        and seq_len % 4 == 0
-        and attn_batch_size % 4 == 0
-    )
+    custom_kernel_constraint = seq_len > 16 and seq_len <= 4096 and seq_len % 4 == 0 and attn_batch_size % 4 == 0
     # Print a warning.
-    if not (
-        (args.fp16 or args.bf16)
-        and custom_kernel_constraint
-        and args.masked_softmax_fusion
-    ):
+    if not ((args.fp16 or args.bf16) and custom_kernel_constraint and args.masked_softmax_fusion):
         if args.rank == 0:
             print(
                 "WARNING: constraints for invoking optimized"
@@ -173,8 +161,7 @@ def _initialize_distributed():
 
         if args.rank == 0:
             print(
-                "torch distributed is already initialized, "
-                "skipping initialization ...",
+                "torch distributed is already initialized, " "skipping initialization ...",
                 flush=True,
             )
         args.rank = torch.distributed.get_rank()
@@ -188,9 +175,7 @@ def _initialize_distributed():
         if device_count > 0:
             device = args.rank % device_count
             if args.local_rank is not None:
-                assert (
-                    args.local_rank == device
-                ), "expected local-rank to be the same as rank % device-count."
+                assert args.local_rank == device, "expected local-rank to be the same as rank % device-count."
             else:
                 args.local_rank = device
             torch.cuda.set_device(device)
@@ -215,10 +200,7 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_split_rank,
             )
             if args.rank == 0:
-                print(
-                    f"> initialized tensor model parallel with size "
-                    f"{mpu.get_tensor_model_parallel_world_size()}"
-                )
+                print(f"> initialized tensor model parallel with size " f"{mpu.get_tensor_model_parallel_world_size()}")
                 print(
                     f"> initialized pipeline model parallel with size "
                     f"{mpu.get_pipeline_model_parallel_world_size()}"
@@ -332,15 +314,11 @@ def _warmup_jit_function():
         dtype=dtype,
         device="cuda",
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(
-        residual
-    )
+    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
-    for input_grad, bias_grad, residual_grad in zip(
-        [False, True], [True, True], [True, True]
-    ):
+    for input_grad, bias_grad, residual_grad in zip([False, True], [True, True], [True, True]):
         input.requires_grad = input_grad
         bias.requires_grad = bias_grad
         residual.requires_grad = residual_grad

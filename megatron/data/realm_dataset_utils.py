@@ -36,9 +36,7 @@ def get_one_epoch_dataloader(dataset, micro_batch_size=None):
         world_size=world_size,
     )
 
-    return torch.utils.data.DataLoader(
-        dataset, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=True
-    )
+    return torch.utils.data.DataLoader(dataset, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=True)
 
 
 def get_ict_batch(data_iterator):
@@ -96,9 +94,7 @@ class BlockSampleData(object):
         self.block_idx = block_idx
 
     def as_array(self):
-        return np.array(
-            [self.start_idx, self.end_idx, self.doc_idx, self.block_idx]
-        ).astype(np.int64)
+        return np.array([self.start_idx, self.end_idx, self.doc_idx, self.block_idx]).astype(np.int64)
 
     def as_tuple(self):
         return self.start_idx, self.end_idx, self.doc_idx, self.block_idx
@@ -191,8 +187,7 @@ def get_block_samples_mapping(
         print_rank_0(" > saved the index mapping in {}".format(indexmap_filename))
         # Make sure all the ranks have built the mapping
         print_rank_0(
-            " > elapsed time to build and save samples mapping "
-            "(seconds): {:4f}".format(time.time() - start_time)
+            " > elapsed time to build and save samples mapping " "(seconds): {:4f}".format(time.time() - start_time)
         )
 
     # This should be a barrier but nccl barrier assumes
@@ -200,9 +195,7 @@ def get_block_samples_mapping(
     # parallel case
     counts = torch.cuda.LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    assert counts[0].item() == torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group()
-    )
+    assert counts[0].item() == torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
     # Load indexed dataset.
     print_rank_0(" > loading indexed mapping from {}".format(indexmap_filename))
@@ -211,9 +204,7 @@ def get_block_samples_mapping(
     mapping_array = np.load(indexmap_filename, allow_pickle=True, mmap_mode="r")
     samples_mapping = BlockSamplesMapping(mapping_array)
 
-    print_rank_0(
-        "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
-    )
+    print_rank_0("    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time))
     print_rank_0("    total number of samples: {}".format(mapping_array.shape[0]))
 
     return samples_mapping

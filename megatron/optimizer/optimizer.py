@@ -74,9 +74,7 @@ class MegatronOptimizer(ABC):
         self.models = models
 
         if self.use_contiguous_buffers_in_local_ddp:
-            assert (
-                self.params_have_main_grad
-            ), "use of contiguous buffer requires that params have main grad"
+            assert self.params_have_main_grad, "use of contiguous buffer requires that params have main grad"
 
     def get_parameters(self):
         params = []
@@ -97,9 +95,7 @@ class MegatronOptimizer(ABC):
             grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = (
-                tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
-            )
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
@@ -121,9 +117,7 @@ class MegatronOptimizer(ABC):
 
     def count_zeros(self):
         params = self.get_parameters()
-        return count_zeros_fp32(
-            params, model_parallel_group=self.get_model_parallel_group()
-        )
+        return count_zeros_fp32(params, model_parallel_group=self.get_model_parallel_group())
 
     @abstractmethod
     def zero_grad(self, set_to_none=True):
@@ -196,19 +190,14 @@ class MegatronOptimizer(ABC):
         pipelined model parallelism (BERT and GPT-2).
         """
 
-        if (
-            mpu.is_rank_in_embedding_group(ignore_virtual=True)
-            and mpu.get_pipeline_model_parallel_world_size() > 1
-        ):
+        if mpu.is_rank_in_embedding_group(ignore_virtual=True) and mpu.get_pipeline_model_parallel_world_size() > 1:
             if mpu.is_pipeline_first_stage(ignore_virtual=True):
                 unwrapped_model = self.models[0]
             elif mpu.is_pipeline_last_stage(ignore_virtual=True):
                 unwrapped_model = self.models[-1]
             else:  # We do not support the interleaved schedule for T5 yet.
                 unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module)
-            )
+            unwrapped_model = unwrap_model(unwrapped_model, (torchDDP, LocalDDP, Float16Module))
 
             if unwrapped_model.share_word_embeddings:
                 word_embeddings_weight = unwrapped_model.word_embeddings_weight()
@@ -231,15 +220,9 @@ class MegatronOptimizer(ABC):
             and args.pipeline_model_parallel_split_rank is not None
         ):
             unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module)
-            )
-            assert (
-                args.DDP_impl == "local"
-            ), "T5 model is only supported with local DDP mode"
-            grad = (
-                unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-            )
+            unwrapped_model = unwrap_model(unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+            assert args.DDP_impl == "local", "T5 model is only supported with local DDP mode"
+            grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
             torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
 
     def allreduce_embedding_grads(self, args):
@@ -255,19 +238,13 @@ class MegatronOptimizer(ABC):
         if mpu.get_tensor_model_parallel_world_size() > 1 and args.sequence_parallel:
             grads = []
             for model_module in self.models:
-                unwrapped_model = unwrap_model(
-                    model_module, (torchDDP, LocalDDP, Float16Module)
-                )
+                unwrapped_model = unwrap_model(model_module, (torchDDP, LocalDDP, Float16Module))
                 for param in unwrapped_model.parameters():
                     if getattr(param, "sequence_parallel", False):
-                        grad = (
-                            param.main_grad if args.DDP_impl == "local" else param.grad
-                        )
+                        grad = param.main_grad if args.DDP_impl == "local" else param.grad
                         grads.append(grad.data)
             coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(
-                coalesced, group=mpu.get_tensor_model_parallel_group()
-            )
+            torch.distributed.all_reduce(coalesced, group=mpu.get_tensor_model_parallel_group())
             for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                 buf.copy_(synced)
 
@@ -275,25 +252,19 @@ class MegatronOptimizer(ABC):
         """All-reduce all grads, and all-reduce embeddings."""
 
         # All-reduce layer-norm grads (for sequence parallelism).
-        timers("layernorm-grads-all-reduce", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("layernorm-grads-all-reduce", log_level=1).start(barrier=args.barrier_with_L1_time)
         self.allreduce_layernorm_grads(args)
         timers("layernorm-grads-all-reduce").stop()
 
         # All-reduce if needed.
         if args.DDP_impl == "local":
-            timers("grads-all-reduce", log_level=1).start(
-                barrier=args.barrier_with_L1_time
-            )
+            timers("grads-all-reduce", log_level=1).start(barrier=args.barrier_with_L1_time)
             for model in self.models:
                 model.allreduce_gradients()
             timers("grads-all-reduce").stop()
 
         # All-reduce embedding grads.
-        timers("embedding-grads-all-reduce", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("embedding-grads-all-reduce", log_level=1).start(barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
         timers("embedding-grads-all-reduce").stop()
 
@@ -397,9 +368,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         self.found_inf.fill_(0.0)
 
         # Unscale and set found inf/nan
-        torch._amp_foreach_non_finite_check_and_unscale_(
-            main_grads, self.found_inf, self.grad_scaler.inv_scale
-        )
+        torch._amp_foreach_non_finite_check_and_unscale_(main_grads, self.found_inf, self.grad_scaler.inv_scale)
 
         # Update across all model parallel instances.
         torch.distributed.all_reduce(
@@ -417,9 +386,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self, args, timers):
 
         # Copy gradients from model params to main params.
-        timers("optimizer-copy-to-main-grad", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-copy-to-main-grad", log_level=1).start(barrier=args.barrier_with_L1_time)
         self._copy_model_grads_to_main_grads()
         timers("optimizer-copy-to-main-grad").stop()
 
@@ -428,9 +395,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler:
 
             # Unscale and check for inf/nan.
-            timers("optimizer-unscale-and-check-inf", log_level=1).start(
-                barrier=args.barrier_with_L1_time
-            )
+            timers("optimizer-unscale-and-check-inf", log_level=1).start(barrier=args.barrier_with_L1_time)
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
             timers("optimizer-unscale-and-check-inf").stop()
 
@@ -443,32 +408,24 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 return False, None, None
 
         # Clip the main gradients.
-        timers("optimizer-clip-main-grad", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-clip-main-grad", log_level=1).start(barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers("optimizer-clip-main-grad").stop()
 
         # Count the zeros in the grads.
-        timers("optimizer-count-zeros", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-count-zeros", log_level=1).start(barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
         timers("optimizer-count-zeros").stop()
 
         # Step the optimizer.
-        timers("optimizer-inner-step", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-inner-step", log_level=1).start(barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers("optimizer-inner-step").stop()
 
         # Update params from main params.
-        timers("optimizer-copy-main-to-model-params", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-copy-main-to-model-params", log_level=1).start(barrier=args.barrier_with_L1_time)
         self._copy_main_params_to_model_params()
         timers("optimizer-copy-main-to-model-params").stop()
 
@@ -563,9 +520,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Create a copy
                         main_param = param.detach().clone().float()
                         # Copy tensor model parallel attributes.
-                        tensor_parallel.copy_tensor_model_parallel_attributes(
-                            main_param, param
-                        )
+                        tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                         if hasattr(param, "shared"):
                             main_param.shared = param.shared
                         # Replace the optimizer params with the new fp32 copy.
@@ -574,9 +529,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         fp32_from_float16_params_this_group.append(main_param)
                         # Reset existing state dict key to the new main param.
                         if param in self.optimizer.state:
-                            self.optimizer.state[main_param] = self.optimizer.state.pop(
-                                param
-                            )
+                            self.optimizer.state[main_param] = self.optimizer.state.pop(param)
                     # fp32 params.
                     elif param.type() == "torch.cuda.FloatTensor":
                         fp32_params_this_group.append(param)
@@ -629,9 +582,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def _get_model_and_main_params_data_float16(self):
         model_data = []
         main_data = []
-        for model_group, main_group in zip(
-            self.float16_groups, self.fp32_from_float16_groups
-        ):
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 model_data.append(model_param.data)
                 main_data.append(main_param.data)
@@ -639,9 +590,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def _copy_model_grads_to_main_grads(self):
         # This only needs to be done for the float16 group.
-        for model_group, main_group in zip(
-            self.float16_groups, self.fp32_from_float16_groups
-        ):
+        for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 if self.params_have_main_grad and hasattr(model_param, "main_grad"):
                     main_param.grad = model_param.main_grad.float()
@@ -653,10 +602,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 # (If using contiguous buffers, main_grad's memory should
                 # persist and therefore should not be deallocated.)
                 model_param.grad = None
-                if (
-                    self.params_have_main_grad
-                    and not self.use_contiguous_buffers_in_local_ddp
-                ):
+                if self.params_have_main_grad and not self.use_contiguous_buffers_in_local_ddp:
                     model_param.main_grad = None
 
         # For fp32 grads, we need to reset the grads to main grad.
@@ -674,16 +620,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def _copy_main_params_to_model_params(self):
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
-        _multi_tensor_copy_this_to_that(
-            this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
-        )
+        _multi_tensor_copy_this_to_that(this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf)
 
     def _copy_model_params_to_main_params(self):
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
-        _multi_tensor_copy_this_to_that(
-            this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
-        )
+        _multi_tensor_copy_this_to_that(this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf)
 
     def state_dict(self):
         state_dict = {}
@@ -698,18 +640,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         optimizer_key = "optimizer"
         if optimizer_key not in state_dict:
             optimizer_key = "optimizer_state_dict"
-            print_rank_0(
-                "***WARNING*** loading optimizer from " "an old checkpoint ..."
-            )
+            print_rank_0("***WARNING*** loading optimizer from " "an old checkpoint ...")
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
         if "grad_scaler" not in state_dict:
             if self.fp16:
-                print_rank_0(
-                    "***WARNING*** found an old checkpoint, will not "
-                    "load grad scaler ..."
-                )
+                print_rank_0("***WARNING*** found an old checkpoint, will not " "load grad scaler ...")
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
@@ -724,9 +661,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         fp32_from_float16_params_key = "fp32_from_fp16_params"
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = "fp32_from_fp16"
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
-        ):
+        for current_group, saved_group in zip(self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
@@ -768,9 +703,7 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
 
         # Copy main_grads to grads.
-        timers("optimizer-copy-to-main-grad", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-copy-to-main-grad", log_level=1).start(barrier=args.barrier_with_L1_time)
         if self.params_have_main_grad:
             for param_group in self.optimizer.param_groups:
                 for param in param_group["params"]:
@@ -784,25 +717,19 @@ class FP32Optimizer(MegatronOptimizer):
         timers("optimizer-copy-to-main-grad").stop()
 
         # Clip gradients.
-        timers("optimizer-clip-main-grad", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-clip-main-grad", log_level=1).start(barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers("optimizer-clip-main-grad").stop()
 
         # count the zeros in the grads
-        timers("optimizer-count-zeros", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-count-zeros", log_level=1).start(barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if self.log_num_zeros_in_grad else None
         timers("optimizer-count-zeros").stop()
 
         # Update parameters.
-        timers("optimizer-inner-step", log_level=1).start(
-            barrier=args.barrier_with_L1_time
-        )
+        timers("optimizer-inner-step", log_level=1).start(barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers("optimizer-inner-step").stop()
 

@@ -19,9 +19,7 @@ class GLUEAbstractDataset(ABC, Dataset):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
-        print_rank_0(
-            " > building {} dataset for {}:".format(self.task_name, self.dataset_name)
-        )
+        print_rank_0(" > building {} dataset for {}:".format(self.task_name, self.dataset_name))
         # Process the files.
         string = "  > paths:"
         for path in datapaths:
@@ -43,9 +41,7 @@ class GLUEAbstractDataset(ABC, Dataset):
             self.tokenizer,
             self.max_seq_length,
         )
-        sample = build_sample(
-            ids, types, paddings, raw_sample["label"], raw_sample["uid"]
-        )
+        sample = build_sample(ids, types, paddings, raw_sample["label"], raw_sample["uid"])
         return sample
 
     @abstractmethod

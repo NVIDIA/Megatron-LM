@@ -37,9 +37,7 @@ class MemoryBuffer:
             element_size = torch.tensor([], dtype=dtype).element_size()
             print(
                 "> building the {} memory buffer with {} num elements "
-                "and {} dtype ({:.1f} MB)...".format(
-                    name, numel, dtype, numel * element_size / 1024 / 1024
-                ),
+                "and {} dtype ({:.1f} MB)...".format(name, numel, dtype, numel * element_size / 1024 / 1024),
                 flush=True,
             )
         self.name = name
@@ -76,17 +74,13 @@ class MemoryBuffer:
     def add(self, tensor):
         """Allocate a chunk of memory from the buffer to tensor and copy
         the values."""
-        assert (
-            tensor.dtype == self.dtype
-        ), "Input tensor type {} different from buffer type {}".format(
+        assert tensor.dtype == self.dtype, "Input tensor type {} different from buffer type {}".format(
             tensor.dtype, self.dtype
         )
         # Number of elements of the input tensor.
         tensor_numel = torch.numel(tensor)
         new_start = self._start + tensor_numel
-        assert (
-            new_start <= self.numel
-        ), "Not enough memory left in the buffer ({} > {})".format(
+        assert new_start <= self.numel, "Not enough memory left in the buffer ({} > {})".format(
             tensor_numel, self.numel - self._start
         )
         # New tensor is a view into the memory.
@@ -123,8 +117,7 @@ class RingMemBuffer:
     def __init__(self, name, num_buffers, numel, dtype, track_usage):
         self.num_buffers = num_buffers
         self.buffers = [
-            allocate_mem_buff(name + " {}".format(i), numel, dtype, track_usage)
-            for i in range(num_buffers)
+            allocate_mem_buff(name + " {}".format(i), numel, dtype, track_usage) for i in range(num_buffers)
         ]
         self._index = -1
 

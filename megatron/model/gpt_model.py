@@ -13,9 +13,7 @@ from .module import MegatronModule
 from .utils import init_method_normal, scaled_init_method_normal
 
 
-def post_language_model_processing(
-    lm_output, labels, logit_weights, parallel_output, fp16_lm_cross_entropy
-):
+def post_language_model_processing(lm_output, labels, logit_weights, parallel_output, fp16_lm_cross_entropy):
 
     # Output. Format [s b h]
     output = parallel_lm_logits(lm_output, logit_weights, parallel_output)
@@ -60,9 +58,7 @@ class GPTModel(MegatronModule):
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.causal,
             init_method=init_method_normal(args.init_method_std),
-            scaled_init_method=scaled_init_method_normal(
-                args.init_method_std, args.num_layers
-            ),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -83,9 +79,7 @@ class GPTModel(MegatronModule):
         inference_params=None,
     ):
 
-        lm_output = self.language_model(
-            input_ids, position_ids, attention_mask, inference_params=inference_params
-        )
+        lm_output = self.language_model(input_ids, position_ids, attention_mask, inference_params=inference_params)
 
         if self.post_process:
             return post_language_model_processing(
@@ -101,16 +95,14 @@ class GPTModel(MegatronModule):
     def state_dict_for_save_checkpoint(self, prefix="", keep_vars=False):
 
         state_dict_ = {}
-        state_dict_[
-            self._language_model_key
-        ] = self.language_model.state_dict_for_save_checkpoint(
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             prefix=prefix, keep_vars=keep_vars
         )
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
-            state_dict_[
-                self._word_embeddings_for_head_key
-            ] = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
+            state_dict_[self._word_embeddings_for_head_key] = self.word_embeddings.state_dict(
+                prefix=prefix, keep_vars=keep_vars
+            )
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
@@ -118,9 +110,7 @@ class GPTModel(MegatronModule):
 
         # Load word_embeddings.
         if self.post_process and not self.pre_process:
-            self.word_embeddings.load_state_dict(
-                state_dict[self._word_embeddings_for_head_key], strict=strict
-            )
+            self.word_embeddings.load_state_dict(state_dict[self._word_embeddings_for_head_key], strict=strict)
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
         self.language_model.load_state_dict(state_dict, strict=strict)

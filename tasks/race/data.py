@@ -36,11 +36,7 @@ class RaceDataset(Dataset):
 
         self.samples = []
         for datapath in datapaths:
-            self.samples.extend(
-                process_single_datapath(
-                    datapath, tokenizer, max_qa_length, max_seq_length
-                )
-            )
+            self.samples.extend(process_single_datapath(datapath, tokenizer, max_qa_length, max_seq_length))
 
         print_rank_0("  >> total number of samples: {}".format(len(self.samples)))
 
@@ -131,11 +127,7 @@ def process_single_datapath(datapath, tokenizer, max_qa_length, max_seq_length):
                         paddings_list.append(paddings)
 
                     # Convert to numpy and add to samples
-                    samples.append(
-                        build_sample(
-                            ids_list, types_list, paddings_list, label, num_samples
-                        )
-                    )
+                    samples.append(build_sample(ids_list, types_list, paddings_list, label, num_samples))
                     num_samples += 1
 
     elapsed_time = time.time() - start_time

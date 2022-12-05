@@ -52,9 +52,7 @@ def build_tokens_types_paddings_from_text(query, context, tokenizer, max_seq_len
 
 
 # Similar code tasks/data_utils with some changes
-def build_tokens_types_paddings_from_ids(
-    text_ids, max_seq_length, cls_id, sep_id, pad_id
-):
+def build_tokens_types_paddings_from_ids(text_ids, max_seq_length, cls_id, sep_id, pad_id):
     """Build token types and paddings, trim if needed, and pad if needed."""
     enc_ids = []
     tokentypes_enc = []
@@ -127,9 +125,7 @@ def build_sample(
     if include_neg:
         neg_ctx_ids = np.array(neg_ctx_id_list, dtype=np.int64)
         neg_ctx_id_types = np.array(neg_ctx_types_list, dtype=np.int64)
-        neg_ctx_mask = np.array(
-            [make_attention_mask(ids, ids) for ids in neg_ctx_ids], dtype=np.int64
-        )
+        neg_ctx_mask = np.array([make_attention_mask(ids, ids) for ids in neg_ctx_ids], dtype=np.int64)
 
         sample["neg_context"] = neg_ctx_ids
         sample["neg_context_types"] = neg_ctx_id_types
@@ -162,9 +158,7 @@ class OpenRetrievalAbstractDataset(ABC, Dataset):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
-        print_rank_0(
-            " > building {} dataset for {}:".format(self.task_name, self.dataset_name)
-        )
+        print_rank_0(" > building {} dataset for {}:".format(self.task_name, self.dataset_name))
         # Process the files.
         string = "  > paths:"
         for path in datapaths:

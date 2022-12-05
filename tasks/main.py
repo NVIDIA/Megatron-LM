@@ -5,9 +5,7 @@
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
 from megatron import get_args
 from megatron.initialize import initialize_megatron
@@ -41,9 +39,7 @@ def get_tasks_args(parser):
         default=None,
         help="Whitespace separated paths or corpora names " "for training.",
     )
-    group.add_argument(
-        "--valid-data", nargs="*", default=None, help="path(s) to the validation data."
-    )
+    group.add_argument("--valid-data", nargs="*", default=None, help="path(s) to the validation data.")
     group.add_argument(
         "--overlapping-eval",
         type=int,
@@ -56,9 +52,7 @@ def get_tasks_args(parser):
         help="Use more difficult formulation of lambada.",
     )
     # Retriever args
-    group.add_argument(
-        "--qa-data-dev", type=str, default=None, help="Path to the QA dataset dev file."
-    )
+    group.add_argument("--qa-data-dev", type=str, default=None, help="Path to the QA dataset dev file.")
     group.add_argument(
         "--qa-data-test",
         type=str,
@@ -114,15 +108,13 @@ def get_tasks_args(parser):
         "--val-av-rank-hard-neg",
         type=int,
         default=30,
-        help="Av.rank validation: how many hard negatives to"
-        " take from each question pool",
+        help="Av.rank validation: how many hard negatives to" " take from each question pool",
     )
     group.add_argument(
         "--val-av-rank-other-neg",
         type=int,
         default=30,
-        help="Av.rank validation: how many other negatives to"
-        " take from each question pool",
+        help="Av.rank validation: how many other negatives to" " take from each question pool",
     )
 
     return parser
@@ -135,9 +127,7 @@ if __name__ == "__main__":
     args = get_args()
 
     if args.num_layers_per_virtual_pipeline_stage is not None:
-        print(
-            "Interleaved pipeline schedule is not yet supported for downstream tasks."
-        )
+        print("Interleaved pipeline schedule is not yet supported for downstream tasks.")
         exit()
 
     if args.task == "RACE":

@@ -10,9 +10,7 @@ import torch
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
-    parser = argparse.ArgumentParser(
-        description="Megatron-LM Arguments", allow_abbrev=False
-    )
+    parser = argparse.ArgumentParser(description="Megatron-LM Arguments", allow_abbrev=False)
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -50,9 +48,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
 def validate_args(args, defaults={}):
     # Tensor model parallel size.
-    args.tensor_model_parallel_size = min(
-        args.tensor_model_parallel_size, args.world_size
-    )
+    args.tensor_model_parallel_size = min(args.tensor_model_parallel_size, args.world_size)
     assert (
         args.world_size % args.tensor_model_parallel_size == 0
     ), "world size" " ({}) is not divisible by tensor model parallel size ({})".format(
@@ -64,14 +60,10 @@ def validate_args(args, defaults={}):
         (args.world_size // args.tensor_model_parallel_size),
     )
     args.transformer_pipeline_model_parallel_size = (
-        args.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage
-        else args.pipeline_model_parallel_size
+        args.pipeline_model_parallel_size - 1 if args.standalone_embedding_stage else args.pipeline_model_parallel_size
     )
     # Checks.
-    model_parallel_size = (
-        args.pipeline_model_parallel_size * args.tensor_model_parallel_size
-    )
+    model_parallel_size = args.pipeline_model_parallel_size * args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, (
         "world size is not"
         " divisible by tensor parallel size ({}) times pipeline parallel "
@@ -97,27 +89,18 @@ def validate_args(args, defaults={}):
     if args.pipeline_model_parallel_size > 1:
         if args.pipeline_model_parallel_split_rank is not None:
             assert (
-                args.pipeline_model_parallel_split_rank
-                < args.pipeline_model_parallel_size
-            ), (
-                "split rank needs"
-                " to be less than pipeline model parallel size ({})".format(
-                    args.pipeline_model_parallel_size
-                )
+                args.pipeline_model_parallel_split_rank < args.pipeline_model_parallel_size
+            ), "split rank needs" " to be less than pipeline model parallel size ({})".format(
+                args.pipeline_model_parallel_size
             )
 
     # Deprecated arguments
-    assert args.batch_size is None, (
-        "--batch-size argument is no longer " "valid, use --micro-batch-size instead"
-    )
+    assert args.batch_size is None, "--batch-size argument is no longer " "valid, use --micro-batch-size instead"
     del args.batch_size
-    assert args.warmup is None, (
-        "--warmup argument is no longer valid, use " "--lr-warmup-fraction instead"
-    )
+    assert args.warmup is None, "--warmup argument is no longer valid, use " "--lr-warmup-fraction instead"
     del args.warmup
     assert args.model_parallel_size is None, (
-        "--model-parallel-size is no "
-        "longer valid, use --tensor-model-parallel-size instead"
+        "--model-parallel-size is no " "longer valid, use --tensor-model-parallel-size instead"
     )
     del args.model_parallel_size
 
@@ -166,12 +149,10 @@ def validate_args(args, defaults={}):
     assert args.global_batch_size > 0
     if args.num_layers_per_virtual_pipeline_stage is not None:
         assert args.pipeline_model_parallel_size > 2, (
-            "pipeline-model-parallel size should be greater than 2 with "
-            "interleaved schedule"
+            "pipeline-model-parallel size should be greater than 2 with " "interleaved schedule"
         )
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, (
-            "number of layers is not divisible by number of layers per virtual "
-            "pipeline stage"
+            "number of layers is not divisible by number of layers per virtual " "pipeline stage"
         )
         args.virtual_pipeline_model_parallel_size = (
             args.num_layers // args.transformer_pipeline_model_parallel_size
@@ -193,8 +174,7 @@ def validate_args(args, defaults={}):
             args.accumulate_allreduce_grads_in_fp32 = True
             if args.rank == 0:
                 print(
-                    "accumulate and all-reduce gradients in fp32 for "
-                    "bfloat16 data type.",
+                    "accumulate and all-reduce gradients in fp32 for " "bfloat16 data type.",
                     flush=True,
                 )
 
@@ -236,19 +216,11 @@ def validate_args(args, defaults={}):
         # If we use iteration-based training, make sure the
         # sample-based options are off.
         assert args.train_samples is None, "expected iteration-based training"
-        assert (
-            args.lr_decay_samples is None
-        ), "expected iteration-based learning rate decay"
-        assert (
-            args.lr_warmup_samples == 0
-        ), "expected iteration-based learning rate warmup"
-        assert (
-            args.rampup_batch_size is None
-        ), "expected no batch-size rampup for iteration-based training"
+        assert args.lr_decay_samples is None, "expected iteration-based learning rate decay"
+        assert args.lr_warmup_samples == 0, "expected iteration-based learning rate warmup"
+        assert args.rampup_batch_size is None, "expected no batch-size rampup for iteration-based training"
         if args.lr_warmup_fraction is not None:
-            assert (
-                args.lr_warmup_iters == 0
-            ), "can only specify one of lr-warmup-fraction and lr-warmup-iters"
+            assert args.lr_warmup_iters == 0, "can only specify one of lr-warmup-fraction and lr-warmup-iters"
 
     # Sample-based training.
     if args.train_samples:
@@ -258,19 +230,13 @@ def validate_args(args, defaults={}):
         assert args.lr_decay_iters is None, "expected sample-based learning rate decay"
         assert args.lr_warmup_iters == 0, "expected sample-based learnig rate warmup"
         if args.lr_warmup_fraction is not None:
-            assert args.lr_warmup_samples == 0, (
-                "can only specify one of lr-warmup-fraction " "and lr-warmup-samples"
-            )
+            assert args.lr_warmup_samples == 0, "can only specify one of lr-warmup-fraction " "and lr-warmup-samples"
 
     if args.num_layers is not None:
-        assert (
-            args.encoder_num_layers is None
-        ), "cannot have both num-layers and encoder-num-layers specified"
+        assert args.encoder_num_layers is None, "cannot have both num-layers and encoder-num-layers specified"
         args.encoder_num_layers = args.num_layers
     else:
-        assert (
-            args.encoder_num_layers is not None
-        ), "either num-layers or encoder-num-layers should be specified"
+        assert args.encoder_num_layers is not None, "either num-layers or encoder-num-layers should be specified"
         args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
@@ -310,9 +276,7 @@ def validate_args(args, defaults={}):
     if args.fp16_lm_cross_entropy:
         assert args.fp16, "lm cross entropy in fp16 only support in fp16 mode."
     if args.fp32_residual_connection:
-        assert (
-            args.fp16 or args.bf16
-        ), "residual connection in fp32 only supported when using fp16 or bf16."
+        assert args.fp16 or args.bf16, "residual connection in fp32 only supported when using fp16 or bf16."
 
     if args.weight_decay_incr_style == "constant":
         assert args.start_weight_decay is None
@@ -338,17 +302,13 @@ def validate_args(args, defaults={}):
     # Activation recomputing.
     if args.distribute_saved_activations:
         assert args.tensor_model_parallel_size > 1, (
-            "can distribute "
-            "recomputed activations only across tensor model "
-            "parallel groups"
+            "can distribute " "recomputed activations only across tensor model " "parallel groups"
         )
         assert args.recompute_granularity == "full", (
-            "distributed recompute activations is only "
-            "application to full recompute granularity"
+            "distributed recompute activations is only " "application to full recompute granularity"
         )
         assert args.recompute_method is not None, (
-            "for distributed recompute activations to work you "
-            "need to use a recompute method "
+            "for distributed recompute activations to work you " "need to use a recompute method "
         )
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, (
             "distributed recompute activations are supported for pytorch "
@@ -358,8 +318,7 @@ def validate_args(args, defaults={}):
 
     if args.recompute_granularity == "selective":
         assert args.recompute_method is None, (
-            "recompute method is not yet supported for "
-            "selective recomputing granularity"
+            "recompute method is not yet supported for " "selective recomputing granularity"
         )
 
     # disable sequence parallelism when tp=1
@@ -432,9 +391,7 @@ def _add_inference_args(parser):
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title="network size")
 
-    group.add_argument(
-        "--num-layers", type=int, default=None, help="Number of transformer layers."
-    )
+    group.add_argument("--num-layers", type=int, default=None, help="Number of transformer layers.")
     group.add_argument(
         "--encoder-num-layers",
         type=int,
@@ -447,15 +404,12 @@ def _add_network_size_args(parser):
         default=None,
         help="Number of decoder transformer layers.",
     )
-    group.add_argument(
-        "--hidden-size", type=int, default=None, help="Tansformer hidden size."
-    )
+    group.add_argument("--hidden-size", type=int, default=None, help="Tansformer hidden size.")
     group.add_argument(
         "--ffn-hidden-size",
         type=int,
         default=None,
-        help="Transformer Feed-Forward Network hidden size. "
-        "This is set to 4*hidden-size if not provided",
+        help="Transformer Feed-Forward Network hidden size. " "This is set to 4*hidden-size if not provided",
     )
     group.add_argument(
         "--num-attention-heads",
@@ -476,19 +430,15 @@ def _add_network_size_args(parser):
         "--max-position-embeddings",
         type=int,
         default=None,
-        help="Maximum number of position embeddings to use. "
-        "This is the size of position embedding.",
+        help="Maximum number of position embeddings to use. " "This is the size of position embedding.",
     )
     group.add_argument(
         "--make-vocab-size-divisible-by",
         type=int,
         default=128,
-        help="Pad the vocab size to be divisible by this value."
-        "This is added for computational efficieny reasons.",
+        help="Pad the vocab size to be divisible by this value." "This is added for computational efficieny reasons.",
     )
-    group.add_argument(
-        "--layernorm-epsilon", type=float, default=1e-5, help="Layer norm epsilon."
-    )
+    group.add_argument("--layernorm-epsilon", type=float, default=1e-5, help="Layer norm epsilon.")
     group.add_argument(
         "--apply-residual-connection-post-layernorm",
         action="store_true",
@@ -675,15 +625,13 @@ def _add_regularization_args(parser):
         "--adam-beta1",
         type=float,
         default=0.9,
-        help="First coefficient for computing running averages "
-        "of gradient and its square",
+        help="First coefficient for computing running averages " "of gradient and its square",
     )
     group.add_argument(
         "--adam-beta2",
         type=float,
         default=0.999,
-        help="Second coefficient for computing running averages "
-        "of gradient and its square",
+        help="Second coefficient for computing running averages " "of gradient and its square",
     )
     group.add_argument(
         "--adam-eps",
@@ -691,9 +639,7 @@ def _add_regularization_args(parser):
         default=1e-08,
         help="Term added to the denominator to improve" "numerical stability",
     )
-    group.add_argument(
-        "--sgd-momentum", type=float, default=0.9, help="Momentum factor for sgd"
-    )
+    group.add_argument("--sgd-momentum", type=float, default=0.9, help="Momentum factor for sgd")
 
     return parser
 
@@ -745,8 +691,7 @@ def _add_training_args(parser):
     group.add_argument(
         "--recompute-activations",
         action="store_true",
-        help="recompute activation to allow for training "
-        "with larger models, sequences, and batch sizes.",
+        help="recompute activation to allow for training " "with larger models, sequences, and batch sizes.",
     )
     group.add_argument(
         "--recompute-granularity",
@@ -763,8 +708,7 @@ def _add_training_args(parser):
     group.add_argument(
         "--distribute-saved-activations",
         action="store_true",
-        help="If set, distribute recomputed activations "
-        "across model parallel group.",
+        help="If set, distribute recomputed activations " "across model parallel group.",
     )
     group.add_argument(
         "--recompute-method",
@@ -793,8 +737,7 @@ def _add_training_args(parser):
     group.add_argument(
         "--checkpoint-activations",
         action="store_true",
-        help="Checkpoint activation to allow for training "
-        "with larger models, sequences, and batch sizes.",
+        help="Checkpoint activation to allow for training " "with larger models, sequences, and batch sizes.",
     )
     group.add_argument(
         "--train-iters",
@@ -812,9 +755,7 @@ def _add_training_args(parser):
         "training runs. Note that either train-iters or "
         "train-samples should be provided.",
     )
-    group.add_argument(
-        "--log-interval", type=int, default=100, help="Report loss and timing interval."
-    )
+    group.add_argument("--log-interval", type=int, default=100, help="Report loss and timing interval.")
     group.add_argument(
         "--exit-interval",
         type=int,
@@ -830,8 +771,7 @@ def _add_training_args(parser):
     group.add_argument(
         "--exit-signal-handler",
         action="store_true",
-        help="Dynamically save the checkpoint and shutdown the "
-        "training if SIGTERM is received",
+        help="Dynamically save the checkpoint and shutdown the " "training if SIGTERM is received",
     )
     group.add_argument(
         "--tensorboard-dir",
@@ -895,8 +835,7 @@ def _add_training_args(parser):
     group.add_argument(
         "--no-gradient-accumulation-fusion",
         action="store_false",
-        help="Disable fusing gradient accumulation to weight "
-        "gradient computation of linear layers",
+        help="Disable fusing gradient accumulation to weight " "gradient computation of linear layers",
         dest="gradient_accumulation_fusion",
     )
     return parser
@@ -920,8 +859,7 @@ def _add_initialization_args(parser):
         "--init-method-std",
         type=float,
         default=0.02,
-        help="Standard deviation of the zero mean normal "
-        "distribution used for weight initialization.",
+        help="Standard deviation of the zero mean normal " "distribution used for weight initialization.",
     )
     group.add_argument(
         "--init-method-xavier-uniform",
@@ -954,15 +892,13 @@ def _add_learning_rate_args(parser):
         "--lr-decay-iters",
         type=int,
         default=None,
-        help="number of iterations to decay learning rate over,"
-        " If None defaults to `--train-iters`",
+        help="number of iterations to decay learning rate over," " If None defaults to `--train-iters`",
     )
     group.add_argument(
         "--lr-decay-samples",
         type=int,
         default=None,
-        help="number of samples to decay learning rate over,"
-        " If None defaults to `--train-samples`",
+        help="number of samples to decay learning rate over," " If None defaults to `--train-samples`",
     )
     group.add_argument(
         "--lr-warmup-fraction",
@@ -986,15 +922,13 @@ def _add_learning_rate_args(parser):
         "--warmup",
         type=int,
         default=None,
-        help="Old lr warmup argument, do not use. Use one of the"
-        "--lr-warmup-* arguments above",
+        help="Old lr warmup argument, do not use. Use one of the" "--lr-warmup-* arguments above",
     )
     group.add_argument(
         "--min-lr",
         type=float,
         default=0.0,
-        help="Minumum value for learning rate. The scheduler"
-        "clip values below this threshold.",
+        help="Minumum value for learning rate. The scheduler" "clip values below this threshold.",
     )
     group.add_argument(
         "--override-opt_param-scheduler",
@@ -1080,8 +1014,7 @@ def _add_checkpointing_args(parser):
     group.add_argument(
         "--use-checkpoint-args",
         action="store_true",
-        help="Override any command line arguments with arguments "
-        "from the checkpoint",
+        help="Override any command line arguments with arguments " "from the checkpoint",
     )
 
     return parser
@@ -1091,9 +1024,7 @@ def _add_mixed_precision_args(parser):
     group = parser.add_argument_group(title="mixed precision")
 
     group.add_argument("--fp16", action="store_true", help="Run model in fp16 mode.")
-    group.add_argument(
-        "--bf16", action="store_true", help="Run model in bfloat16 mode."
-    )
+    group.add_argument("--bf16", action="store_true", help="Run model in bfloat16 mode.")
     group.add_argument(
         "--loss-scale",
         type=float,
@@ -1120,9 +1051,7 @@ def _add_mixed_precision_args(parser):
         default=1000,
         help="Window over which to raise/lower dynamic scale.",
     )
-    group.add_argument(
-        "--hysteresis", type=int, default=2, help="hysteresis for dynamic loss scaling"
-    )
+    group.add_argument("--hysteresis", type=int, default=2, help="hysteresis for dynamic loss scaling")
     group.add_argument(
         "--fp32-residual-connection",
         action="store_true",
@@ -1180,8 +1109,7 @@ def _add_distributed_args(parser):
         "--model-parallel-size",
         type=int,
         default=None,
-        help="Old model parallel argument, do not use. Use "
-        "--tensor-model-parallel-size instead.",
+        help="Old model parallel argument, do not use. Use " "--tensor-model-parallel-size instead.",
     )
     group.add_argument(
         "--num-layers-per-virtual-pipeline-stage",
@@ -1341,18 +1269,13 @@ def _add_data_args(parser):
         "dataset2-path ...",
     )
 
-    group.add_argument(
-        "--vocab-file", type=str, default=None, help="Path to the vocab file."
-    )
-    group.add_argument(
-        "--merge-file", type=str, default=None, help="Path to the BPE merge file."
-    )
+    group.add_argument("--vocab-file", type=str, default=None, help="Path to the vocab file.")
+    group.add_argument("--merge-file", type=str, default=None, help="Path to the BPE merge file.")
     group.add_argument(
         "--vocab-extra-ids",
         type=int,
         default=0,
-        help="Number of additional vocabulary tokens. "
-        "They are used for span masking in the T5 model",
+        help="Number of additional vocabulary tokens. " "They are used for span masking in the T5 model",
     )
     group.add_argument(
         "--seq-length",
@@ -1364,8 +1287,7 @@ def _add_data_args(parser):
         "--encoder-seq-length",
         type=int,
         default=None,
-        help="Maximum encoder sequence length to process."
-        "This should be exclusive of --seq-length",
+        help="Maximum encoder sequence length to process." "This should be exclusive of --seq-length",
     )
     group.add_argument(
         "--decoder-seq-length",
@@ -1398,9 +1320,7 @@ def _add_data_args(parser):
         help="Probability of producing a short sequence.",
     )
     group.add_argument("--mmap-warmup", action="store_true", help="Warm up mmap files.")
-    group.add_argument(
-        "--num-workers", type=int, default=2, help="Dataloader number of workers."
-    )
+    group.add_argument("--num-workers", type=int, default=2, help="Dataloader number of workers.")
     group.add_argument(
         "--tokenizer-type",
         type=str,
@@ -1471,8 +1391,7 @@ def _add_biencoder_args(parser):
         "--ict-head-size",
         type=int,
         default=None,
-        help="Size of block embeddings to be used in ICT and "
-        "REALM (paper default: 128)",
+        help="Size of block embeddings to be used in ICT and " "REALM (paper default: 128)",
     )
     group.add_argument(
         "--biencoder-projection-dim",
@@ -1483,8 +1402,7 @@ def _add_biencoder_args(parser):
     group.add_argument(
         "--biencoder-shared-query-context-model",
         action="store_true",
-        help="Whether to share the parameters of the query "
-        "and context models or not",
+        help="Whether to share the parameters of the query " "and context models or not",
     )
 
     # checkpointing
@@ -1498,8 +1416,7 @@ def _add_biencoder_args(parser):
         "--bert-load",
         type=str,
         default=None,
-        help="Directory containing an BertModel checkpoint "
-        "(needed to start ICT and REALM)",
+        help="Directory containing an BertModel checkpoint " "(needed to start ICT and REALM)",
     )
 
     # data
@@ -1538,8 +1455,7 @@ def _add_biencoder_args(parser):
     group.add_argument(
         "--retriever-score-scaling",
         action="store_true",
-        help="Whether to scale retriever scores by inverse "
-        "square root of hidden size",
+        help="Whether to scale retriever scores by inverse " "square root of hidden size",
     )
 
     # faiss index
@@ -1662,23 +1578,17 @@ def _add_vision_args(parser):
         choices=["random", "row"],
         help="mask types",
     )
-    group.add_argument(
-        "--mask-factor", type=float, default=1.0, help="mask size scaling parameter"
-    )
+    group.add_argument("--mask-factor", type=float, default=1.0, help="mask size scaling parameter")
 
     # dino arguments
-    group.add_argument(
-        "--iter-per-epoch", type=int, default=1250, help="iterations per epoch"
-    )
+    group.add_argument("--iter-per-epoch", type=int, default=1250, help="iterations per epoch")
     group.add_argument(
         "--dino-local-img-size",
         type=int,
         default=96,
         help="Image size for vision classification task",
     )
-    group.add_argument(
-        "--dino-local-crops-number", type=int, default=10, help="Number of local crops"
-    )
+    group.add_argument("--dino-local-crops-number", type=int, default=10, help="Number of local crops")
     group.add_argument(
         "--dino-head-hidden-size",
         type=int,
@@ -1708,9 +1618,7 @@ def _add_vision_args(parser):
         default=0.04,
         help="warump teacher temperature",
     )
-    group.add_argument(
-        "--dino-teacher-temp", type=float, default=0.07, help="teacher temperature"
-    )
+    group.add_argument("--dino-teacher-temp", type=float, default=0.07, help="teacher temperature")
     group.add_argument(
         "--dino-warmup-teacher-temp-epochs",
         type=int,

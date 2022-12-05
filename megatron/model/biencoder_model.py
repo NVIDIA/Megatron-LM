@@ -54,8 +54,7 @@ def biencoder_model_provider(
     """Build the model."""
 
     assert (
-        mpu.get_tensor_model_parallel_world_size() == 1
-        and mpu.get_pipeline_model_parallel_world_size() == 1
+        mpu.get_tensor_model_parallel_world_size() == 1 and mpu.get_pipeline_model_parallel_world_size() == 1
     ), "Model parallel size > 1 not supported for ICT"
 
     print_rank_0("building BiEncoderModel...")
@@ -139,9 +138,7 @@ class BiEncoderModel(MegatronModule):
         return the respective embeddings."""
 
         if self.use_query_model:
-            query_logits = self.embed_text(
-                self.query_model, query_tokens, query_attention_mask, query_types
-            )
+            query_logits = self.embed_text(self.query_model, query_tokens, query_attention_mask, query_types)
         else:
             raise ValueError("Cannot embed query without the query model.")
         if self.use_context_model:
@@ -165,21 +162,15 @@ class BiEncoderModel(MegatronModule):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
         if self.biencoder_shared_query_context_model:
-            state_dict_[self._model_key] = self.model.state_dict_for_save_checkpoint(
-                prefix=prefix, keep_vars=keep_vars
-            )
+            state_dict_[self._model_key] = self.model.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
         else:
             if self.use_query_model:
-                state_dict_[
-                    self._query_key
-                ] = self.query_model.state_dict_for_save_checkpoint(
+                state_dict_[self._query_key] = self.query_model.state_dict_for_save_checkpoint(
                     prefix=prefix, keep_vars=keep_vars
                 )
 
             if self.use_context_model:
-                state_dict_[
-                    self._context_key
-                ] = self.context_model.state_dict_for_save_checkpoint(
+                state_dict_[self._context_key] = self.context_model.state_dict_for_save_checkpoint(
                     prefix=prefix, keep_vars=keep_vars
                 )
 
@@ -193,15 +184,11 @@ class BiEncoderModel(MegatronModule):
         else:
             if self.use_query_model:
                 print_rank_0("Loading query model")
-                self.query_model.load_state_dict(
-                    state_dict[self._query_key], strict=strict
-                )
+                self.query_model.load_state_dict(state_dict[self._query_key], strict=strict)
 
             if self.use_context_model:
                 print_rank_0("Loading context model")
-                self.context_model.load_state_dict(
-                    state_dict[self._context_key], strict=strict
-                )
+                self.context_model.load_state_dict(state_dict[self._context_key], strict=strict)
 
     def init_state_dict_from_bert(self):
         """Initialize the state from a pretrained BERT model
@@ -221,11 +208,7 @@ class BiEncoderModel(MegatronModule):
 
         checkpoint_name = get_checkpoint_name(args.bert_load, iteration, False)
         if mpu.get_data_parallel_rank() == 0:
-            print(
-                "global rank {} is loading BERT checkpoint {}".format(
-                    torch.distributed.get_rank(), checkpoint_name
-                )
-            )
+            print("global rank {} is loading BERT checkpoint {}".format(torch.distributed.get_rank(), checkpoint_name))
 
         # Load the checkpoint.
         try:
@@ -235,12 +218,8 @@ class BiEncoderModel(MegatronModule):
 
             # For backward compatibility.
             print_rank_0(" > deserializing using the old code structure ...")
-            sys.modules["fp16.loss_scaler"] = sys.modules[
-                "megatron.fp16_deprecated.loss_scaler"
-            ]
-            sys.modules["megatron.fp16.loss_scaler"] = sys.modules[
-                "megatron.fp16_deprecated.loss_scaler"
-            ]
+            sys.modules["fp16.loss_scaler"] = sys.modules["megatron.fp16_deprecated.loss_scaler"]
+            sys.modules["megatron.fp16.loss_scaler"] = sys.modules["megatron.fp16_deprecated.loss_scaler"]
             state_dict = torch.load(checkpoint_name, map_location="cpu")
             sys.modules.pop("fp16.loss_scaler", None)
             sys.modules.pop("megatron.fp16.loss_scaler", None)
@@ -261,17 +240,13 @@ class BiEncoderModel(MegatronModule):
                 self.query_model.language_model.load_state_dict(model_dict)
                 # give each model the same ict_head to begin with as well
                 if self.biencoder_projection_dim > 0:
-                    query_proj_state_dict = self.state_dict_for_save_checkpoint()[
-                        self._query_key
-                    ]["projection_enc"]
+                    query_proj_state_dict = self.state_dict_for_save_checkpoint()[self._query_key]["projection_enc"]
                 fix_query_key_value_ordering(self.query_model, checkpoint_version)
 
             if self.use_context_model:
                 self.context_model.language_model.load_state_dict(model_dict)
                 if self.query_model is not None and self.biencoder_projection_dim > 0:
-                    self.context_model.projection_enc.load_state_dict(
-                        query_proj_state_dict
-                    )
+                    self.context_model.projection_enc.load_state_dict(query_proj_state_dict)
                 fix_query_key_value_ordering(self.context_model, checkpoint_version)
 
 
@@ -296,9 +271,7 @@ class PretrainedBertModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         init_method = init_method_normal(args.init_method_std)
-        scaled_init_method = scaled_init_method_normal(
-            args.init_method_std, args.num_layers
-        )
+        scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
@@ -311,9 +284,7 @@ class PretrainedBertModel(MegatronModule):
         )
 
         if args.biencoder_projection_dim > 0:
-            self.projection_enc = get_linear_layer(
-                args.hidden_size, args.biencoder_projection_dim, init_method
-            )
+            self.projection_enc = get_linear_layer(args.hidden_size, args.biencoder_projection_dim, init_method)
             self._projection_enc_key = "projection_enc"
 
     def forward(self, input_ids, attention_mask, tokentype_ids=None):
@@ -347,28 +318,20 @@ class PretrainedBertModel(MegatronModule):
         add an extra key."""
 
         state_dict_ = {}
-        state_dict_[
-            self._language_model_key
-        ] = self.language_model.state_dict_for_save_checkpoint(
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             prefix=prefix, keep_vars=keep_vars
         )
 
         if self.biencoder_projection_dim > 0:
-            state_dict_[self._projection_enc_key] = self.projection_enc.state_dict(
-                prefix=prefix, keep_vars=keep_vars
-            )
+            state_dict_[self._projection_enc_key] = self.projection_enc.state_dict(prefix=prefix, keep_vars=keep_vars)
 
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
         print_rank_0("loading pretrained weights")
-        self.language_model.load_state_dict(
-            state_dict[self._language_model_key], strict=strict
-        )
+        self.language_model.load_state_dict(state_dict[self._language_model_key], strict=strict)
 
         if self.biencoder_projection_dim > 0:
             print_rank_0("loading projection head weights")
-            self.projection_enc.load_state_dict(
-                state_dict[self._projection_enc_key], strict=strict
-            )
+            self.projection_enc.load_state_dict(state_dict[self._projection_enc_key], strict=strict)

@@ -75,33 +75,24 @@ def loss_func(output_tensor):
 
     micro_batch_size = query_logits.shape[0]
     # recall we assert that tensor_model_parallel_size == 1
-    assert (
-        mpu.get_tensor_model_parallel_world_size() == 1
-    ), "Model parallel size > 1 not supported for ICT"
+    assert mpu.get_tensor_model_parallel_world_size() == 1, "Model parallel size > 1 not supported for ICT"
 
     global_batch_size = dist.get_world_size() * micro_batch_size
     all_query_logits = AllgatherFromDataParallelRegion.apply(query_logits)
     all_context_logits = AllgatherFromDataParallelRegion.apply(context_logits)
 
     # scores are inner products between query and context embeddings
-    retrieval_scores = torch.matmul(
-        all_query_logits, torch.transpose(all_context_logits, 0, 1)
-    )
+    retrieval_scores = torch.matmul(all_query_logits, torch.transpose(all_context_logits, 0, 1))
     # scaling the retriever scores
     if args.retriever_score_scaling:
         retrieval_scores = retrieval_scores / math.sqrt(args.hidden_size)
 
     softmax_scores = F.log_softmax(retrieval_scores, dim=1)
-    sorted_vals, sorted_indices = torch.topk(
-        softmax_scores, k=softmax_scores.shape[1], sorted=True
-    )
+    sorted_vals, sorted_indices = torch.topk(softmax_scores, k=softmax_scores.shape[1], sorted=True)
 
     def topk_accuracy(k):
         return torch.cuda.FloatTensor(
-            [
-                sum([int(i in sorted_indices[i, :k]) for i in range(global_batch_size)])
-                / global_batch_size
-            ]
+            [sum([int(i in sorted_indices[i, :k]) for i in range(global_batch_size)]) / global_batch_size]
         )
 
     topk_accs = [topk_accuracy(int(k)) for k in args.retriever_report_topk_accuracies]
@@ -115,8 +106,7 @@ def loss_func(output_tensor):
 
     # create stats_dict with retrieval loss and all specified top-k accuracies
     topk_acc_dict = {
-        "top{}_acc".format(k): v * 100
-        for k, v in zip(args.retriever_report_topk_accuracies, reduced_losses[1:])
+        "top{}_acc".format(k): v * 100 for k, v in zip(args.retriever_report_topk_accuracies, reduced_losses[1:])
     }
     stats_dict = dict(loss=reduced_losses[0], **topk_acc_dict)
     return loss, stats_dict

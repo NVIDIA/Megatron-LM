@@ -17,9 +17,7 @@ from lsh import cache, minhash
 # This function is adapted from:
 #   https://github.com/mattilyra/LSH/blob/master/examples/Introduction.ipynb
 def shingles(text, char_ngram=5):
-    return set(
-        text[head : head + char_ngram] for head in range(0, len(text) - char_ngram)
-    )
+    return set(text[head : head + char_ngram] for head in range(0, len(text) - char_ngram))
 
 
 # This function is adapted from:
@@ -140,24 +138,18 @@ def find_pair_urls_parallel(args, lshcache, url_doc):
     # limited to # of bins)
     num_bins = len(lshcache.bins)
     pool = multiprocessing.Pool(num_bins)
-    compute_jaccard_partial = partial(
-        compute_jaccard, num_bins=num_bins, start_time_local=start_time
-    )
+    compute_jaccard_partial = partial(compute_jaccard, num_bins=num_bins, start_time_local=start_time)
     # don't need to pass args and url_doc as they are already shared
     compute_jaccard_iter = pool.imap(compute_jaccard_partial, lshcache.bins)
 
-    print(
-        "multiprocessing init took {:.2f}".format(time.time() - start_time), flush=True
-    )
+    print("multiprocessing init took {:.2f}".format(time.time() - start_time), flush=True)
     for remove_urls_list, deduped_local, counter_local in compute_jaccard_iter:
         deduped += deduped_local
         counter += counter_local
         write_remove_urls_list(remove_urls_list, f_out)
         print(
             " [write]> processed {} documents in {:.2f} "
-            "seoncds and deduped {} documents ...".format(
-                counter, time.time() - start_time, deduped
-            ),
+            "seoncds and deduped {} documents ...".format(counter, time.time() - start_time, deduped),
             flush=True,
         )
 
@@ -166,9 +158,7 @@ def find_pair_urls_parallel(args, lshcache, url_doc):
     f_out.close()
 
     print(
-        " Taken time for jaccard similariries {:.2f} seconds".format(
-            time.time() - start_time
-        ),
+        " Taken time for jaccard similariries {:.2f} seconds".format(time.time() - start_time),
         flush=True,
     )
 
@@ -195,17 +185,13 @@ def find_pair_urls_sequential(args, lshcache, url_doc):
             if counter % 10000 == 0:
                 print(
                     " [write]> processed {} documents in {:.2f} "
-                    "seoncds and deduped {} documents ...".format(
-                        counter, time.time() - start_time, deduped
-                    ),
+                    "seoncds and deduped {} documents ...".format(counter, time.time() - start_time, deduped),
                     flush=True,
                 )
     f_out.close()
     print(
         " [write]> processed {} documents in {:.2f} "
-        "seoncds and deduped {} documents ...".format(
-            counter, time.time() - start_time, deduped
-        ),
+        "seoncds and deduped {} documents ...".format(counter, time.time() - start_time, deduped),
         flush=True,
     )
 
@@ -215,15 +201,12 @@ if __name__ == "__main__":
     print("parsing the arguments ...")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--seed", type=int, default=1234, help="Random seed used for python, numpy"
-    )
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed used for python, numpy")
     parser.add_argument(
         "--inputs",
         nargs="*",
         default=None,
-        help="Pairwise list of the input files and keys, "
-        "e.g. --inputs cc.json cc_id news.json news_id",
+        help="Pairwise list of the input files and keys, " "e.g. --inputs cc.json cc_id news.json news_id",
     )
     parser.add_argument(
         "--load-fingerprints",
@@ -256,15 +239,12 @@ if __name__ == "__main__":
         default=1,
         help="Number of iterations to run the heuristics" ": use -1 for exact",
     )
-    parser.add_argument(
-        "--num-bands", type=int, default=10, help="Number of bands to use in cache"
-    )
+    parser.add_argument("--num-bands", type=int, default=10, help="Number of bands to use in cache")
     parser.add_argument(
         "--num-seeds",
         type=int,
         default=100,
-        help="Number of seeds to use for minhash. Note that"
-        " this value should be divisible by num-bands",
+        help="Number of seeds to use for minhash. Note that" " this value should be divisible by num-bands",
     )
     parser.add_argument(
         "--jaccard-parallel",

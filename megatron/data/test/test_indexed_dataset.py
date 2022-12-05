@@ -90,9 +90,7 @@ def main():
         default="infer",
         choices=["lazy", "cached", "mmap", "infer"],
     )
-    parser.add_argument(
-        "--count", type=int, default=10, help="Number of samples/documents to print"
-    )
+    parser.add_argument("--count", type=int, default=10, help="Number of samples/documents to print")
 
     group = parser.add_argument_group(title="tokenizer")
     group.add_argument(
@@ -102,9 +100,7 @@ def main():
         choices=["BertWordPieceLowerCase", "GPT2BPETokenizer"],
         help="What type of tokenizer to use.",
     )
-    group.add_argument(
-        "--vocab-file", type=str, default=None, help="Path to the vocab file"
-    )
+    group.add_argument("--vocab-file", type=str, default=None, help="Path to the vocab file")
     group.add_argument(
         "--merge-file",
         type=str,
@@ -112,9 +108,7 @@ def main():
         help="Path to the BPE merge file (if necessary).",
     )
 
-    parser.add_argument(
-        "--epochs", type=int, default=5, help="Number of epochs to plan for"
-    )
+    parser.add_argument("--epochs", type=int, default=5, help="Number of epochs to plan for")
     parser.add_argument(
         "--max-num-samples",
         type=int,
@@ -127,9 +121,7 @@ def main():
         default=0.15,
         help="probability of masking tokens",
     )
-    parser.add_argument(
-        "--seq-length", type=int, default=512, help="maximum sequence length"
-    )
+    parser.add_argument("--seq-length", type=int, default=512, help="maximum sequence length")
     parser.add_argument(
         "--short-seq-prob",
         type=float,

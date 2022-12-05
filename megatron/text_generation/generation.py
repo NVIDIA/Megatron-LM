@@ -184,16 +184,11 @@ def generate_tokens_probs_and_return_on_first_stage(
                 device=torch.cuda.current_device(),
             )
         generated_sequence_lengths = (
-            torch.ones(
-                batch_size, dtype=torch.int64, device=torch.cuda.current_device()
-            )
-            * max_sequence_length
+            torch.ones(batch_size, dtype=torch.int64, device=torch.cuda.current_device()) * max_sequence_length
         )
 
     # Whether we have reached a termination id.
-    is_generation_done = torch.zeros(
-        batch_size, dtype=torch.uint8, device=torch.cuda.current_device()
-    )
+    is_generation_done = torch.zeros(batch_size, dtype=torch.uint8, device=torch.cuda.current_device())
 
     # =============
     # Run infernece
@@ -207,9 +202,7 @@ def generate_tokens_probs_and_return_on_first_stage(
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
             positions2use = position_ids[:, prev_context_length:context_length]
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length
-            ]
+            attention_mask2use = attention_mask[..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
@@ -256,15 +249,13 @@ def generate_tokens_probs_and_return_on_first_stage(
                             tokens[:, (prev_context_length + 1) : (context_length + 1)],
                             2,
                         )
-                        output_log_probs[
-                            :, prev_context_length:context_length
-                        ] = torch.gather(log_probs, 2, indices).squeeze(2)
+                        output_log_probs[:, prev_context_length:context_length] = torch.gather(
+                            log_probs, 2, indices
+                        ).squeeze(2)
 
             # Update the tokens on the first stage so the next input to
             # the network is correct.
-            copy_from_last_to_first_pipeline_stage(
-                batch_size, torch.int64, tokens[:, context_length]
-            )
+            copy_from_last_to_first_pipeline_stage(batch_size, torch.int64, tokens[:, context_length])
 
             # Update the context length for the next token generation.
             prev_context_length = context_length
@@ -277,9 +268,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                 if stop_on_double_eol:
                     hit_double_eol = (new_sample == 628).byte() & started.byte()
                     hit_two_eols = (
-                        (new_sample == 198).byte()
-                        & (tokens[:, context_length - 1] == 198).byte()
-                        & started.byte()
+                        (new_sample == 198).byte() & (tokens[:, context_length - 1] == 198).byte() & started.byte()
                     )
                     done_token = hit_double_eol | hit_two_eols
                 elif stop_on_eol:
@@ -351,9 +340,7 @@ def beam_search_and_return_on_first_stage(
     beam_hyp = BeamHypotheses(beam_size, length_penalty)
     best_batches = None
     done = torch.zeros(1, dtype=torch.uint8, device=torch.cuda.current_device())
-    scores = torch.zeros(
-        beam_size, dtype=torch.float32, device=torch.cuda.current_device()
-    ).unsqueeze(1)
+    scores = torch.zeros(beam_size, dtype=torch.float32, device=torch.cuda.current_device()).unsqueeze(1)
     scores_size_tensor, tokens_size_tensor = None, None
     # =============
     # Run infernece
@@ -367,9 +354,7 @@ def beam_search_and_return_on_first_stage(
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
             positions2use = position_ids[:, prev_context_length:context_length]
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length
-            ]
+            attention_mask2use = attention_mask[..., prev_context_length:context_length, :context_length]
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
@@ -386,17 +371,11 @@ def beam_search_and_return_on_first_stage(
                 new_scores = log_probs[:, -1, :] + scores
 
                 if context_length == prompt_length:  # if this is the first one
-                    sorted_scores, indices = torch.sort(
-                        new_scores[0, :], descending=True
-                    )
+                    sorted_scores, indices = torch.sort(new_scores[0, :], descending=True)
                 else:
-                    sorted_scores, indices = torch.sort(
-                        new_scores.view(-1), descending=True
-                    )
+                    sorted_scores, indices = torch.sort(new_scores.view(-1), descending=True)
 
-                best_beam_ids = (
-                    torch.div(indices[: 2 * beam_size], vocab_size).trunc().long()
-                )
+                best_beam_ids = torch.div(indices[: 2 * beam_size], vocab_size).trunc().long()
                 best_words = indices[: 2 * beam_size] % vocab_size
                 best_scores = sorted_scores[: 2 * beam_size]
 
@@ -406,9 +385,7 @@ def beam_search_and_return_on_first_stage(
                 ):
                     if token_id.item() == stop_token:
                         # if beam_token does not belong to top num_beams tokens, it should not be added
-                        is_beam_token_worse_than_top_num_beams = (
-                            beam_token_rank >= beam_size
-                        )
+                        is_beam_token_worse_than_top_num_beams = beam_token_rank >= beam_size
                         if is_beam_token_worse_than_top_num_beams:
                             continue
                         beam_hyp.add(
@@ -423,12 +400,8 @@ def beam_search_and_return_on_first_stage(
                     if len(next_beams) == beam_size:
                         break
 
-                if beam_hyp.is_done(
-                    best_scores.max().item(), context_length + 1 - prompt_length
-                ):
-                    done = torch.ones(
-                        1, dtype=torch.uint8, device=torch.cuda.current_device()
-                    )
+                if beam_hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
+                    done = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
 
                 best_batches = tokens.new([item[2] for item in next_beams])
                 tokens = tokens[best_batches, :]
@@ -445,9 +418,7 @@ def beam_search_and_return_on_first_stage(
             copy_from_last_to_first_pipeline_stage(tokens.size(), torch.int64, tokens)
 
             # set inference key values to make it consistent with best beam index
-            best_batches = broadcast_from_last_pipeline_stage(
-                beam_size, torch.int64, best_batches
-            )
+            best_batches = broadcast_from_last_pipeline_stage(beam_size, torch.int64, best_batches)
             forward_step.inference_params.swap_key_value_dict(best_batches)
 
             # Update the context length for the next token generation.
@@ -470,26 +441,14 @@ def beam_search_and_return_on_first_stage(
             tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
             scores = torch.stack(scores, dim=0)
             tokens = torch.stack(tokens, dim=0)
-            scores_size_tensor = torch.tensor(
-                scores.shape, dtype=torch.int64, device=torch.cuda.current_device()
-            )
-            tokens_size_tensor = torch.tensor(
-                tokens.shape, dtype=torch.int64, device=torch.cuda.current_device()
-            )
+            scores_size_tensor = torch.tensor(scores.shape, dtype=torch.int64, device=torch.cuda.current_device())
+            tokens_size_tensor = torch.tensor(tokens.shape, dtype=torch.int64, device=torch.cuda.current_device())
 
-        scores_size_tensor = broadcast_from_last_pipeline_stage(
-            1, torch.int64, scores_size_tensor
-        )
-        tokens_size_tensor = broadcast_from_last_pipeline_stage(
-            2, torch.int64, tokens_size_tensor
-        )
+        scores_size_tensor = broadcast_from_last_pipeline_stage(1, torch.int64, scores_size_tensor)
+        tokens_size_tensor = broadcast_from_last_pipeline_stage(2, torch.int64, tokens_size_tensor)
 
-        scores = broadcast_from_last_to_first_pipeline_stage(
-            tuple(scores_size_tensor), torch.float32, scores
-        )
-        tokens = broadcast_from_last_to_first_pipeline_stage(
-            tuple(tokens_size_tensor), torch.int64, tokens
-        )
+        scores = broadcast_from_last_to_first_pipeline_stage(tuple(scores_size_tensor), torch.float32, scores)
+        tokens = broadcast_from_last_to_first_pipeline_stage(tuple(tokens_size_tensor), torch.int64, tokens)
 
     return tokens, scores
 

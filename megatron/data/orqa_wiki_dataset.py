@@ -72,9 +72,7 @@ def build_tokens_types_paddings_from_text(row, tokenizer, max_seq_length):
 
 
 # noinspection DuplicatedCode
-def build_tokens_types_paddings_from_ids(
-    text_ids, max_seq_length, cls_id, sep_id, pad_id
-):
+def build_tokens_types_paddings_from_ids(text_ids, max_seq_length, cls_id, sep_id, pad_id):
     """Build token types and paddings, trim if needed, and pad if needed."""
     enc_ids = []
     tokentypes_enc = []
@@ -136,9 +134,7 @@ class OpenRetrievalEvidenceDataset(ABC, Dataset):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
-        print_rank_0(
-            " > building {} dataset for {}:".format(self.task_name, self.dataset_name)
-        )
+        print_rank_0(" > building {} dataset for {}:".format(self.task_name, self.dataset_name))
         # Process the files.
         print_rank_0(datapath)
         self.samples, self.id2text = self.process_samples_from_single_path(datapath)
@@ -160,13 +156,9 @@ class OpenRetrievalEvidenceDataset(ABC, Dataset):
             context_ids,
             context_types,
             context_pad_mask,
-        ) = build_tokens_types_paddings_from_text(
-            row, self.tokenizer, self.max_seq_length
-        )
+        ) = build_tokens_types_paddings_from_text(row, self.tokenizer, self.max_seq_length)
 
-        sample = build_sample(
-            row["doc_id"], context_ids, context_types, context_pad_mask
-        )
+        sample = build_sample(row["doc_id"], context_ids, context_types, context_pad_mask)
         return sample
 
     @staticmethod

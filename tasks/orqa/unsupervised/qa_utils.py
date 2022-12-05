@@ -27,9 +27,7 @@ from tasks.orqa.unsupervised.tokenizers import SimpleTokenizer
 
 logger = logging.getLogger(__name__)
 
-QAMatchStats = collections.namedtuple(
-    "QAMatchStats", ["top_k_hits", "questions_doc_hits"]
-)
+QAMatchStats = collections.namedtuple("QAMatchStats", ["top_k_hits", "questions_doc_hits"])
 
 
 def calculate_matches(
@@ -71,9 +69,7 @@ def calculate_matches(
 
     logger.info("Matching answers in top docs...")
 
-    get_score_partial = partial(
-        check_answer, match_type=match_type, tokenizer=tokenizer
-    )
+    get_score_partial = partial(check_answer, match_type=match_type, tokenizer=tokenizer)
 
     questions_answers_docs = zip(answers, closest_docs)
 

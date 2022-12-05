@@ -21,9 +21,7 @@ if __name__ == "__main__":
         default=None,
         help="Input" " json file where id needs to be added",
     )
-    parser.add_argument(
-        "--output-file", type=str, default=None, help="Output file name with id"
-    )
+    parser.add_argument("--output-file", type=str, default=None, help="Output file name with id")
     parser.add_argument("--id-prefix", type=str, default=None, help="Id prefix")
     parser.add_argument("--log-interval", type=int, default=100, help="Log interval")
     args = parser.parse_args()
@@ -46,9 +44,7 @@ if __name__ == "__main__":
 
         if unique_ids % args.log_interval == 0:
             print(
-                "    processed {:9d} documents in {:.2f} seconds ...".format(
-                    unique_ids, time.time() - start_time
-                ),
+                "    processed {:9d} documents in {:.2f} seconds ...".format(unique_ids, time.time() - start_time),
                 flush=True,
             )
 

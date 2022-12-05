@@ -79,15 +79,9 @@ def twod_interpolate_position_embeddings_hook(
         input_param = state_dict[key]
 
         input_seq_len = input_param.shape[0]
-        assert isPerfectSquare(input_seq_len) or isPerfectSquare(
-            input_seq_len - CLASS_TOKEN_LENGTH
-        )
+        assert isPerfectSquare(input_seq_len) or isPerfectSquare(input_seq_len - CLASS_TOKEN_LENGTH)
         input_has_class_token = not isPerfectSquare(input_seq_len)
-        num_tok_input = (
-            input_seq_len - CLASS_TOKEN_LENGTH
-            if input_has_class_token
-            else input_seq_len
-        )
+        num_tok_input = input_seq_len - CLASS_TOKEN_LENGTH if input_has_class_token else input_seq_len
         num_tok_output = num_patches
         output_has_class_token = args.class_token_present
 
@@ -111,9 +105,7 @@ def twod_interpolate_position_embeddings_hook(
             input_param_grid = input_param_grid.float()
             scale_factor = (gs_new[0] / gs_input, gs_new[1] / gs_input)
 
-            input_param_grid = F.interpolate(
-                input_param_grid, scale_factor=scale_factor, mode="bilinear"
-            )
+            input_param_grid = F.interpolate(input_param_grid, scale_factor=scale_factor, mode="bilinear")
 
             input_param_grid = input_param_grid.half()
             input_param_grid = input_param_grid.reshape((-1, num_tok_output))
@@ -122,10 +114,7 @@ def twod_interpolate_position_embeddings_hook(
             assert input_param_grid.shape[1] == hidden_size
 
         input_param = input_param_grid
-        assert (
-            input_param.shape[0] == num_tok_output
-            and input_param.shape[1] == hidden_size
-        )
+        assert input_param.shape[0] == num_tok_output and input_param.shape[1] == hidden_size
 
         if output_has_class_token:
             input_param = torch.cat((input_param_tok, input_param), dim=0)
@@ -154,9 +143,7 @@ class VitBackbone(MegatronModule):
             self.scaled_init_method = torch.nn.init.xavier_uniform_
         else:
             self.init_method = init_method_normal(args.init_method_std)
-            self.scaled_init_method = scaled_init_method_normal(
-                args.init_method_std, args.num_layers
-            )
+            self.scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
 
         self.pre_process = pre_process
         self.post_process = post_process
@@ -175,9 +162,7 @@ class VitBackbone(MegatronModule):
         self.num_patches_per_dim_h = self.img_h // self.patch_dim
         self.num_patches_per_dim_w = self.img_w // self.patch_dim
         self.num_patches = self.num_patches_per_dim_h * self.num_patches_per_dim_w
-        self.seq_length = self.num_patches + (
-            CLASS_TOKEN_LENGTH if self.class_token else 0
-        )
+        self.seq_length = self.num_patches + (CLASS_TOKEN_LENGTH if self.class_token else 0)
         self.flatten_dim = self.patch_dim * self.patch_dim * args.num_channels
         self.input_tensor = None
         self.position_ids = None
@@ -185,9 +170,7 @@ class VitBackbone(MegatronModule):
         if self.pre_process:
             # cls_token
             if self.class_token:
-                self.cls_token = torch.nn.Parameter(
-                    torch.randn(1, CLASS_TOKEN_LENGTH, self.hidden_size)
-                )
+                self.cls_token = torch.nn.Parameter(torch.randn(1, CLASS_TOKEN_LENGTH, self.hidden_size))
                 torch.nn.init.zeros_(self.cls_token)
             self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
@@ -195,15 +178,11 @@ class VitBackbone(MegatronModule):
             self.linear_encoder = torch.nn.Linear(self.flatten_dim, self.hidden_size)
 
             # embedding
-            self.position_embeddings = torch.nn.Embedding(
-                self.seq_length, self.hidden_size
-            )
+            self.position_embeddings = torch.nn.Embedding(self.seq_length, self.hidden_size)
             init_method_normal(args.init_method_std)(self.position_embeddings.weight)
 
             args.class_token_present = self.class_token
-            self.position_embeddings._register_load_state_dict_pre_hook(
-                twod_interpolate_position_embeddings_hook
-            )
+            self.position_embeddings._register_load_state_dict_pre_hook(twod_interpolate_position_embeddings_hook)
 
             self.embedding_dropout = torch.nn.Dropout(args.hidden_dropout)
 

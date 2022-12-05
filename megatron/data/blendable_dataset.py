@@ -44,8 +44,7 @@ class BlendableDataset(torch.utils.data.Dataset):
             torch.distributed.get_rank() == 0,
         )
         print_rank_0(
-            "> elapsed time for building blendable dataset indices: "
-            "{:.2f} (sec)".format(time.time() - start_time)
+            "> elapsed time for building blendable dataset indices: " "{:.2f} (sec)".format(time.time() - start_time)
         )
 
     def __len__(self):

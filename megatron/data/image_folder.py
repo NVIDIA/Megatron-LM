@@ -89,9 +89,7 @@ def make_dataset(
     both_none = extensions is None and is_valid_file is None
     both_something = extensions is not None and is_valid_file is not None
     if both_none or both_something:
-        raise ValueError(
-            "Both extensions and is_valid_file cannot be None or not None at the same time"
-        )
+        raise ValueError("Both extensions and is_valid_file cannot be None or not None at the same time")
     if extensions is not None:
 
         def is_valid_file(x: str) -> bool:
@@ -111,9 +109,7 @@ def make_dataset(
                     item = path, class_index
                     local_instances.append(item)
 
-        instances.extend(
-            local_instances[0 : int(len(local_instances) * data_per_class_fraction)]
-        )
+        instances.extend(local_instances[0 : int(len(local_instances) * data_per_class_fraction)])
 
     return instances
 
@@ -157,9 +153,7 @@ class DatasetFolder(VisionDataset):
         data_per_class_fraction=1.0,
         is_valid_file: Optional[Callable[[str], bool]] = None,
     ) -> None:
-        super(DatasetFolder, self).__init__(
-            root, transform=transform, target_transform=target_transform
-        )
+        super(DatasetFolder, self).__init__(root, transform=transform, target_transform=target_transform)
         self.classes_fraction = classes_fraction
         self.data_per_class_fraction = data_per_class_fraction
         classes, class_to_idx = self._find_classes(self.root)

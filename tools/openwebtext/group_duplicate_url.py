@@ -51,11 +51,7 @@ if __name__ == "__main__":
                 index_to_urls[index] = None
 
             if counter % 100000 == 0:
-                print(
-                    " > processed {} lines in {} seconds ...".format(
-                        counter, time.time() - start_time
-                    )
-                )
+                print(" > processed {} lines in {} seconds ...".format(counter, time.time() - start_time))
 
     total_remove = 0
     total_remain = 0

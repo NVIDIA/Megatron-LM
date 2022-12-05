@@ -9,16 +9,10 @@ from googleapiclient.errors import HttpError
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description="Process some integers.")
-parser.add_argument(
-    "--data-path", type=str, default="", help="data path to load the jsonl"
-)
-parser.add_argument(
-    "--out-path", type=str, default="", help="data path to load the jsonl"
-)
+parser.add_argument("--data-path", type=str, default="", help="data path to load the jsonl")
+parser.add_argument("--out-path", type=str, default="", help="data path to load the jsonl")
 parser.add_argument("--total", type=int, default=-1, help="Total number of data")
-parser.add_argument(
-    "--workers", type=int, default=1, help="Number of worker processes to launch"
-)
+parser.add_argument("--workers", type=int, default=1, help="Number of worker processes to launch")
 
 
 class PerspectiveApiScorer:
@@ -48,26 +42,18 @@ class PerspectiveApiScorer:
             static_discovery=False,
         )
 
-    def get_scores(
-        self, input_text: str, requested_attributes: Optional[List[str]] = None
-    ) -> Dict[str, float]:
+    def get_scores(self, input_text: str, requested_attributes: Optional[List[str]] = None) -> Dict[str, float]:
         """
         Get attribute scores for a given text via Perspective API.
         :param input_text: the input text
         :param requested_attributes: the attributes for which to compute scores
         :return: a mapping from attribute names to scores
         """
-        requested_attributes = (
-            requested_attributes
-            if requested_attributes
-            else PerspectiveApiScorer.DEFAULT_ATTRIBUTES
-        )
+        requested_attributes = requested_attributes if requested_attributes else PerspectiveApiScorer.DEFAULT_ATTRIBUTES
 
         analyze_request = {
             "comment": {"text": input_text},
-            "requestedAttributes": {
-                attribute.upper(): {} for attribute in requested_attributes
-            },
+            "requestedAttributes": {attribute.upper(): {} for attribute in requested_attributes},
             "spanAnnotations": False,
             "languages": ["en"],
         }
@@ -75,18 +61,14 @@ class PerspectiveApiScorer:
         response = None
         while not response:
             try:
-                response = (
-                    self._service.comments().analyze(body=analyze_request).execute()
-                )
+                response = self._service.comments().analyze(body=analyze_request).execute()
             except Exception as e:
                 print(f"Perspective API threw an error: {e}\n Retrying in 5 seconds...")
                 print(input_text)
                 time.sleep(1)
 
         return {
-            attribute: response["attributeScores"][attribute.upper()]["summaryScore"][
-                "value"
-            ]
+            attribute: response["attributeScores"][attribute.upper()]["summaryScore"]["value"]
             for attribute in requested_attributes
         }
 

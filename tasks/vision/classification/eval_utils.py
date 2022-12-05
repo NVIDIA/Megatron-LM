@@ -46,8 +46,7 @@ def accuracy_func_provider():
         correct, total = calculate_correct_answers(model, dataloader, epoch)
         percent = float(correct) * 100.0 / float(total)
         print_rank_last(
-            " >> |epoch: {}| overall: correct / total = {} / {} = "
-            "{:.4f} %".format(epoch, correct, total, percent)
+            " >> |epoch: {}| overall: correct / total = {} / {} = " "{:.4f} %".format(epoch, correct, total, percent)
         )
 
     return metrics_func

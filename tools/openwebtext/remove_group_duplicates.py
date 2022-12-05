@@ -55,8 +55,6 @@ if __name__ == "__main__":
 
     print(
         " [PROCESSED] time (s): {:.2f} | written: {} "
-        "| removed: {} (char: {})".format(
-            time.time() - start_time, written_docs, removed_docs, removed_chars
-        )
+        "| removed: {} (char: {})".format(time.time() - start_time, written_docs, removed_docs, removed_chars)
     )
     print("done :-)")

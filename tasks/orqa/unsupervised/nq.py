@@ -78,9 +78,7 @@ def get_one_epoch_nq_dataloader(dataset, micro_batch_size=None):
     batch_sampler = BatchSampler(sampler, batch_size=micro_batch_size, drop_last=False)
 
     # Data loader. Note that batch size is the per GPU batch size.
-    data_loader = CustomDataLoader(
-        dataset, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=True
-    )
+    data_loader = CustomDataLoader(dataset, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=True)
     return data_loader
 
 
@@ -94,9 +92,7 @@ def build_tokens_types_paddings_from_text(src_text, tokenizer, max_seq_length):
     )
 
 
-def build_tokens_types_paddings_from_ids(
-    src_ids, max_seq_length, cls_id, sep_id, pad_id
-):
+def build_tokens_types_paddings_from_ids(src_ids, max_seq_length, cls_id, sep_id, pad_id):
     """
     Build token types and paddings, trim if needed, and pad if needed.
 
@@ -166,9 +162,7 @@ class NQDataset(ABC, Dataset):
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
         self.max_seq_length = max_seq_length
-        print_rank_0(
-            " > building {} dataset for {}:".format(self.task_name, self.dataset_name)
-        )
+        print_rank_0(" > building {} dataset for {}:".format(self.task_name, self.dataset_name))
         print_rank_0(datapath)
         self.samples = self.process_samples_from_single_path(datapath)
         print_rank_0("  >> total number of samples: {}".format(len(self.samples)))
@@ -183,13 +177,9 @@ class NQDataset(ABC, Dataset):
             ques_tokens,
             tokentypes_enc,
             num_tokens_ques,
-        ) = build_tokens_types_paddings_from_text(
-            raw_sample["question"], self.tokenizer, self.max_seq_length
-        )
+        ) = build_tokens_types_paddings_from_text(raw_sample["question"], self.tokenizer, self.max_seq_length)
 
-        sample = build_sample(
-            ques_tokens, tokentypes_enc, num_tokens_ques, raw_sample["answers"]
-        )
+        sample = build_sample(ques_tokens, tokentypes_enc, num_tokens_ques, raw_sample["answers"])
         return sample
 
     @staticmethod

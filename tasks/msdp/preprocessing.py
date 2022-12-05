@@ -14,15 +14,9 @@ from tqdm import tqdm
 def get_args():
     parser = argparse.ArgumentParser(description="Preprocessing")
 
-    parser.add_argument(
-        "--func", type=str, default=None, help="choose to run which function"
-    )
-    parser.add_argument(
-        "--raw_file", type=str, default=None, help="path of the input file"
-    )
-    parser.add_argument(
-        "--processed_file", type=str, default=None, help="path of the output file"
-    )
+    parser.add_argument("--func", type=str, default=None, help="choose to run which function")
+    parser.add_argument("--raw_file", type=str, default=None, help="path of the input file")
+    parser.add_argument("--processed_file", type=str, default=None, help="path of the output file")
     parser.add_argument(
         "--knwl_ref_file",
         type=str,
@@ -41,15 +35,9 @@ def get_args():
         default=None,
         help="path of the generated knowledge file",
     )
-    parser.add_argument(
-        "--test_file", type=str, default=None, help="path of the test file"
-    )
-    parser.add_argument(
-        "--train_file", type=str, default=None, help="path of the train file"
-    )
-    parser.add_argument(
-        "--model_file", type=str, default=None, help="path of the model file"
-    )
+    parser.add_argument("--test_file", type=str, default=None, help="path of the test file")
+    parser.add_argument("--train_file", type=str, default=None, help="path of the train file")
+    parser.add_argument("--model_file", type=str, default=None, help="path of the model file")
     parser.add_argument(
         "--data_type",
         type=str,
@@ -128,16 +116,7 @@ def process_wow_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                 turn_list.append(response)
 
                 # write to the output files
-                fproc.write(
-                    topic
-                    + "\t"
-                    + dialog_context
-                    + "\t"
-                    + knowledge
-                    + "\t"
-                    + response
-                    + "\n"
-                )
+                fproc.write(topic + "\t" + dialog_context + "\t" + knowledge + "\t" + response + "\n")
 
                 if fknwl:
                     fknwl.write(knowledge + "\n")
@@ -236,30 +215,13 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
 
                     # processing
                     topic = topic.replace("\n", "").replace("\r", "").replace("\t", "")
-                    dialog_context = (
-                        dialog_context.replace("\n", "")
-                        .replace("\r", "")
-                        .replace("\t", "")
-                    )
-                    knwl_sent = (
-                        knwl_sent.replace("\n", "").replace("\r", "").replace("\t", "")
-                    )
-                    response = (
-                        response.replace("\n", "").replace("\r", "").replace("\t", "")
-                    )
+                    dialog_context = dialog_context.replace("\n", "").replace("\r", "").replace("\t", "")
+                    knwl_sent = knwl_sent.replace("\n", "").replace("\r", "").replace("\t", "")
+                    response = response.replace("\n", "").replace("\r", "").replace("\t", "")
 
                     if topic != "no_topic":
                         # write to the ouput files
-                        fproc.write(
-                            topic
-                            + "\t"
-                            + dialog_context
-                            + "\t"
-                            + knwl_sent
-                            + "\t"
-                            + response
-                            + "\n"
-                        )
+                        fproc.write(topic + "\t" + dialog_context + "\t" + knwl_sent + "\t" + response + "\n")
                         if fknwl:
                             fknwl.write(knwl_sent + "\n")
                         if fresp:
@@ -274,9 +236,7 @@ def process_woi_dataset(raw_file, processed_file, knwl_ref_file, resp_ref_file):
                     turn_list.append(turn)
 
                 else:
-                    assert (
-                        action == "SearchAgent => Wizard"
-                    ), "Please check whether you have used the correct data!"
+                    assert action == "SearchAgent => Wizard", "Please check whether you have used the correct data!"
 
     fproc.close()
     if fknwl:
@@ -374,9 +334,7 @@ def get_database(test_datapath, train_datapath, data_type):
 emb_dict = {}
 
 
-def select_prompts_based_on_similarity(
-    query, dialog_list, prompt_list, topic, tokenizer, encoder, topk
-):
+def select_prompts_based_on_similarity(query, dialog_list, prompt_list, topic, tokenizer, encoder, topk):
     """Select samples based on the similarity"""
 
     with torch.no_grad():
@@ -398,9 +356,7 @@ def select_prompts_based_on_similarity(
                 if idx == 0:
                     example_embeddings = example_emb
                 else:
-                    example_embeddings = torch.cat(
-                        (example_embeddings, example_emb), dim=0
-                    )
+                    example_embeddings = torch.cat((example_embeddings, example_emb), dim=0)
             emb_dict[topic] = example_embeddings.cpu()
 
         # compare the similarity and select the topk samples
@@ -417,23 +373,17 @@ def select_prompts_based_on_similarity(
     return selected_prompts
 
 
-def prompt_selection_for_knowledge_generation(
-    test_datapath, train_datapath, model_path, output_prompt_path, data_type
-):
+def prompt_selection_for_knowledge_generation(test_datapath, train_datapath, model_path, output_prompt_path, data_type):
     """Selecting prompts for the knowledge generation"""
 
     print("> Selecting prompts for the knowledge generation")
 
-    train_data_by_topic, dialog_data_by_topic, dialog_examples = get_database(
-        test_datapath, train_datapath, data_type
-    )
+    train_data_by_topic, dialog_data_by_topic, dialog_examples = get_database(test_datapath, train_datapath, data_type)
 
     from transformers import DPRQuestionEncoderTokenizer
 
     print("> loading tokenizer and encoder")
-    tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(
-        "facebook/dpr-question_encoder-single-nq-base"
-    )
+    tokenizer = DPRQuestionEncoderTokenizer.from_pretrained("facebook/dpr-question_encoder-single-nq-base")
     encoder = torch.load(model_path).cuda()
 
     print("> getting dialog embeddings")
@@ -552,9 +502,7 @@ def prompt_selection_for_response_generation(input_path, output_path, seed):
             from nltk import word_tokenize
 
             knowledge_sent_token_list = word_tokenize(knowledge)
-            knowledge_sent_token_dict = {
-                token: True for token in knowledge_sent_token_list
-            }
+            knowledge_sent_token_dict = {token: True for token in knowledge_sent_token_list}
             knowledge_len = len(knowledge_sent_token_list)
             response_token_list = word_tokenize(response)
             response_len = len(response_token_list)
@@ -571,10 +519,7 @@ def prompt_selection_for_response_generation(input_path, output_path, seed):
                 num_overlap_token += accumulator
 
             # filtering the data based on the ratio
-            if (
-                num_overlap_token > response_len * 0.9
-                or num_overlap_token < response_len * 0.6
-            ):
+            if num_overlap_token > response_len * 0.9 or num_overlap_token < response_len * 0.6:
                 continue
             if num_overlap_token < knowledge_len * 0.8:
                 continue
@@ -626,30 +571,17 @@ def prepare_input_for_response_generation(test_file, knwl_gen_file, processed_fi
                     knowledge = knowledge.replace("<|endoftext|>", "")
 
                 # write to the output file
-                fw.write(
-                    topic
-                    + "\t"
-                    + dialog_context
-                    + "\t"
-                    + knowledge
-                    + "\t"
-                    + response
-                    + "\n"
-                )
+                fw.write(topic + "\t" + dialog_context + "\t" + knowledge + "\t" + response + "\n")
 
 
 if __name__ == "__main__":
 
     args = get_args()
     if args.func == "process_wow_dataset":
-        process_wow_dataset(
-            args.raw_file, args.processed_file, args.knwl_ref_file, args.resp_ref_file
-        )
+        process_wow_dataset(args.raw_file, args.processed_file, args.knwl_ref_file, args.resp_ref_file)
 
     elif args.func == "process_woi_dataset":
-        process_woi_dataset(
-            args.raw_file, args.processed_file, args.knwl_ref_file, args.resp_ref_file
-        )
+        process_woi_dataset(args.raw_file, args.processed_file, args.knwl_ref_file, args.resp_ref_file)
 
     elif args.func == "get_knwl_gen_prompts":
         prompt_selection_for_knowledge_generation(
@@ -661,11 +593,7 @@ if __name__ == "__main__":
         )
 
     elif args.func == "get_resp_gen_prompts":
-        prompt_selection_for_response_generation(
-            args.train_file, args.processed_file, args.seed
-        )
+        prompt_selection_for_response_generation(args.train_file, args.processed_file, args.seed)
 
     elif args.func == "prepare_input":
-        prepare_input_for_response_generation(
-            args.test_file, args.knwl_gen_file, args.processed_file
-        )
+        prepare_input_for_response_generation(args.test_file, args.knwl_gen_file, args.processed_file)

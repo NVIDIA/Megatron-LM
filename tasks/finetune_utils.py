@@ -70,17 +70,13 @@ def _cross_entropy_forward_step(batch, model):
     return output_tensor, partial(cross_entropy_loss_func, labels)
 
 
-def build_data_loader(
-    dataset, micro_batch_size, num_workers, drop_last, task_collate_fn=None
-):
+def build_data_loader(dataset, micro_batch_size, num_workers, drop_last, task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
     # Sampler.
     world_size = mpu.get_data_parallel_world_size()
     rank = mpu.get_data_parallel_rank()
-    sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank
-    )
+    sampler = torch.utils.data.distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank)
 
     # Data loader. Note that batch size is the per GPU batch size.
     data_loader = torch.utils.data.DataLoader(
@@ -167,9 +163,7 @@ def _train(
     args = get_args()
     timers = get_timers()
 
-    assert (
-        get_num_microbatches() == 1
-    ), "finetuning with gradient accumulation doesn't currently work"
+    assert get_num_microbatches() == 1, "finetuning with gradient accumulation doesn't currently work"
 
     # Turn on training mode which enables dropout.
     for m in model:
@@ -227,12 +221,8 @@ def _train(
             )
 
             # Autoresume
-            if args.adlr_autoresume and (
-                iteration % args.adlr_autoresume_interval == 0
-            ):
-                check_adlr_autoresume_termination(
-                    iteration, model, optimizer, opt_param_scheduler
-                )
+            if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
+                check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
             # Checkpointing
             saved_checkpoint = False
@@ -282,9 +272,7 @@ def finetune(
     args = get_args()
     timers = get_timers()
 
-    assert (
-        args.rampup_batch_size is None
-    ), "batch size scaling is not supported for finetuning"
+    assert args.rampup_batch_size is None, "batch size scaling is not supported for finetuning"
 
     # Train and validation data loaders.
     timers("train/valid/test dataset/dataloder", log_level=0).start()
@@ -306,9 +294,7 @@ def finetune(
 
     # Build model, optimizer and learning rate scheduler.
     timers("model and optimizer", log_level=0).start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type
-    )
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider, model_type)
     timers("model and optimizer").stop()
 
     # If pretrained checkpoint is provided and we have not trained for

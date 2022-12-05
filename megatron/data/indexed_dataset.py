@@ -45,17 +45,13 @@ def infer_dataset_impl(path):
                 return None
     else:
         print(f"Dataset does not exist: {path}")
-        print(
-            "Path should be a basename that both .idx and .bin can be appended to get full filenames."
-        )
+        print("Path should be a basename that both .idx and .bin can be appended to get full filenames.")
         return None
 
 
 def make_builder(out_file, impl, vocab_size=None):
     if impl == "mmap":
-        return MMapIndexedDatasetBuilder(
-            out_file, dtype=__best_fitting_dtype(vocab_size)
-        )
+        return MMapIndexedDatasetBuilder(out_file, dtype=__best_fitting_dtype(vocab_size))
     else:
         return IndexedDatasetBuilder(out_file)
 
@@ -63,9 +59,7 @@ def make_builder(out_file, impl, vocab_size=None):
 def make_dataset(path, impl, skip_warmup=False):
     if not IndexedDataset.exists(path):
         print(f"Dataset does not exist: {path}")
-        print(
-            "Path should be a basename that both .idx and .bin can be appended to get full filenames."
-        )
+        print("Path should be a basename that both .idx and .bin can be appended to get full filenames.")
         return None
     if impl == "infer":
         impl = infer_dataset_impl(path)
@@ -146,8 +140,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         with open(index_file_path(path), "rb") as f:
             magic = f.read(8)
             assert magic == self._HDR_MAGIC, (
-                "Index file doesn't match expected format. "
-                "Make sure that --dataset-impl is configured properly."
+                "Index file doesn't match expected format. " "Make sure that --dataset-impl is configured properly."
             )
             version = f.read(8)
             assert struct.unpack("<Q", version) == (1,)
@@ -207,9 +200,7 @@ class IndexedDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def exists(path):
-        return os.path.exists(index_file_path(path)) and os.path.exists(
-            data_file_path(path)
-        )
+        return os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
 
     @property
     def supports_prefetch(self):
@@ -398,8 +389,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             with open(path, "rb") as stream:
                 magic_test = stream.read(9)
                 assert self._HDR_MAGIC == magic_test, (
-                    "Index file doesn't match expected format. "
-                    "Make sure that --dataset-impl is configured properly."
+                    "Index file doesn't match expected format. " "Make sure that --dataset-impl is configured properly."
                 )
                 version = struct.unpack("<Q", stream.read(8))
                 assert (1,) == version
@@ -419,9 +409,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             self._bin_buffer_mmap = np.memmap(path, mode="r", order="C")
             self._bin_buffer = memoryview(self._bin_buffer_mmap)
             print_rank_0("    reading sizes...")
-            self._sizes = np.frombuffer(
-                self._bin_buffer, dtype=np.int32, count=self._len, offset=offset
-            )
+            self._sizes = np.frombuffer(self._bin_buffer, dtype=np.int32, count=self._len, offset=offset)
             print_rank_0("    reading pointers...")
             self._pointers = np.frombuffer(
                 self._bin_buffer,
@@ -483,9 +471,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             print_rank_0("    warming up data mmap file...")
             _warmup_mmap_file(data_file_path(self._path))
         print_rank_0("    creating numpy buffer of mmap...")
-        self._bin_buffer_mmap = np.memmap(
-            data_file_path(self._path), mode="r", order="C"
-        )
+        self._bin_buffer_mmap = np.memmap(data_file_path(self._path), mode="r", order="C")
         print_rank_0("    creating memory view of numpy buffer...")
         self._bin_buffer = memoryview(self._bin_buffer_mmap)
 
@@ -501,9 +487,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if isinstance(idx, (int, np.integer)):
             ptr, size = self._index[idx]
-            np_array = np.frombuffer(
-                self._bin_buffer, dtype=self._index.dtype, count=size, offset=ptr
-            )
+            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype, count=size, offset=ptr)
             return np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
@@ -513,9 +497,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             sizes = self._index._sizes[idx]
             offsets = list(accumulate(sizes))
             total_size = sum(sizes)
-            np_array = np.frombuffer(
-                self._bin_buffer, dtype=self._index.dtype, count=total_size, offset=ptr
-            )
+            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype, count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
             return sents
         else:
@@ -531,9 +513,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         if length is None:
             length = size - offset
         ptr += offset * np.dtype(self._index.dtype).itemsize
-        np_array = np.frombuffer(
-            self._bin_buffer, dtype=self._index.dtype, count=length, offset=ptr
-        )
+        np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype, count=length, offset=ptr)
         return np_array
 
     @property
@@ -556,9 +536,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def exists(path):
-        return os.path.exists(index_file_path(path)) and os.path.exists(
-            data_file_path(path)
-        )
+        return os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
 
 
 class MMapIndexedDatasetBuilder(object):

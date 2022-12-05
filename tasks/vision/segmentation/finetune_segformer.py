@@ -41,9 +41,7 @@ def fast_hist(pred, gtruth, num_classes):
     # TP exist where value == num_classes*class_id + class_id
     # FP = row[class].sum() - TP
     # FN = col[class].sum() - TP
-    hist = np.bincount(
-        num_classes * gtruth[mask].astype(int) + pred[mask], minlength=num_classes**2
-    )
+    hist = np.bincount(num_classes * gtruth[mask].astype(int) + pred[mask], minlength=num_classes**2)
     hist = hist.reshape(num_classes, num_classes)
     return hist
 
@@ -53,9 +51,7 @@ def segmentation():
         """Build train and validation dataset."""
         args = get_args()
 
-        train_ds, valid_ds = build_train_valid_datasets(
-            data_path=args.data_path, image_size=(args.img_h, args.img_w)
-        )
+        train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
         return train_ds, valid_ds
 
     def model_provider(pre_process=True, post_process=True):
@@ -87,9 +83,7 @@ def segmentation():
         ignore_index = args.ignore_index
         color_table = args.color_table
         logits = output_tensor.contiguous().float()
-        logits = resize(
-            logits, size=masks.shape[1:], mode="bilinear", align_corners=False
-        )
+        logits = resize(logits, size=masks.shape[1:], mode="bilinear", align_corners=False)
 
         # Cross-entropy loss.
         # weight = calculate_weight(masks, num_classes)
@@ -135,9 +129,7 @@ def segmentation():
         def loss_func(labels, output_tensor):
             args = get_args()
             logits = output_tensor
-            logits = resize(
-                logits, size=labels.shape[1:], mode="bilinear", align_corners=False
-            )
+            logits = resize(logits, size=labels.shape[1:], mode="bilinear", align_corners=False)
 
             loss_dict = {}
             # Compute the correct answers.
@@ -145,9 +137,7 @@ def segmentation():
             max_probs, preds = torch.max(probs, 1)
 
             preds = preds.cpu().numpy()
-            performs = fast_hist(
-                preds.flatten(), labels.cpu().numpy().flatten(), args.ignore_index
-            )
+            performs = fast_hist(preds.flatten(), labels.cpu().numpy().flatten(), args.ignore_index)
             loss_dict["performs"] = performs
             return 0, loss_dict
 
@@ -187,9 +177,7 @@ def segmentation():
         # Reduce.
         if mpu.is_pipeline_last_stage():
             performs_tensor = torch.cuda.FloatTensor(performs)
-            torch.distributed.all_reduce(
-                performs_tensor, group=mpu.get_data_parallel_group()
-            )
+            torch.distributed.all_reduce(performs_tensor, group=mpu.get_data_parallel_group())
             hist = performs_tensor.cpu().numpy()
             iu, acc, acc_cls = calculate_iou(hist)
             miou = np.nanmean(iu)
@@ -200,9 +188,7 @@ def segmentation():
         """Provide function that calculates accuracies."""
         args = get_args()
 
-        train_ds, valid_ds = build_train_valid_datasets(
-            data_path=args.data_path, image_size=(args.img_h, args.img_w)
-        )
+        train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
         dataloader = build_data_loader(
             valid_ds,
             args.micro_batch_size,
@@ -214,10 +200,7 @@ def segmentation():
         def metrics_func(model, epoch):
             print_rank_0("calculating metrics ...")
             iou, miou = calculate_correct_answers(model, dataloader, epoch)
-            print_rank_last(
-                " >> |epoch: {}| overall: iou = {},"
-                "miou = {:.4f} %".format(epoch, iou, miou * 100.0)
-            )
+            print_rank_last(" >> |epoch: {}| overall: iou = {}," "miou = {:.4f} %".format(epoch, iou, miou * 100.0))
 
         return metrics_func
 

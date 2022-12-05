@@ -179,9 +179,7 @@ class ORQAEvaluator(object):
         top_k_hits = match_stats.top_k_hits
 
         print_rank_0("{} SET RESULTS".format(split))
-        print_rank_0(
-            "topk-{} documents hits {}".format(args.faiss_topk_retrievals, top_k_hits)
-        )
+        print_rank_0("topk-{} documents hits {}".format(args.faiss_topk_retrievals, top_k_hits))
         top_k_hits = [v / len(top_ids_and_scores) for v in top_k_hits]
         print_rank_0("top-k documents hits accuracy {}".format(top_k_hits))
 

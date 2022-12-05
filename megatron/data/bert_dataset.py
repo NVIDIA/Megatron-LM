@@ -138,14 +138,10 @@ def build_training_sample(
 
     # Truncate to `target_sequence_length`.
     max_num_tokens = target_seq_length
-    truncated = truncate_segments(
-        tokens_a, tokens_b, len(tokens_a), len(tokens_b), max_num_tokens, np_rng
-    )
+    truncated = truncate_segments(tokens_a, tokens_b, len(tokens_a), len(tokens_b), max_num_tokens, np_rng)
 
     # Build tokens and toketypes.
-    tokens, tokentypes = create_tokens_and_tokentypes(
-        tokens_a, tokens_b, cls_id, sep_id
-    )
+    tokens, tokentypes = create_tokens_and_tokentypes(tokens_a, tokens_b, cls_id, sep_id)
 
     # Masking.
     max_predictions_per_seq = masked_lm_prob * max_num_tokens
@@ -168,9 +164,7 @@ def build_training_sample(
         labels_np,
         padding_mask_np,
         loss_mask_np,
-    ) = pad_and_convert_to_numpy(
-        tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length
-    )
+    ) = pad_and_convert_to_numpy(tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length)
 
     train_sample = {
         "text": tokens_np,
@@ -184,9 +178,7 @@ def build_training_sample(
     return train_sample
 
 
-def pad_and_convert_to_numpy(
-    tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length
-):
+def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length):
     """Pad sequences and convert them to numpy."""
 
     # Some checks.

@@ -80,9 +80,7 @@ def check_and_clean_text(
             return False
 
         # split the text
-        text_first, text_second = split_text(
-            text, start_position, args.remove_char_each_side, seq
-        )
+        text_first, text_second = split_text(text, start_position, args.remove_char_each_side, seq)
 
         # first part of ngrams free
         if len(text_first) > args.filter_text_char_len:
@@ -334,9 +332,7 @@ def compute_ngram_freq_sorted(args, ngrams):
     return ngrams_freq_sorted
 
 
-def get_ngrams_below_threshold(
-    args, ngrams, ngrams_below_threshold, dedup_file, dedup_key, ngrams_freq_sorted
-):
+def get_ngrams_below_threshold(args, ngrams, ngrams_below_threshold, dedup_file, dedup_key, ngrams_freq_sorted):
 
     start_time = time.time()
     # get the ngrams frequency
@@ -371,9 +367,7 @@ def get_ngrams_below_threshold(
         local_ngram = {}
 
     print(
-        " Time taken to compute statistics {:.2f} seconds".format(
-            time.time() - start_time
-        ),
+        " Time taken to compute statistics {:.2f} seconds".format(time.time() - start_time),
         flush=True,
     )
     pool.close()
@@ -441,11 +435,7 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, dedup
                     use_prefix = ""
 
                 for i in range(len(text_buf_ngram_free)):
-                    split_id_string = (
-                        id_prefix
-                        + "-{:010d}".format(int(counter))
-                        + "-{:04d}".format(int(i))
-                    )
+                    split_id_string = id_prefix + "-{:010d}".format(int(counter)) + "-{:04d}".format(int(i))
                     myjson[dedup_key] = text_buf_ngram_free[i]
                     myjson["split_id"] = use_prefix + split_id_string
                     outjson = json.dumps(myjson, ensure_ascii=False)
@@ -457,18 +447,14 @@ def clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, dedup
 
             if counter % 1000 == 0:
                 print(
-                    " [final]> processed {} documents in {:.2f} seconds ...".format(
-                        counter, time.time() - start_time
-                    ),
+                    " [final]> processed {} documents in {:.2f} seconds ...".format(counter, time.time() - start_time),
                     flush=True,
                 )
         except Exception as e:
             print("Error:", e)
 
     print(
-        " [final]> processed {} documents in {:.2f} seconds ...".format(
-            counter, time.time() - start_time
-        ),
+        " [final]> processed {} documents in {:.2f} seconds ...".format(counter, time.time() - start_time),
         flush=True,
     )
 
@@ -520,16 +506,10 @@ if __name__ == "__main__":
         default=None,
         help="Output file name to save dedup dataset",
     )
-    parser.add_argument(
-        "--num-threads", type=int, default=40, help="Number of threads to use"
-    )
+    parser.add_argument("--num-threads", type=int, default=40, help="Number of threads to use")
     # Default dedup values
-    parser.add_argument(
-        "--max-ngram-size", type=int, default=13, help="Maximum size of ngram to use."
-    )
-    parser.add_argument(
-        "--min-ngram-size", type=int, default=8, help="Minimum size of ngram to use."
-    )
+    parser.add_argument("--max-ngram-size", type=int, default=13, help="Maximum size of ngram to use.")
+    parser.add_argument("--min-ngram-size", type=int, default=8, help="Minimum size of ngram to use.")
     parser.add_argument(
         "--filter-text-char-len",
         type=int,
@@ -542,12 +522,8 @@ if __name__ == "__main__":
         default=10,
         help="Number of keys to consider as threshold",
     )
-    parser.add_argument(
-        "--save-dictionary", type=str, default=None, help="Save the dictionary"
-    )
-    parser.add_argument(
-        "--load-dictionary", type=str, default=None, help="Load the dictionary"
-    )
+    parser.add_argument("--save-dictionary", type=str, default=None, help="Save the dictionary")
+    parser.add_argument("--load-dictionary", type=str, default=None, help="Load the dictionary")
     parser.add_argument(
         "--splits-count",
         type=int,
@@ -600,8 +576,6 @@ if __name__ == "__main__":
 
     # filter the large file
     if args.output is not None:
-        clean_ngrams_below_threshold(
-            args, ngrams_below_threshold, dedup_file, dedup_key
-        )
+        clean_ngrams_below_threshold(args, ngrams_below_threshold, dedup_file, dedup_key)
 
     print("done :-)")

@@ -54,9 +54,7 @@ def loss_func(model, labels, output_tensor, collect_data=False):
 
         knn_accs = []
         for k in [10, 20, 100, 200]:
-            pred_labels = knn_predict(
-                feature, feature_bank, feature_labels, classes, k, 0.07
-            )
+            pred_labels = knn_predict(feature, feature_bank, feature_labels, classes, k, 0.07)
             knn_acc = (pred_labels[:, 0] == labels).float().mean()
             knn_accs.append(knn_acc)
 
@@ -89,9 +87,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     print_rank_0("> building train, validation, and test datasets " "for VIT ...")
-    train_ds, valid_ds = build_train_valid_datasets(
-        data_path=args.data_path, image_size=(args.img_h, args.img_w)
-    )
+    train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
     print_rank_0("> finished creating VIT datasets ...")
 
     return train_ds, valid_ds, None

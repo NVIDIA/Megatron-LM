@@ -195,12 +195,9 @@ class SubPolicy:
             "contrast": np.linspace(0.0, 0.9, num_levels),
             "sharpness": np.linspace(0.0, 0.9, num_levels),
             "brightness": np.linspace(0.0, 0.9, num_levels),
-            "autocontrast": [0]
-            * num_levels,  # This augmentation doesn't use magnitude parameter.
-            "equalize": [0]
-            * num_levels,  # This augmentation doesn't use magnitude parameter.
-            "invert": [0]
-            * num_levels,  # This augmentation doesn't use magnitude parameter.
+            "autocontrast": [0] * num_levels,  # This augmentation doesn't use magnitude parameter.
+            "equalize": [0] * num_levels,  # This augmentation doesn't use magnitude parameter.
+            "invert": [0] * num_levels,  # This augmentation doesn't use magnitude parameter.
         }
 
         def rotate_with_fill(img, magnitude):
@@ -217,9 +214,7 @@ class SubPolicy:
                 disoccluded areas unveiled by the rotation.
             """
             rotated = img.convert("RGBA").rotate(magnitude)
-            rotated_filled = Image.composite(
-                rotated, Image.new("RGBA", rotated.size, (128,) * 4), rotated
-            )
+            rotated_filled = Image.composite(rotated, Image.new("RGBA", rotated.size, (128,) * 4), rotated)
             return rotated_filled.convert(img.mode)
 
         # Define a dictionary of augmentation functions where each key refers
@@ -268,9 +263,7 @@ class SubPolicy:
                 fillcolor=fillcolor,
             ),
             "rotate": lambda img, magnitude: rotate_with_fill(img, magnitude),
-            "color": lambda img, magnitude: ImageEnhance.Color(img).enhance(
-                1 + magnitude * random.choice([-1, 1])
-            ),
+            "color": lambda img, magnitude: ImageEnhance.Color(img).enhance(1 + magnitude * random.choice([-1, 1])),
             "posterize": lambda img, magnitude: ImageOps.posterize(img, magnitude),
             "solarize": lambda img, magnitude: ImageOps.solarize(img, magnitude),
             "contrast": lambda img, magnitude: ImageEnhance.Contrast(img).enhance(

@@ -106,16 +106,11 @@ def write_predictions(all_predictions, all_labels, all_uid, args):
             print(accuracy)
         if not os.path.exists(os.path.join(args.outdir, dataset)):
             os.makedirs(os.path.join(args.outdir, dataset))
-        outpath = os.path.join(
-            args.outdir, dataset, os.path.splitext(args.prediction_name)[0] + ".tsv"
-        )
+        outpath = os.path.join(args.outdir, dataset, os.path.splitext(args.prediction_name)[0] + ".tsv")
         with open(outpath, "w") as f:
             f.write("id\tlabel\n")
             f.write(
-                "\n".join(
-                    str(uid) + "\t" + str(args.labels[p])
-                    for uid, p in zip(all_uid[dataset], preds.tolist())
-                )
+                "\n".join(str(uid) + "\t" + str(args.labels[p]) for uid, p in zip(all_uid[dataset], preds.tolist()))
             )
     if args.eval:
         print(all_correct / count)
@@ -123,9 +118,7 @@ def write_predictions(all_predictions, all_labels, all_uid, args):
 
 def ensemble_predictions(args):
     all_predictions, all_labels, all_uid = process_files(args)
-    all_predictions, all_labels = postprocess_predictions(
-        all_predictions, all_labels, args
-    )
+    all_predictions, all_labels = postprocess_predictions(all_predictions, all_labels, args)
     write_predictions(all_predictions, all_labels, all_uid, args)
 
 

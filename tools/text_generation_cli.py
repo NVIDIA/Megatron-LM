@@ -17,9 +17,7 @@ if __name__ == "__main__":
     while True:
         sentence = raw_input("Enter prompt: ")
         tokens_to_generate = int(input("Enter number of tokens to generate: "))
-        data = json.dumps(
-            {"prompts": [sentence], "tokens_to_generate": tokens_to_generate}
-        )
+        data = json.dumps({"prompts": [sentence], "tokens_to_generate": tokens_to_generate})
         req = PutRequest(url, data, {"Content-Type": "application/json"})
         response = urllib2.urlopen(req)
         resp_sentences = json.load(response)

@@ -28,9 +28,7 @@ def detokenize_generations(tokens_gpu_tensor, lengths_gpu_tensor, return_segment
             words = []
             for token in sequence_tokens:
                 word = tokenizer.tokenizer.decoder[token]
-                word = bytearray(
-                    [tokenizer.tokenizer.byte_decoder[c] for c in word]
-                ).decode("utf-8", errors="replace")
+                word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode("utf-8", errors="replace")
                 words.append(word)
             prompts_plus_generations_segments.append(words)
 
@@ -91,9 +89,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     # Tokenize all the prompts.
     tokenizer = get_tokenizer()
     if add_BOS:
-        prompts_tokens = [
-            [tokenizer.eod] + tokenizer.tokenize(prompt) for prompt in prompts
-        ]
+        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt) for prompt in prompts]
     else:
         prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
 

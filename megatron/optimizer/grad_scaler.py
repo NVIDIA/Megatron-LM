@@ -91,9 +91,7 @@ class DynamicGradScaler(MegatronGradScaler):
             self._hysteresis_tracker -= 1
             # Now if we are out of hysteresis count, scale down the loss.
             if self._hysteresis_tracker <= 0:
-                self._scale = torch.max(
-                    self._scale * self.backoff_factor, self.min_scale
-                )
+                self._scale = torch.max(self._scale * self.backoff_factor, self.min_scale)
         else:
             # If there is no nan/inf, increment the growth tracker.
             self._growth_tracker += 1

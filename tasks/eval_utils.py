@@ -40,9 +40,7 @@ def accuracy_func_provider(single_dataset_provider):
             named_predictions = []
             names = "predictions"
         for name, dataloader in dataloaders:
-            output = calculate_correct_answers(
-                name, model, dataloader, epoch, output_predictions
-            )
+            output = calculate_correct_answers(name, model, dataloader, epoch, output_predictions)
             if not output_predictions:
                 correct_ans, total_count = output
             else:
@@ -87,12 +85,8 @@ def calculate_correct_answers(name, model, dataloader, epoch, output_predictions
         sample_multiplier = ds.sample_multiplier
     else:
         sample_multiplier = 1
-    micro_batch_size_times_data_parallel = (
-        args.orig_micro_batch_size * args.data_parallel_size
-    )
-    num_micro_batches = (
-        args.orig_global_batch_size // micro_batch_size_times_data_parallel
-    )
+    micro_batch_size_times_data_parallel = args.orig_micro_batch_size * args.data_parallel_size
+    num_micro_batches = args.orig_global_batch_size // micro_batch_size_times_data_parallel
 
     def loss_func(output_predictions, labels, output_tensor):
         logits = output_tensor
@@ -101,9 +95,7 @@ def calculate_correct_answers(name, model, dataloader, epoch, output_predictions
         # Add output predictions.
         if output_predictions:
             assert False
-            loss_dict["softmaxes"] = (
-                torch.nn.Softmax(dim=-1)(logits.float()).data.cpu().numpy().tolist()
-            )
+            loss_dict["softmaxes"] = torch.nn.Softmax(dim=-1)(logits.float()).data.cpu().numpy().tolist()
             loss_dict["labels"] = labels.data.cpu().numpy().tolist()
             loss_dict["ids"] = batch["uid"].cpu().numpy().tolist()
         # Compute the correct answers.
@@ -146,9 +138,7 @@ def calculate_correct_answers(name, model, dataloader, epoch, output_predictions
             actual_batch_size = len(batch["label"])
             # ... applying sample_multiplier if necessary
             args.micro_batch_size = actual_batch_size * sample_multiplier
-            args.global_batch_size = (
-                actual_batch_size * sample_multiplier * num_micro_batches
-            )
+            args.global_batch_size = actual_batch_size * sample_multiplier * num_micro_batches
 
             loss_dicts = forward_backward_func(
                 correct_answers_forward_step,

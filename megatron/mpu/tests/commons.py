@@ -59,9 +59,7 @@ def initialize_distributed(backend="nccl"):
     master_ip = os.getenv("MASTER_ADDR", "localhost")
     master_port = os.getenv("MASTER_PORT", "6000")
     init_method += master_ip + ":" + master_port
-    torch.distributed.init_process_group(
-        backend=backend, world_size=world_size, rank=rank, init_method=init_method
-    )
+    torch.distributed.init_process_group(backend=backend, world_size=world_size, rank=rank, init_method=init_method)
 
 
 def print_separator(message):

@@ -7,11 +7,7 @@ import json
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(
-        os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)
-    )
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
 import torch
 
 from megatron import get_args, get_tokenizer, mpu, print_rank_0
@@ -40,12 +36,8 @@ def add_text_generate_args(parser):
     """Text generation arguments."""
     group = parser.add_argument_group(title="text generation")
 
-    group.add_argument(
-        "--temperature", type=float, default=1.0, help="Sampling temperature."
-    )
-    group.add_argument(
-        "--greedy", action="store_true", default=False, help="Use greedy sampling."
-    )
+    group.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
+    group.add_argument("--greedy", action="store_true", default=False, help="Use greedy sampling.")
     group.add_argument("--top_p", type=float, default=0.0, help="Top p sampling.")
     group.add_argument("--top_k", type=int, default=0, help="Top k sampling.")
     group.add_argument(
@@ -58,8 +50,7 @@ def add_text_generate_args(parser):
         "--sample-input-file",
         type=str,
         default=None,
-        help="Get input from file instead of interactive mode, "
-        "each line is an input.",
+        help="Get input from file instead of interactive mode, " "each line is an input.",
     )
     group.add_argument(
         "--sample-output-file",
@@ -71,12 +62,9 @@ def add_text_generate_args(parser):
         "--num-samples",
         type=int,
         default=0,
-        help="Number of samples to generate unconditionally, "
-        "defaults to 0 and interactive conditional sampling",
+        help="Number of samples to generate unconditionally, " "defaults to 0 and interactive conditional sampling",
     )
-    group.add_argument(
-        "--genfile", type=str, help="Output file when generating unconditionally"
-    )
+    group.add_argument("--genfile", type=str, help="Output file when generating unconditionally")
     return parser
 
 
@@ -95,12 +83,7 @@ def generate_samples_unconditional(model):
             sentences = [""] * args.global_batch_size
             print("global batch size", args.global_batch_size)
             max_len = args.out_seq_length
-            (
-                resp_sentences,
-                resp_sentences_seg,
-                output_logits,
-                tokens,
-            ) = generate_and_post_process(
+            (resp_sentences, resp_sentences_seg, output_logits, tokens,) = generate_and_post_process(
                 model,
                 prompts=sentences,
                 tokens_to_generate=max_len,
@@ -161,12 +144,7 @@ def generate_samples_conditional(model):
                 sentences.append(raw_text)
 
             max_len = args.out_seq_length
-            (
-                resp_sentences,
-                resp_sentences_seg,
-                output_logits,
-                tokens,
-            ) = generate_and_post_process(
+            (resp_sentences, resp_sentences_seg, output_logits, tokens,) = generate_and_post_process(
                 model,
                 prompts=sentences,
                 tokens_to_generate=max_len,
@@ -209,10 +187,7 @@ def generate_and_write_samples_conditional(model):
     args = get_args()
     if args.sample_output_file is None:
         sample_output_file = args.sample_input_file + ".out"
-        print(
-            "`sample-output-file` not specified, setting "
-            "it to {}".format(sample_output_file)
-        )
+        print("`sample-output-file` not specified, setting " "it to {}".format(sample_output_file))
     else:
         sample_output_file = args.sample_output_file
     with open(sample_output_file, "w") as f:

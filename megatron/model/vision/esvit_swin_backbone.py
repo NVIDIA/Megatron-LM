@@ -60,9 +60,7 @@ def window_partition(x, window_size):
     """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    )
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
     return windows
 
 
@@ -77,9 +75,7 @@ def window_reverse(windows, window_size, H, W):
         x: (B, H, W, C)
     """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(
-        B, H // window_size, W // window_size, window_size, window_size, -1
-    )
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
 
@@ -125,12 +121,8 @@ class WindowAttention(nn.Module):
         coords_w = torch.arange(self.window_size[1])
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2 Wh*Ww
-        relative_coords = (
-            coords_flatten[:, :, None] - coords_flatten[:, None, :]
-        )  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(
-            1, 2, 0
-        ).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
         relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
         relative_coords[:, :, 1] += self.window_size[1] - 1
         relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
@@ -152,11 +144,7 @@ class WindowAttention(nn.Module):
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
         B_, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
-        )
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = (
             qkv[0],
             qkv[1],
@@ -166,23 +154,17 @@ class WindowAttention(nn.Module):
         q = q * self.scale
         attn = q @ k.transpose(-2, -1)
 
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1],
             self.window_size[0] * self.window_size[1],
             -1,
         )  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(
-            2, 0, 1
-        ).contiguous()  # nH, Wh*Ww, Wh*Ww
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(
-                1
-            ).unsqueeze(0).type(attn.type())
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0).type(attn.type())
             attn = attn.view(-1, self.num_heads, N, N)
             attn = self.softmax(attn)
         else:
@@ -264,9 +246,7 @@ class SwinTransformerBlock(nn.Module):
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
-        assert (
-            0 <= self.shift_size < self.window_size
-        ), "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
@@ -316,14 +296,10 @@ class SwinTransformerBlock(nn.Module):
                 img_mask[:, h, w, :] = cnt
                 cnt += 1
 
-        mask_windows = window_partition(
-            img_mask, self.window_size
-        )  # nW, window_size, window_size, 1
+        mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
         mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
-        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
-            attn_mask == 0, float(0.0)
-        )
+        attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
         return attn_mask
 
@@ -345,16 +321,12 @@ class SwinTransformerBlock(nn.Module):
 
         # cyclic shift
         if self.shift_size > 0:
-            shifted_x = torch.roll(
-                x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2)
-            )
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
 
             if H in self.attn_mask_dict.keys():
                 attn_mask = self.attn_mask_dict[H]
             else:
-                self.attn_mask_dict[H] = self.create_attn_mask(self.H, self.W).to(
-                    x.device
-                )
+                self.attn_mask_dict[H] = self.create_attn_mask(self.H, self.W).to(x.device)
                 attn_mask = self.attn_mask_dict[H]
 
         else:
@@ -362,17 +334,11 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = None
 
         # partition windows
-        x_windows = window_partition(
-            shifted_x, self.window_size
-        )  # nW*B, window_size, window_size, C
-        x_windows = x_windows.view(
-            -1, self.window_size * self.window_size, C
-        )  # nW*B, window_size*window_size, C
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows, attn = self.attn(
-            x_windows, attn_mask
-        )  # nW*B, window_size*window_size, C
+        attn_windows, attn = self.attn(x_windows, attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -380,9 +346,7 @@ class SwinTransformerBlock(nn.Module):
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            x = torch.roll(
-                shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2)
-            )
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
 
@@ -525,18 +489,14 @@ class BasicLayer(nn.Module):
                     qk_scale=qk_scale,
                     drop=drop,
                     attn_drop=attn_drop,
-                    drop_path=drop_path[i]
-                    if isinstance(drop_path, list)
-                    else drop_path,
+                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                     norm_layer=norm_layer,
                 )
                 for i in range(depth)
             ]
         )
         if downsample is not None:
-            self.downsample = downsample(
-                input_resolution, dim=dim, norm_layer=norm_layer
-            )
+            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
         else:
             self.downsample = None
 
@@ -580,9 +540,7 @@ class BasicLayer(nn.Module):
 class PatchEmbed(nn.Module):
     """Image to Patch Embedding"""
 
-    def __init__(
-        self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None
-    ):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None):
         super().__init__()
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
@@ -598,9 +556,7 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -616,13 +572,7 @@ class PatchEmbed(nn.Module):
 
     def flops(self):
         Ho, Wo = self.patches_resolution
-        flops = (
-            Ho
-            * Wo
-            * self.embed_dim
-            * self.in_chans
-            * (self.patch_size[0] * self.patch_size[1])
-        )
+        flops = Ho * Wo * self.embed_dim * self.in_chans * (self.patch_size[0] * self.patch_size[1])
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
@@ -695,16 +645,12 @@ class SwinTransformer(nn.Module):
         self.patches_resolution = patches_resolution
 
         if self.ape:
-            self.absolute_pos_embed = nn.Parameter(
-                torch.zeros(1, num_patches, embed_dim)
-            )
+            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
             trunc_normal_(self.absolute_pos_embed, std=0.02)
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        dpr = [
-            x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))
-        ]  # stochastic depth decay rule
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicLayer(
@@ -811,9 +757,7 @@ class SwinTransformer(nn.Module):
 
         return attn_out
 
-    def forward_return_n_last_blocks(
-        self, x, n=1, return_patch_avgpool=False, depth=[]
-    ):
+    def forward_return_n_last_blocks(self, x, n=1, return_patch_avgpool=False, depth=[]):
 
         num_blks = sum(depth)
         start_idx = num_blks - n
@@ -859,12 +803,7 @@ class SwinTransformer(nn.Module):
             flops += layer.flops()
             if dist.get_rank() == 0:
                 print(f"GFLOPs layer_{i}: {layer.flops() / 1e9}")
-        flops += (
-            self.num_features
-            * self.patches_resolution[0]
-            * self.patches_resolution[1]
-            // (2**self.num_layers)
-        )
+        flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2**self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
 
@@ -873,9 +812,7 @@ class SwinTransformer(nn.Module):
             pretrained_dict = torch.load(pretrained, map_location="cpu")
             logging.info(f"=> loading pretrained model {pretrained}")
             model_dict = self.state_dict()
-            pretrained_dict = {
-                k: v for k, v in pretrained_dict.items() if k in model_dict.keys()
-            }
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict.keys()}
             need_init_state_dict = {}
             for k, v in pretrained_dict.items():
                 need_init = (
@@ -889,10 +826,7 @@ class SwinTransformer(nn.Module):
                     if verbose:
                         logging.info(f"=> init {k} from {pretrained}")
 
-                    if (
-                        "relative_position_bias_table" in k
-                        and v.size() != model_dict[k].size()
-                    ):
+                    if "relative_position_bias_table" in k and v.size() != model_dict[k].size():
                         relative_position_bias_table_pretrained = v
                         relative_position_bias_table_current = model_dict[k]
                         L1, nH1 = relative_position_bias_table_pretrained.size()
@@ -902,26 +836,16 @@ class SwinTransformer(nn.Module):
                         else:
                             if L1 != L2:
                                 logging.info(
-                                    "=> load_pretrained: resized variant: {} to {}".format(
-                                        (L1, nH1), (L2, nH2)
-                                    )
+                                    "=> load_pretrained: resized variant: {} to {}".format((L1, nH1), (L2, nH2))
                                 )
                                 S1 = int(L1**0.5)
                                 S2 = int(L2**0.5)
-                                relative_position_bias_table_pretrained_resized = (
-                                    torch.nn.functional.interpolate(
-                                        relative_position_bias_table_pretrained.permute(
-                                            1, 0
-                                        ).view(1, nH1, S1, S1),
-                                        size=(S2, S2),
-                                        mode="bicubic",
-                                    )
+                                relative_position_bias_table_pretrained_resized = torch.nn.functional.interpolate(
+                                    relative_position_bias_table_pretrained.permute(1, 0).view(1, nH1, S1, S1),
+                                    size=(S2, S2),
+                                    mode="bicubic",
                                 )
-                                v = relative_position_bias_table_pretrained_resized.view(
-                                    nH2, L2
-                                ).permute(
-                                    1, 0
-                                )
+                                v = relative_position_bias_table_pretrained_resized.view(nH2, L2).permute(1, 0)
 
                     if "absolute_pos_embed" in k and v.size() != model_dict[k].size():
                         absolute_pos_embed_pretrained = v
@@ -933,30 +857,18 @@ class SwinTransformer(nn.Module):
                         else:
                             if L1 != L2:
                                 logging.info(
-                                    "=> load_pretrained: resized variant: {} to {}".format(
-                                        (1, L1, C1), (1, L2, C2)
-                                    )
+                                    "=> load_pretrained: resized variant: {} to {}".format((1, L1, C1), (1, L2, C2))
                                 )
                                 S1 = int(L1**0.5)
                                 S2 = int(L2**0.5)
-                                absolute_pos_embed_pretrained = (
-                                    absolute_pos_embed_pretrained.reshape(
-                                        -1, S1, S1, C1
-                                    )
+                                absolute_pos_embed_pretrained = absolute_pos_embed_pretrained.reshape(-1, S1, S1, C1)
+                                absolute_pos_embed_pretrained = absolute_pos_embed_pretrained.permute(0, 3, 1, 2)
+                                absolute_pos_embed_pretrained_resized = torch.nn.functional.interpolate(
+                                    absolute_pos_embed_pretrained,
+                                    size=(S2, S2),
+                                    mode="bicubic",
                                 )
-                                absolute_pos_embed_pretrained = (
-                                    absolute_pos_embed_pretrained.permute(0, 3, 1, 2)
-                                )
-                                absolute_pos_embed_pretrained_resized = (
-                                    torch.nn.functional.interpolate(
-                                        absolute_pos_embed_pretrained,
-                                        size=(S2, S2),
-                                        mode="bicubic",
-                                    )
-                                )
-                                v = absolute_pos_embed_pretrained_resized.permute(
-                                    0, 2, 3, 1
-                                ).flatten(1, 2)
+                                v = absolute_pos_embed_pretrained_resized.permute(0, 2, 3, 1).flatten(1, 2)
 
                     need_init_state_dict[k] = v
             self.load_state_dict(need_init_state_dict, strict=False)

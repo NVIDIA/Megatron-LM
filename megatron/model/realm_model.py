@@ -21,12 +21,9 @@ from .module import MegatronModule
 def general_ict_model_provider(only_query_model=False, only_block_model=False):
     """Build the model."""
     args = get_args()
+    assert args.ict_head_size is not None, "Need to specify --ict-head-size to provide an ICTBertModel"
     assert (
-        args.ict_head_size is not None
-    ), "Need to specify --ict-head-size to provide an ICTBertModel"
-    assert (
-        mpu.get_tensor_model_parallel_world_size() == 1
-        and mpu.get_pipeline_model_parallel_world_size() == 1
+        mpu.get_tensor_model_parallel_world_size() == 1 and mpu.get_pipeline_model_parallel_world_size() == 1
     ), "Model parallel size > 1 not supported for ICT"
 
     print_rank_0("building ICTBertModel...")
@@ -74,9 +71,7 @@ class ICTBertModel(MegatronModule):
             self.block_model = IREncoderBertModel(**bert_kwargs)
             self._block_key = "context_model"
 
-    def forward(
-        self, query_tokens, query_attention_mask, block_tokens, block_attention_mask
-    ):
+    def forward(self, query_tokens, query_attention_mask, block_tokens, block_attention_mask):
         """Run a forward pass for each of the models and return the respective embeddings."""
         query_logits = self.embed_query(query_tokens, query_attention_mask)
         block_logits = self.embed_block(block_tokens, block_attention_mask)
@@ -86,9 +81,7 @@ class ICTBertModel(MegatronModule):
         """Embed a batch of tokens using the query model"""
         if self.use_query_model:
             query_types = torch.cuda.LongTensor(*query_tokens.shape).fill_(0)
-            query_ict_logits, _ = self.query_model.forward(
-                query_tokens, query_attention_mask, query_types
-            )
+            query_ict_logits, _ = self.query_model.forward(query_tokens, query_attention_mask, query_types)
             return query_ict_logits
         else:
             raise ValueError("Cannot embed query without query model.")
@@ -97,9 +90,7 @@ class ICTBertModel(MegatronModule):
         """Embed a batch of tokens using the block model"""
         if self.use_block_model:
             block_types = torch.cuda.LongTensor(*block_tokens.shape).fill_(0)
-            block_ict_logits, _ = self.block_model.forward(
-                block_tokens, block_attention_mask, block_types
-            )
+            block_ict_logits, _ = self.block_model.forward(block_tokens, block_attention_mask, block_types)
             return block_ict_logits
         else:
             raise ValueError("Cannot embed block without block model.")
@@ -108,16 +99,12 @@ class ICTBertModel(MegatronModule):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
         if self.use_query_model:
-            state_dict_[
-                self._query_key
-            ] = self.query_model.state_dict_for_save_checkpoint(
+            state_dict_[self._query_key] = self.query_model.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars
             )
 
         if self.use_block_model:
-            state_dict_[
-                self._block_key
-            ] = self.block_model.state_dict_for_save_checkpoint(
+            state_dict_[self._block_key] = self.block_model.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars
             )
 
@@ -145,11 +132,7 @@ class ICTBertModel(MegatronModule):
 
         checkpoint_name = get_checkpoint_name(args.bert_load, iteration, False)
         if mpu.get_data_parallel_rank() == 0:
-            print(
-                "global rank {} is loading checkpoint {}".format(
-                    torch.distributed.get_rank(), checkpoint_name
-                )
-            )
+            print("global rank {} is loading checkpoint {}".format(torch.distributed.get_rank(), checkpoint_name))
 
         try:
             state_dict = torch.load(checkpoint_name, map_location="cpu")
@@ -162,9 +145,7 @@ class ICTBertModel(MegatronModule):
         self.block_model.language_model.load_state_dict(model_dict)
 
         # give each model the same ict_head to begin with as well
-        query_ict_head_state_dict = self.state_dict_for_save_checkpoint()[
-            self._query_key
-        ]["ict_head"]
+        query_ict_head_state_dict = self.state_dict_for_save_checkpoint()[self._query_key]["ict_head"]
         self.block_model.ict_head.load_state_dict(query_ict_head_state_dict)
 
 
@@ -178,9 +159,7 @@ class IREncoderBertModel(MegatronModule):
         self.ict_head_size = ict_head_size
         self.parallel_output = parallel_output
         init_method = init_method_normal(args.init_method_std)
-        scaled_init_method = scaled_init_method_normal(
-            args.init_method_std, args.num_layers
-        )
+        scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
 
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
@@ -215,19 +194,13 @@ class IREncoderBertModel(MegatronModule):
         add an extra key."""
 
         state_dict_ = {}
-        state_dict_[
-            self._language_model_key
-        ] = self.language_model.state_dict_for_save_checkpoint(
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             prefix=prefix, keep_vars=keep_vars
         )
-        state_dict_[self._ict_head_key] = self.ict_head.state_dict(
-            prefix=prefix, keep_vars=keep_vars
-        )
+        state_dict_[self._ict_head_key] = self.ict_head.state_dict(prefix=prefix, keep_vars=keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
-        self.language_model.load_state_dict(
-            state_dict[self._language_model_key], strict=strict
-        )
+        self.language_model.load_state_dict(state_dict[self._language_model_key], strict=strict)
         self.ict_head.load_state_dict(state_dict[self._ict_head_key], strict=strict)

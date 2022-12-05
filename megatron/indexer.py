@@ -28,9 +28,7 @@ class IndexBuilder(object):
         self.model = None
         self.dataloader = None
         self.evidence_embedder_obj = None
-        self.biencoder_shared_query_context_model = (
-            args.biencoder_shared_query_context_model
-        )
+        self.biencoder_shared_query_context_model = args.biencoder_shared_query_context_model
 
         # need to know whether we're using a REALM checkpoint (args.load)
         # or ICT checkpoint
@@ -59,9 +57,7 @@ class IndexBuilder(object):
             )
         )
 
-        self.model = load_biencoder_checkpoint(
-            model, only_context_model=only_context_model
-        )
+        self.model = load_biencoder_checkpoint(model, only_context_model=only_context_model)
 
         assert len(self.model) == 1
         self.model[0].eval()
@@ -79,9 +75,7 @@ class IndexBuilder(object):
         self.total_processed += batch_size * self.num_total_builders
         if self.is_main_builder and self.iteration % self.log_interval == 0:
             print(
-                "Batch {:10d} | Total {:10d}".format(
-                    self.iteration, self.total_processed
-                ),
+                "Batch {:10d} | Total {:10d}".format(self.iteration, self.total_processed),
                 flush=True,
             )
 

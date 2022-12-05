@@ -80,9 +80,7 @@ def process_doc(json_line, args):
             return output, cleaned_text, document, False
 
     except Exception as e:
-        print(
-            "Error: *************************\n{}\ntext: {}".format(e, text), flush=True
-        )
+        print("Error: *************************\n{}\ntext: {}".format(e, text), flush=True)
         return output, text, document, True
 
     # don't remove
@@ -95,9 +93,7 @@ def process_set(args, input_file, output_f_cleaned, output_f_filtered):
 
     num_docs = (
         num_remove_512
-    ) = (
-        num_remove_java
-    ) = num_remove_512_non_english = num_ftfy_fix_text = num_general_cleaning = 0
+    ) = num_remove_java = num_remove_512_non_english = num_ftfy_fix_text = num_general_cleaning = 0
 
     # Output file and counters.
     output_cleaned = open(output_f_cleaned, "wb")
@@ -134,9 +130,7 @@ def process_set(args, input_file, output_f_cleaned, output_f_filtered):
 
         if num_docs % args.log_interval == 0:
             print(
-                "    processed {:9d} documents in {:.2f} seconds ...".format(
-                    num_docs, time.time() - start_time
-                ),
+                "    processed {:9d} documents in {:.2f} seconds ...".format(num_docs, time.time() - start_time),
                 flush=True,
             )
 
@@ -199,12 +193,8 @@ if __name__ == "__main__":
     for input_file in args.input_files:
         input_filename, input_filename_ext = os.path.splitext(Path(input_file).name)
 
-        output_f_cleaned = os.path.join(
-            args.output_path, input_filename + "_cleaned" + input_filename_ext
-        )
-        output_f_filtered = os.path.join(
-            args.output_path, input_filename + "_filtered" + input_filename_ext
-        )
+        output_f_cleaned = os.path.join(args.output_path, input_filename + "_cleaned" + input_filename_ext)
+        output_f_filtered = os.path.join(args.output_path, input_filename + "_filtered" + input_filename_ext)
 
         process_set(args, input_file, output_f_cleaned, output_f_filtered)
 

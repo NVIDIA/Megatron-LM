@@ -66,9 +66,7 @@ def loss_func(loss_mask, sentence_order, output_tensor):
     lm_loss = torch.sum(lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
     if sop_logits is not None:
-        sop_loss = F.cross_entropy(
-            sop_logits.view(-1, 2).float(), sentence_order.view(-1), ignore_index=-1
-        )
+        sop_loss = F.cross_entropy(sop_logits.view(-1, 2).float(), sentence_order.view(-1), ignore_index=-1)
         sop_loss = sop_loss.float()
         loss = lm_loss + sop_loss
         averaged_losses = average_losses_across_data_parallel_group([lm_loss, sop_loss])
@@ -87,18 +85,14 @@ def forward_step(data_iterator, model):
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
-    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(
-        data_iterator
-    )
+    tokens, types, sentence_order, loss_mask, lm_labels, padding_mask = get_batch(data_iterator)
     timers("batch-generator").stop()
 
     if not args.bert_binary_head:
         types = None
 
     # Forward pass through the model.
-    output_tensor = model(
-        tokens, padding_mask, tokentype_ids=types, lm_labels=lm_labels
-    )
+    output_tensor = model(tokens, padding_mask, tokentype_ids=types, lm_labels=lm_labels)
 
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 

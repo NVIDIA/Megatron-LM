@@ -57,9 +57,7 @@ class DistributedDataParallelBase(MegatronModule, ABC):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix="", keep_vars=False):
-        return self.module.state_dict_for_save_checkpoint(
-            prefix=prefix, keep_vars=keep_vars
-        )
+        return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
@@ -81,9 +79,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             gradients.
     """
 
-    def __init__(
-        self, module, accumulate_allreduce_grads_in_fp32, use_contiguous_buffers
-    ):
+    def __init__(self, module, accumulate_allreduce_grads_in_fp32, use_contiguous_buffers):
 
         super(DistributedDataParallel, self).__init__(module)
 
@@ -107,20 +103,14 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
             # Simple function to define buffer type.
             def _get_buffer_type(param):
-                return (
-                    torch.float
-                    if self.accumulate_allreduce_grads_in_fp32
-                    else param.dtype
-                )
+                return torch.float if self.accumulate_allreduce_grads_in_fp32 else param.dtype
 
             # First calculate total number of elements per type.
             type_num_elements = {}
             for param in self.module.parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
-                    type_num_elements[dtype] = (
-                        type_num_elements.get(dtype, 0) + param.data.nelement()
-                    )
+                    type_num_elements[dtype] = type_num_elements.get(dtype, 0) + param.data.nelement()
 
             # Allocate the buffer.
             for dtype, num_elements in type_num_elements.items():
@@ -129,14 +119,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 # multiple of data_parallel_world_size. (This padding is done
                 # due to a constraint with the reduce_scatter op, which requires
                 # all tensors have equal size. See: optimizer.py.)
-                num_elements_padded = data_parallel_world_size * int(
-                    math.ceil(num_elements / data_parallel_world_size)
-                )
+                num_elements_padded = data_parallel_world_size * int(math.ceil(num_elements / data_parallel_world_size))
 
                 # Allocate grad buffer.
-                self._grad_buffers[dtype] = MemoryBuffer(
-                    num_elements, num_elements_padded, dtype
-                )
+                self._grad_buffers[dtype] = MemoryBuffer(num_elements, num_elements_padded, dtype)
 
             # Assume the back prop order is reverse the params order,
             # store the start index for the gradients.
@@ -144,9 +130,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] -= param.data.nelement()
-                    param.main_grad = self._grad_buffers[dtype].get(
-                        param.data.shape, type_num_elements[dtype]
-                    )
+                    param.main_grad = self._grad_buffers[dtype].get(param.data.shape, type_num_elements[dtype])
                     if dtype not in self._grad_buffer_param_index_map:
                         self._grad_buffer_param_index_map[dtype] = {}
                     self._grad_buffer_param_index_map[dtype][param] = (
@@ -202,9 +186,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         if self._grad_buffers is not None:
             for _, buffer_ in self._grad_buffers.items():
                 buffer_.data /= mpu.get_data_parallel_world_size()
-                torch.distributed.all_reduce(
-                    buffer_.data, group=mpu.get_data_parallel_group()
-                )
+                torch.distributed.all_reduce(buffer_.data, group=mpu.get_data_parallel_group())
         else:
             # Otherwise, bucketize and all-reduce
             buckets = {}
@@ -223,10 +205,6 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 grads = [param.grad.data for param in bucket]
                 coalesced = _flatten_dense_tensors(grads)
                 coalesced /= mpu.get_data_parallel_world_size()
-                torch.distributed.all_reduce(
-                    coalesced, group=mpu.get_data_parallel_group()
-                )
-                for buf, synced in zip(
-                    grads, _unflatten_dense_tensors(coalesced, grads)
-                ):
+                torch.distributed.all_reduce(coalesced, group=mpu.get_data_parallel_group())
+                for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
                     buf.copy_(synced)

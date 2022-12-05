@@ -102,9 +102,7 @@ def set_args(args):
 def _build_num_microbatches_calculator(args):
 
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
-    _ensure_var_is_not_initialized(
-        _GLOBAL_NUM_MICROBATCHES_CALCULATOR, "num microbatches calculator"
-    )
+    _ensure_var_is_not_initialized(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, "num microbatches calculator")
 
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = build_num_microbatches_calculator(args)
 
@@ -128,11 +126,7 @@ def _set_tensorboard_writer(args):
     global _GLOBAL_TENSORBOARD_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER, "tensorboard writer")
 
-    if (
-        hasattr(args, "tensorboard_dir")
-        and args.tensorboard_dir
-        and args.rank == (args.world_size - 1)
-    ):
+    if hasattr(args, "tensorboard_dir") and args.tensorboard_dir and args.rank == (args.world_size - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
 

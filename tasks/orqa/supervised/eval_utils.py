@@ -35,15 +35,9 @@ def task_collate_fn(batch_data):
     tensorized["context_pad_mask"] = torch.LongTensor(tensorized["context_pad_mask"])
 
     if "neg_context" in tensorized:
-        tensorized["neg_context"] = torch.LongTensor(
-            np.concatenate(tensorized["neg_context"])
-        )
-        tensorized["neg_context_mask"] = torch.LongTensor(
-            np.concatenate(tensorized["neg_context_mask"])
-        )
-        tensorized["neg_context_types"] = torch.LongTensor(
-            np.concatenate(tensorized["neg_context_types"])
-        )
+        tensorized["neg_context"] = torch.LongTensor(np.concatenate(tensorized["neg_context"]))
+        tensorized["neg_context_mask"] = torch.LongTensor(np.concatenate(tensorized["neg_context_mask"]))
+        tensorized["neg_context_types"] = torch.LongTensor(np.concatenate(tensorized["neg_context_types"]))
 
     return tensorized
 
@@ -128,9 +122,7 @@ def accuracy_func_provider(single_dataset_provider, rank0sampler=False):
             for k, v in stats_dict.items():
                 format_string += "|{} = {:.2f}".format(k, v / total)
             print_rank_0("epoch:{}{}".format(epoch, format_string))
-            print_rank_0(
-                "taken time to calcuate metrics {:.3f}".format(time.time() - start_time)
-            )
+            print_rank_0("taken time to calcuate metrics {:.3f}".format(time.time() - start_time))
         else:
             raise AssertionError("{} Task not supported".format(args.task))
 
@@ -140,9 +132,7 @@ def accuracy_func_provider(single_dataset_provider, rank0sampler=False):
 def retrieval_loss(model, dataloader):
     args = get_args()
     total = 0
-    topk_stats_dict = {
-        "top{}_acc".format(k): 0 for k in args.retriever_report_topk_accuracies
-    }
+    topk_stats_dict = {"top{}_acc".format(k): 0 for k in args.retriever_report_topk_accuracies}
     stats_dict = dict(rank=0, **topk_stats_dict)
 
     assert len(model) == 1
@@ -177,9 +167,7 @@ def retrieval_loss(model, dataloader):
                 torch.cat([context_types, neg_context_types]),
             )
 
-            retrieval_scores = torch.matmul(
-                query_logits, torch.transpose(context_logits, 0, 1)
-            )
+            retrieval_scores = torch.matmul(query_logits, torch.transpose(context_logits, 0, 1))
 
             if args.retriever_score_scaling:
                 retrieval_scores = retrieval_scores / math.sqrt(args.hidden_size)
@@ -188,45 +176,26 @@ def retrieval_loss(model, dataloader):
             labels = torch.arange(local_batch_size).long().cuda()
 
             softmax_scores = F.softmax(retrieval_scores, dim=1)
-            sorted_vals, sorted_indices = torch.topk(
-                softmax_scores, k=softmax_scores.shape[1], sorted=True
-            )
+            sorted_vals, sorted_indices = torch.topk(softmax_scores, k=softmax_scores.shape[1], sorted=True)
 
             def topk_accuracy(k):
                 return torch.cuda.FloatTensor(
-                    [
-                        sum(
-                            [
-                                int(labels[i] in sorted_indices[i, :k])
-                                for i in range(local_batch_size)
-                            ]
-                        )
-                    ]
+                    [sum([int(labels[i] in sorted_indices[i, :k]) for i in range(local_batch_size)])]
                 )
 
             def get_rank():
                 return torch.cuda.FloatTensor(
-                    [
-                        sum(
-                            [
-                                torch.nonzero(labels[i] == sorted_indices[i])[0][0]
-                                for i in range(local_batch_size)
-                            ]
-                        )
-                    ]
+                    [sum([torch.nonzero(labels[i] == sorted_indices[i])[0][0] for i in range(local_batch_size)])]
                 )
 
-            topk_accs = [
-                topk_accuracy(k) for k in args.retriever_report_topk_accuracies
-            ]
+            topk_accs = [topk_accuracy(k) for k in args.retriever_report_topk_accuracies]
             rank = get_rank()
             losses = average_losses_across_data_parallel_group([rank, *topk_accs])
 
             # create stats_dict with retrieval loss and all specified
             # top-k accuracies
             topk_acc_dict = {
-                "top{}_acc".format(k): v * 100
-                for k, v in zip(args.retriever_report_topk_accuracies, losses[1:])
+                "top{}_acc".format(k): v * 100 for k, v in zip(args.retriever_report_topk_accuracies, losses[1:])
             }
             temp_stats_dict = dict(rank=losses[0], **topk_acc_dict)
             for k in stats_dict.keys():

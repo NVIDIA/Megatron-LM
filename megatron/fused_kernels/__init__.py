@@ -74,15 +74,11 @@ def load(args):
             srcpath / "scaled_masked_softmax.cpp",
             srcpath / "scaled_masked_softmax_cuda.cu",
         ]
-        scaled_masked_softmax_cuda = _cpp_extention_load_helper(
-            "scaled_masked_softmax_cuda", sources, extra_cuda_flags
-        )
+        scaled_masked_softmax_cuda = _cpp_extention_load_helper("scaled_masked_softmax_cuda", sources, extra_cuda_flags)
 
         # Softmax
         sources = [srcpath / "scaled_softmax.cpp", srcpath / "scaled_softmax_cuda.cu"]
-        scaled_softmax_cuda = _cpp_extention_load_helper(
-            "scaled_softmax_cuda", sources, extra_cuda_flags
-        )
+        scaled_softmax_cuda = _cpp_extention_load_helper("scaled_softmax_cuda", sources, extra_cuda_flags)
 
     # =================================
     # Mixed precision fused layer norm.
@@ -107,9 +103,7 @@ def load(args):
 
 
 def _get_cuda_bare_metal_version(cuda_dir):
-    raw_output = subprocess.check_output(
-        [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
-    )
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
     output = raw_output.split()
     release_idx = output.index("release") + 1
     release = output[release_idx].split(".")

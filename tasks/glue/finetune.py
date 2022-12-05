@@ -15,9 +15,7 @@ def glue_classification(num_classes, Dataset, name_from_datapath_func):
         tokenizer = get_tokenizer()
 
         train_dataset = Dataset("training", args.train_data, tokenizer, args.seq_length)
-        valid_dataset = Dataset(
-            "validation", args.valid_data, tokenizer, args.seq_length
-        )
+        valid_dataset = Dataset("validation", args.valid_data, tokenizer, args.seq_length)
 
         return train_dataset, valid_dataset
 

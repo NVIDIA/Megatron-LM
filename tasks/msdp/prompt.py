@@ -27,9 +27,7 @@ def call_model_api(inputs, tokens_to_generate):
     headers = {"Content-Type": "application/json; charset=UTF-8"}
     data = {"prompts": [inputs], "tokens_to_generate": tokens_to_generate, "top_k": 1}
     data_json = json.dumps(data)
-    outputs = requests.put(
-        args.megatron_api_url, headers=headers, data=data_json
-    ).json()["text"][0]
+    outputs = requests.put(args.megatron_api_url, headers=headers, data=data_json).json()["text"][0]
 
     input_len = len(inputs)
     outputs = outputs[input_len:]
@@ -85,14 +83,10 @@ def generate_samples_by_calling_api():
 
     if args.prompt_type == "knowledge":
         # read knowledge generation prompts
-        knwl_gen_prompt_dict = read_prompts(
-            args.prompt_file, args.prompt_type, args.num_prompt_examples
-        )
+        knwl_gen_prompt_dict = read_prompts(args.prompt_file, args.prompt_type, args.num_prompt_examples)
 
     else:
-        resp_gen_prompt = read_prompts(
-            args.prompt_file, args.prompt_type, args.num_prompt_examples
-        )
+        resp_gen_prompt = read_prompts(args.prompt_file, args.prompt_type, args.num_prompt_examples)
 
     # read the test data
     fname = open(args.sample_input_file, "r")
@@ -174,10 +168,7 @@ def generate_samples_by_prompting_input_from_file(model):
         input_count = len(all_raw_text)
         if args.sample_output_file is None:
             sample_output_file = args.sample_input_file + ".out"
-            print(
-                "`sample-output-file` not specified, setting "
-                "it to {}".format(sample_output_file)
-            )
+            print("`sample-output-file` not specified, setting " "it to {}".format(sample_output_file))
         else:
             sample_output_file = args.sample_output_file
 
@@ -226,10 +217,7 @@ def generate_samples_by_prompting_input_from_file(model):
     with torch.no_grad():
         while True:
             raw_text_len = 0
-            if (
-                mpu.is_pipeline_first_stage()
-                and mpu.get_tensor_model_parallel_rank() == 0
-            ):
+            if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
                 input_str = all_raw_text[input_pos]
                 input_str = input_str.strip()
                 splits = input_str.split("\t")

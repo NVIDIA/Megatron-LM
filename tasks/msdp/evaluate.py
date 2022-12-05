@@ -29,9 +29,7 @@ def evaluate_f1(guess_file, answer_file):
                 line = ""
             answer_list.append(line)
 
-    assert len(guess_list) == len(
-        answer_list
-    ), "lengths of guess and answer are different!"
+    assert len(guess_list) == len(answer_list), "lengths of guess and answer are different!"
 
     precision, recall, f1 = F1Metric.compute_all_pairs(guess_list, answer_list)
     print_rank_0("Precision: %.4f; recall: %.4f; f1: %.4f" % (precision, recall, f1))

@@ -63,17 +63,13 @@ def get_datasets_weights_and_num_samples(data_prefix, train_valid_test_num_sampl
         datasets_train_valid_test_num_samples = []
         for weight in weights:
             datasets_train_valid_test_num_samples.append(
-                [
-                    int(math.ceil(val * weight * 1.005))
-                    for val in train_valid_test_num_samples
-                ]
+                [int(math.ceil(val * weight * 1.005)) for val in train_valid_test_num_samples]
             )
     else:
         # Used when separate dataset files are provided for train,
         # valid and test
         datasets_train_valid_test_num_samples = [
-            int(math.ceil(train_valid_test_num_samples * weight * 1.005))
-            for weight in weights
+            int(math.ceil(train_valid_test_num_samples * weight * 1.005)) for weight in weights
         ]
 
     return prefixes, weights, datasets_train_valid_test_num_samples
@@ -221,11 +217,7 @@ def create_masked_lm_predictions(
         # Note that Whole Word Masking does *not* change the training code
         # at all -- we still predict each WordPiece independently, softmaxed
         # over the entire vocabulary.
-        if (
-            do_whole_word_mask
-            and len(cand_indexes) >= 1
-            and not is_start_piece(vocab_id_to_token_dict[token])
-        ):
+        if do_whole_word_mask and len(cand_indexes) >= 1 and not is_start_piece(vocab_id_to_token_dict[token]):
             cand_indexes[-1].append(i)
         else:
             cand_indexes.append([i])
@@ -240,9 +232,7 @@ def create_masked_lm_predictions(
     if masked_lm_prob == 0:
         return (output_tokens, masked_lm_positions, masked_lm_labels, token_boundary)
 
-    num_to_predict = min(
-        max_predictions_per_seq, max(1, int(round(len(tokens) * masked_lm_prob)))
-    )
+    num_to_predict = min(max_predictions_per_seq, max(1, int(round(len(tokens) * masked_lm_prob))))
 
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
     if not geometric_dist:
@@ -279,8 +269,7 @@ def create_masked_lm_predictions(
         if not geometric_dist:
             n = np_rng.choice(
                 ngrams[: len(cand_index_set)],
-                p=pvals[: len(cand_index_set)]
-                / pvals[: len(cand_index_set)].sum(keepdims=True),
+                p=pvals[: len(cand_index_set)] / pvals[: len(cand_index_set)].sum(keepdims=True),
             )
         else:
             # Sampling "n" from the geometric distribution and clipping it to
@@ -322,9 +311,7 @@ def create_masked_lm_predictions(
                         masked_token = tokens[index]
                     # 10% of the time, replace with random word
                     else:
-                        masked_token = vocab_id_list[
-                            np_rng.randint(0, len(vocab_id_list))
-                        ]
+                        masked_token = vocab_id_list[np_rng.randint(0, len(vocab_id_list))]
             elif masking_style == "t5":
                 masked_token = mask_id
             else:
@@ -333,11 +320,7 @@ def create_masked_lm_predictions(
             output_tokens[index] = masked_token
             masked_lms.append(MaskedLmInstance(index=index, label=tokens[index]))
 
-        masked_spans.append(
-            MaskedLmInstance(
-                index=index_set, label=[tokens[index] for index in index_set]
-            )
-        )
+        masked_spans.append(MaskedLmInstance(index=index_set, label=[tokens[index] for index in index_set]))
 
     assert len(masked_lms) <= num_to_predict
     np_rng.shuffle(ngram_indexes)
@@ -358,8 +341,7 @@ def create_masked_lm_predictions(
 
             n = np.random.choice(
                 ngrams[: len(cand_index_set)],
-                p=pvals[: len(cand_index_set)]
-                / pvals[: len(cand_index_set)].sum(keepdims=True),
+                p=pvals[: len(cand_index_set)] / pvals[: len(cand_index_set)].sum(keepdims=True),
             )
             index_set = sum(cand_index_set[n - 1], [])
             n -= 1
@@ -409,9 +391,7 @@ def create_masked_lm_predictions(
     )
 
 
-def pad_and_convert_to_numpy(
-    tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length
-):
+def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions, masked_labels, pad_id, max_seq_length):
     """Pad sequences and convert them to numpy."""
 
     # Some checks.
@@ -474,9 +454,7 @@ def build_train_valid_test_datasets(
         )
     # Blending dataset.
     # Parse the values.
-    output = get_datasets_weights_and_num_samples(
-        data_prefix, train_valid_test_num_samples
-    )
+    output = get_datasets_weights_and_num_samples(data_prefix, train_valid_test_num_samples)
     prefixes, weights, datasets_train_valid_test_num_samples = output
 
     # Build individual datasets.
@@ -541,9 +519,7 @@ def _build_train_valid_test_datasets(
 
     if dataset_type == DSET_TYPE_ICT:
         args = get_args()
-        title_dataset = get_indexed_dataset_(
-            args.titles_data_path, data_impl, skip_warmup
-        )
+        title_dataset = get_indexed_dataset_(args.titles_data_path, data_impl, skip_warmup)
 
     # Get start and end indices of train/valid/train into doc-idx
     # Note that doc-idx is desinged to be num-docs + 1 so we can
@@ -558,9 +534,7 @@ def _build_train_valid_test_datasets(
         print_rank_0("    {}:".format(name))
         print_rank_0(
             "     document indices in [{}, {}) total of {} "
-            "documents".format(
-                splits[index], splits[index + 1], splits[index + 1] - splits[index]
-            )
+            "documents".format(splits[index], splits[index + 1], splits[index + 1] - splits[index])
         )
         start_index = indexed_dataset.doc_idx[splits[index]]
         end_index = indexed_dataset.doc_idx[splits[index + 1]]
@@ -648,15 +622,10 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
     start_time = time.time()
     indexed_dataset = make_indexed_dataset(data_prefix, data_impl, skip_warmup)
     assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
-    print_rank_0(
-        " > finished creating indexed dataset in {:4f} "
-        "seconds".format(time.time() - start_time)
-    )
+    print_rank_0(" > finished creating indexed dataset in {:4f} " "seconds".format(time.time() - start_time))
 
     print_rank_0(" > indexed dataset stats:")
-    print_rank_0(
-        "    number of documents: {}".format(indexed_dataset.doc_idx.shape[0] - 1)
-    )
+    print_rank_0("    number of documents: {}".format(indexed_dataset.doc_idx.shape[0] - 1))
     print_rank_0("    number of sentences: {}".format(indexed_dataset.sizes.shape[0]))
 
     return indexed_dataset
@@ -755,8 +724,7 @@ def get_samples_mapping(
         print_rank_0(" > saved the index mapping in {}".format(indexmap_filename))
         # Make sure all the ranks have built the mapping
         print_rank_0(
-            " > elasped time to build and save samples mapping "
-            "(seconds): {:4f}".format(time.time() - start_time)
+            " > elasped time to build and save samples mapping " "(seconds): {:4f}".format(time.time() - start_time)
         )
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
@@ -773,9 +741,7 @@ def get_samples_mapping(
     print_rank_0(" > loading indexed mapping from {}".format(indexmap_filename))
     start_time = time.time()
     samples_mapping = np.load(indexmap_filename, allow_pickle=True, mmap_mode="r")
-    print_rank_0(
-        "    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time)
-    )
+    print_rank_0("    loaded indexed file in {:3.3f} seconds".format(time.time() - start_time))
     print_rank_0("    total number of samples: {}".format(samples_mapping.shape[0]))
 
     return samples_mapping

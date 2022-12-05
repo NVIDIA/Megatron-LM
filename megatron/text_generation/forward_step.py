@@ -32,12 +32,8 @@ class InferenceParams:
             raise ValueError("should not swap when dict in empty")
 
         for layer_number in self.key_value_memory_dict.keys():
-            inference_key_memory, inference_value_memory = self.key_value_memory_dict[
-                layer_number
-            ]
-            assert (
-                len(batch_idx) == inference_key_memory.shape[1]
-            )  ## make sure batch size is the same
+            inference_key_memory, inference_value_memory = self.key_value_memory_dict[layer_number]
+            assert len(batch_idx) == inference_key_memory.shape[1]  ## make sure batch size is the same
             new_inference_key_memory = inference_key_memory[:, batch_idx]
             new_inference_value_memory = inference_value_memory[:, batch_idx]
             self.key_value_memory_dict[layer_number] = (
@@ -54,9 +50,7 @@ class ForwardStep:
     def __init__(self, model, max_batch_size, max_sequence_len):
         """Set values so we don't need to do it multiple times."""
         # Make sure model is in eval mode.
-        assert not isinstance(
-            model, Iterable
-        ), "interleaving schedule is not supported for inference"
+        assert not isinstance(model, Iterable), "interleaving schedule is not supported for inference"
         model.eval()
         self.model = model
         # Initialize inference parameters.
@@ -74,9 +68,7 @@ class ForwardStep:
         if self.pipeline_size_larger_than_one:
             current_batch_x_seqlen = tokens.size(0) * tokens.size(1)
             if current_batch_x_seqlen >= self.pipelining_batch_x_seqlen:
-                micro_batch_size = max(
-                    1, self.pipelining_batch_x_seqlen // tokens.size(1)
-                )
+                micro_batch_size = max(1, self.pipelining_batch_x_seqlen // tokens.size(1))
                 return _with_pipelining_forward_step(
                     self.model,
                     tokens,
@@ -86,9 +78,7 @@ class ForwardStep:
                     micro_batch_size,
                 )
 
-        return _no_pipelining_forward_step(
-            self.model, tokens, position_ids, attention_mask, self.inference_params
-        )
+        return _no_pipelining_forward_step(self.model, tokens, position_ids, attention_mask, self.inference_params)
 
 
 def _get_recv_buffer_dtype(args):
@@ -111,9 +101,7 @@ def _allocate_recv_buffer(batch_size, sequence_length):
     )
 
 
-def _forward_step_helper(
-    model, tokens, position_ids, attention_mask, inference_params, recv_buffer=None
-):
+def _forward_step_helper(model, tokens, position_ids, attention_mask, inference_params, recv_buffer=None):
     """Single forward step. Update the allocate memory flag so
     only the first time the memory is allocated."""
     batch_size = tokens.size(0)
@@ -126,9 +114,7 @@ def _forward_step_helper(
 
     # Forward pass through the model.
     model.set_input_tensor(recv_buffer)
-    output_tensor = model(
-        tokens, position_ids, attention_mask, inference_params=inference_params
-    )
+    output_tensor = model(tokens, position_ids, attention_mask, inference_params=inference_params)
 
     # Send output to the next stage.
     send_to_next_pipeline_rank(output_tensor)
@@ -136,9 +122,7 @@ def _forward_step_helper(
     return output_tensor
 
 
-def _no_pipelining_forward_step(
-    model, tokens, position_ids, attention_mask, inference_params, recv_buffer=None
-):
+def _no_pipelining_forward_step(model, tokens, position_ids, attention_mask, inference_params, recv_buffer=None):
     """If recv_buffer is none, we will allocate one on the fly."""
     # Run a simple forward pass.
     output_tensor = _forward_step_helper(
@@ -159,9 +143,7 @@ def _no_pipelining_forward_step(
     return logits
 
 
-def _with_pipelining_forward_step(
-    model, tokens, position_ids, attention_mask, inference_params, micro_batch_size
-):
+def _with_pipelining_forward_step(model, tokens, position_ids, attention_mask, inference_params, micro_batch_size):
     """No interleaving is supported."""
     sequence_length = tokens.size(1)
     batch_size = tokens.size(0)

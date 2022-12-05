@@ -36,19 +36,13 @@ class MegatronModule(torch.nn.Module):
             return self.language_model.embedding.word_embeddings.weight
         else:
             if not self.share_word_embeddings:
-                raise Exception(
-                    "word_embeddings_weight() called for last "
-                    "stage, but share_word_embeddings is false"
-                )
+                raise Exception("word_embeddings_weight() called for last " "stage, but share_word_embeddings is false")
             return self.word_embeddings.weight
 
     def initialize_word_embeddings(self, init_method_normal):
         args = get_args()
         if not self.share_word_embeddings:
-            raise Exception(
-                "initialize_word_embeddings() was called but "
-                "share_word_embeddings is false"
-            )
+            raise Exception("initialize_word_embeddings() was called but " "share_word_embeddings is false")
 
         # This function just initializes the word embeddings in the final stage
         # when we are using pipeline parallelism. Nothing to do if we aren't
@@ -104,17 +98,12 @@ class MegatronModule(torch.nn.Module):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_rank_in_embedding_group():
-            torch.distributed.all_reduce(
-                self.word_embeddings_weight().data, group=mpu.get_embedding_group()
-            )
+            torch.distributed.all_reduce(self.word_embeddings_weight().data, group=mpu.get_embedding_group())
 
         # Ensure that encoder(first stage) and decoder(split stage) position
         # embeddings have the same initial parameter values
         # NOTE: We don't currently support T5 with the interleaved schedule.
-        if (
-            mpu.is_rank_in_position_embedding_group()
-            and args.pipeline_model_parallel_split_rank is not None
-        ):
+        if mpu.is_rank_in_position_embedding_group() and args.pipeline_model_parallel_split_rank is not None:
             # TODO: Support tokentype embedding.
             self.language_model.embedding.cuda()
             position_embeddings = self.language_model.embedding.position_embeddings
@@ -199,9 +188,7 @@ class Float16Module(MegatronModule):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix="", keep_vars=False):
-        return self.module.state_dict_for_save_checkpoint(
-            prefix=prefix, keep_vars=keep_vars
-        )
+        return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)

@@ -63,17 +63,13 @@ class PhotoMetricDistortion(object):
     def brightness(self, img):
         """Brightness distortion."""
         if random.randint(0, 1):
-            return self.convert(
-                img, beta=random.uniform(-self.brightness_delta, self.brightness_delta)
-            )
+            return self.convert(img, beta=random.uniform(-self.brightness_delta, self.brightness_delta))
         return img
 
     def contrast(self, img):
         """Contrast distortion."""
         if random.randint(0, 1):
-            return self.convert(
-                img, alpha=random.uniform(self.contrast_lower, self.contrast_upper)
-            )
+            return self.convert(img, alpha=random.uniform(self.contrast_lower, self.contrast_upper))
         return img
 
     def saturation(self, img):
@@ -91,10 +87,7 @@ class PhotoMetricDistortion(object):
         """Hue distortion."""
         if random.randint(0, 1):
             img = mmcv.bgr2hsv(img)
-            img[:, :, 0] = (
-                img[:, :, 0].astype(int)
-                + random.randint(-self.hue_delta, self.hue_delta)
-            ) % 180
+            img[:, :, 0] = (img[:, :, 0].astype(int) + random.randint(-self.hue_delta, self.hue_delta)) % 180
             img = mmcv.hsv2bgr(img)
         return img
 
@@ -258,9 +251,7 @@ class RandomSizeAndCrop(object):
 class RandomHorizontallyFlip(object):
     def __call__(self, img, mask):
         if random.random() < 0.5:
-            return img.transpose(Image.FLIP_LEFT_RIGHT), mask.transpose(
-                Image.FLIP_LEFT_RIGHT
-            )
+            return img.transpose(Image.FLIP_LEFT_RIGHT), mask.transpose(Image.FLIP_LEFT_RIGHT)
         return img, mask
 
 
@@ -401,26 +392,16 @@ class ColorJitter(object):
         """
         transforms = []
         if brightness > 0:
-            brightness_factor = np.random.uniform(
-                max(0, 1 - brightness), 1 + brightness
-            )
-            transforms.append(
-                torch_tr.Lambda(lambda img: adjust_brightness(img, brightness_factor))
-            )
+            brightness_factor = np.random.uniform(max(0, 1 - brightness), 1 + brightness)
+            transforms.append(torch_tr.Lambda(lambda img: adjust_brightness(img, brightness_factor)))
 
         if contrast > 0:
             contrast_factor = np.random.uniform(max(0, 1 - contrast), 1 + contrast)
-            transforms.append(
-                torch_tr.Lambda(lambda img: adjust_contrast(img, contrast_factor))
-            )
+            transforms.append(torch_tr.Lambda(lambda img: adjust_contrast(img, contrast_factor)))
 
         if saturation > 0:
-            saturation_factor = np.random.uniform(
-                max(0, 1 - saturation), 1 + saturation
-            )
-            transforms.append(
-                torch_tr.Lambda(lambda img: adjust_saturation(img, saturation_factor))
-            )
+            saturation_factor = np.random.uniform(max(0, 1 - saturation), 1 + saturation)
+            transforms.append(torch_tr.Lambda(lambda img: adjust_saturation(img, saturation_factor)))
 
         if hue > 0:
             hue_factor = np.random.uniform(-hue, hue)
@@ -439,7 +420,5 @@ class ColorJitter(object):
         Returns:
             PIL Image: Color jittered image.
         """
-        transform = self.get_params(
-            self.brightness, self.contrast, self.saturation, self.hue
-        )
+        transform = self.get_params(self.brightness, self.contrast, self.saturation, self.hue)
         return transform(img)

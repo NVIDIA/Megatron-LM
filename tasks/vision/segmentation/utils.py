@@ -35,9 +35,7 @@ def slidingcrops(img, mask):
                 sub_h, sub_w = img_sub.shape[2:]
                 pad_h = max(crop_size - sub_h, 0)
                 pad_w = max(crop_size - sub_w, 0)
-                img_sub = torch.nn.functional.pad(
-                    img_sub, pad=(0, pad_w, 0, pad_h), value=ignore_index
-                )
+                img_sub = torch.nn.functional.pad(img_sub, pad=(0, pad_w, 0, pad_h), value=ignore_index)
                 mask_sub = torch.nn.functional.pad(mask_sub, pad=(0, pad_w, 0, pad_h))
 
                 img_slices.append(img_sub)
@@ -80,14 +78,10 @@ def slidingjoins(preds, probs, labels, slices_info, img_size):
         local_preds = preds_split[i][:, :sub_h, :sub_w]
 
         result_max_probs = torch.maximum(curr_max_probs, local_max_probs)
-        result_preds = torch.where(
-            curr_max_probs >= local_max_probs, curr_preds, local_preds
-        )
+        result_preds = torch.where(curr_max_probs >= local_max_probs, curr_preds, local_preds)
 
         total_max_probs[:, sy : sy + sub_h, sx : sx + sub_w] = result_max_probs
         total_preds[:, sy : sy + sub_h, sx : sx + sub_w] = result_preds
-        total_labels[:, sy : sy + sub_h, sx : sx + sub_w] = labels_split[i][
-            0, :sub_h, :sub_w
-        ]
+        total_labels[:, sy : sy + sub_h, sx : sx + sub_w] = labels_split[i][0, :sub_h, :sub_w]
 
     return total_preds, total_labels

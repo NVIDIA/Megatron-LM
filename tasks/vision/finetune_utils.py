@@ -76,17 +76,13 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
 
     print_rank_0("building train and validation dataloaders ...")
     # Training dataset.
-    train_dataloader = build_data_loader(
-        train_dataset, args.micro_batch_size, args.num_workers, False, True
-    )
+    train_dataloader = build_data_loader(train_dataset, args.micro_batch_size, args.num_workers, False, True)
     # Set the training iterations.
     args.train_iters_per_epoch = len(train_dataloader)
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
-    valid_dataloader_ = build_data_loader(
-        valid_dataset, args.micro_batch_size, args.num_workers, True, False
-    )
+    valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size, args.num_workers, True, False)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
     # Now that we've built the data loaders, set batch_size arguments
@@ -171,9 +167,7 @@ def _train(
 
             # Autoresume
             if args.adlr_autoresume and iteration % args.adlr_autoresume_interval == 0:
-                check_adlr_autoresume_termination(
-                    iteration, model, optimizer, opt_param_scheduler
-                )
+                check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
             # Checkpointing
             if args.save and args.save_interval and iteration % args.save_interval == 0:
@@ -213,9 +207,7 @@ def finetune(
     timers("train/valid/test dataset/dataloder", log_level=0).start()
     if args.epochs > 0:
         train_dataset, valid_dataset = train_valid_datasets_provider()
-        train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
-            train_dataset, valid_dataset
-        )
+        train_dataloader, valid_dataloader = _build_train_valid_dataloaders(train_dataset, valid_dataset)
     timers("train/valid/test dataset/dataloder").stop()
 
     # Build calback function.
@@ -260,11 +252,7 @@ def finetune(
             }
             unwrap_model[0].module.backbone.load_state_dict(state_dict, strict=False)
         else:
-            raise Exception(
-                "pretrained checkpoint type {} not supported".format(
-                    args.pretrained_checkpoint_type
-                )
-            )
+            raise Exception("pretrained checkpoint type {} not supported".format(args.pretrained_checkpoint_type))
 
         # This is critical when only model is loaded. We should make sure
         # master parameters are also updated.

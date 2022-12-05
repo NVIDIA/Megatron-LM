@@ -67,19 +67,13 @@ class QQPDataset(GLUEAbstractDataset):
                         text_b = clean_text(row[4].strip())
                         label = int(row[5].strip())
                     else:
-                        print_rank_0(
-                            "***WARNING*** index error, " "skipping: {}".format(row)
-                        )
+                        print_rank_0("***WARNING*** index error, " "skipping: {}".format(row))
                         continue
                     if len(text_a) == 0:
-                        print_rank_0(
-                            "***WARNING*** zero length a, " "skipping: {}".format(row)
-                        )
+                        print_rank_0("***WARNING*** zero length a, " "skipping: {}".format(row))
                         continue
                     if len(text_b) == 0:
-                        print_rank_0(
-                            "***WARNING*** zero length b, " "skipping: {}".format(row)
-                        )
+                        print_rank_0("***WARNING*** zero length b, " "skipping: {}".format(row))
                         continue
                 assert label in LABELS
                 assert uid >= 0

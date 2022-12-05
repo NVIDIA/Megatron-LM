@@ -127,9 +127,7 @@ class Cityscapes(VisionDataset):
     classes = [
         CityscapesClass("unlabeled", 0, 19, "void", 0, False, True, (0, 0, 0)),
         CityscapesClass("ego vehicle", 1, 19, "void", 0, False, True, (0, 0, 0)),
-        CityscapesClass(
-            "rectification border", 2, 19, "void", 0, False, True, (0, 0, 0)
-        ),
+        CityscapesClass("rectification border", 2, 19, "void", 0, False, True, (0, 0, 0)),
         CityscapesClass("out of roi", 3, 19, "void", 0, False, True, (0, 0, 0)),
         CityscapesClass("static", 4, 19, "void", 0, False, True, (0, 0, 0)),
         CityscapesClass("dynamic", 5, 19, "void", 0, False, True, (111, 74, 0)),
@@ -138,32 +136,16 @@ class Cityscapes(VisionDataset):
         CityscapesClass("sidewalk", 8, 1, "flat", 1, False, False, (244, 35, 232)),
         CityscapesClass("parking", 9, 19, "flat", 1, False, True, (250, 170, 160)),
         CityscapesClass("rail track", 10, 19, "flat", 1, False, True, (230, 150, 140)),
-        CityscapesClass(
-            "building", 11, 2, "construction", 2, False, False, (70, 70, 70)
-        ),
-        CityscapesClass(
-            "wall", 12, 3, "construction", 2, False, False, (102, 102, 156)
-        ),
-        CityscapesClass(
-            "fence", 13, 4, "construction", 2, False, False, (190, 153, 153)
-        ),
-        CityscapesClass(
-            "guard rail", 14, 19, "construction", 2, False, True, (180, 165, 180)
-        ),
-        CityscapesClass(
-            "bridge", 15, 19, "construction", 2, False, True, (150, 100, 100)
-        ),
-        CityscapesClass(
-            "tunnel", 16, 19, "construction", 2, False, True, (150, 120, 90)
-        ),
+        CityscapesClass("building", 11, 2, "construction", 2, False, False, (70, 70, 70)),
+        CityscapesClass("wall", 12, 3, "construction", 2, False, False, (102, 102, 156)),
+        CityscapesClass("fence", 13, 4, "construction", 2, False, False, (190, 153, 153)),
+        CityscapesClass("guard rail", 14, 19, "construction", 2, False, True, (180, 165, 180)),
+        CityscapesClass("bridge", 15, 19, "construction", 2, False, True, (150, 100, 100)),
+        CityscapesClass("tunnel", 16, 19, "construction", 2, False, True, (150, 120, 90)),
         CityscapesClass("pole", 17, 5, "object", 3, False, False, (153, 153, 153)),
         CityscapesClass("polegroup", 18, 19, "object", 3, False, True, (153, 153, 153)),
-        CityscapesClass(
-            "traffic light", 19, 6, "object", 3, False, False, (250, 170, 30)
-        ),
-        CityscapesClass(
-            "traffic sign", 20, 7, "object", 3, False, False, (220, 220, 0)
-        ),
+        CityscapesClass("traffic light", 19, 6, "object", 3, False, False, (250, 170, 30)),
+        CityscapesClass("traffic sign", 20, 7, "object", 3, False, False, (220, 220, 0)),
         CityscapesClass("vegetation", 21, 8, "nature", 4, False, False, (107, 142, 35)),
         CityscapesClass("terrain", 22, 9, "nature", 4, False, False, (152, 251, 152)),
         CityscapesClass("sky", 23, 10, "sky", 5, False, False, (70, 130, 180)),
@@ -177,9 +159,7 @@ class Cityscapes(VisionDataset):
         CityscapesClass("train", 31, 16, "vehicle", 7, True, False, (0, 80, 100)),
         CityscapesClass("motorcycle", 32, 17, "vehicle", 7, True, False, (0, 0, 230)),
         CityscapesClass("bicycle", 33, 18, "vehicle", 7, True, False, (119, 11, 32)),
-        CityscapesClass(
-            "license plate", -1, -1, "vehicle", 7, False, True, (0, 0, 142)
-        ),
+        CityscapesClass("license plate", -1, -1, "vehicle", 7, False, True, (0, 0, 142)),
     ]
 
     # label2trainid
@@ -197,9 +177,7 @@ class Cityscapes(VisionDataset):
     ) -> None:
         super(Cityscapes, self).__init__(root, transforms, transform, target_transform)
         self.mode = "gtFine" if mode == "fine" else "gtCoarse"
-        self.images_dir = os.path.join(
-            self.root, "leftImg8bit_trainvaltest/leftImg8bit", split
-        )
+        self.images_dir = os.path.join(self.root, "leftImg8bit_trainvaltest/leftImg8bit", split)
         self.targets_dir = os.path.join(self.root, "gtFine_trainvaltest/gtFine", split)
         self.split = split
         self.resolution = resolution
@@ -210,9 +188,7 @@ class Cityscapes(VisionDataset):
             img_dir = os.path.join(self.images_dir, city)
             target_dir = os.path.join(self.targets_dir, city)
             for file_name in os.listdir(img_dir):
-                target_name = "{}_{}_labelIds.png".format(
-                    file_name.split("_leftImg8bit")[0], self.mode
-                )
+                target_name = "{}_{}_labelIds.png".format(file_name.split("_leftImg8bit")[0], self.mode)
                 self.images.append(os.path.join(img_dir, file_name))
                 self.targets.append(os.path.join(target_dir, target_name))
 

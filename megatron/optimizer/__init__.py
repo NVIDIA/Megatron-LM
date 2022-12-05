@@ -51,20 +51,14 @@ def get_param_groups(modules, no_weight_decay_cond, scale_lr_cond, lr_mult):
     if len(wd_scale_lr):
         param_groups.append({"params": wd_scale_lr, "wd_mult": 1.0, "lr_mult": lr_mult})
     if len(no_wd_no_scale_lr):
-        param_groups.append(
-            {"params": no_wd_no_scale_lr, "wd_mult": 0.0, "lr_mult": 1.0}
-        )
+        param_groups.append({"params": no_wd_no_scale_lr, "wd_mult": 0.0, "lr_mult": 1.0})
     if len(no_wd_scale_lr):
-        param_groups.append(
-            {"params": no_wd_scale_lr, "wd_mult": 0.0, "lr_mult": lr_mult}
-        )
+        param_groups.append({"params": no_wd_scale_lr, "wd_mult": 0.0, "lr_mult": lr_mult})
 
     return param_groups
 
 
-def get_megatron_optimizer(
-    model, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0
-):
+def get_megatron_optimizer(model, no_weight_decay_cond=None, scale_lr_cond=None, lr_mult=1.0):
     args = get_args()
 
     # Base optimizer.
@@ -124,11 +118,7 @@ def get_megatron_optimizer(
                 )
 
         # Megatron optimizer.
-        opt_ty = (
-            DistributedOptimizer
-            if args.use_distributed_optimizer
-            else Float16OptimizerWithFloat16Params
-        )
+        opt_ty = DistributedOptimizer if args.use_distributed_optimizer else Float16OptimizerWithFloat16Params
         return opt_ty(
             optimizer,
             args.clip_grad,

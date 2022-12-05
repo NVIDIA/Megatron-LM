@@ -7,9 +7,7 @@ import math
 import os
 import sys
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
-)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import glob
 import gzip
 import multiprocessing
@@ -78,10 +76,7 @@ class Encoder(object):
         for key in self.args.json_keys:
             text = data[key]
             max_len = 1000000
-            tokens_list = [
-                Encoder.splitter.tokenize(text[i : i + max_len])
-                for i in range(0, len(text), max_len)
-            ]
+            tokens_list = [Encoder.splitter.tokenize(text[i : i + max_len]) for i in range(0, len(text), max_len)]
             output[key] = [tokens for partial in tokens_list for tokens in partial]
         return json.dumps(output), len(json_line)
 
@@ -177,9 +172,7 @@ class Partition(object):
         proc_start = time.time()
         total_bytes_processed = 0
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(
-            encoded_docs, start=1
-        ):
+        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
             for key in doc.keys():
                 builders[key].add_doc(doc[key], sentence_lens[key])
@@ -199,9 +192,7 @@ def get_args():
         default=["text"],
         help="space separate listed of keys to extract from json",
     )
-    group.add_argument(
-        "--split-sentences", action="store_true", help="Split documents into sentences."
-    )
+    group.add_argument("--split-sentences", action="store_true", help="Split documents into sentences.")
     group.add_argument(
         "--keep-newlines",
         action="store_true",
@@ -221,12 +212,8 @@ def get_args():
         ],
         help="What type of tokenizer to use.",
     )
-    group.add_argument(
-        "--tokenizer-model", type=str, default=None, help="YTTM tokenizer model."
-    )
-    group.add_argument(
-        "--vocab-file", type=str, default=None, help="Path to the vocab file"
-    )
+    group.add_argument("--tokenizer-model", type=str, default=None, help="YTTM tokenizer model.")
+    group.add_argument("--vocab-file", type=str, default=None, help="Path to the vocab file")
     group.add_argument(
         "--merge-file",
         type=str,
@@ -251,17 +238,11 @@ def get_args():
         required=True,
         help="Path to binary output file without suffix",
     )
-    group.add_argument(
-        "--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"]
-    )
+    group.add_argument("--dataset-impl", type=str, default="mmap", choices=["lazy", "cached", "mmap"])
 
     group = parser.add_argument_group(title="runtime")
-    group.add_argument(
-        "--workers", type=int, default=1, help="Number of worker processes to launch"
-    )
-    group.add_argument(
-        "--partitions", type=int, default=1, help="Number of file partitions"
-    )
+    group.add_argument("--workers", type=int, default=1, help="Number of worker processes to launch")
+    group.add_argument("--partitions", type=int, default=1, help="Number of file partitions")
     group.add_argument(
         "--log-interval",
         type=int,
@@ -310,9 +291,7 @@ def main():
         if nltk_available:
             nltk.download("punkt", quiet=True)
         else:
-            raise Exception(
-                "nltk library required for sentence splitting is not available."
-            )
+            raise Exception("nltk library required for sentence splitting is not available.")
 
     in_ss_out_names = []
     if args.partitions == 1:
@@ -333,14 +312,10 @@ def main():
             in_ss_out_names.append(in_ss_out_name)
 
         # check to see if paritions were already created
-        partitions_present = check_files_exist(
-            in_ss_out_names, "partition", args.partitions
-        )
+        partitions_present = check_files_exist(in_ss_out_names, "partition", args.partitions)
 
         # check to see if paritions with split sentences already created
-        split_sentences_present = check_files_exist(
-            in_ss_out_names, "sentence_split", args.partitions
-        )
+        split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", args.partitions)
 
         if not partitions_present and not split_sentences_present:
             # populate .jsonl partition files from parent files
@@ -370,9 +345,7 @@ def main():
     partition = Partition(args, args.workers // args.partitions)
 
     # check to see if paritions with split sentences already created
-    split_sentences_present = check_files_exist(
-        in_ss_out_names, "sentence_split", args.partitions
-    )
+    split_sentences_present = check_files_exist(in_ss_out_names, "sentence_split", args.partitions)
 
     # split sentences in partition files
     if args.split_sentences and not split_sentences_present:
@@ -422,9 +395,7 @@ def main():
         )
         for name in in_ss_out_names:
             parition_output_prefix = name["output_prefix"]
-            full_partition_output_prefix = "{}_{}_{}".format(
-                parition_output_prefix, key, level
-            )
+            full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix, key, level)
             builders[key].merge_file_(full_partition_output_prefix)
         builders[key].finalize(output_idx_files[key])
 

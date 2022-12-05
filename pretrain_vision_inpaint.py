@@ -24,9 +24,7 @@ def model_provider(pre_process=True, post_process=True):
     elif args.vision_backbone_type == "mit":
         model = MitInpaintingModel(pre_process=pre_process, post_process=post_process)
     else:
-        raise Exception(
-            "{} vision backbone is not supported.".format(args.vision_backbone_type)
-        )
+        raise Exception("{} vision backbone is not supported.".format(args.vision_backbone_type))
     return model
 
 
@@ -51,9 +49,7 @@ def loss_func(images, masks, masked_images, outputs, collect_data=False):
 
     if not collect_data:
         mask_count = torch.count_nonzero(masks)
-        loss = F.mse_loss(
-            flip_masked_outputs, flip_masked_images.float(), reduction="sum"
-        )
+        loss = F.mse_loss(flip_masked_outputs, flip_masked_images.float(), reduction="sum")
         loss = loss / mask_count
         ssim = ssim_fun(flip_masked_outputs, flip_masked_images.float())
         psnr = psnr_fun(flip_masked_outputs, flip_masked_images.float())
@@ -117,9 +113,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     args = get_args()
 
     print_rank_0("> building train, validation, and test datasets " "for VIT ...")
-    train_ds, valid_ds = build_train_valid_datasets(
-        data_path=args.data_path, image_size=(args.img_h, args.img_w)
-    )
+    train_ds, valid_ds = build_train_valid_datasets(data_path=args.data_path, image_size=(args.img_h, args.img_w))
     print_rank_0("> finished creating VIT datasets ...")
 
     return train_ds, valid_ds, None

@@ -31,9 +31,7 @@ class MultipleChoice(MegatronModule):
             add_pooler=True,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(
-                args.init_method_std, args.num_layers
-            ),
+            scaled_init_method=scaled_init_method_normal(args.init_method_std, args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -91,9 +89,7 @@ class MultipleChoice(MegatronModule):
         add an extra key."""
 
         state_dict_ = {}
-        state_dict_[
-            self._language_model_key
-        ] = self.language_model.state_dict_for_save_checkpoint(
+        state_dict_[self._language_model_key] = self.language_model.state_dict_for_save_checkpoint(
             prefix=prefix, keep_vars=keep_vars
         )
         if self.post_process:
@@ -105,14 +101,10 @@ class MultipleChoice(MegatronModule):
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
 
-        self.language_model.load_state_dict(
-            state_dict[self._language_model_key], strict=strict
-        )
+        self.language_model.load_state_dict(state_dict[self._language_model_key], strict=strict)
         if self.post_process:
             if self._multichoice_head_key in state_dict:
-                self.multichoice_head.load_state_dict(
-                    state_dict[self._multichoice_head_key], strict=strict
-                )
+                self.multichoice_head.load_state_dict(state_dict[self._multichoice_head_key], strict=strict)
             else:
                 print_rank_last(
                     "***WARNING*** could not find {} in the checkpoint, "

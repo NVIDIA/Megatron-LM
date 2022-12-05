@@ -49,9 +49,7 @@ to accumulate the encoder_hidden_state gradient across skip connections
 """
 
 
-def model_provider(
-    pre_process=True, post_process=True, add_encoder=True, add_decoder=True
-):
+def model_provider(pre_process=True, post_process=True, add_encoder=True, add_decoder=True):
     """Build the model."""
 
     print_rank_0("building T5 model ...")

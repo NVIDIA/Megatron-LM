@@ -26,9 +26,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output, bias=Non
         input_parallel = input_
         model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
         async_grad_allreduce = (
-            args.async_tensor_model_parallel_allreduce
-            and model_parallel
-            and not args.sequence_parallel
+            args.async_tensor_model_parallel_allreduce and model_parallel and not args.sequence_parallel
         )
     else:
         input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
@@ -70,9 +68,7 @@ def get_language_model(
         init_method = init_method_normal(args.init_method_std)
 
     if scaled_init_method is None:
-        scaled_init_method = scaled_init_method_normal(
-            args.init_method_std, args.num_layers
-        )
+        scaled_init_method = scaled_init_method_normal(args.init_method_std, args.num_layers)
 
     # Language model.
     language_model = TransformerLanguageModel(
@@ -171,9 +167,7 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = "word_embeddings"
 
         # Position embedding (serial).
-        self.position_embeddings = torch.nn.Embedding(
-            max_sequence_length, self.hidden_size
-        )
+        self.position_embeddings = torch.nn.Embedding(max_sequence_length, self.hidden_size)
         self._position_embeddings_key = "position_embeddings"
         # Initialize the position embeddings.
         if args.perform_initialization:
@@ -185,9 +179,7 @@ class Embedding(MegatronModule):
         # token types and add them as needed.
         self._tokentype_embeddings_key = "tokentype_embeddings"
         if self.num_tokentypes > 0:
-            self.tokentype_embeddings = torch.nn.Embedding(
-                self.num_tokentypes, self.hidden_size
-            )
+            self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes, self.hidden_size)
             # Initialize the token-type embeddings.
             if args.perform_initialization:
                 self.init_method(self.tokentype_embeddings.weight)
@@ -217,9 +209,7 @@ class Embedding(MegatronModule):
         if self.tokentype_embeddings is not None:
             raise Exception("tokentype embeddings is already initialized")
         if torch.distributed.get_rank() == 0:
-            print(
-                "adding embedding for {} tokentypes".format(num_tokentypes), flush=True
-            )
+            print("adding embedding for {} tokentypes".format(num_tokentypes), flush=True)
         self.num_tokentypes = num_tokentypes
         self.tokentype_embeddings = torch.nn.Embedding(num_tokentypes, self.hidden_size)
         # Initialize the token-type embeddings.
@@ -258,16 +248,14 @@ class Embedding(MegatronModule):
         """For easy load."""
 
         state_dict_ = {}
-        state_dict_[self._word_embeddings_key] = self.word_embeddings.state_dict(
+        state_dict_[self._word_embeddings_key] = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
+        state_dict_[self._position_embeddings_key] = self.position_embeddings.state_dict(
             prefix=prefix, keep_vars=keep_vars
         )
-        state_dict_[
-            self._position_embeddings_key
-        ] = self.position_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
         if self.num_tokentypes > 0:
-            state_dict_[
-                self._tokentype_embeddings_key
-            ] = self.tokentype_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
+            state_dict_[self._tokentype_embeddings_key] = self.tokentype_embeddings.state_dict(
+                prefix=prefix, keep_vars=keep_vars
+            )
 
         return state_dict_
 
@@ -305,15 +293,12 @@ class Embedding(MegatronModule):
                 # for backward compatibility.
                 for key in state_dict.keys():
                     if "tokentype_embeddings" in key:
-                        state_dict_[key.split("tokentype_embeddings.")[1]] = state_dict[
-                            key
-                        ]
+                        state_dict_[key.split("tokentype_embeddings.")[1]] = state_dict[key]
             if len(state_dict_.keys()) > 0:
                 self.tokentype_embeddings.load_state_dict(state_dict_, strict=strict)
             else:
                 print(
-                    "***WARNING*** expected tokentype embeddings in the "
-                    "checkpoint but could not find it",
+                    "***WARNING*** expected tokentype embeddings in the " "checkpoint but could not find it",
                     flush=True,
                 )
 
@@ -421,9 +406,7 @@ class TransformerLanguageModel(MegatronModule):
             ), "input_tensor should only be length 1 for stage with both encoder and decoder"
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_encoder:
-            assert (
-                len(input_tensor) == 1
-            ), "input_tensor should only be length 1 for stage with only encoder"
+            assert len(input_tensor) == 1, "input_tensor should only be length 1 for stage with only encoder"
             self.encoder.set_input_tensor(input_tensor[0])
         elif self.add_decoder:
             if len(input_tensor) == 2:
@@ -455,18 +438,14 @@ class TransformerLanguageModel(MegatronModule):
 
         # Encoder embedding.
         if self.pre_process:
-            encoder_input = self.embedding(
-                enc_input_ids, enc_position_ids, tokentype_ids=tokentype_ids
-            )
+            encoder_input = self.embedding(enc_input_ids, enc_position_ids, tokentype_ids=tokentype_ids)
         else:
             encoder_input = None
 
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                encoder_output = self.encoder(
-                    encoder_input, enc_attn_mask, inference_params=inference_params
-                )
+                encoder_output = self.encoder(encoder_input, enc_attn_mask, inference_params=inference_params)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -510,28 +489,20 @@ class TransformerLanguageModel(MegatronModule):
 
         state_dict_ = {}
         if self.pre_process:
-            state_dict_[
-                self._embedding_key
-            ] = self.embedding.state_dict_for_save_checkpoint(
+            state_dict_[self._embedding_key] = self.embedding.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars
             )
         if self.add_encoder:
-            state_dict_[
-                self._encoder_key
-            ] = self.encoder.state_dict_for_save_checkpoint(
+            state_dict_[self._encoder_key] = self.encoder.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars
             )
         if self.post_process:
             if self.add_pooler:
-                state_dict_[
-                    self._pooler_key
-                ] = self.pooler.state_dict_for_save_checkpoint(
+                state_dict_[self._pooler_key] = self.pooler.state_dict_for_save_checkpoint(
                     prefix=prefix, keep_vars=keep_vars
                 )
         if self.add_decoder:
-            state_dict_[
-                self._decoder_key
-            ] = self.decoder.state_dict_for_save_checkpoint(
+            state_dict_[self._decoder_key] = self.decoder.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars
             )
 
@@ -570,9 +541,7 @@ class TransformerLanguageModel(MegatronModule):
             state_dict_self_attention = {}
             for key in state_dict_.keys():
                 if ".attention." in key:
-                    state_dict_self_attention[
-                        key.replace(".attention.", ".self_attention.")
-                    ] = state_dict_[key]
+                    state_dict_self_attention[key.replace(".attention.", ".self_attention.")] = state_dict_[key]
                 else:
                     state_dict_self_attention[key] = state_dict_[key]
             state_dict_ = state_dict_self_attention
@@ -582,13 +551,9 @@ class TransformerLanguageModel(MegatronModule):
         # Pooler.
         if self.post_process:
             if self.add_pooler:
-                assert (
-                    "pooler" in state_dict
-                ), "could not find data for pooler in the checkpoint"
+                assert "pooler" in state_dict, "could not find data for pooler in the checkpoint"
                 self.pooler.load_state_dict(state_dict[self._pooler_key], strict=strict)
         # Decoder.
         if self.add_decoder:
-            assert (
-                "decoder" in state_dict
-            ), "could not find data for pooler in the checkpoint"
+            assert "decoder" in state_dict, "could not find data for pooler in the checkpoint"
             self.decoder.load_state_dict(state_dict[self._decoder_key], strict=strict)
