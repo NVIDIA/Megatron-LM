@@ -4,20 +4,12 @@ import sys
 import torch
 
 from megatron import get_args, get_tokenizer, print_rank_0
-from megatron.checkpointing import (
-    fix_query_key_value_ordering,
-    get_checkpoint_name,
-    get_checkpoint_tracker_filename,
-)
+from megatron.checkpointing import fix_query_key_value_ordering, get_checkpoint_name, get_checkpoint_tracker_filename
 from megatron.core import mpu
 from megatron.model.bert_model import bert_position_ids
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import get_language_model
-from megatron.model.utils import (
-    get_linear_layer,
-    init_method_normal,
-    scaled_init_method_normal,
-)
+from megatron.model.utils import get_linear_layer, init_method_normal, scaled_init_method_normal
 
 from .module import MegatronModule
 

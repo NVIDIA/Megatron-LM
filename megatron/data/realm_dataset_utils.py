@@ -6,10 +6,7 @@ import torch
 
 from megatron import get_args, get_tokenizer, print_rank_0
 from megatron.core import mpu, tensor_parallel
-from megatron.data.dataset_utils import (
-    create_masked_lm_predictions,
-    pad_and_convert_to_numpy,
-)
+from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 
 
 def get_one_epoch_dataloader(dataset, micro_batch_size=None):

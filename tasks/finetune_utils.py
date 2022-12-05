@@ -11,12 +11,7 @@ from megatron import get_args, get_num_microbatches, get_timers, print_rank_0
 from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.core import mpu
 from megatron.model import ModelType
-from megatron.training import (
-    evaluate_and_print_results,
-    setup_model_and_optimizer,
-    train_step,
-    training_log,
-)
+from megatron.training import evaluate_and_print_results, setup_model_and_optimizer, train_step, training_log
 from megatron.utils import (
     average_losses_across_data_parallel_group,
     calc_params_l2_norm,

@@ -9,12 +9,7 @@ from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import get_language_model, parallel_lm_logits
 from megatron.model.transformer import LayerNorm
-from megatron.model.utils import (
-    get_linear_layer,
-    init_method_normal,
-    openai_gelu,
-    scaled_init_method_normal,
-)
+from megatron.model.utils import get_linear_layer, init_method_normal, openai_gelu, scaled_init_method_normal
 
 from .module import MegatronModule
 

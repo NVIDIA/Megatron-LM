@@ -14,10 +14,7 @@ from megatron.checkpointing import load_checkpoint
 from megatron.core import mpu
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
-from megatron.text_generation import (
-    beam_search_and_post_process,
-    generate_and_post_process,
-)
+from megatron.text_generation import beam_search_and_post_process, generate_and_post_process
 from megatron.text_generation_server import MegatronServer
 from megatron.training import get_model
 

@@ -10,12 +10,7 @@ from datetime import timedelta
 import numpy as np
 import torch
 
-from megatron import (
-    fused_kernels,
-    get_adlr_autoresume,
-    get_args,
-    get_tensorboard_writer,
-)
+from megatron import fused_kernels, get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.arguments import parse_args, validate_args
 from megatron.checkpointing import load_args_from_checkpoint
 from megatron.core import mpu, tensor_parallel

@@ -9,11 +9,7 @@ from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.model.enums import AttnMaskType, LayerType
 from megatron.model.transformer import ParallelTransformer
-from megatron.model.utils import (
-    get_linear_layer,
-    init_method_normal,
-    scaled_init_method_normal,
-)
+from megatron.model.utils import get_linear_layer, init_method_normal, scaled_init_method_normal
 
 from .module import MegatronModule
 

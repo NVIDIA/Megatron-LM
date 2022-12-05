@@ -10,10 +10,7 @@ from megatron import get_args
 from megatron.model.module import MegatronModule
 from megatron.model.vision.mit_backbone import mit_b3, mit_b5
 from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
-from tasks.vision.segmentation.seg_heads import (
-    SegformerSegmentationHead,
-    SetrSegmentationHead,
-)
+from tasks.vision.segmentation.seg_heads import SegformerSegmentationHead, SetrSegmentationHead
 
 
 class SetrSegmentationModel(MegatronModule):

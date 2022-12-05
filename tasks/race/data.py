@@ -6,11 +6,7 @@ import time
 from torch.utils.data import Dataset
 
 from megatron import print_rank_0
-from tasks.data_utils import (
-    build_sample,
-    build_tokens_types_paddings_from_ids,
-    clean_text,
-)
+from tasks.data_utils import build_sample, build_tokens_types_paddings_from_ids, clean_text
 
 NUM_CHOICES = 4
 MAX_QA_LENGTH = 128

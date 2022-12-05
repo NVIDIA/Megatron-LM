@@ -17,11 +17,7 @@ from megatron.utils import average_losses_across_data_parallel_group
 from pretrain_ict import get_group_world_size_rank
 from tasks.finetune_utils import finetune
 from tasks.orqa.evaluate_utils import ORQAEvaluator
-from tasks.orqa.supervised.eval_utils import (
-    accuracy_func_provider,
-    process_batch,
-    task_collate_fn,
-)
+from tasks.orqa.supervised.eval_utils import accuracy_func_provider, process_batch, task_collate_fn
 
 
 # input_ is a 2D tensor

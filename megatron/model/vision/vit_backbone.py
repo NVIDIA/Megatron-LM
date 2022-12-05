@@ -12,11 +12,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.model.module import MegatronModule
 from megatron.model.transformer import ParallelTransformer
-from megatron.model.utils import (
-    get_linear_layer,
-    init_method_normal,
-    scaled_init_method_normal,
-)
+from megatron.model.utils import get_linear_layer, init_method_normal, scaled_init_method_normal
 
 CLASS_TOKEN_LENGTH = 8
 

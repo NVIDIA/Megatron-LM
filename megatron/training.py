@@ -27,23 +27,14 @@ from megatron import (
 from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.core import mpu, tensor_parallel
 from megatron.data.data_samplers import build_pretraining_data_loader
-from megatron.initialize import (
-    initialize_megatron,
-    set_jit_fusion_options,
-    write_args_to_tensorboard,
-)
+from megatron.initialize import initialize_megatron, set_jit_fusion_options, write_args_to_tensorboard
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module, ModelType
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.optimizer import get_megatron_optimizer
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.schedules import get_forward_backward_func
-from megatron.utils import (
-    calc_params_l2_norm,
-    check_adlr_autoresume_termination,
-    report_memory,
-    unwrap_model,
-)
+from megatron.utils import calc_params_l2_norm, check_adlr_autoresume_termination, report_memory, unwrap_model
 
 
 def print_datetime(string):

@@ -8,10 +8,7 @@ from flask import Flask, current_app, jsonify, request
 from flask_restful import Api, Resource
 
 from megatron import get_args
-from megatron.text_generation import (
-    beam_search_and_post_process,
-    generate_and_post_process,
-)
+from megatron.text_generation import beam_search_and_post_process, generate_and_post_process
 
 GENERATE_NUM = 0
 BEAM_NUM = 1

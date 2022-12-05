@@ -11,12 +11,7 @@ from megatron.checkpointing import load_checkpoint, save_checkpoint
 from megatron.core import mpu
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module, ModelType
-from megatron.training import (
-    evaluate_and_print_results,
-    setup_model_and_optimizer,
-    train_step,
-    training_log,
-)
+from megatron.training import evaluate_and_print_results, setup_model_and_optimizer, train_step, training_log
 from megatron.utils import (
     average_losses_across_data_parallel_group,
     check_adlr_autoresume_termination,

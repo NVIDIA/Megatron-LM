@@ -16,10 +16,7 @@ from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel, ModelType
 from megatron.training import pretrain
-from megatron.utils import (
-    average_losses_across_data_parallel_group,
-    get_ltor_masks_and_position_ids,
-)
+from megatron.utils import average_losses_across_data_parallel_group, get_ltor_masks_and_position_ids
 
 
 def model_provider(pre_process=True, post_process=True):

@@ -6,12 +6,7 @@ import sys
 import mpu
 import torch
 import torch.nn.functional as F
-from commons import (
-    IdentityLayer,
-    initialize_distributed,
-    print_separator,
-    set_random_seed,
-)
+from commons import IdentityLayer, initialize_distributed, print_separator, set_random_seed
 from mpu.cross_entropy import vocab_parallel_cross_entropy
 
 sys.path.append("../..")

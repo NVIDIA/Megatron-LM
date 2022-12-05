@@ -18,11 +18,7 @@ from .mappings import (
     scatter_to_tensor_model_parallel_region,
 )
 from .random import checkpoint, get_cuda_rng_tracker, model_parallel_cuda_manual_seed
-from .utils import (
-    gather_split_1d_tensor,
-    split_tensor_along_last_dim,
-    split_tensor_into_1d_equal_chunks,
-)
+from .utils import gather_split_1d_tensor, split_tensor_along_last_dim, split_tensor_into_1d_equal_chunks
 
 __all__ = [
     # cross_entropy.py

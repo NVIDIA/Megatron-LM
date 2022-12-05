@@ -10,10 +10,7 @@ import torch.nn.functional as F
 from megatron import get_args, get_timers, print_rank_0
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model import ModelType
-from megatron.model.vision.classification import (
-    MitClassificationModel,
-    VitClassificationModel,
-)
+from megatron.model.vision.classification import MitClassificationModel, VitClassificationModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
