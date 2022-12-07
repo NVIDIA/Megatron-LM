@@ -41,7 +41,7 @@ def model_provider(pre_process=True, post_process=True):
 
     print_rank_0('building GPT model ...')
     model = GPTModel(num_tokentypes=0, parallel_output=False,
-                     pre_process=pre_process, post_process=post_process, 
+                     pre_process=pre_process, post_process=post_process,
                      return_moe_loss=False) # we need to set "return_moe_loss" for the inference_mode
     return model
 
@@ -102,7 +102,7 @@ def print_latency(latency_set, title=""):
         print("\tP95 Latency: {0:8.2f} ms".format(p95 * 1000))
         print("\tP99 Latency: {0:8.2f} ms".format(p99 * 1000))
         print("\t999 Latency: {0:8.2f} ms".format(p999 * 1000))
-        
+
 def main():
     """Main program."""
     latencies = []
@@ -115,7 +115,7 @@ def main():
                                        'no_load_optim': True})
 
     args = get_args()
-    
+
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -142,8 +142,8 @@ def main():
             generate_samples_interactive(model)
     else:
         generate_and_write_samples_unconditional(model, latencies, single_token_latency, model_latencies)
-    
-    
+
+
     #if torch.cuda.current_device() == 0:
     if torch.distributed.get_rank() == 0:
         print_latency(latencies)
@@ -154,13 +154,13 @@ def main():
 def ds_inference(model, args):
     import megatron.model as mm
     engine = deepspeed.init_inference(model=model,
-                                      mp_size=args.tensor_model_parallel_size, 
-                                      mpu=mpu,
+                                      mp_size=args.tensor_model_parallel_size,
+                                      tensor_parallel={"mpu": mpu},
                                       dtype=torch.half,
                                       replace_with_kernel_inject=True,
                                       moe_experts=args.num_experts,
                                       moe_type=args.mlp_type)
-    
+
     return engine.module
 
 if __name__ == "__main__":
