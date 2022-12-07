@@ -53,6 +53,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    untie_embeddings_and_output_weights: bool = False,
 ) -> None:
     """
     Initialize model data parallel groups.
@@ -92,6 +93,9 @@ def initialize_model_parallel(
             pipeline_model_parallel_size is 8 and
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
+
+        untie_embeddings_and_output_weights: whether to use separate embedding and output layer.
+                this affects the computation of embedding groups
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -200,13 +204,19 @@ def initialize_model_parallel(
         # Setup embedding group (to exchange gradients between
         # first and last stages).
         if len(ranks) > 1:
-            embedding_ranks = [ranks[0], ranks[-1]]
+            if untie_embeddings_and_output_weights:
+                embedding_ranks = [ranks[0]]
+            else:
+                embedding_ranks = [ranks[0], ranks[-1]]
             position_embedding_ranks = [ranks[0]]
             if pipeline_model_parallel_split_rank is not None:
                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
-                    embedding_ranks = [ranks[0],
-                                       ranks[pipeline_model_parallel_split_rank],
-                                       ranks[-1]]
+                    if untie_embeddings_and_output_weights:
+                        embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
+                    else:
+                        embedding_ranks = [ranks[0],
+                                        ranks[pipeline_model_parallel_split_rank],
+                                        ranks[-1]]
                 if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
                     position_embedding_ranks = [ranks[0],
                                        ranks[pipeline_model_parallel_split_rank]]

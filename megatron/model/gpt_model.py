@@ -57,6 +57,7 @@ class GPTModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
+        self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
         self.language_model, self._language_model_key = get_language_model(
             num_tokentypes=num_tokentypes,
@@ -90,7 +91,7 @@ class GPTModel(MegatronModule):
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
-                self.word_embeddings_weight(),
+                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
         else:
