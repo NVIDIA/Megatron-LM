@@ -541,8 +541,8 @@ class TransformerLanguageModel(MegatronModule):
                                                                  keep_vars=keep_vars)
             if self.untie_embeddings_and_output_weights:
                 state_dict_[self._output_layer_key] \
-                    = self.output_layer.state_dict_for_save_checkpoint(prefix=prefix,
-                                                                       keep_vars=keep_vars)
+                    = self.output_layer.state_dict(prefix=prefix, keep_vars=keep_vars)
+
         if self.add_decoder:
             state_dict_[self._decoder_key] \
                 = self.decoder.state_dict_for_save_checkpoint(prefix=prefix,
