@@ -277,20 +277,20 @@ def main(path_to_checkpoint, output_dir, print_checkpoint_structure):
 
     # Add tokenizer class info to config
     # see https://github.com/huggingface/transformers/issues/13906)
-    if ds_args is not None:
-        tokenizer_type = ds_args.tokenizer_type
-        if tokenizer_type == "GPT2BPETokenizer":
-            tokenizer_model_name = "gpt2"
-        elif tokenizer_type == "PretrainedFromHF":
-            tokenizer_model_name = ds_args.tokenizer_name_or_path
-        else:
-            raise ValueError(f"Unrecognized tokenizer_type {tokenizer_type}")
-    else:
-        tokenizer_model_name = "gpt2"
+    # if ds_args is not None:
+    #     tokenizer_type = ds_args.tokenizer_type
+    #     if tokenizer_type == "GPT2BPETokenizer":
+    #         tokenizer_model_name = "gpt2"
+    #     elif tokenizer_type == "PretrainedFromHF":
+    #         tokenizer_model_name = ds_args.tokenizer_name_or_path
+    #     else:
+    #         raise ValueError(f"Unrecognized tokenizer_type {tokenizer_type}")
+    # else:
+    #     tokenizer_model_name = "gpt2"
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
-    tokenizer_class = type(tokenizer).__name__
-    config.tokenizer_class = tokenizer_class
+    # tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
+    # tokenizer_class = type(tokenizer).__name__
+    # config.tokenizer_class = tokenizer_class
 
     # Save custom model
     GPT2CustomConfig.register_for_auto_class()

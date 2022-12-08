@@ -32,7 +32,7 @@ from transformers.utils import (
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers.models.gpt2.modeling_gpt2 import GPT2Model, GPT2Block, GPT2PreTrainedModel, GPT2LMHeadModel
-from tools.hf_transformers.configuration_gpt2_mq import GPT2CustomConfig, MULTI_QUERY, MULTI_HEAD
+from .configuration_gpt2_mq import GPT2CustomConfig, MULTI_QUERY, MULTI_HEAD
 
 
 
