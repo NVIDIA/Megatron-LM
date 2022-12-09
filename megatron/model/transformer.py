@@ -608,8 +608,12 @@ class ParallelAttention(MegatronModule):
              key_layer,
              value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
         elif self.attention_type == AttnType.self_attn and self.attention_head_type == 'multiquery':
+            kv_input=hidden_states
+            if get_args().sequence_parallel:
+                # The linear layer doesn't gather the sequence-parallel.
+                kv_input = mpu.gather_from_sequence_parallel_region(kv_input, tensor_parallel_output_grad=False)
             # Attention heads [sq, b, h] --> [sq, b, (2 * hn)]
-            mixed_kv_layer = self.key_value(hidden_states)
+            mixed_kv_layer = self.key_value(kv_input)
 
             # [sq, b, (2 * hn)] --> [sq, b, np (expanded), 2 * hn]
             # new_tensor_shape = mixed_kv_layer.size()[:-1] + \

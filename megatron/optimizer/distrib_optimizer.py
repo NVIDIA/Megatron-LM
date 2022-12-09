@@ -541,6 +541,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.allreduce_embedding_grads(args)
         timers('backward-embedding-all-reduce').stop()
 
+        # All-reduce key-value grads if needed.
+        if args.attention_head_type == "multiquery":
+            timers('backward-key-value-all-reduce').start()
+            self.allreduce_key_value_grads(args)
+            timers('backward-key-value-all-reduce').stop()
+
         # Reduce-scatter setup.
         timers('backward-params-all-reduce').start()
         data_parallel_rank = mpu.get_data_parallel_rank()

@@ -267,18 +267,28 @@ class MegatronOptimizer(ABC):
         self.allreduce_position_embedding_grads(args)
     
     def allreduce_key_value_grads(self, args):
-        # TODO: models[0] ?
-        unwrapped_model = self.models[0]
-        unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-        for layer in unwrapped_model.language_model.encoder.layers:
-            kv_weight = layer.self_attention.key_value.weight
-            if args.DDP_impl == 'local':
-                grad = kv_weight.main_grad
-            else:
-                grad = kv_weight.grad
-            torch.distributed.all_reduce(grad, group=mpu.get_tensor_model_parallel_group())
-
+        """
+        Reduce the gradients for the key_value weights and biases for multi-query attention.
+        Coalesce the bias grads to avoid too many small reductions,
+        but not the weight grads since it could cause memory issues.
+        """
+        grads=[]
+        for model_module in self.models:
+            unwrapped_model = unwrap_model(
+                    model_module, (torchDDP, LocalDDP, Float16Module))
+            for layer in unwrapped_model.language_model.encoder.layers:
+                kv_weight = layer.self_attention.key_value.weight
+                grad = kv_weight.main_grad if args.DDP_impl == 'local' else kv_weight.grad
+                torch.distributed.all_reduce(grad, group=mpu.get_tensor_model_parallel_group())
+                kv_bias = layer.self_attention.key_value.bias
+                grads.append(kv_bias.main_grad if args.DDP_impl == 'local' else kv_bias.grad)
+        if len(grads)>0:
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=mpu.get_tensor_model_parallel_group())
+            for buf, synced in zip(grads, _unflatten_dense_tensors(
+                    coalesced, grads)):
+                buf.copy_(synced)
 
     def allreduce_layernorm_grads(self, args):
         """All-reduce layernorm grads (for sequence parallelism)."""
