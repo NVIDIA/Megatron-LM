@@ -612,6 +612,9 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--use-flash-attn', action='store_true',
+                       help='use FlashAttention implementation of attention. '
+                       'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
