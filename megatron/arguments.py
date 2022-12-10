@@ -488,6 +488,10 @@ def _add_logging_args(parser):
     group.add_argument('--transformer-timers', action='store_true',
                         help="If set, activate the timers within the transformer layers."
                         "Only for debugging, as this slows down the model.")
+    group.add_argument('--structured-logs', action="store_true",
+                       help='Add timestamp and worker name to stdout and stderr.')
+    group.add_argument('--structured-logs-dir', type=str, default=None,
+                       help='Directory to save the logs.')
 
     return parser
 
@@ -836,6 +840,9 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--distributed-timeout', default=600, type=float,
+                       help='Timeout for distributed operations, in seconds. '
+                       'Should be at least as high as the dataset preprocessing ans checkpoint saving times.')
 
     return parser
 
