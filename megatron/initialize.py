@@ -134,7 +134,8 @@ def _compile_dependencies():
     if _is_rank_0():
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
-        fused_kernels.load(args)
+        if torch.cuda.device_count() > 0: # Skip when CPU-only
+            fused_kernels.load(args)
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
@@ -205,7 +206,7 @@ def _initialize_distributed():
             else:
                 args.local_rank = device
 
-        torch.cuda.set_device(device) 
+            torch.cuda.set_device(device) # only do so when device_count > 0
 
         # Call the init process
         init_method = 'tcp://'
@@ -247,7 +248,11 @@ def _set_random_seed(seed_):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
         # Ensure that different pipeline MP stages get different seeds.
-        seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
+        # No need to do so for CPU-only case.
+        if torch.cuda.device_count() == 0:
+            seed = seed_
+        else:
+            seed = seed_ + (100 * mpu.get_pipeline_model_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)

@@ -41,7 +41,7 @@ def scaled_init_method_normal(sigma, num_layers):
 
 def attention_mask_func(attention_scores, attention_mask):
     args = get_args()
-    if args.curriculum_learning:
+    if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
         attention_mask_ = attention_mask
         actual_seqlen = attention_scores.size()[2]
         if actual_seqlen != attention_mask_.size()[2]:

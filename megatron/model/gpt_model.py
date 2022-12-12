@@ -114,7 +114,7 @@ class GPTModel(MegatronModule):
                 # attention_mask has size [1, 1, seqlen, seqlen]
                 attention_mask = attention_mask[:, :, :curriculum_seqlen, :curriculum_seqlen].contiguous()
         else:
-            if args.curriculum_learning:
+            if args.curriculum_learning_legacy:
                 # If got a None input, need to reset curriculum_seqlen on user side
                 args.curriculum_seqlen = args.seq_length
 

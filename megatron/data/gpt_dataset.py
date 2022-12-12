@@ -21,7 +21,7 @@ import time
 import numpy as np
 import torch
 
-from megatron import mpu, is_rank_0, print_rank_0
+from megatron import mpu, is_rank_0, print_rank_0, get_args
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
 from megatron.data.dataset_utils import get_train_valid_test_split_
@@ -159,6 +159,8 @@ class GPTDataset(torch.utils.data.Dataset):
         return self.sample_idx.shape[0] - 1
 
     def __getitem__(self, idx):
+        args = get_args()
+        orig_idx = idx
         # Get the shuffled index.
         idx = self.shuffle_idx[idx]
         # Start and end documents and offsets.
@@ -183,7 +185,8 @@ class GPTDataset(torch.utils.data.Dataset):
                 self.doc_idx[doc_index_l],
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
-
+        if args.return_data_index:
+            return {'text': np.array(sample, dtype=np.int64), 'index': np.array([orig_idx], dtype=np.int64)}
         return {'text': np.array(sample, dtype=np.int64)}
 
 
@@ -195,6 +198,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
        training sample.
     shuffle-idx: maps the sample index into a random index into sample-idx.
     """
+    args = get_args()
     # Number of tokens in each epoch and number of required epochs.
     tokens_per_epoch = _num_tokens(documents, sizes)
     num_epochs = _num_epochs(tokens_per_epoch, seq_length, num_samples)
@@ -204,12 +208,25 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     # Filename of the index mappings.
     _filename = data_prefix
     _filename += '_{}_indexmap'.format(name)
-    _filename += '_{}ns'.format(num_samples)
+    if args.train_data_exact_num_epochs is not None and name == 'train':
+        num_epochs = args.train_data_exact_num_epochs
+        _filename += '_exact{}ep'.format(num_epochs)
+    else:
+        _filename += '_{}ns'.format(num_samples)
     _filename += '_{}sl'.format(seq_length)
     _filename += '_{}s'.format(seed)
     doc_idx_filename = _filename + '_doc_idx.npy'
     sample_idx_filename = _filename + '_sample_idx.npy'
     shuffle_idx_filename = _filename + '_shuffle_idx.npy'
+
+    if name == 'train':
+        # force to use certain index files
+        if args.train_doc_idx_path is not None:
+            doc_idx_filename = args.train_doc_idx_path
+        if args.train_sample_idx_path is not None:
+            sample_idx_filename = args.train_sample_idx_path
+        if args.train_shuffle_idx_path is not None:
+            shuffle_idx_filename = args.train_shuffle_idx_path
 
     # Build the indexed mapping if not exist.
     if is_rank_0():

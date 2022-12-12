@@ -12,9 +12,14 @@ If you have a custom infrastructure (e.g. HPC clusters) or Azure VM and VMSS bas
 
 Please see the ```MoE``` folder for different training recipes and scripts for Mixture-of-expert based models and dense models. These recipes are for GPT-style NLG models.
 
+### Data Efficiency 
+
+The ```data_efficiency``` folder includes GPT-3 and BERT pretraining examples for DeepSpeed Data Efficiency Library. Please refer to the detailed tutorials in data_efficiency/README.MD.
+
 ### Curriculum Learning
 
 Curriculum learning recipes are in the ```curriculum_learning``` folder. Please refer to the detailed tutorials linked inside. These recipes are for GPT-style NLG models.
+Note that the DeepSpeed Data Efficiency Library above includes a more general curriculum learning support. This legacy curriculum learning feature is still compatible, but we recommend using the DeepSpeed Data Efficiency Library above.
 
 ### Model Compression
 

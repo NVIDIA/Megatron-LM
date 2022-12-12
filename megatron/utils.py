@@ -231,7 +231,10 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     # The factor of 4 is when used with activation check-pointing,
     # otherwise it will be 3.
     checkpoint_activations_factor = 4 if args.checkpoint_activations else 3
-    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * args.seq_length * num_layers * (hidden_size**2)) * (1. + (args.seq_length / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+    seq_len = args.seq_length
+    if hasattr(args, 'actual_seq_length'):
+        seq_len = args.actual_seq_length
+    flops_per_iteration = (24 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
     tflops = flops_per_iteration / (elapsed_time_per_iter * args.world_size * (10**12))
     return samples_per_second, tflops, approx_parameters_in_billions
 

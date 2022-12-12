@@ -17,6 +17,7 @@
 
 from functools import partial
 
+import math
 import torch
 import torch.nn.functional as F
 
@@ -72,6 +73,28 @@ def get_batch(data_iterator):
 
     return tokens, types, sentence_order, loss_mask, lm_labels, padding_mask
 
+def data_post_process(data, data_sampler_state_dict):
+    args = get_args()
+    if args.data_efficiency_curriculum_learning:
+        if 'seqlen_truncate' in data_sampler_state_dict['current_difficulties']:
+            effective_seqlen = data_sampler_state_dict['current_difficulties']['seqlen_truncate']
+        else:
+            effective_seqlen = torch.count_nonzero(data['padding_mask'], dim=1)
+            effective_seqlen = torch.max(effective_seqlen).to(torch.cuda.current_device())
+            torch.distributed.all_reduce(effective_seqlen,
+                op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group())
+            effective_seqlen = effective_seqlen.item()
+        # Has to be multiple of 8 to enable Tensor Core acceleration
+        if effective_seqlen % 8 != 0:
+            effective_seqlen = math.ceil(effective_seqlen / 8) * 8
+        if effective_seqlen < args.seq_length:
+            data['text'] = data['text'][:, :effective_seqlen].contiguous()
+            data['types'] = data['types'][:, :effective_seqlen].contiguous()
+            data['loss_mask'] = data['loss_mask'][:, :effective_seqlen].contiguous()
+            data['labels'] = data['labels'][:, :effective_seqlen].contiguous()
+            data['padding_mask'] = data['padding_mask'][:, :effective_seqlen].contiguous()
+    return data
 
 def loss_func(loss_mask, sentence_order, output_tensor):
     lm_loss_, sop_logits = output_tensor
@@ -110,10 +133,8 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    effective_train_tokens = torch.count_nonzero(padding_mask)
-    torch.distributed.all_reduce(effective_train_tokens,
-        group=mpu.get_data_parallel_group())
-    args.consumed_train_tokens += effective_train_tokens.item()
+    if args.data_efficiency_curriculum_learning:
+        args.curriculum_seqlen = tokens.size()[1]
 
     if not args.bert_binary_head:
         types = None
@@ -150,4 +171,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 if __name__ == "__main__":
 
     pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
-             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'},
+             data_post_process=data_post_process)

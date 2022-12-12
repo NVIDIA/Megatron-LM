@@ -73,13 +73,14 @@ class BertDataset(torch.utils.data.Dataset):
         return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
+        args = get_args()
         start_idx, end_idx, seq_length = self.samples_mapping[idx]
         sample = [self.indexed_dataset[i] for i in range(start_idx, end_idx)]
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
         # We % 2**32 since numpy requres the seed to be between 0 and 2**32 - 1
         np_rng = np.random.RandomState(seed=((self.seed + idx) % 2**32))
-        return build_training_sample(sample, seq_length,
+        train_sample = build_training_sample(sample, seq_length,
                                      self.max_seq_length,  # needed for padding
                                      self.vocab_id_list,
                                      self.vocab_id_to_token_dict,
@@ -87,6 +88,9 @@ class BertDataset(torch.utils.data.Dataset):
                                      self.mask_id, self.pad_id,
                                      self.masked_lm_prob, np_rng,
                                      self.binary_head)
+        if args.return_data_index:
+            train_sample['index'] = np.array([idx], dtype=np.int64)
+        return train_sample
 
 
 
