@@ -205,7 +205,8 @@ def create_masked_lm_predictions(tokens,
                                  do_permutation=False,
                                  geometric_dist=False,
                                  masking_style="bert",
-                                 sampling_style=SamplingStyle.POISSON):
+                                 sampling_style=SamplingStyle.POISSON,
+                                 prefix_lm=False):
     """Creates the predictions for the masked LM objective.
     Note: Tokens here are vocab ids and not text tokens."""
     if not isinstance(sampling_style, SamplingStyle):
@@ -265,6 +266,10 @@ def create_masked_lm_predictions(tokens,
     for idx in range(len(cand_indexes)):
         ngram_index = []
         for n in ngrams:
+            if prefix_lm:
+                last_cand_index_index = min(idx + n - 1, len(cand_indexes) - 1)
+                if cand_indexes[last_cand_index_index][-1] < len(tokens) - 1:
+                    continue
             ngram_index.append(cand_indexes[idx:idx + n])
         ngram_indexes.append(ngram_index)
 
