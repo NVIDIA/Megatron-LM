@@ -19,6 +19,7 @@ import logging
 import logging.config
 import random
 import os
+import sys
 import time
 
 import numpy as np
@@ -149,6 +150,9 @@ def _configure_logging():
     # Add these methods so that stdout can be redirected to logging.
     logging.write = lambda msg: logging.info(msg) if msg != '\n' else None
     logging.flush = lambda : None
+
+    sys.stdout=logging
+    sys.stderr=logging
 
 
 
