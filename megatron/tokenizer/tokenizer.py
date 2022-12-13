@@ -298,7 +298,7 @@ class _SentencePieceTokenizer(AbstractTokenizer):
 
         import sentencepiece
         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
-        self._initalize(vocab_extra_ids)
+        self._initialize(vocab_extra_ids)
 
     def _populate_vocab(self):
         self._vocab = {}
@@ -309,7 +309,7 @@ class _SentencePieceTokenizer(AbstractTokenizer):
             self._inv_vocab[i] = t
             self._vocab[t] = i
 
-    def _initalize(self, vocab_extra_ids):
+    def _initialize(self, vocab_extra_ids):
         self._populate_vocab()
         self._special_tokens = {}
         self._inv_special_tokens = {}
