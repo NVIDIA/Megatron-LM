@@ -243,28 +243,11 @@ def _initialize_distributed():
             torch.cuda.set_device(device)
         # Include this torch.distributed.init_process_group() code in the `else` branch because
         # we do not want to reinitialize if torch.distributed.is_initialized() returns True
-        if "AGENT_STORE_HOST" in os.environ:
-            # This allows creating the store on an external server.
-            # This is needed when the master host address is not known in advance.
-            # Does not handle torch elastic restarts.
-            store = torch.distributed.TCPStore(
-                host_name=os.environ["AGENT_STORE_HOST"],
-                port=int(os.environ["AGENT_STORE_PORT"]),
-                world_size=0,
-                is_master=False,
-                timeout=timedelta(seconds=float(os.environ["AGENT_STORE_TIMEOUT"]))
-                    if "AGENT_STORE_TIMEOUT" in os.environ else None,
-            )
-        else:
-            store=None
-
         # Call the init process
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(seconds=args.distributed_timeout),
-            store=store,
-        )
+            timeout=timedelta(seconds=args.distributed_timeout))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
