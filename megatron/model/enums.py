@@ -16,6 +16,7 @@ class AttnType(enum.Enum):
 class AttnMaskType(enum.Enum):
     padding = 1
     causal = 2
+    prefix = 3
 
 # For backward compatibility with old model checkpoints
 from megatron.core.enums import ModelType

@@ -48,7 +48,8 @@ class GPTModel(MegatronModule):
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 prefix_lm=False):
         args = get_args()
         super().__init__(config=config, share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
@@ -62,7 +63,11 @@ class GPTModel(MegatronModule):
             config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
-            encoder_attn_mask_type=AttnMaskType.causal,
+            encoder_attn_mask_type=(
+                AttnMaskType.prefix
+                if prefix_lm
+                else AttnMaskType.causal
+            ),
             pre_process=self.pre_process,
             post_process=self.post_process)
         
