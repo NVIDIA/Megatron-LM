@@ -18,5 +18,10 @@ class AttnMaskType(enum.Enum):
     causal = 2
     prefix = 3
 
+class UL2ModelType(enum.Enum):
+    encoder_decoder = 'ED'
+    non_causal_decoder = 'ND'
+    causal_decoder = 'CD'
+
 # For backward compatibility with old model checkpoints
 from megatron.core.enums import ModelType

@@ -15,6 +15,8 @@ from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
 
+from megatron.model.enums import UL2ModelType
+
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
@@ -336,6 +338,17 @@ def validate_args(args, defaults={}):
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
+
+    args.ul2_model_type = UL2ModelType(args.ul2_model_type)
+    if (
+            args.ul2_model_type is not UL2ModelType.encoder_decoder
+            and args.decoder_seq_length is not None
+    ):
+        print(
+            f'WARNING: `--decoder_seq_length` is ignored when '
+            f'`--ul2-model-type` is not '
+            f'"{UL2ModelType.encoder_decoder.value}"!'
+        )
 
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
@@ -1308,6 +1321,11 @@ def _add_vision_args(parser):
 def _add_ul2_args(parser):
     group = parser.add_argument_group(title="UL2")
 
+    group.add_argument('--ul2-model-type', type=str, default='ED',
+                       choices=['ED', 'ND', 'CD'],
+                       help='What type of model to use for UL2 pretraining. '
+                       'ED = encoder-decoder; ND = non-causal decoder-only; '
+                       'CD = causal decoder-only')
     group.add_argument('--ul2-denoiser-ratios', nargs='+', type=float,
                        default=None,
                        help='Probability of each denoising objective to be '
