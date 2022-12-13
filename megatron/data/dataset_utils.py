@@ -18,6 +18,7 @@
 #   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
 # with some modifications.
 
+from enum import Enum
 import math
 import os
 import time
@@ -40,6 +41,11 @@ DSET_TYPE_T5  = 't5'
 DSET_TYPE_MULTIMODAL = 'multimodal'
 
 DSET_TYPES = [DSET_TYPE_BERT, DSET_TYPE_ICT, DSET_TYPE_T5, DSET_TYPE_MULTIMODAL]
+
+
+class SamplingStyle(Enum):
+    POISSON = 'poisson'
+    GEOMETRIC = 'geometric'
 
 
 def get_datasets_weights_and_num_samples(data_prefix,
@@ -196,9 +202,15 @@ def create_masked_lm_predictions(tokens,
                                  favor_longer_ngram=False,
                                  do_permutation=False,
                                  geometric_dist=False,
-                                 masking_style="bert"):
+                                 masking_style="bert",
+                                 sampling_style=SamplingStyle.POISSON):
     """Creates the predictions for the masked LM objective.
     Note: Tokens here are vocab ids and not text tokens."""
+    if not isinstance(sampling_style, SamplingStyle):
+        sampling_style = SamplingStyle(sampling_style)
+    # Backward-compatibility
+    if geometric_dist:
+        sampling_style = SamplingStyle.GEOMETRIC
 
     cand_indexes = []
     # Note(mingdachen): We create a list for recording if the piece is
@@ -237,7 +249,7 @@ def create_masked_lm_predictions(tokens,
                          max(1, int(round(len(tokens) * masked_lm_prob))))
 
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
-    if not geometric_dist:
+    if sampling_style is SamplingStyle.POISSON:
         # Note(mingdachen):
         # By default, we set the probilities to favor shorter ngram sequences.
         pvals = 1. / np.arange(1, max_ngrams + 1)
@@ -268,15 +280,17 @@ def create_masked_lm_predictions(tokens,
                 if index in covered_indexes:
                     continue
 
-        if not geometric_dist:
+        if sampling_style is SamplingStyle.POISSON:
             n = np_rng.choice(ngrams[:len(cand_index_set)],
                               p=pvals[:len(cand_index_set)] /
                               pvals[:len(cand_index_set)].sum(keepdims=True))
-        else:
+        elif sampling_style is SamplingStyle.GEOMETRIC:
             # Sampling "n" from the geometric distribution and clipping it to
             # the max_ngrams. Using p=0.2 default from the SpanBERT paper
             # https://arxiv.org/pdf/1907.10529.pdf (Sec 3.1)
             n = min(np_rng.geometric(0.2), max_ngrams)
+        else:
+            raise ValueError('unknown sampling style')
 
         index_set = sum(cand_index_set[n - 1], [])
         n -= 1
