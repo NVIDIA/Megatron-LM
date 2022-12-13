@@ -145,13 +145,8 @@ def build_training_sample(sample, target_seq_length,
     return train_sample
 
 
-def pad_and_convert_to_numpy(tokens, masked_positions,
-                             masked_labels, pad_id,
-                             max_seq_length, max_seq_length_dec,
-                             masked_spans=None, bos_id=None,
-                             eos_id=None, sentinel_tokens=None):
-    """Pad sequences and convert them to numpy."""
-
+def merge_subsequent_masks(tokens, masked_spans=None, bos_id=None,
+                           eos_id=None, sentinel_tokens=None):
     sentinel_tokens = collections.deque(sentinel_tokens)
     t5_input = []
     (t5_decoder_in, t5_decoder_out) = ([bos_id], [])
@@ -177,6 +172,18 @@ def pad_and_convert_to_numpy(tokens, masked_positions,
 
     # Add the remaining tokens to the t5 input
     t5_input.extend(tokens[start_index:])
+    return t5_input, t5_decoder_in, t5_decoder_out
+
+
+def pad_and_convert_to_numpy(tokens, masked_positions,
+                             masked_labels, pad_id,
+                             max_seq_length, max_seq_length_dec,
+                             masked_spans=None, bos_id=None,
+                             eos_id=None, sentinel_tokens=None):
+    """Pad sequences and convert them to numpy."""
+
+    t5_input, t5_decoder_in, t5_decoder_out = merge_subsequent_masks(
+        tokens, masked_spans, bos_id, eos_id, sentinel_tokens)
 
     # assert (len(t5_input) - len(masked_spans)) + \
     #        (len(t5_decoder_in) - (len(masked_spans) + 1)) == len(tokens)
