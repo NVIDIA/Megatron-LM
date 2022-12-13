@@ -32,7 +32,15 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _SentencePieceTokenizer(
+            args.tokenizer_model,
+            vocab_extra_ids=args.vocab_extra_ids,
+            ul2_denoiser_tokens=[
+                args.ul2_r_denoiser_token,
+                args.ul2_s_denoiser_token,
+                args.ul2_x_denoiser_token,
+            ],
+        )
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
@@ -292,13 +300,13 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 class _SentencePieceTokenizer(AbstractTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file, vocab_extra_ids=0):
+    def __init__(self, model_file, vocab_extra_ids=0, ul2_denoiser_tokens=[]):
         name = 'SentencePieceTokenizer'
         super().__init__(name)
 
         import sentencepiece
         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
-        self._initialize(vocab_extra_ids)
+        self._initialize(vocab_extra_ids, ul2_denoiser_tokens)
 
     def _populate_vocab(self):
         self._vocab = {}
@@ -309,12 +317,13 @@ class _SentencePieceTokenizer(AbstractTokenizer):
             self._inv_vocab[i] = t
             self._vocab[t] = i
 
-    def _initialize(self, vocab_extra_ids):
+    def _initialize(self, vocab_extra_ids, ul2_denoiser_tokens):
         self._populate_vocab()
         self._special_tokens = {}
         self._inv_special_tokens = {}
 
         self._t5_tokens = []
+        self._ul2_tokens = []
 
         def _add_special_token(t):
             if t not in self._vocab:
@@ -361,6 +370,10 @@ class _SentencePieceTokenizer(AbstractTokenizer):
             t = "<extra_id_{}>".format(i)
             _add_special_token(t)
             self._t5_tokens += [t]
+
+        for t in ul2_denoiser_tokens:
+            _add_special_token(t)
+            self._ul2_tokens.append(t)
 
     @property
     def vocab_size(self):
@@ -462,6 +475,11 @@ class _SentencePieceTokenizer(AbstractTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return [self.vocab[k] for k in self._t5_tokens]
+
+    @property
+    def ul2_token_ids(self):
+        return [self.vocab[k] for k in self._ul2_tokens]
+
 
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
