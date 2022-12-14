@@ -17,7 +17,7 @@
 # train_iters_in_million=2
 # ltd_enabled="true"
 # ltd_start=200
-# ltd_step_in_million=1.8
+# ltd_step_in_million=18e-1
 # dropout=0
 # cl_enabled="true"
 # cl_num_metric=2
@@ -28,7 +28,7 @@
 # cl_1st_clustering_type="schedule_based"
 # cl_1st_min=600
 # cl_1st_max=9069
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=1
 # cl_1st_root=2
 # cl_2nd_metric="seqlen_truncate"
@@ -38,7 +38,7 @@
 # cl_2nd_clustering_type="single_cluster"
 # cl_2nd_min=128
 # cl_2nd_max=512
-# cl_2nd_total_step_in_million=0.96
+# cl_2nd_total_step_in_million=96e-2
 # cl_2nd_difficulty_step=8
 # cl_2nd_root=1
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -55,10 +55,10 @@
 ### Random layerwise token dropping (random-LTD).
 ## random-LTD 723B tokens (69%):
 # lr=1.45e-4
-# train_iters_in_million=1.38
+# train_iters_in_million=138e-2
 # ltd_enabled="true"
 # ltd_start=200
-# ltd_step_in_million=1.8
+# ltd_step_in_million=18e-1
 # dropout=0
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
 #     ${ltd_enabled} ${ltd_start} ${ltd_step_in_million} ${dropout}
@@ -66,11 +66,11 @@
 ### Curriculum learning (CL).
 ## CL vocab rarity 734B tokens (70%):
 # lr=1.4e-4
-# train_iters_in_million=1.4
+# train_iters_in_million=14e-1
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=1
 # cl_1st_metric="voc"
@@ -80,7 +80,7 @@
 # cl_1st_clustering_type="schedule_based"
 # cl_1st_min=600
 # cl_1st_max=9069
-# cl_1st_total_step_in_million=0.7
+# cl_1st_total_step_in_million=7e-1
 # cl_1st_difficulty_step=1
 # cl_1st_root=2
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -97,7 +97,7 @@
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=2
 # cl_1st_metric="voc"
@@ -107,7 +107,7 @@
 # cl_1st_clustering_type="schedule_based"
 # cl_1st_min=600
 # cl_1st_max=9069
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=1
 # cl_1st_root=2
 # cl_2nd_metric="seqlen_truncate"
@@ -117,7 +117,7 @@
 # cl_2nd_clustering_type="single_cluster"
 # cl_2nd_min=128
 # cl_2nd_max=512
-# cl_2nd_total_step_in_million=0.96
+# cl_2nd_total_step_in_million=96e-2
 # cl_2nd_difficulty_step=8
 # cl_2nd_root=1
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -137,7 +137,7 @@
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=1
 # cl_1st_metric="seqlenvocabrarity"
@@ -147,7 +147,7 @@
 # cl_1st_clustering_type="schedule_based"
 # cl_1st_min=5
 # cl_1st_max=100
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=1
 # cl_1st_root=2
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -164,7 +164,7 @@
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=1
 # cl_1st_metric="voc"
@@ -174,7 +174,7 @@
 # cl_1st_clustering_type="schedule_based"
 # cl_1st_min=600
 # cl_1st_max=9069
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=1
 # cl_1st_root=2
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -191,7 +191,7 @@
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=1
 # cl_1st_metric="seqlen_truncate"
@@ -201,7 +201,7 @@
 # cl_1st_clustering_type="single_cluster"
 # cl_1st_min=128
 # cl_1st_max=512
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=8
 # cl_1st_root=1
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
@@ -218,7 +218,7 @@
 # ltd_enabled="false"
 # ltd_start=512
 # ltd_step_in_million=1
-# dropout=0.1
+# dropout=1e-1
 # cl_enabled="true"
 # cl_num_metric=1
 # cl_1st_metric="seqlen"
@@ -228,7 +228,7 @@
 # cl_1st_clustering_type="single_cluster"
 # cl_1st_min=5
 # cl_1st_max=100
-# cl_1st_total_step_in_million=0.96
+# cl_1st_total_step_in_million=96e-2
 # cl_1st_difficulty_step=8
 # cl_1st_root=2
 # bash ds_pretrain_bert_336M_base_script.sh ${lr} ${train_iters_in_million} \
