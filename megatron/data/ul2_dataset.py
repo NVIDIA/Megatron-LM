@@ -159,12 +159,17 @@ def build_training_sample(sample, target_seq_length,
     tokens = [token for sentence in sample for token in sentence]
 
     max_num_tokens = target_seq_length
-    # Keep space for repeated `extra_id` tokens; not the most data
-    # efficient since we calculate this based on the maximum number
-    # of possible `extra_id` tokens.
-    safe_max_seq_len = math.floor(max_num_tokens / (1 + masked_lm_prob))
-    truncated = len(tokens) > safe_max_seq_len
-    tokens = tokens[:safe_max_seq_len]
+    # if is_decoder_only(model_type):
+    #     # Keep space for repeated `extra_id` tokens; not the most data
+    #     # efficient since we calculate this based on the maximum number
+    #     # of possible `extra_id` tokens.
+    #     safe_max_seq_len = math.floor(max_num_tokens / (1 + masked_lm_prob))
+    #     truncated = len(tokens) > safe_max_seq_len
+    #     tokens = tokens[:safe_max_seq_len]
+    # else:
+    # Truncate to `target_sequence_length`.
+    truncated = len(tokens) > max_num_tokens
+    tokens = tokens[:max_num_tokens]
 
     # Prepend objective token.
     cls_id = cls_ids.get(denoiser)
