@@ -13,6 +13,7 @@ from megatron.data.dataset_utils import (
     SamplingStyle
 )
 from megatron.data.t5_dataset import (
+    LengthExceededError,
     make_history_mask,
     merge_subsequent_masks,
     pad_and_convert_to_numpy,
@@ -221,6 +222,9 @@ def build_training_sample(sample, target_seq_length,
             np.array([sep_id], dtype=np.int64),
             labels,
         ])
+
+        if max_seq_length - len(tokens) < 0:
+            raise LengthExceededError()
 
         loss_mask = np.zeros(len(tokens), dtype=np.int64)
         loss_mask[-num_labels:] = 1
