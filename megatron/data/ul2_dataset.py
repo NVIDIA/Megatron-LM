@@ -216,17 +216,17 @@ def build_training_sample(sample, target_seq_length,
 
         # Move BOS token to start of sequence.
         tokens_dec_in = tokens_dec_in[1:]
-        tokens = np.concatenate([
-            np.array([bos_id], dtype=np.int64),
-            tokens_enc,
-            np.array([sep_id], dtype=np.int64),
-            tokens_dec_in,
-        ])
-        labels = np.concatenate([
-            tokens_enc,
-            np.array([sep_id], dtype=np.int64),
-            labels,
-        ])
+        tokens = np.array((
+            [bos_id]
+            + tokens_enc
+            + [sep_id]
+            + tokens_dec_in
+        ), dtype=np.int64)
+        labels = np.array((
+            tokens_enc
+            + [sep_id]
+            + labels
+        ), dtype=np.int64)
 
         if max_seq_length - len(tokens) < 0:
             raise LengthExceededError()
