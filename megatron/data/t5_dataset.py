@@ -13,6 +13,27 @@ from megatron.data.dataset_utils import (
     get_samples_mapping
 )
 
+
+class LengthExceededError(ValueError):
+    def __init__(self, msg=None):
+        if msg is None:
+            msg = (
+                'The sequence input became too long. '
+                'Try to increase `--seq-length` or `--encoder-seq-length`.'
+            )
+        super().__init__(msg)
+
+
+class DecoderLengthExceededError(ValueError):
+    def __init__(self, msg=None):
+        if msg is None:
+            msg = (
+                'The sequence input for the decoder became too long. '
+                'Try to increase `--decoder-seq-length`.'
+            )
+        super().__init__(msg)
+
+
 class T5Dataset(torch.utils.data.Dataset):
 
     def __init__(self, name, indexed_dataset, data_prefix,
@@ -193,7 +214,8 @@ def pad_and_convert_to_numpy(tokens, masked_positions,
     # Encoder-side padding mask.
     num_tokens = len(t5_input)
     padding_length = max_seq_length - num_tokens
-    assert padding_length >= 0
+    if padding_length < 0:
+        raise LengthExceededError()
     assert len(masked_positions) == len(masked_labels)
 
     # Tokens..
@@ -203,7 +225,8 @@ def pad_and_convert_to_numpy(tokens, masked_positions,
     # Decoder-side padding mask.
     num_tokens_dec = len(t5_decoder_in)
     padding_length_dec = max_seq_length_dec - num_tokens_dec
-    assert padding_length_dec >= 0
+    if padding_length_dec < 0:
+        raise DecoderLengthExceededError()
     filler_dec = [pad_id] * padding_length_dec
     tokens_dec_in = np.array(t5_decoder_in + filler_dec, dtype=np.int64)
 
