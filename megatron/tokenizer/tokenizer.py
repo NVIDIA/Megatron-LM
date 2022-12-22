@@ -480,6 +480,15 @@ class _HFTokenizer(AbstractTokenizer):
         return self.tokenizer.decode(token_ids)
 
     @property
+    def bos(self):
+        return self.bos_token_id
+
+    @property
+    def bos_token_id(self):
+        candidate = self.tokenizer.eos_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
     def cls(self):
         candidate = self.tokenizer.cls_token_id
         return self._check_token_candidate(candidate)
@@ -496,6 +505,15 @@ class _HFTokenizer(AbstractTokenizer):
 
     @property
     def eod(self):
+        candidate = self.tokenizer.eos_token_id
+        return self._check_token_candidate(candidate)
+
+    @property
+    def eos(self):
+        return self.eos_token_id
+
+    @property
+    def eos_token_id(self):
         candidate = self.tokenizer.eos_token_id
         return self._check_token_candidate(candidate)
 
