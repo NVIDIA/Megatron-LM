@@ -17,7 +17,7 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    if args.tokenizer_type != 'SentencePieceTokenizer':
+    if args.tokenizer_type not in ['SentencePieceTokenizer', 'HFTokenizer']:
         assert args.vocab_file is not None
 
     # Select and instantiate the tokenizer.
