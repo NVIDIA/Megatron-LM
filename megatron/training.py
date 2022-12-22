@@ -26,6 +26,7 @@ from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import ModelType
+from megatron.model import GPTModel
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -250,6 +251,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if not isinstance(model, list):
         model = [model]
+
+    # Disallow training and inference with Transformer Engine
+    # for non-GPT models
+    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+        'Transformer Engine is only approved for GPT models'
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these

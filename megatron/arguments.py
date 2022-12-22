@@ -28,6 +28,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
+    parser = _add_transformer_engine_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -304,6 +305,18 @@ def validate_args(args, defaults={}):
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
+    # Tranformer-Engine/FP8 related checking
+    if args.fp8_e4m3 or args.fp8_hybrid:
+        assert args.transformer_impl == 'transformer_engine', \
+            'transformer-engine required for fp8 training and inference'
+
+    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
+        'cannot train with both fp8 e4m3 and hybrid formatting'
+
+    if args.fp16:
+        assert args.transformer_impl == 'local', \
+            'transformer-engine not yet approved for fp16 training and inference'
+
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
@@ -354,6 +367,33 @@ def _print_args(args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
+
+def _add_transformer_engine_args(parser):
+    group = parser.add_argument_group(title='Transformer-Engine')
+
+    group.add_argument('--fp8-e4m3', action='store_true',
+                        help='E4M3 TransformerLayer', dest='fp8_e4m3')
+    group.add_argument('--fp8-hybrid', action='store_true',
+                        help='Hybrid FP8 TransformerLayer', dest='fp8_hybrid')
+    group.add_argument('--no-fp8-wgrad', action='store_false',
+                        help='Execute wgrad in higher precision even for FP8 runs', dest='fp8_wgrad')
+    group.add_argument('--fp8-margin', type=int, default=0,
+                        help='Scaling margin for fp8', dest='fp8_margin')
+    group.add_argument('--fp8-interval', type=int, default=1,
+                        help='Scaling update interval for fp8', dest='fp8_interval')
+    group.add_argument('--transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.',
+                       dest='transformer_impl')
+    group.add_argument('--fp8-amax-history-len', type=int, default=1,
+                        help='Number of steps for which amax history is recorded per tensor',
+                        dest='fp8_amax_history_len')
+    group.add_argument('--fp8-amax-compute-algo', default='most_recent',
+                       choices=['most_recent', 'max'],
+                       help='Algorithm for computing amax from history',
+                       dest='fp8_amax_compute_algo')
+
+    return parser
 
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
