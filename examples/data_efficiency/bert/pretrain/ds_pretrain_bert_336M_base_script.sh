@@ -300,7 +300,7 @@ data_options=" \
 megatron_options=" \
     --override-lr-scheduler \
     --adam-beta1 0.9 \
-    --adam-beta2 0.95 \
+    --adam-beta2 0.999 \
     --tensor-model-parallel-size ${mp_size} \
     --init-method-std ${init_std} \
     --lr-decay-tokens ${lr_decay_tokens} \
