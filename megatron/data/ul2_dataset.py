@@ -217,27 +217,35 @@ def build_training_sample(sample, target_seq_length,
 
         # Move BOS token to start of sequence.
         tokens_dec_in = tokens_dec_in[1:]
-        tokens = np.array((
+        tokens = (
             [bos_id]
             + tokens_enc
             + [sep_id]
             + tokens_dec_in
-        ), dtype=np.int64)
+        )
+
+        # Pad and convert to NumPy.
+        padding_length = max_seq_length - len(tokens)
+        if padding_length < 0:
+            raise LengthExceededError()
+        filler = [pad_id] * padding_length
+
+        tokens = np.array(tokens + filler, dtype=np.int64)
         labels = np.array((
             tokens_enc
             + [sep_id]
             + labels
+            + filler
         ), dtype=np.int64)
 
-        if max_seq_length - len(tokens) < 0:
-            raise LengthExceededError()
-
         loss_mask = np.zeros(len(tokens), dtype=np.int64)
-        loss_mask[-num_labels:] = 1
+        labels_start_neg_index = -(num_labels + padding_length)
+        labels_end_neg_index = -padding_length if padding_length > 0 else None
+        loss_mask[labels_start_neg_index:labels_end_neg_index] = 1
 
         dec_mask = make_history_mask(tokens)
         if is_prefix_lm(model_type):
-            dec_mask[:-num_labels, :-num_labels] = 1
+            dec_mask[:labels_start_neg_index, :labels_start_neg_index] = 1
 
         train_sample = {
             'text': tokens,
