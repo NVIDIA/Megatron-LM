@@ -203,7 +203,7 @@ def build_training_sample(sample, target_seq_length,
     if is_decoder_only(model_type):
         # Concatenate to one sequence.
         tokens_enc, tokens_dec_in, labels = merge_subsequent_masks(
-            tokens, masked_spans, bos_id, eos_id, sentinel_tokens)
+            tokens, masked_spans, bos_id, eos_id, sentinel_tokens, prefix_lm)
 
         # Move EOS tokens to end of sequence.
         while tokens_enc[-1] == eos_id:
@@ -251,7 +251,8 @@ def build_training_sample(sample, target_seq_length,
             = pad_and_convert_to_numpy(tokens, masked_positions,
                                        masked_labels, pad_id, max_seq_length,
                                        max_seq_length_dec, masked_spans,
-                                       bos_id, eos_id, sentinel_tokens)
+                                       bos_id, eos_id, sentinel_tokens,
+                                       prefix_lm)
 
         train_sample = {
             'text_enc': tokens_enc,

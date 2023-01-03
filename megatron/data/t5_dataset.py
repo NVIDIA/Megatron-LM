@@ -167,23 +167,30 @@ def build_training_sample(sample, target_seq_length,
 
 
 def merge_subsequent_masks(tokens, masked_spans=None, bos_id=None,
-                           eos_id=None, sentinel_tokens=None):
-    sentinel_tokens = collections.deque(sentinel_tokens)
+                           eos_id=None, sentinel_tokens=None,
+                           prefix_lm=False):
+    if prefix_lm:
+        assert len(masked_spans) <= 1, \
+            'Received more than one masked span for PrefixLM masking'
+    else:
+        sentinel_tokens = collections.deque(sentinel_tokens)
     t5_input = []
     (t5_decoder_in, t5_decoder_out) = ([bos_id], [])
     (start_index, end_index) = (0, None)
     for span in masked_spans:
-        flag = sentinel_tokens.popleft()
+        if not prefix_lm:
+            flag = sentinel_tokens.popleft()
 
-        # Append the same tokens in decoder input and output
-        t5_decoder_in.append(flag)
+            # Append the same tokens in decoder input and output
+            t5_decoder_in.append(flag)
+            t5_decoder_out.append(flag)
         t5_decoder_in.extend(span.label)
-        t5_decoder_out.append(flag)
         t5_decoder_out.extend(span.label)
 
         end_index = span.index[0]
         t5_input.extend(tokens[start_index: end_index])
-        t5_input.append(flag)
+        if not prefix_lm:
+            t5_input.append(flag)
 
         # the next start index is the token after the last span token
         start_index = span.index[-1] + 1
@@ -200,11 +207,12 @@ def pad_and_convert_to_numpy(tokens, masked_positions,
                              masked_labels, pad_id,
                              max_seq_length, max_seq_length_dec,
                              masked_spans=None, bos_id=None,
-                             eos_id=None, sentinel_tokens=None):
+                             eos_id=None, sentinel_tokens=None,
+                             prefix_lm=False):
     """Pad sequences and convert them to numpy."""
 
     t5_input, t5_decoder_in, t5_decoder_out = merge_subsequent_masks(
-        tokens, masked_spans, bos_id, eos_id, sentinel_tokens)
+        tokens, masked_spans, bos_id, eos_id, sentinel_tokens, prefix_lm)
 
     # assert (len(t5_input) - len(masked_spans)) + \
     #        (len(t5_decoder_in) - (len(masked_spans) + 1)) == len(tokens)
