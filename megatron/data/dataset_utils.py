@@ -272,6 +272,10 @@ def create_masked_lm_predictions(tokens,
                 if cand_indexes[last_cand_index_index][-1] < len(tokens) - 1:
                     continue
             ngram_index.append(cand_indexes[idx:idx + n])
+            if prefix_lm:
+                # No need to go further – we would only produce
+                # duplicate entries by continuing for this `idx`.
+                break
         ngram_indexes.append(ngram_index)
 
     np_rng.shuffle(ngram_indexes)
