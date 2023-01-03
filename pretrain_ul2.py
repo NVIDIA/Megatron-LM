@@ -99,6 +99,7 @@ def get_batch(data_iterator):
         loss_mask = data_b['loss_mask'].float()
 
         dec_mask = (data_b['dec_mask'] < 0.5)
+        dec_mask = dec_mask.unsqueeze(1)
         return tokens, loss_mask, labels, dec_mask
     else:
         tokens_enc = data_b['text_enc'].long()
