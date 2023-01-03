@@ -124,6 +124,8 @@ def build_training_sample(sample, target_seq_length,
         target_seq_length: Desired sequence length.
         max_seq_length: Maximum length of the sequence. All values are padded to
             this length.
+        max_seq_length_dec: Maximum length of the decoder input sequence. All
+            values are padded to this length.
         vocab_id_list: List of vocabulary ids. Used to pick a random id.
         vocab_id_to_token_dict: A dictionary from vocab ids to text tokens.
         cls_ids: Start of example ids.
