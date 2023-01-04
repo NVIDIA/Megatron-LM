@@ -386,8 +386,6 @@ class ParallelAttention(MegatronModule):
                                                           'self-attention for now')
             assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
                                                                 'supports causal mask for now')
-            headdim = args.hidden_size / args.num_attention_heads
-            assert headdim <= 128, 'FlashAttention only supports head dimension at most 128'
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
 
