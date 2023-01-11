@@ -143,6 +143,14 @@ def validate_args(args, defaults={}):
     else:
         args.virtual_pipeline_model_parallel_size = None
 
+    if args.custom_pipeline_stages is not None:
+        assert args.num_layers_per_virtual_pipeline_stage is None, \
+            'virtual pipeline is not allowed when custom pipeline distribution is in use'
+        assert len(args.custom_pipeline_stages) == args.pipeline_model_parallel_size, \
+            'length of custom_pipeline_stages must be equal to pipeline_model_parallel_size'
+        assert sum(args.custom_pipeline_stages) == args.num_layers, \
+            'sum of custom_pipeline_stages must be equal to num_layers'
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -789,6 +797,10 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--custom-pipeline-stages', nargs='+', type=int, default=None,
+                       help='Customized number of layers per pipeline stage, '
+                       'e.g. 6 7 7 4 for a 4-stage pipeline. '
+                       'Incompatible with --num-layers-per-virtual-pipeline-stage.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

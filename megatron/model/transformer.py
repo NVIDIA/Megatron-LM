@@ -860,6 +860,8 @@ class ParallelTransformer(MegatronModule):
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
                     mpu.get_pipeline_model_parallel_world_size() > 1:
+                assert args.custom_pipeline_stages is not None, \
+                    'custom pipeline is not supported with encoder_and_decoder type'
                 pipeline_rank = mpu.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
@@ -867,7 +869,11 @@ class ParallelTransformer(MegatronModule):
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                if args.custom_pipeline_stages is not None:
+                    offset = sum(([0]+args.custom_pipeline_stages)[:mpu.get_pipeline_model_parallel_rank()+1])
+                    self.num_layers = args.custom_pipeline_stages[mpu.get_pipeline_model_parallel_rank()] 
+                else:
+                    offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
