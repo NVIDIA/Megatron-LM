@@ -10,4 +10,6 @@ class TestTransformerConfig:
 
         assert transformer_config.hidden_size == 2
         assert transformer_config.ffn_hidden_size == 8
+        assert transformer_config.num_attention_heads == 2
+        assert transformer_config.kv_channels == 1
         assert transformer_config.padded_vocab_size == 10

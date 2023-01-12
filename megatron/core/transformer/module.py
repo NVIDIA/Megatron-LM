@@ -171,17 +171,16 @@ class Float16Module(MegatronModule):
     def __init__(self, config: TransformerConfig, module: torch.nn.Module):
         super(Float16Module, self).__init__(config)
         self.config = config
+        self.fp16 = config.fp16
+        self.bf16 = config.bf16
 
-        if config.fp16 and config.bf16:
-            raise ValueError(f'Only one of config.fp16: {config.fp16} and config.bf16 {config.bf16} should be True.')
-
-        if config.fp16:
+        if self.fp16:
             self.add_module('module', module.half())
 
             def float16_convertor(val):
                 return val.half()
 
-        elif config.bf16:
+        elif self.bf16:
             self.add_module('module', module.bfloat16())
 
             def float16_convertor(val):

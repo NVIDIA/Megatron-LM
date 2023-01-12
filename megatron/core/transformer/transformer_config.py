@@ -17,7 +17,13 @@ class TransformerConfig:
         # model architecture
         hidden_size (int): Transformer hidden size.
         ffn_hidden_size (int): Transformer Feed-Forward Network hidden size.
-                                Defaults to 4*hidden_size if not provided.')
+                                This is set to 4*hidden_size if not provided. Defaults to None.')
+        num_attention_heads (int): Number of transformer attention heads.
+        kv_channels (int): Projection weights dimension in multi-head attention.
+                            This is set to hidden_size // num_attention_heads if not provided.
+                            Defaults to None.
+        
+        attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
         padded_vocab_size (int): Vocab size after padding.
 
         # model parallelism
@@ -35,9 +41,12 @@ class TransformerConfig:
         perform_initialization (bool): If true, weights are initialized. Defaults to True.
         params_dtype: (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32
 
-        # precision
+        # mixed-precision
         fp16 (bool): If true, train with O2 fp16 mixed precision training. Defaults to False.
         bf16 (bool): If true, train with O2 bf16 mixed precision training. Defaults to False.
+        apply_query_key_layer_scaling (bool): If true, scale Q * K^T by 1 / layer-number. Defaults to True.
+        attention_softmax_in_fp32 (bool): If true, run attention masking and softmax in fp32.
+                                          This should be true if apply_query_key_layer_scaling is true.
 
         # communication
         async_tensor_model_parallel_allreduce (bool): If true, enables asynchronous execution of
@@ -48,13 +57,19 @@ class TransformerConfig:
         # fusion
         gradient_accumulation_fusion (bool): If true, fuses weight gradient accumulation to GEMMs. Defaults to False.
         bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
+        masked_softmax_fusion (bool): If true, uses softmax fusion.
 
     """
 
     # model architecture
     hidden_size: int
-    ffn_hidden_size: int  # TODO: default this to 4*hidden_size if None?
+    num_attention_heads: int
     padded_vocab_size: int
+
+    ffn_hidden_size: int = None
+    kv_channels: int = None
+
+    attention_dropout: float = 0.1
 
     # model parallelism
     sequence_parallel_enabled: bool = False
@@ -67,9 +82,11 @@ class TransformerConfig:
     perform_initialization: bool = True
     params_dtype: torch.dtype = torch.float32
 
-    # precision
+    # mixed-precision
     fp16: bool = False
     bf16: bool = False
+    apply_query_key_layer_scaling: bool = True
+    attention_softmax_in_fp32: bool = True
 
     # communication
     async_tensor_model_parallel_allreduce: bool = True
@@ -77,3 +94,20 @@ class TransformerConfig:
     # fusion
     gradient_accumulation_fusion: bool = False
     bias_gelu_fusion: bool = False
+    masked_softmax_fusion: bool = False
+
+    def __post_init__(self):
+        """ Python dataclass method that is used to modify attributes after initialization.
+            See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        """
+        if self.fp16 and self.bf16:
+            raise ValueError(f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.')
+
+        if self.ffn_hidden_size is None:
+            self.ffn_hidden_size = 4 * self.hidden_size
+
+        if self.kv_channels is None:
+            self.kv_channels = self.hidden_size // self.num_attention_heads
+
+        if self.apply_query_key_layer_scaling:
+            self.attention_softmax_in_fp32 = True

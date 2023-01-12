@@ -42,6 +42,11 @@ class TestMegatronModule:
         x = torch.ones((2, 2)).cuda()
         assert megatron_module(x).dtype == torch.float32
 
+        # TODO: test bad configs actually fail
+        # failed_module = megatron_module
+        # failed_module.fp16 = True
+        # failed_module.bf16 = True
+
 
 class TestFloat16Module:
     def test_fp16_module(self, transformer_config, megatron_module):
