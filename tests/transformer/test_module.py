@@ -35,8 +35,8 @@ def megatron_module(transformer_config):
 class TestMegatronModule:
     def test_megatron_module(self, megatron_module):
         assert megatron_module
-        assert megatron_module.config.hidden_size == 2
-        assert megatron_module.config.ffn_hidden_size == 8
+        assert megatron_module.config.hidden_size == 12
+        assert megatron_module.config.ffn_hidden_size == 48
         assert megatron_module.linear.weight.dtype == torch.float32
 
         x = torch.ones((2, 2)).cuda()
@@ -54,8 +54,8 @@ class TestFloat16Module:
         fp16_module = Float16Module(config=transformer_config, module=megatron_module)
 
         assert fp16_module
-        assert fp16_module.config.hidden_size == 2
-        assert fp16_module.config.ffn_hidden_size == 8
+        assert fp16_module.config.hidden_size == 12
+        assert fp16_module.config.ffn_hidden_size == 48
         assert fp16_module.module.linear.weight.dtype == torch.float16
 
         x = torch.ones((2, 2)).cuda()
@@ -71,8 +71,8 @@ class TestFloat16Module:
         bf16_module = Float16Module(config=transformer_config, module=megatron_module)
 
         assert bf16_module
-        assert bf16_module.config.hidden_size == 2
-        assert bf16_module.config.ffn_hidden_size == 8
+        assert bf16_module.config.hidden_size == 12
+        assert bf16_module.config.ffn_hidden_size == 48
         assert bf16_module.module.linear.weight.dtype == torch.bfloat16
 
         x = torch.ones((2, 2)).cuda()

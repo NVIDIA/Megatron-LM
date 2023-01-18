@@ -21,10 +21,10 @@ class TestParallelMLP:
         assert isinstance(mlp, ParallelMLP)
 
         num_weights = sum([p.numel() for p in mlp.parameters()])
-        assert num_weights == 42
+        assert num_weights == 1212
 
     def test_cpu_forward(self, mlp):
-        # [sequence length, batch size, hidden size]
+        # [sequence length, micro batch size, hidden size]
         hidden_states = torch.ones((32, 2, mlp.config.hidden_size))
         output, output_bias = mlp(hidden_states)
         assert output.shape[0] == 32
@@ -46,5 +46,5 @@ class TestParallelMLP:
         assert output_bias.shape[0] == mlp.config.hidden_size
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
-        assert output.device.type == 'cuda'
+        assert output_bias.device.type == 'cuda'
 
