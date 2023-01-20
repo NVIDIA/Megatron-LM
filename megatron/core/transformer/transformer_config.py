@@ -59,6 +59,13 @@ class TransformerConfig:
         bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
         masked_softmax_fusion (bool): If true, uses softmax fusion.
 
+        # activation recomputation
+        recompute_granularity (str): megatron-core supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
+                                     These memory intensive activations are also less compute intensive which makes activation checkpointing more efficient for LLMs (20B+).
+                                     See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
+                                     'full' will checkpoint the entire transformer layer.
+                                     Must be 'selective' or 'full'. Defaults to None. 
+
     """
 
     # model architecture
@@ -96,6 +103,9 @@ class TransformerConfig:
     bias_gelu_fusion: bool = False
     masked_softmax_fusion: bool = False
 
+    # activation recomputation
+    recompute_granularity: str = None
+
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
             See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
@@ -111,3 +121,9 @@ class TransformerConfig:
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
+
+        if self.recompute_granularity is not None:
+            if not self.recompute_granularity in ['full', 'selective']:
+                raise ValueError(
+                    f'self.recompute_granuarlity: {self.recompute_granularity} must be "full" or "selective".'
+                )

@@ -31,6 +31,8 @@ class CoreAttention(MegatronModule):
 
     def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__(config)
+
+        self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
         self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling

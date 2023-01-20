@@ -23,6 +23,8 @@ class ParallelMLP(MegatronModule):
 
     def __init__(self, config: TransformerConfig):
         super(ParallelMLP, self).__init__(config)
+
+        self.config = config
         self.hidden_size = config.hidden_size
         self.ffn_hidden_size = config.ffn_hidden_size
         self.init_method = config.init_method
