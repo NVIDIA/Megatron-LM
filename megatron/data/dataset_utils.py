@@ -221,6 +221,7 @@ def create_masked_lm_predictions(tokens,
     # the starting piece of current token, where 1 means true, so that
     # on-the-fly whole word masking is possible.
     token_boundary = [0] * len(tokens)
+    num_filtered_tokens = 0
 
     for (i, token) in enumerate(tokens):
         if token == cls_id or token == sep_id:
@@ -239,6 +240,7 @@ def create_masked_lm_predictions(tokens,
             cand_indexes.append([i])
             if is_start_piece(vocab_id_to_token_dict[token]):
                 token_boundary[i] = 1
+        num_filtered_tokens += 1
 
     output_tokens = list(tokens)
 
@@ -260,7 +262,7 @@ def create_masked_lm_predictions(tokens,
 
     if sampling_style is SamplingStyle.NORMAL:
         normal_mean = (max_ngrams + 1) / 2
-        max_ngrams = len(tokens) - 1
+        max_ngrams = num_filtered_tokens - 1
 
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
     if sampling_style is SamplingStyle.POISSON:
