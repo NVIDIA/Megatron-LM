@@ -177,8 +177,6 @@ def build_training_sample(sample, target_seq_length,
     tokens = [cls_id] + tokens
 
     # Masking.
-    # Ensure we always have at least one prediction.
-    max_predictions_per_seq = max(1.0, masked_lm_prob * len(tokens))
     mean_ngrams = mean_span_lengths[denoiser_index]
     if mean_ngrams < 1:
         # Ensure we always obtain at least one `max_ngrams`.
@@ -188,11 +186,19 @@ def build_training_sample(sample, target_seq_length,
     if denoiser == 'R' or denoiser == 'X':
         sampling_style = SamplingStyle.NORMAL
         prefix_lm = False
+        max_predictions_per_seq = len(tokens) - 1
     elif denoiser == 'S':
         sampling_style = SamplingStyle.UNIFORM
         prefix_lm = True
+        max_predictions_per_seq = min(
+            round(masked_lm_prob * len(tokens)) * 2 - 1,
+            len(tokens) - 1,
+        )
     else:
         raise ValueError('unknown denoiser')
+
+    # Ensure we always have at least one prediction.
+    max_predictions_per_seq = max(1, max_predictions_per_seq)
     (
         tokens, masked_positions, masked_labels, _, masked_spans,
     ) = create_masked_lm_predictions(
