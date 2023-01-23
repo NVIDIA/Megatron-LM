@@ -185,7 +185,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 def extra_args_provider(parser):
-    parser.add_argument('--_is_ul2', default=False, help=argparse.SUPPRESS)
+    parser.add_argument('--_is_ul2', default=True, help=argparse.SUPPRESS)
     return parser
 
 
