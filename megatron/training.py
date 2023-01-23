@@ -70,7 +70,8 @@ def pretrain(train_valid_test_dataset_provider,
             train/valid/test dataset and returns `train, valid, test` datasets.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
-        model_type: an enum that specifies the type of model being trained.
+        model_type: an enum that specifies the type of model being trained. May
+            also be a zero-argument callable that returns a `ModelType` enum.
         forward_step_func: a function that takes a `data iterator` and `model`,
             and returns a `loss` scalar with a dictionary with key:values being
             the info we would like to monitor during training, for example
@@ -106,6 +107,9 @@ def pretrain(train_valid_test_dataset_provider,
 
     args = get_args()
     timers = get_timers()
+    if callable(model_type):
+        model_type = model_type()
+    assert isinstance(model_type, ModelType)
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
