@@ -300,12 +300,16 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 class _SentencePieceTokenizer(AbstractTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
-    def __init__(self, model_file, vocab_extra_ids=0, ul2_denoiser_tokens=[]):
+    def __init__(
+            self, model_file, vocab_extra_ids=0, ul2_denoiser_tokens=None):
         name = 'SentencePieceTokenizer'
         super().__init__(name)
 
         import sentencepiece
         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
+
+        if ul2_denoiser_tokens is None:
+            ul2_denoiser_tokens = []
         self._initialize(vocab_extra_ids, ul2_denoiser_tokens)
 
     def _populate_vocab(self):
