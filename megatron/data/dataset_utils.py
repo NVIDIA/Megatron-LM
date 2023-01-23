@@ -258,6 +258,10 @@ def create_masked_lm_predictions(tokens,
     num_to_predict = min(max_predictions_per_seq,
                          max(1, int(round(len(tokens) * masked_lm_prob))))
 
+    if sampling_style is SamplingStyle.NORMAL:
+        normal_mean = (max_ngrams + 1) / 2
+        max_ngrams = len(tokens) - 1
+
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
     if sampling_style is SamplingStyle.POISSON:
         # Note(mingdachen):
@@ -266,8 +270,6 @@ def create_masked_lm_predictions(tokens,
         pvals /= pvals.sum(keepdims=True)
         if favor_longer_ngram:
             pvals = pvals[::-1]
-    elif sampling_style is SamplingStyle.NORMAL:
-        normal_mean = (max_ngrams + 1) / 2
 
     ngram_indexes = []
     for idx in range(len(cand_indexes)):
