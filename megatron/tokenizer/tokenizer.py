@@ -309,9 +309,16 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         # Warning! `additional_special_token_ids` will also return the UL2
         # tokens here.
         special_tokens = self._ul2_tokens
+        if self._ul2_tokens:
+            special_tokens.append('<SEP>')
+
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
                                        special_tokens=special_tokens,
                                        max_len=None)
+        if self._ul2_tokens:
+            self.sep_id = self.tokenizer.encoder['<SEP>']
+        else:
+            self.sep_id = None
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
     @property
@@ -331,6 +338,14 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
     def detokenize(self, token_ids):
         return self.tokenizer.decode(token_ids)
+
+    @property
+    def sep(self):
+        if self.sep_id is None:
+            raise AttributeError(
+                'GPT tokenizer does not have a SEP token by default; '
+                'please add it to the `special_tokens`')
+        return self.sep_id
 
     @property
     def eod(self):
