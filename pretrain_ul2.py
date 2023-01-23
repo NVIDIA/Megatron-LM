@@ -20,6 +20,7 @@ from megatron.data.ul2_dataset import (
     is_prefix_lm as _is_prefix_lm,
 )
 from megatron.model import GPTModel, T5Model
+from megatron.model.enums import UL2ModelType
 from megatron.model.t5_model import t5_position_ids
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
@@ -182,7 +183,15 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
+def model_type_fn():
+    args = get_args()
+    if args.ul2_model_type is UL2ModelType.ENCODER_DECODER:
+        return ModelType.encoder_and_decoder
+    else:
+        return ModelType.encoder_or_decoder
+
+
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider, ModelType.encoder_and_decoder,
+    pretrain(train_valid_test_datasets_provider, model_provider, model_type_fn,
              forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
