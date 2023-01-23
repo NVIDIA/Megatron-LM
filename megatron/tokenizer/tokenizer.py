@@ -15,6 +15,15 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
+    if hasattr(args, '_is_ul2') and args._is_ul2:
+        ul2_denoiser_tokens = [
+            args.ul2_r_denoiser_token,
+            args.ul2_s_denoiser_token,
+            args.ul2_x_denoiser_token,
+        ]
+    else:
+        ul2_denoiser_tokens = []
+
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         assert args.vocab_file is not None
@@ -35,11 +44,7 @@ def build_tokenizer(args):
         tokenizer = _SentencePieceTokenizer(
             args.tokenizer_model,
             vocab_extra_ids=args.vocab_extra_ids,
-            ul2_denoiser_tokens=[
-                args.ul2_r_denoiser_token,
-                args.ul2_s_denoiser_token,
-                args.ul2_x_denoiser_token,
-            ],
+            ul2_denoiser_tokens=ul2_denoiser_tokens,
         )
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
