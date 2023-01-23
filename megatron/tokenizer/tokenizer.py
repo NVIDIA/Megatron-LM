@@ -27,18 +27,28 @@ def build_tokenizer(args):
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
         assert args.vocab_file is not None
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=True,
-                                            vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _BertWordPieceTokenizer(
+            vocab_file=args.vocab_file,
+            lower_case=True,
+            vocab_extra_ids=args.vocab_extra_ids,
+            ul2_denoiser_tokens=ul2_denoiser_tokens,
+        )
     elif args.tokenizer_type == 'BertWordPieceCase':
         assert args.vocab_file is not None
-        tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
-                                            lower_case=False,
-                                            vocab_extra_ids=args.vocab_extra_ids)
+        tokenizer = _BertWordPieceTokenizer(
+            vocab_file=args.vocab_file,
+            lower_case=False,
+            vocab_extra_ids=args.vocab_extra_ids,
+            ul2_denoiser_tokens=ul2_denoiser_tokens,
+        )
     elif args.tokenizer_type == 'GPT2BPETokenizer':
         assert args.vocab_file is not None
         assert args.merge_file is not None
-        tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
+        tokenizer = _GPT2BPETokenizer(
+            args.vocab_file,
+            args.merge_file,
+            ul2_denoiser_tokens=ul2_denoiser_tokens,
+        )
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(
@@ -140,7 +150,13 @@ class AbstractTokenizer(ABC):
 class _BertWordPieceTokenizer(AbstractTokenizer):
     """Original BERT wordpiece tokenizer."""
 
-    def __init__(self, vocab_file, lower_case=True, vocab_extra_ids=0):
+    def __init__(
+            self,
+            vocab_file,
+            lower_case=True,
+            vocab_extra_ids=0,
+            ul2_denoiser_tokens=None,
+    ):
         if lower_case:
             name = 'BERT Lower Case'
         else:
@@ -169,6 +185,13 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
         additional_special_tokens = []
         additional_special_tokens.extend(
             ["<extra_id_{}>".format(i) for i in range(vocab_extra_ids)])
+
+        if ul2_denoiser_tokens is None:
+            ul2_denoiser_tokens = []
+        self._ul2_tokens = ul2_denoiser_tokens
+        for value in self._ul2_tokens:
+            self.add_token(value)
+
         self.add_additional_special_tokens(additional_special_tokens)
 
     def add_token(self, token):
@@ -267,16 +290,28 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
     def additional_special_tokens(self, value):
         self._additional_special_tokens = value
 
+    @property
+    def ul2_token_ids(self):
+        return [self.vocab[k] for k in self._ul2_tokens]
+
 
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""
 
-    def __init__(self, vocab_file, merge_file):
+    def __init__(self, vocab_file, merge_file, ul2_denoiser_tokens=None):
         name = 'GPT2 BPE'
         super().__init__(name)
 
+        if ul2_denoiser_tokens is None:
+            ul2_denoiser_tokens = []
+        self._ul2_tokens = ul2_denoiser_tokens
+
+        # Warning! `additional_special_token_ids` will also return the UL2
+        # tokens here.
+        special_tokens = self._ul2_tokens
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
-                                       special_tokens=[], max_len=None)
+                                       special_tokens=special_tokens,
+                                       max_len=None)
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
     @property
@@ -300,6 +335,15 @@ class _GPT2BPETokenizer(AbstractTokenizer):
     @property
     def eod(self):
         return self.eod_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        # Warning! This will also return the UL2 tokens.
+        return [self.vocab[k] for k in self.tokenizer.special_tokens]
+
+    @property
+    def ul2_tokens_ids(self):
+        return [self.vocab[k] for k in self._ul2_tokens]
 
 
 class _SentencePieceTokenizer(AbstractTokenizer):
