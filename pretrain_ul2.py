@@ -191,7 +191,7 @@ def extra_args_provider(parser):
 
 def model_type_fn():
     args = get_args()
-    if args.ul2_model_type is UL2ModelType.ENCODER_DECODER:
+    if args.ul2_model_type is UL2ModelType.encoder_decoder:
         return ModelType.encoder_and_decoder
     else:
         return ModelType.encoder_or_decoder
