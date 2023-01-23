@@ -261,7 +261,13 @@ def create_masked_lm_predictions(tokens,
                          max(1, int(round(len(tokens) * masked_lm_prob))))
 
     if sampling_style is SamplingStyle.NORMAL:
+        # First, we get the center of our normal distribution from
+        # `max_ngrams`. Keeping the meaning of `max_ngrams` this way
+        # plays nicely with the other probability distributions in terms
+        # of math.
         normal_mean = (max_ngrams + 1) / 2
+        # However, we do not want to bound the maximum number of
+        # n-grams.
         max_ngrams = num_filtered_tokens - 1
 
     ngrams = np.arange(1, max_ngrams + 1, dtype=np.int64)
