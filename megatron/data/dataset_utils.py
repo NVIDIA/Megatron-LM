@@ -215,13 +215,12 @@ def get_ngram_indices(
         first_le_index = max(1, first_gt_index) - 1
 
         tail_cand_indexes = cand_indexes[first_le_index:]
-        ngram_index = []
-        for i in range(len(tail_cand_indexes)):
-            ngram_index.append(tail_cand_indexes[i:])
+        ngram_index = [
+            tail_cand_indexes[i:]
+            for i in range(len(tail_cand_indexes))
+        ]
     else:
-        ngram_index = []
-        for n in ngrams:
-            ngram_index.append(cand_indexes[idx:idx + n])
+        ngram_index = [cand_indexes[idx:idx + n] for n in ngrams]
     return ngram_index
 
 
