@@ -292,7 +292,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         # Save model and optimizer together.
         state_dict = {**model_state_dict, **optim_state_dict}
         if state_dict: # only saves if populated (i.e., inherits conditions above)
-            print("Trying to save ...", flush=True)
             ensure_directory_exists(model_checkpoint_name)
             torch.save(state_dict, model_checkpoint_name)
 

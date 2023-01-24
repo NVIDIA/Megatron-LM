@@ -34,7 +34,6 @@ def test_fused_softmax():
         [test_text] * 4,
         return_tensors="pt",
     )
-    print("tokens :", tokens["input_ids"].shape)
 
     embedding_output = bert.embeddings(
         input_ids=tokens["input_ids"].cuda(),
@@ -133,7 +132,6 @@ def test_fused_upper_triangle_mask_softmax():
         [test_text] * 4,
         return_tensors="pt",
     )
-    print("tokens :", tokens["input_ids"].shape)
 
     attention_mask = tokens["attention_mask"].cuda()
     attention_mask = attention_mask.view(attention_mask.size(0), -1)
@@ -234,7 +232,6 @@ def test_layer_norm():
         [test_text] * 4,
         return_tensors="pt",
     )
-    print("tokens :", tokens["input_ids"].shape)
 
     # [bsz, seq_len, d_model]
     embedding_output = (
