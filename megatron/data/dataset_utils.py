@@ -18,6 +18,7 @@
 #   https://github.com/google-research/albert/blob/master/create_pretraining_data.py
 # with some modifications.
 
+import bisect
 from enum import Enum
 import math
 import os
@@ -278,13 +279,9 @@ def create_masked_lm_predictions(tokens,
 
         # Find first index which is greater than the number of
         # predictions.
-        first_gt_index = next(
-            (
-                i
-                for (i, x) in enumerate(cand_indexes)
-                if x[0] > num_filtered_tokens - max_predictions_per_seq
-            ),
-            len(cand_indexes),
+        first_gt_index = bisect.bisect_right(
+            cand_indexes,
+            [num_filtered_tokens - max_predictions_per_seq],
         )
         # Then move one index before to get less than or equal to the
         # number of predictions, handling not going below 0.
