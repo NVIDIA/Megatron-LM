@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.transformer.mlp import ParallelMLP
+from megatron.core.transformer.parallel_mlp import ParallelMLP
 
 parallel_state.set_tensor_model_parallel_world_size(1)
 parallel_state.set_tensor_model_parallel_rank(0)

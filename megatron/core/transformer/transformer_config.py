@@ -22,9 +22,13 @@ class TransformerConfig:
         kv_channels (int): Projection weights dimension in multi-head attention.
                             This is set to hidden_size // num_attention_heads if not provided.
                             Defaults to None.
-        
+        hidden_dropout (float): Dropout probability for transformer hidden state. Defaults to 0.1.
         attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
         padded_vocab_size (int): Vocab size after padding.
+        apply_residual_connection_post_layernorm (bool): If true, uses the original BERT residule connection ordering.
+                                                         Defaults to False.
+        layernorm-epsilon (float): Layernorm epsilon. Defaults to 1e-5.
+
 
         # model parallelism
         sequence_parallel_enabled (bool): Makes tensor parallelism more memory efficient for LLMs (20B+) by 
@@ -58,6 +62,10 @@ class TransformerConfig:
         gradient_accumulation_fusion (bool): If true, fuses weight gradient accumulation to GEMMs. Defaults to False.
         bias_gelu_fustion (bool): If true, fuses bias and gelu. Defaults to False.
         masked_softmax_fusion (bool): If true, uses softmax fusion.
+        persist_layer_norm (bool): If true, uses the persistent fused layer norm kernel.
+                                   This kernel only supports a fixed set of hidden sizes.
+                                   Defaults to False.
+        bias_dropout_fusion (bool): If true, uses bias dropout fusion.
 
         # activation recomputation
         recompute_granularity (str): megatron-core supports 'selective' activation checkpointing where only the memory intensive part of attention is checkpointed.
@@ -72,11 +80,13 @@ class TransformerConfig:
     hidden_size: int
     num_attention_heads: int
     padded_vocab_size: int
-
     ffn_hidden_size: int = None
     kv_channels: int = None
-
+    hidden_dropout: float = 0.1
     attention_dropout: float = 0.1
+    # @jcasper should we keep this option?
+    apply_residual_connection_post_layernorm: bool = False
+    layernorm_epsilon: float = 1e-5
 
     # model parallelism
     sequence_parallel_enabled: bool = False
@@ -102,6 +112,8 @@ class TransformerConfig:
     gradient_accumulation_fusion: bool = False
     bias_gelu_fusion: bool = False
     masked_softmax_fusion: bool = False
+    persist_layer_norm: bool = False
+    bias_dropout_fusion: bool = False
 
     # activation recomputation
     recompute_granularity: str = None
