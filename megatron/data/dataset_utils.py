@@ -195,6 +195,36 @@ def is_start_piece(piece):
     return not piece.startswith("##")
 
 
+def get_ngram_indices(
+        idx,
+        ngrams,
+        cand_indexes,
+        num_to_predict,
+        num_filtered_tokens,
+        prefix_lm,
+):
+    if prefix_lm:
+        # Find first index which is greater than the number of
+        # predictions.
+        first_gt_index = bisect.bisect_right(
+            cand_indexes,
+            [num_filtered_tokens - num_to_predict],
+        )
+        # Then move one index before to get less than or equal to the
+        # number of predictions, handling not going below 0.
+        first_le_index = max(1, first_gt_index) - 1
+
+        tail_cand_indexes = cand_indexes[first_le_index:]
+        ngram_index = []
+        for i in range(len(tail_cand_indexes)):
+            ngram_index.append(tail_cand_indexes[i:])
+    else:
+        ngram_index = []
+        for n in ngrams:
+            ngram_index.append(cand_indexes[idx:idx + n])
+    return ngram_index
+
+
 def create_masked_lm_predictions(tokens,
                                  vocab_id_list, vocab_id_to_token_dict,
                                  masked_lm_prob,
@@ -277,34 +307,24 @@ def create_masked_lm_predictions(tokens,
         # sequences greater than the mean ratio.
         num_to_predict = max_predictions_per_seq
 
-        # Find first index which is greater than the number of
-        # predictions.
-        first_gt_index = bisect.bisect_right(
-            cand_indexes,
-            [num_filtered_tokens - max_predictions_per_seq],
-        )
-        # Then move one index before to get less than or equal to the
-        # number of predictions, handling not going below 0.
-        first_le_index = max(1, first_gt_index) - 1
-
-        tail_cand_indexes = cand_indexes[first_le_index:]
-        ngram_indexes = []
-        for i in range(len(tail_cand_indexes)):
-            ngram_indexes.append(tail_cand_indexes[i:])
-        ngram_indexes = [ngram_indexes]
-        # No need to shuffle outer list of length 1.
+        ngram_index_indexes = np.array([0])
     else:
         num_to_predict = min(max_predictions_per_seq,
                              max(1, int(round(len(tokens) * masked_lm_prob))))
 
-        ngram_indexes = []
-        for idx in range(len(cand_indexes)):
-            ngram_index = []
-            for n in ngrams:
-                ngram_index.append(cand_indexes[idx:idx + n])
-            ngram_indexes.append(ngram_index)
+        ngram_index_indexes = np.arange(len(cand_indexes))
+        np_rng.shuffle(ngram_index_indexes)
 
-        np_rng.shuffle(ngram_indexes)
+    def get_ngram_indices_(idx):
+        return get_ngram_indices(
+            idx,
+            ngrams,
+            cand_indexes,
+            num_to_predict,
+            num_filtered_tokens,
+            prefix_lm,
+        )
+    ngram_indexes = map(get_ngram_indices_, ngram_index_indexes)
 
     (masked_lms, masked_spans) = ([], [])
     covered_indexes = set()
@@ -388,7 +408,8 @@ def create_masked_lm_predictions(tokens,
             label=[tokens[index] for index in index_set]))
 
     assert len(masked_lms) <= num_to_predict
-    np_rng.shuffle(ngram_indexes)
+    np_rng.shuffle(ngram_index_indexes)
+    ngram_indexes = map(get_ngram_indices_, ngram_index_indexes)
 
     select_indexes = set()
     if do_permutation:
