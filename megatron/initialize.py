@@ -15,8 +15,11 @@
 
 """Megatron initialization."""
 
+import logging
+import logging.config
 import random
 import os
+import sys
 import time
 
 import numpy as np
@@ -74,6 +77,7 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         args = get_args()
         # Pytorch distributed.
         _initialize_distributed()
+        _configure_logging()
         
         # Random seeds for reproducibility.
         if args.rank == 0:
@@ -102,6 +106,54 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
         # No continuation function
         return None
+
+
+def _configure_logging():
+    args=get_args()
+    if not args.structured_logs:
+        return
+    rank = torch.distributed.get_rank()
+
+    logging_config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "default": {
+                "format": f"%(asctime)s [Rank {rank}]: %(message)s",
+                "use_colors": True,
+            }
+        },
+        "handlers": {
+            "default": {
+                "level": "INFO",
+                "formatter": "default",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            }
+        },
+        "loggers": {"default": {"level": "DEBUG", "handlers": ["default"]}},
+        "root": {"handlers": ["default"], "level": "INFO"},
+    }
+    if args.structured_logs_dir is not None:
+        log_dir=args.structured_logs_dir
+        os.makedirs(log_dir, exist_ok=True)
+        logging_config["handlers"]["file"] = {
+            "level": "INFO",
+            "formatter": "default",
+            "class": "logging.FileHandler",
+            "filename": os.path.join(log_dir, f"logs_rank_{rank}.txt"),
+        }
+        logging_config["root"]["handlers"].append("file")
+        logging_config["loggers"]["default"]["handlers"].append("file")
+    logging.config.dictConfig(logging_config)
+
+    # Add these methods so that stdout can be redirected to logging.
+    logging.write = lambda msg: logging.info(msg) if msg != '\n' else None
+    logging.flush = lambda : None
+
+    sys.stdout=logging
+    sys.stderr=logging
+
 
 
 def _compile_dependencies():
@@ -195,7 +247,7 @@ def _initialize_distributed():
         torch.distributed.init_process_group(
             backend=args.distributed_backend,
             world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(minutes=10))
+            timeout=timedelta(seconds=args.distributed_timeout))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
