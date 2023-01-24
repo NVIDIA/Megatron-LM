@@ -6,14 +6,10 @@ import torch
 
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.parallel_state import set_pipeline_model_parallel_rank, set_pipeline_model_parallel_world_size
 
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
-
-set_pipeline_model_parallel_rank(0)
-set_pipeline_model_parallel_world_size(1)
 
 
 class DummyModule(MegatronModule):
@@ -78,3 +74,4 @@ class TestFloat16Module:
         x = torch.ones((2, 2)).cuda()
         # inputs are converted to bf16 then outputs are converted to fp32
         assert bf16_module(x).dtype == torch.float32
+

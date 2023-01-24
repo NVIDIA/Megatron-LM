@@ -4,15 +4,7 @@ import pytest
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.transformer.parallel_attention import ParallelAttention
-from megatron.core.parallel_state import _set_global_memory_buffer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-
-parallel_state.set_tensor_model_parallel_world_size(1)
-parallel_state.set_tensor_model_parallel_rank(0)
-_set_global_memory_buffer()
-model_parallel_cuda_manual_seed(123)
 
 
 @pytest.fixture

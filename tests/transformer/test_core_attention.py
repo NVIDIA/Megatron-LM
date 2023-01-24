@@ -5,11 +5,7 @@ import pytest
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.transformer.core_attention import CoreAttention
-
-parallel_state.set_tensor_model_parallel_world_size(1)
-parallel_state.set_tensor_model_parallel_rank(0)
 
 
 @pytest.fixture
@@ -30,11 +26,10 @@ class TestCoreAttention:
         pass
 
     def test_gpu_forward(self, core_attention):
-        from megatron.core.parallel_state import _set_global_memory_buffer
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-        _set_global_memory_buffer()
-        model_parallel_cuda_manual_seed(123)
+        # destroy_global_memory_buffer()
+        # _set_global_memory_buffer()
+        # model_parallel_cuda_manual_seed(123)
 
         core_attention.cuda()
         config = core_attention.config
