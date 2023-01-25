@@ -30,7 +30,7 @@ class CoreAttention(MegatronModule):
     """
 
     def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
-        super(CoreAttention, self).__init__(config)
+        super(CoreAttention, self).__init__(config=config)
 
         self.config = config
         self.fp16 = config.fp16

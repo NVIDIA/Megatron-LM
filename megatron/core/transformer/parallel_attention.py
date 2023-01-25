@@ -25,7 +25,7 @@ class ParallelAttention(MegatronModule):
         attention_type=AttnType.self_attn,
         attn_mask_type=AttnMaskType.padding,
     ):
-        super(ParallelAttention, self).__init__(config)
+        super(ParallelAttention, self).__init__(config=config)
 
         self.config = config
         self.hidden_size = config.hidden_size

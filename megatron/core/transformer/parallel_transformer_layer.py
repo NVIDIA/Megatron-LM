@@ -5,7 +5,7 @@ import torch
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnType, AttnMaskType
-from megatron.core.fusions.fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+from megatron.core.fusions.fused_layer_norm import MixedFusedLayerNorm as LayerNorm, get_layer_norm
 from megatron.core.fusions.fused_bias_dropout import (
     get_bias_dropout_add,
     bias_dropout_add_fused_train,
@@ -27,7 +27,7 @@ class ParallelTransformerLayer(MegatronModule):
         self, config: TransformerConfig, layer_number: int = 1, self_attn_mask_type=AttnMaskType.padding,
     ):
 
-        super(ParallelTransformerLayer, self).__init__()
+        super(ParallelTransformerLayer, self).__init__(config=config)
         self.config = config
 
         self.layer_number = layer_number
@@ -35,11 +35,11 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layernorm on the input data.
         # TODO: add pytorch only layernorm
-        self.input_layernorm = LayerNorm(
-            normalized_shape=self.config.hidden_size,
+        self.input_layernorm = get_layer_norm(
+            hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            no_persist_layer_norm=self.config.no_persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
+            persist_layer_norm=self.config.persist_layer_norm,
+            sequence_parallel=self.config.sequence_parallel_enabled,
         )
 
         # Self attention.
@@ -51,11 +51,11 @@ class ParallelTransformerLayer(MegatronModule):
         )
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
-            normalized_shape=self.config.hidden_size,
+        self.post_attention_layernorm = get_layer_norm(
+            hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            no_persist_layer_norm=self.config.no_persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
+            persist_layer_norm=self.config.persist_layer_norm,
+            sequence_parallel=self.config.sequence_parallel_enabled,
         )
 
         # MLP
@@ -102,7 +102,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         with self.bias_dropout_add_exec_handler():
             layernorm_input = bias_dropout_add_func(
-                attention_output, attention_bias.expand_as(residual), residual, self.hidden_dropout
+                attention_output, attention_bias.expand_as(residual), residual, self.config.hidden_dropout
             )
 
         # Layer norm post the self attention.
@@ -118,7 +118,9 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_input
 
         with self.bias_dropout_add_exec_handler():
-            output = bias_dropout_add_func(mlp_output, mlp_bias.expand_as(residual), residual, self.hidden_dropout)
+            output = bias_dropout_add_func(
+                mlp_output, mlp_bias.expand_as(residual), residual, self.config.hidden_dropout
+            )
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
