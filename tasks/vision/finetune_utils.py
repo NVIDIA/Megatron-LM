@@ -29,12 +29,12 @@ from megatron.training import train_step
 from megatron.training import training_log
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import average_losses_across_data_parallel_group
-
+from deepspeed.accelerator import get_accelerator
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
-    images = batch[0].cuda().contiguous()
-    labels = batch[1].cuda().contiguous()
+    images = batch[0].to(get_accelerator().device_name()).contiguous()
+    labels = batch[1].to(get_accelerator().device_name()).contiguous()
     return images, labels
 
 

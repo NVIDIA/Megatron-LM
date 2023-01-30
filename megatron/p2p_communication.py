@@ -16,7 +16,7 @@
 from functools import reduce
 import operator
 import torch
-
+from deepspeed.accelerator import get_accelerator
 from megatron import get_args
 from megatron import mpu
 
@@ -59,12 +59,12 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
     if recv_prev:
         tensor_recv_prev = torch.empty(tensor_chunk_shape,
                                        requires_grad=True,
-                                       device=torch.cuda.current_device(),
+                                       device=get_accelerator().current_device_name(),
                                        dtype=dtype)
     if recv_next:
         tensor_recv_next = torch.empty(tensor_chunk_shape,
                                        requires_grad=True,
-                                       device=torch.cuda.current_device(),
+                                       device=get_accelerator().current_device_name(),
                                        dtype=dtype)
 
     # Split tensor into smaller chunks if using scatter-gather optimization.
@@ -109,7 +109,7 @@ def _communicate(tensor_send_next, tensor_send_prev, recv_prev, recv_next,
             for req in reqs:
                 req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
+    get_accelerator().synchronize()
 
     # If using scatter-gather optimization, gather smaller chunks.
     if args.scatter_gather_tensors_in_pipeline:

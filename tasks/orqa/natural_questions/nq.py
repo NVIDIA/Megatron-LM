@@ -28,6 +28,7 @@ from torch.utils.data import Dataset, BatchSampler
 
 from megatron import print_rank_0, get_args, get_tokenizer, mpu
 from megatron.data.biencoder_dataset_utils import make_attention_mask
+from deepspeed.accelerator import get_accelerator
 
 def get_nq_dataset(qa_data, split):
     args = get_args()
@@ -42,10 +43,10 @@ def get_nq_dataset(qa_data, split):
 
 
 def process_nq_batch(batch):
-    query_tokens = batch['token_ids'].long().cuda()
-    query_mask = (batch['token_mask'] < 0.5).cuda()
-    query_types = batch['token_types'].long().cuda()
-    query_len = batch['seq_len'].long().cuda()
+    query_tokens = batch['token_ids'].long().to(get_accelerator().device_name())
+    query_mask = (batch['token_mask'] < 0.5).to(get_accelerator().device_name())
+    query_types = batch['token_types'].long().to(get_accelerator().device_name())
+    query_len = batch['seq_len'].long().to(get_accelerator().device_name())
     reference = batch['reference']
 
     return query_tokens, query_mask, query_types, query_len, reference

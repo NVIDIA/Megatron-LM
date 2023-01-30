@@ -12,9 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from deepspeed.accelerator import get_accelerator
+if get_accelerator().device_name() == 'cuda':
+    from apex.optimizers import FusedAdam as Adam
+    from apex.optimizers import FusedSGD as SGD
+else:
+    from torch.optim import Adam
+    from torch.optim import SGD
 
-from apex.optimizers import FusedAdam as Adam
-from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
 from megatron.model import LayerNorm

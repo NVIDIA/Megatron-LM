@@ -22,7 +22,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron import get_args
 from megatron import mpu
 from .module import MegatronModule
-
+from deepspeed.accelerator import get_accelerator
 
 
 class MemoryBuffer:
@@ -32,7 +32,7 @@ class MemoryBuffer:
         self.dtype = dtype
         self.data = torch.zeros(self.numel,
                                 dtype=self.dtype,
-                                device=torch.cuda.current_device(),
+                                device=get_accelerator().current_device_name(),
                                 requires_grad=False)
 
 

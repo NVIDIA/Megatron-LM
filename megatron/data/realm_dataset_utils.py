@@ -7,7 +7,7 @@ import torch
 from megatron import mpu, print_rank_0
 from megatron.data.dataset_utils import create_masked_lm_predictions, pad_and_convert_to_numpy
 from megatron import get_args, get_tokenizer, print_rank_0, mpu
-
+from deepspeed.accelerator import get_accelerator
 
 def get_one_epoch_dataloader(dataset, micro_batch_size=None):
     """Specifically one epoch to be used in an indexing job."""
@@ -177,7 +177,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.cuda.LongTensor([1])
+    counts = get_accelerator().LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     assert counts[0].item() == torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group())

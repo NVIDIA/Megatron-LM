@@ -37,7 +37,7 @@ from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args
 import deepspeed.runtime.activation_checkpointing.checkpointing as ds_checkpointing
-
+from deepspeed.accelerator import get_accelerator
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -176,7 +176,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
-                device=torch.cuda.current_device(), dtype=args.params_dtype))
+                device=get_accelerator().current_device_name(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=1)
 
@@ -264,7 +264,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size_per_partition, self.input_size,
-                device=torch.cuda.current_device(), dtype=args.params_dtype))
+                device=get_accelerator().current_device_name(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=0, stride=stride)
             
@@ -275,7 +275,7 @@ class ColumnParallelLinear(torch.nn.Module):
             else:
                 self.bias = Parameter(torch.empty(
                     self.output_size_per_partition,
-                    device=torch.cuda.current_device(),
+                    device=get_accelerator().current_device_name(),
                     dtype=args.params_dtype))
             set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
             # Always initialize bias to zero.
@@ -375,7 +375,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size, self.input_size_per_partition,
-                device=torch.cuda.current_device(), dtype=args.params_dtype))
+                device=get_accelerator().current_device_name(), dtype=args.params_dtype))
             _initialize_affine_weight_gpu(self.weight, init_method,
                                           partition_dim=1, stride=stride)
         if bias:
@@ -384,7 +384,7 @@ class RowParallelLinear(torch.nn.Module):
                                                   dtype=args.params_dtype))
             else:
                 self.bias = Parameter(torch.empty(
-                    self.output_size, device=torch.cuda.current_device(),
+                    self.output_size, device=get_accelerator().current_device_name(),
                     dtype=args.params_dtype))
             # Always initialize bias to zero.
             with torch.no_grad():

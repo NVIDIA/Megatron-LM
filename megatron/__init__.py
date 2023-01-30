@@ -14,7 +14,7 @@
 # limitations under the License.
 import os
 import torch
-
+from deepspeed.accelerator import get_accelerator
 from .package_info import (
     __description__,
     __contact_names__,
@@ -64,7 +64,7 @@ def is_rank_0():
     """Check whether it is rank 0. For AML, check if it is rank 0 of a node"""
     if torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0 or (
-            is_aml() and torch.distributed.get_rank() % torch.cuda.device_count() == 0
+            is_aml() and torch.distributed.get_rank() % get_accelerator().device_count() == 0
             ):
             return True
         else:

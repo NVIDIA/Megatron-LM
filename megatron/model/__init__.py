@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
-
+from deepspeed.accelerator.real_accelerator import get_accelerator
+if get_accelerator().device_name() == 'cuda':
+    from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+else:
+    from torch.nn import LayerNorm
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel
 from .gpt_model import GPTModel, GPTModelPipe

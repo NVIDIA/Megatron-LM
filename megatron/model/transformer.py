@@ -29,6 +29,7 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 from torch import distributed as dist
 import deepspeed
 from deepspeed.moe.layer import MoE
+from deepspeed.accelerator import get_accelerator
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -275,7 +276,7 @@ class ParallelAttention(MegatronModule):
             output_size[2],
             output_size[3],
             dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+            device=get_accelerator().current_device_name())
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(

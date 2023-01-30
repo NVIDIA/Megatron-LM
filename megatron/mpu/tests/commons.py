@@ -20,7 +20,7 @@ import numpy
 import torch
 
 import mpu
-
+from deepspeed.accelerator import get_accelerator
 
 class IdentityLayer(torch.nn.Module):
     def __init__(self, size, scale=1.0):
@@ -56,10 +56,10 @@ def initialize_distributed(backend='nccl'):
           'rank: {}, world size: {}'.format(local_rank, rank, world_size))
 
     # Set the device id.
-    device = rank % torch.cuda.device_count()
+    device = rank % get_accelerator().device_count()
     if local_rank is not None:
         device = local_rank
-    torch.cuda.set_device(device)
+    get_accelerator().set_device(device)
 
     # Call the init process.
     init_method = 'tcp://'

@@ -32,11 +32,11 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
 
     size = 123
     seed = 1234
-    torch.cuda.manual_seed(1234)
-    tensor = torch.cuda.FloatTensor(size)
+    get_accelerator().manual_seed(1234)
+    tensor = get_accelerator().FloatTensor(size)
 
     # Get the state
-    rng_state = torch.cuda.get_rng_state()
+    rng_state = get_accelerator().get_rng_state()
     rng_state_copy = rng_state.clone()
 
     # Do some stuff.
@@ -45,10 +45,10 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     result_1 = tensor.clone()
 
     assert rng_state.sub(rng_state_copy).max() == 0
-    assert torch.cuda.get_rng_state().sub(rng_state_copy).max() > 0
+    assert get_accelerator().get_rng_state().sub(rng_state_copy).max() > 0
 
     # State should be different.
-    new_rng_state = torch.cuda.get_rng_state()
+    new_rng_state = get_accelerator().get_rng_state()
     max_diff = new_rng_state.sub(rng_state).max()
     print('   max diff in rng state (should be non-zero) on global rank {}: {}'.
           format(torch.distributed.get_rank(), max_diff))
@@ -95,17 +95,17 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     seed_1 = 1234
     seed_2 = 4321
     size = [12, 21]
-    tensor = torch.cuda.FloatTensor(size)
+    tensor = get_accelerator().FloatTensor(size)
 
     # Set to seed_1 and generate two tensors.
-    torch.cuda.manual_seed(seed_1)
+    get_accelerator().manual_seed(seed_1)
     torch.randn(size, out=tensor)
     target_11 = tensor.clone()
     torch.randn(size, out=tensor)
     target_12 = tensor.clone()
 
     # Set to seed_2 and generate two tensors.
-    torch.cuda.manual_seed(seed_2)
+    get_accelerator().manual_seed(seed_2)
     torch.randn(size, out=tensor)
     target_21 = tensor.clone()
     torch.randn(size, out=tensor)
@@ -113,7 +113,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
 
     # Now if we interleave seed_1 and seed_2,
     # we should still get the same tensors
-    torch.cuda.manual_seed(seed_1)
+    get_accelerator().manual_seed(seed_1)
     mpu.get_cuda_rng_tracker().add('test', seed_2)
 
     torch.randn(size, out=tensor)
@@ -164,9 +164,9 @@ def test_model_parallel_cuda_manual_seed(tensor_model_parallel_size):
     tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
 
     mpu.model_parallel_cuda_manual_seed(12345)
-    assert torch.cuda.initial_seed() == 12345
+    assert get_accelerator().initial_seed() == 12345
     with mpu.get_cuda_rng_tracker().fork():
-        assert torch.cuda.initial_seed() == (12345 + 2718 +
+        assert get_accelerator().initial_seed() == (12345 + 2718 +
                                              mpu.get_tensor_model_parallel_rank())
 
     # Reset the tracker

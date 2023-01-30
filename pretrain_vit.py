@@ -37,8 +37,8 @@ def get_batch(data_iterator):
     data = next(data_iterator)
 
     # only data parallelism; no need for broadcast
-    images = data[0].cuda()
-    labels = data[1].cuda()
+    images = data[0].to(get_accelerator().device_name())
+    labels = data[1].to(get_accelerator().device_name())
 
     return images, labels
 

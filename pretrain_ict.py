@@ -29,7 +29,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
-
+from deepspeed.accelerator import get_accelerator
 
 def pretrain_ict_model_provider():
     args = get_args()
@@ -89,8 +89,8 @@ def forward_step(data_iterator, model, input_tensor):
     timers('batch-generator').stop()
 
     # Query and Context Types
-    query_types = torch.cuda.LongTensor(*query_tokens.shape).fill_(0)
-    context_types = torch.cuda.LongTensor(*context_tokens.shape).fill_(0)
+    query_types = get_accelerator().LongTensor(*query_tokens.shape).fill_(0)
+    context_types = get_accelerator().LongTensor(*context_tokens.shape).fill_(0)
 
     # Forward model.
     query_logits, context_logits = model(query_tokens, query_mask,
@@ -118,12 +118,12 @@ def forward_step(data_iterator, model, input_tensor):
                                     k=softmax_scores.shape[1], sorted=True)
 
     def topk_accuracy(k):
-        return torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :k]) \
+        return get_accelerator().FloatTensor([sum([int(i in sorted_indices[i, :k]) \
             for i in range(global_batch_size)]) / global_batch_size])
 
     topk_accs = [topk_accuracy(int(k)) for k in args.retriever_report_topk_accuracies]
 
-    labels = torch.arange(global_batch_size).long().cuda()
+    labels = torch.arange(global_batch_size).long().to(get_accelerator().device_name())
     loss = F.nll_loss(softmax_scores, labels, reduction='mean')
     reduced_losses = average_losses_across_data_parallel_group([loss, *topk_accs])
 

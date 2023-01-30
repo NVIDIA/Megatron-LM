@@ -19,14 +19,14 @@ from abc import ABC
 from abc import abstractmethod
 
 import torch
-
+from deepspeed.accelerator import get_accelerator
 
 class MegatronGradScaler(ABC):
 
     def __init__(self, initial_scale):
         """Initialize scale value with the input initial scale."""
         assert initial_scale > 0.0
-        self._scale = torch.cuda.FloatTensor([initial_scale])
+        self._scale = get_accelerator().FloatTensor([initial_scale])
 
     @property
     def scale(self):
@@ -75,13 +75,13 @@ class DynamicGradScaler(MegatronGradScaler):
         # Lower bound on the scale.
         assert min_scale > 0.0
         assert min_scale <= initial_scale
-        self.min_scale = torch.cuda.FloatTensor([min_scale])
+        self.min_scale = get_accelerator().FloatTensor([min_scale])
         # Growth and backoff factors for the scale.
         assert growth_factor > 1.0
-        self.growth_factor = torch.cuda.FloatTensor([growth_factor])
+        self.growth_factor = get_accelerator().FloatTensor([growth_factor])
         assert backoff_factor < 1.0
         assert backoff_factor > 0.0
-        self.backoff_factor = torch.cuda.FloatTensor([backoff_factor])
+        self.backoff_factor = get_accelerator().FloatTensor([backoff_factor])
         # Interval over which if we don't see any inf/nan,
         # we will scale the grad scale by the growth factor.
         assert growth_interval > 0
@@ -128,6 +128,6 @@ class DynamicGradScaler(MegatronGradScaler):
 
 
     def load_state_dict(self, state_dict):
-        self._scale = state_dict['scale'].cuda(torch.cuda.current_device())
+        self._scale = state_dict['scale'].to(get_accelerator().current_device_name())
         self._growth_tracker = state_dict['growth_tracker']
         self._hysteresis_tracker = state_dict['hysteresis_tracker']

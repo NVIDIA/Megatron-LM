@@ -32,16 +32,16 @@ from megatron.training import training_log
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.utils import calc_params_l2_norm
 from megatron.utils import check_adlr_autoresume_termination
-
+from deepspeed.accelerator import get_accelerator
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
     args = get_args()
 
-    tokens = batch['text'].long().cuda().contiguous()
-    types = batch['types'].long().cuda().contiguous()
-    labels = batch['label'].long().cuda().contiguous()
-    attention_mask = batch['padding_mask'].float().cuda().contiguous()
+    tokens = batch['text'].long().to(get_accelerator().device_name()).contiguous()
+    types = batch['types'].long().to(get_accelerator().device_name()).contiguous()
+    labels = batch['label'].long().to(get_accelerator().device_name()).contiguous()
+    attention_mask = batch['padding_mask'].float().to(get_accelerator().device_name()).contiguous()
     if args.fp16:
         attention_mask = attention_mask.half()
 

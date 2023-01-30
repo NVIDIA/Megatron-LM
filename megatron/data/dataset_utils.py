@@ -33,7 +33,7 @@ from megatron import (
 )
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
-
+from deepspeed.accelerator import get_accelerator
 DSET_TYPE_BERT = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
 DSET_TYPE_T5  = 't5'
@@ -711,8 +711,8 @@ def get_samples_mapping(indexed_dataset,
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    if torch.cuda.device_count() > 0: # Skip when CPU-only
-        counts = torch.cuda.LongTensor([1])
+    if get_accelerator().device_count() > 0: # Skip when CPU-only
+        counts = get_accelerator().LongTensor([1])
         torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
         torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
         assert counts[0].item() == (

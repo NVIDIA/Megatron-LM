@@ -27,6 +27,7 @@ from megatron import mpu
 from megatron.schedules import get_forward_backward_func
 from tasks.finetune_utils import build_data_loader
 from tasks.finetune_utils import process_batch
+from deepspeed.accelerator import get_accelerator
 
 
 def accuracy_func_provider(single_dataset_provider):
@@ -172,7 +173,7 @@ def calculate_correct_answers(name, model, dataloader,
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
-        unreduced = torch.cuda.LongTensor([correct, total])
+        unreduced = get_accelerator().LongTensor([correct, total])
         torch.distributed.all_reduce(unreduced,
                                      group=mpu.get_data_parallel_group())
 

@@ -20,7 +20,7 @@ import time
 
 import numpy as np
 import torch
-
+from deepspeed.accelerator import get_accelerator
 from megatron import mpu, is_rank_0, print_rank_0, get_args
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
@@ -313,7 +313,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.cuda.LongTensor([1])
+    counts = get_accelerator().LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     assert counts[0].item() == (

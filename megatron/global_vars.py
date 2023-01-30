@@ -24,7 +24,7 @@ import torch
 from megatron.tokenizer import build_tokenizer
 from .arguments import parse_args
 from .microbatches import build_num_microbatches_calculator
-
+from deepspeed.accelerator import get_accelerator
 _GLOBAL_ARGS = None
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
@@ -192,14 +192,14 @@ class _Timer:
     def start(self):
         """Start the timer."""
         assert not self.started_, 'timer has already been started'
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         self.start_time = time.time()
         self.started_ = True
 
     def stop(self):
         """Stop the timer."""
         assert self.started_, 'timer is not started'
-        torch.cuda.synchronize()
+        get_accelerator().synchronize()
         self.elapsed_ += (time.time() - self.start_time)
         self.started_ = False
 

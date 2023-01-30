@@ -52,7 +52,7 @@ from megatron.schedules import forward_backward_no_pipelining
 from megatron.schedules import forward_backward_pipelining_without_interleaving
 from megatron.schedules import forward_backward_pipelining_with_interleaving
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
-
+from deepspeed.accelerator import get_accelerator
 import deepspeed
 from deepspeed.compression.compress import init_compression, redundancy_clean
 
@@ -105,7 +105,7 @@ def pretrain(train_valid_test_dataset_provider,
     # This will be closer to what scheduler will see (outside of
     # image ... launches.
     global _TRAIN_START_TIME
-    start_time_tensor = torch.cuda.FloatTensor([_TRAIN_START_TIME])
+    start_time_tensor = get_accelerator().FloatTensor([_TRAIN_START_TIME])
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -326,14 +326,15 @@ def get_model(model_provider_func):
 
     # GPU allocation.
     for model_module in model:
-        model_module.cuda(torch.cuda.current_device())
+        model_module.to(get_accelerator().current_device_name())
+ 
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
     if args.DDP_impl == 'torch':
-        i = torch.cuda.current_device()
+        i = get_accelerator().current_device()
         model = [torchDDP(model_module, device_ids=[i], output_device=i,
                           process_group=mpu.get_data_parallel_group())
                  for model_module in model]
@@ -712,7 +713,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = total_loss_dict.get(
-                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
         else:
             value = loss_dict[key].float().sum().item()
             is_nan = value == float('inf') or \
@@ -848,23 +849,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             # print('step {} rank {} before sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
             if args.zero_stage > 0:
                 # ZeRO partiions optimizer states
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_data_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_data_parallel_group())
 
             if args.tensor_model_parallel_size > 1:
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_tensor_model_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_tensor_model_parallel_group())
 
             if args.pipeline_model_parallel_size > 1:
-                opt_stats = torch.cuda.FloatTensor(opt_stats)
+                opt_stats = get_accelerator().FloatTensor(opt_stats)
                 torch.distributed.all_reduce(opt_stats, group=mpu.get_pipeline_model_parallel_group())
-                opt_stats_2 = torch.cuda.FloatTensor(opt_stats_2)
+                opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_pipeline_model_parallel_group())
 
@@ -939,7 +940,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
+                total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
@@ -1103,7 +1104,7 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Exiting based on duration
         if args.exit_duration_in_mins:
             train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
+            done_cuda = get_accelerator().IntTensor(
                 [train_time > args.exit_duration_in_mins])
             torch.distributed.all_reduce(
                 done_cuda, op=torch.distributed.ReduceOp.MAX)
@@ -1180,7 +1181,7 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                     for key in loss_dict:
                         if 'moe' not in key:
                             total_loss_dict[key] = total_loss_dict.get(
-                                key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
+                                key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
                                            * args.micro_batch_size \
@@ -1299,10 +1300,10 @@ def build_train_valid_test_data_iterators(
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
         # Need to broadcast num_tokens and num_type_tokens.
-        flags = torch.cuda.LongTensor(
+        flags = get_accelerator().LongTensor(
             [int(do_train), int(do_valid), int(do_test)])
     else:
-        flags = torch.cuda.LongTensor([0, 0, 0])
+        flags = get_accelerator().LongTensor([0, 0, 0])
 
     # Broadcast num tokens.
     torch.distributed.broadcast(flags,

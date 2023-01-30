@@ -8,7 +8,7 @@ from megatron import get_args, get_tokenizer, mpu, print_rank_0
 from megatron.data.dataset_utils import create_masked_lm_predictions, \
                                             pad_and_convert_to_numpy
 from megatron.data.data_samplers import MegatronPretrainingSampler
-
+from deepspeed.accelerator import get_accelerator
 def make_attention_mask(source_block, target_block):
     """
     Returns a 2-dimensional (2-D) attention mask
@@ -187,7 +187,7 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.cuda.LongTensor([1])
+    counts = get_accelerator().LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     assert counts[0].item() == torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group())

@@ -27,6 +27,7 @@ from megatron.model.utils import (
     scaled_init_method_normal,
 )
 from .module import MegatronModule
+from deepspeed.accelerator import get_accelerator
 
 
 class VitMlpHead(MegatronModule):
@@ -164,7 +165,7 @@ class VitModel(MegatronModule):
         init_method_normal(args.init_method_std)(
             self.position_embeddings.weight
         )
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(get_accelerator().device_name())
 
         self.position_embeddings._register_load_state_dict_pre_hook(
             twod_interpolate_position_embeddings_hook

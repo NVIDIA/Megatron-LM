@@ -31,6 +31,7 @@ from megatron.utils import average_losses_across_data_parallel_group
 
 import deepspeed
 from deepspeed.runtime.utils import see_memory_usage
+from deepspeed.accelerator.real_accelerator import get_accelerator
 import os
 import subprocess
 
@@ -62,7 +63,7 @@ def model_provider(pre_process=True, post_process=True):
             # pipeline it as an activation during training. The mask is constant, and thus
             # we can reuse it.
             attention_mask = torch.tril(torch.ones(
-                (1, args.seq_length, args.seq_length), device=torch.cuda.current_device())).view(
+                (1, args.seq_length, args.seq_length), device=get_accelerator().current_device_name())).view(
                     1, 1, args.seq_length, args.seq_length)
 
             # Convert attention mask to binary:
