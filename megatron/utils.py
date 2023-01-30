@@ -133,7 +133,7 @@ def check_adlr_autoresume_termination(iteration, model,
     args = get_args()
     autoresume = get_adlr_autoresume()
     # Add barrier to ensure consistnecy.
-    barrier()
+    torch.distributed.barrier()
     if autoresume.termination_requested():
         if args.save:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -223,14 +223,3 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
-
-
-def barrier():
-    args = get_args()
-
-    opts = BarrierOptions()
-    opts.device_ids = [args.local_rank]
-
-    group = GroupMember.WORLD
-    work = group.barrier(opts=opts)
-    work.wait()
