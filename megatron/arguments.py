@@ -349,7 +349,6 @@ def validate_args(args, defaults={}):
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
-
     # Load retro args.
     if args.retro_workdir:
         retro_args_path = get_retro_args_path(args.retro_workdir)
@@ -367,7 +366,6 @@ def validate_args(args, defaults={}):
     retro_args = get_retro_args()
     if retro_args and args != retro_args:
         _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
-
 
     return args
 

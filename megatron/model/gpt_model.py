@@ -50,8 +50,8 @@ class GPTModel(MegatronModule):
                  parallel_output=True,
                  pre_process=True,
                  post_process=True):
-        super(GPTModel, self).__init__()
         args = get_args()
+        super(GPTModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
@@ -68,8 +68,9 @@ class GPTModel(MegatronModule):
                                                          args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process)
-
-        self.initialize_word_embeddings(init_method_normal)
+        
+        if not args.untie_embeddings_and_output_weights:
+            self.initialize_word_embeddings(init_method_normal)
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
