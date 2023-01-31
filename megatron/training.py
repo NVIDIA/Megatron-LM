@@ -25,8 +25,8 @@ from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
-from megatron.model import ModelType
 from megatron.model import GPTModel
+from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -37,7 +37,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.schedules import get_forward_backward_func
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -395,6 +395,7 @@ def setup_model_and_optimizer(model_provider_func,
     return model, optimizer, opt_param_scheduler
 
 
+
 def train_step(forward_step_func, data_iterator,
                model, optimizer, opt_param_scheduler):
     """Single training step."""
@@ -413,8 +414,16 @@ def train_step(forward_step_func, data_iterator,
     forward_backward_func = get_forward_backward_func()
     fwd_bwd_timers = timers if args.timing_log_level > 1 else None
     losses_reduced = forward_backward_func(
-        forward_step_func, data_iterator, model,
-        optimizer, fwd_bwd_timers, forward_only=False)
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=get_num_microbatches(),
+        dtype=args.params_dtype,
+        tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
+        grad_scaler=optimizer.scale_loss,
+        sequence_parallel=args.sequence_parallel,
+        forward_only=False,
+        timers=fwd_bwd_timers)
     timers('forward-backward').stop()
 
     # Empty unused memory.

@@ -9,8 +9,9 @@ from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
+from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, ModelType
+from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group

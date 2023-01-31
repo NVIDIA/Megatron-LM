@@ -58,12 +58,40 @@ def initialize_model_parallel(
     Initialize model data parallel groups.
 
     Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model parallelism.
-        virtual_pipeline_model_parallel_size: number of virtual stages (interleaved
-                                              pipeline).
-        pipeline_model_parallel_split_rank: for models with both encoder and decoder,
-                                            rank in pipeline with split point.
+        tensor_model_parallel_size (int, default = 1):
+            The number of GPUs to split individual tensors across.
+
+        pipeline_model_parallel_size (int, default = 1):
+            The number of tensor parallel GPU groups to split the
+            Transformer layers across. For example, if
+            tensor_model_parallel_size is 4 and
+            pipeline_model_parallel_size is 2, the model will be split
+            into 2 groups of 4 GPUs.
+
+        virtual_pipeline_model_parallel_size (int, optional):
+            The number of stages that each pipeline group will have,
+            interleaving as necessary. If None, no interleaving is
+            performed. For example, if tensor_model_parallel_size is 1,
+            pipeline_model_parallel_size is 4,
+            virtual_pipeline_model_parallel_size is 2, and there are
+            16 transformer layers in the model, the model will be
+            split into 8 stages with two layers each and each GPU
+            would get 2 stages as such (layer number starting with 1):
+
+            GPU 0: [1, 2] [9, 10]
+            GPU 1: [3, 4] [11, 12]
+            GPU 2: [5, 6] [13, 14]
+            GPU 3: [7, 8] [15, 16]
+
+        pipeline_model_parallel_split_rank (int, optional):
+            For models with both an encoder and decoder, the rank in
+            pipeline to switch between encoder and decoder (i.e. the
+            first rank of the decoder). This allows the user to set
+            the pipeline parallel size of the encoder and decoder
+            independently. For example, if
+            pipeline_model_parallel_size is 8 and
+            pipeline_model_parallel_split_rank is 3, then ranks 0-2
+            will be the encoder and ranks 3-7 will be the decoder.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
