@@ -20,4 +20,6 @@ model_parallel_cuda_manual_seed(123)
 
 @pytest.fixture
 def transformer_config():
-    return TransformerConfig(hidden_size=12, num_attention_heads=4, padded_vocab_size=10, use_cpu_initialization=True)
+    return TransformerConfig(
+        num_layers=2, hidden_size=12, num_attention_heads=4, padded_vocab_size=10, use_cpu_initialization=True
+    )

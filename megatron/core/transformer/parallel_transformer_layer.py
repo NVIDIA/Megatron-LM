@@ -5,7 +5,7 @@ import torch
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnType, AttnMaskType
-from megatron.core.fusions.fused_layer_norm import MixedFusedLayerNorm as LayerNorm, get_layer_norm
+from megatron.core.fusions.fused_layer_norm import get_layer_norm
 from megatron.core.fusions.fused_bias_dropout import (
     get_bias_dropout_add,
     bias_dropout_add_fused_train,

@@ -5,6 +5,7 @@ import pytest
 
 import torch
 
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.parallel_transformer_layer import ParallelTransformerLayer
 
 
@@ -22,7 +23,7 @@ class TestParallelTransformerLayer:
         assert num_weights == 1884
 
     def test_gpu_forward(self, parallel_transformer_layer):
-        config = parallel_transformer_layer.config
+        config: TransformerConfig = parallel_transformer_layer.config
         sequence_length = 32
         micro_batch_size = 2
         parallel_transformer_layer.cuda()
