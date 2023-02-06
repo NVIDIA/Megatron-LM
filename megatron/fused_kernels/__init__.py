@@ -20,10 +20,11 @@ def load(args):
     cc_flag = []
     _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
         cpp_extension.CUDA_HOME)
+    compute_cap = _get_compute_cap()
     if int(bare_metal_major) >= 11:
         cc_flag.append('-gencode')
         cc_flag.append('arch=compute_80,code=sm_80')
-        if int(bare_metal_minor) >= 7:
+        if int(bare_metal_minor) >= 7 and compute_cap == '9.0':
             cc_flag.append('-gencode')
             cc_flag.append('arch=compute_90,code=sm_90')
 
@@ -109,6 +110,12 @@ def _get_cuda_bare_metal_version(cuda_dir):
 
     return raw_output, bare_metal_major, bare_metal_minor
 
+def _get_compute_cap():
+    raw_output = subprocess.check_output(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv"],
+                                         universal_newlines=True)
+    output = raw_output.split()
+    # example output on A100 ['compute_cap', '8.0', '8.0', '8.0', '8.0', '8.0', '8.0', '8.0', '8.0']
+    return output[1]
 
 def _create_build_dir(buildpath):
     try:
