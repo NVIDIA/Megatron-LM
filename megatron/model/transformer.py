@@ -522,8 +522,10 @@ class ParallelAttention(MegatronModule):
                 2 * projection_size,
                 gather_output=False,
                 init_method=init_method)
-        else:
+        elif attention_type == AttnType.cross_attn and self.attention_head_type == 'multiquery':
             raise NotImplementedError("Multiquery attention not implemented for cross-attention.")
+        else:
+            raise ValueError(f"Invalid attention arguments: {attention_type}, {self.attention_head_type}")
 
         if self.attention_head_type == 'multihead':
             self.core_attention = CoreAttention(self.layer_number,

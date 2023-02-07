@@ -205,7 +205,7 @@ class GPTDataset(torch.utils.data.Dataset):
             assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
 
             eod = self.tokenizer.eod
-            pad = self.tokenizer.tokenizer.special_tokens[FIM_PAD]
+            pad = self.tokenizer.special_tokens[FIM_PAD]
 
             segment_breaks = np.argwhere(sample == eod) # split sample by document
 
@@ -495,7 +495,7 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
     """
     fim_rate = args.fim_rate
 
-    suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
+    suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
 
     if np_rng.binomial(1, fim_rate): # sample bernoulli dist
 

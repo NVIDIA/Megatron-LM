@@ -877,6 +877,8 @@ def _add_data_args(parser):
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
                        help='Path to the BPE merge file.')
+    group.add_argument('--tokenizer-file', type=str, default=None,
+                       help='Path to the tokenizer.json file. Used for the TokenizerFromFile[...] tokenizers')
     group.add_argument('--vocab-extra-ids', type=int, default=0,
                        help='Number of additional vocabulary tokens. '
                             'They are used for span masking in the T5 model')
@@ -906,7 +908,9 @@ def _add_data_args(parser):
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer',
-                                'GPT2BPETokenizerWithFIM'],
+                                'GPT2BPETokenizerWithFIM',
+                                'TokenizerFromFile',
+                                'TokenizerFromFileWithFIM'],
                        help='What type of tokenizer to use.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],

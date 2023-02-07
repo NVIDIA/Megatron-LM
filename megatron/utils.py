@@ -19,6 +19,7 @@ import sys
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as torchDDP
+from torch.distributed import BarrierOptions, GroupMember
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
