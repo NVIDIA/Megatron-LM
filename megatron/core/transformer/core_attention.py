@@ -4,6 +4,7 @@
 import math
 
 import torch
+from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.utils import divide
@@ -32,19 +33,12 @@ class CoreAttention(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__(config=config)
 
-        self.config = config
-        self.fp16 = config.fp16
-        self.bf16 = config.bf16
-        self.apply_query_key_layer_scaling = config.apply_query_key_layer_scaling
-        self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
-        self.sequence_parallel = config.sequence_parallel_enabled
-        self.masked_softmax_fusion = config.masked_softmax_fusion
-        self.attention_dropout = config.attention_dropout
+        self.config: TransformerConfig = config
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
 
-        projection_size = config.kv_channels * config.num_attention_heads
+        projection_size = self.config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -54,26 +48,26 @@ class CoreAttention(MegatronModule):
 
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
-        if self.apply_query_key_layer_scaling:
+        if self.config.apply_query_key_layer_scaling:
             coeff = self.layer_number
             self.norm_factor *= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            input_in_fp16=self.fp16,
-            input_in_bf16=self.bf16,
+            input_in_fp16=self.config.fp16,
+            input_in_bf16=self.config.bf16,
             attn_mask_type=self.attn_mask_type,
-            scaled_masked_softmax_fusion=self.masked_softmax_fusion,
+            scaled_masked_softmax_fusion=self.config.masked_softmax_fusion,
             mask_func=attention_mask_func,
-            softmax_in_fp32=self.attention_softmax_in_fp32,
+            softmax_in_fp32=self.config.attention_softmax_in_fp32,
             scale=coeff,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(self.attention_dropout)
+        self.attention_dropout = torch.nn.Dropout(self.config.attention_dropout)
 
-    def forward(self, query_layer, key_layer, value_layer, attention_mask):
+    def forward(self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor):
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
@@ -109,12 +103,12 @@ class CoreAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs = self.scale_mask_softmax(attention_scores, attention_mask)
+        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
 
-        if not self.sequence_parallel:
+        if not self.config.sequence_parallel_enabled:
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
         else:
