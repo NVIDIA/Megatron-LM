@@ -8,4 +8,3 @@ class TestTransformerConfig:
         assert transformer_config.ffn_hidden_size == 48
         assert transformer_config.num_attention_heads == 4
         assert transformer_config.kv_channels == 3
-        assert transformer_config.padded_vocab_size == 10

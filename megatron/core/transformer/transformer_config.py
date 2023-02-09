@@ -25,7 +25,6 @@ class TransformerConfig:
                             Defaults to None.
         hidden_dropout (float): Dropout probability for transformer hidden state. Defaults to 0.1.
         attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
-        padded_vocab_size (int): Vocab size after padding.
         fp32_residual_connection (bool): If true, move residual connections to fp32.
         apply_residual_connection_post_layernorm (bool): If true, uses the original BERT residule connection ordering.
                                                          Defaults to False.
@@ -101,7 +100,7 @@ class TransformerConfig:
     num_layers: int
     hidden_size: int
     num_attention_heads: int
-    padded_vocab_size: int
+
     ffn_hidden_size: int = None
     kv_channels: int = None
     hidden_dropout: float = 0.1

@@ -28,7 +28,7 @@ class ParallelTransformerLayer(MegatronModule):
     ):
 
         super(ParallelTransformerLayer, self).__init__(config=config)
-        self.config = config
+        self.config: TransformerConfig = config
 
         self.layer_number = layer_number
         self.self_attn_mask_type = self_attn_mask_type
