@@ -175,7 +175,7 @@ class ParallelTransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(self, hidden_states, attention_mask):
+    def forward(self, hidden_states, attention_mask, inference_params=None):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 

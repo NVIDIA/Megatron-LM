@@ -10,9 +10,7 @@ from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 
 @pytest.fixture
 def gpt_embedding(transformer_config):
-    embedding = GPTEmbedding(
-        config=transformer_config, vocab_size=100, max_sequence_length=4, embedding_dropout_prob=0.1
-    )
+    embedding = GPTEmbedding(config=transformer_config, vocab_size=100, max_sequence_length=4)
     return embedding
 
 

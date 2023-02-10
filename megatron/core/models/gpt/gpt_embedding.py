@@ -19,15 +19,12 @@ class GPTEmbedding(MegatronModule):
         embedding_dropout_prob float): dropout probability for embeddings
     """
 
-    def __init__(
-        self, config: TransformerConfig, vocab_size: int, max_sequence_length: int, embedding_dropout_prob: float,
-    ):
+    def __init__(self, config: TransformerConfig, vocab_size: int, max_sequence_length: int):
         super(GPTEmbedding, self).__init__(config=config)
 
         self.config: TransformerConfig = config
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
-        self.embedding_dropout_prob: float = embedding_dropout_prob
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -50,7 +47,7 @@ class GPTEmbedding(MegatronModule):
             self.config.init_method(self.position_embeddings.weight)
 
         # Embeddings dropout
-        self.embedding_dropout = torch.nn.Dropout(self.embedding_dropout_prob)
+        self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
