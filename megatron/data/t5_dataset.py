@@ -39,7 +39,7 @@ class T5Dataset(torch.utils.data.Dataset):
     def __init__(self, name, indexed_dataset, data_prefix,
                  splits_string, num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, max_seq_length_dec,
-                 short_seq_prob, seed):
+                 short_seq_prob, add_mask_tokens, seed):
 
         # Params to store.
         self.name = name
@@ -73,8 +73,12 @@ class T5Dataset(torch.utils.data.Dataset):
         self.pad_id = tokenizer.pad
         self.bos_id = tokenizer.bos_token_id
         self.eos_id = tokenizer.eos_token_id
-        self.sentinel_tokens = tokenizer.additional_special_tokens_ids
-        assert len(self.sentinel_tokens) > 0, "Provide the argument --vocab-extra-ids 100 to the script"
+        if add_mask_tokens:
+            self.sentinel_tokens = tokenizer.additional_special_tokens_ids
+            assert len(self.sentinel_tokens) > 0, \
+                "Provide the argument --vocab-extra-ids 100 to the script"
+        else:
+            self.sentinel_tokens = None
 
     def __len__(self):
         return self.samples_mapping.shape[0]

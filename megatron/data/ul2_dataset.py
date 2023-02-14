@@ -38,8 +38,9 @@ class UL2Dataset(torch.utils.data.Dataset):
     def __init__(self, name, indexed_dataset, data_prefix,
                  splits_string, num_epochs, max_num_samples, model_type,
                  denoiser_ratios, denoisers, mean_span_lengths,
-                 mask_ratios, denoiser_tokens, max_seq_length,
-                 max_seq_length_dec, short_seq_prob, seed):
+                 mask_ratios, add_mask_tokens, denoiser_tokens,
+                 max_seq_length, max_seq_length_dec, short_seq_prob,
+                 seed):
         super().__init__()
 
         if denoiser_ratios is None:
@@ -120,14 +121,17 @@ class UL2Dataset(torch.utils.data.Dataset):
         self.bos_id = tokenizer.bos_token_id
         self.eos_id = tokenizer.eos_token_id
 
-        # Filter out denoiser tokens.
-        self.sentinel_tokens = [
-            token
-            for token in tokenizer.additional_special_tokens_ids
-            if token not in self.cls_ids.values()
-        ]
-        assert len(self.sentinel_tokens) > 0, \
-            "Provide the argument --vocab-extra-ids 100 to the script"
+        if add_mask_tokens:
+            # Filter out denoiser tokens.
+            self.sentinel_tokens = [
+                token
+                for token in tokenizer.additional_special_tokens_ids
+                if token not in self.cls_ids.values()
+            ]
+            assert len(self.sentinel_tokens) > 0, \
+                "Provide the argument --vocab-extra-ids 100 to the script"
+        else:
+            self.sentinel_tokens = None
 
     def __len__(self):
         return self.samples_mapping.shape[0]
