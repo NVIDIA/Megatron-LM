@@ -47,6 +47,7 @@ def build_tokenizer(args):
         tokenizer = _GPT2BPETokenizer(
             args.vocab_file,
             args.merge_file,
+            vocab_extra_ids=args.vocab_extra_ids,
             ul2_denoiser_tokens=ul2_denoiser_tokens,
         )
     elif args.tokenizer_type == 'SentencePieceTokenizer':
@@ -298,18 +299,26 @@ class _BertWordPieceTokenizer(AbstractTokenizer):
 class _GPT2BPETokenizer(AbstractTokenizer):
     """Original GPT2 BPE tokenizer."""
 
-    def __init__(self, vocab_file, merge_file, ul2_denoiser_tokens=None):
+    def __init__(
+            self,
+            vocab_file,
+            merge_file,
+            vocab_extra_ids=0,
+            ul2_denoiser_tokens=None,
+    ):
         name = 'GPT2 BPE'
         super().__init__(name)
+
+        self._extra_id_tokens = [
+            f"<extra_id_{i}>" for i in range(vocab_extra_ids)]
 
         if ul2_denoiser_tokens is None:
             ul2_denoiser_tokens = []
         self._ul2_tokens = ul2_denoiser_tokens
 
-        # Warning! `additional_special_token_ids` will also return the UL2
-        # tokens here.
-        special_tokens = self._ul2_tokens.copy()
+        special_tokens = self._extra_id_tokens.copy()
         if self._ul2_tokens:
+            special_tokens.extend(self._ul2_tokens)
             special_tokens.append('<SEP>')
 
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
@@ -353,8 +362,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
     @property
     def additional_special_tokens_ids(self):
-        # Warning! This will also return the UL2 tokens.
-        return [self.vocab[k] for k in self.tokenizer.special_tokens]
+        return [self.vocab[k] for k in self._extra_id_tokens]
 
     @property
     def ul2_tokens_ids(self):
