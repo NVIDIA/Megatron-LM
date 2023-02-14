@@ -105,8 +105,10 @@ class UL2Dataset(torch.utils.data.Dataset):
             vocab = tokenizer.vocab
         self.vocab_id_list = list(inv_vocab.keys())
         self.vocab_id_to_token_dict = inv_vocab
+        # Replace empty string tokens with `None` – we want to ignore
+        # those.
         self.cls_ids = {
-            denoiser: vocab[token]
+            denoiser: vocab[token] if token else None
             for (denoiser, token) in denoiser_tokens.items()
         }
         # cls_token = self.vocab_id_to_token_dict[tokenizer.cls]
@@ -213,10 +215,13 @@ def build_training_sample(sample, target_seq_length,
     tokens = tokens[:max_num_tokens]
 
     # Prepend objective token.
-    cls_id = cls_ids.get(denoiser)
-    if cls_id is None:
+    cls_id = cls_ids.get(denoiser, False)
+    if cls_id is False:
         raise ValueError('unknown denoiser')
-    tokens = [cls_id] + tokens
+
+    # If objective token is `None`, ignore it.
+    if cls_id is not None:
+        tokens = [cls_id] + tokens
 
     # Masking.
     mean_ngrams = mean_span_lengths[denoiser_index]

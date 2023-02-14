@@ -1345,12 +1345,15 @@ def _add_ul2_args(parser):
                        help='Ratio of masked token in the full sequence.')
     group.add_argument('--ul2-r-denoiser-token', type=str, default='[R]',
                        help='What token to prepend for the UL2 R-denoising '
+                       'objective. If empty, do not prepend a token for this '
                        'objective.')
     group.add_argument('--ul2-s-denoiser-token', type=str, default='[S]',
                        help='What token to prepend for the UL2 S-denoising '
+                       'objective. If empty, do not prepend a token for this '
                        'objective.')
     group.add_argument('--ul2-x-denoiser-token', type=str, default='[X]',
                        help='What token to prepend for the UL2 X-denoising '
+                       'objective. If empty, do not prepend a token for this '
                        'objective.')
 
     return parser
