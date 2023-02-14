@@ -174,13 +174,16 @@ def merge_subsequent_masks(tokens, masked_spans=None, bos_id=None,
     if prefix_lm:
         assert len(masked_spans) <= 1, \
             'Received more than one masked span for PrefixLM masking'
-    else:
+    elif sentinel_tokens is not None:
         sentinel_tokens = collections.deque(sentinel_tokens)
+
+    insert_mask_tokens = not prefix_lm and sentinel_tokens is not None
+
     t5_input = []
     (t5_decoder_in, t5_decoder_out) = ([bos_id], [])
     (start_index, end_index) = (0, None)
     for span in masked_spans:
-        if not prefix_lm:
+        if insert_mask_tokens:
             flag = sentinel_tokens.popleft()
 
             # Append the same tokens in decoder input and output
@@ -191,7 +194,7 @@ def merge_subsequent_masks(tokens, masked_spans=None, bos_id=None,
 
         end_index = span.index[0]
         t5_input.extend(tokens[start_index: end_index])
-        if not prefix_lm:
+        if insert_mask_tokens:
             t5_input.append(flag)
 
         # the next start index is the token after the last span token
