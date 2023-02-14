@@ -28,88 +28,77 @@ class ParallelAttention(MegatronModule):
         super(ParallelAttention, self).__init__(config=config)
 
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.kv_channels = config.kv_channels
-        self.num_attention_heads = config.num_attention_heads
-        self.init_method = config.init_method
-        self.output_layer_init_method = config.output_layer_init_method
-        self.params_dtype = config.params_dtype
-        self.layer_number = max(1, layer_number)
+        self.layer_number = layer_number
         self.attention_type = attention_type
         self.attn_mask_type = attn_mask_type
-        self.async_tensor_model_parallel_allreduce = config.async_tensor_model_parallel_allreduce
-        self.recompute_granularity = config.recompute_granularity
-        self.use_cpu_initialization = config.use_cpu_initialization
-        self.perform_initialization = config.perform_initialization
-        self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
-        self.sequence_parallel_enabled = config.sequence_parallel_enabled
 
-        projection_size = self.kv_channels * self.num_attention_heads
+        projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = divide(projection_size, self.num_attention_heads)
-        self.num_attention_heads_per_partition = divide(self.num_attention_heads, world_size)
+        self.hidden_size_per_attention_head = divide(projection_size, self.config.num_attention_heads)
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                self.hidden_size,
+                self.config.hidden_size,
                 3 * projection_size,
                 gather_output=False,
-                init_method=self.init_method,
+                init_method=self.config.init_method,
                 async_tensor_model_parallel_allreduce=config.async_tensor_model_parallel_allreduce,
-                params_dtype=self.params_dtype,
-                use_cpu_initialization=self.use_cpu_initialization,
-                perform_initialization=self.perform_initialization,
-                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                params_dtype=self.config.params_dtype,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                perform_initialization=self.config.perform_initialization,
+                gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                sequence_parallel_enabled=self.config.sequence_parallel_enabled,
             )
         else:
+            # TODO: supporting T5
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
-                self.hidden_size,
+                self.config.hidden_size,
                 projection_size,
                 gather_output=False,
-                init_method=self.init_method,
+                init_method=self.config.init_method,
                 async_tensor_model_parallel_allreduce=config.async_tensor_model_parallel_allreduce,
-                params_dtype=self.params_dtype,
-                use_cpu_initialization=self.use_cpu_initialization,
-                perform_initialization=self.perform_initialization,
-                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                params_dtype=self.config.params_dtype,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                perform_initialization=self.config.perform_initialization,
+                gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                sequence_parallel_enabled=self.config.sequence_parallel_enabled,
             )
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
-                self.hidden_size,
+                self.config.hidden_size,
                 2 * projection_size,
                 gather_output=False,
-                init_method=self.init_method,
-                async_tensor_model_parallel_allreduce=self.async_tensor_model_parallel_allreduce,
-                params_dtype=self.params_dtype,
-                use_cpu_initialization=self.use_cpu_initialization,
-                perform_initialization=self.perform_initialization,
-                gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-                sequence_parallel_enabled=self.sequence_parallel_enabled,
+                init_method=self.config.init_method,
+                async_tensor_model_parallel_allreduce=self.config.async_tensor_model_parallel_allreduce,
+                params_dtype=self.config.params_dtype,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                perform_initialization=self.config.perform_initialization,
+                gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+                sequence_parallel_enabled=self.config.sequence_parallel_enabled,
             )
 
         self.core_attention = CoreAttention(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
-        self.checkpoint_core_attention = self.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
-            self.hidden_size,
+            self.config.hidden_size,
             input_is_parallel=True,
-            init_method=self.output_layer_init_method,
+            init_method=self.config.output_layer_init_method,
             skip_bias_add=True,
-            params_dtype=self.params_dtype,
-            use_cpu_initialization=self.use_cpu_initialization,
-            perform_initialization=self.perform_initialization,
-            gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.sequence_parallel_enabled,
+            params_dtype=self.config.params_dtype,
+            use_cpu_initialization=self.config.use_cpu_initialization,
+            perform_initialization=self.config.perform_initialization,
+            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
+            sequence_parallel_enabled=self.config.sequence_parallel_enabled,
         )
 
     def _checkpointed_attention_forward(self, query_layer, key_layer, value_layer, attention_mask):
