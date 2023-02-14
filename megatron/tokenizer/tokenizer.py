@@ -325,7 +325,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
                                        special_tokens=special_tokens,
                                        max_len=None)
         if self._ul2_tokens:
-            self.sep_id = self.tokenizer.encoder['<SEP>']
+            self.sep_id = self.tokenizer.special_tokens['<SEP>']
         else:
             self.sep_id = None
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
@@ -362,11 +362,12 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
     @property
     def additional_special_tokens_ids(self):
-        return [self.vocab[k] for k in self._extra_id_tokens]
+        return [
+            self.tokenizer.special_tokens[k] for k in self._extra_id_tokens]
 
     @property
     def ul2_tokens_ids(self):
-        return [self.vocab[k] for k in self._ul2_tokens]
+        return [self.tokenizer.special_tokens[k] for k in self._ul2_tokens]
 
 
 class _SentencePieceTokenizer(AbstractTokenizer):
