@@ -308,7 +308,7 @@ class _GPT2BPETokenizer(AbstractTokenizer):
 
         # Warning! `additional_special_token_ids` will also return the UL2
         # tokens here.
-        special_tokens = self._ul2_tokens
+        special_tokens = self._ul2_tokens.copy()
         if self._ul2_tokens:
             special_tokens.append('<SEP>')
 
