@@ -2,6 +2,8 @@
 
 """UL2-style dataset."""
 
+from collections import ChainMap
+
 import numpy as np
 import torch
 
@@ -86,10 +88,25 @@ class UL2Dataset(torch.utils.data.Dataset):
 
         # Vocab stuff.
         tokenizer = get_tokenizer()
-        self.vocab_id_list = list(tokenizer.inv_vocab.keys())
-        self.vocab_id_to_token_dict = tokenizer.inv_vocab
+        # Some tokenizers split their vocabularies. Here we handle both
+        # cases.
+        if (
+                hasattr(tokenizer, 'tokenizer')
+                and hasattr(tokenizer.tokenizer, 'special_tokens_decoder')
+        ):
+            inv_vocab = ChainMap(
+                tokenizer.inv_vocab,
+                tokenizer.tokenizer.special_tokens_decoder,
+            )
+            vocab = ChainMap(
+                tokenizer.vocab, tokenizer.tokenizer.special_tokens)
+        else:
+            inv_vocab = tokenizer.inv_vocab
+            vocab = tokenizer.vocab
+        self.vocab_id_list = list(inv_vocab.keys())
+        self.vocab_id_to_token_dict = inv_vocab
         self.cls_ids = {
-            denoiser: tokenizer.vocab[token]
+            denoiser: vocab[token]
             for (denoiser, token) in denoiser_tokens.items()
         }
         # cls_token = self.vocab_id_to_token_dict[tokenizer.cls]

@@ -319,15 +319,30 @@ class _GPT2BPETokenizer(AbstractTokenizer):
         special_tokens = self._extra_id_tokens.copy()
         if self._ul2_tokens:
             special_tokens.extend(self._ul2_tokens)
-            special_tokens.append('<SEP>')
+            extra_ul2_tokens = [
+                '<SEP>',
+                '<MASK>',
+                '<PAD>',
+                '<BOS>',
+                '<EOS>',
+            ]
+            special_tokens.extend(extra_ul2_tokens)
 
         self.tokenizer = GPT2Tokenizer(vocab_file, merge_file, errors='replace',
                                        special_tokens=special_tokens,
                                        max_len=None)
         if self._ul2_tokens:
             self.sep_id = self.tokenizer.special_tokens['<SEP>']
+            self.mask_id = self.tokenizer.special_tokens['<MASK>']
+            self.pad_id = self.tokenizer.special_tokens['<PAD>']
+            self._bos_token_id = self.tokenizer.special_tokens['<BOS>']
+            self._eos_token_id = self.tokenizer.special_tokens['<EOS>']
         else:
             self.sep_id = None
+            self.mask_id = None
+            self.pad_id = None
+            self._bos_token_id = None
+            self._eos_token_id = None
         self.eod_id = self.tokenizer.encoder['<|endoftext|>']
 
     @property
@@ -355,6 +370,38 @@ class _GPT2BPETokenizer(AbstractTokenizer):
                 'GPT tokenizer does not have a SEP token by default; '
                 'please add it to the `special_tokens`')
         return self.sep_id
+
+    @property
+    def mask(self):
+        if self.mask_id is None:
+            raise AttributeError(
+                'GPT tokenizer does not have a MASK token by default; '
+                'please add it to the `special_tokens`')
+        return self.mask_id
+
+    @property
+    def pad(self):
+        if self.pad_id is None:
+            raise AttributeError(
+                'GPT tokenizer does not have a PAD token by default; '
+                'please add it to the `special_tokens`')
+        return self.pad_id
+
+    @property
+    def bos_token_id(self):
+        if self._bos_token_id is None:
+            raise AttributeError(
+                'GPT tokenizer does not have a BOS token by default; '
+                'please add it to the `special_tokens`')
+        return self._bos_token_id
+
+    @property
+    def eos_token_id(self):
+        if self._eos_token_id is None:
+            raise AttributeError(
+                'GPT tokenizer does not have a EOS token by default; '
+                'please add it to the `special_tokens`')
+        return self._eos_token_id
 
     @property
     def eod(self):
