@@ -32,7 +32,7 @@ class GPTModel(MegatronModule):
         max_sequence_length: int,
         pre_process: bool = True,
         post_process: bool = True,
-        fp_16_lm_cross_entropy: bool = False,
+        fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
     ):
         super(GPTModel, self).__init__(config=config)
@@ -42,7 +42,7 @@ class GPTModel(MegatronModule):
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
         self.post_process = post_process
-        self.fp_16_lm_cross_entropy = fp_16_lm_cross_entropy
+        self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
 
         # Embeddings.

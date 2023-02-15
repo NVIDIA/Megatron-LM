@@ -124,7 +124,7 @@ class TransformerConfig:
     perform_initialization: bool = True
     params_dtype: torch.dtype = torch.float32
 
-    # mixed-precision
+    # O2 mixed-precision
     fp16: bool = False
     bf16: bool = False
     apply_query_key_layer_scaling: bool = True
@@ -135,10 +135,10 @@ class TransformerConfig:
 
     # fusion
     gradient_accumulation_fusion: bool = False
-    bias_gelu_fusion: bool = False
+    bias_gelu_fusion: bool = False  # TODO: this should be bias_activation_fusion ?
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
-    bias_dropout_fusion: bool = False
+    bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
 
     # activation recomputation
     recompute_granularity: str = None
@@ -199,3 +199,5 @@ class TransformerConfig:
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
 
+        if self.apply_query_key_layer_scaling:
+            self.attention_softmax_in_fp32 = True
