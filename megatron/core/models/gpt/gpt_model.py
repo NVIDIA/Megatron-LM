@@ -50,16 +50,14 @@ class GPTModel(MegatronModule):
             self.embedding = GPTEmbedding(
                 config=self.config, vocab_size=self.vocab_size, max_sequence_length=self.max_sequence_length,
             )
-            self._embedding_key = 'embedding'
 
         # Transformer.
-        self.transformer_block = ParallelTransformerBlock(
+        self.decoder = ParallelTransformerBlock(
             config=self.config,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
-        self._encoder_key = 'encoder'
 
         self.initialize_word_embeddings()
 
@@ -72,7 +70,7 @@ class GPTModel(MegatronModule):
             input_tensor = [input_tensor]
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
-        self.transformer_block.set_input_tensor(input_tensor[0])
+        self.decoder.set_input_tensor(input_tensor[0])
 
     def forward(
         self,
@@ -92,7 +90,7 @@ class GPTModel(MegatronModule):
             encoder_input = None
 
         # Run encoder.
-        hidden_states = self.transformer_block(
+        hidden_states = self.decoder(
             hidden_states=encoder_input, attention_mask=attention_mask, inference_params=inference_params
         )
 
@@ -199,7 +197,7 @@ class GPTModel(MegatronModule):
         # Zero out initial weights for decoder embedding.
         # NOTE: We don't currently support T5 with the interleaved schedule.
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True) and self.pre_process:
-            self.transformer_block.embedding.zero_parameters()
+            self.embedding.zero_parameters()
 
         if not torch.distributed.is_initialized():
             # TODO: this should be log not print
