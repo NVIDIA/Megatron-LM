@@ -5,7 +5,7 @@ from typing import Callable
 
 import torch
 import torch.nn.init as init
-from torch import Tensor
+from megatron.core.transformer.utils import init_method_normal, scaled_init_method_normal
 
 
 @dataclass
@@ -117,9 +117,9 @@ class TransformerConfig:
     sequence_parallel_enabled: bool = False
 
     # weight initialization
-    init_method: Callable = init.xavier_normal_
+    init_method: Callable = None
     init_method_std: float = 0.02
-    output_layer_init_method: Callable = init.xavier_normal_
+    output_layer_init_method: Callable = None
     use_cpu_initialization: bool = False
     perform_initialization: bool = True
     params_dtype: torch.dtype = torch.float32
@@ -192,4 +192,10 @@ class TransformerConfig:
                     raise ValueError(
                         f'num_layers: {self.num_layers} must be divisible by virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
                     )
+
+        if self.init_method is None:
+            self.init_method = init_method_normal(self.init_method_std)
+
+        if self.output_layer_init_method is None:
+            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
 
