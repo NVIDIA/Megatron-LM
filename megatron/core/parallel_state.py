@@ -278,6 +278,12 @@ def set_pipeline_model_parallel_world_size(world_size):
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
+def set_virtual_pipeline_model_parallel_world_size(world_size):
+    """Set the virtual pipeline model parallel size"""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
+
+
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
@@ -496,6 +502,7 @@ def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
     assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
     return _GLOBAL_MEMORY_BUFFER
+
 
 def destroy_global_memory_buffer():
     """Sets the global memory buffer to None"""
