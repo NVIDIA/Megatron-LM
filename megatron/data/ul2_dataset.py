@@ -73,6 +73,11 @@ class UL2Dataset(torch.utils.data.Dataset):
         # Dataset.
         self.indexed_dataset = indexed_dataset
 
+        # Minimum number of tokens added: BOS and EOS.
+        min_added_tokens = 2
+        if is_decoder_only(model_type):
+            # Here we also add a SEP token.
+            min_added_tokens += 1
         # Build the samples mapping.
         self.samples_mapping = get_samples_mapping(
             self.indexed_dataset,
@@ -80,7 +85,7 @@ class UL2Dataset(torch.utils.data.Dataset):
             splits_string,
             num_epochs,
             max_num_samples,
-            self.max_seq_length - 2,  # account for added tokens
+            self.max_seq_length - min_added_tokens,  # account for added tokens
             short_seq_prob,
             self.seed,
             self.name,
