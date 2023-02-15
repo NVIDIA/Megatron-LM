@@ -105,7 +105,7 @@ class GPTModel(MegatronModule):
             = self.language_model.state_dict_for_save_checkpoint(
                 prefix=prefix, keep_vars=keep_vars)
         # Save word_embeddings.
-        if self.post_process and not self.pre_process:
+        if self.post_process and not self.pre_process and not self.untie_embeddings_and_output_weights:
             state_dict_[self._word_embeddings_for_head_key] \
                 = self.word_embeddings.state_dict(prefix=prefix,
                                                   keep_vars=keep_vars)
@@ -115,7 +115,7 @@ class GPTModel(MegatronModule):
         """Customized load."""
 
         # Load word_embeddings.
-        if self.post_process and not self.pre_process:
+        if self.post_process and not self.pre_process and not self.untie_embeddings_and_output_weights:
             self.word_embeddings.load_state_dict(
                 state_dict[self._word_embeddings_for_head_key], strict=strict)
         if self._language_model_key in state_dict:
