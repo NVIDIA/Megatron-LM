@@ -187,17 +187,26 @@ def merge_subsequent_masks(tokens, masked_spans=None, bos_id=None,
     (t5_decoder_in, t5_decoder_out) = ([bos_id], [])
     (start_index, end_index) = (0, None)
     for span in masked_spans:
+        end_index = span.index[0]
+        # The part of the sequence that is visible before the masked
+        # span starts. Starting from beginning or end of last masked
+        # span.
+        before_mask = tokens[start_index:end_index]
+
         if insert_mask_tokens:
             flag = sentinel_tokens.popleft()
 
             # Append the same tokens in decoder input and output
             t5_decoder_in.append(flag)
             t5_decoder_out.append(flag)
+        elif not prefix_lm:
+            # Append visible part of input sequence.
+            t5_decoder_in.extend(before_mask)
+            t5_decoder_out.extend(before_mask)
         t5_decoder_in.extend(span.label)
         t5_decoder_out.extend(span.label)
 
-        end_index = span.index[0]
-        t5_input.extend(tokens[start_index: end_index])
+        t5_input.extend(before_mask)
         if insert_mask_tokens:
             t5_input.append(flag)
 
