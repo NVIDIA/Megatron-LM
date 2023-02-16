@@ -83,15 +83,15 @@ class GPTModel(MegatronModule):
 
         # Encoder embedding.
         if self.pre_process:
-            encoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
             # encoder will get hidden_states from encoder.input_tensor
-            encoder_input = None
+            decoder_input = None
 
         # Run encoder.
         hidden_states = self.decoder(
-            hidden_states=encoder_input, attention_mask=attention_mask, inference_params=inference_params
+            hidden_states=decoder_input, attention_mask=attention_mask, inference_params=inference_params
         )
 
         if self.post_process:
