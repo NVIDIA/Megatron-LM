@@ -287,7 +287,7 @@ def create_masked_lm_predictions(tokens,
         # plays nicely with the other probability distributions in terms
         # of math.
         normal_mean = (max_ngrams + 1) / 2
-        # However, we do not want to bound the maximum number of
+        # However, we do not want to bound the maximum length of
         # n-grams.
         max_ngrams = num_filtered_tokens - 1
 
