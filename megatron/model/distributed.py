@@ -9,6 +9,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_args
 from megatron.core import mpu
+from megatron.core import tensor_parallel
 from .module import MegatronModule
 
 
@@ -125,7 +126,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             type_num_elements = {}
             for param in self.module.parameters():
                 if (param.requires_grad and
-                    not mpu.param_is_expert_model_parallel(param)):
+                    not tensor_parallel.param_is_expert_model_parallel(param)):
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] = type_num_elements.get(dtype, 0) \
                                                + param.data.nelement()
@@ -149,7 +150,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # store the start index for the gradients.
             for param in self.module.parameters():
                 if (param.requires_grad and
-                    not mpu.param_is_expert_model_parallel(param)):
+                    not tensor_parallel.param_is_expert_model_parallel(param)):
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] -= param.data.nelement()
                     param.main_grad = self._grad_buffers[dtype].get(
@@ -168,7 +169,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # Loop over all the parameters in the model.
             for param in self.module.parameters():
                 if (param.requires_grad and
-                    not mpu.param_is_expert_model_parallel(param)):
+                    not tensor_parallel.param_is_expert_model_parallel(param)):
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator functtion.

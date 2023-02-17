@@ -8,8 +8,9 @@ from torch._six import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from megatron import mpu
+from megatron.core import parallel_state
 from megatron.model.module import param_is_not_shared
+from megatron.core.tensor_parallel import param_is_expert_model_parallel
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
 
@@ -47,7 +48,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     dp_grads_for_norm = []
     ep_grads_for_norm = []
     for (param, grad) in zip(parameters, grads_for_norm):
-        if mpu.param_is_expert_model_parallel(param):
+        if param_is_expert_model_parallel(param):
             ep_grads_for_norm.append(grad)
         else:
             dp_grads_for_norm.append(grad)
@@ -119,7 +120,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
         if ep_grads_for_norm:
             torch.distributed.all_reduce(ep_total_norm,
                                      op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_data_parallel_group())
+                                     group=parallel_state.get_data_parallel_group())
             total_norm += ep_total_norm
 
         # Sum across all model-parallel GPUs.
