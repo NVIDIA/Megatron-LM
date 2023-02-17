@@ -262,7 +262,7 @@ python pretrain_t5.py \
 
 ## Distributed Pretraining
 
-The `examples/pretrain_{bert,gpt,t5}_distributed.sh` scripts use the PyTorch distributed launcher for distributed training. As such, multi-node training can be achieved by properly setting environment variables and using `init_method='env://'` in the launcher. See the official PyTorch [documentation](https://pytorch.org/docs/stable/distributed.html#launch-utility) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default, multi-node training uses the [nccl](https://developer.nvidia.com/nccl) distributed backend. A simple set of additional arguments and the use of the PyTorch distributed module with the Python flag `-m torch.distributed.launch`, detailed below, are the only additional requirements to adopt distributed training.
+The `examples/pretrain_{bert,gpt,t5}_distributed.sh` scripts use the PyTorch distributed launcher for distributed training. As such, multi-node training can be achieved by properly setting environment variables. See the official PyTorch [documentation](https://pytorch.org/docs/stable/elastic/run.html#launcher-api) for further description of these [environment variables](https://pytorch.org/docs/stable/distributed.html#environment-variable-initialization). By default, multi-node training uses the [nccl](https://developer.nvidia.com/nccl) distributed backend. A simple set of additional arguments and the use of the PyTorch distributed module with the `torchrun` elastic launcher (equivalent to `python -m torch.distributed.run`) are the only additional requirements to adopt distributed training. See any of `examples/pretrain_{bert,gpt,t5}_distributed.sh` for more details.
 
 We use two types of parallelism: data and model parallelism. We facilitate two distributed data parallel implementations: a simple one of our own that performs gradient all-reduce at the end of back propagation step, and Torch's distributed data parallel wrapper that overlaps gradient reduction with back propagation computation. To switch between these two options use `--DDP-impl local` or `--DDP-impl torch`, respectively. As expected, Torch distributed data parallelism is more efficient at larger model sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 76% when Torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
 
@@ -275,36 +275,6 @@ To use pipeline model parallelism (sharding the transformer modules into stages 
 We have examples of how to use these two different forms of model parallelism the example scripts ending in `distributed_with_mp.sh`:
 
 Other than these minor changes, the distributed training is identical to the training on a single GPU.
-
-Distributed training:
-<pre>
-WORLD_SIZE=8
-TENSOR_MP_SIZE=2
-PIPELINE_MP_SIZE=2
-
-DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
-                  --nnodes 1 \
-                  --node_rank 0 \
-                  --master_addr localhost \
-                  --master_port 6000"
-
-CHECKPOINT_PATH=&#60;same as above&#62;
-VOCAB_FILE=&#60;same as above&#62;
-DATA_PATH=&#60;same as above&#62;
-MODEL_ARGS=&#60;same as above&#62;
-OUTPUT_ARGS=&#60;same as above&#62;
-
-python -m torch.distributed.launch $DISTRIBUTED_ARGS ./pretrain_<model>.py \
-                $MODEL_ARGS \
-                $OUTPUT_ARGS \
-                --save $CHECKPOINT_PATH \
-                --load $CHECKPOINT_PATH \
-                --data-path $DATA_PATH \
-                --tensor-model-parallel-size $TENSOR_MP_SIZE \
-                --pipeline-model-parallel-size $PIPELINE_MP_SIZE \
-                --sequence-parallel \
-                --DDP-impl torch
-</pre>
 
 The interleaved pipelining schedule (more details in Section 2.2.2 of [our paper](https://arxiv.org/pdf/2104.04473.pdf)) can be enabled using the `--num-layers-per-virtual-pipeline-stage` argument, which controls the number of transformer layers in a virtual stage (by default with the non-interleaved schedule, each GPU will execute a single virtual stage with `NUM_LAYERS / PIPELINE_MP_SIZE` transformer layers). The total number of layers in the transformer model should be divisible by this argument value. Additionally, the number of microbatches in the pipeline (computed as `GLOBAL_BATCH_SIZE / (DATA_PARALLEL_SIZE * MICRO_BATCH_SIZE)`) should be divisible by the `PIPELINE_MP_SIZE` when using this schedule (this condition is checked in an assertion in the code). The interleaved schedule is not supported for pipelines with 2 stages (`PIPELINE_MP_SIZE=2`).
 
