@@ -1155,6 +1155,9 @@ def _add_data_args(parser):
                        help='Whether not to add sentinel tokens for masked '
                        'spans in span corruption tasks.',
                        dest='add_mask_tokens')
+    group.add_argument('--pack-samples', action='store_true',
+                       help='Whether to pack samples in span corruption '
+                       'datasets (T5 or UL2). GPT dataset is always packed.')
     group.add_argument('--mmap-warmup', action='store_true',
                        help='Warm up mmap files.')
     group.add_argument('--num-workers', type=int, default=2,

@@ -12,6 +12,7 @@ from megatron.data.dataset_utils import (
     create_masked_lm_predictions,
     get_samples_mapping
 )
+from megatron.data.gpt_dataset import build_index_mappings, get_sample
 
 
 class LengthExceededError(ValueError):
@@ -39,7 +40,9 @@ class T5Dataset(torch.utils.data.Dataset):
     def __init__(self, name, indexed_dataset, data_prefix,
                  splits_string, num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, max_seq_length_dec,
-                 short_seq_prob, add_mask_tokens, seed):
+                 short_seq_prob, add_mask_tokens, pack_samples, seed,
+                 *,
+                 data_cache_path=None):
 
         # Params to store.
         self.name = name
@@ -50,18 +53,30 @@ class T5Dataset(torch.utils.data.Dataset):
 
         # Dataset.
         self.indexed_dataset = indexed_dataset
+        self.pack_samples = pack_samples
 
-        # Build the samples mapping.
-        self.samples_mapping = get_samples_mapping(self.indexed_dataset,
-                                                   data_prefix,
-                                                   splits_string,
-                                                   num_epochs,
-                                                   max_num_samples,
-                                                   self.max_seq_length - 2, # account for added tokens
-                                                   short_seq_prob,
-                                                   self.seed,
-                                                   self.name,
-                                                   False)
+        if self.pack_samples:
+            (
+                self.doc_idx, self.sample_idx, self.shuffle_idx,
+                self.desc, self.desc_hash,
+            ) = build_index_mappings(
+                self.name, data_prefix, self.indexed_dataset.get_doc_idx(),
+                self.indexed_dataset.sizes, splits_string, max_num_samples,
+                self.max_seq_length, self.seed,
+                data_cache_path=data_cache_path)
+        else:
+            # Build the samples mapping.
+            self.samples_mapping = get_samples_mapping(self.indexed_dataset,
+                                                       data_prefix,
+                                                       splits_string,
+                                                       num_epochs,
+                                                       max_num_samples,
+                                                       # account for added tokens
+                                                       self.max_seq_length - 2,
+                                                       short_seq_prob,
+                                                       self.seed,
+                                                       self.name,
+                                                       False)
 
         # Vocab stuff.
         tokenizer = get_tokenizer()
@@ -81,14 +96,24 @@ class T5Dataset(torch.utils.data.Dataset):
             self.sentinel_tokens = None
 
     def __len__(self):
-        return self.samples_mapping.shape[0]
+        if self.pack_samples:
+            return self.sample_idx.shape[0] - 1
+        else:
+            return self.samples_mapping.shape[0]
 
     def __getitem__(self, idx):
-
-        start_index, end_index, seq_length = self.samples_mapping[idx]
-        sample = []
-        for index in range(start_index, end_index):
-            sample.append(self.indexed_dataset[index])
+        if self.pack_samples:
+            sample = get_sample(
+                self.indexed_dataset, self.doc_idx,
+                self.sample_idx, self.shuffle_idx, idx, False,
+            )['text']
+            seq_length = len(sample)
+            sample = [sample]
+        else:
+            start_index, end_index, seq_length = self.samples_mapping[idx]
+            sample = []
+            for index in range(start_index, end_index):
+                sample.append(self.indexed_dataset[index])
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
         np_rng = np.random.RandomState(seed=(self.seed + idx))
