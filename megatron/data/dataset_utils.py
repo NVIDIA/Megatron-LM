@@ -262,10 +262,16 @@ def create_masked_lm_predictions(tokens,
             continue
         # Note(mingdachen):
         # Skip current piece if they are covered in lm masking or previous ngrams.
+        is_covered = False
         for index_set in cand_index_set[0]:
             for index in index_set:
                 if index in covered_indexes:
-                    continue
+                    is_covered = True
+                    break
+            if is_covered:
+                break
+        if is_covered:
+            continue
 
         if not geometric_dist:
             n = np_rng.choice(ngrams[:len(cand_index_set)],
