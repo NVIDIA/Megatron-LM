@@ -318,13 +318,14 @@ def build_training_sample(sample, target_seq_length,
         }
     else:
         # Padding.
-        tokens_enc, tokens_dec_in, labels, enc_mask, \
-        dec_mask, enc_dec_mask, loss_mask \
-            = pad_and_convert_to_numpy(tokens, masked_positions,
-                                       masked_labels, pad_id, max_seq_length,
-                                       max_seq_length_dec, masked_spans,
-                                       bos_id, eos_id, sentinel_tokens,
-                                       prefix_lm)
+        (
+            tokens_enc, tokens_dec_in, labels, enc_mask,
+            dec_mask, enc_dec_mask, loss_mask,
+        ) = pad_and_convert_to_numpy(tokens, masked_positions,
+                                     masked_labels, pad_id, max_seq_length,
+                                     max_seq_length_dec, masked_spans,
+                                     bos_id, eos_id, sentinel_tokens,
+                                     prefix_lm)
 
         train_sample = {
             'text_enc': tokens_enc,
