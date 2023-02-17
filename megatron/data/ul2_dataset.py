@@ -41,8 +41,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                  splits_string, num_epochs, max_num_samples, model_type,
                  denoiser_ratios, denoisers, mean_span_lengths,
                  mask_ratios, add_mask_tokens, pack_samples,
-                 denoiser_tokens, max_seq_length, max_seq_length_dec,
-                 short_seq_prob, seed,
+                 denoiser_tokens, like_ul2r, max_seq_length,
+                 max_seq_length_dec, short_seq_prob, seed,
                  *,
                  data_cache_path=None):
         super().__init__()
@@ -73,6 +73,7 @@ class UL2Dataset(torch.utils.data.Dataset):
         self.denoisers = [denoiser.upper() for denoiser in denoisers]
         self.mean_span_lengths = mean_span_lengths
         self.mask_ratios = mask_ratios
+        self.like_ul2r = like_ul2r
 
         # Dataset.
         self.indexed_dataset = indexed_dataset
@@ -185,8 +186,9 @@ class UL2Dataset(torch.utils.data.Dataset):
                                      self.mask_id, self.pad_id,
                                      self.model_type, self.denoiser_ratios,
                                      self.denoisers, self.mean_span_lengths,
-                                     self.mask_ratios, np_rng, self.bos_id,
-                                     self.eos_id, self.sentinel_tokens)
+                                     self.mask_ratios, self.like_ul2r, np_rng,
+                                     self.bos_id, self.eos_id,
+                                     self.sentinel_tokens)
 
 
 def build_training_sample(sample, target_seq_length,
@@ -195,7 +197,7 @@ def build_training_sample(sample, target_seq_length,
                           cls_ids, sep_id, mask_id, pad_id,
                           model_type, denoiser_ratios, denoisers,
                           mean_span_lengths, mask_ratios,
-                          np_rng, bos_id=None,
+                          like_ul2r, np_rng, bos_id=None,
                           eos_id=None, sentinel_tokens=None):
     """Build training sample.
 
@@ -219,6 +221,8 @@ def build_training_sample(sample, target_seq_length,
         mean_span_lengths: Mean length for sampling span lengths. Numbers < 1
               indicate a mean length of the sequence length times that number.
         mask_ratios: Ratio of masked token in the full sequence.
+        like_ul2r: Whether to use the updated implementation as specified in
+            the UL2R paper.
         np_rng: Random number genenrator. Note that this rng state should be
               numpy and not python since python randint is inclusive for
               the opper bound whereas the numpy one is exclusive.
@@ -271,7 +275,10 @@ def build_training_sample(sample, target_seq_length,
     max_ngrams = mean_ngrams * 2 - 1
 
     if denoiser == 'R' or denoiser == 'X':
-        sampling_style = SamplingStyle.NORMAL
+        if like_ul2r:
+            sampling_style = SamplingStyle.UNIFORM
+        else:
+            sampling_style = SamplingStyle.NORMAL
         prefix_lm = False
         max_predictions_per_seq = len(tokens) - 1
     elif denoiser == 'S':
