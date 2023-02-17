@@ -258,11 +258,10 @@ class GPTDataset(torch.utils.data.Dataset):
 
         # Build index mappings.
         self.doc_idx, self.sample_idx, self.shuffle_idx, self.desc, self.desc_hash = \
-            _build_index_mappings(self.name, data_prefix,
-                                  documents, self.indexed_dataset.sizes,
-                                  splits_string, num_samples, seq_length, seed,
-                                  data_cache_path=data_cache_path)
-
+            build_index_mappings(self.name, data_prefix,
+                                 documents, self.indexed_dataset.sizes,
+                                 splits_string, num_samples, seq_length, seed,
+                                 data_cache_path=data_cache_path)
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
@@ -307,10 +306,10 @@ class GPTDataset(torch.utils.data.Dataset):
             return {'text': np.array(sample, dtype=np.int64)}
 
 
-def _build_index_mappings(name, data_prefix, documents, sizes,
-                          splits_string, num_samples, seq_length, seed,
-                          *,
-                          data_cache_path):
+def build_index_mappings(name, data_prefix, documents, sizes,
+                         splits_string, num_samples, seq_length, seed,
+                         *,
+                         data_cache_path):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
     sample-idx: is the start document index and document offset for each
