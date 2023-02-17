@@ -210,6 +210,15 @@ def build_training_sample(sample, target_seq_length,
     # flatten sentences into one list
     tokens = [token for sentence in sample for token in sentence]
 
+    # Prepend objective token.
+    cls_id = cls_ids.get(denoiser, False)
+    if cls_id is False:
+        raise ValueError('unknown denoiser')
+
+    # If objective token is `None`, ignore it.
+    if cls_id is not None:
+        tokens = [cls_id] + tokens
+
     max_num_tokens = target_seq_length
     # if is_decoder_only(model_type):
     #     # Keep space for repeated `extra_id` tokens; not the most data
@@ -222,15 +231,6 @@ def build_training_sample(sample, target_seq_length,
     # Truncate to `target_sequence_length`.
     truncated = len(tokens) > max_num_tokens
     tokens = tokens[:max_num_tokens]
-
-    # Prepend objective token.
-    cls_id = cls_ids.get(denoiser, False)
-    if cls_id is False:
-        raise ValueError('unknown denoiser')
-
-    # If objective token is `None`, ignore it.
-    if cls_id is not None:
-        tokens = [cls_id] + tokens
 
     # Masking.
     mean_ngrams = mean_span_lengths[denoiser_index]
