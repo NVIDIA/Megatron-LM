@@ -55,28 +55,31 @@ class T5Dataset(torch.utils.data.Dataset):
         self.indexed_dataset = indexed_dataset
         self.pack_samples = pack_samples
 
+        # Minimum number of tokens added: BOS and EOS.
+        min_added_tokens = 2
         if self.pack_samples:
             (
                 self.doc_idx, self.sample_idx, self.shuffle_idx,
                 self.desc, self.desc_hash,
             ) = build_index_mappings(
-                self.name, data_prefix, self.indexed_dataset.get_doc_idx(),
+                self.name, data_prefix, self.indexed_dataset.get_doc_idx()[:-1],
                 self.indexed_dataset.sizes, splits_string, max_num_samples,
-                self.max_seq_length, self.seed,
+                self.max_seq_length - min_added_tokens, self.seed,
                 data_cache_path=data_cache_path)
         else:
             # Build the samples mapping.
-            self.samples_mapping = get_samples_mapping(self.indexed_dataset,
-                                                       data_prefix,
-                                                       splits_string,
-                                                       num_epochs,
-                                                       max_num_samples,
-                                                       # account for added tokens
-                                                       self.max_seq_length - 2,
-                                                       short_seq_prob,
-                                                       self.seed,
-                                                       self.name,
-                                                       False)
+            self.samples_mapping = get_samples_mapping(
+                self.indexed_dataset,
+                data_prefix,
+                splits_string,
+                num_epochs,
+                max_num_samples,
+                self.max_seq_length - min_added_tokens, # account for added tokens
+                short_seq_prob,
+                self.seed,
+                self.name,
+                False,
+            )
 
         # Vocab stuff.
         tokenizer = get_tokenizer()
