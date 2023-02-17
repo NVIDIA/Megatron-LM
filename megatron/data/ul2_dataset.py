@@ -3,6 +3,7 @@
 """UL2-style dataset."""
 
 from collections import ChainMap
+import math
 
 import numpy as np
 import torch
@@ -220,17 +221,21 @@ def build_training_sample(sample, target_seq_length,
         tokens = [cls_id] + tokens
 
     max_num_tokens = target_seq_length
-    # if is_decoder_only(model_type):
-    #     # Keep space for repeated `extra_id` tokens; not the most data
-    #     # efficient since we calculate this based on the maximum number
-    #     # of possible `extra_id` tokens.
-    #     safe_max_seq_len = math.floor(max_num_tokens / (1 + masked_lm_prob))
-    #     truncated = len(tokens) > safe_max_seq_len
-    #     tokens = tokens[:safe_max_seq_len]
-    # else:
-    # Truncate to `target_sequence_length`.
-    truncated = len(tokens) > max_num_tokens
-    tokens = tokens[:max_num_tokens]
+    if is_decoder_only(model_type) and denoiser != 'S':
+        # Keep space for repeated `extra_id` tokens; not the most data
+        # efficient since we calculate this based on the maximum number
+        # of possible `extra_id` tokens.
+        safe_max_seq_len = math.floor(max_num_tokens / (1 + masked_lm_prob))
+        truncated = len(tokens) > safe_max_seq_len
+        tokens = tokens[:safe_max_seq_len]
+    else:
+        # If we are S-denoising, we know only one `extra_id` token is
+        # going to be added.
+        if is_decoder_only(model_type) and denoiser == 'S':
+            max_num_tokens -= 1
+        # Truncate to `target_sequence_length`.
+        truncated = len(tokens) > max_num_tokens
+        tokens = tokens[:max_num_tokens]
 
     # Masking.
     mean_ngrams = mean_span_lengths[denoiser_index]
