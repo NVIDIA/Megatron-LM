@@ -201,12 +201,14 @@ class _MegablocksAdapter(MegatronModule):
 class MoE(_MegablocksAdapter):
 
     def __init__(self, init_method, output_layer_init_method):
+        megablocks_utils.assert_megablocks_is_available()
         super().__init__(
             megablocks_utils.moe.MoE, init_method, output_layer_init_method)
 
 class dMoE(_MegablocksAdapter):
 
     def __init__(self, init_method, output_layer_init_method):
+        megablocks_utils.assert_megablocks_is_available()
         super().__init__(
             megablocks_utils.dmoe.dMoE, init_method, output_layer_init_method)
 
