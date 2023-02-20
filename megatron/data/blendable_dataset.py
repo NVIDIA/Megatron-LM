@@ -34,7 +34,6 @@ class BlendableDataset(torch.utils.data.Dataset):
         assert num_datasets == len(weights)
 
         self.size = size
-        assert self.size < sum([len(dataset) for dataset in self.datasets])
 
         # Normalize weights.
         weights = np.array(weights, dtype=np.float64)
@@ -42,7 +41,7 @@ class BlendableDataset(torch.utils.data.Dataset):
         assert sum_weights > 0.0
         weights /= sum_weights
 
-        # Build indecies.
+        # Build indicies.
         start_time = time.time()
         assert num_datasets < 255
         self.dataset_index = np.zeros(self.size, dtype=np.uint8)
@@ -55,6 +54,14 @@ class BlendableDataset(torch.utils.data.Dataset):
                                        torch.distributed.get_rank() == 0)
         print_rank_0('> elapsed time for building blendable dataset indices: '
                      '{:.2f} (sec)'.format(time.time() - start_time))
+
+        # Check size
+        _ = self.__getitem__(self.size - 1)
+        try:
+            _ = self.__getitem__(self.size)
+            raise RuntimeError('BlendedDataset size is improperly bounded')
+        except IndexError:
+            pass
 
 
     def __len__(self):
