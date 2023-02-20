@@ -29,6 +29,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
+    parser = _add_moe_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -344,7 +345,7 @@ def validate_args(args, defaults={}):
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
     # Expert model parallelism assume local DDP and contiguous buffers.
-    if args.expert_model_parallelism:
+    if args.moe_expert_model_parallelism:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
@@ -412,7 +413,7 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
-    
+
     group.add_argument('--max-tokens-to-oom',
                        type=int, default=12000,
                        help='Maximum number of tokens during inference'
@@ -464,8 +465,34 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in Switch Transformer (None means no Switch)')
+    return parser
+
+
+def _add_moe_args(parser):
+    group = parser.add_argument_group(title='moe')
+    group.add_argument('--moe-num-experts', type=int, default=None,
+                       help='The number of experts in MoE layers. MoE '
+                       'layers not used if set to None')
+    group.add_argument('--moe-capacity-factor', type=int, default=0,
+                       help='Capacity factor for MoE layers. If zero, use '
+                       'dropless MoE implementation.')
+    group.add_argument('--moe-top-k', type=int, default=1,
+                       help='The number of experts each token is routed to '
+                       'in MoE layers.')
+    group.add_argument('--moe-loss-weight', type=float, default=0.1,
+                       help='The weight for the MoE auxiliary load balancing '
+                       'loss.')
+    group.add_argument('--moe-lbl-in-fp32', type=bool, default=False,
+                       help='Whether to compute the load balancing loss in '
+                       'fp32.')
+    group.add_argument('--moe-jitter-eps', type=float, default=None,
+                       help='Coefficient for MoE routing jitter. Jitter is '
+                       'not used if set to None.')
+    group.add_argument('--moe-use-megatron-switch', type=bool, default=False,
+                       help='Whether to use Megatron SwitchMLP for MoE layers.')
+    group.add_argument('--moe-expert-model-parallelism', action='store_true',
+                       default=False, help='Enable expert model paralleism within'
+                       ' the data parallel group')
     return parser
 
 
@@ -882,10 +909,6 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-    group.add_argument('--expert-model-parallelism', action='store_true',
-                       default=False, help='Enable expert model paralleism within'
-                       'the data parallel group')
-
     return parser
 
 

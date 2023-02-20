@@ -88,7 +88,7 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
     # If we're using expert parallelism we need to include the data parallel
     # rank in the path for both model and optim.
     args = get_args()
-    expert_parallel = args.expert_model_parallelism
+    expert_parallel = args.moe_expert_model_parallelism
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
