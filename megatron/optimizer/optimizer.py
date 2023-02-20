@@ -400,7 +400,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         # Update across all data parallel instances if we're using expert
         # model parallelism.
-        if get_args().expert_model_parallelism:
+        if get_args().moe_expert_model_parallelism:
             torch.distributed.all_reduce(self.found_inf,
                                          op=torch.distributed.ReduceOp.MAX,
                                          group=mpu.get_data_parallel_group())
