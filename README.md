@@ -349,9 +349,9 @@ pip install flash-attn
 
 ## Mixture-of-Experts
 
-Usage: `--moe-num-experts <number_of_experts>`. See command line arguments prefixed with `moe-` for additional MoE arguments. Compatible with GPT models.
+Usage: `--moe-num-experts <number_of_experts>`. See command line arguments prefixed with `moe-` for additional mixture-of-experts (MoE) arguments. Compatible with GPT models.
 
-[MegaBlocks](https://github.com/stanford-futuredata/megablocks) is a light-weight library for mixture-of-experts (MoE) training. The core of the system is efficient "dropless-MoE" ([paper](https://arxiv.org/abs/2211.15841)) and standard MoE layers.
+MoEs are supported through [MegaBlocks](https://github.com/stanford-futuredata/megablocks), a light-weight library for MoE training. The core of the system is efficient "dropless-MoE" ([paper](https://arxiv.org/abs/2211.15841)) and standard MoE layers.
 
 To install MegaBlocks:
 ```sh
