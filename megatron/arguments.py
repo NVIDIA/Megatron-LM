@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -20,8 +7,7 @@ import os
 
 import torch
 
-def parse_args(extra_args_provider=None, defaults={},
-               ignore_unknown_args=False):
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -42,6 +28,7 @@ def parse_args(extra_args_provider=None, defaults={},
     parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
+    parser = _add_transformer_engine_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -53,9 +40,13 @@ def parse_args(extra_args_provider=None, defaults={},
     else:
         args = parser.parse_args()
 
-    # Distributed args.
+    # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+        
+    return args
+
+def validate_args(args, defaults={}):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -103,13 +94,19 @@ def parse_args(extra_args_provider=None, defaults={},
     assert args.model_parallel_size is None, '--model-parallel-size is no ' \
         'longer valid, use --tensor-model-parallel-size instead'
     del args.model_parallel_size
+
     if args.checkpoint_activations:
-        args.activations_checkpoint_method = 'uniform'
+        args.recompute_granularity = 'full'
+        args.recompute_method = 'uniform'
         if args.rank == 0:
             print('--checkpoint-activations is no longer valid, '
-                  'use --activation-checkpoint-method instead. '
-                  'Defaulting to activation-checkpoint-method=uniform.')
+                  'use --recompute-granularity and --recompute-method  instead. '
+                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
     del args.checkpoint_activations
+
+    if args.recompute_activations:
+        args.recompute_granularity = 'selective'
+    del args.recompute_activations
 
     # Set input defaults.
     for key in defaults:
@@ -172,14 +169,12 @@ def parse_args(extra_args_provider=None, defaults={},
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    else:
-        if args.gradient_accumulation_fusion:
-            args.gradient_accumulation_fusion = False
-            if args.rank == 0:
-                print('Gradient accumulation fusion to linear layer weight '
-                      'gradient computation is supported only with fp32 '
-                      'gradient accumulation. Setting gradient_accumulation_fusion '
-                      'to False', flush=True)
+
+    # If we use the distributed optimizer, we need to have local DDP
+    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
+    if args.use_distributed_optimizer:
+        assert args.DDP_impl == 'local'
+        assert args.use_contiguous_buffers_in_local_ddp
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
@@ -191,6 +186,13 @@ def parse_args(extra_args_provider=None, defaults={},
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -222,6 +224,15 @@ def parse_args(extra_args_provider=None, defaults={},
             assert args.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
+
+    if args.num_layers is not None:
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
+        args.encoder_num_layers = args.num_layers
+    else:
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
+        args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
@@ -278,18 +289,61 @@ def parse_args(extra_args_provider=None, defaults={},
                   'pytorch v1.11 (nvidia pytorch container paired with v1.11). '
                   'Defaulting to no_persist_layer_norm=True')
 
-    # Activation checkpointing.
-    if args.distribute_checkpointed_activations:
+    # Activation recomputing.
+    if args.distribute_saved_activations:
         assert args.tensor_model_parallel_size > 1, 'can distribute ' \
-            'checkpointed activations only across tensor model ' \
+            'recomputed activations only across tensor model ' \
             'parallel groups'
-        assert args.activations_checkpoint_method is not None, \
-            'for distributed checkpoint activations to work you '\
-            'need to use a activation-checkpoint method '
+        assert args.recompute_granularity == 'full', \
+            'distributed recompute activations is only '\
+            'application to full recompute granularity'
+        assert args.recompute_method is not None, \
+            'for distributed recompute activations to work you '\
+            'need to use a recompute method '
         assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
-            'distributed checkpoint activations are supported for pytorch ' \
+            'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
+
+    # Tranformer-Engine/FP8 related checking
+    if args.fp8_e4m3 or args.fp8_hybrid:
+        assert args.transformer_impl == 'transformer_engine', \
+            'transformer-engine required for fp8 training and inference'
+
+    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
+        'cannot train with both fp8 e4m3 and hybrid formatting'
+
+    if args.fp16:
+        assert args.transformer_impl == 'local', \
+            'transformer-engine not yet approved for fp16 training and inference'
+
+    if args.recompute_granularity == 'selective':
+        assert args.recompute_method is None, \
+            'recompute method is not yet supported for ' \
+            'selective recomputing granularity'
+
+    # disable sequence parallelism when tp=1
+    # to avoid change in numerics when
+    # sequence_parallelism is enabled.
+    if args.tensor_model_parallel_size == 1:
+        args.sequence_parallel = False
+
+    # disable async_tensor_model_parallel_allreduce when
+    # model parallel memory optimization is enabled
+    if args.sequence_parallel:
+        args.async_tensor_model_parallel_allreduce = False
+
+
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if args.sequence_parallel:
+            raise RuntimeError(
+                "Using sequence parallelism requires setting the environment variable "
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+        if args.async_tensor_model_parallel_allreduce:
+            raise RuntimeError(
+                "Using async gradient all reduce requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
 
     _print_args(args)
     return args
@@ -314,6 +368,33 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
+def _add_transformer_engine_args(parser):
+    group = parser.add_argument_group(title='Transformer-Engine')
+
+    group.add_argument('--fp8-e4m3', action='store_true',
+                        help='E4M3 TransformerLayer', dest='fp8_e4m3')
+    group.add_argument('--fp8-hybrid', action='store_true',
+                        help='Hybrid FP8 TransformerLayer', dest='fp8_hybrid')
+    group.add_argument('--no-fp8-wgrad', action='store_false',
+                        help='Execute wgrad in higher precision even for FP8 runs', dest='fp8_wgrad')
+    group.add_argument('--fp8-margin', type=int, default=0,
+                        help='Scaling margin for fp8', dest='fp8_margin')
+    group.add_argument('--fp8-interval', type=int, default=1,
+                        help='Scaling update interval for fp8', dest='fp8_interval')
+    group.add_argument('--transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.',
+                       dest='transformer_impl')
+    group.add_argument('--fp8-amax-history-len', type=int, default=1,
+                        help='Number of steps for which amax history is recorded per tensor',
+                        dest='fp8_amax_history_len')
+    group.add_argument('--fp8-amax-compute-algo', default='most_recent',
+                       choices=['most_recent', 'max'],
+                       help='Algorithm for computing amax from history',
+                       dest='fp8_amax_compute_algo')
+
+    return parser
+
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
 
@@ -322,7 +403,12 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
-
+    
+    group.add_argument('--max-tokens-to-oom',
+                       type=int, default=12000,
+                       help='Maximum number of tokens during inference'
+                       'tokens here is # in prompt + # to generate'
+                       'Allows us to throw an error before OOM crashes server')
     return parser
 
     
@@ -331,6 +417,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--encoder-num-layers', type=int, default=None,
+                       help='Number of encoder transformer layers.')
+    group.add_argument('--decoder-num-layers', type=int, default=None,
+                       help='Number of decoder transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -377,6 +467,32 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
+    group.add_argument('--timing-log-level', type=int,
+                       default=0, choices=range(0,3),
+                       help='Granularity level to measure and report timing. '
+                       '   0: report only iteration time and make sure timing '
+                       '      does not introduce extra overhead.'
+                       '   1: report timing for operations that are executed '
+                       '      very limited times (basically once) during '
+                       '      each iteration (such as gradient all-reduce) '
+                       '   2: report timing for operations that migh be '
+                       '      executed numerous times during each iteration. '
+                       'Note that setting the level to 1 or 2 might '
+                       'cause increase in iteration time.')
+    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
+                       help='If not set, use barrier with level 1 time '
+                       'measurements. Note that this is up to the user '
+                       'to make sure calling barrier with their timers '
+                       'will not result in hangs. This can happen if for '
+                       'example the user adds a level 1 timer that is not '
+                       'called by all ranks.',
+                       dest='barrier_with_L1_time')
+    group.add_argument('--timing-log-option', type=str, default='minmax',
+                       choices=['max', 'minmax', 'all'],
+                       help='Options for logging timing:'
+                       '  max: report the max timing across all ranks'
+                       '  minmax: report min and max timings across all ranks'
+                       '  all: report timings of all ranks.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
@@ -471,27 +587,40 @@ def _add_training_args(parser):
                        ' (1024 - 16) / 8 = 126 intervals will increase'
                        'the batch size linearly to 1024. In each interval'
                        'we will use approximately 300000 / 126 = 2380 samples.')
+    group.add_argument('--recompute-activations', action='store_true',
+                       help='recompute activation to allow for training '
+                       'with larger models, sequences, and batch sizes.')
+    group.add_argument('--recompute-granularity', type=str, default=None,
+                       choices=['full', 'selective'],
+                       help='Checkpoint activations to allow for training '
+                       'with larger models, sequences, and batch sizes. '
+                       'It is supported at two granularities 1) full: '
+                       'whole transformer layer is recomputed, '
+                       '2) selective: core attention part of the transformer '
+                       'layer is recomputed.')
+    group.add_argument('--distribute-saved-activations',
+                       action='store_true',
+                       help='If set, distribute recomputed activations '
+                       'across model parallel group.')
+    group.add_argument('--recompute-method', type=str, default=None,
+                       choices=['uniform', 'block'],
+                       help='1) uniform: uniformly divide the total number of '
+                       'Transformer layers and recompute the input activation of '
+                       'each divided chunk at specified granularity, '
+                       '2) recompute the input activations of only a set number of '
+                       'individual Transformer layers per pipeline stage and do the '
+                       'rest without any recomputing at specified granularity'
+                       'default) do not apply activations recompute to any layers')
+    group.add_argument('--recompute-num-layers', type=int, default=1,
+                       help='1) uniform: the number of Transformer layers in each '
+                       'uniformly divided recompute unit, '
+                       '2) block: the number of individual Transformer layers '
+                       'to recompute within each pipeline stage.')
+
+    # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
                        'with larger models, sequences, and batch sizes.')
-    group.add_argument('--distribute-checkpointed-activations',
-                       action='store_true',
-                       help='If set, distribute checkpointed activations '
-                       'across model parallel group.')
-    group.add_argument('--activations-checkpoint-method', type=str, default=None,
-                       choices=['uniform', 'block'],
-                       help='1) uniform: uniformly divide the total number of '
-                       'Transformer layers and checkpoint the input activation of '
-                       'each divided chunk, '
-                       '2) checkpoint the input activations of only a set number of '
-                       'individual Transformer layers per pipeline stage and do the '
-                       'rest without any checkpointing'
-                       'default) do not apply activations checkpoint to any layers')
-    group.add_argument('--activations-checkpoint-num-layers', type=int, default=1,
-                       help='1) uniform: the number of Transformer layers in each '
-                       'uniformly divided checkpoint unit, '
-                       '2) block: the number of individual Transformer layers '
-                       'to checkpoint within each pipeline stage.')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs. Note that either train-iters or '
@@ -523,6 +652,9 @@ def _add_training_args(parser):
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
+    group.add_argument('--use-flash-attn', action='store_true',
+                       help='use FlashAttention implementation of attention. '
+                       'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -540,6 +672,8 @@ def _add_training_args(parser):
                        'This kernel supports only a set of hidden sizes. Please '
                        'check persist_ln_hidden_sizes if your hidden '
                        'size is supported.')
+    group.add_argument('--sequence-parallel', action='store_true',
+                       help='Enable sequence parallel optimization.')
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '
@@ -574,7 +708,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -633,6 +767,14 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
+    group.add_argument('--no-initialization', action='store_false',
+                       help='Do not perform initialization when building model, '
+                       'can reduce startup time when definitely loading from a '
+                       'checkpoint',
+                       dest='perform_initialization')
+    group.add_argument('--use-checkpoint-args', action='store_true',
+                       help='Override any command line arguments with arguments '
+                       'from the checkpoint')
 
     return parser
 
@@ -704,6 +846,10 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
+    group.add_argument('--use-ring-exchange-p2p', action='store_true',
+                       default=False, help='If set, use custom-built ring exchange '
+                       'for p2p communications. Note that this option will require '
+                       'a custom built image that support ring-exchange p2p.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -725,6 +871,9 @@ def _add_distributed_args(parser):
                        'is placed on its own pipeline stage, without any '
                        'transformer layers. (For T5, this flag currently only '
                        'affects the encoder embedding.)')
+    group.add_argument('--use-distributed-optimizer', action='store_true',
+                       help='Use distributed optimizer.')
+
     return parser
 
 
@@ -748,12 +897,31 @@ def _add_data_args(parser):
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       'dataset2-path ... It is used with --split when a '
+                       'single dataset used for all three: train, valid '
+                       'and test. It is exclusive to the other '
+                       '--*-data-path args')
     group.add_argument('--split', type=str, default='969, 30, 1',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
+    group.add_argument('--train-data-path', nargs='*', default=None,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--valid-data-path', nargs='*', default=None,
+                       help='Path to the validation dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--test-data-path', nargs='*', default=None,
+                       help='Path to the test dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -770,7 +938,7 @@ def _add_data_args(parser):
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--retriever-seq-length', type=int, default=256,
                        help='Maximum sequence length for the biencoder model '
-                        ' for retriever')
+                       'for retriever')
     group.add_argument('--sample-rate', type=float, default=1.0,
                        help='sample rate for training data. Supposed to be 0 '
                             ' < sample_rate < 1')
@@ -786,8 +954,11 @@ def _add_data_args(parser):
                        default=None,
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer',
+                                'SentencePieceTokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')

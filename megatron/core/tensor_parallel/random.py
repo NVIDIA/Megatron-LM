@@ -1,18 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
@@ -24,13 +10,19 @@ from torch import _C
 from torch.cuda import _lazy_call, device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
 
-from megatron.memory import allocate_mem_buff
+from megatron.core.parallel_state import (
+    get_data_parallel_rank,
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 
-from .initialize import get_data_parallel_rank
-from .initialize import get_tensor_model_parallel_group
-from .initialize import get_tensor_model_parallel_rank
-from .initialize import get_tensor_model_parallel_world_size
+from .utils import (
+    split_tensor_into_1d_equal_chunks,
+    gather_split_1d_tensor,
+)
 
+from megatron.core.utils import safely_set_viewless_tensor_data
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -68,117 +60,6 @@ def _set_cuda_rng_state(new_state, device=-1):
 
     _lazy_call(cb)
 
-
-def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
-    """Break a tensor into equal 1D chunks."""
-    partition_size = torch.numel(tensor) // \
-        get_tensor_model_parallel_world_size()
-    start_index = partition_size * get_tensor_model_parallel_rank()
-    end_index = start_index + partition_size
-    if new_buffer:
-        data = torch.empty(partition_size, dtype=tensor.dtype,
-                           device=torch.cuda.current_device(),
-                           requires_grad=False)
-        data.copy_(tensor.view(-1)[start_index:end_index])
-    else:
-        data = tensor.view(-1)[start_index:end_index]
-    return data
-    
-
-def gather_split_1d_tensor(tensor):
-    """Opposite of above function, gather values from model parallel ranks."""
-    numel_gathered = torch.numel(tensor) * \
-        get_tensor_model_parallel_world_size()
-    gathered = torch.empty(numel_gathered, dtype=tensor.dtype,
-                           device=torch.cuda.current_device(),
-                           requires_grad=False)
-    # TODO: This API is experimental in pytorch (as of Feb 2022) and
-    # this might break in future pytorch releases. We chose this API
-    # as opposed to torch.distributed.all_gather for efficiency reasons.
-    # This API calls directly NCCL all-gather versus the former does
-    # internal copies and can potentially cause slow down.
-    torch.distributed._all_gather_base(gathered, tensor,
-                                       group=get_tensor_model_parallel_group())
-    return gathered
-
-
-def _kernel_make_viewless_tensor(inp, requires_grad):
-    '''Make a viewless tensor.
-
-    View tensors have the undesirable side-affect of retaining a reference
-    to the originally-viewed tensor, even after manually setting the '.data'
-    field. This method creates a new tensor that links to the old tensor's
-    data, without linking the viewed tensor, referenced via the '._base'
-    field.
-    '''
-    out = torch.empty(
-        (1,),
-        dtype = inp.dtype,
-        device = inp.device,
-        requires_grad = requires_grad,
-    )
-    out.data = inp.data
-    return out
-
-class MakeViewlessTensor(torch.autograd.Function):
-    '''
-    Autograd function to make a viewless tensor.
-
-    This function should be used in cases where the computation graph needs
-    to be propagated, but we only want a viewless tensor (e.g.,
-    ParallelTransformer's hidden_states). Call this function by passing
-    'keep_graph = True' to 'make_viewless_tensor()'.
-    '''
-    @staticmethod
-    def forward(ctx, inp, requires_grad):
-        return _kernel_make_viewless_tensor(inp, requires_grad)
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
-def make_viewless_tensor(inp, requires_grad, keep_graph):
-    '''
-    Entry-point for creating viewless tensors.
-
-    This method should be used, rather than calling 'MakeViewlessTensor'
-    or '_kernel_make_viewless_tensor' directly. This method acts as a
-    switch for determining if an autograd function or a regular method
-    should be used to create the tensor.
-    '''
-
-    # return tensor as-is, if not a 'view'
-    if inp._base is None:
-        return inp
-
-    # create viewless tensor
-    if keep_graph:
-        return MakeViewlessTensor.apply(inp, requires_grad)
-    else:
-        return _kernel_make_viewless_tensor(inp, requires_grad)
-
-def assert_viewless_tensor(tensor, extra_msg = None):
-    '''Assert that a tensor is not a view (i.e., its '._base' field is
-    not set).'''
-    if isinstance(tensor, list):
-        [ assert_viewless_tensor(t) for t in tensor ]
-        return tensor
-    if not isinstance(tensor, torch.Tensor):
-        return tensor
-    assert tensor._base is None, (
-        "Ensure tensor._base is None before setting tensor.data or storing "
-        "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). %s"
-    ) % extra_msg
-    return tensor
-
-def safely_set_viewless_tensor_data(tensor, new_data_tensor):
-    '''Safely set tensor's '.data' field.
-
-    Check first that the tensor is viewless (i.e., '._base' not set). If not,
-    raise an exception.
-    '''
-    assert_viewless_tensor(tensor, extra_msg = "FYI, tensor._base has shape %s, and new_data_tensor has shape %s." % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape))
-    tensor.data = new_data_tensor
 
 
 class CudaRNGStatesTracker:
@@ -284,13 +165,6 @@ def model_parallel_cuda_manual_seed(seed):
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    if torch.distributed.get_rank() == 0:
-        print('> initializing model parallel cuda seeds on global rank {}, '
-              'model parallel rank {}, and data parallel rank {} with '
-              'model parallel seed: {} and data parallel seed: {}'.format(
-                  torch.distributed.get_rank(), get_tensor_model_parallel_rank(),
-                  get_data_parallel_rank(), tensor_model_parallel_seed,
-                  data_parallel_seed), flush=True)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
@@ -307,10 +181,10 @@ class CheckpointFunction(torch.autograd.Function):
               tracked/set/reset.
     """
     @staticmethod
-    def forward(ctx, run_function, distribute_checkpointed_activations, *args):
+    def forward(ctx, run_function, distribute_saved_activations, *args):
         ctx.run_function = run_function
-        ctx.distribute_checkpointed_activations \
-            = distribute_checkpointed_activations
+        ctx.distribute_saved_activations \
+            = distribute_saved_activations
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -322,7 +196,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
-        if distribute_checkpointed_activations:
+        if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
                 args[0],
@@ -339,7 +213,7 @@ class CheckpointFunction(torch.autograd.Function):
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
         inputs = ctx.saved_tensors
-        if ctx.distribute_checkpointed_activations:
+        if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0],
                 gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
@@ -372,8 +246,8 @@ class CheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
 
 
-def checkpoint(function, distribute_checkpointed_activations, *args):
+def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function,
-                                    distribute_checkpointed_activations, *args)
+                                    distribute_saved_activations, *args)

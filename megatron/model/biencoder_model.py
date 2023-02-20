@@ -2,11 +2,11 @@ import os
 import torch
 import sys
 
-from megatron import get_args, print_rank_0
+from megatron import get_args, print_rank_0, get_tokenizer
+from megatron.core import mpu
 from megatron.checkpointing import fix_query_key_value_ordering
 from megatron.checkpointing import get_checkpoint_tracker_filename
 from megatron.checkpointing import get_checkpoint_name
-from megatron import mpu, get_tokenizer
 from megatron.model.bert_model import bert_position_ids
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import get_language_model
@@ -139,25 +139,23 @@ class BiEncoderModel(MegatronModule):
                               token_types)
         return logits
 
-    def state_dict_for_save_checkpoint(self, destination=None, \
-        prefix='', keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
         if self.biencoder_shared_query_context_model:
             state_dict_[self._model_key] = \
-                self.model.state_dict_for_save_checkpoint(destination,
-                                                          prefix,
-                                                          keep_vars)
+                self.model.state_dict_for_save_checkpoint(
+                    prefix=prefix, keep_vars=keep_vars)
         else:
             if self.use_query_model:
                 state_dict_[self._query_key] = \
                     self.query_model.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                        prefix=prefix, keep_vars=keep_vars)
 
             if self.use_context_model:
                 state_dict_[self._context_key] = \
                     self.context_model.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                        prefix=prefix, keep_vars=keep_vars)
 
         return state_dict_
 
@@ -291,7 +289,7 @@ class PretrainedBertModel(MegatronModule):
         pool_mask = (input_ids == self.pad_id).unsqueeze(2)
 
         # Taking the representation of the [CLS] token of BERT
-        pooled_output = lm_output[:, 0, :]
+        pooled_output = lm_output[0, :, :]
 
         # Converting to float16 dtype
         pooled_output = pooled_output.to(lm_output.dtype)
@@ -302,19 +300,19 @@ class PretrainedBertModel(MegatronModule):
 
         return pooled_output
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
             = self.language_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+                prefix=prefix, keep_vars=keep_vars)
 
         if self.biencoder_projection_dim > 0:
             state_dict_[self._projection_enc_key] = \
-                self.projection_enc.state_dict(destination, prefix, keep_vars)
+                self.projection_enc.state_dict(prefix=prefix,
+                                               keep_vars=keep_vars)
 
         return state_dict_
 

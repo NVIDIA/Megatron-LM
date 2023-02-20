@@ -1,10 +1,13 @@
-image: gitlab-master.nvidia.com/dl/dgx/pytorch:20.12-py3-devel
+image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 test:
+  tags:
+    - docker_gpu_enabled
   script:
-    - pytest --junitxml=report.xml tests
+    - torchrun --nproc_per_node=8  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
-    when: always
-    reports:
-      junit: report.xml
+    paths:
+      - coverage
+    expire_in: 30 days
     

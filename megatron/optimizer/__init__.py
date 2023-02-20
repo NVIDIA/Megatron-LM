@@ -1,24 +1,11 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
 from megatron import get_args
-from megatron.model import LayerNorm
 
+from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
 
@@ -105,7 +92,11 @@ def get_megatron_optimizer(model,
     if args.DDP_impl == 'local':
         params_have_main_grad = True
 
-    if args.fp16 or args.bf16:
+    # Mixed precision optimizer.
+    # - Note: both the Float16Optimizer and the DistributedOptimizer inherit
+    #   from the MixedPrecisionOptimizer, which manages any optimizer where
+    #   the model params and main params are distinct.
+    if args.fp16 or args.bf16 or args.use_distributed_optimizer:
 
         # Grad scaler:
         #    if loss-scale is provided, instantiate the constant scaler.
@@ -114,9 +105,11 @@ def get_megatron_optimizer(model,
         #    otherwise we are running in bf16 with no loss-scale so
         #       leave it as None.
         grad_scaler = None
+
         # Constant loss scale.
         if args.loss_scale:
             grad_scaler = ConstantGradScaler(args.loss_scale)
+
         # Dynamic loss scale.
         else:
             if args.fp16:
@@ -129,16 +122,23 @@ def get_megatron_optimizer(model,
                     hysteresis=args.hysteresis)
 
         # Megatron optimizer.
-        return Float16OptimizerWithFloat16Params(optimizer,
-                                                 args.clip_grad,
-                                                 args.log_num_zeros_in_grad,
-                                                 params_have_main_grad,
-                                                 args.use_contiguous_buffers_in_local_ddp,
-                                                 args.bf16,
-                                                 grad_scaler)
+        opt_ty = DistributedOptimizer \
+            if args.use_distributed_optimizer else \
+            Float16OptimizerWithFloat16Params
+        return opt_ty(optimizer,
+                      args.clip_grad,
+                      args.log_num_zeros_in_grad,
+                      params_have_main_grad,
+                      args.use_contiguous_buffers_in_local_ddp,
+                      args.fp16,
+                      args.bf16,
+                      args.params_dtype,
+                      grad_scaler,
+                      model)
 
     # FP32.
     return FP32Optimizer(optimizer, args.clip_grad,
                          args.log_num_zeros_in_grad,
                          params_have_main_grad,
-                         args.use_contiguous_buffers_in_local_ddp)
+                         args.use_contiguous_buffers_in_local_ddp,
+                         model)

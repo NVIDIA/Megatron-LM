@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """This code is copied fron NVIDIA apex:
       https://github.com/NVIDIA/apex
@@ -23,7 +10,7 @@ from torch.nn.parameter import Parameter
 from torch.nn import init
 import importlib
 
-from megatron.mpu import make_viewless_tensor
+from megatron.core.utils import make_viewless_tensor
 
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNormFN
@@ -69,7 +56,9 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
 
 class MixedFusedLayerNorm(torch.nn.Module):
 
-  def __init__(self, normalized_shape, eps=1e-5, no_persist_layer_norm=True):
+  def __init__(self, normalized_shape, eps=1e-5,
+               no_persist_layer_norm=True,
+               sequence_parallel=False):
         super(MixedFusedLayerNorm, self).__init__()
 
         global fused_mix_prec_layer_norm_cuda
@@ -94,6 +83,11 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.bias = Parameter(torch.Tensor(*normalized_shape))
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
+        self.sequence_parallel = sequence_parallel
+        
+        # set sequence parallelism flag on weight and bias parameters
+        setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
+        setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
 
 
   def reset_parameters(self):

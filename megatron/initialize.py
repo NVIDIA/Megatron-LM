@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
 
@@ -27,10 +14,10 @@ from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
-from megatron import mpu
+from megatron.core import mpu, tensor_parallel
+from megatron.arguments import (parse_args, validate_args)
+from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
-from megatron.mpu import (set_tensor_model_parallel_rank,
-                          set_tensor_model_parallel_world_size)
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
@@ -49,11 +36,18 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         # Make sure cuda is available.
         assert torch.cuda.is_available(), 'Megatron requires CUDA.'
 
-    # Parse args, build tokenizer, and set adlr-autoresume,
+    # Parse arguments
+    args = parse_args(extra_args_provider, ignore_unknown_args)
+
+    if args.use_checkpoint_args or args_defaults.get('use_checkpoint_args', False):
+        assert args.load is not None, '--use-checkpoints-args requires --load argument'
+        load_args_from_checkpoint(args)
+
+    validate_args(args, args_defaults)
+        
+    # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
-    set_global_variables(extra_args_provider=extra_args_provider,
-                         args_defaults=args_defaults,
-                         ignore_unknown_args=ignore_unknown_args)
+    set_global_variables(args)
 
     # torch.distributed initialization
     def finish_mpu_init():
@@ -68,13 +62,14 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     args = get_args()
     if  args.lazy_mpu_init:
+        # TODO is this still a necessary option?
         args.use_cpu_initialization=True
         # delayed initialization of DDP-related stuff
-        # We only set basic DDP globals    
-        set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
+        # We only set basic DDP globals
+        mpu.set_tensor_model_parallel_world_size(args.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        set_tensor_model_parallel_rank(args.rank)    
+        mpu.set_tensor_model_parallel_rank(args.rank)
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -150,7 +145,7 @@ def _compile_dependencies():
 
 
 def _initialize_distributed():
-    """Initialize torch.distributed and mpu."""
+    """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
     device_count = torch.cuda.device_count()
@@ -188,9 +183,14 @@ def _initialize_distributed():
             print('model parallel is already initialized')
         else:
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
-                                          args.pipeline_model_parallel_size,
-                                          args.virtual_pipeline_model_parallel_size,
-                                          args.pipeline_model_parallel_split_rank)
+                                           args.pipeline_model_parallel_size,
+                                           args.virtual_pipeline_model_parallel_size,
+                                           args.pipeline_model_parallel_split_rank)
+            if args.rank == 0:
+                print(f'> initialized tensor model parallel with size '
+                      f'{mpu.get_tensor_model_parallel_world_size()}')
+                print(f'> initialized pipeline model parallel with size '
+                      f'{mpu.get_pipeline_model_parallel_world_size()}')
 
 
 def _init_autoresume():
@@ -214,7 +214,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         np.random.seed(seed)
         torch.manual_seed(seed)
         if torch.cuda.device_count() > 0:
-            mpu.model_parallel_cuda_manual_seed(seed)
+            tensor_parallel.model_parallel_cuda_manual_seed(seed)
     else:
         raise ValueError('Seed ({}) should be a positive integer.'.format(seed))
 
@@ -278,9 +278,13 @@ def _warmup_jit_function():
     del bias, input, output
 
     # Warmup fused bias+dropout+add
-    input = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+    if args.sequence_parallel:
+        seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
+    else:
+        seq_length = args.seq_length
+    input = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
                        dtype=dtype, device='cuda')
-    residual = torch.rand((args.seq_length, args.micro_batch_size, args.hidden_size),
+    residual = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
                           dtype=dtype, device='cuda')
     bias = torch.rand((args.hidden_size), dtype=dtype, device='cuda').expand_as(residual)
     dropout_rate = 0.1

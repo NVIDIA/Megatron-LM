@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Processing data for pretraining."""
 
@@ -63,12 +50,14 @@ class Encoder(object):
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
                 exit()
-            splitter = nltk.load("tokenizers/punkt/english.pickle")
+            library = "tokenizers/punkt/{}.pickle".format(self.args.lang)
+            print("loading: " + library)
+            splitter = nltk.load(library)
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
+                    train_text=splitter._params,
+                    lang_vars=CustomLanguageVars())
             else:
                 Encoder.splitter = splitter
 
@@ -105,7 +94,7 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
@@ -113,6 +102,8 @@ def get_args():
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
+    group.add_argument('--lang', type=str, default='english',
+                       help='Language to use for NLTK-powered sentence splitting.')
 
 
     group = parser.add_argument_group(title='output data')
@@ -122,8 +113,10 @@ def get_args():
                        choices=['lazy', 'cached', 'mmap'])
 
     group = parser.add_argument_group(title='runtime')
-    group.add_argument('--workers', type=int, default=1,
+    group.add_argument('--workers', type=int, required=True,
                        help='Number of worker processes to launch')
+    group.add_argument('--chunk-size', type=int, required=True,
+                       help='Chunk size assigned to each worker process')
     group.add_argument('--log-interval', type=int, default=100,
                        help='Interval between progress updates')
     args = parser.parse_args()
@@ -154,7 +147,7 @@ def main():
     encoder = Encoder(args)
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
-    encoded_docs = pool.imap(encoder.encode, fin, 25)
+    encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
     #encoded_docs = map(encoder.encode, fin)
 
     level = "document"
@@ -195,6 +188,7 @@ def main():
             print(f"Processed {i} documents",
                   f"({i/elapsed} docs/s, {mbs} MB/s).",
                   file=sys.stderr)
+    print("Done! Now finalizing.")
 
     for key in args.json_keys:
         builders[key].finalize(output_idx_files[key])

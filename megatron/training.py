@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -32,13 +19,14 @@ from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
 from megatron import update_num_microbatches
-from megatron import mpu
+from megatron.core import mpu, tensor_parallel
 from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import ModelType
+from megatron.model import GPTModel
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -119,23 +107,28 @@ def pretrain(train_valid_test_dataset_provider,
     timers = get_timers()
 
     # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup').start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider,
-                                                               model_type)
+    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        model_provider, model_type)
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
 
     # Data stuff.
-    timers('train/valid/test-data-iterators-setup').start()
+    timers('train/valid/test-data-iterators-setup', log_level=0).start(
+        barrier=True)
     if args.virtual_pipeline_model_parallel_size is not None:
         all_data_iterators = [
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+            build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider)
             for _ in range(len(model))
         ]
-        train_data_iterator = [data_iterators[0] for data_iterators in all_data_iterators]
-        valid_data_iterator = [data_iterators[1] for data_iterators in all_data_iterators]
-        test_data_iterator = [data_iterators[2] for data_iterators in all_data_iterators]
+        train_data_iterator = [data_iterators[0]
+                               for data_iterators in all_data_iterators]
+        valid_data_iterator = [data_iterators[1]
+                               for data_iterators in all_data_iterators]
+        test_data_iterator = [data_iterators[2]
+                              for data_iterators in all_data_iterators]
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
@@ -145,7 +138,8 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Print setup timing.
     print_rank_0('done with setup ...')
-    timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'])
+    timers.log(['model-and-optimizer-setup',
+                'train/valid/test-data-iterators-setup'], barrier=True)
     print_rank_0('training ...')
 
     iteration = 0
@@ -258,13 +252,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if not isinstance(model, list):
         model = [model]
 
+    # Disallow training and inference with Transformer Engine
+    # for non-GPT models
+    args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
+    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+        'Transformer Engine is only approved for GPT models'
+
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
     # attributes set for them. We should make sure the default attributes
     # are set for all params so the optimizer can use them.
     for model_module in model:
         for param in model_module.parameters():
-            mpu.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+            tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
@@ -364,23 +364,18 @@ def setup_model_and_optimizer(model_provider_func,
     args = get_args()
 
     model = get_model(model_provider_func, model_type)
-
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
-    optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
 
+    optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
+                                       scale_lr_cond, lr_mult)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:
         timers = get_timers()
-        # Extra barrier is added to make sure all ranks report the
-        # max time.
-        torch.distributed.barrier()
-        timers('load-checkpoint').start()
+        timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration = load_checkpoint(model, optimizer, opt_param_scheduler)
-        torch.distributed.barrier()
-        timers('load-checkpoint').stop()
+        timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
     else:
         args.iteration = 0
@@ -412,77 +407,43 @@ def train_step(forward_step_func, data_iterator,
             partition.zero_grad_buffer()
     optimizer.zero_grad()
 
+    # Forward pass.
+    timers('forward-backward', log_level=1).start(
+        barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
+    fwd_bwd_timers = timers if args.timing_log_level > 1 else None
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
-        optimizer, timers, forward_only=False)
+        optimizer, fwd_bwd_timers, forward_only=False)
+    timers('forward-backward').stop()
 
-    # Empty unused memory
+    # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
-    # All-reduce if needed.
-    if args.DDP_impl == 'local':
-        timers('backward-params-all-reduce').start()
-        for model_module in model:
-            model_module.allreduce_gradients()
-        timers('backward-params-all-reduce').stop()
+    # Reduce gradients.
+    optimizer.reduce_model_grads(args, timers)
 
-    # All-reduce word_embeddings' grad across first and last stages to ensure
-    # that word_embeddings parameters stay in sync.
-    # This should only run for models that support pipelined model parallelism
-    # (BERT and GPT-2).
-    timers('backward-embedding-all-reduce').start()
-    if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
-            mpu.get_pipeline_model_parallel_world_size() > 1:
-        if mpu.is_pipeline_first_stage(ignore_virtual=True):
-            unwrapped_model = model[0]
-        elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-            unwrapped_model = model[-1]
-        else:  # We do not support the interleaved schedule for T5 yet.
-            unwrapped_model = model[0]
-        unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-
-        if unwrapped_model.share_word_embeddings:
-            word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-            if args.DDP_impl == 'local':
-                grad = word_embeddings_weight.main_grad
-            else:
-                grad = word_embeddings_weight.grad
-            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
-
-    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
-    # stages to ensure that position embeddings parameters stay in sync.
-    # This should only run for T5 models with pipeline parallelism
-    if mpu.is_rank_in_position_embedding_group() and \
-            mpu.get_pipeline_model_parallel_world_size() > 1 and \
-            args.pipeline_model_parallel_split_rank is not None:
-        unwrapped_model = model[0]
-        unwrapped_model = unwrap_model(
-            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-        assert args.DDP_impl == 'local', \
-            'T5 model is only supported with local DDP mode'
-        grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
-    timers('backward-embedding-all-reduce').stop()
-
+    # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
-
     # Update parameters.
-    timers('optimizer').start()
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
 
+    # Gather params.
+    if update_successful:
+        optimizer.gather_model_params(args, timers)
+
+    # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.update_momentum(args.curr_iteration)
-
 
     # Update learning rate.
     if update_successful:
@@ -494,7 +455,7 @@ def train_step(forward_step_func, data_iterator,
     else:
         skipped_iter = 1
 
-    # Empty unused memory
+    # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
@@ -546,28 +507,32 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         nan_iters_key, 0) + int(got_nan)
 
     # Logging.
-    timers_to_log = []
-
-    def add_to_logging(name):
-        if name in timers.timers:
-            timers_to_log.append(name)
-    add_to_logging('forward-compute')
-    add_to_logging('forward-recv')
-    add_to_logging('forward-send')
-    add_to_logging('forward-backward-send-forward-backward-recv')
-    add_to_logging('backward-compute')
-    add_to_logging('backward-recv')
-    add_to_logging('backward-send')
-    add_to_logging('backward-send-forward-recv')
-    add_to_logging('backward-send-backward-recv')
-    add_to_logging('backward-params-all-reduce')
-    add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('optimizer-copy-to-main-grad')
-    add_to_logging('optimizer-unscale-and-check-inf')
-    add_to_logging('optimizer-clip-main-grad')
-    add_to_logging('optimizer-copy-main-to-model-params')
-    add_to_logging('optimizer')
-    add_to_logging('batch-generator')
+    timers_to_log = [
+        'forward-backward',
+        'forward-compute',
+        'backward-compute',
+        'batch-generator',
+        'forward-recv',
+        'forward-send',
+        'backward-recv',
+        'backward-send',
+        'forward-send-forward-recv',
+        'forward-send-backward-recv',
+        'backward-send-forward-recv',
+        'backward-send-backward-recv',
+        'forward-backward-send-forward-backward-recv',
+        'layernorm-grads-all-reduce',
+        'embedding-grads-all-reduce',
+        'grads-all-reduce',
+        'grads-reduce-scatter',
+        'params-all-gather',
+        'optimizer-copy-to-main-grad',
+        'optimizer-unscale-and-check-inf',
+        'optimizer-clip-main-grad',
+        'optimizer-count-zeros',
+        'optimizer-inner-step',
+        'optimizer-copy-main-to-model-params',
+        'optimizer']
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
@@ -577,8 +542,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                        total_loss_dict[skipped_iters_key]
 
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0 ) and \
-       is_last_rank():
+    # Timer requires all the ranks to call.
+    if args.log_timers_to_tensorboard and \
+       (iteration % args.tensorboard_log_interval == 0):
+        timers.write(timers_to_log, writer, iteration,
+                     normalizer=total_iterations)
+    if writer and (iteration % args.tensorboard_log_interval == 0):
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate,
@@ -611,9 +580,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
                               args.consumed_train_samples)
-        if args.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration,
-                         normalizer=total_iterations)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -633,7 +599,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             )
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval-time').elapsed()
+        elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         if writer:
             if args.log_timers_to_tensorboard:
@@ -683,11 +649,9 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
     # Extra barrier is added to make sure
     # all ranks report the max time.
-    torch.distributed.barrier()
-    timers('save-checkpoint').start()
+    timers('save-checkpoint', log_level=0).start(barrier=True)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
-    torch.distributed.barrier()
-    timers('save-checkpoint').stop()
+    timers('save-checkpoint').stop(barrier=True)
     timers.log(['save-checkpoint'])
 
 
@@ -711,7 +675,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Iterations.
     iteration = args.iteration
 
-    timers('interval-time').start()
+    timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
     while iteration < args.train_iters:

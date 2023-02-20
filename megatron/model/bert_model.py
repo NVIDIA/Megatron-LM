@@ -1,24 +1,11 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """BERT model."""
 
 import torch
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
@@ -74,11 +61,16 @@ class BertLMHead(MegatronModule):
         args = get_args()
 
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        mpu.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+        tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        setattr(self.dense.weight, 'sequence_parallel', args.sequence_parallel)
+        setattr(self.dense.bias, 'sequence_parallel', args.sequence_parallel)
+
+        self.layernorm = LayerNorm(hidden_size,
+                                   eps=layernorm_epsilon,
+                                   sequence_parallel=args.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -110,14 +102,20 @@ def post_language_model_processing(lm_output, pooled_output,
         binary_logits = binary_head(pooled_output)
 
     if lm_labels is None:
-        return lm_logits, binary_logits
+        # [s b h] => [b s h]
+        return lm_logits.transpose(0,1).contiguous(), binary_logits
     else:
+        # [b s] => [s b]
+        lm_labels = lm_labels.transpose(0,1).contiguous()
+        # lm_logits : [s, b, h] and lm_labels: [s, b]
         if fp16_lm_cross_entropy:
             assert lm_logits.dtype == torch.half
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits, lm_labels)
         else:
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
-                                                       lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                        lm_labels)
+        # [s, b] => [b s]
+        lm_loss = lm_loss.transpose(0,1).contiguous()
         return lm_loss, binary_logits
 
 
@@ -197,26 +195,25 @@ class BertModel(MegatronModule):
             return lm_output
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
-            = self.language_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+            = self.language_model.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         if self.post_process:
             state_dict_[self._lm_head_key] \
-                = self.lm_head.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+                = self.lm_head.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
         if self.post_process and self.add_binary_head:
             state_dict_[self._binary_head_key] \
-                = self.binary_head.state_dict(destination, prefix, keep_vars)
+                = self.binary_head.state_dict(prefix=prefix, keep_vars=keep_vars)
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
-                = self.word_embeddings.state_dict(destination, prefix, keep_vars)
+                = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):

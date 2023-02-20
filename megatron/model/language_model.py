@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Transformer based language model."""
 
@@ -19,34 +6,43 @@ import torch
 import torch.nn.functional as F
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import mpu, tensor_parallel
 from .module import MegatronModule
 from megatron.model.enums import LayerType, AttnMaskType
 from megatron.model.transformer import ParallelTransformer
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal, scaled_init_method_normal
 
+
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
     args = get_args()
     # Parallel logits.
-    if args.async_tensor_model_parallel_allreduce:
+    if args.async_tensor_model_parallel_allreduce or\
+            args.sequence_parallel:
         input_parallel = input_
-        async_grad_allreduce = mpu.get_tensor_model_parallel_world_size() > 1
+        model_parallel = mpu.get_tensor_model_parallel_world_size() > 1
+        async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
+            model_parallel and not args.sequence_parallel
     else:
-        input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+        input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
         async_grad_allreduce = False
+
     # Matrix multiply.
-    logits_parallel = mpu.LinearWithGradAccumulationAndAsyncAllreduce.apply(
-            input_parallel, word_embeddings_weight, bias,
-            args.gradient_accumulation_fusion,
-            async_grad_allreduce)
+    logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
+        input=input_parallel,
+        weight=word_embeddings_weight,
+        bias=bias,
+        gradient_accumulation_fusion=args.gradient_accumulation_fusion,
+        async_grad_allreduce=async_grad_allreduce,
+        sequence_parallel_enabled=args.sequence_parallel)
     # Gather if needed.
+
     if parallel_output:
         return logits_parallel
 
-    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
+    return tensor_parallel.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
 def get_language_model(num_tokentypes, add_pooler,
@@ -98,12 +94,23 @@ class Pooler(MegatronModule):
 
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
+        args = get_args()
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        self.sequence_parallel = args.sequence_parallel
+
 
     def forward(self, hidden_states, sequence_index=0):
-        # hidden_states: [b, s, h]
+        # hidden_states: [s, b, h]
         # sequence_index: index of the token to pool.
-        pooled = hidden_states[:, sequence_index, :]
+
+        # gather data along sequence dimensions
+        # same pooler is run on all tensor parallel nodes
+        if self.sequence_parallel:
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states,
+                tensor_parallel_output_grad=False)
+
+        pooled = hidden_states[sequence_index, :, :]
         pooled = self.dense(pooled)
         pooled = torch.tanh(pooled)
         return pooled
@@ -139,9 +146,13 @@ class Embedding(MegatronModule):
         args = get_args()
 
         # Word embeddings (parallel).
-        self.word_embeddings = mpu.VocabParallelEmbedding(
+        self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             vocab_size, self.hidden_size,
-            init_method=self.init_method)
+            init_method=self.init_method,
+            params_dtype=args.params_dtype,
+            use_cpu_initialization=args.use_cpu_initialization,
+            perform_initialization=args.perform_initialization
+        )
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
@@ -149,7 +160,8 @@ class Embedding(MegatronModule):
             max_sequence_length, self.hidden_size)
         self._position_embeddings_key = 'position_embeddings'
         # Initialize the position embeddings.
-        self.init_method(self.position_embeddings.weight)
+        if args.perform_initialization:
+            self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -160,10 +172,13 @@ class Embedding(MegatronModule):
             self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes,
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
-            self.init_method(self.tokentype_embeddings.weight)
+            if args.perform_initialization:
+                self.init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
+        self.fp32_residual_connection = args.fp32_residual_connection 
+        self.sequence_parallel = args.sequence_parallel
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
@@ -205,25 +220,37 @@ class Embedding(MegatronModule):
         else:
             assert self.tokentype_embeddings is None
 
+        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+        embeddings = embeddings.transpose(0, 1).contiguous()
+
+        # If the input flag for fp32 residual connection is set, convert for float.
+        if self.fp32_residual_connection:
+            embeddings = embeddings.float()
+
         # Dropout.
-        embeddings = self.embedding_dropout(embeddings)
+        if self.sequence_parallel:
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                embeddings = self.embedding_dropout(embeddings)
+        else:
+            embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load."""
 
         state_dict_ = {}
         state_dict_[self._word_embeddings_key] \
-            = self.word_embeddings.state_dict(destination, prefix, keep_vars)
+            = self.word_embeddings.state_dict(prefix=prefix,
+                                              keep_vars=keep_vars)
         state_dict_[self._position_embeddings_key] \
-            = self.position_embeddings.state_dict(
-                destination, prefix, keep_vars)
+            = self.position_embeddings.state_dict(prefix=prefix,
+                                                  keep_vars=keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
-                = self.tokentype_embeddings.state_dict(
-                    destination, prefix, keep_vars)
+                = self.tokentype_embeddings.state_dict(prefix=prefix,
+                                                       keep_vars=keep_vars)
 
         return state_dict_
 
@@ -445,28 +472,27 @@ class TransformerLanguageModel(MegatronModule):
         else:
             return decoder_output, encoder_output
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load."""
 
         state_dict_ = {}
         if self.pre_process:
             state_dict_[self._embedding_key] \
-                = self.embedding.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.embedding.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                keep_vars=keep_vars)
         if self.add_encoder:
             state_dict_[self._encoder_key] \
-                = self.encoder.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.encoder.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
         if self.post_process:
             if self.add_pooler:
                 state_dict_[self._pooler_key] \
-                    = self.pooler.state_dict_for_save_checkpoint(
-                        destination, prefix, keep_vars)
+                    = self.pooler.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         if self.add_decoder:
             state_dict_[self._decoder_key] \
-                = self.decoder.state_dict_for_save_checkpoint(
-                    destination, prefix, keep_vars)
+                = self.decoder.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
 
         return state_dict_
 
