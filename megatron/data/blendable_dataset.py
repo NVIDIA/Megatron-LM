@@ -47,6 +47,8 @@ class BlendableDataset(torch.utils.data.Dataset):
             raise RuntimeError('BlendedDataset size is improperly bounded')
         except IndexError:
             pass
+        print_rank_0('> size of blendable dataset: '
+                     '{} samples'.format(self.size))
 
 
     def __len__(self):

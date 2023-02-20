@@ -114,7 +114,7 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples, seq_length,
                 datasets.append(ds)
 
         if datasets:
-            dataset = BlendableDataset(datasets, weights)
+            dataset = BlendableDataset(datasets, weights, sum(dataset_num_samples))
 
     return dataset
 
