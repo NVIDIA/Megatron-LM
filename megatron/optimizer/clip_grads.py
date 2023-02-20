@@ -8,9 +8,10 @@ from torch._six import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
+from megablocks.layers.mpu import param_is_expert_model_parallel
+
 from megatron.core import parallel_state
 from megatron.model.module import param_is_not_shared
-from megatron.core.tensor_parallel import param_is_expert_model_parallel
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
 

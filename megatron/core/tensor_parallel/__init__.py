@@ -5,12 +5,9 @@ from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
-    set_expert_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
-    copy_expert_model_parallel_attributes,
     copy_tensor_model_parallel_attributes,
-    param_is_expert_model_parallel,
     param_is_not_tensor_parallel_duplicate,
     linear_with_grad_accumulation_and_async_allreduce
 
