@@ -10,14 +10,12 @@ import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megablocks.layers import mpu as expert_parallel
-
 from megatron import get_args
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import Float16Module
+from megatron.model import Float16Module, megablocks_utils
 from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
 
@@ -539,8 +537,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Copy tensor model parallel attributes.
                         tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
                                                                               param)
-                        expert_parallel.copy_expert_model_parallel_attributes(main_param,
-                                                                              param)
+                        megablocks_utils.copy_expert_model_parallel_attributes(main_param,
+                                                                               param)
 
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared

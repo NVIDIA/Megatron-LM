@@ -346,6 +346,17 @@ To install FlashAttention:
 pip install flash-attn
 ```
 
+## Mixture-of-Experts
+
+Usage: `--moe-num-experts <number_of_experts>`. See command line arguments prefixed with `moe-` for additional MoE arguments. Compatible with GPT models.
+
+[MegaBlocks](https://github.com/stanford-futuredata/megablocks) is a light-weight library for mixture-of-experts (MoE) training. The core of the system is efficient "dropless-MoE" ([paper](https://arxiv.org/abs/2211.15841)) and standard MoE layers.
+
+To install MegaBlocks:
+```sh
+pip install megablocks
+```
+
 ## GPT-3 Example
 
 In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to configure Megatron to run [GPT-3](https://arxiv.org/abs/2005.14165) with 175 billion parameters on 1024 GPUs. The script is designed for [slurm](https://slurm.schedmd.com/documentation.html) with [pyxis](https://github.com/NVIDIA/pyxis) plugin but can be easily adopted to any other scheduler. It uses 8-way and 16-way tensor and pipeline parallelism, respectively. With options `global-batch-size 1536` and `rampup-batch-size 16 16 5859375`, the training will start with global batch size 16 and linearly increase the global batch size to 1536 over 5,859,375 samples with incrmeental steps 16. The training dataset can be either a single set or a multiple datasets combined with a set of weights.

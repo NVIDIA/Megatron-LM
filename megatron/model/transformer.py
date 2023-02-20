@@ -6,15 +6,11 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from megablocks.layers import arguments as megablocks_arguments
-from megablocks.layers import dmoe
-from megablocks.layers import moe
-
 from megatron import get_timers, get_args, core, get_num_microbatches
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel, parallel_state
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, megablocks_utils
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
@@ -185,7 +181,8 @@ class _MegablocksAdapter(MegatronModule):
 
     def __init__(self, layer_cls, init_method, output_layer_init_method):
         super().__init__()
-        args = megablocks_arguments.from_megatron(get_args())
+        megablocks_utils.assert_megablocks_is_available()
+        args = megablocks_utils.arguments.from_megatron(get_args())
         args.device = torch.cuda.current_device()
         args.init_method = init_method
         args.output_layer_init_method = output_layer_init_method
@@ -204,14 +201,14 @@ class _MegablocksAdapter(MegatronModule):
 class MoE(_MegablocksAdapter):
 
     def __init__(self, init_method, output_layer_init_method):
-        super().__init__(moe.MoE, init_method, output_layer_init_method)
-
+        super().__init__(
+            megablocks_utils.moe.MoE, init_method, output_layer_init_method)
 
 class dMoE(_MegablocksAdapter):
 
     def __init__(self, init_method, output_layer_init_method):
-        super().__init__(dmoe.dMoE, init_method, output_layer_init_method)
-
+        super().__init__(
+            megablocks_utils.dmoe.dMoE, init_method, output_layer_init_method)
 
 class CoreAttention(MegatronModule):
 

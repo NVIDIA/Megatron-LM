@@ -200,9 +200,12 @@ def update_train_iters(args):
 
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True):
     """Build the model."""
-    # Update the model type to note the load balancing loss if MoE layers are in use.
+    # Update the model type to note the load balancing loss if
+    # MegaBlocks MoE layers are in use.
     args = get_args()
-    if args.moe_num_experts is not None and model_type == ModelType.encoder_or_decoder:
+    if (args.moe_num_experts is not None
+        and not args.moe_use_megatron_switch and
+        model_type == ModelType.encoder_or_decoder):
         model_type = ModelType.encoder_or_decoder_with_lbl
     args.model_type = model_type
 

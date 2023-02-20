@@ -5,16 +5,14 @@
 import torch
 from functools import partial
 
-from megablocks.layers import arguments as megablocks_arguments
-from megablocks.layers import moe
-
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel, parallel_state
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, ModelType
+from megatron.model import GPTModel, ModelType, megablocks_utils
+from megatron.model.megablocks_utils import moe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -99,7 +97,7 @@ def moe_loss_func(loss_mask, output_tensor=None):
             moe.save_load_balancing_loss(load_balancing_loss_data)
 
     # Compute the load balancing loss for all MoE layers.
-    megablocks_args = megablocks_arguments.from_megatron(args)
+    megablocks_args = megablocks_utils.arguments.from_megatron(args)
     lbl = moe.batched_load_balancing_loss(megablocks_args)
     moe.clear_load_balancing_loss()
 

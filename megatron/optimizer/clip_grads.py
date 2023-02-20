@@ -8,9 +8,8 @@ from torch._six import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
-from megablocks.layers.mpu import param_is_expert_model_parallel
-
 from megatron.core import parallel_state
+from megatron.model import megablocks_utils
 from megatron.model.module import param_is_not_shared
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
@@ -49,7 +48,7 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     dp_grads_for_norm = []
     ep_grads_for_norm = []
     for (param, grad) in zip(parameters, grads_for_norm):
-        if param_is_expert_model_parallel(param):
+        if megablocks_utils.param_is_expert_model_parallel(param):
             ep_grads_for_norm.append(grad)
         else:
             dp_grads_for_norm.append(grad)
