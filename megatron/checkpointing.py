@@ -226,9 +226,12 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         get_checkpoint_names(args.save, iteration, args.use_distributed_optimizer)
 
     # Collect args, model, RNG.
+    # We use DP ranks for expert model parallelism, so all DP ranks also need to
+    # participate in checkpointing when using expert model parallelism.
     model_state_dict = {}
     if not torch.distributed.is_initialized() \
-       or mpu.get_data_parallel_rank() == 0:
+       or mpu.get_data_parallel_rank() == 0 \
+       or args.moe_expert_model_parallelism:
 
         # Arguments, iteration, and model.
         model_state_dict['args'] = args
@@ -252,6 +255,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     if not args.no_save_optim \
        and (not torch.distributed.is_initialized()
             or mpu.get_data_parallel_rank() == 0
+            or args.moe_expert_model_parallelism
             or args.use_distributed_optimizer):
 
         # Optimizer stuff.
