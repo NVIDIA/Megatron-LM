@@ -21,7 +21,7 @@ from megatron import get_tokenizer
 from megatron import mpu
 from megatron.model.classification import Classification
 from tasks.eval_utils import accuracy_func_provider
-from tasks.finetune_utils import finetune
+from tasks.finetune_utils import finetune, mse_forward_step
 
 
 def glue_classification(num_classes, Dataset,
@@ -60,9 +60,15 @@ def glue_classification(num_classes, Dataset,
             return Dataset(name, [datapath], tokenizer, args.seq_length)
         return accuracy_func_provider(single_dataset_provider)
 
+    args = get_args()
     """Finetune/evaluate."""
-    finetune(train_valid_datasets_provider, model_provider,
-             end_of_epoch_callback_provider=metrics_func_provider)
+    if args.task == 'STS-B':
+        finetune(train_valid_datasets_provider, model_provider,
+                forward_step=mse_forward_step,
+                end_of_epoch_callback_provider=metrics_func_provider)
+    else:
+        finetune(train_valid_datasets_provider, model_provider,
+                end_of_epoch_callback_provider=metrics_func_provider)
 
 
 def main():
@@ -85,7 +91,54 @@ def main():
         def name_from_datapath(datapath):
             return datapath.split('QQP')[-1].strip(
                 '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'QNLI':
 
+        num_classes = 2
+        from tasks.glue.qnli import QNLIDataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('QNLI')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'SST-2':
+
+        num_classes = 2
+        from tasks.glue.sst2 import SST2Dataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('SST-2')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'CoLA':
+
+        num_classes = 2
+        from tasks.glue.cola import CoLADataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('CoLA')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'STS-B':
+
+        num_classes = 1
+        from tasks.glue.stsb import STSBDataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('STS-B')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'MRPC':
+
+        num_classes = 2
+        from tasks.glue.mrpc import MRPCDataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('MRPC')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
+    elif args.task == 'RTE':
+
+        num_classes = 2
+        from tasks.glue.rte import RTEDataset as Dataset
+
+        def name_from_datapath(datapath):
+            return datapath.split('RTE')[-1].strip(
+                '.tsv').strip('/').replace('_', '-')
     else:
         raise NotImplementedError('GLUE task {} is not implemented.'.format(
             args.task))

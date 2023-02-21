@@ -79,6 +79,48 @@ def _cross_entropy_forward_step(batch, model):
 
     return output_tensor, partial(cross_entropy_loss_func, labels)
 
+def process_batch_mse(batch):
+    """Process batch and produce inputs for the model."""
+    args = get_args()
+
+    tokens = batch['text'].long().to(get_accelerator().device_name()).contiguous()
+    types = batch['types'].long().to(get_accelerator().device_name()).contiguous()
+    labels = batch['label'].float().to(get_accelerator().device_name()).contiguous()
+    attention_mask = batch['padding_mask'].float().to(get_accelerator().device_name()).contiguous()
+    if args.fp16:
+        attention_mask = attention_mask.half()
+
+    return tokens, types, labels, attention_mask
+
+def mse_loss_func(labels, output_tensor):
+    logits = output_tensor
+
+    # Cross-entropy loss.
+    loss_func = torch.nn.MSELoss()
+    loss = loss_func(logits.contiguous().float().view(-1), labels.view(-1))
+
+    # Reduce loss for logging.
+    averaged_loss = average_losses_across_data_parallel_group([loss])
+
+    return loss, {'lm loss': averaged_loss[0]}
+
+def mse_forward_step(batch, model):
+    """Simple forward step with cross-entropy loss."""
+    timers = get_timers()
+
+    # Get the batch.
+    timers('batch-generator').start()
+    try:
+        batch_ = next(batch)
+    except BaseException:
+        batch_ = batch
+    tokens, types, labels, attention_mask = process_batch_mse(batch_)
+    timers('batch-generator').stop()
+
+    # Forward model.
+    output_tensor = model(tokens, attention_mask, tokentype_ids=types)
+
+    return output_tensor, partial(mse_loss_func, labels)
 
 def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""

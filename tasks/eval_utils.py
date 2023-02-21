@@ -64,7 +64,9 @@ def accuracy_func_provider(single_dataset_provider):
             correct += correct_ans
             total += total_count
         if is_last_rank():
-            percent = float(correct) * 100.0 / float(total)
+            percent = 0
+            if total > 0:
+                percent = float(correct) * 100.0 / float(total)
             print(' >> |epoch: {}| overall: correct / total = {} / {} = '
                   '{:.4f} %'.format(epoch, correct, total, percent))
 
@@ -102,6 +104,7 @@ def calculate_correct_answers(name, model, dataloader,
     num_micro_batches = args.orig_global_batch_size // micro_batch_size_times_data_parallel
 
     def loss_func(output_predictions, labels, output_tensor):
+        args = get_args()
         logits = output_tensor
 
         loss_dict = {}
@@ -113,11 +116,20 @@ def calculate_correct_answers(name, model, dataloader,
             loss_dict['labels'] = labels.data.cpu().numpy().tolist()
             loss_dict['ids'] = batch['uid'].cpu().numpy().tolist()
         # Compute the correct answers.
-        predicted = torch.argmax(logits, dim=-1)
-        corrects = (predicted == labels)
-        # Add to the counters.
-        loss_dict['total'] = labels.size(0)
-        loss_dict['correct'] = corrects.sum().item()
+        if args.finetune and args.task == 'CoLA':
+            predicted = torch.argmax(logits, dim=-1)
+            loss_dict['labels'] = labels.data.cpu().numpy().tolist()
+            loss_dict['predicted'] = predicted.data.cpu().numpy().tolist()
+        elif args.finetune and args.task == 'STS-B':
+            predicted = torch.squeeze(logits)
+            loss_dict['labels'] = labels.data.cpu().numpy().tolist()
+            loss_dict['predicted'] = predicted.data.cpu().numpy().tolist()
+        else:
+            predicted = torch.argmax(logits, dim=-1)
+            corrects = (predicted == labels)
+            # Add to the counters.
+            loss_dict['total'] = labels.size(0)
+            loss_dict['correct'] = corrects.sum().item()
 
         return 0, loss_dict
 
@@ -139,6 +151,8 @@ def calculate_correct_answers(name, model, dataloader,
         # For all the batches in the dataset.
         total = 0
         correct = 0
+        labels = []
+        predicted = []
         if output_predictions:
             # This option is only possible when data parallel size is 1.
             assert mpu.get_data_parallel_world_size() == 1
@@ -162,8 +176,12 @@ def calculate_correct_answers(name, model, dataloader,
                     softmaxes.extend(loss_dict['softmaxes'])
                     labels.extend(loss_dict['labels'])
                     ids.extend(loss_dict['ids'])
-                total += loss_dict['total']
-                correct += loss_dict['correct']
+                if args.finetune and args.task in ['CoLA', 'STS-B']:
+                    labels.extend(loss_dict['labels'])
+                    predicted.extend(loss_dict['predicted'])
+                else:
+                    total += loss_dict['total']
+                    correct += loss_dict['correct']
 
 
     for m in model:
@@ -173,24 +191,70 @@ def calculate_correct_answers(name, model, dataloader,
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
-        unreduced = get_accelerator().LongTensor([correct, total])
-        torch.distributed.all_reduce(unreduced,
-                                     group=mpu.get_data_parallel_group())
+        if args.finetune and args.task in ['CoLA', 'STS-B']:
+            if args.task == 'CoLA':
+                labels = get_accelerator().LongTensor(labels)
+                predicted = get_accelerator().LongTensor(predicted)
+                labels_gather = [torch.zeros(len(labels), dtype=torch.long,
+                    device=labels.device) for _ in range(mpu.get_data_parallel_world_size())]
+                predicted_gather = [torch.zeros(len(predicted), dtype=torch.long,
+                    device=predicted.device) for _ in range(mpu.get_data_parallel_world_size())]
+            else:
+                labels = get_accelerator().FloatTensor(labels)
+                predicted = get_accelerator().FloatTensor(predicted)
+                labels_gather = [torch.zeros(len(labels), dtype=torch.float,
+                    device=labels.device) for _ in range(mpu.get_data_parallel_world_size())]
+                predicted_gather = [torch.zeros(len(predicted), dtype=torch.float,
+                    device=predicted.device) for _ in range(mpu.get_data_parallel_world_size())]
+            torch.distributed.all_gather(labels_gather, labels,
+                group=mpu.get_data_parallel_group())
+            torch.distributed.all_gather(predicted_gather, predicted,
+                group=mpu.get_data_parallel_group())
 
-        # Print on screen.
+            labels_gather = sum([x.data.cpu().numpy().tolist() for x in labels_gather], [])
+            predicted_gather = sum([x.data.cpu().numpy().tolist() for x in predicted_gather], [])
 
-        correct_ans = unreduced[0].item()
-        total_count = unreduced[1].item()
-        percent = float(correct_ans) * 100.0 / float(total_count)
-        elapsed_time = time.time() - start_time
-        print_rank_last(' > |epoch: {}| metrics for {}: correct / total '
-                        '= {} / {} = {:.4f} %, elapsed time (sec): {:.3f}'.format(
-                            epoch, name, correct_ans, total_count,
-                            percent, elapsed_time))
+            # Print on screen.
+            if args.task == 'CoLA':
+                from sklearn.metrics import matthews_corrcoef
+                mcc = matthews_corrcoef(labels_gather, predicted_gather)
+                elapsed_time = time.time() - start_time
+                print_rank_last(' > |epoch: {}| metrics for {}: mcc '
+                                '= {} , elapsed time (sec): {:.3f}'.format(
+                                    epoch, name, mcc, elapsed_time))
+            else:
+                from scipy.stats import pearsonr, spearmanr
+                pearson_corr = pearsonr(predicted_gather, labels_gather)[0]
+                spearman_corr = spearmanr(predicted_gather, labels_gather)[0]
+                corr = (pearson_corr + spearman_corr) / 2
+                elapsed_time = time.time() - start_time
+                print_rank_last(' > |epoch: {}| metrics for {}: pearson '
+                                '= {} spearmanr = {} corr = {} elapsed time (sec): {:.3f}'.format(
+                                    epoch, name, pearson_corr, spearman_corr,
+                                    corr, elapsed_time))
 
-        if output_predictions:
-            return correct_ans, total_count, (softmaxes, labels, ids)
-        return correct_ans, total_count
+            if output_predictions:
+                return 0, 0, ()
+            return 0, 0
+        else:
+            unreduced = get_accelerator().LongTensor([correct, total])
+            torch.distributed.all_reduce(unreduced,
+                                         group=mpu.get_data_parallel_group())
+
+            # Print on screen.
+
+            correct_ans = unreduced[0].item()
+            total_count = unreduced[1].item()
+            percent = float(correct_ans) * 100.0 / float(total_count)
+            elapsed_time = time.time() - start_time
+            print_rank_last(' > |epoch: {}| metrics for {}: correct / total '
+                            '= {} / {} = {:.4f} %, elapsed time (sec): {:.3f}'.format(
+                                epoch, name, correct_ans, total_count,
+                                percent, elapsed_time))
+
+            if output_predictions:
+                return correct_ans, total_count, (softmaxes, labels, ids)
+            return correct_ans, total_count
     if output_predictions:
         return 0, 0, ()
     return 0, 0
