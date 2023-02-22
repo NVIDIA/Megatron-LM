@@ -56,7 +56,13 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
 
 # Setup
-We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch). If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
+We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) with DGX nodes. If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
+
+You can launch an instance of the PyTorch container and mount Megatron, your dataset, and checkpoints with the following Docker commands:
+```
+docker pull nvcr.io/nvidia/pytorch:xx.xx-py3
+docker run --gpus all -it --rm -v /path/to/megatron:/workspace/megatron -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints nvcr.io/nvidia/pytorch:xx.xx-py3
+```
 
 ## Downloading Checkpoints
 We have provided pretrained [BERT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_bert_345m) and [GPT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_lm_345m) checkpoints for use to evaluate or finetuning downstream tasks. To access these checkpoints, first [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI. Further documentation for downloading models can be found in the [NGC documentation](https://docs.nvidia.com/dgx/ngc-registry-cli-user-guide/index.html#topic_6_4_1).
@@ -130,47 +136,13 @@ Further command line arguments are described in the source file [`preprocess_dat
 ## BERT Pretraining
 
 
-The `examples/pretrain_bert.sh` script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
+The [`examples/pretrain_bert.sh`](./examples/pretrain_bert.sh) script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
 
 The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
-<pre>
-CHECKPOINT_PATH=checkpoints/bert_345m
-VOCAB_FILE=bert-vocab.txt
-DATA_PATH=my-bert_text_sentence
-
-BERT_ARGS="--num-layers 24 \
-           --hidden-size 1024 \
-           --num-attention-heads 16 \
-           --seq-length 512 \
-           --max-position-embeddings 512 \
-           --lr 0.0001 \
-           --lr-decay-iters 990000 \
-           --train-iters 2000000 \
-           --min-lr 0.00001 \
-           --lr-warmup-fraction 0.01 \
-	   --micro-batch-size 4 \
-           --global-batch-size 8 \
-           --vocab-file $VOCAB_FILE \
-           --split 949,50,1 \
-           --fp16"
-
-OUTPUT_ARGS="--log-interval 10 \
-             --save-interval 500 \
-             --eval-interval 100 \
-             --eval-iters 10 \
-             --activations-checkpoint-method uniform"
-
-python pretrain_bert.py \
-       $BERT_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH
-</pre>
-
 Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
 
+To run `examples/pretrain_bert.sh`, make any desired modifications including setting the environment variables for `CHECKPOINT_PATH`, `VOCAB_FILE`, and `DATA_PATH`. Make sure to set these variables to their paths in the container. Then launch the container with Megatron and necessary paths mounted (as explained in [Setup](#setup)) and run the example script.
 
 ## GPT Pretraining
 
@@ -178,39 +150,9 @@ The `examples/pretrain_gpt.sh` script runs single GPU 345M parameter GPT pretrai
 
 It follows largely the same format as the previous BERT script with a few notable differences: the tokenization scheme used is BPE (which requires a merge table and a `json` vocabulary file) instead of WordPiece, the model architecture allows for longer sequences (note that the max position embedding must be greater than or equal to the maximum sequence length), and the `--lr-decay-style` has been set to cosine decay.  Note that the `--data-path` now includes the additional `_text_document` suffix added in preprocessing, but does not include the file extensions.
 
-<pre>
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
-DATA_PATH=my-gpt2_text_document
-
-GPT_ARGS="--num-layers 24 \
-          --hidden-size 1024 \
-          --num-attention-heads 16 \
-          --seq-length 1024 \
-          --max-position-embeddings 1024 \
-          --micro-batch-size 4 \
-          --global-batch-size 8 \
-          --lr 0.00015 \
-          --train-iters 500000 \
-          --lr-decay-iters 320000 \
-          --lr-decay-style cosine \
-          --vocab-file $VOCAB_FILE \
-          --merge-file $MERGE_FILE \
-          --lr-warmup-fraction .01 \
-          --fp16"
-
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-
-python pretrain_gpt.py \
-       $GPT_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH \
-</pre>
-
 Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+
+`examples/pretrain_gpt.sh` can be launched the same way as described for BERT. Set the env vars and make any other modifications, launch the container with appropriate mounts, and run the script.
 
 ## T5 Pretraining
 
@@ -222,43 +164,7 @@ Very similar to BERT and GPT, the `examples/pretrain_t5.sh` script runs single G
 
 * `--encoder-seq-length` and `--decoder-seq-length` set the sequence length for the encoder and decoder separately.
 
-All of the other arguments remain as they were for BERT and GPT pretraining.
-
-<pre>
-CHECKPOINT_PATH=checkpoints/t5_base
-VOCAB_FILE=t5-vocab.txt
-DATA_PATH=my-t5_text_sentence
-
-T5_ARGS="--num-layers 24 \
-         --hidden-size 1024 \
-         --num-attention-heads 16 \
-         --kv-channels 64 \
-         --ffn-hidden-size 3072 \
-         --encoder-seq-length 512 \
-         --decoder-seq-length 128 \
-         --max-position-embeddings 512 \
-         --lr 0.0001 \
-         --lr-decay-iters 990000 \
-         --train-iters 2000000 \
-         --min-lr 0.00001 \
-         --lr-warmup-fraction 0.01 \
-         --micro-batch-size 16 \
-         --global-batch-size 2048 \
-         --vocab-file $VOCAB_FILE \
-         --vocab-extra-ids 100 \
-         --split 949,50,1 \
-         --fp16"
-
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-
-python pretrain_t5.py \
-       $T5_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH
-</pre>
-
+All of the other arguments remain as they were for BERT and GPT pretraining. Run this example with the same steps described above for the other scripts.
 
 ## Distributed Pretraining
 
