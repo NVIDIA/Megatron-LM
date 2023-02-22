@@ -4,13 +4,15 @@
 
 import torch
 from functools import partial
+
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, ModelType
+from megatron.model import GPTModel, ModelType, megablocks_utils
+from megatron.model.megablocks_utils import moe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -69,6 +71,37 @@ def loss_func(loss_mask, output_tensor):
 
     return loss, {'lm loss': averaged_loss[0]}
 
+def moe_loss_func(loss_mask, output_tensor):
+    loss, loss_dict = loss_func(loss_mask, output_tensor)
+    assert loss.numel() == 1
+
+    # NOTE: If recompute is enabled we will collect duplicate load
+    # balancing loss contributions. Prune these before calculating
+    # the load balancing loss.
+    args = get_args()
+    if args.recompute_granularity is not None:
+        # Ignore load balancing loss contributions compute during
+        # the forward pass if recompute is turned on.
+        load_balancing_loss_data = moe.get_load_balancing_loss()
+        if args.num_layers * 2 == len(load_balancing_loss_data):
+            load_balancing_loss_data = (
+                load_balancing_loss_data[args.num_layers:])
+            moe.clear_load_balancing_loss()
+            moe.save_load_balancing_loss(load_balancing_loss_data)
+
+    # Compute the load balancing loss for all MoE layers.
+    megablocks_args = megablocks_utils.arguments.from_megatron(args)
+    lbl = moe.batched_load_balancing_loss(megablocks_args)
+    moe.clear_load_balancing_loss()
+
+    # Average the load balancing loss across data parallel
+    # replicas and save for logging.
+    averaged_lbl = average_losses_across_data_parallel_group([lbl])
+    loss_dict['load balancing loss'] = averaged_lbl[0]
+
+    # Compute the total loss, if necessary.
+    total_loss = loss + lbl if loss is not None else lbl
+    return total_loss, loss_dict
 
 def forward_step(data_iterator, model):
     """Forward step."""
@@ -84,8 +117,9 @@ def forward_step(data_iterator, model):
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)
 
-    return output_tensor, partial(loss_func, loss_mask)
-
+    loss_fn = (
+        moe_loss_func if args.moe_num_experts is not None else loss_func)
+    return output_tensor, partial(loss_fn, loss_mask)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
@@ -110,7 +144,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
              forward_step,

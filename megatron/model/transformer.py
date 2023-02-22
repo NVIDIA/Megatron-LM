@@ -10,7 +10,7 @@ from megatron import get_timers, get_args, core, get_num_microbatches
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, megablocks_utils
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
@@ -136,9 +136,9 @@ class SwitchMLP(MegatronModule):
     def __init__(self, init_method, output_layer_init_method):
         super(SwitchMLP, self).__init__()
         args = get_args()
-        self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
+        self.router = torch.nn.Linear(args.hidden_size, args.moe_num_experts)
         self.experts = torch.nn.ModuleList()
-        for i in range(args.num_experts):
+        for i in range(args.moe_num_experts):
             self.experts.append(ParallelMLP(init_method, output_layer_init_method))
 
     def forward(self, hidden_states):
@@ -177,6 +177,33 @@ class SwitchMLP(MegatronModule):
 
         return output_total, output_bias_total
 
+class _MegablocksAdapter(MegatronModule):
+
+    def __init__(self, layer_cls, init_method, output_layer_init_method):
+        super().__init__()
+        megablocks_utils.assert_megablocks_is_available()
+        args = megablocks_utils.arguments.from_megatron(get_args())
+        args.device = torch.cuda.current_device()
+        args.init_method = init_method
+        args.output_layer_init_method = output_layer_init_method
+        self.moe = layer_cls(args)
+
+    def forward(self, x):
+        return self.moe.forward(x)
+
+class MoE(_MegablocksAdapter):
+
+    def __init__(self, init_method, output_layer_init_method):
+        megablocks_utils.assert_megablocks_is_available()
+        super().__init__(
+            megablocks_utils.moe.MoE, init_method, output_layer_init_method)
+
+class dMoE(_MegablocksAdapter):
+
+    def __init__(self, init_method, output_layer_init_method):
+        megablocks_utils.assert_megablocks_is_available()
+        super().__init__(
+            megablocks_utils.dmoe.dMoE, init_method, output_layer_init_method)
 
 class CoreAttention(MegatronModule):
 
@@ -673,10 +700,15 @@ class ParallelTransformerLayer(MegatronModule):
                 sequence_parallel=args.sequence_parallel)
 
         # MLP
-        if args.num_experts is not None:
-            self.mlp = SwitchMLP(init_method, output_layer_init_method)
-        else:
-            self.mlp = ParallelMLP(init_method, output_layer_init_method)
+        mlp_cls = ParallelMLP
+        if args.moe_num_experts is not None:
+            if args.moe_use_megatron_switch:
+                mlp_cls = SwitchMLP
+            elif args.moe_capacity_factor > 0:
+                mlp_cls = MoE
+            else:
+                mlp_cls = dMoE
+        self.mlp = mlp_cls(init_method, output_layer_init_method)
 
         # Set bias+dropout+add fusion grad_enable execution handler.
         TORCH_MAJOR = int(torch.__version__.split('.')[0])

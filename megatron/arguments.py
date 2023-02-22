@@ -29,6 +29,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
+    parser = _add_moe_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -43,7 +44,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-        
+
     return args
 
 def validate_args(args, defaults={}):
@@ -333,7 +334,6 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
@@ -344,6 +344,10 @@ def validate_args(args, defaults={}):
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
+    # Pipeline parallelism not supported with MoE.
+    if args.moe_num_experts is not None:
+        assert args.pipeline_model_parallel_size == 1, (
+            "Pipeline parallelism not yet support for MoEs.")
 
     _print_args(args)
     return args
@@ -403,7 +407,7 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
-    
+
     group.add_argument('--max-tokens-to-oom',
                        type=int, default=12000,
                        help='Maximum number of tokens during inference'
@@ -411,7 +415,7 @@ def _add_inference_args(parser):
                        'Allows us to throw an error before OOM crashes server')
     return parser
 
-    
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -455,8 +459,31 @@ def _add_network_size_args(parser):
     group.add_argument('--bert-no-binary-head', action='store_false',
                        help='Disable BERT binary head.',
                        dest='bert_binary_head')
-    group.add_argument('--num-experts', type=int, default=None,
-                       help='Number of Experts in Switch Transformer (None means no Switch)')
+    return parser
+
+
+def _add_moe_args(parser):
+    group = parser.add_argument_group(title='moe')
+    group.add_argument('--moe-num-experts', type=int, default=None,
+                       help='The number of experts in MoE layers. MoE '
+                       'layers not used if set to None')
+    group.add_argument('--moe-capacity-factor', type=int, default=0,
+                       help='Capacity factor for MoE layers. If zero, use '
+                       'dropless MoE implementation.')
+    group.add_argument('--moe-top-k', type=int, default=1,
+                       help='The number of experts each token is routed to '
+                       'in MoE layers.')
+    group.add_argument('--moe-loss-weight', type=float, default=0.1,
+                       help='The weight for the MoE auxiliary load balancing '
+                       'loss.')
+    group.add_argument('--moe-lbl-in-fp32', type=bool, default=False,
+                       help='Whether to compute the load balancing loss in '
+                       'fp32.')
+    group.add_argument('--moe-jitter-eps', type=float, default=None,
+                       help='Coefficient for MoE routing jitter. Jitter is '
+                       'not used if set to None.')
+    group.add_argument('--moe-use-megatron-switch', type=bool, default=False,
+                       help='Whether to use Megatron SwitchMLP for MoE layers.')
     return parser
 
 
@@ -873,7 +900,6 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-
     return parser
 
 
@@ -1078,14 +1104,14 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-    
+
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
- 
+
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,
                        help='iterations per epoch')
