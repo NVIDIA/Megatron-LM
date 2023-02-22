@@ -143,6 +143,11 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('training ...')
 
     iteration = 0
+
+    if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
+        args.train_iters = args.retro_cyclic_train_iters
+        print_rank_0("retro cyclic train iters : %d" % args.train_iters)
+
     if args.do_train and args.train_iters > 0:
         iteration = train(forward_step_func,
                           model, optimizer, opt_param_scheduler,
@@ -751,7 +756,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
-            if not saved_checkpoint:
+            if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
             torch.distributed.barrier()
@@ -864,7 +869,8 @@ def cyclic_iter(iter):
         for x in iter:
             yield x
 
-def build_train_valid_test_data_iterators(
+
+def build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider):
     """XXX"""
     args = get_args()
@@ -930,6 +936,19 @@ def build_train_valid_test_data_iterators(
     args.do_train = flags[0].item()
     args.do_valid = flags[1].item()
     args.do_test = flags[2].item()
+
+    return train_dataloader, valid_dataloader, test_dataloader
+
+
+def build_train_valid_test_data_iterators(
+        build_train_valid_test_datasets_provider):
+
+    args = get_args()
+
+    # Build loaders.
+    train_dataloader, valid_dataloader, test_dataloader = \
+        build_train_valid_test_data_loaders(
+            build_train_valid_test_datasets_provider)
 
     # Build iterators.
     dl_type = args.dataloader_type
