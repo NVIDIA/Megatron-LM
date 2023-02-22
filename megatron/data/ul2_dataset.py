@@ -14,12 +14,14 @@ from megatron.data.dataset_utils import (
     get_samples_mapping,
     SamplingStyle
 )
-from megatron.data.gpt_dataset import build_index_mappings, get_sample
+from megatron.data.gpt_dataset import build_index_mappings, get_samples
 from megatron.data.t5_dataset import (
+    add_final_padding,
     LengthExceededError,
     make_history_mask,
     merge_subsequent_masks,
     pad_and_convert_to_numpy,
+    update_samples_dict,
 )
 from megatron.model.enums import UL2ModelType
 
@@ -91,7 +93,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                 self.doc_idx, self.sample_idx, self.shuffle_idx,
                 self.desc, self.desc_hash,
             ) = build_index_mappings(
-                self.name, data_prefix, self.indexed_dataset.get_doc_idx()[:-1],
+                self.name, data_prefix,
+                self.indexed_dataset.get_doc_idx()[:-1],
                 self.indexed_dataset.sizes, splits_string, max_num_samples,
                 self.max_seq_length - min_added_tokens, self.seed,
                 data_cache_path=data_cache_path)
@@ -102,7 +105,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                 splits_string,
                 num_epochs,
                 max_num_samples,
-                self.max_seq_length - min_added_tokens,  # account for added tokens
+                # account for added tokens
+                self.max_seq_length - min_added_tokens,
                 short_seq_prob,
                 self.seed,
                 self.name,
@@ -161,41 +165,131 @@ class UL2Dataset(torch.utils.data.Dataset):
         else:
             return self.samples_mapping.shape[0]
 
+    def _create_samples_dict(self):
+        if is_decoder_only(self.model_type):
+            samples_dict = {
+                'text': np.empty((self.max_seq_length,), dtype=np.int64),
+                'labels': np.empty((self.max_seq_length,), dtype=np.int64),
+                'loss_mask': np.zeros((self.max_seq_length,), dtype=np.int64),
+                'truncated': 0,
+                'dec_mask': np.zeros(
+                    (self.max_seq_length, self.max_seq_length),
+                    dtype=np.int64,
+                ),
+            }
+        else:
+            samples_dict = {
+                'text_enc': np.empty((self.max_seq_length,), dtype=np.int64),
+                'text_dec': np.empty(
+                    (self.max_seq_length_dec,), dtype=np.int64),
+                'labels': np.empty(
+                    (self.max_seq_length_dec,), dtype=np.int64),
+                'loss_mask': np.zeros(
+                    (self.max_seq_length_dec,), dtype=np.int64),
+                'truncated': 0,
+                'enc_mask': np.zeros(
+                    (self.max_seq_length, self.max_seq_length),
+                    dtype=np.int64,
+                ),
+                'dec_mask': np.zeros(
+                    (self.max_seq_length_dec, self.max_seq_length_dec),
+                    dtype=np.int64,
+                ),
+                'enc_dec_mask': np.zeros(
+                    (self.max_seq_length_dec, self.max_seq_length),
+                    dtype=np.int64,
+                ),
+            }
+        return samples_dict
+
     def __getitem__(self, idx):
+        # Note that this rng state should be numpy and not python since
+        # python randint is inclusive whereas the numpy one is exclusive.
+        np_rng = np.random.RandomState(seed=(self.seed + idx))
+        # Denoiser selection
+        denoiser_index = np_rng.choice(
+            np.arange(len(self.denoisers)),
+            p=self.denoiser_ratios,
+        )
+
         if self.pack_samples:
-            sample = get_sample(
+            samples = get_samples(
                 self.indexed_dataset, self.doc_idx,
                 self.sample_idx, self.shuffle_idx, idx, False,
             )['text']
-            seq_length = len(sample)
-            sample = [sample]
+            samples_dict = self._create_samples_dict()
+            prev_len = 0
+            prev_len_dec = 0
+            for sample in samples:
+                seq_length = len(sample)
+                result_sample = build_training_sample(
+                    [sample], seq_length,
+                    self.max_seq_length,  # needed for padding
+                    self.max_seq_length_dec, self.vocab_id_list,
+                    self.vocab_id_to_token_dict, self.cls_ids, self.sep_id,
+                    self.mask_id, self.pad_id, self.model_type, denoiser_index,
+                    self.denoisers, self.mean_span_lengths,
+                    self.mask_ratios, self.like_ul2r, np_rng,
+                    self.bos_id, self.eos_id, self.sentinel_tokens)
+                if is_decoder_only(self.model_type):
+                    maybe_lens = update_samples_dict_decoder_only(
+                        samples_dict,
+                        result_sample,
+                        self.max_seq_length,
+                        prev_len,
+                        self.pad_id,
+                        self.eos_id,
+                    )
+                else:
+                    maybe_lens = update_samples_dict(
+                        samples_dict,
+                        result_sample,
+                        self.max_seq_length,
+                        self.max_seq_length_dec,
+                        prev_len,
+                        prev_len_dec,
+                        self.pad_id,
+                        self.eos_id,
+                    )
+                if maybe_lens is None:
+                    # We are exceeding our sequence length already.
+                    break
+
+                if is_decoder_only(self.model_type):
+                    len_enc = maybe_lens
+                else:
+                    len_enc, len_dec = maybe_lens
+                    prev_len_dec += len_dec
+                prev_len += len_enc
+
+            if is_decoder_only(self.model_type):
+                samples_dict['text'][prev_len:] = self.pad_id
+                samples_dict['labels'][prev_len:] = -1
+            else:
+                add_final_padding(
+                    samples_dict, prev_len, prev_len_dec, self.pad_id)
         else:
             start_index, end_index, seq_length = self.samples_mapping[idx]
             sample = []
             for index in range(start_index, end_index):
                 sample.append(self.indexed_dataset[index])
-        # Note that this rng state should be numpy and not python since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        np_rng = np.random.RandomState(seed=(self.seed + idx))
-        return build_training_sample(sample, seq_length,
-                                     self.max_seq_length,  # needed for padding
-                                     self.max_seq_length_dec,
-                                     self.vocab_id_list,
-                                     self.vocab_id_to_token_dict,
-                                     self.cls_ids, self.sep_id,
-                                     self.mask_id, self.pad_id,
-                                     self.model_type, self.denoiser_ratios,
-                                     self.denoisers, self.mean_span_lengths,
-                                     self.mask_ratios, self.like_ul2r, np_rng,
-                                     self.bos_id, self.eos_id,
-                                     self.sentinel_tokens)
+            samples_dict = build_training_sample(
+                sample, seq_length,
+                self.max_seq_length,  # needed for padding
+                self.max_seq_length_dec, self.vocab_id_list,
+                self.vocab_id_to_token_dict, self.cls_ids, self.sep_id,
+                self.mask_id, self.pad_id, self.model_type, denoiser_index,
+                self.denoisers, self.mean_span_lengths,
+                self.mask_ratios, self.like_ul2r, np_rng,
+                self.bos_id, self.eos_id, self.sentinel_tokens)
+        return samples_dict
 
 
 def build_training_sample(sample, target_seq_length,
                           max_seq_length, max_seq_length_dec,
                           vocab_id_list, vocab_id_to_token_dict,
                           cls_ids, sep_id, mask_id, pad_id,
-                          model_type, denoiser_ratios, denoisers,
+                          model_type, denoiser_index, denoisers,
                           mean_span_lengths, mask_ratios,
                           like_ul2r, np_rng, bos_id=None,
                           eos_id=None, sentinel_tokens=None):
@@ -215,7 +309,7 @@ def build_training_sample(sample, target_seq_length,
         mask_id: Mask token id.
         pad_id: Padding token id.
         model_type: What type of model is used.
-        denoiser_ratios: Probability of each denoising objective to be selected.
+        denoiser_index: Index of selected denoising objective.
         denoisers: What type of UL2 denoising objective the other UL2
               configurations refer to.
         mean_span_lengths: Mean length for sampling span lengths. Numbers < 1
@@ -232,7 +326,6 @@ def build_training_sample(sample, target_seq_length,
     """
 
     # Denoiser selection
-    denoiser_index = np_rng.choice(np.arange(len(denoisers)), p=denoiser_ratios)
     denoiser = denoisers[denoiser_index]
     masked_lm_prob = mask_ratios[denoiser_index]
 
@@ -376,3 +469,77 @@ def build_training_sample(sample, target_seq_length,
             'enc_dec_mask': enc_dec_mask,
         }
     return train_sample
+
+
+def _remove_padding(result_sample, pad_id):
+    # Remove padding
+    padding_length = (
+        len(result_sample['text'])
+        - np.argmax(result_sample['text'] == pad_id)
+    )
+    result_sample['text'] = result_sample['text'][:padding_length]
+    for key in ['labels', 'loss_mask']:
+        result_sample[key] = result_sample[key][:padding_length]
+    result_sample['dec_mask'] = \
+        result_sample['dec_mask'][:padding_length, :padding_length]
+
+
+def update_samples_dict_decoder_only(
+        samples_dict,
+        result_sample,
+        max_seq_len,
+        prev_len,
+        pad_id,
+        eos_id,
+):
+    _remove_padding(result_sample, pad_id)
+    len_enc = len(result_sample['text'])
+
+    if (
+            (
+                prev_len
+                + len_enc
+                + int(result_sample['text'][-1] != eos_id)
+            ) > max_seq_len
+    ):
+        return None
+
+    eos_added = False
+    for key in ['text', 'labels']:
+        curr_sample = result_sample[key]
+        samples_dict[key][prev_len:prev_len + len_enc] = curr_sample
+
+        # Add EOS token if not present.
+        if (
+                curr_sample[-1] != eos_id
+                or key == 'labels' and eos_added
+        ):
+            samples_dict[key][prev_len + len_enc] = eos_id
+            eos_added = True
+
+    samples_dict['loss_mask'][
+        prev_len:prev_len + len_enc,
+    ] += result_sample['loss_mask']
+    samples_dict['dec_mask'][
+        prev_len:prev_len + len_enc,
+        prev_len:prev_len + len_enc,
+    ] += result_sample['dec_mask']
+
+    if eos_added:
+        samples_dict['loss_mask'][prev_len + len_enc] = 1
+
+        all_samples = samples_dict['dec_mask']
+        all_samples[
+            prev_len + len_enc,
+            prev_len:prev_len + len_enc,
+        ] = 1
+        all_samples[
+            prev_len:prev_len + len_enc,
+            prev_len + len_enc,
+        ] = 1
+
+        len_enc += 1
+
+    samples_dict['truncated'] += result_sample['truncated']
+
+    return len_enc
