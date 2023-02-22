@@ -12,7 +12,7 @@ from megatron.data.dataset_utils import (
     create_masked_lm_predictions,
     get_samples_mapping
 )
-from megatron.data.gpt_dataset import build_index_mappings, get_sample
+from megatron.data.gpt_dataset import build_index_mappings, get_samples
 
 
 class LengthExceededError(ValueError):
@@ -104,32 +104,85 @@ class T5Dataset(torch.utils.data.Dataset):
         else:
             return self.samples_mapping.shape[0]
 
+    def _create_samples_dict(self):
+        samples_dict = {
+            'text_enc': np.empty((self.max_seq_length,), dtype=np.int64),
+            'text_dec': np.empty(
+                (self.max_seq_length_dec,), dtype=np.int64),
+            'labels': np.empty(
+                (self.max_seq_length_dec,), dtype=np.int64),
+            'loss_mask': np.zeros(
+                (self.max_seq_length_dec,), dtype=np.int64),
+            'truncated': 0,
+            'enc_mask': np.zeros(
+                (self.max_seq_length, self.max_seq_length),
+                dtype=np.int64,
+            ),
+            'dec_mask': np.zeros(
+                (self.max_seq_length_dec, self.max_seq_length_dec),
+                dtype=np.int64,
+            ),
+            'enc_dec_mask': np.zeros(
+                (self.max_seq_length_dec, self.max_seq_length),
+                dtype=np.int64,
+            ),
+        }
+        return samples_dict
+
     def __getitem__(self, idx):
+        # Note that this rng state should be numpy and not python since
+        # python randint is inclusive whereas the numpy one is exclusive.
+        np_rng = np.random.RandomState(seed=(self.seed + idx))
         if self.pack_samples:
-            sample = get_sample(
+            samples = get_samples(
                 self.indexed_dataset, self.doc_idx,
                 self.sample_idx, self.shuffle_idx, idx, False,
             )['text']
-            seq_length = len(sample)
-            sample = [sample]
+            samples_dict = self._create_samples_dict()
+            prev_len = 0
+            prev_len_dec = 0
+            for sample in samples:
+                seq_length = len(sample)
+                result_sample = build_training_sample(
+                    [sample], seq_length,
+                    self.max_seq_length,  # needed for padding
+                    self.max_seq_length_dec, self.vocab_id_list,
+                    self.vocab_id_to_token_dict, self.cls_id, self.sep_id,
+                    self.mask_id, self.pad_id, self.masked_lm_prob, np_rng,
+                    self.bos_id, self.eos_id, self.sentinel_tokens)
+                maybe_lens = update_samples_dict(
+                    samples_dict,
+                    result_sample,
+                    self.max_seq_length,
+                    self.max_seq_length_dec,
+                    prev_len,
+                    prev_len_dec,
+                    self.pad_id,
+                    self.eos_id,
+                )
+                if maybe_lens is None:
+                    # We are exceeding our sequence length already.
+                    break
+
+                len_enc, len_dec = maybe_lens
+                prev_len += len_enc
+                prev_len_dec += len_dec
+
+            add_final_padding(
+                samples_dict, prev_len, prev_len_dec, self.pad_id)
         else:
             start_index, end_index, seq_length = self.samples_mapping[idx]
             sample = []
             for index in range(start_index, end_index):
                 sample.append(self.indexed_dataset[index])
-        # Note that this rng state should be numpy and not python since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        np_rng = np.random.RandomState(seed=(self.seed + idx))
-        return build_training_sample(sample, seq_length,
-                                     self.max_seq_length,  # needed for padding
-                                     self.max_seq_length_dec,
-                                     self.vocab_id_list,
-                                     self.vocab_id_to_token_dict,
-                                     self.cls_id, self.sep_id,
-                                     self.mask_id, self.pad_id,
-                                     self.masked_lm_prob, np_rng,
-                                     self.bos_id, self.eos_id,
-                                     self.sentinel_tokens)
+            samples_dict = build_training_sample(
+                sample, seq_length,
+                self.max_seq_length,  # needed for padding
+                self.max_seq_length_dec, self.vocab_id_list,
+                self.vocab_id_to_token_dict, self.cls_id, self.sep_id,
+                self.mask_id, self.pad_id, self.masked_lm_prob, np_rng,
+                self.bos_id, self.eos_id, self.sentinel_tokens)
+        return samples_dict
 
 
 def build_training_sample(sample, target_seq_length,
@@ -340,3 +393,161 @@ def make_history_mask_3d(block):
     history_mask = (arange[None, ] <= arange[:, None])[None, ]
     history_mask = history_mask.expand(batch, length, length)
     return history_mask
+
+
+def _remove_padding(result_sample, pad_id):
+    # Remove padding
+    padding_length = (
+        len(result_sample['text_enc'])
+        - np.argmax(result_sample['text_enc'] == pad_id)
+    )
+    padding_length_dec = (
+        len(result_sample['text_dec'])
+        - np.argmax(result_sample['text_dec'] == pad_id)
+    )
+    result_sample['text_enc'] = result_sample['text_enc'][:padding_length]
+    for key in ['text_dec', 'labels', 'loss_mask']:
+        result_sample[key] = result_sample[key][:padding_length_dec]
+    result_sample['enc_mask'] = \
+        result_sample['enc_mask'][:padding_length, :padding_length]
+    result_sample['enc_dec_mask'] = \
+        result_sample['enc_dec_mask'][:padding_length_dec, :padding_length]
+    result_sample['dec_mask'] = \
+        result_sample['dec_mask'][:padding_length_dec, :padding_length_dec]
+
+
+def get_lens(key, prev_len, prev_len_dec, len_enc, len_dec):
+    assert key != 'enc_dec_mask'
+    if key in ['text_enc', 'enc_mask']:
+        offset = prev_len
+        length = len_enc
+    else:
+        offset = prev_len_dec
+        length = len_dec
+    return offset, length
+
+
+def update_samples_dict(
+        samples_dict,
+        result_sample,
+        max_seq_len,
+        max_seq_len_dec,
+        prev_len,
+        prev_len_dec,
+        pad_id,
+        eos_id,
+):
+    _remove_padding(result_sample, pad_id)
+
+    len_enc = len(result_sample['text_enc'])
+    len_dec = len(result_sample['text_dec'])
+
+    if (
+            (
+                prev_len
+                + len_enc
+                + int(result_sample['text_enc'][-1] != eos_id)
+            ) > max_seq_len
+            or (
+                prev_len_dec
+                + len_dec
+                + int(result_sample['text_dec'][-1] != eos_id)
+            ) > max_seq_len_dec
+    ):
+        return None
+
+    eos_added = {
+        'text_enc': False,
+        'text_dec': False,
+        'labels': False,
+    }
+    for (key, is_enc) in zip(
+            ['text_enc', 'text_dec', 'labels'],
+            [True, False, False],
+    ):
+        curr_sample = result_sample[key]
+        offset, length = get_lens(
+            key, prev_len, prev_len_dec, len_enc, len_dec)
+        samples_dict[key][offset:offset + length] = curr_sample
+
+        # Add EOS token if not present.
+        if (
+                curr_sample[-1] != eos_id
+                or key == 'labels' and eos_added['text_dec']
+        ):
+            samples_dict[key][offset + length] = eos_id
+            eos_added[key] = True
+
+    need_extras = {
+        'loss_mask': False,
+        'enc_mask': False,
+        'dec_mask': False,
+        'enc_dec_mask': [False, False],
+    }
+    if eos_added['text_enc']:
+        need_extras['enc_mask'] = True
+        need_extras['enc_dec_mask'][1] = True
+    if eos_added['text_dec']:
+        need_extras['loss_mask'] = True
+        need_extras['dec_mask'] = True
+        need_extras['enc_dec_mask'][0] = True
+
+    samples_dict['loss_mask'][
+        prev_len_dec:prev_len_dec + len_dec,
+    ] += result_sample['loss_mask']
+    samples_dict['enc_mask'][
+        prev_len:prev_len + len_enc,
+        prev_len:prev_len + len_enc,
+    ] += result_sample['enc_mask']
+    samples_dict['dec_mask'][
+        prev_len_dec:prev_len_dec + len_dec,
+        prev_len_dec:prev_len_dec + len_dec,
+    ] += result_sample['dec_mask']
+    samples_dict['enc_dec_mask'][
+        prev_len_dec:prev_len_dec + len_dec,
+        prev_len:prev_len + len_enc,
+    ] += result_sample['enc_dec_mask']
+
+    if need_extras['loss_mask']:
+        samples_dict['loss_mask'][prev_len_dec + len_dec] = 1
+
+    for key in ['enc_mask', 'dec_mask']:
+        if need_extras[key]:
+            all_samples = samples_dict[key]
+            offset, length = get_lens(
+                key, prev_len, prev_len_dec, len_enc, len_dec)
+            all_samples[
+                offset + length,
+                offset:offset + length,
+            ] = 1
+            all_samples[
+                offset:offset + length,
+                offset + length,
+            ] = 1
+
+    if need_extras['enc_dec_mask'][0] or need_extras['enc_dec_mask'][1]:
+        all_samples = samples_dict['enc_dec_mask']
+        if need_extras['enc_dec_mask'][0]:
+            all_samples[
+                prev_len_dec + len_dec,
+                prev_len:prev_len + len_enc,
+            ] = 1
+        elif need_extras['enc_dec_mask'][1]:
+            all_samples[
+                prev_len_dec:prev_len_dec + len_dec,
+                prev_len + len_enc,
+            ] = 1
+    samples_dict['truncated'] += result_sample['truncated']
+
+    if eos_added['text_enc']:
+        len_enc += 1
+    if eos_added['text_dec']:
+        len_dec += 1
+
+    return len_enc, len_dec
+
+
+def add_final_padding(samples_dict, prev_len, prev_len_dec, pad_id):
+    samples_dict['text_enc'][prev_len:] = pad_id
+    samples_dict['text_dec'][prev_len_dec:] = pad_id
+    samples_dict['labels'][prev_len_dec:] = -1
