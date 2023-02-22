@@ -269,12 +269,15 @@ class GPTDataset(torch.utils.data.Dataset):
         return self.sample_idx.shape[0] - 1
 
     def __getitem__(self, idx):
-        return get_sample(self.indexed_dataset, self.doc_idx,
-                            self.sample_idx, self.shuffle_idx,
-                            idx, self.return_doc_ids)
+        samples = get_samples(self.indexed_dataset, self.doc_idx,
+                              self.sample_idx, self.shuffle_idx,
+                              idx, self.return_doc_ids)
+        text = np.concatenate(samples['text'])
+        samples['text'] = np.array(text, dtype=np.int64)
+        return samples
 
 
-def get_sample(
+def get_samples(
         indexed_dataset,
         doc_idx,
         sample_idx,
@@ -296,6 +299,7 @@ def get_sample(
         sample = indexed_dataset.get(doc_idx[doc_index_f],
                                      offset=offset_f,
                                      length=offset_l - offset_f + 1)
+        sample_list = [sample]
     else:
         # Otherwise, get the rest of the initial document.
         doc_ids.append(doc_idx[doc_index_f])
@@ -310,13 +314,12 @@ def get_sample(
         sample_list.append(indexed_dataset.get(
             doc_idx[doc_index_l],
             length=offset_l + 1))
-        sample = np.concatenate(sample_list)
 
     if return_doc_ids: # for retro preprocessing
-        return {'text': np.array(sample, dtype=np.int64),
+        return {'text': sample_list,
                 'doc_ids': np.array(doc_ids, dtype=np.int64)}
     else:
-        return {'text': np.array(sample, dtype=np.int64)}
+        return {'text': sample_list}
 
 
 def build_index_mappings(name, data_prefix, documents, sizes,
