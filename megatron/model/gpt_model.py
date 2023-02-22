@@ -74,13 +74,17 @@ class GPTModel(MegatronModule):
         """See megatron.model.transformer.set_input_tensor()"""
         self.language_model.set_input_tensor(input_tensor)
 
-    def forward(self, input_ids, position_ids, attention_mask, labels=None,
-                tokentype_ids=None, inference_params=None):
+    def forward(self, input_ids, position_ids, attention_mask,
+                ret_input_ids=None, ret_position_ids=None, ret_attn_mask=None,
+                labels=None, tokentype_ids=None, inference_params=None):
 
         lm_output = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
+            ret_input_ids=ret_input_ids,
+            ret_position_ids=ret_position_ids,
+            ret_attn_mask=ret_attn_mask,
             inference_params=inference_params)
 
         if self.post_process:

@@ -244,6 +244,7 @@ def forward_backward_no_pipelining(forward_step_func,
     output_tensor = forward_step(forward_step_func, data_iterator,
                                  model, input_tensor, forward_data_store,
                                  timers, collect_non_loss_data)
+
     if not forward_only:
         backward_step(optimizer, input_tensor, output_tensor,
                       output_tensor_grad, timers)

@@ -16,6 +16,7 @@ from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
 
+
 def bert_extended_attention_mask(attention_mask):
     # We create a 3D attention mask from a 2D tensor mask.
     # [b, 1, s]
@@ -137,6 +138,10 @@ class BertModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
 
+        self.return_embeddings = args.output_bert_embeddings
+        if self.return_embeddings:
+            assert self.post_process and self.add_binary_head
+
         init_method = init_method_normal(args.init_method_std)
         scaled_init_method = scaled_init_method_normal(args.init_method_std,
                                                        args.num_layers)
@@ -182,6 +187,24 @@ class BertModel(MegatronModule):
 
         if self.post_process and self.add_binary_head:
             lm_output, pooled_output = lm_output
+
+            # Return pooled output (e.g., when computing Bert embeddings).
+            if self.return_embeddings:
+
+                # Sum attention mask.
+                embeddings = torch.transpose(lm_output, 0, 1)
+                masks = torch.sum(attention_mask, dim=1)
+
+                # Collect masked embeddings.
+                output = torch.zeros(
+                    size=(embeddings.shape[0], embeddings.shape[2]),
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device())
+                for i, (embedding, mask) in enumerate(zip(embeddings, masks)):
+                    output[i, :] = torch.mean(embedding[1: mask - 1], dim=0)
+
+                return output
+
         else:
             pooled_output = None
 

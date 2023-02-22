@@ -3,9 +3,14 @@
 """Megatron arguments."""
 
 import argparse
+import json
 import os
-
 import torch
+import types
+
+from megatron.global_vars import set_retro_args, get_retro_args
+from tools.retro.utils import get_args_path as get_retro_args_path
+
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -29,6 +34,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
+    parser = _add_retro_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -333,7 +339,6 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
@@ -344,15 +349,31 @@ def validate_args(args, defaults={}):
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
+    # Load retro args.
+    if args.retro_workdir:
+        retro_args_path = get_retro_args_path(args.retro_workdir)
+        if os.path.exists(retro_args_path):
+            with open(retro_args_path) as f:
+                retro_args = types.SimpleNamespace(**json.load(f))
+                retro_args.retro_return_doc_ids = args.retro_return_doc_ids
+                retro_args.retro_gpt_retrieved_length = \
+                    args.retro_num_retrieved_chunks * \
+                    retro_args.retro_gpt_chunk_length
+                set_retro_args(retro_args)
 
-    _print_args(args)
+    # Print arguments.
+    _print_args("arguments", args)
+    retro_args = get_retro_args()
+    if retro_args and args != retro_args:
+        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
+
     return args
 
 
-def _print_args(args):
+def _print_args(title, args):
     """Print arguments."""
     if args.rank == 0:
-        print('------------------------ arguments ------------------------',
+        print(f'------------------------ {title} ------------------------',
               flush=True)
         str_list = []
         for arg in vars(args):
@@ -360,7 +381,7 @@ def _print_args(args):
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
-        print('-------------------- end of arguments ---------------------',
+        print(f'-------------------- end of {title} ---------------------',
               flush=True)
 
 
@@ -403,15 +424,67 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
-    
     group.add_argument('--max-tokens-to-oom',
                        type=int, default=12000,
                        help='Maximum number of tokens during inference'
                        'tokens here is # in prompt + # to generate'
                        'Allows us to throw an error before OOM crashes server')
+    group.add_argument('--output-bert-embeddings', action='store_true',
+                       help='Output Bert embeddings (via mean pooling) from '
+                       'model, rather than its binary head output or entire '
+                       'hidden batch.')
+    group.add_argument('--bert-embedder-type', default="megatron",
+                       choices=["megatron", "huggingface"],
+                       help='Select either Megatron or Huggingface as the '
+                       'Bert embedder.')
+
     return parser
 
-    
+
+def _add_retro_args(parser):
+    group = parser.add_argument_group(title='retro')
+
+    group.add_argument('--retro-workdir', default=None,
+                       help='Retro working directory, which contains the '
+                       'preprocessed data for for pretraining. This directory '
+                       'is built during preprocessing (see '
+                       'tools/retro/README.md), and contains subdirectories '
+                       'for the chunk database and pretraining neighbors.')
+    group.add_argument('--retro-add-retriever',
+                       action='store_true', default=False,
+                       help='Add a retriever to the transformer, for use in '
+                       'pretraining a Retro model.')
+    group.add_argument('--retro-cyclic-train-iters', type=int, default=None,
+                       help='Set number of training iterations for cyclic '
+                       'Retro training.')
+    group.add_argument('--retro-encoder-layers', type=int, default=2,
+                       help='Number of layers to use for the retrieval '
+                       'encoder.')
+    group.add_argument('--retro-encoder-hidden-dropout',
+                       type=float, default=0.1, help='Hidden dropout for '
+                       'retrieval encoder.')
+    group.add_argument('--retro-encoder-attention-dropout',
+                       type=float, default=0.1, help='Attention dropout for '
+                       'retrieval encoder.')
+    group.add_argument("--retro-num-neighbors", type=int, default=2,
+                       help='Number of neighbors to retrieve during '
+                       'pretraining.')
+    group.add_argument("--retro-num-retrieved-chunks", type=int, default=2,
+                       help='Number of chunks to retrieve from the retrieval '
+                       'database.')
+    group.add_argument("--retro-return-doc-ids", action="store_true",
+                       help="Turn this on when preprocessing retro data.")
+
+    # Enforce argument naming convention.
+    for action in group._group_actions:
+        prefix = action.dest.split("_")[0]
+        assert prefix == "retro", \
+            "Retro args must be prefixed with '--retro-*', for consistent " \
+            "styling. Please fix '%s'." % ", ".join(action.option_strings)
+
+    return parser
+
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
@@ -775,6 +848,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-checkpoint-args', action='store_true',
                        help='Override any command line arguments with arguments '
                        'from the checkpoint')
+    group.add_argument('--exit-on-missing-checkpoint', action='store_true',
+                       help="If '--load' is set, but checkpoint is not found "
+                       "(e.g., path typo), then exit instead of random "
+                       "initialization.")
 
     return parser
 
@@ -835,6 +912,8 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
+    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
+                       help='Timeout minutes for torch.distributed.')
     group.add_argument('--DDP-impl', default='local',
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
