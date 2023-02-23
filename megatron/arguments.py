@@ -1371,9 +1371,10 @@ def _add_ul2_args(parser):
                        'pack different denoisers into one sample. If not '
                        'given, the same denoiser is used for all packed '
                        'samples.')
-    group.add_argument('--ul2-pack-repeat-prompt', action='store_true',
+    group.add_argument('--ul2-pack-no-repeat-prompt', action='store_false',
                        help='When `--pack-samples` is also given and '
                        '`--ul2-pack-any` is *not* given, whether to '
-                       'repeat the prompt token for each packed sample.')
+                       'repeat the prompt token for each packed sample.',
+                       dest='ul2_pack_repeat_prompt')
 
     return parser
