@@ -43,8 +43,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                  splits_string, num_epochs, max_num_samples, model_type,
                  denoiser_ratios, denoisers, mean_span_lengths,
                  mask_ratios, add_mask_tokens, pack_samples,
-                 denoiser_tokens, like_ul2r, max_seq_length,
-                 max_seq_length_dec, short_seq_prob, seed,
+                 denoiser_tokens, like_ul2r, pack_any,
+                 max_seq_length, max_seq_length_dec, short_seq_prob, seed,
                  *,
                  data_cache_path=None):
         super().__init__()
@@ -80,6 +80,7 @@ class UL2Dataset(torch.utils.data.Dataset):
         # Dataset.
         self.indexed_dataset = indexed_dataset
         self.pack_samples = pack_samples
+        self.pack_any = pack_any
 
         # Minimum number of tokens added: BOS and EOS.
         min_added_tokens = 2
@@ -263,6 +264,12 @@ class UL2Dataset(torch.utils.data.Dataset):
                     len_enc, len_dec = maybe_lens
                     prev_len_dec += len_dec
                 prev_len += len_enc
+
+                if self.pack_any:
+                    denoiser_index = np_rng.choice(
+                        np.arange(len(self.denoisers)),
+                        p=self.denoiser_ratios,
+                    )
 
             if is_decoder_only(self.model_type):
                 samples_dict['text'][prev_len:] = self.pad_id
