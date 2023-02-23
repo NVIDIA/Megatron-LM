@@ -204,6 +204,77 @@ class UL2Dataset(torch.utils.data.Dataset):
             }
         return samples_dict
 
+    def _pack_samples(self, np_rng, idx, denoiser_index):
+        samples = get_samples(
+            self.indexed_dataset, self.doc_idx,
+            self.sample_idx, self.shuffle_idx, idx, False,
+        )['text']
+        samples_dict = self._create_samples_dict()
+        prev_len = 0
+        prev_len_dec = 0
+        cls_ids = self.cls_ids
+
+        for sample in samples:
+            remaining_seq_len = self.max_seq_length - prev_len
+            seq_length = min(remaining_seq_len, len(sample))
+
+            result_sample = build_training_sample(
+                [sample], seq_length,
+                self.max_seq_length,  # needed for padding
+                self.max_seq_length_dec, self.vocab_id_list,
+                self.vocab_id_to_token_dict, cls_ids, self.sep_id,
+                self.mask_id, self.pad_id, self.model_type, denoiser_index,
+                self.denoisers, self.mean_span_lengths,
+                self.mask_ratios, self.like_ul2r, np_rng,
+                self.bos_id, self.eos_id, self.sentinel_tokens)
+            if is_decoder_only(self.model_type):
+                maybe_lens = update_samples_dict_decoder_only(
+                    samples_dict,
+                    result_sample,
+                    self.max_seq_length,
+                    prev_len,
+                    self.pad_id,
+                    self.eos_id,
+                )
+            else:
+                maybe_lens = update_samples_dict(
+                    samples_dict,
+                    result_sample,
+                    self.max_seq_length,
+                    self.max_seq_length_dec,
+                    prev_len,
+                    prev_len_dec,
+                    self.pad_id,
+                    self.eos_id,
+                )
+            if maybe_lens is None:
+                # We are exceeding our sequence length already.
+                break
+
+            if is_decoder_only(self.model_type):
+                len_enc = maybe_lens
+            else:
+                len_enc, len_dec = maybe_lens
+                prev_len_dec += len_dec
+            prev_len += len_enc
+
+            if not self.repeat_prompt and not self.pack_any:
+                cls_ids = {self.denoisers[denoiser_index]: None}
+
+            if self.pack_any:
+                denoiser_index = np_rng.choice(
+                    np.arange(len(self.denoisers)),
+                    p=self.denoiser_ratios,
+                )
+
+        if is_decoder_only(self.model_type):
+            samples_dict['text'][prev_len:] = self.pad_id
+            samples_dict['labels'][prev_len:] = -1
+        else:
+            add_final_padding(
+                samples_dict, prev_len, prev_len_dec, self.pad_id)
+        return samples_dict
+
     def __getitem__(self, idx):
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
@@ -215,74 +286,7 @@ class UL2Dataset(torch.utils.data.Dataset):
         )
 
         if self.pack_samples:
-            samples = get_samples(
-                self.indexed_dataset, self.doc_idx,
-                self.sample_idx, self.shuffle_idx, idx, False,
-            )['text']
-            samples_dict = self._create_samples_dict()
-            prev_len = 0
-            prev_len_dec = 0
-            cls_ids = self.cls_ids
-
-            for sample in samples:
-                remaining_seq_len = self.max_seq_length - prev_len
-                seq_length = min(remaining_seq_len, len(sample))
-
-                result_sample = build_training_sample(
-                    [sample], seq_length,
-                    self.max_seq_length,  # needed for padding
-                    self.max_seq_length_dec, self.vocab_id_list,
-                    self.vocab_id_to_token_dict, cls_ids, self.sep_id,
-                    self.mask_id, self.pad_id, self.model_type, denoiser_index,
-                    self.denoisers, self.mean_span_lengths,
-                    self.mask_ratios, self.like_ul2r, np_rng,
-                    self.bos_id, self.eos_id, self.sentinel_tokens)
-                if is_decoder_only(self.model_type):
-                    maybe_lens = update_samples_dict_decoder_only(
-                        samples_dict,
-                        result_sample,
-                        self.max_seq_length,
-                        prev_len,
-                        self.pad_id,
-                        self.eos_id,
-                    )
-                else:
-                    maybe_lens = update_samples_dict(
-                        samples_dict,
-                        result_sample,
-                        self.max_seq_length,
-                        self.max_seq_length_dec,
-                        prev_len,
-                        prev_len_dec,
-                        self.pad_id,
-                        self.eos_id,
-                    )
-                if maybe_lens is None:
-                    # We are exceeding our sequence length already.
-                    break
-
-                if is_decoder_only(self.model_type):
-                    len_enc = maybe_lens
-                else:
-                    len_enc, len_dec = maybe_lens
-                    prev_len_dec += len_dec
-                prev_len += len_enc
-
-                if not self.repeat_prompt and not self.pack_any:
-                    cls_ids = {self.denoisers[denoiser_index]: None}
-
-                if self.pack_any:
-                    denoiser_index = np_rng.choice(
-                        np.arange(len(self.denoisers)),
-                        p=self.denoiser_ratios,
-                    )
-
-            if is_decoder_only(self.model_type):
-                samples_dict['text'][prev_len:] = self.pad_id
-                samples_dict['labels'][prev_len:] = -1
-            else:
-                add_final_padding(
-                    samples_dict, prev_len, prev_len_dec, self.pad_id)
+            samples_dict = self._pack_samples(np_rng, idx, denoiser_index)
         else:
             start_index, end_index, seq_length = self.samples_mapping[idx]
             sample = []

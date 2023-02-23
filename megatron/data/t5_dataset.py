@@ -129,49 +129,53 @@ class T5Dataset(torch.utils.data.Dataset):
         }
         return samples_dict
 
+    def _pack_samples(self, np_rng, idx):
+        samples = get_samples(
+            self.indexed_dataset, self.doc_idx,
+            self.sample_idx, self.shuffle_idx, idx, False,
+        )['text']
+        samples_dict = self._create_samples_dict()
+        prev_len = 0
+        prev_len_dec = 0
+
+        for sample in samples:
+            remaining_seq_len = self.max_seq_length - prev_len
+            seq_length = min(remaining_seq_len, len(sample))
+
+            result_sample = build_training_sample(
+                [sample], seq_length,
+                self.max_seq_length,  # needed for padding
+                self.max_seq_length_dec, self.vocab_id_list,
+                self.vocab_id_to_token_dict, self.cls_id, self.sep_id,
+                self.mask_id, self.pad_id, self.masked_lm_prob, np_rng,
+                self.bos_id, self.eos_id, self.sentinel_tokens)
+            maybe_lens = update_samples_dict(
+                samples_dict,
+                result_sample,
+                self.max_seq_length,
+                self.max_seq_length_dec,
+                prev_len,
+                prev_len_dec,
+                self.pad_id,
+                self.eos_id,
+            )
+            if maybe_lens is None:
+                # We are exceeding our sequence length already.
+                break
+
+            len_enc, len_dec = maybe_lens
+            prev_len += len_enc
+            prev_len_dec += len_dec
+
+        add_final_padding(samples_dict, prev_len, prev_len_dec, self.pad_id)
+        return samples_dict
+
     def __getitem__(self, idx):
         # Note that this rng state should be numpy and not python since
         # python randint is inclusive whereas the numpy one is exclusive.
         np_rng = np.random.RandomState(seed=(self.seed + idx))
         if self.pack_samples:
-            samples = get_samples(
-                self.indexed_dataset, self.doc_idx,
-                self.sample_idx, self.shuffle_idx, idx, False,
-            )['text']
-            samples_dict = self._create_samples_dict()
-            prev_len = 0
-            prev_len_dec = 0
-            for sample in samples:
-                remaining_seq_len = self.max_seq_length - prev_len
-                seq_length = min(remaining_seq_len, len(sample))
-
-                result_sample = build_training_sample(
-                    [sample], seq_length,
-                    self.max_seq_length,  # needed for padding
-                    self.max_seq_length_dec, self.vocab_id_list,
-                    self.vocab_id_to_token_dict, self.cls_id, self.sep_id,
-                    self.mask_id, self.pad_id, self.masked_lm_prob, np_rng,
-                    self.bos_id, self.eos_id, self.sentinel_tokens)
-                maybe_lens = update_samples_dict(
-                    samples_dict,
-                    result_sample,
-                    self.max_seq_length,
-                    self.max_seq_length_dec,
-                    prev_len,
-                    prev_len_dec,
-                    self.pad_id,
-                    self.eos_id,
-                )
-                if maybe_lens is None:
-                    # We are exceeding our sequence length already.
-                    break
-
-                len_enc, len_dec = maybe_lens
-                prev_len += len_enc
-                prev_len_dec += len_dec
-
-            add_final_padding(
-                samples_dict, prev_len, prev_len_dec, self.pad_id)
+            samples_dict = self._pack_samples(np_rng, idx)
         else:
             start_index, end_index, seq_length = self.samples_mapping[idx]
             sample = []
