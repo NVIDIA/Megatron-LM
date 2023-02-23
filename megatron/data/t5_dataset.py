@@ -399,23 +399,18 @@ def make_history_mask_3d(block):
 
 def _remove_padding(result_sample, pad_id):
     # Remove padding
-    padding_length = (
-        len(result_sample['text_enc'])
-        - np.argmax(result_sample['text_enc'] == pad_id)
-    )
-    padding_length_dec = (
-        len(result_sample['text_dec'])
-        - np.argmax(result_sample['text_dec'] == pad_id)
-    )
-    result_sample['text_enc'] = result_sample['text_enc'][:padding_length]
+    padding_start = np.argmax(result_sample['text_enc'] == pad_id)
+    padding_start_dec = np.argmax(result_sample['text_dec'] == pad_id)
+
+    result_sample['text_enc'] = result_sample['text_enc'][:padding_start]
     for key in ['text_dec', 'labels', 'loss_mask']:
-        result_sample[key] = result_sample[key][:padding_length_dec]
+        result_sample[key] = result_sample[key][:padding_start_dec]
     result_sample['enc_mask'] = \
-        result_sample['enc_mask'][:padding_length, :padding_length]
+        result_sample['enc_mask'][:padding_start, :padding_start]
     result_sample['enc_dec_mask'] = \
-        result_sample['enc_dec_mask'][:padding_length_dec, :padding_length]
+        result_sample['enc_dec_mask'][:padding_start_dec, :padding_start]
     result_sample['dec_mask'] = \
-        result_sample['dec_mask'][:padding_length_dec, :padding_length_dec]
+        result_sample['dec_mask'][:padding_start_dec, :padding_start_dec]
 
 
 def get_lens(key, prev_len, prev_len_dec, len_enc, len_dec):

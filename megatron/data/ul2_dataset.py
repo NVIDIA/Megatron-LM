@@ -475,15 +475,12 @@ def build_training_sample(sample, target_seq_length,
 
 def _remove_padding(result_sample, pad_id):
     # Remove padding
-    padding_length = (
-        len(result_sample['text'])
-        - np.argmax(result_sample['text'] == pad_id)
-    )
-    result_sample['text'] = result_sample['text'][:padding_length]
+    padding_start = np.argmax(result_sample['text'] == pad_id)
+    result_sample['text'] = result_sample['text'][:padding_start]
     for key in ['labels', 'loss_mask']:
-        result_sample[key] = result_sample[key][:padding_length]
+        result_sample[key] = result_sample[key][:padding_start]
     result_sample['dec_mask'] = \
-        result_sample['dec_mask'][:padding_length, :padding_length]
+        result_sample['dec_mask'][:padding_start, :padding_start]
 
 
 def update_samples_dict_decoder_only(
