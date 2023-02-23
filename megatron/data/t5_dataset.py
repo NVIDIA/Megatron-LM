@@ -142,7 +142,9 @@ class T5Dataset(torch.utils.data.Dataset):
             prev_len = 0
             prev_len_dec = 0
             for sample in samples:
-                seq_length = len(sample)
+                remaining_seq_len = self.max_seq_length - prev_len
+                seq_length = min(remaining_seq_len, len(sample))
+
                 result_sample = build_training_sample(
                     [sample], seq_length,
                     self.max_seq_length,  # needed for padding
