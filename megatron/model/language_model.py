@@ -442,7 +442,9 @@ class TransformerLanguageModel(MegatronModule):
                     args.hidden_size,
                     args.padded_vocab_size,
                     bias=False, # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
-                    init_method=self.init_method)
+                    init_method=self.init_method,
+                    use_cpu_initialization=args.use_cpu_initialization,
+                    perform_initialization=args.perform_initialization)
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):

@@ -300,6 +300,10 @@ def set_pipeline_model_parallel_world_size(world_size):
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
+def set_virtual_pipeline_model_parallel_world_size(world_size):
+    """Set the pipeline model parallel size"""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
