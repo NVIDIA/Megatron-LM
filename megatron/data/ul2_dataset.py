@@ -420,7 +420,7 @@ def build_training_sample(sample, target_seq_length,
             tokens, masked_spans, bos_id, eos_id, sentinel_tokens, prefix_lm)
 
         # Move EOS tokens to end of sequence.
-        while tokens_enc[-1] == eos_id:
+        while tokens_enc and tokens_enc[-1] == eos_id:
             del tokens_enc[-1]
             tokens_dec_in.append(eos_id)
             labels.append(eos_id)
