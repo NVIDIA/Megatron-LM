@@ -20,8 +20,7 @@ TOKENIZER_FILE=/tokenizer/path  # Adjust
 GPT_ARGS="\
        --tensor-model-parallel-size 1 \
        --pipeline-model-parallel-size 1 \
-       --recompute-granularity full \
-       --recompute-method uniform \
+       --recompute-activations \
 --num-layers 24 \
 --hidden-size 2048 \
 --num-attention-heads 16 \
@@ -37,7 +36,7 @@ GPT_ARGS="\
 --train-iters 3000 \
 --lr-decay-iters 600000 \
 --lr-decay-style cosine \
---lr-warmup-iters 175 \
+--lr-warmup-fraction 0.02 \
 --weight-decay .1 \
 --adam-beta2 .95 \
 --clip-grad 1.0 \
@@ -46,6 +45,8 @@ GPT_ARGS="\
        --save-interval 4000 \
        --eval-interval 200 \
        --eval-iters 10 \
+--initial-loss-scale 65536 \
+--fim-rate 0.5 \
 "
 
 TENSORBOARD_ARGS="--tensorboard-dir ${CHECKPOINT_PATH}/tensorboard"
