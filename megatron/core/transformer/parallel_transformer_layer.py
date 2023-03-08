@@ -100,6 +100,7 @@ class ParallelTransformerLayer(MegatronModule):
         else:
             bias_dropout_add_func = get_bias_dropout_add(self.training)
 
+        # bias_dropout_add fusion returning fp32 instead of bf16
         with self.bias_dropout_add_exec_handler():
             layernorm_input = bias_dropout_add_func(
                 attention_output, attention_bias.expand_as(residual), residual, self.config.hidden_dropout
