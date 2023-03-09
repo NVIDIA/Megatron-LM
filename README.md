@@ -338,7 +338,7 @@ python tools/checkpoint_util.py \
         --load-dir checkpoints/gpt3_tp4_pp4 \
         --save-dir checkpoints/gpt3_tp2_pp2 \
         --target-tensor-parallel-size 2 \
-        --target-pipeline-paralle-size 2
+        --target-pipeline-parallel-size 2
 
 </pre>
 
@@ -351,7 +351,7 @@ We have included a simple REST server to use for text generation in `tools/run_t
 Once the server is running you can use `tools/text_generation_cli.py` to query it, it takes one argument which is the host the server is running on.
 
 <pre>
-tools/text_generation_cli.py localhost
+tools/text_generation_cli.py localhost:5000
 </pre>
 
 You can also use CURL or any other tools to query the server directly:
