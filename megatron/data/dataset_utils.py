@@ -41,8 +41,7 @@ DSET_TYPE_T5  = 't5'
 DSET_TYPES = [DSET_TYPE_BERT, DSET_TYPE_ICT, DSET_TYPE_T5]
 
 
-def get_datasets_weights_and_num_samples(data_prefix,
-                                         train_valid_test_num_samples):
+def analyze_data_prefix(data_prefix):
 
     # The data prefix should be in the format of:
     #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
@@ -59,10 +58,16 @@ def get_datasets_weights_and_num_samples(data_prefix,
         weight_sum += weight
     assert weight_sum > 0.0
     weights = [weight / weight_sum for weight in weights]
+    return prefixes, weights
 
-    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+
+def get_datasets_weights_and_num_samples(data_prefix,
+                                         train_valid_test_num_samples):
+
+    # Add 0.5% (the 1.005 factor) so in case the blending dataset does
     # not uniformly distribute the number of samples, we still have
     # samples left to feed to the network.
+    prefixes, weights = analyze_data_prefix(data_prefix)
     datasets_train_valid_test_num_samples = []
     for weight in weights:
         datasets_train_valid_test_num_samples.append(
@@ -601,6 +606,22 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
         indexed_dataset.sizes.shape[0]))
 
     return indexed_dataset
+
+
+def get_split_by_range_(range_string, size):
+    """ Get dataset splits based on a range:
+    range_string is in the form  START%:END%  for e.g. 0.2:0.8
+    outputs an array of two values [start_index, end_index]
+    """
+    # some checks that range is given in the correct form
+    splits = [float(i) for i in range_string.split(":")]
+    assert len(splits) == 2, "splits should be passed as start:end"
+    assert splits[0] <= 1 and splits[1] <= 1
+    splits_sum = sum(splits)
+    assert splits_sum > 0.0
+    splits_index = [round(s * float(size)) for s in splits]
+    assert len(splits_index) == 2
+    return splits_index
 
 
 def get_train_valid_test_split_(splits_string, size):
