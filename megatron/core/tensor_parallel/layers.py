@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
+from torch.cuda.amp import custom_fwd, custom_bwd
+
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -214,6 +216,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
     @staticmethod
+    @custom_fwd
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
                 async_grad_allreduce, sequence_parallel):
         ctx.save_for_backward(input, weight)
@@ -243,6 +246,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         return output
 
     @staticmethod
+    @custom_bwd
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
@@ -402,8 +406,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                     "maximum speedup")
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
-    with torch.cuda.amp.autocast(enabled=False):
-        return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+    return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 class ColumnParallelLinear(torch.nn.Module):

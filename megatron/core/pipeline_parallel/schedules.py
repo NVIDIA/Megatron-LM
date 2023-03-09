@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Optional, List, Union, Callable, Any
 
 import torch
@@ -184,7 +184,9 @@ def forward_step(forward_step_func,
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
 
-    output_tensor, loss_func = forward_step_func(data_iterator, model)
+    context_manager = torch.autocast("cuda") if torch.is_autocast_enabled() else nullcontext()
+    with context_manager:
+        output_tensor, loss_func = forward_step_func(data_iterator, model)
 
     if parallel_state.is_pipeline_last_stage():
         if not collect_non_loss_data:
