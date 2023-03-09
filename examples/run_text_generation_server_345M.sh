@@ -10,9 +10,11 @@ CHECKPOINT=<Path to checkpoint (e.g /345m)>
 VOCAB_FILE=<Path to vocab.json (e.g. /gpt2-vocab.json)>
 MERGE_FILE=<Path to merges.txt (e.g. /gpt2-merges.txt)>
 
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 pip install flask-restful
 
-python -m torch.distributed.run $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
+torchrun $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
        --tensor-model-parallel-size 1  \
        --pipeline-model-parallel-size 1  \
        --num-layers 24  \
