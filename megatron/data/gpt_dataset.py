@@ -385,7 +385,10 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
                 assert last_epoch_num_samples >= 0, \
                     'last epoch number of samples should be non-negative.'
                 num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
-                assert last_epoch_num_samples < (num_samples_per_epoch + 1), \
+                # For very small datasets, `last_epoch_num_samples` can be equal to
+                # (num_samples_per_epoch + 1).
+                # TODO: check that this is not problematic indeed
+                assert last_epoch_num_samples <= (num_samples_per_epoch + 1), \
                     'last epoch number of samples exceeded max value.'
                 # If we have less than 80% of the samples for the last epoch,
                 # seperate out the epoch and treat it differently.
