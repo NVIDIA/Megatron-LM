@@ -120,6 +120,10 @@ def build_dataset_group(dataset_group_name, paths, weights, splits, data_impl,
                                         seed, skip_warmup,
                                         dataset_group_name, train_valid_test)
 
+            # ds can be none if the dataset is so small that not a single document
+            # is present in the split.
+            assert ds is not None, \
+                f"Got an empty split when trying to create dataset: {prefixes[i], splits[i]}"
             datasets.append(ds)
         all_datasets = BlendableDataset(datasets, weights)
 
