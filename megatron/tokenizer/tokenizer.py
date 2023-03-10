@@ -23,10 +23,10 @@ from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 
-FIM_PREFIX = "<fim-prefix>"
-FIM_MIDDLE = "<fim-middle>"
-FIM_SUFFIX = "<fim-suffix>"
-FIM_PAD = "<fim-pad>"
+FIM_PREFIX = "<fim_prefix>"
+FIM_MIDDLE = "<fim_middle>"
+FIM_SUFFIX = "<fim_suffix>"
+FIM_PAD = "<fim_pad>"
 EOD = "<|endoftext|>"
 
 
