@@ -247,6 +247,11 @@ class GPTDataset(torch.utils.data.Dataset):
         self.args = get_args()
         self.tokenizer = get_tokenizer()
         self.np_rng = np.random.RandomState(seed=seed) # rng state for FIM
+        
+        try:
+            self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
+        except KeyError:
+            self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.vocab[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
@@ -294,11 +299,6 @@ class GPTDataset(torch.utils.data.Dataset):
             assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
 
             eod = self.tokenizer.eod
-            try:
-                pad = self.tokenizer.special_tokens[FIM_PAD]
-            except KeyError:
-                pad = self.tokenizer.vocab[FIM_PAD]
-
             segment_breaks = np.argwhere(sample == eod) # split sample by document
 
             if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
@@ -309,25 +309,28 @@ class GPTDataset(torch.utils.data.Dataset):
                     if loc - curr_start_position > 0:
                         # permute {prefix, suffix, middle} or {suffix, prefix, middle}
                         permuted, self.np_rng = \
-                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
+                                    suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
                         new_samples += [permuted, [eod]]
 
                     curr_start_position = loc + 1 # jump over the EOD token
                 # Permute the segment after the last EOD
                 permuted, self.np_rng = \
-                    permute(sample[curr_start_position:], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                    permute(sample[curr_start_position:], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
+                            suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
                 new_samples.append(permuted)
 
                 sample = np.concatenate(new_samples)
             else:
-                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer, truncate_or_pad=False)
+                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
+                                              suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
         
         # Truncate or pad sequence to max-length
         diff = sample.shape[0] - sample_len
         if diff > 0: # too long
             sample = sample[:sample_len]
         elif diff < 0: # too short
-            sample = np.concatenate([sample, np.full((-1 * diff), pad)])
+            sample = np.concatenate([sample, np.full((-1 * diff), self.pad_tok_id)])
 
         assert sample.shape[0] == sample_len
         # end FIM-specific code
@@ -583,17 +586,14 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
 
 
 # From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
-def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True):
+def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True,
+            suffix_tok_id=None, prefix_tok_id=None, middle_tok_id=None, pad_tok_id=None):
     """
     Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
     Maintain the same sample length (if transform creates a few extra tokens, drop them).
     """
     fim_rate = args.fim_rate
 
-    try:
-        suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
-    except KeyError:
-        suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id = (tokenizer.vocab[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
     if np_rng.binomial(1, fim_rate): # sample bernoulli dist
 
         contents = tokenizer.detokenize(sample)
