@@ -9,7 +9,8 @@ variables: &VARS
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
   PYTORCH_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels, ci job names etc as a space seperated list to run during merge request
+  TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
+  TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
   TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
   TEST_REGEX_ON_THIS_COMMIT: NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
@@ -69,6 +70,8 @@ unit_tests:
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
+    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always      
   allow_failure: false
 
 .selene_test_launcher: &selene-test-launcher
@@ -77,6 +80,7 @@ unit_tests:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene test"
+    - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
@@ -117,6 +121,8 @@ unit_tests:
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
+    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always      
   allow_failure: false
     
 train.gpt3.345m_tp4_pp1_1node_50steps:
