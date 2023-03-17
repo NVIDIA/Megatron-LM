@@ -34,6 +34,7 @@ class GPTModel(MegatronModule):
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = True,
     ):
         super(GPTModel, self).__init__(config=config)
 
@@ -44,6 +45,7 @@ class GPTModel(MegatronModule):
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         # Embeddings.
         if self.pre_process:
@@ -199,7 +201,29 @@ class GPTModel(MegatronModule):
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True) and self.pre_process:
             self.embedding.zero_parameters()
 
-        if not torch.distributed.is_initialized():
+        self.sync_initial_word_embeddings()
+
+    def word_embeddings_weight(self):
+        if self.pre_process:
+            return self.embedding.word_embeddings.weight
+        else:
+            if not self.share_embeddings_and_output_weights:
+                raise Exception(
+                    'word_embeddings_weight() called for last '
+                    'stage, but share_embeddings_and_output_weights is false'
+                )
+            return self.word_embeddings.weight
+
+    def sync_initial_word_embeddings(self):
+
+        # Ensure that first and last stages have the same initial parameter
+        # values.
+        if torch.distributed.is_initialized():
+            if parallel_state.is_rank_in_embedding_group():
+                torch.distributed.all_reduce(
+                    self.word_embeddings_weight().data, group=parallel_state.get_embedding_group()
+                )
+        else:
             # TODO: this should be log not print
             if not getattr(MegatronModule, "embedding_warning_printed", False):
                 print(
@@ -211,23 +235,6 @@ class GPTModel(MegatronModule):
                 )
                 MegatronModule.embedding_warning_printed = True
             return
-
-        # Ensure that first and last stages have the same initial parameter
-        # values.
-        if parallel_state.is_rank_in_embedding_group():
-            torch.distributed.all_reduce(
-                self.word_embeddings_weight().data, group=parallel_state.get_embedding_group()
-            )
-
-    def word_embeddings_weight(self):
-        if self.pre_process:
-            return self.embedding.word_embeddings.weight
-        else:
-            if not self.share_word_embeddings:
-                raise Exception(
-                    'word_embeddings_weight() called for last ' 'stage, but share_word_embeddings is false'
-                )
-            return self.word_embeddings.weight
 
     # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
