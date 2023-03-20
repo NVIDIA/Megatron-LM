@@ -2,9 +2,13 @@
 
 import enum
 
-# class ModelType(enum.Enum):
-#     encoder_or_decoder = 1
-#     encoder_and_decoder = 2
+
+# can we get rid of this?
+# it's being used in pipeline schedules
+class ModelType(enum.Enum):
+    encoder_or_decoder = 1
+    encoder_and_decoder = 2
+
 
 # class LayerType(enum.Enum):
 #     encoder = 1

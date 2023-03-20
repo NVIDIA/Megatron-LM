@@ -8,7 +8,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.parallel_transformer_block import ParallelTransformerBlock
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 
 
@@ -46,6 +46,9 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
+        # megatron core pipelining currently depends on model type
+        self.model_type = ModelType.encoder_or_decoder
 
         # Embeddings.
         if self.pre_process:
