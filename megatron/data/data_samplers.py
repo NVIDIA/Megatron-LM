@@ -24,7 +24,7 @@ from megatron import get_args
 from megatron import mpu
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
+def build_pretraining_data_loader(dataset, consumed_samples, num_workers=None):
     """Buld dataloader given an input dataset."""
 
     if dataset is None:
@@ -52,10 +52,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         raise Exception('{} dataloader type is not supported.'.format(
                 args.dataloader_type))
 
+    num_workers = args.num_workers if num_workers is None else num_workers
     # Torch dataloader.
     return torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
-                                       num_workers=args.num_workers,
+                                       num_workers=num_workers,
                                        pin_memory=True)
 
 class MegatronPretrainingSampler:
