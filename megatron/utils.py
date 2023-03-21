@@ -250,14 +250,17 @@ def get_tflops(batch_size, elapsed_time_per_iteration):
         coefficient_h_squared += 8 
 
     # In MultiQuery attention, keys and values are shared across heads
-    # qkv projection: 6Bsh^2 -> 4Bsh^2 + 4Bsd_kv
+    # qkv projection: 6Bsh^2 -> 2Bsh^2 + 4Bshd_kv
     # The formula in https://arxiv.org/pdf/2104.04473.pdf becomes:
-    # 4 * (20 Bsh^2 + 4Bsd_kv + 4Bs^2h) = 4*20*Bsh^2 (1 + (d_kv+s)/5h)
+    # 4 * (20 Bsh^2 + 4Bshd_kv + 4Bs^2h) = 4*20*Bsh^2 (1 + (d_kv+s)/5h)
     if args.attention_head_type == 'multiquery':
         coefficient_h_squared -= 4 # We substract 4 because of shared kv projection
 
-    flops_per_iteration = (coefficient_h_squared * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) 
-    flops_per_iteration += (4 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (seq_len / hidden_size) 
+    # Feed-forward and projections
+    flops_per_iteration = (coefficient_h_squared * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2))
+    # Attention-matrix computation
+    flops_per_iteration += (4 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (seq_len / hidden_size)
+    # LM-head
     flops_per_iteration += (6 * batch_size * seq_len * num_layers * (hidden_size**2)) * (vocab_size / (num_layers * hidden_size))
 
     if args.attention_head_type == 'multiquery':
