@@ -210,9 +210,7 @@ class ParallelTransformerBlock(MegatronModule):
             if self.config.recompute_granularity == 'full':
                 hidden_states = self._checkpointed_forward(hidden_states=hidden_states, attention_mask=attention_mask)
             else:
-                for index in range(self.num_layers_per_pipeline_rank):
-                    layer = self._get_layer(index)
-
+                for layer in self.layers:
                     hidden_states = layer(hidden_states=hidden_states, attention_mask=attention_mask)
 
         # Final layer norm.

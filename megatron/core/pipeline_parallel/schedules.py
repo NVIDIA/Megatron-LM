@@ -591,7 +591,7 @@ def forward_backward_pipelining_with_interleaving(*,
     if not forward_only:
         if all_warmup_microbatches:
             output_tensor_grads[num_model_chunks-1].append(
-                p2p_communication.recv_backward(tensor_shape, timers=timers))
+                p2p_communication.recv_backward(tensor_shape, dtype, timers=timers))
         for k in range(num_microbatches_remaining, total_num_microbatches):
             input_tensor_grad = backward_step_helper(k)
             next_backward_model_chunk_id = get_model_chunk_id(k+1, forward=False)

@@ -64,7 +64,7 @@ class GPTModel(MegatronModule):
             post_process=self.post_process,
         )
 
-        self.initialize_word_embeddings()
+        self.initialize_last_stage_word_embeddings()
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
@@ -163,7 +163,7 @@ class GPTModel(MegatronModule):
             loss = loss.transpose(0, 1).contiguous()
             return loss
 
-    def initialize_word_embeddings(self):
+    def initialize_last_stage_word_embeddings(self):
 
         # This function just initializes the word embeddings in the final stage
         # when we are using pipeline parallelism. Nothing to do if we aren't
@@ -199,12 +199,7 @@ class GPTModel(MegatronModule):
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 
-        # Zero out initial weights for decoder embedding.
-        # NOTE: We don't currently support T5 with the interleaved schedule.
-        if not parallel_state.is_pipeline_first_stage(ignore_virtual=True) and self.pre_process:
-            self.embedding.zero_parameters()
-
-        self.sync_initial_word_embeddings()
+        self.sync_first_and_last_stage_word_embeddings()
 
     def word_embeddings_weight(self):
         if self.pre_process:
@@ -217,7 +212,7 @@ class GPTModel(MegatronModule):
                 )
             return self.word_embeddings.weight
 
-    def sync_initial_word_embeddings(self):
+    def sync_first_and_last_stage_word_embeddings(self):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
