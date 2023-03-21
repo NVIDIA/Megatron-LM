@@ -268,7 +268,8 @@ class MegatronOptimizer(ABC):
     
     def allreduce_key_value_grads(self, args):
         """
-        Reduce the gradients for the key_value weights and biases for multi-query attention.
+        Reduce the gradients for the key_value weights and biases for multi-query attention
+        with sequence parallelism.
         Coalesce the bias grads to avoid too many small reductions,
         but not the weight grads since it could cause memory issues.
         """
@@ -334,7 +335,11 @@ class MegatronOptimizer(ABC):
         timers('backward-embedding-all-reduce').stop()
 
         # All-reduce key-value grads if needed.
-        if args.attention_head_type == "multiquery":
+        if (
+            args.attention_head_type == "multiquery"
+            and mpu.get_tensor_model_parallel_world_size() > 1
+            and args.sequence_parallel
+        ):
             timers('backward-key-value-all-reduce').start()
             self.allreduce_key_value_grads(args)
             timers('backward-key-value-all-reduce').stop()

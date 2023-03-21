@@ -611,11 +611,21 @@ class ParallelAttention(MegatronModule):
              value_layer) = mpu.split_tensor_along_last_dim(mixed_x_layer, 3)
         elif self.attention_type == AttnType.self_attn and self.attention_head_type == 'multiquery':
             kv_input=hidden_states
-            if get_args().sequence_parallel:
-                # The linear layer doesn't gather the sequence-parallel.
-                kv_input = mpu.gather_from_sequence_parallel_region(kv_input, tensor_parallel_output_grad=False)
             # Attention heads [sq, b, h] --> [sq, b, (2 * hn)]
             mixed_kv_layer = self.key_value(kv_input)
+
+            # Reduce the KV gradients in the tensor-parallel direction.
+            # This is different from multi-head attention which reduces the KV input,
+            # because the sum over attn heads happens in the attn weight gradient instead of the KV layer:
+            #   A [b, n * sq, sk] = Q [b, n * sq, hn] x K^T [b, hn, sk]
+            #   G_K [b, sk, hn] = G_A [b, sk, n * sq] x Q [b, n * sq, hn]
+            #                   = sum_p (G_Ap [b, sk, np * sq] x Q_p [b, np * sq, hn])
+            if get_args().sequence_parallel:
+                # We switch to the tensor parallel regime here instead of at the KV input
+                # so that the KV layer is done in parallel instead of just duplicated.
+                mixed_kv_layer = mpu.gather_from_sequence_parallel_region(mixed_kv_layer, tensor_parallel_output_grad=True)
+            else:
+                mixed_kv_layer = mpu.copy_to_tensor_model_parallel_region(mixed_kv_layer)
 
             # [sq, b, (2 * hn)] --> [sq, b, np (expanded), 2 * hn]
             # new_tensor_shape = mixed_kv_layer.size()[:-1] + \
