@@ -242,10 +242,27 @@ def get_tflops(batch_size, elapsed_time_per_iteration):
     # The factor of 4 is when used with activation check-pointing,
     # otherwise it will be 3, but for 200B model, activation check-pointing will always be on.
     checkpoint_activations_factor = 4 if args.recompute_granularity == 'full' else 3
+    coefficient_h_squared = 24
     # GLU activations double the hidden states in the upscaling feed-forward in each transformer layer
-    # This leads to 16bsh^2 instead of 8bsh^2 per first feed-forward layer in MLP, thus we increase the coefficient by 8.
+    # This leads to 16bsh^2 instead of 8bsh^2 per first feed-forward layer in MLP, thus we increase the coefficient_h_squared by 8.
     # Refer to https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/283#issue-1260805063 for more details.
-    coefficient = 32 if args.glu_activation else 24
-    flops_per_iteration = (coefficient * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+    if args.glu_activation :
+        coefficient_h_squared += 8 
+
+    # In MultiQuery attention, keys and values are shared across heads
+    # qkv projection: 6Bsh^2 -> 4Bsh^2 + 4Bsd_kv
+    # The formula in https://arxiv.org/pdf/2104.04473.pdf becomes:
+    # 4 * (20 Bsh^2 + 4Bsd_kv + 4Bs^2h) = 4*20*Bsh^2 (1 + (d_kv+s)/5h)
+    if args.attention_head_type == 'multiquery':
+        coefficient_h_squared -= 4 # We substract 4 because of shared kv projection
+
+    flops_per_iteration = (coefficient_h_squared * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) 
+    flops_per_iteration += (4 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (seq_len / hidden_size) 
+    flops_per_iteration += (6 * batch_size * seq_len * num_layers * (hidden_size**2)) * (vocab_size / (num_layers * hidden_size))
+
+    if args.attention_head_type == 'multiquery':
+        d_kv = args.kv_channels
+        flops_per_iteration += (4 * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (d_kv / hidden_size)  # TODO: maybe tp_size factor missing here
+
     tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
     return tflops
