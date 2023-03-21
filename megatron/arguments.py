@@ -17,6 +17,7 @@
 
 import argparse
 import os
+import re
 
 import torch
 
@@ -99,6 +100,30 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
+
+    # --data-path and --train-weighted-splits-paths
+    message = "Data loading Mode 1: --data-path and --split "\
+            "and Mode 2: --(train|valid|test)-weighted-split-paths"\
+            "are mutually exclusive i.e. cannot be set together."
+
+    if args.data_path:
+        assert args.train_weighted_split_paths is None, message
+        setattr(args, "valid_weighted_split_names", None)
+        setattr(args, "valid_weighted_split_weights", None)
+        setattr(args, "valid_weighted_split_splits", None)
+
+        setattr(args, "test_weighted_split_names", None)
+        setattr(args, "test_weighted_split_weights", None)
+        setattr(args, "test_weighted_split_splits", None)
+
+        # args.split default value in the args is None it is set here in order
+        # to check that it does not to overlap with the 2nd mode of data loading
+        if args.split is None:
+            args.split = "969, 30, 1"
+
+    if args.train_weighted_split_paths or args.valid_weighted_split_paths or \
+                args.test_weighted_split_paths:
+        assert args.data_path is None and args.split is None, message
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -863,16 +888,114 @@ def _add_validation_args(parser):
 def _add_data_args(parser):
     group = parser.add_argument_group(title='data and dataloader')
 
+    # option 1 for data loading  (mutually exclusive with option2)
     group.add_argument('--data-path', nargs='*', default=None,
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
-    group.add_argument('--split', type=str, default='969, 30, 1',
+    group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
                        'validation and 5%% for test.')
+    # option 2 for data loading (mutually exclusive with option1)
+    # see https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/97/files
+
+    # helper class to parse the --xxx-weighted-split-paths
+    # note here two args are set: extra valid dataset paths and names
+    class parse_data_paths(argparse.Action):
+        def __call__(self, parser, args, values, option_string=None):
+
+            if option_string == "--train-weighted-split-paths":
+                assert len(values) == 1, 'Only 1 dataset group is allowed to'
+                'be passed for the argument --train-weighted-split-paths'
+
+            # make sure string given in the correct format
+            err_message = 'Each data group should be input on the following format'
+            '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+            'where START < END'
+            for v in values:
+                # each prefix consists several datasets separated by commas
+                prefix = ":".join(v.split(":")[1:]) # remove GIVEN_NAME
+                datasets = prefix.split(",")
+                # check if each dataset is formatted like `WEIGHT START:END PATH`
+                for d in datasets:
+                    assert len(d.split()) == 3, err_message
+                    start, end = d.split()[1].split(":")
+                    assert float(start) < float(end), err_message
+
+            names = [v.split(":")[0] for v in values]
+
+            prefixes = [":".join(v.split(":")[1:]).strip() for v in values]
+            weights = [[d.split()[0] for d in p.split(",")] for p in prefixes]
+            splits = [[d.split()[1] for d in p.split(",")] for p in prefixes]
+            paths = [[d.split()[2] for d in p.split(",")] for p in prefixes]
+
+            # # to keep consistency with Option 1 of data loading (through --data-path)
+            # #  paths will contain strings on the following form
+            # # "WEIGHTS1 PATH1 WEIGHTS2 PATH2 WEIGHTS3 PATH3" for each dataset group
+            # # while data will be parsed in additional arguments below
+            # paths_option1_style = []
+            # for p, w in zip(paths, weights):
+            #   paths_option1_style.append(" ".join([f"{w_i} {p_i}" for p_i, w_i in zip(p,w)]))
+            # setattr(args, self.dest, paths_option1_style)
+            setattr(args, self.dest, paths)
+            setattr(args, self.dest.replace("paths", "weights"), weights)
+            setattr(args, self.dest.replace("paths", "splits"), splits)
+            setattr(args, self.dest.replace("paths","names"), names)
+
+
+    group.add_argument('--train-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: ONE dataset groups could be'
+                    'submitted in the following form between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0:0.6 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    'WEIGHT is used to up and down sample each dataset A,B,C in the group'
+                    'START:END indicates the split portion of the dataset',
+                    action=parse_data_paths)
+
+    group.add_argument('--valid-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: one or many dataset groups could be'
+                    'submitted in the following form each between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0.6:0.8 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    '"NAME_CDE: 0.6 0.6:0.8 C, 0.3 0:1 D, 0.1 0:1 E" '
+                    'validation will be run on each of those groups independently',
+                    action=parse_data_paths)
+
+    group.add_argument('--test-weighted-split-paths', nargs='*', default=None,
+                    help='Weights, splits and paths to groups of datasets'
+                    'Accepted format: one or many dataset groups could be'
+                    'submitted in the following form each between double quotes'
+                    '"GIVEN_NAME WEIGHT1 START:END PATH1, WEIGHT2 START:END PATH2"'
+                    'e.g.: "NAME_ABC: 0.6 0.6:0.8 A, 0.3 0:1 B, 0.1 0:1 C" '
+                    '"NAME_CDE: 0.6 0.6:0.8 C, 0.3 0:1 D, 0.1 0:1 E" '
+                    'test will be run on each of those groups independently',
+                    action=parse_data_paths)
+
+    class parse_data_paths_path(argparse.Action):
+        def __call__(self, parser, args, values, option_string=None):
+            expected_option_strings = ["--train-weighted-split-paths-path", "--valid-weighted-split-paths-path", "--test-weighted-split-paths-path"]
+            assert option_string in expected_option_strings, f"Expected {option_string} to be in {expected_option_strings}"
+
+            with open(values, "r") as fi:
+                lines = fi.readlines()
+                assert len(lines) == 1, f"Got multiple lines {len(lines)} instead of 1 expected"
+                assert lines[0][-2:] == "\"\n" and lines[0][0] == "\"", f"Invalid input format, got {lines}"
+                values = lines[0][1:-2].split("\" \"")
+                weighted_split_paths_dest = re.sub(r"_path$", "", self.dest)
+                weighted_split_paths_option = re.sub(r"-path$", "", self.option_strings[0])
+                setattr(args, weighted_split_paths_dest, values)
+                parse_data_paths(option_strings=[weighted_split_paths_option], dest=weighted_split_paths_dest)(parser, args, values, option_string=weighted_split_paths_option)
+
+    # option 2-bis: load x-weighted-split-paths from a file in case this argument is very long
+    group.add_argument('--train-weighted-split-paths-path', type=str, action=parse_data_paths_path ,default=None)
+    group.add_argument('--valid-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
+    group.add_argument('--test-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
+
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -903,6 +1026,8 @@ def _add_data_args(parser):
                        help='Warm up mmap files.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
+    group.add_argument('--valid-num-workers', type=int, default=2,
+                       help="Dataloader number of workers for validation.")
     group.add_argument('--tokenizer-type', type=str,
                        default=None,
                        choices=['BertWordPieceLowerCase',

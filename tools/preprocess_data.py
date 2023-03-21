@@ -105,6 +105,8 @@ def get_args():
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
+    group.add_argument('--subset', type=str, default=None,
+                       help='Subset argument when loading input data from a HuggingFace dataset')
     group.add_argument('--json-keys', nargs='+', default=['text'],
                        help='space separate listed of keys to extract from json')
     group.add_argument('--split-sentences', action='store_true',
@@ -170,12 +172,17 @@ def main():
 
     if args.input.endswith(".jsonl"):
         print("Input is a jsonl file")
+        assert args.subset is None, f"subset argument set to: {args.subset}, but loading a jsonl file."
         fin = open(args.input, 'r', encoding='utf-8')
         encoded_docs = pool.imap(encoder.encode, fin, args.chunk_size)
         #encoded_docs = map(encoder.encode, fin)
     else:
+        # NOTE: this is not recommended for datasets larger than 40-50GB, as iterating through a dataset can be slow.
+        # Somehow, it seems faster to first dump the dataset to a jsonl file: ds.to_json() and then process the jsonl file.
+        # NOTE: this will be even slower if the dataset has large objects in other columns.
+        # In this case, it is recommended to dump as json only the required key: ds = ds.remove_columns(...) then to_json()
         print("Input is not a jsonl file, will try to load from HF datasets")
-        ds = load_dataset(args.input, use_auth_token=True, streaming=True, split="train")
+        ds = load_dataset(args.input, use_auth_token=True, streaming=True, split="train", data_dir=args.subset)
         encoded_docs = pool.imap(encoder.encode_hf, ds, args.chunk_size)
 
     level = "document"
