@@ -90,6 +90,9 @@ unit_tests:
     - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
     - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
     - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
     - export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
     - export LOGS_DIR=$BASE_DIR/logs
     - export RESULTS_DIR=$BASE_DIR/results
