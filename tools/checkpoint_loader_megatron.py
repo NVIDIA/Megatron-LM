@@ -78,6 +78,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
     check_for_arg('params_dtype')
+    check_for_arg('attention_head_type')
 
     # Determine how to make our models
     if args.model_type == 'GPT':
@@ -147,6 +148,7 @@ def _load_checkpoint(queue, args):
     # metadata
     md = types.SimpleNamespace()
     md.model_type = args.model_type
+    md.attention_head_type = margs.attention_head_type
     md.num_layers = margs.num_layers
     md.hidden_size = margs.hidden_size
     md.seq_length = margs.seq_length
@@ -202,26 +204,40 @@ def _load_checkpoint(queue, args):
             message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
             message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
             message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
+            if margs.attention_head_type == "multiquery":
+                # MQA: kv is shared across tp-ranks
+                message["kv weight"] = layer.self_attention.key_value.weight.data
+                message["kv bias"] = layer.self_attention.key_value.bias.data
 
             # Grab all parallel tensors for this layer
             qkv_weight = []
             qkv_bias = []
+            q_weight = []
+            q_bias = []
             dense_weight = []
             mlp_l0_weight = []
             mlp_l0_bias = []
             mlp_l1_weight = []
             for tp_rank, model in enumerate(models):
                 layer = model.language_model.encoder.layers[layer_num]
-                qkv_weight.append(layer.self_attention.query_key_value.weight.data)
-                qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+                if margs.attention_head_type == "multihead":
+                    qkv_weight.append(layer.self_attention.query_key_value.weight.data)
+                    qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+                elif margs.attention_head_type == "multiquery":
+                    q_weight.append(layer.self_attention.query.weight.data)
+                    q_bias.append(layer.self_attention.query.bias.data)
                 dense_weight.append(layer.self_attention.dense.weight.data)
                 mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
                 mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
                 mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
 
             # concat them
-            message["qkv weight"] = torch.cat(qkv_weight, dim=0)
-            message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+            if margs.attention_head_type == "multihead":
+                message["qkv weight"] = torch.cat(qkv_weight, dim=0)
+                message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+            elif margs.attention_head_type == "multiquery":
+                message["q weight"] = torch.cat(q_weight, dim=0)
+                message["q bias"] = torch.cat(q_bias, dim=0)
             message["dense weight"] = torch.cat(dense_weight, dim=1)
             message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
             message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
