@@ -38,6 +38,16 @@ torch._C._jit_set_profiling_executor(False)
 torch._C._jit_override_can_fuse_on_cpu(True)
 torch._C._jit_override_can_fuse_on_gpu(True)
 
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+except ImportError:
+    flash_attn_unpadded_func = None
+
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -459,6 +469,48 @@ class MultiQueryCoreAttention(CoreAttention):
         return context_layer
 
 
+class FlashSelfAttention(torch.nn.Module):
+    """Implement the scaled dot product attention with softmax.
+    Arguments
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                      (default: 1/sqrt(d_keys) where d_keys is computed at
+                      runtime)
+        attention_dropout: The dropout rate to apply to the attention
+                           (default: 0.0)
+    """
+    def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
+                 device=None, dtype=None):
+        super().__init__()
+        assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
+                                                      'e.g., with pip install flash-attn')
+        assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
+        self.causal = causal
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+
+    def forward(self, q, k, v):
+        """Implements the multihead softmax attention.
+        Arguments
+        ---------
+            q, k, v: The tensor containing the query, key, and value. (B, S, H, D)
+        """
+        assert q.dtype in [torch.float16, torch.bfloat16]
+        assert q.is_cuda
+        batch_size, seqlen = q.shape[0], q.shape[1]
+        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+        max_s = seqlen
+        cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
+                                  device=q.device)
+        output = flash_attn_unpadded_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_s, max_s,
+            self.dropout_p if self.training else 0.0,
+            softmax_scale=self.softmax_scale, causal=self.causal
+        )
+        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+        return output
+
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -477,6 +529,20 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = args.params_dtype
         self.attention_head_type = args.attention_head_type
+        self.sequence_parallel = args.sequence_parallel
+
+        self.use_flash_attn = args.use_flash_attn
+        if self.use_flash_attn:
+            if flash_attn_unpadded_func is None:
+                raise ImportError('FlashAttention is not installed, please install with '
+                                  'pip install flash-attn')
+            assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
+                                                          'self-attention for now')
+            assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
+                                                                'supports causal mask for now')
+            # TODO: add assert that we are not using alibi
+            if rearrange is None:
+                raise ImportError('einops is not installed, please install with pip install einops')
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -533,6 +599,11 @@ class ParallelAttention(MegatronModule):
         else:
             self.core_attention = MultiQueryCoreAttention(self.layer_number, self.attn_mask_type)
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
+        
+        if self.use_flash_attn:
+            self.core_attention_flash = FlashSelfAttention(
+                causal=True, attention_dropout=args.attention_dropout
+            )
 
         # Output.
         self.dense = mpu.RowParallelLinear(
@@ -699,13 +770,30 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-
-        if self.checkpoint_core_attention:
-            context_layer = self._checkpointed_attention_forward(
-                query_layer, key_layer, value_layer, attention_mask, alibi)
+        if not self.use_flash_attn:
+            if self.checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer, key_layer, value_layer, attention_mask, alibi)
+            else:
+                context_layer = self.core_attention(
+                    query_layer, key_layer, value_layer, attention_mask, alibi)
         else:
-            context_layer = self.core_attention(
-                query_layer, key_layer, value_layer, attention_mask, alibi)
+            
+            if self.attention_head_type == "multiquery":
+                sq, b, np, hn = query_layer.size()
+                # Expand kv to be compatible with flash-attn implementation
+                # [sq, b, 1, hn] -> [sq, b, np, hn]
+                key_layer = key_layer.expand((sq, b, np, hn))
+                value_layer = value_layer.expand((sq, b, np, hn))
+            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            if not self.sequence_parallel:
+                with mpu.get_cuda_rng_tracker().fork():
+                    context_layer = self.core_attention_flash(q, k, v)
+            else:
+                context_layer = self.core_attention_flash(q, k, v)
+            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+
 
         # =================
         # Output. [sq, b, h]
