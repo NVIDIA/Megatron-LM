@@ -142,6 +142,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                                         args.seq_length, args.seed,
                                         (not args.mmap_warmup),
                                         train_valid_test=s)
+                assert d is not None, \
+                    f"Got an empty split when trying to create dataset: {paths, weights, splits, name}"
                 eval(f"{s}_ds").append(d)
     else:
         raise NotImplementedError("No dataloading argument passed")

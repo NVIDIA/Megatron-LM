@@ -50,7 +50,7 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import check_adlr_autoresume_termination, get_tflops
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
@@ -615,24 +615,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 iteration,
             )
     
-    # Weights and biases reporting
-    if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
-        metrics = {
-            'learning-rate': learning_rate,
-            'samples': args.consumed_train_samples,
-            'loss-scale': loss_scale,
-            'grad-norm': grad_norm,
-            **loss_dict
-        }
-        wandb.log(metrics, step=iteration)
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        tflops = get_tflops(batch_size, elapsed_time_per_iteration)
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
                                   elapsed_time_per_iteration, iteration)
+                writer.add_scalar('TFLOPs per gpu (estimated)',
+                                  tflops, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
@@ -660,6 +653,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
+        log_string += ' TFLOPs: {:.2f} |'.format(tflops)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -670,6 +664,17 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
 
+    # Weights and biases reporting
+    if (iteration % args.log_interval == 0) and is_last_rank() and args.wandb_project_name:
+        metrics = {
+            'learning-rate': learning_rate,
+            'samples': args.consumed_train_samples,
+            'loss-scale': loss_scale,
+            'grad-norm': grad_norm,
+            'tflops': tflops,
+            **loss_dict
+        }
+        wandb.log(metrics, step=iteration)
     return report_memory_flag
 
 
