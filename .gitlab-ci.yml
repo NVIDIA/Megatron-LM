@@ -26,6 +26,8 @@ unit_tests:
     paths:
       - coverage
     expire_in: 30 days
+  only:
+    - merge_requests
 
 .selene_test_resume_checkpoint_launcher: &selene-test-resume-checkpoint-launcher
   tags:
