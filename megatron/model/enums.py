@@ -2,10 +2,6 @@
 
 import enum
 
-class ModelType(enum.Enum):
-    encoder_or_decoder = 1
-    encoder_and_decoder = 2
-
 class LayerType(enum.Enum):
     encoder = 1
     decoder = 2

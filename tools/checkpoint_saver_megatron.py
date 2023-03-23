@@ -32,7 +32,7 @@ def save_checkpoint(queue, args):
         from megatron.arguments import (parse_args, validate_args)
         from megatron.checkpointing import save_checkpoint
         from megatron.global_vars import set_global_variables, get_args
-        from megatron.model import ModelType
+        from megatron.core.enums import ModelType
         from megatron.tokenizer.tokenizer import _vocab_size_with_padding
         from megatron import fused_kernels
         from megatron.core import mpu
