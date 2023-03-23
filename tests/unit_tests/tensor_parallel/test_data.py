@@ -1,6 +1,6 @@
 from megatron.core.tensor_parallel.data import broadcast_data
 import torch
-from tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils
 
 def test_broadcast_data():
     Utils.initialize_model_parallel(2,4)

@@ -6,13 +6,13 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron import get_args, get_timers, print_rank_0, print_rank_last
+from megatron.core.enums import ModelType
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model.vision.inpainting import VitInpaintingModel
 from megatron.model.vision.inpainting import MitInpaintingModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from tasks.vision.metrics import SSIM, PSNR
-from megatron.model import ModelType
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""

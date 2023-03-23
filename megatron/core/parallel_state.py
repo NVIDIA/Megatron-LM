@@ -314,8 +314,8 @@ def set_pipeline_model_parallel_rank(rank):
 
 def set_pipeline_model_parallel_split_rank(rank):
     """Set pipeline model parallel split rank."""
-    global _MPU_PIPELINE_MODEL_PARALLEL_SPLIT_RANK
-    _MPU_PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
 
 def get_tensor_model_parallel_rank():
@@ -332,6 +332,12 @@ def get_pipeline_model_parallel_rank():
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
     return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+
+
+def get_pipeline_model_parallel_split_rank():
+    """Return pipeline model parallel split rank."""
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
 def is_pipeline_first_stage(ignore_virtual=False):

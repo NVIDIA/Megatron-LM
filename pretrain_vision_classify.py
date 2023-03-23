@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from functools import partial
 from megatron import get_args, get_timers, print_rank_0
+from megatron.core.enums import ModelType
 from megatron.data.vit_dataset import build_train_valid_datasets
-from megatron.model import ModelType
 from megatron.model.vision.classification import VitClassificationModel
 from megatron.model.vision.classification import MitClassificationModel
 from megatron.training import pretrain

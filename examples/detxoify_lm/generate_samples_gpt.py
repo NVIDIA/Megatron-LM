@@ -10,10 +10,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
 import torch
 from megatron import get_args
-from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron import print_rank_0
 from megatron.checkpointing import load_checkpoint
+from megatron.core import mpu
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model

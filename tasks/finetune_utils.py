@@ -10,9 +10,9 @@ from megatron import get_args, get_num_microbatches
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron.core import mpu
+from megatron.core.enums import ModelType
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
-from megatron.model import ModelType
 from megatron.training import evaluate_and_print_results
 from megatron.training import setup_model_and_optimizer
 from megatron.training import train_step

@@ -1,5 +1,5 @@
 from megatron.core.tensor_parallel import mappings
-from tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils
 import torch
 
 def test_CopyToModelParallelRegion():

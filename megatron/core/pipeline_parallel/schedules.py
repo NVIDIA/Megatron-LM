@@ -329,6 +329,7 @@ def forward_backward_no_pipelining(*,
     output_tensor = forward_step(forward_step_func, data_iterator,
                                  model, num_microbatches, input_tensor, forward_data_store,
                                  timers, collect_non_loss_data)
+
     if not forward_only:
         backward_step(grad_scaler, input_tensor, output_tensor,
                       output_tensor_grad, model_type, timers)
@@ -364,7 +365,7 @@ def forward_backward_pipelining_with_interleaving(*,
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
 
     if num_microbatches % pipeline_parallel_size != 0:
-        msg = f'number of microbatches ({num_micropatches}) is not divisible by '
+        msg = f'number of microbatches ({num_microbatches}) is not divisible by '
         msg += f'pipeline-model-parallel-size ({pipeline_parallel_size}) '
         msg += 'when using interleaved schedule'
         raise RuntimeError(msg)
@@ -773,9 +774,7 @@ def forward_backward_pipelining_without_interleaving(*,
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)
-        output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
-                                     input_tensor, forward_data_store,
-                                     timers, collect_non_loss_data)
+        output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,input_tensor, forward_data_store,timers, collect_non_loss_data)
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
         if not forward_only:

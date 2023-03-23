@@ -11,8 +11,9 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron.core import tensor_parallel
+from megatron.core.enums import ModelType
 from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model import BertModel, ModelType
+from megatron.model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 
