@@ -10,7 +10,8 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
-from megatron.model import GPTModel, ModelType
+from megatron.core.enums import ModelType
+from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from tools.retro.pretraining.retro_dataset import get_retro_datasets

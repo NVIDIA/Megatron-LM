@@ -20,7 +20,8 @@ from megatron import get_args, get_retro_args, get_tensorboard_writer
 from megatron.core import parallel_state
 from megatron.core import tensor_parallel
 from megatron.core import utils as core_utils
-from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
+from megatron.core.enums import ModelType
+from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl

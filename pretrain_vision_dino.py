@@ -7,6 +7,7 @@ import numpy as np
 import torch.distributed as dist
 from functools import partial
 from megatron import get_args, get_timers, print_rank_0
+from megatron.core.enums import ModelType
 from megatron.data.vit_dataset import build_train_valid_datasets
 from megatron.model.vision.dino import DINOPretrainModel
 from megatron.model.vision.knn_monitor import knn_predict, get_feature_bank
@@ -15,7 +16,6 @@ from megatron.utils import average_losses_across_data_parallel_group, unwrap_mod
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
-from megatron.model import ModelType
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
