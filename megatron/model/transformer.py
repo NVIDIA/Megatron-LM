@@ -20,8 +20,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from megatron import get_timers, get_args, get_global_memory_buffer, print_rank_0
+from megatron import get_timers, get_args, get_global_memory_buffer
 from megatron import mpu
+from megatron.utils import print_rank_0
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType, PositionEmbeddingType
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
