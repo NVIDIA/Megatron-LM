@@ -333,6 +333,18 @@ Theoretical memory savings vary depending on the combination of the model's para
 | bf16 param, fp32 grads | 18 | 6 + 12/d |
 | fp32 param, fp32 grads | 16 | 8 + 8/d |
 
+## FlashAttention
+
+Usage: `--use-flash-attn`. Support attention head dimensions at most 128.
+
+[FlashAttention](https://github.com/HazyResearch/flash-attention) is a fast and
+memory-efficient algorithm to compute exact attention. It speeds up model
+training and reduces memory requirement.
+
+To install FlashAttention:
+```sh
+pip install flash-attn
+```
 
 ## GPT-3 Example
 
