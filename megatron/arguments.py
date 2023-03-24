@@ -1362,6 +1362,9 @@ def _add_ul2_args(parser):
                        help='What token to prepend for the UL2 X-denoising '
                        'objective. If empty, do not prepend a token for this '
                        'objective.')
+    group.add_argument('--ul2-scale-normal-std', action='store_true',
+                       help='Whether to scale the standard deviation when '
+                       'using a normal distribution for span length sampling.')
     group.add_argument('--ul2-like-ul2r', action='store_true',
                        help='Whether to use the updated implementation as '
                        'described in the UL2R paper. This only changes the '

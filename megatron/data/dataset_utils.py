@@ -50,6 +50,7 @@ class SamplingStyle(Enum):
     GEOMETRIC = 'geometric'
     UNIFORM = 'uniform'
     NORMAL = 'normal'
+    UNSCALED_NORMAL = 'unscaled normal'
 
 
 def get_datasets_weights_and_num_samples(data_prefix,
@@ -281,12 +282,20 @@ def create_masked_lm_predictions(tokens,
         return (output_tokens, masked_lm_positions,
                 masked_lm_labels, token_boundary)
 
-    if sampling_style is SamplingStyle.NORMAL:
+    if (
+            sampling_style is SamplingStyle.NORMAL
+            or sampling_style is SamplingStyle.UNSCALED_NORMAL
+    ):
         # First, we get the center of our normal distribution from
         # `max_ngrams`. Keeping the meaning of `max_ngrams` this way
         # plays nicely with the other probability distributions in terms
         # of math.
         normal_mean = (max_ngrams + 1) / 2
+        normal_std = (
+            math.sqrt(normal_mean)
+            if sampling_style is not SamplingStyle.UNSCALED_NORMAL
+            else 1.0
+        )
         # However, we do not want to bound the maximum length of
         # n-grams.
         max_ngrams = num_filtered_tokens - 1
@@ -356,9 +365,12 @@ def create_masked_lm_predictions(tokens,
             n = min(np_rng.geometric(0.2), max_ngrams)
         elif sampling_style is SamplingStyle.UNIFORM:
             n = np_rng.choice(ngrams[:len(cand_index_set)])
-        elif sampling_style is SamplingStyle.NORMAL:
+        elif (
+                sampling_style is SamplingStyle.NORMAL
+                or sampling_style is SamplingStyle.UNSCALED_NORMAL
+        ):
             n = round(np.clip(
-                np_rng.normal(loc=normal_mean),
+                np_rng.normal(loc=normal_mean, scale=normal_std),
                 1,
                 len(cand_index_set),
             ))
@@ -754,6 +766,7 @@ def build_dataset(name, data_prefix, data_impl, splits_string, max_num_samples,
                 'S': args.ul2_s_denoiser_token,
                 'X': args.ul2_x_denoiser_token,
             },
+            scale_normal_std=args.ul2_scale_normal_std,
             like_ul2r=args.ul2_like_ul2r,
             pack_any=args.ul2_pack_any,
             pack_repeat_prompt=args.ul2_pack_repeat_prompt,

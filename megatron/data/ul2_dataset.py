@@ -43,7 +43,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                  splits_string, num_epochs, max_num_samples, model_type,
                  denoiser_ratios, denoisers, mean_span_lengths,
                  mask_ratios, add_mask_tokens, pack_samples,
-                 denoiser_tokens, like_ul2r, pack_any, pack_repeat_prompt,
+                 denoiser_tokens, scale_normal_std, like_ul2r,
+                 pack_any, pack_repeat_prompt,
                  max_seq_length, max_seq_length_dec, short_seq_prob, seed,
                  *,
                  data_cache_path=None):
@@ -75,6 +76,7 @@ class UL2Dataset(torch.utils.data.Dataset):
         self.denoisers = [denoiser.upper() for denoiser in denoisers]
         self.mean_span_lengths = mean_span_lengths
         self.mask_ratios = mask_ratios
+        self.scale_normal_std = scale_normal_std
         self.like_ul2r = like_ul2r
 
         # Dataset.
@@ -225,8 +227,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                 self.vocab_id_to_token_dict, cls_ids, self.sep_id,
                 self.mask_id, self.pad_id, self.model_type, denoiser_index,
                 self.denoisers, self.mean_span_lengths,
-                self.mask_ratios, self.like_ul2r, np_rng,
-                self.bos_id, self.eos_id, self.sentinel_tokens)
+                self.mask_ratios, self.scale_normal_std, self.like_ul2r,
+                np_rng, self.bos_id, self.eos_id, self.sentinel_tokens)
             if is_decoder_only(self.model_type):
                 maybe_lens = update_samples_dict_decoder_only(
                     samples_dict,
@@ -299,8 +301,8 @@ class UL2Dataset(torch.utils.data.Dataset):
                 self.vocab_id_to_token_dict, self.cls_ids, self.sep_id,
                 self.mask_id, self.pad_id, self.model_type, denoiser_index,
                 self.denoisers, self.mean_span_lengths,
-                self.mask_ratios, self.like_ul2r, np_rng,
-                self.bos_id, self.eos_id, self.sentinel_tokens)
+                self.mask_ratios, self.scale_normal_std, self.like_ul2r,
+                np_rng, self.bos_id, self.eos_id, self.sentinel_tokens)
         return samples_dict
 
 
@@ -310,7 +312,8 @@ def build_training_sample(sample, target_seq_length,
                           cls_ids, sep_id, mask_id, pad_id,
                           model_type, denoiser_index, denoisers,
                           mean_span_lengths, mask_ratios,
-                          like_ul2r, np_rng, bos_id=None,
+                          scale_normal_std, like_ul2r,
+                          np_rng, bos_id=None,
                           eos_id=None, sentinel_tokens=None):
     """Build training sample.
 
@@ -334,6 +337,8 @@ def build_training_sample(sample, target_seq_length,
         mean_span_lengths: Mean length for sampling span lengths. Numbers < 1
               indicate a mean length of the sequence length times that number.
         mask_ratios: Ratio of masked token in the full sequence.
+        scale_normal_std: Whether to scale the standard deviation when using a
+            normal distribution for span length sampling.
         like_ul2r: Whether to use the updated implementation as specified in
             the UL2R paper.
         np_rng: Random number genenrator. Note that this rng state should be
@@ -389,8 +394,10 @@ def build_training_sample(sample, target_seq_length,
     if denoiser == 'R' or denoiser == 'X':
         if like_ul2r:
             sampling_style = SamplingStyle.UNIFORM
-        else:
+        elif scale_normal_std:
             sampling_style = SamplingStyle.NORMAL
+        else:
+            sampling_style = SamplingStyle.UNSCALED_NORMAL
         prefix_lm = False
         max_predictions_per_seq = len(tokens) - 1
     elif denoiser == 'S':
