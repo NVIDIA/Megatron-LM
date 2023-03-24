@@ -604,7 +604,8 @@ class ParallelAttention(MegatronModule):
                 raise ImportError('einops is not installed, please install with pip install einops')
             
             if self.checkpoint_core_attention:
-                raise NotImplementedError("Using selective recomputation with flash-attn: this is not implemented.")
+                print_rank_0("  Warning, using selective recomputation with flash-attn: this is already handled in the "
+                             "flash-attn library and has no effect.")
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=args.attention_dropout
             )
