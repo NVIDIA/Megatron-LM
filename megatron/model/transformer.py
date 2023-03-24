@@ -604,7 +604,7 @@ class ParallelAttention(MegatronModule):
                 raise ImportError('einops is not installed, please install with pip install einops')
             
             if self.checkpoint_core_attention:
-                print_rank_0("  Warning, using selective recomputation with flash-attn: this is not implemented and will have no effect")
+                raise NotImplementedError("Using selective recomputation with flash-attn: this is not implemented.")
             self.core_attention_flash = FlashSelfAttention(
                 causal=True, attention_dropout=args.attention_dropout
             )
@@ -774,15 +774,7 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-        if not self.use_flash_attn:
-            if self.checkpoint_core_attention:
-                context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask, alibi)
-            else:
-                context_layer = self.core_attention(
-                    query_layer, key_layer, value_layer, attention_mask, alibi)
-        else:
-            
+        if self.use_flash_attn:
             if self.attention_head_type == "multiquery":
                 sq, b, np, hn = query_layer.size()
                 # Expand kv to be compatible with flash-attn implementation
@@ -791,12 +783,20 @@ class ParallelAttention(MegatronModule):
                 value_layer = value_layer.expand((sq, b, np, hn))
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
-            if not self.sequence_parallel:
+            if self.sequence_parallel:
+                context_layer = self.core_attention_flash(q, k, v)
+            else:
                 with mpu.get_cuda_rng_tracker().fork():
                     context_layer = self.core_attention_flash(q, k, v)
-            else:
-                context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+
+        else:
+            if self.checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer, key_layer, value_layer, attention_mask, alibi)
+            else:
+                context_layer = self.core_attention(
+                    query_layer, key_layer, value_layer, attention_mask, alibi)
 
 
         # =================
