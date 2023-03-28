@@ -202,7 +202,7 @@ class Float16Module(MegatronModule):
             outputs = float16_to_fp32(outputs)
         return outputs
 
-    def state_dict(self, prefix='', keep_vars=False):
+    def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
