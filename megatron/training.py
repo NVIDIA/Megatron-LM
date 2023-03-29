@@ -619,6 +619,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed()
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        
+        num_gpus = args.data_parallel_size * args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+        tokens_per_sec_per_gpu = (args.seq_length * batch_size) / num_gpus / elapsed_time_per_iteration
+
         tflops = get_tflops(batch_size, elapsed_time_per_iteration)
         if writer:
             if args.log_timers_to_tensorboard:
@@ -672,6 +676,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             'loss-scale': loss_scale,
             'grad-norm': grad_norm,
             'tflops': tflops,
+            'tokens-per-second-per-gpu': tokens_per_sec_per_gpu, 
             **loss_dict
         }
         wandb.log(metrics, step=iteration)
