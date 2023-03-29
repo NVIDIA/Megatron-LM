@@ -391,9 +391,6 @@ def setup_model_and_optimizer(model_provider_func,
         torch.distributed.barrier()
         timers('load-checkpoint').stop()
         timers.log(['load-checkpoint'])
-        # This is critical when only model is loaded. We should make sure
-        # main parameters are also updated.
-        optimizer.reload_model_params()
     else:
         args.iteration = 0
 
