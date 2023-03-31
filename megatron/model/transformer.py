@@ -14,6 +14,7 @@ from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model import LayerNorm
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
+from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
 try:
@@ -444,20 +445,27 @@ class ParallelAttention(MegatronModule):
             **_args_to_kwargs())
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
-                                        value_layer, attention_mask):
+                                        value_layer, attention_mask,
+                                        rotary_pos_emb=None):
         """Forward method with activation checkpointing."""
         def custom_forward(*inputs):
             query_layer = inputs[0]
             key_layer = inputs[1]
             value_layer = inputs[2]
             attention_mask = inputs[3]
+            rotary_pos_emb = inputs[4] if inputs[4] is None \
+                else (inputs[4], inputs[5])
             output_ = self.core_attention(query_layer, key_layer,
                                           value_layer, attention_mask)
             return output_
 
+        q_pos_emb, k_pos_emb = (None, None) if rotary_pos_emb is None \
+            else rotary_pos_emb
+
         hidden_states = tensor_parallel.checkpoint(
             custom_forward,
-            False, query_layer, key_layer, value_layer, attention_mask)
+            False, query_layer, key_layer, value_layer, attention_mask,
+            q_pos_emb, k_pos_emb)
 
         return hidden_states
 
@@ -471,7 +479,8 @@ class ParallelAttention(MegatronModule):
             device=torch.cuda.current_device())
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None, inference_params=None):
+                encoder_output=None, inference_params=None,
+                rotary_pos_emb=None):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -536,6 +545,11 @@ class ParallelAttention(MegatronModule):
         # Adjust key and value for inference
         # ==================================
 
+        # duplicate the pos_emb for self attention
+        if rotary_pos_emb is not None:
+            rotary_pos_emb = rotary_pos_emb if isinstance(rotary_pos_emb, \
+                tuple) else ((rotary_pos_emb,) * 2)
+
         if inference_params:
             batch_start = inference_params.batch_size_offset
             batch_end = batch_start + key_layer.size(1)
@@ -553,9 +567,41 @@ class ParallelAttention(MegatronModule):
             value_layer = inference_value_memory[
                 :sequence_end, batch_start:batch_end, ...]
 
+
+            # adjust the key rotary positional embedding
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                # need to cross check this condition during inference
+                # if not set_inference_key_value_memory:
+                if not is_first_step:
+                    # In inference, we compute one token at a time.
+                    # Select the correct positional embedding
+                    # (only the last token in the sequence)
+                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+                else:
+                    # In the first forward pass of inference,
+                    # we use the entire provided prefix.
+                    # q_pos_emb here has the rope embeddings of the entire
+                    # prefix + to-be-generated output so
+                    # we slice to just the prefix.
+                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+                rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
+
         # ==================================
         # core attention computation
         # ==================================
+
+        # apply relative positional encoding (rotary embedding)
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb)
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
         if not self.use_flash_attn:
             if self.checkpoint_core_attention:
@@ -688,17 +734,21 @@ class ParallelTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None):
+                inference_params=None, rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
+        self_attention_pos_emb = None
+        if rotary_pos_emb is not None:
+            self_attention_pos_emb = rotary_pos_emb
         attention_output, attention_bias = \
             self.self_attention(
                 layernorm_output,
                 attention_mask,
-                inference_params=inference_params)
+                inference_params=inference_params,
+                rotary_pos_emb=self_attention_pos_emb)
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1032,7 +1082,8 @@ class ParallelTransformer(MegatronModule):
         return self.layers[layer_number]
 
     def _checkpointed_forward(self, hidden_states, attention_mask,
-                              encoder_output, enc_dec_attn_mask, is_first_microbatch):
+                              encoder_output, enc_dec_attn_mask,
+                              rotary_pos_emb, is_first_microbatch):
         """Forward method with activation checkpointing."""
         def custom(start, end, is_transformer_engine=False):
             def custom_forward(*args, **kwargs):
@@ -1059,12 +1110,14 @@ class ParallelTransformer(MegatronModule):
                         self.distribute_saved_activations,
                         tensor_parallel.get_cuda_rng_tracker,
                         mpu.get_tensor_model_parallel_group(),
-                        hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                        hidden_states, attention_mask, encoder_output,
+                        enc_dec_attn_mask, rotary_pos_emb)
                 else:
                     hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
-                        hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                        hidden_states, attention_mask, encoder_output,
+                        enc_dec_attn_mask, rotary_pos_emb)
 
                 l += self.recompute_num_layers
 
@@ -1080,19 +1133,23 @@ class ParallelTransformer(MegatronModule):
                             self.distribute_saved_activations,
                             tensor_parallel.get_cuda_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
-                            hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, rotary_pos_emb)
                     else:
                         hidden_states = tensor_parallel.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
-                            hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1, is_transformer_engine=True)(
-                            hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, rotary_pos_emb)
                     else:
                         hidden_states = custom(l, l + 1)(
-                            hidden_states, attention_mask, encoder_output, enc_dec_attn_mask)
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1110,7 +1167,7 @@ class ParallelTransformer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None):
+                inference_params=None, rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
         # Checks.
@@ -1168,12 +1225,14 @@ class ParallelTransformer(MegatronModule):
                                                                attention_mask,
                                                                encoder_output,
                                                                enc_dec_attn_mask,
+                                                               rotary_pos_emb,
                                                                is_first_microbatch)
                 else:
                     forward_kwargs = {
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
                         'inference_params': inference_params,
+                        'rotary_pos_emb': rotary_pos_emb,
                     }
 
                     if self.transformer_impl == 'transformer_engine':
