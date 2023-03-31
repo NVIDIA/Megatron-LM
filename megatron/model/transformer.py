@@ -1036,9 +1036,10 @@ class ParallelTransformer(MegatronModule):
         """Forward method with activation checkpointing."""
         def custom(start, end, is_transformer_engine=False):
             def custom_forward(*args, **kwargs):
+                x_, *args = args
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_ = layer(*args, **kwargs)
+                    x_ = layer(x_, *args, **kwargs)
                 return x_
             def custom_forward_transformer_engine(*args, **kwargs):
                 return custom_forward(*args, is_first_microbatch=is_first_microbatch, **kwargs)
