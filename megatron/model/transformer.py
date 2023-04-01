@@ -86,28 +86,45 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
+        self.add_bias = args.add_bias_linear
 
-        # Project to 4h.
+        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             args.hidden_size,
-            args.ffn_hidden_size,
+            args.ffn_hidden_size * 2 if args.swiglu else args.ffn_hidden_size,
+            bias=self.add_bias,
             gather_output=False,
             init_method=init_method,
             skip_bias_add=True,
             async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
             **_args_to_kwargs())
 
-        self.bias_gelu_fusion = args.bias_gelu_fusion
-        self.activation_func = F.gelu
+        self.bias_gelu_fusion = False
+        self.activation_func = None
+        self.swiglu = args.swiglu
+
         if args.openai_gelu:
             self.activation_func = openai_gelu
         elif args.onnx_safe:
             self.activation_func = erf_gelu
+        elif args.swiglu:
+            def swiglu(x):
+                x = torch.chunk(x, 2, dim=-1)
+                return F.silu(x[0]) * x[1]
+            self.activation_func = swiglu
+        elif args.squared_relu:
+            def squared_relu(x):
+                return torch.pow(F.relu(x), 2)
+            self.activation_func = squared_relu
+        else:
+            self.bias_gelu_fusion = args.bias_gelu_fusion
+            self.activation_func = F.gelu
 
         # Project back to h.
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             args.ffn_hidden_size,
             args.hidden_size,
+            bias=self.add_bias,
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
@@ -119,11 +136,13 @@ class ParallelMLP(MegatronModule):
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
         if self.bias_gelu_fusion:
-             intermediate_parallel = \
-                     bias_gelu_impl(intermediate_parallel, bias_parallel)
+            assert self.add_bias is True
+            assert self.activation_func == F.gelu
+            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
         else:
-            intermediate_parallel = \
-                self.activation_func(intermediate_parallel + bias_parallel)
+            if self.add_bias:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
@@ -401,6 +420,7 @@ class ParallelAttention(MegatronModule):
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 3 * projection_size,
+                bias=args.add_bias_linear,
                 gather_output=False,
                 init_method=init_method,
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
@@ -410,6 +430,7 @@ class ParallelAttention(MegatronModule):
             self.query = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 projection_size,
+                bias=args.add_bias_linear,
                 gather_output=False,
                 init_method=init_method,
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
@@ -419,6 +440,7 @@ class ParallelAttention(MegatronModule):
             self.key_value = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 2 * projection_size,
+                bias=args.add_bias_linear,
                 gather_output=False,
                 init_method=init_method,
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
@@ -437,6 +459,7 @@ class ParallelAttention(MegatronModule):
         self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
             args.hidden_size,
+            bias=args.add_bias_linear,
             input_is_parallel=True,
             init_method=output_layer_init_method,
             skip_bias_add=True,
@@ -584,7 +607,9 @@ class ParallelAttention(MegatronModule):
 
 def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Tensor, Tensor, float, bool) -> Tensor
-    out = torch.nn.functional.dropout(x + bias, p=prob, training=training)
+    if bias is not None:
+        x = x + bias
+    out = torch.nn.functional.dropout(x, p=prob, training=training)
     out = residual + out
     return out
 
@@ -649,7 +674,7 @@ class ParallelTransformerLayer(MegatronModule):
             attention_type=AttnType.self_attn,
             attn_mask_type=self_attn_mask_type)
         self.hidden_dropout = args.hidden_dropout
-        self.bias_dropout_fusion = args.bias_dropout_fusion
+        self.bias_dropout_fusion = args.bias_dropout_fusion and args.add_bias_linear
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
@@ -718,10 +743,12 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 bias_dropout_add_func = get_bias_dropout_add(self.training)
 
+            if attention_bias is not None:
+                attention_bias = attention_bias.expand_as(residual)
             with self.bias_dropout_add_exec_handler():
                 layernorm_input = bias_dropout_add_func(
                     attention_output,
-                    attention_bias.expand_as(residual),
+                    attention_bias,
                     residual,
                     self.hidden_dropout)
         else:
@@ -744,10 +771,13 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 residual = layernorm_input
 
+            if attention_bias is not None:
+                attention_bias = attention_bias.expand_as(residual)
+
             with self.bias_dropout_add_exec_handler():
                 layernorm_input = bias_dropout_add_func(
                     attention_output,
-                    attention_bias.expand_as(residual),
+                    attention_bias,
                     residual,
                     self.hidden_dropout)
 
@@ -764,10 +794,12 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_input
 
         if self.drop_path is None:
+            if mlp_bias is not None:
+                mlp_bias = mlp_bias.expand_as(residual)
             with self.bias_dropout_add_exec_handler():
                 output = bias_dropout_add_func(
                     mlp_output,
-                    mlp_bias.expand_as(residual),
+                    mlp_bias,
                     residual,
                     self.hidden_dropout)
 
@@ -782,7 +814,9 @@ class ParallelTransformerLayer(MegatronModule):
                                                      keep_graph = True)
 
         else:
-            out = torch.nn.functional.dropout(mlp_output + mlp_bias,
+            if mlp_bias is not None:
+                mlp_output = mlp_output + mlp_bias
+            out = torch.nn.functional.dropout(mlp_output,
                                               p=self.hidden_dropout,
                                               training=self.training)
             output = residual + self.drop_path(out)
