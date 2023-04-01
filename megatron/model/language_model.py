@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
+from ..arguments import core_config_from_args
 from .enums import LayerType, AttnMaskType
 from .module import MegatronModule
 from .retro_transformer import ParallelRetroEncoder, ParallelRetroTransformer
@@ -49,25 +50,24 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 
 
 def get_language_model(num_tokentypes, add_pooler,
-                       encoder_attn_mask_type, init_method=None,
-                       scaled_init_method=None, add_encoder=True,
+                       encoder_attn_mask_type,
+                       add_encoder=True,
                        add_decoder=False,
                        decoder_attn_mask_type=AttnMaskType.causal,
                        pre_process=True, post_process=True):
     """Build language model and return along with the key to save."""
     args = get_args()
+    config = core_config_from_args(args)
+    if config.init_method is None:
+        config.init_method = init_method_normal(config.init_method_std)
 
-    if init_method is None:
-        init_method = init_method_normal(args.init_method_std)
-
-    if scaled_init_method is None:
-        scaled_init_method = scaled_init_method_normal(args.init_method_std,
-                                                       args.num_layers)
+    if config.output_layer_init_method is None:
+        config.output_layer_init_method = scaled_init_method_normal(args.init_method_std,
+                                                                    args.num_layers)
 
     # Language model.
     language_model = TransformerLanguageModel(
-        init_method,
-        scaled_init_method,
+        config,
         encoder_attn_mask_type,
         num_tokentypes=num_tokentypes,
         add_encoder=add_encoder,
@@ -138,24 +138,19 @@ class Embedding(MegatronModule):
                  vocab_size,
                  max_sequence_length,
                  embedding_dropout_prob,
-                 init_method,
+                 config,
                  num_tokentypes=0):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
-        self.init_method = init_method
+        self.init_method = config.init_method
         self.num_tokentypes = num_tokentypes
 
         args = get_args()
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size,
-            init_method=self.init_method,
-            params_dtype=args.params_dtype,
-            use_cpu_initialization=args.use_cpu_initialization,
-            perform_initialization=args.perform_initialization
-        )
+            vocab_size, self.hidden_size, config=config)
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
@@ -326,8 +321,7 @@ class TransformerLanguageModel(MegatronModule):
     """
 
     def __init__(self,
-                 init_method,
-                 output_layer_init_method,
+                 config,
                  encoder_attn_mask_type,
                  num_tokentypes=0,
                  add_encoder=True,
@@ -343,9 +337,9 @@ class TransformerLanguageModel(MegatronModule):
 
         self.pre_process = pre_process
         self.post_process = post_process
-        self.hidden_size = args.hidden_size
+        self.hidden_size = config.hidden_size
         self.num_tokentypes = num_tokentypes
-        self.init_method = init_method
+        self.init_method = config.init_method
         self.add_encoder = add_encoder
         self.encoder_attn_mask_type = encoder_attn_mask_type
         self.add_decoder = add_decoder
@@ -360,7 +354,7 @@ class TransformerLanguageModel(MegatronModule):
                                        args.padded_vocab_size,
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
-                                       self.init_method,
+                                       config,
                                        self.num_tokentypes)
             self._embedding_key = 'embedding'
 
@@ -407,8 +401,7 @@ class TransformerLanguageModel(MegatronModule):
                 )
             else:
                 self.encoder = ParallelTransformer(
-                    self.init_method,
-                    output_layer_init_method,
+                    config,
                     self_attn_mask_type=self.encoder_attn_mask_type,
                     pre_process=self.pre_process,
                     post_process=self.post_process,
@@ -421,8 +414,7 @@ class TransformerLanguageModel(MegatronModule):
         # architecture and in decoder-only stage).
         if self.add_decoder:
             self.decoder = ParallelTransformer(
-                self.init_method,
-                output_layer_init_method,
+                config,
                 layer_type=LayerType.decoder,
                 self_attn_mask_type=self.decoder_attn_mask_type,
                 pre_process=self.pre_process,

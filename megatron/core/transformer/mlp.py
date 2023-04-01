@@ -8,6 +8,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import \
         TERowParallelLinear, TEColumnParallelLinear
+#from megatron.core.tensor_parallel import RowParallelLinear, ColumnParallelLinear
 
 class MLP(MegatronModule):
     """
@@ -27,12 +28,10 @@ class MLP(MegatronModule):
 
         self.config: TransformerConfig = config
 
-        # Project to 4h.
-        # @jcasper should we change the name dense_h_to_4h here?
         self.linear_fc1 = TEColumnParallelLinear(
             self.config.hidden_size,
             self.config.ffn_hidden_size,
-            self.config,
+            config=self.config,
             bias=True,
             return_bias=True,
         )
@@ -46,12 +45,10 @@ class MLP(MegatronModule):
         # elif args.onnx_safe:
         #     self.activation_func = erf_gelu
 
-        # Project back to h.
-        # @jcasper should we change the name here?
         self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
-            self.config,
+            config=self.config,
             bias=True,
             return_bias=True,
         )

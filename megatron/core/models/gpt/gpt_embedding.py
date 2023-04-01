@@ -30,10 +30,7 @@ class GPTEmbedding(MegatronModule):
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
-            params_dtype=self.config.params_dtype,
-            use_cpu_initialization=self.config.use_cpu_initialization,
-            perform_initialization=self.config.perform_initialization,
+            config=self.config
         )
         # @jcasper are these keys needed?
         self._word_embeddings_key = 'word_embeddings'
@@ -70,7 +67,7 @@ class GPTEmbedding(MegatronModule):
             embeddings = embeddings.float()
 
         # Dropout.
-        if self.config.sequence_parallel_enabled:
+        if self.config.sequence_parallel:
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)

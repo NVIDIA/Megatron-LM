@@ -12,9 +12,11 @@ from megatron.core.utils import divide
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.enums import AttnType, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.custom_layers.transformer_engine import \
-        TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
-
+#from megatron.core.transformer.custom_layers.transformer_engine import \
+#        TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
+from megatron.core.tensor_parallel import ColumnParallelLinear as TEColumnParallelLinear
+from megatron.core.tensor_parallel import RowParallelLinear as TERowParallelLinear
+from megatron.core.transformer import CoreAttention as TECoreAttention
 
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
@@ -54,7 +56,7 @@ class Attention(MegatronModule, ABC):
         self.linear_proj = TERowParallelLinear(
             self.projection_size,
             self.config.hidden_size,
-            self.config,
+            config=self.config,
             bias=True,
             return_bias=True,
         )
@@ -178,7 +180,7 @@ class SelfAttention(Attention):
         self.linear_qkv = TEColumnParallelLinear(
                 self.config.hidden_size,
                 3 * self.projection_size,
-                self.config,
+                config=self.config,
                 bias=False,
         )
 

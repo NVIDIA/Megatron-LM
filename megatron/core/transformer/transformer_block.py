@@ -8,7 +8,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.fusions.fused_layer_norm import get_layer_norm
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
@@ -112,11 +112,12 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = get_layer_norm(
+            self.final_layernorm = FusedLayerNorm(
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
                 persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel_enabled,
+                sequence_parallel=self.config.sequence_parallel,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             )
 
     def _get_layer(self, layer_number):
@@ -200,7 +201,7 @@ class TransformerBlock(MegatronModule):
         #   is called here to be future-proof and corner-case-proof.
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True,)
 
-        if self.config.sequence_parallel_enabled:
+        if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()

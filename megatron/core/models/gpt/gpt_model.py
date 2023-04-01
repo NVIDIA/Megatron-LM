@@ -112,17 +112,10 @@ class GPTModel(MegatronModule):
     ):
         """LM logits using word embedding weights."""
         # Parallel logits.
-        if self.config.async_tensor_model_parallel_allreduce or self.config.sequence_parallel_enabled:
+        if self.config.async_tensor_model_parallel_allreduce or self.config.sequence_parallel:
             input_parallel = input_
-            model_parallel = parallel_state.get_tensor_model_parallel_world_size() > 1
-            async_grad_allreduce = (
-                self.config.async_tensor_model_parallel_allreduce
-                and model_parallel
-                and not self.config.sequence_parallel_enabled
-            )
         else:
             input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
-            async_grad_allreduce = False
 
         # Matrix multiply.
         logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
@@ -130,8 +123,8 @@ class GPTModel(MegatronModule):
             weight=word_embeddings_weight,
             bias=bias,
             gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-            async_grad_allreduce=async_grad_allreduce,
-            sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            async_grad_allreduce=self.config.async_tensor_model_parallel_allreduce,
+            sequence_parallel=self.config.sequence_parallel,
         )
 
         # Gather if needed.
