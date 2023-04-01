@@ -53,9 +53,11 @@ class TestCIPipeline:
             raise FileNotFoundError("Expected data is none")
         expected = self.expected[loss_type]
         expected_list = expected["values"]
+        print(expected_list)
         actual_list = read_tb_logs_as_list(LOGS_DIR, loss_type)
         assert actual_list is not None, f"No TensorBoard events file was found in the logs for {loss_type}."
         for i, step in enumerate(range(expected["start_step"], expected["end_step"], expected["step_interval"])):
+            print(f"Checking step {step} against expected {i}")
             if test_type == TypeOfTest.APPROX:
                 assert actual_list[step] == pytest.approx(expected=expected_list[i], rel=self.margin_loss), f"{self.job_name} : The loss at step {step} should be approximately {expected_list[i]} but it is {actual_list[step]}."
             else:
