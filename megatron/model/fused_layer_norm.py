@@ -114,3 +114,29 @@ class MixedFusedLayerNorm(torch.nn.Module):
                                       keep_graph = True)
 
         return output
+
+
+
+class MixedFusedLayerNorm1P(MixedFusedLayerNorm):
+  def reset_parameters(self):
+    init.zeros_(self.weight)
+    init.zeros_(self.bias)
+
+  def forward(self, input):
+
+    if self.no_persist_layer_norm:
+        return FusedLayerNormAffineFunction.apply(
+          input, self.weight + 1, self.bias, self.normalized_shape, self.eps)
+    else:
+        output = FastLayerNormFN.apply(
+          input, self.weight + 1, self.bias, self.eps)
+
+        # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
+        # a populated '_base' field). This will result in schedule.py's
+        # deallocate_output_tensor() throwing an error, so a viewless tensor is
+        # created to prevent this.
+        output = make_viewless_tensor(inp = output,
+                                      requires_grad = input.requires_grad,
+                                      keep_graph = True)
+
+        return output
