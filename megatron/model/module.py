@@ -70,8 +70,7 @@ class MegatronModule(torch.nn.Module):
         # 3. In the training loop, before an all-reduce between the grads of
         #    the two word_embeddings layers to ensure that every applied weight
         #    update is the same on both stages.
-        if mpu.is_pipeline_last_stage() and \
-                not self.pre_process and not self.untie_embeddings_and_output_weights:
+        if mpu.is_pipeline_last_stage() and not self.pre_process:
             assert not mpu.is_pipeline_first_stage()
             self._word_embeddings_for_head_key = 'word_embeddings_for_head'
             # set word_embeddings weights to 0 here, then copy first
