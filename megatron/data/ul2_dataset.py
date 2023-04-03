@@ -170,6 +170,34 @@ class UL2Dataset(torch.utils.data.Dataset):
         else:
             return self.samples_mapping.shape[0]
 
+    def __getitem__(self, idx):
+        # Note that this rng state should be numpy and not python since
+        # python randint is inclusive whereas the numpy one is exclusive.
+        np_rng = np.random.RandomState(seed=(self.seed + idx))
+        # Denoiser selection
+        denoiser_index = np_rng.choice(
+            np.arange(len(self.denoisers)),
+            p=self.denoiser_ratios,
+        )
+
+        if self.pack_samples:
+            samples_dict = self._pack_samples(np_rng, idx, denoiser_index)
+        else:
+            start_index, end_index, seq_length = self.samples_mapping[idx]
+            sample = []
+            for index in range(start_index, end_index):
+                sample.append(self.indexed_dataset[index])
+            samples_dict = build_training_sample(
+                sample, seq_length,
+                self.max_seq_length,  # needed for padding
+                self.max_seq_length_dec, self.vocab_id_list,
+                self.vocab_id_to_token_dict, self.cls_ids, self.sep_id,
+                self.mask_id, self.pad_id, self.model_type, denoiser_index,
+                self.denoisers, self.mean_span_lengths,
+                self.mask_ratios, self.scale_normal_std, self.like_ul2r,
+                np_rng, self.bos_id, self.eos_id, self.sentinel_tokens)
+        return samples_dict
+
     def _pack_samples(self, np_rng, idx, denoiser_index):
         samples = get_samples(
             self.indexed_dataset, self.doc_idx,
@@ -240,34 +268,6 @@ class UL2Dataset(torch.utils.data.Dataset):
         else:
             add_final_padding(
                 samples_dict, prev_len, prev_len_dec, self.pad_id)
-        return samples_dict
-
-    def __getitem__(self, idx):
-        # Note that this rng state should be numpy and not python since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        np_rng = np.random.RandomState(seed=(self.seed + idx))
-        # Denoiser selection
-        denoiser_index = np_rng.choice(
-            np.arange(len(self.denoisers)),
-            p=self.denoiser_ratios,
-        )
-
-        if self.pack_samples:
-            samples_dict = self._pack_samples(np_rng, idx, denoiser_index)
-        else:
-            start_index, end_index, seq_length = self.samples_mapping[idx]
-            sample = []
-            for index in range(start_index, end_index):
-                sample.append(self.indexed_dataset[index])
-            samples_dict = build_training_sample(
-                sample, seq_length,
-                self.max_seq_length,  # needed for padding
-                self.max_seq_length_dec, self.vocab_id_list,
-                self.vocab_id_to_token_dict, self.cls_ids, self.sep_id,
-                self.mask_id, self.pad_id, self.model_type, denoiser_index,
-                self.denoisers, self.mean_span_lengths,
-                self.mask_ratios, self.scale_normal_std, self.like_ul2r,
-                np_rng, self.bos_id, self.eos_id, self.sentinel_tokens)
         return samples_dict
 
 
