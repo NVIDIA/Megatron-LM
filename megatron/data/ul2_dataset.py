@@ -482,6 +482,8 @@ def create_samples_dict(max_seq_length, max_seq_length_dec, model_type):
 def _remove_padding(result_sample, pad_id):
     # Remove padding
     padding_start = np.argmax(result_sample['text'] == pad_id)
+    if padding_start == 0:
+        return
     result_sample['text'] = result_sample['text'][:padding_start]
     for key in ['labels', 'loss_mask']:
         result_sample[key] = result_sample[key][:padding_start]
