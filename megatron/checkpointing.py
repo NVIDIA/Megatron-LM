@@ -92,7 +92,7 @@ def ensure_directory_exists(filename):
 
 
 def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release=False,
-                        pipeline_parallel=None, tensor_rank=None, pipeline_rank=None):
+                        pipeline_parallel=None, tensor_rank=None, pipeline_rank=None, only_model=False):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
@@ -119,8 +119,9 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
 
     if use_distributed_optimizer:
         model_name = os.path.join(common_path, "model_rng.pt")
+        data_parallel_rank = 0 if only_model else mpu.get_data_parallel_rank()
         optim_name = os.path.join(
-            common_path + "_%03d" % mpu.get_data_parallel_rank(),
+            common_path + "_%03d" % data_parallel_rank,
             "optim.pt")
     else:
         model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
@@ -139,14 +140,14 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, use_distributed_optimize
     # Look for checkpoint with no pipelining
     filenames = get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release,
                                      pipeline_parallel=False,
-                                     tensor_rank=0, pipeline_rank=0)
+                                     tensor_rank=0, pipeline_rank=0, only_model=True)
     if os.path.isfile(filenames[0]):
         return filenames
 
     # Look for checkpoint with pipelining
     filenames = get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release,
                                     pipeline_parallel=True,
-                                    tensor_rank=0, pipeline_rank=0)
+                                    tensor_rank=0, pipeline_rank=0, only_model=True)
     if os.path.isfile(filenames[0]):
         return filenames
 
@@ -379,10 +380,11 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False, iteration=None, release=None):
+def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False, iteration=None, release=None, no_load_optim=False):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
+    If rank0 is true or no_load_optim is true, we do not care about the optimizer, only the model checkpoint.
     """
 
     # Read the tracker file and set the iteration.
@@ -408,7 +410,7 @@ def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False, iter
                                                   release)
     else:
         checkpoint_names = get_checkpoint_names(load_dir, iteration, use_distributed_optimizer,
-                                                release)
+                                                release, only_model=no_load_optim)
         if release:
             print_rank_0(f' loading release checkpoint from {load_dir}')
         else:
@@ -572,7 +574,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                               use_distributed_optimizer=args.use_distributed_optimizer,
                               rank0=False,
                               iteration=iteration,
-                              release=release)
+                              release=release,
+                              no_load_optim=args.no_load_optim)
 
     if model_state_dict is None:
         return 0

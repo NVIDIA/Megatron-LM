@@ -50,6 +50,9 @@ def _load_checkpoint(queue, args):
                 '--no-initialization',
                 '--load', args.load_dir
                 ]
+    if args.use_distributed_optimizer:
+        sys.argv.append("--use-distributed-optimizer")
+
 
     margs = parse_args()
     margs = load_args_from_checkpoint(margs)
