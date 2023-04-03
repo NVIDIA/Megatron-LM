@@ -322,6 +322,17 @@ def get_samples(
         return {'text': sample_list}
 
 
+def _get_description(data_prefix, name, num_samples, seq_length, seed):
+    desc = "GPT Dataset\n\n"
+    desc += f"Data prefix {data_prefix}\n"
+    desc += f"Dataset name {name}\n"
+    desc += f"Number of samples {num_samples}\n"
+    desc += f"Sequence length {seq_length}\n"
+    desc += f"Random seed {seed}\n"
+    desc += f"Split {splits_string}\n"
+    return desc
+
+
 def build_index_mappings(name, data_prefix, documents, sizes,
                          splits_string, num_samples, seq_length, seed,
                          *,
@@ -340,13 +351,8 @@ def build_index_mappings(name, data_prefix, documents, sizes,
     np_rng = np.random.RandomState(seed=seed)
 
     # Filename of the index mappings.
-    desc = "GPT Dataset\n\n"
-    desc += f"Data prefix {data_prefix}\n"
-    desc += f"Dataset name {name}\n"
-    desc += f"Number of samples {num_samples}\n"
-    desc += f"Sequence length {seq_length}\n"
-    desc += f"Random seed {seed}\n"
-    desc += f"Split {splits_string}\n"
+    desc = _get_description(
+        data_prefix, name, num_samples, seq_length, seed)
     desc_hash = hashlib.md5(desc.encode('utf-8')).hexdigest()
     desc_filename = desc_hash + ".dsc"
     doc_idx_filename = desc_hash + '_doc_idx.npy'
