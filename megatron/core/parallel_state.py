@@ -205,8 +205,8 @@ def initialize_model_parallel(
             if pipeline_model_parallel_split_rank is not None:
                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
                     embedding_ranks = [ranks[0],
-                                    ranks[pipeline_model_parallel_split_rank],
-                                    ranks[-1]]
+                                       ranks[pipeline_model_parallel_split_rank],
+                                       ranks[-1]]
                 if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
                     position_embedding_ranks = [ranks[0],
                                        ranks[pipeline_model_parallel_split_rank]]
