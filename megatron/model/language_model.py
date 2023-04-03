@@ -328,6 +328,7 @@ class TransformerLanguageModel(MegatronModule):
                  post_process=True):
         args = get_args()
         # TODO: passing share_word_embeddings=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
+        if args.untie_embeddings_and_output_weights: assert not add_decoder
         super(TransformerLanguageModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
 
         self.pre_process = pre_process
