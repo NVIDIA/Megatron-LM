@@ -362,7 +362,8 @@ class TransformerLanguageModel(MegatronModule):
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings
-        self.use_rotary_position_embeddings = False
+        self.use_rotary_position_embeddings = \
+            args.use_rotary_position_embeddings
         if args.use_rotary_position_embeddings:
             self.seq_length = args.seq_length
             rotary_dim = args.hidden_size // args.num_attention_heads \
@@ -375,8 +376,6 @@ class TransformerLanguageModel(MegatronModule):
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
             self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
-            self.use_rotary_position_embeddings = \
-                args.use_rotary_position_embeddings
 
         # Retriever (bi-directional transformer with cross attention)
         if args.retro_add_retriever:
