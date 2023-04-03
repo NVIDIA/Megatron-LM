@@ -119,9 +119,8 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
 
     if use_distributed_optimizer:
         model_name = os.path.join(common_path, "model_rng.pt")
-        data_parallel_rank = 0 if only_model else mpu.get_data_parallel_rank()
-        optim_name = os.path.join(
-            common_path + "_%03d" % data_parallel_rank,
+        optim_name = None if only_model else os.path.join(
+            common_path + "_%03d" % mpu.get_data_parallel_rank(),
             "optim.pt")
     else:
         model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
@@ -421,7 +420,9 @@ def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False, iter
     # Load the checkpoint.
     try:
         model_state_dict = torch.load(model_checkpoint_name, map_location='cpu')
-        if use_distributed_optimizer:
+        if rank0 or no_load_optim:
+            optim_state_dict = None
+        elif use_distributed_optimizer:
             optim_state_dict = torch.load(optim_checkpoint_name, map_location='cpu')
         else:
             optim_state_dict = model_state_dict
