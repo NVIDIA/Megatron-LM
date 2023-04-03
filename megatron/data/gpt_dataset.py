@@ -3,6 +3,7 @@
 """GPT style dataset."""
 
 import hashlib
+import math
 import os
 import time
 
@@ -322,7 +323,8 @@ def get_samples(
         return {'text': sample_list}
 
 
-def _get_description(data_prefix, name, num_samples, seq_length, seed):
+def _get_description(
+        data_prefix, name, num_samples, seq_length, seed, splits_string):
     desc = "GPT Dataset\n\n"
     desc += f"Data prefix {data_prefix}\n"
     desc += f"Dataset name {name}\n"
@@ -352,7 +354,7 @@ def build_index_mappings(name, data_prefix, documents, sizes,
 
     # Filename of the index mappings.
     desc = _get_description(
-        data_prefix, name, num_samples, seq_length, seed)
+        data_prefix, name, num_samples, seq_length, seed, splits_string)
     desc_hash = hashlib.md5(desc.encode('utf-8')).hexdigest()
     desc_filename = desc_hash + ".dsc"
     doc_idx_filename = desc_hash + '_doc_idx.npy'
@@ -498,6 +500,129 @@ def build_index_mappings(name, data_prefix, documents, sizes,
     return doc_idx, sample_idx, shuffle_idx, desc, desc_hash
 
 
+def build_index_mappings_full_docs(
+        name, data_prefix, documents, sizes,
+        splits_string, num_samples, seq_length, seed,
+        *,
+        data_cache_path):
+    """Build doc-idx, sample-idx, and shuffle-idx.
+    doc-idx: is an array (ordered) of documents to be used in training.
+    sample-idx: is the start document index and document offset for each
+       training sample.
+    shuffle-idx: maps the sample index into a random index into sample-idx.
+    """
+    # rng state
+    np_rng = np.random.RandomState(seed=seed)
+
+    # Filename of the index mappings.
+    desc = _get_description(
+        data_prefix, name, num_samples, seq_length, seed, splits_string)
+    desc += "Full docs\n"
+    desc_hash = hashlib.md5(desc.encode('utf-8')).hexdigest()
+    desc_filename = desc_hash + ".dsc"
+    doc_idx_filename = desc_hash + '_doc_idx.npy'
+    sample_idx_filename = desc_hash + '_sample_idx.npy'
+    shuffle_idx_filename = desc_hash + '_shuffle_idx.npy'
+
+    # Look for cache in main data dir first to avoid unnecessary
+    # duplication, then look in data-cache-path if specified,
+    # If nothing is found, use the last path looked in
+    build_indices = True
+    prefixes = [os.path.join(os.path.dirname(data_prefix), 'index-cache')]
+    if data_cache_path is not None:
+        prefixes.append(data_cache_path)
+    for prefix in prefixes:
+        idx_path = {
+            'desc': os.path.join(prefix, desc_filename),
+            'doc': os.path.join(prefix, doc_idx_filename),
+            'sample': os.path.join(prefix, sample_idx_filename),
+            'shuffle': os.path.join(prefix, shuffle_idx_filename)
+        }
+        for f in idx_path.values():
+            if not os.path.isfile(f):
+                break
+        else:
+            # Found our files!
+            build_indices = False
+            break
+    data_cache_dir = os.path.dirname(idx_path['desc'])
+    data_cache_success = True
+
+    # Build the indexed mapping if not exist.
+    if build_indices and torch.distributed.get_rank() == 0:
+        print_rank_0(
+            ' > WARNING: could not find index map files, building '
+            'the indices on rank 0 ...')
+
+        try:
+            os.makedirs(data_cache_dir, exist_ok=True)
+
+            # description
+            with open(idx_path['desc'], 'wt') as fd:
+                fd.write(desc)
+
+            # sample-idx.
+            start_time = time.time()
+            # Use C++ implementation for speed.
+            # First compile and then import.
+            from megatron.data import helpers
+            assert sizes.dtype == np.int32
+            # sample_idx = helpers.build_sample_idx_full_docs(
+            #     sizes, doc_idx, seq_length, num_samples)
+            doc_idx, sample_idx = _build_sample_idx_full_docs(
+                sizes, documents, seq_length, num_samples, np_rng)
+            np.save(idx_path['doc'], doc_idx, allow_pickle=True)
+            np.save(idx_path['sample'], sample_idx, allow_pickle=True)
+            print_rank_0(' > elasped time to build and save doc-idx and '
+                         'sample-idx mapping (seconds): {:4f}'.format(
+                             time.time() - start_time))
+            # shuffle-idx.
+            start_time = time.time()
+            num_samples_ = sample_idx.shape[0]
+            shuffle_idx = _build_shuffle_idx(
+                num_samples_, sample_idx.shape[0], np_rng)
+            np.save(idx_path['shuffle'], shuffle_idx, allow_pickle=True)
+            print_rank_0(
+                ' > elasped time to build and save shuffle-idx mapping'
+                ' (seconds): {:4f}'.format(time.time() - start_time))
+        except OSError:
+            print(f'There was an error trying to create the data cache '
+                  f'directory ({data_cache_dir})')
+            print('or a file in it. This defaults to a directory '
+                  '"index-cache" within the directory')
+            print('the data files are in and can be set with the '
+                  '`--data-cache-path` argument. Please')
+            print('ensure you have write access to this directory or specify '
+                  'one that you do have')
+            print('write access to.')
+            data_cache_success = False
+
+    if not dp_pp_barrier(data_cache_success):
+        print_rank_0("Data index creation unsuccessful, exiting.")
+        exit()
+
+    # Load mappings.
+    start_time = time.time()
+    print_rank_0(f" > loading doc-idx mapping from {idx_path['doc']}")
+    doc_idx = np.load(idx_path['doc'], allow_pickle=True, mmap_mode='r')
+
+    print_rank_0(f" > loading sample-idx mapping from {idx_path['sample']}")
+    sample_idx = np.load(idx_path['sample'], allow_pickle=True, mmap_mode='r')
+
+    print_rank_0(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
+    shuffle_idx = np.load(
+        idx_path['shuffle'], allow_pickle=True, mmap_mode='r')
+
+    print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
+        time.time() - start_time))
+    print_rank_0('    total number of samples: {}'.format(
+        sample_idx.shape[0]))
+    num_epochs = math.ceil(len(doc_idx) / len(documents))
+    print_rank_0('    total number of epochs: {}'.format(num_epochs))
+
+    return doc_idx, sample_idx, shuffle_idx, desc, desc_hash
+
+
 def _num_tokens(documents, sizes):
     """Total number of tokens in the dataset."""
     return np.sum(sizes[documents])
@@ -581,6 +706,60 @@ def _build_sample_idx(sizes, doc_idx, seq_length,
         sample_index += 1
 
     return sample_idx
+
+
+def _build_sample_idx_full_docs(
+        sizes, documents, seq_length, num_samples, np_rng):
+    """Sample index mapping is a 1D array with sizes
+    [number-of-samples] where [..., 0] contains
+    the last index into `doc_idx`.
+    """
+    sample_idx = np.zeros([num_samples], dtype=np.int32)
+    # If we only manage to pack one sample each time, we need this many
+    # epochs.
+    min_epochs = math.ceil(num_samples / len(documents))
+
+    doc_idx = _build_doc_idx(documents, min_epochs, np_rng, False)
+    # Index into sample_idx.
+    sample_index = 0
+    # Index into doc_idx.
+    doc_idx_index = 0
+    while sample_index < num_samples:
+
+        # Start with a fresh sequence.
+        remaining_seq_length = seq_length + 1
+        is_multiple = False
+        while remaining_seq_length != 0:
+            if doc_idx_index >= len(doc_idx):
+                # Extend doc-idx.
+                doc_idx = np.concatenate([doc_idx, _build_doc_idx(
+                    documents, 1, np_rng, False)])
+
+            # Get the document length.
+            doc_id = doc_idx[doc_idx_index]
+            doc_length = sizes[doc_id]
+            # And add it to the current sequence.
+            remaining_seq_length -= doc_length
+            if is_multiple:
+                remaining_seq_length -= 1
+            # If we have more than a full sequence, set remaining length
+            # to zero so we return from the while loop.
+            if remaining_seq_length <= 0:
+                remaining_seq_length = 0
+            else:
+                # Otherwise, start from the begining of the next document.
+                doc_idx_index += 1
+                is_multiple = True
+        # Record the sequence.
+        sample_idx[sample_index] = doc_idx_index
+
+        # Reset to next document.
+        doc_idx_index += 1
+        sample_index += 1
+
+    # `doc_idx_index` is already incremented by one. We want to include
+    # it because the last document index is inclusive.
+    return doc_idx[:doc_idx_index], sample_idx
 
 
 def _build_shuffle_idx(num_samples, total_size, np_rng):
