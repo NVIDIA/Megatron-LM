@@ -17,6 +17,7 @@ from megatron.data.dataset_utils import (
 from megatron.data.gpt_dataset import build_index_mappings, get_samples
 from megatron.data.t5_dataset import (
     add_final_padding,
+    create_samples_dict as t5_create_samples_dict,
     LengthExceededError,
     make_history_mask,
     merge_subsequent_masks,
@@ -169,49 +170,13 @@ class UL2Dataset(torch.utils.data.Dataset):
         else:
             return self.samples_mapping.shape[0]
 
-    def _create_samples_dict(self):
-        if is_decoder_only(self.model_type):
-            samples_dict = {
-                'text': np.empty((self.max_seq_length,), dtype=np.int64),
-                'labels': np.empty((self.max_seq_length,), dtype=np.int64),
-                'loss_mask': np.zeros((self.max_seq_length,), dtype=np.int64),
-                'truncated': 0,
-                'dec_mask': np.zeros(
-                    (self.max_seq_length, self.max_seq_length),
-                    dtype=np.int64,
-                ),
-            }
-        else:
-            samples_dict = {
-                'text_enc': np.empty((self.max_seq_length,), dtype=np.int64),
-                'text_dec': np.empty(
-                    (self.max_seq_length_dec,), dtype=np.int64),
-                'labels': np.empty(
-                    (self.max_seq_length_dec,), dtype=np.int64),
-                'loss_mask': np.zeros(
-                    (self.max_seq_length_dec,), dtype=np.int64),
-                'truncated': 0,
-                'enc_mask': np.zeros(
-                    (self.max_seq_length, self.max_seq_length),
-                    dtype=np.int64,
-                ),
-                'dec_mask': np.zeros(
-                    (self.max_seq_length_dec, self.max_seq_length_dec),
-                    dtype=np.int64,
-                ),
-                'enc_dec_mask': np.zeros(
-                    (self.max_seq_length_dec, self.max_seq_length),
-                    dtype=np.int64,
-                ),
-            }
-        return samples_dict
-
     def _pack_samples(self, np_rng, idx, denoiser_index):
         samples = get_samples(
             self.indexed_dataset, self.doc_idx,
             self.sample_idx, self.shuffle_idx, idx, False,
         )['text']
-        samples_dict = self._create_samples_dict()
+        samples_dict = create_samples_dict(
+            self.max_seq_length, self.max_seq_length, self.model_type)
         prev_len = 0
         prev_len_dec = 0
         cls_ids = self.cls_ids
@@ -495,6 +460,24 @@ def build_training_sample(sample, target_seq_length,
             'enc_dec_mask': enc_dec_mask,
         }
     return train_sample
+
+
+def create_samples_dict(max_seq_length, max_seq_length_dec, model_type):
+    if is_decoder_only(model_type):
+        samples_dict = {
+            'text': np.empty((max_seq_length,), dtype=np.int64),
+            'labels': np.empty((max_seq_length,), dtype=np.int64),
+            'loss_mask': np.zeros((max_seq_length,), dtype=np.int64),
+            'truncated': 0,
+            'dec_mask': np.zeros(
+                (max_seq_length, max_seq_length),
+                dtype=np.int64,
+            ),
+        }
+    else:
+        samples_dict = t5_create_samples_dict(
+            max_seq_length, max_seq_length_dec)
+    return samples_dict
 
 
 def _remove_padding(result_sample, pad_id):
