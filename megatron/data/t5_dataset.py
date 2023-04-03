@@ -12,7 +12,7 @@ from megatron.data.dataset_utils import (
     create_masked_lm_predictions,
     get_samples_mapping
 )
-from megatron.data.gpt_dataset import build_index_mappings, get_samples
+from megatron.data.gpt_dataset import build_index_mappings_full_docs
 
 
 class LengthExceededError(ValueError):
@@ -61,7 +61,7 @@ class T5Dataset(torch.utils.data.Dataset):
             (
                 self.doc_idx, self.sample_idx, self.shuffle_idx,
                 self.desc, self.desc_hash,
-            ) = build_index_mappings(
+            ) = build_index_mappings_full_docs(
                 self.name, data_prefix, self.indexed_dataset.get_doc_idx()[:-1],
                 self.indexed_dataset.sizes, splits_string, max_num_samples,
                 self.max_seq_length - min_added_tokens, self.seed,
@@ -100,7 +100,7 @@ class T5Dataset(torch.utils.data.Dataset):
 
     def __len__(self):
         if self.pack_samples:
-            return self.sample_idx.shape[0] - 1
+            return self.sample_idx.shape[0]
         else:
             return self.samples_mapping.shape[0]
 
@@ -125,10 +125,8 @@ class T5Dataset(torch.utils.data.Dataset):
         return samples_dict
 
     def _pack_samples(self, np_rng, idx):
-        samples = get_samples(
-            self.indexed_dataset, self.doc_idx,
-            self.sample_idx, self.shuffle_idx, idx, False,
-        )['text']
+        samples = get_samples(self.indexed_dataset, self.doc_idx,
+                              self.sample_idx, self.shuffle_idx, idx)
         samples_dict = create_samples_dict(
             self.max_seq_length, self.max_seq_length_dec)
         prev_len = 0
@@ -375,6 +373,31 @@ def make_history_mask_3d(block):
     history_mask = (arange[None, ] <= arange[:, None])[None, ]
     history_mask = history_mask.expand(batch, length, length)
     return history_mask
+
+
+def get_samples(indexed_dataset, doc_idx, sample_idx, shuffle_idx, idx):
+    # Get the shuffled index.
+    idx = shuffle_idx[idx]
+    # Start and end documents.
+    if idx == 0:
+        doc_index_f = 0
+    else:
+        doc_index_f = sample_idx[idx - 1] + 1
+    doc_index_l = sample_idx[idx]
+    # If we are within the same document, just extract the chunk.
+    if doc_index_f == doc_index_l:
+        sample = indexed_dataset.get(doc_idx[doc_index_f])
+        sample_list = [sample]
+    else:
+        # Otherwise, get the rest of the initial document.
+        sample_list = [indexed_dataset.get(doc_idx[doc_index_f])]
+        # Loop over all in between documents and add the entire document.
+        for i in range(doc_index_f + 1, doc_index_l):
+            sample_list.append(indexed_dataset.get(doc_idx[i]))
+        # And finally add the relevant portion of last document.
+        sample_list.append(indexed_dataset.get(
+            doc_idx[doc_index_l]))
+    return sample_list
 
 
 def create_samples_dict(max_seq_length, max_seq_length_dec):

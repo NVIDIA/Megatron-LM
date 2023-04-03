@@ -14,10 +14,11 @@ from megatron.data.dataset_utils import (
     get_samples_mapping,
     SamplingStyle
 )
-from megatron.data.gpt_dataset import build_index_mappings, get_samples
+from megatron.data.gpt_dataset import build_index_mappings_full_docs
 from megatron.data.t5_dataset import (
     add_final_padding,
     create_samples_dict as t5_create_samples_dict,
+    get_samples,
     LengthExceededError,
     make_history_mask,
     merge_subsequent_masks,
@@ -97,7 +98,7 @@ class UL2Dataset(torch.utils.data.Dataset):
             (
                 self.doc_idx, self.sample_idx, self.shuffle_idx,
                 self.desc, self.desc_hash,
-            ) = build_index_mappings(
+            ) = build_index_mappings_full_docs(
                 self.name, data_prefix,
                 self.indexed_dataset.get_doc_idx()[:-1],
                 self.indexed_dataset.sizes, splits_string, max_num_samples,
@@ -166,7 +167,7 @@ class UL2Dataset(torch.utils.data.Dataset):
 
     def __len__(self):
         if self.pack_samples:
-            return self.sample_idx.shape[0] - 1
+            return self.sample_idx.shape[0]
         else:
             return self.samples_mapping.shape[0]
 
@@ -199,10 +200,8 @@ class UL2Dataset(torch.utils.data.Dataset):
         return samples_dict
 
     def _pack_samples(self, np_rng, idx, denoiser_index):
-        samples = get_samples(
-            self.indexed_dataset, self.doc_idx,
-            self.sample_idx, self.shuffle_idx, idx, False,
-        )['text']
+        samples = get_samples(self.indexed_dataset, self.doc_idx,
+                              self.sample_idx, self.shuffle_idx, idx)
         samples_dict = create_samples_dict(
             self.max_seq_length, self.max_seq_length, self.model_type)
         prev_len = 0
