@@ -140,7 +140,7 @@ class ParallelMLP(MegatronModule):
             assert self.activation_func == F.gelu
             intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
         else:
-            if self.add_bias:
+            if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
@@ -674,7 +674,7 @@ class ParallelTransformerLayer(MegatronModule):
             attention_type=AttnType.self_attn,
             attn_mask_type=self_attn_mask_type)
         self.hidden_dropout = args.hidden_dropout
-        self.bias_dropout_fusion = args.bias_dropout_fusion and args.add_bias_linear
+        self.bias_dropout_fusion = args.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
