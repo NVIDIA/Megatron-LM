@@ -1,6 +1,6 @@
 from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 import torch
-from tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils
 import numpy as np
 
 def test_vocab_parallel_cross_entropy():

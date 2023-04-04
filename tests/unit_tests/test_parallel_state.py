@@ -1,7 +1,7 @@
 import torch
 import megatron.core.parallel_state as ps
 import pytest
-from tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils
 import os 
 
 rank = Utils.rank

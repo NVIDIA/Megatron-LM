@@ -9,7 +9,8 @@ import torch.nn.functional as F
 from megatron import get_timers, get_args, core, get_num_microbatches
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
-from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
+from megatron.core.enums import ModelType
+from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model import LayerNorm, megablocks_utils
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -297,7 +298,6 @@ class CoreAttention(MegatronModule):
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-
         if not self.sequence_parallel:
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
@@ -504,6 +504,7 @@ class ParallelAttention(MegatronModule):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
+
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -1067,9 +1068,10 @@ class ParallelTransformer(MegatronModule):
         """Forward method with activation checkpointing."""
         def custom(start, end, is_transformer_engine=False):
             def custom_forward(*args, **kwargs):
+                x_, *args = args
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_ = layer(*args, **kwargs)
+                    x_ = layer(x_, *args, **kwargs)
                 return x_
             def custom_forward_transformer_engine(*args, **kwargs):
                 return custom_forward(*args, is_first_microbatch=is_first_microbatch, **kwargs)
