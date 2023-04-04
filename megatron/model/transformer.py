@@ -741,7 +741,6 @@ class ParallelTransformerLayer(MegatronModule):
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
-        self_attention_pos_emb = None
         attention_output, attention_bias = \
             self.self_attention(
                 layernorm_output,
