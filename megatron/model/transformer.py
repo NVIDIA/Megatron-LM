@@ -14,6 +14,7 @@ from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.model import LayerNorm
 
 try:
     from einops import rearrange
@@ -634,10 +635,10 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
 
-        if args.apply_layernorm_1p:
-            from megatron.model import LayerNorm1P as LayerNorm
-        else:
-            from megatron.model import LayerNorm
+        #if args.apply_layernorm_1p:
+        #    from megatron.model import LayerNorm1P as LayerNorm
+        #else:
+        #    from megatron.model import LayerNorm
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
@@ -1024,10 +1025,10 @@ class ParallelTransformer(MegatronModule):
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        if args.apply_layernorm_1p:
-            from megatron.model import LayerNorm1P as LayerNorm
-        else:
-            from megatron.model import LayerNorm
+        #if args.apply_layernorm_1p:
+        #    from megatron.model import LayerNorm1P as LayerNorm
+        #else:
+        #    from megatron.model import LayerNorm
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
