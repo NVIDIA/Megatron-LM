@@ -515,7 +515,7 @@ def _add_network_size_args(parser):
     group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
                        help='Layer norm epsilon.')
     group.add_argument('--apply-layernorm-1p', action='store_true',
-                       help='Use layernorm 1p')
+                       help='Weight adjustment centered around zero.')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '

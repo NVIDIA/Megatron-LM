@@ -638,9 +638,6 @@ class ParallelTransformerLayer(MegatronModule):
         apply_layernorm_1p = False
         if args.apply_layernorm_1p:
             apply_layernorm_1p = True
-            #from megatron.model import LayerNorm1P as LayerNorm
-        #else:
-        #    from megatron.model import LayerNorm
 
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
@@ -1033,9 +1030,6 @@ class ParallelTransformer(MegatronModule):
         apply_layernorm_1p = False
         if args.apply_layernorm_1p:
             apply_layernorm_1p = True
-            #from megatron.model import LayerNorm1P as LayerNorm
-        #else:
-        #    from megatron.model import LayerNorm
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
