@@ -35,6 +35,7 @@ unit_tests:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene resume from checkpoint test. "
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
     - pwd
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
@@ -66,6 +67,7 @@ unit_tests:
     - echo "Finished job"  
     - source $PYTHON_VIRTUAL_ENV
     - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
@@ -82,6 +84,7 @@ unit_tests:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene test"
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
     - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
@@ -259,8 +262,8 @@ cleanup.selene:
   variables:
     <<: [*VARS]
   script:
-    - NUM_CLEANUP=`find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | wc -l`
-    - find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | xargs rm -rf
+    - NUM_CLEANUP=`find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | wc -l`
+    - find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
     - echo "Finished cleaning $NUM_CLEANUP directories older than 20 days everything in Selene"
   allow_failure: true
   rules:
