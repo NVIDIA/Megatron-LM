@@ -10,7 +10,6 @@ from torch.nn.parameter import Parameter
 from torch.nn import init
 import importlib
 
-from megatron import get_args
 from megatron.core.utils import make_viewless_tensor
 
 try:
@@ -59,8 +58,16 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
   def __init__(self, normalized_shape, eps=1e-5,
                no_persist_layer_norm=True,
-               sequence_parallel=False):
+               sequence_parallel=False,
+               apply_layernorm_1p=False):
         super(MixedFusedLayerNorm, self).__init__()
+
+        self.apply_layernorm_1p = False
+        if apply_layernorm_1p:
+            self.weight_adjustment = 1
+            self.apply_layernorm_1p = True
+        else:
+            self.weight_adjustment = 0
 
         global fused_mix_prec_layer_norm_cuda
         fused_mix_prec_layer_norm_cuda = importlib.import_module(
@@ -89,23 +96,23 @@ class MixedFusedLayerNorm(torch.nn.Module):
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
-
-        args = get_args()
-        self.weight_adjustment = 0
-        if args.apply_layernorm_1p:
-            self.weight_adjustment = 1
+        
 
   def reset_parameters(self):
 
-    init.ones_(self.weight)
-    init.zeros_(self.bias)
-
+    if self.apply_layernorm_1p:
+        init.zeros_(self.weight)
+        init.zeros_(self.bias)
+    else: 
+        init.ones_(self.weight)
+        init.zeros_(self.bias)
 
   def forward(self, input):
 
     if self.no_persist_layer_norm:
         return FusedLayerNormAffineFunction.apply(
-          input, self.weight + self.weight_adjustment, self.bias, self.normalized_shape, self.eps)
+          input, self.weight + self.weight_adjustment, \
+            self.bias, self.normalized_shape, self.eps)
     else:
         output = FastLayerNormFN.apply(
           input, self.weight + self.weight_adjustment, self.bias, self.eps)
