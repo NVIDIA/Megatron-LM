@@ -326,6 +326,9 @@ def main():
         for p in processes:
             p.join()
 
+        if args.partitions == 1:
+            return
+
 
     # encode partition files in parallel
     processes = []

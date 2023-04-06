@@ -104,6 +104,8 @@ def get_args():
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
                        help='Language to use for NLTK-powered sentence splitting.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='sentencepeice tokenizer model.')
 
 
     group = parser.add_argument_group(title='output data')
