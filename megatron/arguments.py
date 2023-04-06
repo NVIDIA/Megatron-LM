@@ -250,6 +250,14 @@ def validate_args(args, defaults={}):
     if args.ffn_hidden_size is None:
         args.ffn_hidden_size = 4 * args.hidden_size
 
+    if args.swiglu:
+        # reduce the dimnesion for MLP since projections happens on
+        # two linear layers. this keeps the number of paramters in
+        # the same ballpark as the counterpart with 4*h size
+        # we keep it a multiple of 64, which means the actual tensor size
+        # will be a multiple of 64 / tp_size
+        args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
@@ -348,6 +356,10 @@ def validate_args(args, defaults={}):
             raise RuntimeError(
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
+    # Disable bias gelu fusion if we are disabling bias altogether
+    if not args.add_bias_linear:
+        args.bias_gelu_fusion = False
 
     # Load retro args.
     if args.retro_workdir:
@@ -522,6 +534,10 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
+    group.add_argument('--squared-relu', action='store_true',
+                       help='Use squared relu activation instead of default gelu')
+    group.add_argument('--swiglu', action='store_true',
+                       help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
@@ -730,6 +746,9 @@ def _add_training_args(parser):
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
+    group.add_argument('--disable-bias-linear', action='store_false',
+                       help='Disable bias in the linear layers',
+                       dest='add_bias_linear')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
