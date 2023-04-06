@@ -11,6 +11,7 @@ from megatron.core import mpu, tensor_parallel
 from .enums import LayerType, AttnMaskType
 from .module import MegatronModule
 from .retro_transformer import ParallelRetroEncoder, ParallelRetroTransformer
+from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal
@@ -158,12 +159,14 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.position_embeddings = torch.nn.Embedding(
-            max_sequence_length, self.hidden_size)
-        self._position_embeddings_key = 'position_embeddings'
-        # Initialize the position embeddings.
-        if args.perform_initialization:
-            self.init_method(self.position_embeddings.weight)
+        self.add_position_embedding = args.add_position_embedding
+        if self.add_position_embedding:
+            self.position_embeddings = torch.nn.Embedding(
+                max_sequence_length, self.hidden_size)
+            self._position_embeddings_key = 'position_embeddings'
+            # Initialize the position embeddings.
+            if args.perform_initialization:
+                self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -188,8 +191,9 @@ class Embedding(MegatronModule):
         """Zero out all parameters in embedding."""
         self.word_embeddings.weight.data.fill_(0)
         self.word_embeddings.weight.shared = True
-        self.position_embeddings.weight.data.fill_(0)
-        self.position_embeddings.weight.shared = True
+        if self.add_position_embedding:
+            self.position_embeddings.weight.data.fill_(0)
+            self.position_embeddings.weight.shared = True
         if self.num_tokentypes > 0:
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
@@ -214,8 +218,12 @@ class Embedding(MegatronModule):
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
         words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings = words_embeddings + position_embeddings
+        if self.add_position_embedding:
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings = words_embeddings + position_embeddings
+        else:
+            embeddings = words_embeddings
+
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
@@ -246,8 +254,9 @@ class Embedding(MegatronModule):
         state_dict_[self._word_embeddings_key] \
             = self.word_embeddings.state_dict(prefix=prefix,
                                               keep_vars=keep_vars)
-        state_dict_[self._position_embeddings_key] \
-            = self.position_embeddings.state_dict(prefix=prefix,
+        if self.add_position_embedding:
+            state_dict_[self._position_embeddings_key] \
+                = self.position_embeddings.state_dict(prefix=prefix,
                                                   keep_vars=keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
@@ -272,16 +281,17 @@ class Embedding(MegatronModule):
         self.word_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Position embedding.
-        if self._position_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._position_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'position_embeddings' in key:
-                    state_dict_[key.split('position_embeddings.')[1]] \
-                        = state_dict[key]
-        self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+        if self.add_position_embedding:
+            if self._position_embeddings_key in state_dict:
+                state_dict_ = state_dict[self._position_embeddings_key]
+            else:
+                # for backward compatibility.
+                state_dict_ = {}
+                for key in state_dict.keys():
+                    if 'position_embeddings' in key:
+                        state_dict_[key.split('position_embeddings.')[1]] \
+                            = state_dict[key]
+            self.position_embeddings.load_state_dict(state_dict_, strict=strict)
 
         # Tokentype embedding.
         if self.num_tokentypes > 0:
@@ -350,6 +360,22 @@ class TransformerLanguageModel(MegatronModule):
                                        self.init_method,
                                        self.num_tokentypes)
             self._embedding_key = 'embedding'
+
+        # Rotary positional embeddings
+        self.use_rotary_position_embeddings = \
+            args.use_rotary_position_embeddings
+        if args.use_rotary_position_embeddings:
+            self.seq_length = args.seq_length
+            rotary_dim = args.hidden_size // args.num_attention_heads \
+                if args.kv_channels is None else args.kv_channels
+
+            if args.rotary_percent < 1.0:
+                rotary_dim = int(rotary_dim * args.rotary_percent)
+
+            # partial rotary embeddings, which is better than full rotary
+            # Wang and Komatsuzaki et al
+            # https://github.com/kingoflolz/mesh-transformer-jax/
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
 
         # Retriever (bi-directional transformer with cross attention)
         if args.retro_add_retriever:
@@ -458,6 +484,15 @@ class TransformerLanguageModel(MegatronModule):
         else:
             encoder_input = None
 
+        # Rotary positional embeddings
+        rotary_pos_emb = None
+        if self.use_rotary_position_embeddings:
+            if inference_params is not None:
+                rotary_pos_emb = \
+                    self.rotary_pos_emb(inference_params.max_sequence_len)
+            else:
+                rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
@@ -472,7 +507,8 @@ class TransformerLanguageModel(MegatronModule):
                     encoder_output = self.encoder(
                         encoder_input,
                         enc_attn_mask,
-                        inference_params=inference_params)
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -505,7 +541,8 @@ class TransformerLanguageModel(MegatronModule):
             dec_attn_mask,
             encoder_output=encoder_output,
             enc_dec_attn_mask=enc_dec_attn_mask,
-            inference_params=inference_params)
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb)
 
         if self.add_pooler and self.post_process:
             return decoder_output, encoder_output, pooled_output
