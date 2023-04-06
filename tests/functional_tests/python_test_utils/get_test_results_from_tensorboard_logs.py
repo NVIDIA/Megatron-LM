@@ -25,6 +25,7 @@ def read_tb_logs_as_list(path, summary_name):
         ea.Reload()
         summary = ea.Scalars(summary_name)
         summary_list = [round(x.value, 5) for x in summary]
+        print(f'\nObtained the following list for {summary_name} ------------------')
         print(summary_list)
         return summary_list
     raise FileNotFoundError(f"File not found matching: {path}/events*")    
