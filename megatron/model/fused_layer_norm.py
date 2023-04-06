@@ -58,8 +58,11 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
   def __init__(self, normalized_shape, eps=1e-5,
                no_persist_layer_norm=True,
-               sequence_parallel=False):
+               sequence_parallel=False,
+               apply_layernorm_1p=False):
         super(MixedFusedLayerNorm, self).__init__()
+
+        self.apply_layernorm_1p = apply_layernorm_1p
 
         global fused_mix_prec_layer_norm_cuda
         fused_mix_prec_layer_norm_cuda = importlib.import_module(
@@ -92,18 +95,21 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
   def reset_parameters(self):
 
-    init.ones_(self.weight)
-    init.zeros_(self.bias)
-
+    if self.apply_layernorm_1p:
+        init.zeros_(self.weight)
+        init.zeros_(self.bias)
+    else:
+        init.ones_(self.weight)
+        init.zeros_(self.bias)
 
   def forward(self, input):
 
+    weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
+
     if self.no_persist_layer_norm:
-        return FusedLayerNormAffineFunction.apply(
-          input, self.weight, self.bias, self.normalized_shape, self.eps)
+        return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
     else:
-        output = FastLayerNormFN.apply(
-          input, self.weight, self.bias, self.eps)
+        output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)
 
         # Apex's fast layer norm function outputs a 'view' tensor (i.e., has
         # a populated '_base' field). This will result in schedule.py's
