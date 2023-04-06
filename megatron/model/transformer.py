@@ -635,17 +635,13 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = args.bf16
         self.fp32_residual_connection = args.fp32_residual_connection
 
-        apply_layernorm_1p = False
-        if args.apply_layernorm_1p:
-            apply_layernorm_1p = True
-
         # Layernorm on the input data.
         self.input_layernorm = LayerNorm(
             args.hidden_size,
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
             sequence_parallel=args.sequence_parallel,
-            apply_layernorm_1p=apply_layernorm_1p)
+            apply_layernorm_1p=args.apply_layernorm_1p)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -664,7 +660,7 @@ class ParallelTransformerLayer(MegatronModule):
             eps=args.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
             sequence_parallel=args.sequence_parallel,
-            apply_layernorm_1p=apply_layernorm_1p)
+            apply_layernorm_1p=args.apply_layernorm_1p)
 
         if self.layer_type == LayerType.decoder:
             self.inter_attention = ParallelAttention(
@@ -678,7 +674,7 @@ class ParallelTransformerLayer(MegatronModule):
                 eps=args.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,
                 sequence_parallel=args.sequence_parallel,
-                apply_layernorm_1p=apply_layernorm_1p)
+                apply_layernorm_1p=args.apply_layernorm_1p)
 
         # MLP
         if args.num_experts is not None:
@@ -1027,10 +1023,6 @@ class ParallelTransformer(MegatronModule):
             self.layers = torch.nn.ModuleList(
                 [build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
-        apply_layernorm_1p = False
-        if args.apply_layernorm_1p:
-            apply_layernorm_1p = True
-
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_layernorm = LayerNorm(
@@ -1038,7 +1030,7 @@ class ParallelTransformer(MegatronModule):
                 eps=args.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,
                 sequence_parallel=args.sequence_parallel,
-                apply_layernorm_1p=apply_layernorm_1p)
+                apply_layernorm_1p=args.apply_layernorm_1p)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
