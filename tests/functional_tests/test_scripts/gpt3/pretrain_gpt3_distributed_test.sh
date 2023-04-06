@@ -7,7 +7,9 @@ TP_SIZE=$4
 PP_SIZE=$5
 NNODES=$6
 MAX_STEPS=$7
-
+VP_SIZE=$8
+MBS=$9
+GBS=${10}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -30,8 +32,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --log-validation-ppl-to-tensorboard \
        --log-timers-to-tensorboard \
        --tensorboard-dir ${TENSORBOARD_DIR} \
-       --micro-batch-size 4 \
-       --global-batch-size 32 \
+       --micro-batch-size ${MBS:-4} \
+       --global-batch-size ${GBS:-32} \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters $MAX_STEPS \
@@ -57,5 +59,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --eval-iters 10 \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
+       ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        --no-gradient-accumulation-fusion \
        --fp16
