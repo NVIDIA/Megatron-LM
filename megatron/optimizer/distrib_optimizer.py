@@ -385,10 +385,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   storage & have their own dtype. This is safe because the param
         #   dtype size is always <= grad dtype size.
         self.param_buffers = []
+        untyped_attr = "untyped"
+        if not hasattr(torch.Storage, untyped_attr):
+            # torch <= v1.12.1 does not export 'untyped'
+            untyped_attr = "_untyped"
         for model_index, model in enumerate(self.models):
             current_param_buffers = {}
             for dtype, grad_buffer in model._grad_buffers.items():
-                param_buffer = torch.tensor(grad_buffer.data.storage()._untyped(),
+                param_buffer = torch.tensor(getattr(grad_buffer.data.storage(), untyped_attr)(),
                                             dtype = params_dtype,
                                             device = grad_buffer.data.device)
                 param_buffer = param_buffer[:grad_buffer.numel_padded]
