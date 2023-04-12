@@ -23,7 +23,7 @@ def load(args):
     if int(bare_metal_major) >= 11:
         cc_flag.append('-gencode')
         cc_flag.append('arch=compute_80,code=sm_80')
-        if int(bare_metal_minor) >= 7:
+        if int(bare_metal_minor) >= 8:
             cc_flag.append('-gencode')
             cc_flag.append('arch=compute_90,code=sm_90')
 
