@@ -111,7 +111,7 @@ py::array build_sample_idx(const py::array_t<int32_t>& sizes_,
       endl << std::flush;
     cout << "     sequence length:           " << seq_length <<
       endl << std::flush;
-    cout << "     total tokens of per epoch:   " << tokens_per_epoch <<
+    cout << "     total tokens of per epoch: " << tokens_per_epoch <<
       endl << std::flush;
     cout << "     total number of samples:   " << num_samples <<
       endl << std::flush;
