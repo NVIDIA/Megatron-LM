@@ -308,8 +308,8 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
            (not os.path.isfile(sample_idx_filename)) or \
            (not os.path.isfile(shuffle_idx_filename)):
 
-            print_rank_0(' > WARNING: could not find index map files, building '
-                         'the indices on rank 0 ...')
+            print_rank_0(' > WARNING: could not find index map files for {}, building '
+                         'the indices on rank 0 ...'.format(_filename))
 
             # For the last epoch, decide whether include the entire epoch
             # in the global shuffle or not.
