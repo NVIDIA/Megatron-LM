@@ -188,7 +188,7 @@ def forward_step(forward_step_func,
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
 
-    context_manager = torch.autocast("cuda") if enable_autocast else nullcontext()
+    context_manager = torch.autocast("cuda") if (enable_autocast or torch.is_autocast_enabled()) else nullcontext()
     with context_manager:
         output_tensor, loss_func = forward_step_func(data_iterator, model)
 
