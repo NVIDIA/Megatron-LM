@@ -18,40 +18,11 @@ try:
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
-global fused_mix_prec_layer_norm_cuda
-fused_mix_prec_layer_norm_cuda = None
+from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
 
 
-class FusedLayerNormAffineFunction(torch.autograd.Function):
-
-  @staticmethod
-  def forward(ctx, input, weight, bias, normalized_shape, eps):
-
-    ctx.normalized_shape = normalized_shape
-    ctx.eps = eps
-    input_ = input.contiguous()
-    weight_ = weight.contiguous()
-    bias_ = bias.contiguous()
-    output, mean, invvar = fused_mix_prec_layer_norm_cuda.forward_affine(
-        input_, ctx.normalized_shape, weight_, bias_, ctx.eps)
-    ctx.save_for_backward(input_, weight_, bias_, mean, invvar)
-
-    return output
-
-
-  @staticmethod
-  def backward(ctx, grad_output):
-
-    input_, weight_, bias_, mean, invvar = ctx.saved_tensors
-    grad_input = grad_weight = grad_bias = None
-    grad_input, grad_weight, grad_bias \
-      = fused_mix_prec_layer_norm_cuda.backward_affine(
-        grad_output.contiguous(), mean, invvar,
-        input_, ctx.normalized_shape,
-        weight_, bias_, ctx.eps)
-
-    return grad_input, grad_weight, grad_bias, None, None
-
+global fused_layer_norm_cuda
+fused_layer_norm_cuda = None
 
 
 class MixedFusedLayerNorm(torch.nn.Module):
@@ -64,9 +35,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
 
         self.apply_layernorm_1p = apply_layernorm_1p
 
-        global fused_mix_prec_layer_norm_cuda
-        fused_mix_prec_layer_norm_cuda = importlib.import_module(
-          "fused_mix_prec_layer_norm_cuda")
+        global fused_layer_norm_cuda
+        fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -87,7 +57,7 @@ class MixedFusedLayerNorm(torch.nn.Module):
         self.reset_parameters()
         self.no_persist_layer_norm = no_persist_layer_norm
         self.sequence_parallel = sequence_parallel
-        
+
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
         setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
