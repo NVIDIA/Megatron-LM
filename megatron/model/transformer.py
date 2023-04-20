@@ -383,8 +383,11 @@ class FlashSelfAttention(torch.nn.Module):
             # turn off FA causal mask after first inference autoregressive iteration
             # only on first autoregressive step q,k,v have same seqlen
             is_causal = seqlen_q == seqlen_k
-            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
-                                        device=q.device)
+            if not is_causal:
+                cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
+                                            device=q.device)
+            else:
+                cu_seqlens_k = cu_seqlens_q
 
         output = flash_attn_unpadded_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
