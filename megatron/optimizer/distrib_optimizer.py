@@ -15,6 +15,11 @@ from megatron.model.module import param_is_not_shared
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 
 
+if hasattr(torch, "_TypedStorage"):
+    # simple alias for backward compatibility
+    torch._TypedStorage.untyped = torch._TypedStorage._untyped
+
+
 class Range:
     """
     A range represents a start and end points for indexing a shard
@@ -385,14 +390,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   storage & have their own dtype. This is safe because the param
         #   dtype size is always <= grad dtype size.
         self.param_buffers = []
-        untyped_attr = "untyped"
-        if not hasattr(torch.Storage, untyped_attr):
-            # torch <= v1.12.1 does not export 'untyped'
-            untyped_attr = "_untyped"
         for model_index, model in enumerate(self.models):
             current_param_buffers = {}
             for dtype, grad_buffer in model._grad_buffers.items():
-                param_buffer = torch.tensor(getattr(grad_buffer.data.storage(), untyped_attr)(),
+                param_buffer = torch.tensor(grad_buffer.data.storage().untyped(),
                                             dtype = params_dtype,
                                             device = grad_buffer.data.device)
                 param_buffer = param_buffer[:grad_buffer.numel_padded]
