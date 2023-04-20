@@ -1001,6 +1001,8 @@ def _add_data_args(parser):
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
 
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='Size of vocab before EOD or padding.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -1034,7 +1036,8 @@ def _add_data_args(parser):
                        choices=['BertWordPieceLowerCase',
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer',
-                                'SentencePieceTokenizer'],
+                                'SentencePieceTokenizer',
+                                'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')

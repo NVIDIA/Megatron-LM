@@ -15,28 +15,31 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    if args.tokenizer_type != 'SentencePieceTokenizer':
-        assert args.vocab_file is not None
-
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'BertWordPieceCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=False,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
+        assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
+    elif args.tokenizer_type == 'NullTokenizer':
+        assert args.vocab_size is not None
+        tokenizer = _NullTokenizer(args.vocab_size)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
-
+    
     # Add vocab size.
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                       args)
@@ -447,3 +450,35 @@ class _SentencePieceTokenizer(AbstractTokenizer):
     def additional_special_tokens_ids(self):
         return [self.vocab[k] for k in self._t5_tokens]
 
+class _NullTokenizer:
+    def __init__(self, vocab_size):
+        vocab_size = int(vocab_size)
+        self._eos_id = vocab_size
+        self.vocab_size = vocab_size+1
+
+    def tokenize(self, text):
+        return [int(x) for x in text.split(' ')]
+
+    def detokenize(self, ids):
+        text = [str(x) for x in ids]
+        return ' '.join(txt)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
