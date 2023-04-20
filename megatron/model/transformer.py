@@ -240,7 +240,7 @@ class CoreAttention(MegatronModule):
             args.masked_softmax_fusion,
             attention_mask_func,
             self.attention_softmax_in_fp32,
-            coeff)
+            None)
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
