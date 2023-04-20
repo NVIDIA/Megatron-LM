@@ -15,7 +15,9 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    if args.tokenizer_type not in ['SentencePieceTokenizer', 'GPTSentencePieceTokenizer']:
+    if args.tokenizer_type not in ['SentencePieceTokenizer', 
+            'GPTSentencePieceTokenizer',
+            'NullTokenizer']:
         assert args.vocab_file is not None
 
     # Select and instantiate the tokenizer.
@@ -36,6 +38,9 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'NullTokenizer':
+        assert args.vocab_size is not None
+        tokenizer = _NullTokenizer(args.vocab_size)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -479,6 +484,39 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
 
     def detokenize(self, ids):
         return self.tokenizer.decode_ids(ids)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+class _NullTokenizer:
+    def __init__(self, vocab_size):
+        vocab_size = int(vocab_size)
+        self._eos_id = vocab_size
+        self.vocab_size = vocab_size+1
+
+    def tokenize(self, text):
+        return [int(x) for x in text.split(' ')]
+
+    def detokenize(self, ids):
+        text = [str(x) for x in ids]
+        return ' '.join(text)
 
     @property
     def cls(self):
