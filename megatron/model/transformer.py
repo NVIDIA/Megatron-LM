@@ -473,8 +473,12 @@ class ParallelAttention(MegatronModule):
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
+            attn_scale = math.sqrt(self.hidden_size_per_attention_head)
+            if self.apply_query_key_layer_scaling:
+                attn_scale *= self.layer_number
+
             self.core_attention_flash = FlashSelfAttention(
-                causal=True, attention_dropout=args.attention_dropout
+                causal=True, softmax_scale=attn_scale, attention_dropout=args.attention_dropout
             )
 
         # Output.
