@@ -55,7 +55,7 @@ def get_batch(data_iterator):
         tokens,
         tokenizer.eod, # 结束符
         args.reset_position_ids,
-        args.reset_attention_mask, 
+        args.reset_attention_mask, # 在结束符之后，reset 位置编码和mask
         args.eod_mask_loss) # 预测是结束符是否在loss中计算，默认不计算，影响短句子
 
     return tokens, labels, loss_mask, attention_mask, position_ids
