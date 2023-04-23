@@ -53,10 +53,10 @@ def get_batch(data_iterator):
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
-        tokenizer.eod,
+        tokenizer.eod, # 结束符
         args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.reset_attention_mask, 
+        args.eod_mask_loss) # 预测是结束符是否在loss中计算，默认不计算，影响短句子
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
