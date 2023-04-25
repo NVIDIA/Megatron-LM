@@ -562,7 +562,6 @@ def forward_backward_pipelining_with_interleaving(*,
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             if next_backward_model_chunk_id == (num_model_chunks - 1):
                 recv_next = False
-                                                                                                                              forward=F
 
         # If last iteration, don't receive; we already received one extra
         # before the start of the for loop.
