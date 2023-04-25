@@ -15,21 +15,19 @@ def build_tokenizer(args):
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
 
-    if args.tokenizer_type not in ['SentencePieceTokenizer', 
-            'GPTSentencePieceTokenizer',
-            'NullTokenizer']:
-        assert args.vocab_file is not None
-
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=True,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'BertWordPieceCase':
+        assert args.vocab_file is not None
         tokenizer = _BertWordPieceTokenizer(vocab_file=args.vocab_file,
                                             lower_case=False,
                                             vocab_extra_ids=args.vocab_extra_ids)
     elif args.tokenizer_type == 'GPT2BPETokenizer':
+        assert args.vocab_file is not None
         assert args.merge_file is not None
         tokenizer = _GPT2BPETokenizer(args.vocab_file, args.merge_file)
     elif args.tokenizer_type == 'SentencePieceTokenizer':
@@ -44,7 +42,7 @@ def build_tokenizer(args):
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
-
+    
     # Add vocab size.
     args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
                                                       args)
@@ -464,7 +462,6 @@ class _SentencePieceTokenizer(AbstractTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return [self.vocab[k] for k in self._t5_tokens]
-
 
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
