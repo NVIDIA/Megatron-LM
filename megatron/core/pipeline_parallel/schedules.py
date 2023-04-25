@@ -552,28 +552,17 @@ def forward_backward_pipelining_with_interleaving(*,
         # Determine if peers are sending, and where in data structure to put
         # received tensors.
         recv_prev = True
+        next_forward_model_chunk_id = get_model_chunk_id(forward_k + 1, forward=True)
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            # First stage is ahead of last stage by (pipeline_parallel_size - 1).
-            next_forward_model_chunk_id = get_model_chunk_id(
-                forward_k - (pipeline_parallel_size - 1), forward=True)
-            if next_forward_model_chunk_id == (num_model_chunks - 1):
+            if next_forward_model_chunk_id == 0:
                 recv_prev = False
-            next_forward_model_chunk_id += 1
-        else:
-            next_forward_model_chunk_id = get_model_chunk_id(forward_k + 1,
-                                                             forward=True)
 
         recv_next = True
+        next_backward_model_chunk_id = get_model_chunk_id(backward_k + 1, forward=False)
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            # Last stage is ahead of first stage by (pipeline_parallel_size - 1).
-            next_backward_model_chunk_id = get_model_chunk_id(
-                backward_k - (pipeline_parallel_size - 1), forward=False)
-            if next_backward_model_chunk_id == 0:
+            if next_backward_model_chunk_id == (num_model_chunks - 1):
                 recv_next = False
-            next_backward_model_chunk_id -= 1
-        else:
-            next_backward_model_chunk_id = get_model_chunk_id(backward_k + 1,
-                                                              forward=False)
+                                                                                                                              forward=F
 
         # If last iteration, don't receive; we already received one extra
         # before the start of the for loop.
