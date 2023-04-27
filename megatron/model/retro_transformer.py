@@ -77,9 +77,9 @@ class SwitchMLP(MegatronModule):
     def __init__(self, init_method, output_layer_init_method):
         super(SwitchMLP, self).__init__()
         args = get_args()
-        self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
+        self.router = torch.nn.Linear(args.hidden_size, args.moe_num_experts)
         self.experts = torch.nn.ModuleList()
-        for i in range(args.num_experts):
+        for i in range(args.moe_num_experts):
             self.experts.append(ParallelMLP(init_method, output_layer_init_method))
 
     def forward(self, hidden_states):
@@ -479,7 +479,7 @@ class ParallelRetroTransformerEncoderLayer(MegatronModule):
             no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        if args.num_experts is not None:
+        if args.moe_num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
@@ -714,7 +714,7 @@ class ParallelRetroTransformerLayer(MegatronModule):
             no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        if args.num_experts is not None:
+        if args.moe_num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
@@ -906,7 +906,7 @@ class ParallelRetroEncoderTransformerCALayer(MegatronModule):
             no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        if args.num_experts is not None:
+        if args.moe_num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
@@ -1099,7 +1099,7 @@ class ParallelTransformerLayer(MegatronModule):
                 no_persist_layer_norm=args.no_persist_layer_norm)
 
         # MLP
-        if args.num_experts is not None:
+        if args.moe_num_experts is not None:
             self.mlp = SwitchMLP(init_method, output_layer_init_method)
         else:
             self.mlp = ParallelMLP(init_method, output_layer_init_method)
