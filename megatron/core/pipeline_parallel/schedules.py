@@ -400,6 +400,9 @@ def forward_backward_pipelining_with_interleaving(*,
             no_sync_context = None
     disable_grad_sync()
 
+    # Model chunk IDs with synchronized grads
+    synchronized_model_chunks = set()
+
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
     forward_data_store = []
@@ -489,7 +492,7 @@ def forward_backward_pipelining_with_interleaving(*,
         if microbatch_group_id == num_microbatch_groups - 1:
             return microbatch_id_in_group % pipeline_parallel_size == pipeline_parallel_size - 1
         else:
-            return Falsd
+            return False
 
 
     def forward_step_helper(microbatch_id):
@@ -500,11 +503,10 @@ def forward_backward_pipelining_with_interleaving(*,
         parallel_state.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
         # launch param synchronization for next model chunk
-        # Note: To achieve maximum performance, pipeline parallelism
-        # assumes all ranks have the same compute time. However,
-        # asynchronous communication tends to slow down compute. Thus,
-        # we launch asynchronous communication at the same time across
-        # the pipeline-parallel group.
+        # Note: Asynchronous communication tends to slow down compute.
+        # To reduce idling from mismatched microbatch times, we launch
+        # asynchronous communication at the same time across the
+        # pipeline-parallel group.
         if param_sync_func is not None:
             param_sync_microbatch_id = microbatch_id + pipeline_parallel_rank
             if param_sync_microbatch_id < num_microbatches and is_first_microbatch_for_model_chunk(param_sync_microbatch_id):
@@ -546,6 +548,7 @@ def forward_backward_pipelining_with_interleaving(*,
         # launch grad synchronization (default)
         if grad_sync_func is None and is_last_microbatch_for_model_chunk(microbatch_id):
             enable_grad_sync()
+            synchronized_model_chunks.add(model_chunk_id)
 
         if parallel_state.is_pipeline_last_stage():
             if len(output_tensor_grads[model_chunk_id]) == 0:
@@ -562,17 +565,17 @@ def forward_backward_pipelining_with_interleaving(*,
                           timers)
 
         # launch grad synchronization (custom grad sync)
-        # Note: To achieve maximum performance, pipeline parallelism
-        # assumes all ranks have the same compute time. However,
-        # asynchronous communication tends to slow down compute. Thus,
-        # we launch asynchronous communication at the same time across
-        # the pipeline-parallel group.
+        # Note: Asynchronous communication tends to slow down compute.
+        # To reduce idling from mismatched microbatch times, we launch
+        # asynchronous communication at the same time across the
+        # pipeline-parallel group.
         if grad_sync_func is not None:
             grad_sync_microbatch_id = microbatch_id - pipeline_parallel_rank
             if grad_sync_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(grad_sync_microbatch_id):
                 grad_sync_chunk_id = get_model_chunk_id(grad_sync_microbatch_id, forward=False)
                 enable_grad_sync()
                 grad_sync_func(model[grad_sync_chunk_id].parameters())
+                synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
 
         return input_tensor_grad
@@ -713,8 +716,16 @@ def forward_backward_pipelining_with_interleaving(*,
                     tensor_shape=tensor_shape, dtype=dtype,
                     timers=timers))
 
-    # Make sure to exit context handler for async grad reductions
+    # Launch any remaining grad reductions
     enable_grad_sync()
+    if grad_sync_func is not None:
+        params = []
+        for model_chunk_id in range(num_model_chunks):
+            if model_chunk_id not in synchronized_model_chunks:
+                params.extend(model[model_chunk_id].parameters())
+                synchronized_model_chunks.add(model_chunk_id)
+        if params:
+            grad_sync_func(params)
 
     return forward_data_store
 
@@ -970,10 +981,14 @@ def forward_backward_pipelining_without_interleaving(*,
     if not forward_only:
         for i in range(num_warmup_microbatches):
 
-            if i == num_warmup_microbatches-1 and rank == 0:
-                # Async grad reduction in first pipeline stage, during
-                # last backward pass
-                enable_grad_sync()
+            # Enable async grad reduction in the last backward pass
+            # Note: If grad sync function is provided, only enable
+            # async grad reduction in first pipeline stage. Other
+            # pipeline stages do grad reduction during pipeline
+            # bubble.
+            if i == num_warmup_microbatches-1:
+                if grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
@@ -986,9 +1001,10 @@ def forward_backward_pipelining_without_interleaving(*,
 
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 
-    # Grad reduction in all pipeline stages except the first
-    enable_grad_sync()
-    if rank != 0 and grad_sync_func is not None:
-        grad_sync_func(model.parameters())
+    # Launch any remaining grad reductions
+    if no_sync_context is not None:
+        enable_grad_sync()
+        if grad_sync_func is not None:
+            grad_sync_func(model.parameters())
 
     return forward_data_store
