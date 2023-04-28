@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
+import contextlib
 from typing import Optional, List, Union, Callable, Any
 
 import torch
@@ -203,7 +203,7 @@ def forward_step(forward_step_func,
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
 
-    context_manager = torch.autocast("cuda") if enable_autocast else nullcontext()
+    context_manager = torch.autocast("cuda") if enable_autocast else contextlib.nullcontext()
     with context_manager:
         output_tensor, loss_func = forward_step_func(data_iterator, model)
 
@@ -323,13 +323,14 @@ def forward_backward_no_pipelining(*,
     """
 
     if isinstance(model, list):
-        assert len(model) == 1
+        assert len(model) == 1, \
+            "non-pipeline-parallel schedule does not support model chunking"
         model = model[0]
 
     if no_sync_func is None and isinstance(model, torchDDP):
         no_sync_func = model.no_sync
     if no_sync_func is None:
-        no_sync_func = nullcontext
+        no_sync_func = contextlib.nullcontext
 
     model_type = get_model_type(model)
 
@@ -379,12 +380,21 @@ def forward_backward_pipelining_with_interleaving(*,
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+    assert isinstance(model, list), \
+        "interleaved pipeline parallelism expected model chunking"
+    assert model and isinstance(model[0], torch.nn.Module), \
+        "invalid model chunking"
 
     # Disable async grad reductions
-    if no_sync_func is None and isinstance(model, torchDDP):
-        no_sync_func = model.no_sync
+    if no_sync_func is None and isinstance(model[0], torchDDP):
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for chunk in model:
+                stack.enter_context(chunk.no_sync())
+            return stack
+        no_sync_func = multi_no_sync
     if no_sync_func is None:
-        no_sync_func = nullcontext
+        no_sync_func = contextlib.nullcontext
     no_sync_context = None
     def disable_grad_sync():
         """Disable asynchronous grad reductions"""
@@ -861,14 +871,15 @@ def forward_backward_pipelining_without_interleaving(*,
     Returns dictionary with losses if the last stage, empty dict otherwise."""
 
     if isinstance(model, list):
-        assert len(model) == 1
+        assert len(model) == 1, \
+            "non-interleaved pipeline parallelism does not support model chunking"
         model = model[0]
 
     # Disable async grad reductions
     if no_sync_func is None and isinstance(model, torchDDP):
         no_sync_func = model.no_sync
     if no_sync_func is None:
-        no_sync_func = nullcontext
+        no_sync_func = contextlib.nullcontext
     no_sync_context = None
     def disable_grad_sync():
         """Disable asynchronous grad reductions"""
