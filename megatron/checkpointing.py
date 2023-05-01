@@ -461,14 +461,16 @@ def load_args_from_checkpoint(args, load_arg='load'):
     checkpoint_version = state_dict.get('checkpoint_version', 0)
     args.iteration = state_dict['iteration']
 
-    def _set_arg(arg_name, old_arg_name=None, old_arg_conversion=None, force=False):
+    # One-off conversion for foundation models
+    if hasattr(checkpoint_args, 'disable_bias_linear'):
+        setattr(checkpoint_args, 'add_bias_linear', not getattr(checkpoint_args, 'disable_bias_linear'))
+
+    def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
 
         if old_arg_name is not None:
             checkpoint_value = getattr(checkpoint_args, old_arg_name, None)
-            if old_arg_conversion is not None:
-                checkpoint_value = old_arg_conversion(checkpoint_value)
         else:
             checkpoint_value = getattr(checkpoint_args, arg_name, None)
 
@@ -488,7 +490,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
-    _set_arg('add_bias_linear', old_arg_name='disable_bias_linear', old_arg_conversion=lambda _: not _, force=True)
+    _set_arg('add_bias_linear', force=True)
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
