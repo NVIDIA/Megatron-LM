@@ -142,6 +142,7 @@ def save_checkpoint(queue, args):
                         'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                         'sequence_parallel', 'async_tensor_model_parallel_allreduce',
                         'no_load_optim', 'no_load_rng', 'no_save_optim', 'no_save_rng',
+                        'vocab_file', 'tokenizer_model',
                         'save_interval', 'save',
                         'perform_initialization', 'use_cpu_initialization',
                         'encoder_num_layers', 'encoder_seq_length',
