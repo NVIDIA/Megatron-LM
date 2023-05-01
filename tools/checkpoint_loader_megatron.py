@@ -188,7 +188,7 @@ def _load_checkpoint(queue, args):
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embeddings = margs.add_position_embedding
-    md.linear_bias = not margs.disable_bias_linear
+    md.linear_bias = margs.add_bias_linear
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
