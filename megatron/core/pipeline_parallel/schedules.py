@@ -1,7 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-from typing import Optional, List, Union, Callable, Any
+from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -54,10 +54,11 @@ def get_forward_backward_func():
 
 
     data_iterator (required): an iterator over the data, will be
-        passed as is to forward_step_func
+        passed as is to forward_step_func. Expected to be a list of
+        iterators in the case of interleaved pipeline parallelism.
 
-    model (required): the actual model. A torch.nn.Module or, in the
-        case or iterleaving, a list of torch.nn.Module
+    model (required): the actual model. Expected to be a list of
+        modules in the case of interleaved pipeline parallelism.
 
     num_microbatches (int, required):
         The number of microbatches to go through
@@ -297,7 +298,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
 
 def forward_backward_no_pipelining(*,
                                    forward_step_func,
-                                   data_iterator,
+                                   data_iterator: Union[Iterator, List[Iterator]],
                                    model: Union[torch.nn.Module, List[torch.nn.Module]],
                                    num_microbatches: int,
                                    dtype: Optional[torch.dtype] = None, # unused
@@ -326,6 +327,10 @@ def forward_backward_no_pipelining(*,
         assert len(model) == 1, \
             "non-pipeline-parallel schedule does not support model chunking"
         model = model[0]
+    if isinstance(data_iterator, list):
+        assert len(data_iterator) == 1, \
+            "non-pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
 
     if no_sync_func is None and isinstance(model, torchDDP):
         no_sync_func = model.no_sync
@@ -360,7 +365,7 @@ def forward_backward_no_pipelining(*,
 
 def forward_backward_pipelining_with_interleaving(*,
                                                   forward_step_func,
-                                                  data_iterator,
+                                                  data_iterator: Union[Iterator, List[Iterator]],
                                                   model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                   num_microbatches: int,
                                                   dtype: torch.dtype,
@@ -382,11 +387,13 @@ def forward_backward_pipelining_with_interleaving(*,
     Returns dictionary with losses if the last stage, empty dict otherwise."""
     assert isinstance(model, list), \
         "interleaved pipeline parallelism expected model chunking"
-    assert model and isinstance(model[0], torch.nn.Module), \
+    assert all(isinstance(chunk, torch.nn.Module) for chunk in model), \
         "invalid model chunking"
+    assert isinstance(data_iterator, list), \
+        "interleaved pipeline parallelism expected each model chunk to have a data iterator"
 
     # Disable async grad reductions
-    if no_sync_func is None and isinstance(model[0], torchDDP):
+    if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
         def multi_no_sync():
             stack = contextlib.ExitStack()
             for chunk in model:
@@ -849,7 +856,7 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, dtype, timers)
 
 def forward_backward_pipelining_without_interleaving(*,
                                                      forward_step_func,
-                                                     data_iterator,
+                                                     data_iterator: Union[Iterator, List[Iterator]],
                                                      model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                      num_microbatches: int,
                                                      dtype: torch.dtype,
@@ -874,6 +881,10 @@ def forward_backward_pipelining_without_interleaving(*,
         assert len(model) == 1, \
             "non-interleaved pipeline parallelism does not support model chunking"
         model = model[0]
+    if isinstance(data_iterator, list):
+        assert len(data_iterator) == 1, \
+            "non-pipeline-parallel schedule does not support model chunking"
+        data_iterator = data_iterator[0]
 
     # Disable async grad reductions
     if no_sync_func is None and isinstance(model, torchDDP):
