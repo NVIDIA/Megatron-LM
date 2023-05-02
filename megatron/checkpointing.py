@@ -112,7 +112,7 @@ def get_checkpoint_names(checkpoints_path, iteration,
     if os.path.exists(unified_name) or not use_distributed_optimizer:
         assert not os.path.exists(distrib_model_name)
         if use_distributed_optimizer:
-            assert no_load_optim # or args.finetune?
+            assert no_load_optim
         model_name = optim_name = unified_name
     elif os.path.exists(distrib_model_name) or use_distributed_optimizer:
         assert use_distributed_optimizer
