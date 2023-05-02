@@ -63,7 +63,7 @@ def model_provider(pre_process=True, post_process=True,
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process,
-            prefix_lm=True
+            prefix_lm=is_prefix_lm(),
         )
     else:
         print_rank_0('Using encoder-decoder UL2 model.')
