@@ -106,9 +106,6 @@ def get_checkpoint_names(checkpoints_path, iteration,
     # that's used without loading the pretraining optimizer.
     unified_name = os.path.join(common_path, "model_optim_rng.pt")
     distrib_model_name = os.path.join(common_path, "model_rng.pt")
-    distrib_optim_name = os.path.join(
-        common_path + "_%03d" % mpu.get_data_parallel_rank(),
-        "optim.pt")
     if os.path.exists(unified_name) or not use_distributed_optimizer:
         assert not os.path.exists(distrib_model_name)
         if use_distributed_optimizer:
@@ -117,6 +114,9 @@ def get_checkpoint_names(checkpoints_path, iteration,
     elif os.path.exists(distrib_model_name) or use_distributed_optimizer:
         assert use_distributed_optimizer
         assert not os.path.exists(unified_name)
+        distrib_optim_name = os.path.join(
+            common_path + "_%03d" % mpu.get_data_parallel_rank(),
+            "optim.pt")
         model_name = distrib_model_name
         optim_name = distrib_optim_name
     else:
