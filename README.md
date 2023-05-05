@@ -42,7 +42,9 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Distributed Pretraining](#distributed-pretraining)
       * [Activation Checkpointing and Recomputation](#activation-checkpointing-and-recomputation)
       * [Distributed Optimizer](#distributed-optimizer)
+      * [FlashAttention](#flashattention)
       * [GPT-3 Example](#gpt-3-example)
+      * [Retro](#retro)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
       * [GPT Evaluation](#gpt-evaluation)
@@ -56,7 +58,13 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
 
 # Setup
-We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch). If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
+We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) with DGX nodes. If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.
+
+You can launch an instance of the PyTorch container and mount Megatron, your dataset, and checkpoints with the following Docker commands:
+```
+docker pull nvcr.io/nvidia/pytorch:xx.xx-py3
+docker run --gpus all -it --rm -v /path/to/megatron:/workspace/megatron -v /path/to/dataset:/workspace/dataset -v /path/to/checkpoints:/workspace/checkpoints nvcr.io/nvidia/pytorch:xx.xx-py3
+```
 
 ## Downloading Checkpoints
 We have provided pretrained [BERT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_bert_345m) and [GPT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_lm_345m) checkpoints for use to evaluate or finetuning downstream tasks. To access these checkpoints, first [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI. Further documentation for downloading models can be found in the [NGC documentation](https://docs.nvidia.com/dgx/ngc-registry-cli-user-guide/index.html#topic_6_4_1).
@@ -130,47 +138,13 @@ Further command line arguments are described in the source file [`preprocess_dat
 ## BERT Pretraining
 
 
-The `examples/pretrain_bert.sh` script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
+The [`examples/pretrain_bert.sh`](./examples/pretrain_bert.sh) script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
 
 The logging, checkpoint-saving, and evaluation intervals are specified. Checkpointing the activations facilitates the training of larger models and/or batches. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
 
-<pre>
-CHECKPOINT_PATH=checkpoints/bert_345m
-VOCAB_FILE=bert-vocab.txt
-DATA_PATH=my-bert_text_sentence
-
-BERT_ARGS="--num-layers 24 \
-           --hidden-size 1024 \
-           --num-attention-heads 16 \
-           --seq-length 512 \
-           --max-position-embeddings 512 \
-           --lr 0.0001 \
-           --lr-decay-iters 990000 \
-           --train-iters 2000000 \
-           --min-lr 0.00001 \
-           --lr-warmup-fraction 0.01 \
-	   --micro-batch-size 4 \
-           --global-batch-size 8 \
-           --vocab-file $VOCAB_FILE \
-           --split 949,50,1 \
-           --fp16"
-
-OUTPUT_ARGS="--log-interval 10 \
-             --save-interval 500 \
-             --eval-interval 100 \
-             --eval-iters 10 \
-             --activations-checkpoint-method uniform"
-
-python pretrain_bert.py \
-       $BERT_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH
-</pre>
-
 Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
 
+To run `examples/pretrain_bert.sh`, make any desired modifications including setting the environment variables for `CHECKPOINT_PATH`, `VOCAB_FILE`, and `DATA_PATH`. Make sure to set these variables to their paths in the container. Then launch the container with Megatron and necessary paths mounted (as explained in [Setup](#setup)) and run the example script.
 
 ## GPT Pretraining
 
@@ -178,39 +152,9 @@ The `examples/pretrain_gpt.sh` script runs single GPU 345M parameter GPT pretrai
 
 It follows largely the same format as the previous BERT script with a few notable differences: the tokenization scheme used is BPE (which requires a merge table and a `json` vocabulary file) instead of WordPiece, the model architecture allows for longer sequences (note that the max position embedding must be greater than or equal to the maximum sequence length), and the `--lr-decay-style` has been set to cosine decay.  Note that the `--data-path` now includes the additional `_text_document` suffix added in preprocessing, but does not include the file extensions.
 
-<pre>
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
-DATA_PATH=my-gpt2_text_document
-
-GPT_ARGS="--num-layers 24 \
-          --hidden-size 1024 \
-          --num-attention-heads 16 \
-          --seq-length 1024 \
-          --max-position-embeddings 1024 \
-          --micro-batch-size 4 \
-          --global-batch-size 8 \
-          --lr 0.00015 \
-          --train-iters 500000 \
-          --lr-decay-iters 320000 \
-          --lr-decay-style cosine \
-          --vocab-file $VOCAB_FILE \
-          --merge-file $MERGE_FILE \
-          --lr-warmup-fraction .01 \
-          --fp16"
-
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-
-python pretrain_gpt.py \
-       $GPT_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH \
-</pre>
-
 Further command line arguments are described in the source file [`arguments.py`](./megatron/arguments.py).
+
+`examples/pretrain_gpt.sh` can be launched the same way as described for BERT. Set the env vars and make any other modifications, launch the container with appropriate mounts, and run the script.
 
 ## T5 Pretraining
 
@@ -222,43 +166,7 @@ Very similar to BERT and GPT, the `examples/pretrain_t5.sh` script runs single G
 
 * `--encoder-seq-length` and `--decoder-seq-length` set the sequence length for the encoder and decoder separately.
 
-All of the other arguments remain as they were for BERT and GPT pretraining.
-
-<pre>
-CHECKPOINT_PATH=checkpoints/t5_base
-VOCAB_FILE=t5-vocab.txt
-DATA_PATH=my-t5_text_sentence
-
-T5_ARGS="--num-layers 24 \
-         --hidden-size 1024 \
-         --num-attention-heads 16 \
-         --kv-channels 64 \
-         --ffn-hidden-size 3072 \
-         --encoder-seq-length 512 \
-         --decoder-seq-length 128 \
-         --max-position-embeddings 512 \
-         --lr 0.0001 \
-         --lr-decay-iters 990000 \
-         --train-iters 2000000 \
-         --min-lr 0.00001 \
-         --lr-warmup-fraction 0.01 \
-         --micro-batch-size 16 \
-         --global-batch-size 2048 \
-         --vocab-file $VOCAB_FILE \
-         --vocab-extra-ids 100 \
-         --split 949,50,1 \
-         --fp16"
-
-OUTPUT_ARGS=&#60;same as those in <a href="#bert-pretraining">BERT pretraining</a> above&#62;
-
-python pretrain_t5.py \
-       $T5_ARGS \
-       $OUTPUT_ARGS \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH
-</pre>
-
+All of the other arguments remain as they were for BERT and GPT pretraining. Run this example with the same steps described above for the other scripts.
 
 ## Distributed Pretraining
 
@@ -266,9 +174,9 @@ The `examples/pretrain_{bert,gpt,t5}_distributed.sh` scripts use the PyTorch dis
 
 We use two types of parallelism: data and model parallelism. We facilitate two distributed data parallel implementations: a simple one of our own that performs gradient all-reduce at the end of back propagation step, and Torch's distributed data parallel wrapper that overlaps gradient reduction with back propagation computation. To switch between these two options use `--DDP-impl local` or `--DDP-impl torch`, respectively. As expected, Torch distributed data parallelism is more efficient at larger model sizes. For example, for the 8.3 billion parameters model running on 512 GPUs, the scaling increases from 60% to 76% when Torch's distributed data parallel is used. However, the overlapping method requires more memory and for some configurations (e.g., 2.5 billion parameters using 2-way model parallel and 1.2 billion parameters with no model parallel) can make the overall training slower as a result. We empirically found that using a smaller model in those cases improves the training time.
 
-Second, we developed a simple and efficient two-dimensional model-parallel approach. To use tensor model parallelism (splitting execution of a single transformer module over multiple GPUs), add the `--tensor-model-parallel-size` flag to specify the number of GPUs among which to split the model, along with the arguments passed to the distributed launcher as mentioned above. To use sequence parallelism specify `--sequence-parallel`, which requires tensor model parallel as it split among the same GPUs.
+Second, we developed a simple and efficient two-dimensional model-parallel approach. To use tensor model parallelism (splitting execution of a single transformer module over multiple GPUs, see Section 3 of [our paper](https://arxiv.org/pdf/1909.08053.pdf)), add the `--tensor-model-parallel-size` flag to specify the number of GPUs among which to split the model, along with the arguments passed to the distributed launcher as mentioned above. To use sequence parallelism specify `--sequence-parallel`, which requires tensor model parallel as it split among the same GPUs (more details in Section 4.2.2 of [our paper](https://arxiv.org/pdf/2205.05198.pdf)).
 
-To use pipeline model parallelism (sharding the transformer modules into stages with an equal number of transformer modules on each stage, and then pipelining execution by breaking the batch into smaller microbatches), use the `--pipeline-model-parallel-size` flag to specify the number of stages to split the model into (e.g., splitting a model with 24 transformer layers across 4 stages would mean each stage gets 6 transformer layers each).
+To use pipeline model parallelism (sharding the transformer modules into stages with an equal number of transformer modules on each stage, and then pipelining execution by breaking the batch into smaller microbatches, see Section 2.2 of [our paper](https://arxiv.org/pdf/2104.04473.pdf)), use the `--pipeline-model-parallel-size` flag to specify the number of stages to split the model into (e.g., splitting a model with 24 transformer layers across 4 stages would mean each stage gets 6 transformer layers each).
 
 <!-- The number of microbatches in a per-pipeline minibatch is controlled by the `--num-microbatches-in-minibatch` argument. With `WORLD_SIZE` GPUs, `TENSOR_MP_SIZE` tensor-model-parallel size, `PIPELINE_MP_SIZE` pipeline-model-parallel-size, `WORLD_SIZE`/(`TENSOR_MP_SIZE` * `PIPELINE_MP_SIZE`) GPUs will be used for data parallelism. The default values for `--tensor-model-parallel-size` and `--pipeline-model-parallel-size` is 1, which will not implement either form of model parallelism. -->
 
@@ -322,6 +230,19 @@ In `examples/pretrain_gpt3_175B.sh` we have provided an example of how to config
 
 With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes around 32 seconds resulting in 138 teraFLOPs per GPU which is 44% of the theoretical peak FLOPs.
 
+
+## Retro
+
+See:
+
+- `tools/retro/README.md` for an overview.
+- `tools/retro/examples/get_preprocess_cmd.sh` for an example of common preprocessing arguments.
+- `tools/retro/examples/preprocess_data.sh` for an example of how to preprocess data.
+- `tools/retro/examples/pretrain_model.sh` for an example of how to pretrain a model.
+
+Retro is a retrieval-enhanced model that is based on GPT. As described in [Improving language models by retrieving from trillions of tokens](https://arxiv.org/abs/2112.04426), Retro retrieves from a database of document chunks by performing locality search using a sample's tokens. The retrieval database can be large -- often billions or even trillions of tokens -- and provides a more efficient storage mechanism of factual knowledge, when compared to storing factual knowledge implicitly within the network's parameters.
+
+Using Retro requires two steps: 1) preprocessing the retrieval database and pretraining neighbors, and 2) pretraining a model using this data. Please see `tools/retro/README.md` for a detailed overview.
 
 <!--
 ## REALM Pipeline
@@ -417,7 +338,7 @@ python tools/checkpoint_util.py \
         --load-dir checkpoints/gpt3_tp4_pp4 \
         --save-dir checkpoints/gpt3_tp2_pp2 \
         --target-tensor-parallel-size 2 \
-        --target-pipeline-paralle-size 2
+        --target-pipeline-parallel-size 2
 
 </pre>
 
@@ -430,7 +351,7 @@ We have included a simple REST server to use for text generation in `tools/run_t
 Once the server is running you can use `tools/text_generation_cli.py` to query it, it takes one argument which is the host the server is running on.
 
 <pre>
-tools/text_generation_cli.py localhost
+tools/text_generation_cli.py localhost:5000
 </pre>
 
 You can also use CURL or any other tools to query the server directly:

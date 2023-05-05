@@ -1,13 +1,270 @@
-image: gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
+image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
 
-test:
+stages:
+  - test
+  - cleanup
+
+variables: &VARS
+  SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
+  DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
+  PYTORCH_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
+  PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
+  TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
+  TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
+  TEST_REGEX_ON_THIS_COMMIT: NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
+  DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
+
+unit_tests:
   tags:
-    - docker_gpu_enabled
+    - docker_local_runner
+  stage: test
   script:
-    - torchrun --nproc_per_node=8  -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/
+    - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
     paths:
       - coverage
     expire_in: 30 days
+  only:
+    - merge_requests
+
+.selene_test_resume_checkpoint_launcher: &selene-test-resume-checkpoint-launcher
+  tags:
+    - ssh_selene_runner
+  stage: test
+  script: &selene-test-launcher-script
+    - echo "Running selene resume from checkpoint test. "
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
+    - pwd
+    - export BUILD_DIR=`pwd`
+    - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
+    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS 
+    - export DATA_DIR=$DATA_DIR
+    - echo "Run name is $RUN_NAME"
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
+    - export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
+    - export LOGS_DIR=$BASE_DIR/logs
+    - export RESULTS_DIR=$BASE_DIR/results
+    - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
+    - echo "Submitting job"
+    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES`
+    - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
+    - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
+    - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
+                "----------WAITING FOR SLURM JOB TO BEGIN-----------\n"
+                "---------------------------------------------------\n"
+                "$(scontrol show job=${SLURM_JOBID})\n"
+                "---------------------------------------------------\n"
+    # Gitlab logs collapsible section markers
+    - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
+    # Follow output of the job
+    - echo "Finished job"  
+    - source $PYTHON_VIRTUAL_ENV
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
+    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
+    - echo "Completed the job"
+  rules:
+    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
+      when: always
+    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
+      when: always
+    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always      
+  allow_failure: false
+
+.selene_test_launcher: &selene-test-launcher
+  tags:
+    - ssh_selene_runner
+  stage: test
+  script: &selene-test-launcher-script
+    - echo "Running selene test"
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
+    - echo "$CI_MERGE_REQUEST_APPROVED"
+    - pwd
+    - export BUILD_DIR=`pwd`
+    - export RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
+    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE
+    - export MBS GBS
+    - export DATA_DIR=$DATA_DIR
+    - echo "Run name is $RUN_NAME"
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
+    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
+    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
+    - export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
+    - export LOGS_DIR=$BASE_DIR/logs
+    - export RESULTS_DIR=$BASE_DIR/results
+    - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
+    - echo "Submitting job"
+    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES,MAX_STEPS,VP_SIZE,MBS,GBS`
+    - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
+    - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
+    - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
+                "----------WAITING FOR SLURM JOB TO BEGIN-----------\n"
+                "---------------------------------------------------\n"
+                "$(scontrol show job=${SLURM_JOBID})\n"
+                "---------------------------------------------------\n"
+    # Gitlab logs collapsible section markers
+    - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
+    # Follow output of the job
+    - echo "Finished job"  
+    - source $PYTHON_VIRTUAL_ENV
+    - |
+      if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
+        python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
+      fi
+    - echo "Checking against ground truth file"
+    - export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
+    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
+    - echo "Completed the job"
+  rules:
+    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
+      when: always
+    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
+      when: always
+    - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always      
+  allow_failure: false
     
+train.gpt3.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0 
+
+train.gpt3.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+resume.checkpoint.gpt3.345m_tp1_pp2_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: L0 
+
+train.bert.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0 
+
+train.bert.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+resume.checkpoint.bert.345m_tp1_pp2_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: L0       
+
+cleanup.selene:
+  tags:
+    - ssh_selene_runner
+  stage: cleanup
+  variables:
+    <<: [*VARS]
+  script:
+    - NUM_CLEANUP=`find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | wc -l`
+    - find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
+    - echo "Finished cleaning $NUM_CLEANUP directories older than 20 days everything in Selene"
+  allow_failure: true
+  rules:
+    - when: always

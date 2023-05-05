@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
+from torch.cuda.amp import custom_fwd, custom_bwd
+
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -214,6 +216,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
     @staticmethod
+    @custom_fwd
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
                 async_grad_allreduce, sequence_parallel):
         ctx.save_for_backward(input, weight)
@@ -243,6 +246,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         return output
 
     @staticmethod
+    @custom_bwd
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
@@ -269,6 +273,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.sequence_parallel:
             handle.wait()
 
+        # Doing gather + slicing during the NeMo forward pass can make this tensor 
+        # not be contiguous. PyTorch only checks if the tensor is contiguous, and only 
+        # clones it if it's not contiguous: 
+        # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
+        grad_output = grad_output.contiguous()
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(grad_output.shape[0] * grad_output.shape[1],
                                        grad_output.shape[2])
@@ -402,8 +411,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                     "maximum speedup")
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
-    with torch.cuda.amp.autocast(enabled=False):
-        return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+    return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
+
 linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 class ColumnParallelLinear(torch.nn.Module):

@@ -48,6 +48,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    _compare('add_position_embedding')
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -460,6 +461,10 @@ def load_args_from_checkpoint(args, load_arg='load'):
     checkpoint_version = state_dict.get('checkpoint_version', 0)
     args.iteration = state_dict['iteration']
 
+    # One-off conversion for foundation models
+    if hasattr(checkpoint_args, 'disable_bias_linear'):
+        setattr(checkpoint_args, 'add_bias_linear', not getattr(checkpoint_args, 'disable_bias_linear'))
+
     def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
@@ -472,6 +477,8 @@ def load_args_from_checkpoint(args, load_arg='load'):
         if checkpoint_value is not None:
             print_rank_0(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
             setattr(args, arg_name, checkpoint_value)
+        else:
+            print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
     _set_arg('num_layers')
     _set_arg('hidden_size')
@@ -480,6 +487,13 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('num_attention_heads')
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
+    _set_arg('add_position_embedding', force=True)
+    _set_arg('use_rotary_position_embeddings', force=True)
+    _set_arg('rotary_percent', force=True)
+    _set_arg('add_bias_linear', force=True)
+    _set_arg('swiglu', force=True)
+    _set_arg('untie_embeddings_and_output_weights', force=True)
+    _set_arg('apply_layernorm_1p', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
     if checkpoint_version < 3.0:
@@ -488,8 +502,9 @@ def load_args_from_checkpoint(args, load_arg='load'):
     else:
         _set_arg('tensor_model_parallel_size', force=True)
         _set_arg('pipeline_model_parallel_size', force=True)
+        _set_arg('virtual_pipeline_model_parallel_size', force=True)
         _set_arg('num_layers_per_virtual_pipeline_stage')
-    return args
+    return args, checkpoint_args
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
@@ -508,7 +523,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                               use_distributed_optimizer=args.use_distributed_optimizer,
                               rank0=False)
 
+    # Checkpoint not loaded.
     if model_state_dict is None:
+
+        # Conditionally exit at this point.
+        if args.exit_on_missing_checkpoint:
+            print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
+            torch.distributed.barrier()
+            sys.exit()
+
+        # Iteration defaults to 0.
         return 0
 
     # set checkpoint version
