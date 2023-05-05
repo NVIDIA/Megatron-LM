@@ -102,12 +102,10 @@ def validate_args(args, defaults={}):
     del args.model_parallel_size
 
     if args.checkpoint_activations:
-        args.recompute_granularity = 'full'
-        args.recompute_method = 'uniform'
         if args.rank == 0:
-            print('--checkpoint-activations is no longer valid, '
-                  'use --recompute-granularity and --recompute-method  instead. '
-                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
+            print('--checkpoint-activations is no longer valid, use --recompute-activations, '
+                  'or, for more control, --recompute-granularity and --recompute-method.')
+        exit()
     del args.checkpoint_activations
 
     if args.recompute_activations:
