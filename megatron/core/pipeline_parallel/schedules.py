@@ -170,6 +170,7 @@ def forward_step(forward_step_func,
                  forward_data_store,
                  timers,
                  collect_non_loss_data=False,
+                 autocast_dtype=torch.float,
                  enable_autocast=False):
     """Forward step for passed-in model.
 
@@ -188,7 +189,7 @@ def forward_step(forward_step_func,
     set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
     set_input_tensor(input_tensor)
 
-    context_manager = torch.autocast("cuda") if enable_autocast else nullcontext()
+    context_manager = torch.autocast("cuda", dtype=autocast_dtype) if enable_autocast else nullcontext()
     with context_manager:
         output_tensor, loss_func = forward_step_func(data_iterator, model)
 
@@ -293,7 +294,7 @@ def forward_backward_no_pipelining(*,
                                    data_iterator,
                                    model: Union[torch.nn.Module, List[torch.nn.Module]],
                                    num_microbatches: int,
-                                   dtype: Optional[torch.dtype] = None, # unused
+                                   dtype: Optional[torch.dtype] = None,
                                    tensor_shape: Optional[Shape] = None, # unused
                                    decoder_seq_length: Optional[int] = None, # unused
                                    grad_scaler: Callable = None,
@@ -325,7 +326,7 @@ def forward_backward_no_pipelining(*,
         for i in range(num_microbatches - 1):
             output_tensor = forward_step(forward_step_func, data_iterator,
                                          model, num_microbatches, input_tensor, forward_data_store,
-                                         timers, collect_non_loss_data, enable_autocast)
+                                         timers, collect_non_loss_data, dtype, enable_autocast)
             if not forward_only:
                 backward_step(grad_scaler, input_tensor, output_tensor,
                               output_tensor_grad, model_type, timers)
@@ -334,7 +335,7 @@ def forward_backward_no_pipelining(*,
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator,
                                  model, num_microbatches, input_tensor, forward_data_store,
-                                 timers, collect_non_loss_data, enable_autocast)
+                                 timers, collect_non_loss_data, dtype, enable_autocast)
 
     if not forward_only:
         backward_step(grad_scaler, input_tensor, output_tensor,
@@ -447,6 +448,7 @@ def forward_backward_pipelining_with_interleaving(*,
                                      forward_data_store,
                                      timers,
                                      collect_non_loss_data,
+                                     dtype,
                                      enable_autocast)
         output_tensors[model_chunk_id].append(output_tensor)
 
@@ -785,7 +787,7 @@ def forward_backward_pipelining_without_interleaving(*,
         input_tensor = recv_forward(recv_tensor_shapes, dtype, timers=timers)
         output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                      input_tensor, forward_data_store,
-                                     timers, collect_non_loss_data, enable_autocast)
+                                     timers, collect_non_loss_data, dtype, enable_autocast)
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
         if not forward_only:
@@ -805,7 +807,7 @@ def forward_backward_pipelining_without_interleaving(*,
 
         output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                      input_tensor, forward_data_store,
-                                     timers, collect_non_loss_data, enable_autocast)
+                                     timers, collect_non_loss_data, dtype, enable_autocast)
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, timers=timers)
