@@ -93,6 +93,11 @@ def get_forward_backward_func():
     enable_autocast (optional, default=False): If True, runs the
         forward_step_func call inside torch.autocast context
 
+    deallocate_pipeline_outputs (optional, default=False): If True, output data 
+        is deallocated after the tensor is sent to the next pipeline stage.
+        Helps with saving memory, does nothing when pipeline parallel is 
+        not used.
+
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
@@ -104,14 +109,14 @@ def get_forward_backward_func():
         forward_backward_func = forward_backward_no_pipelining
     return forward_backward_func
 
-def deallocate_output_tensor(out):
+def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     '''Pseudo-deallocate (i.e., set to scalar) the output tensor's '.data' field.
 
     This method should be called right after the output tensor has been
     sent to the next pipeline stage. At this point, the output tensor is
     only useful for its '.grad_fn' field, and not its '.data'.
     '''
-    if out is None:
+    if (out is None) or (not deallocate_pipeline_outputs):
         return
     assert isinstance(out, torch.Tensor), \
         "expected Tensor, found %s." % type(out).__name__
@@ -220,7 +225,7 @@ def forward_step(forward_step_func,
 
 
 def backward_step(grad_scaler, input_tensor, output_tensor,
-                  output_tensor_grad, model_type, timers):
+                  output_tensor_grad, model_type, timers, deallocate_pipeline_outputs=False):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -253,7 +258,11 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     # Backward pass.
     if output_tensor_grad[0] is None and grad_scaler is not None:
         output_tensor = grad_scaler(output_tensor[0])
-    custom_backward(output_tensor[0], output_tensor_grad[0])
+    
+    if deallocate_pipeline_outputs:
+        custom_backward(output_tensor[0], output_tensor_grad[0])
+    else:
+        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -302,7 +311,8 @@ def forward_backward_no_pipelining(*,
                                    forward_only: bool = False,
                                    timers: Callable = None,
                                    collect_non_loss_data: bool = False,
-                                   enable_autocast: bool = False):
+                                   enable_autocast: bool = False,
+                                   deallocate_pipeline_outputs: bool = False):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
 
@@ -329,7 +339,7 @@ def forward_backward_no_pipelining(*,
                                          timers, collect_non_loss_data, dtype, enable_autocast)
             if not forward_only:
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -339,7 +349,7 @@ def forward_backward_no_pipelining(*,
 
     if not forward_only:
         backward_step(grad_scaler, input_tensor, output_tensor,
-                      output_tensor_grad, model_type, timers)
+                      output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
     return forward_data_store
 
@@ -357,7 +367,8 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   forward_only: bool = False,
                                                   timers: Callable = None,
                                                   collect_non_loss_data: bool = False,
-                                                  enable_autocast: bool = False):
+                                                  enable_autocast: bool = False,
+                                                  deallocate_pipeline_outputs: bool = False):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
 
@@ -478,7 +489,8 @@ def forward_backward_pipelining_with_interleaving(*,
                           output_tensor,
                           output_tensor_grad,
                           model_type,
-                          timers)
+                          timers,
+                          deallocate_pipeline_outputs)
 
         return input_tensor_grad
 
@@ -524,7 +536,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     tensor_shape=tensor_shape, dtype=dtype,
                     timers=timers)
         input_tensors[next_forward_model_chunk_id].append(input_tensor)
-        deallocate_output_tensor(output_tensor)
+        deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
@@ -588,7 +600,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     output_tensor, input_tensor_grad,
                     recv_prev=recv_prev, recv_next=recv_next,
                     tensor_shape=tensor_shape, dtype=dtype, timers=timers)
-        deallocate_output_tensor(output_tensor)
+        deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
         # Put input_tensor and output_tensor_grad in data structures in the
         # right location.
@@ -741,7 +753,8 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      forward_only: bool = False,
                                                      timers: Callable = None,
                                                      collect_non_loss_data: bool = False,
-                                                     enable_autocast: bool = False):
+                                                     enable_autocast: bool = False,
+                                                     deallocate_pipeline_outputs: bool = False):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages.
 
@@ -793,7 +806,7 @@ def forward_backward_pipelining_without_interleaving(*,
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0])
+            deallocate_output_tensor(output_tensor[0], deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -824,7 +837,7 @@ def forward_backward_pipelining_without_interleaving(*,
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0])
+            deallocate_output_tensor(output_tensor[0], deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
@@ -833,7 +846,7 @@ def forward_backward_pipelining_without_interleaving(*,
 
             input_tensor_grad = \
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
             if last_iteration:
                 input_tensor = None
@@ -853,7 +866,7 @@ def forward_backward_pipelining_without_interleaving(*,
 
             input_tensor_grad = \
                 backward_step(grad_scaler, input_tensor, output_tensor,
-                              output_tensor_grad, model_type, timers)
+                              output_tensor_grad, model_type, timers, deallocate_pipeline_outputs)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 
