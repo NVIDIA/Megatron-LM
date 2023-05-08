@@ -95,6 +95,7 @@ def save_checkpoint(queue, args):
                 '--seq-length', str(md.seq_length),
                 '--num-attention-heads', str(md.num_attention_heads),
                 '--max-position-embeddings', str(md.max_position_embeddings),
+                '--attention-head-type', str(md.attention_head_type),
                 '--tokenizer-type', str(md.tokenizer_type),
                 '--tensor-model-parallel-size', str(args.target_tensor_parallel_size),
                 '--pipeline-model-parallel-size', str(args.target_pipeline_parallel_size),
@@ -225,10 +226,17 @@ def save_checkpoint(queue, args):
             post_layernorm_weight = msg.pop("post layernorm weight")
             post_layernorm_bias = msg.pop("post layernorm bias")
             mlp_l1_bias = msg.pop("mlp l1 bias")
+            if margs.attention_head_type == "multiquery":
+                kv_weight = msg.pop("kv weight")
+                kv_bias = msg.pop("kv bias")
 
             # Split up the parallel tensors
-            qkv_weight = torch.chunk(msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0)
-            qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
+            if margs.attention_head_type == "multihead":
+                qkv_weight = torch.chunk(msg.pop("qkv weight"), args.target_tensor_parallel_size, dim=0)
+                qkv_bias = torch.chunk(msg.pop("qkv bias"), args.target_tensor_parallel_size, dim=0)
+            elif margs.attention_head_type == "multiquery":
+                q_weight = torch.chunk(msg.pop("q weight"), args.target_tensor_parallel_size, dim=0)
+                q_bias = torch.chunk(msg.pop("q bias"), args.target_tensor_parallel_size, dim=0)
             dense_weight = torch.chunk(msg.pop("dense weight"), args.target_tensor_parallel_size, dim=1)
             mlp_l0_weight = torch.chunk(msg.pop("mlp l0 weight"), args.target_tensor_parallel_size, dim=0)
             mlp_l0_bias = torch.chunk(msg.pop("mlp l0 bias"), args.target_tensor_parallel_size, dim=0)
@@ -239,8 +247,15 @@ def save_checkpoint(queue, args):
                 l = models[tp_rank].language_model.encoder.layers[layer]
                 l.input_layernorm.weight.data.copy_(input_layernorm_weight)
                 l.input_layernorm.bias.data.copy_(input_layernorm_bias)
-                l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
-                l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
+                if margs.attention_head_type == "multihead":
+                    l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
+                    l.self_attention.query_key_value.bias.data.copy_(qkv_bias[tp_rank])
+                elif margs.attention_head_type == "multiquery":
+                    # MQA: key-value are shared across tp-ranks
+                    l.self_attention.key_value.weight.data.copy_(kv_weight)
+                    l.self_attention.key_value.bias.data.copy_(kv_bias)
+                    l.self_attention.query.weight.data.copy_(q_weight[tp_rank])
+                    l.self_attention.query.bias.data.copy_(q_bias[tp_rank])
                 l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
                 l.self_attention.dense.bias.data.copy_(dense_bias)
                 l.post_attention_layernorm.weight.data.copy_(post_layernorm_weight)

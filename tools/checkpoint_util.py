@@ -124,6 +124,9 @@ def main():
     parser.add_argument('--no-checking', action='store_false',
                         help='Do not perform checking on the name and ordering of weights',
                         dest='checking')
+    
+    parser.add_argument('--use-distributed-optimizer', action='store_true',
+                       help='Loaded checkpoint uses distributed optimizer.')
 
     known_args, _ = parser.parse_known_args()
     loader = load_plugin('loader', known_args.loader)
