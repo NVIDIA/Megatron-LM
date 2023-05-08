@@ -98,6 +98,7 @@ def get_forward_backward_func():
         is deallocated after the tensor is sent to the next pipeline stage.
         Helps with saving memory, does nothing when pipeline parallel is 
         not used.
+    
     no_sync_func (optional): Function that creates a context that
         suppresses asynchronous data-parallel communication. If the
         model is an instance of torch.nn.DistributedDataParallel, the
