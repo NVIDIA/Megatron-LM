@@ -488,6 +488,7 @@ def setup_model_and_optimizer(model_provider_func, teacher=False,
                 # Number of train/valid/test samples.
                 if args.train_samples:
                     train_samples = args.train_samples
+                    update_train_iters(args)
                 else:
                     train_samples = args.train_iters * args.global_batch_size
                 # eval_iters and test_iters here are not actually used, only for
@@ -1272,6 +1273,7 @@ def build_train_valid_test_data_iterators(
         # Number of train/valid/test samples.
         if args.train_samples:
             train_samples = args.train_samples
+            update_train_iters(args)
         else:
             train_samples = args.train_iters * args.global_batch_size
         eval_iters = (args.train_iters // args.eval_interval + 1) * \
