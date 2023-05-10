@@ -35,10 +35,10 @@ unit_tests:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene resume from checkpoint test. "
-    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
     - pwd
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS 
     - export DATA_DIR=$DATA_DIR
     - echo "Run name is $RUN_NAME"
@@ -65,9 +65,11 @@ unit_tests:
     - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
     # Follow output of the job
     - echo "Finished job"  
+    - export SLURM_STATE=$(sacct -j "${SLURM_JOBID}" --format State --parsable2 --noheader |& head -n 1)
+    - echo "Slurm job state $SLURM_STATE"
+    - if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
     - source $PYTHON_VIRTUAL_ENV
-    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
-    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py || echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
@@ -84,11 +86,11 @@ unit_tests:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene test"
-    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."
     - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
+    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE
     - export MBS GBS
     - export DATA_DIR=$DATA_DIR
@@ -116,6 +118,9 @@ unit_tests:
     - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
     # Follow output of the job
     - echo "Finished job"  
+    - export SLURM_STATE=$(sacct -j "${SLURM_JOBID}" --format State --parsable2 --noheader |& head -n 1)
+    - echo "Slurm job state $SLURM_STATE"
+    - if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
     - source $PYTHON_VIRTUAL_ENV
     - |
       if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
@@ -123,8 +128,7 @@ unit_tests:
       fi
     - echo "Checking against ground truth file"
     - export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
-    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py
-    - if [ $? -ne 0 ]; then echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${CI_JOB_NAME}/results directory for result logs."; fi
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py || echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
