@@ -266,7 +266,7 @@ cleanup.selene:
     - EC() { echo -e '\e[1;33m'code $?'\e[m\n'; }
     - trap EC ERR
     - NUM_CLEANUP=$(find ${SELENE_ADLR_CI_PATH} -type d -ctime +20)
-    - NUM_CLEANUP=$(find ${SELENE_ADLR_CI_PATH} -type d -ctime +20 | grep -v data | wc -l)
+    # - NUM_CLEANUP=$(find ${SELENE_ADLR_CI_PATH} -type d -ctime +20 | grep -v data | wc -l)
     #- find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
     - echo "Finished cleaning $NUM_CLEANUP directories older than 20 days everything in Selene"
   allow_failure: true
