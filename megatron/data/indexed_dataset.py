@@ -95,8 +95,8 @@ dtypes = {
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: np.float,
-    7: np.double,
+    6: np.float32,
+    7: np.float64,
     8: np.uint16
 }
 
@@ -554,6 +554,13 @@ class MMapIndexedDatasetBuilder(object):
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
+
+    def add_batched_item(self, np_array):
+        self._data_file.write(np_array.tobytes(order='C'))
+        cur_doc_sizes = len(self._sizes)
+        self._doc_idx.extend([i for i in range(current_doc_sizes + 1, 
+                                               current_doc_sizes + np_array.shape[0] + 1)])
+        self._sizes.extend([np_array.shape[1]] * np_array.shape[0])
 
     def add_doc(self, tensor, sizes):
         np_array = np.array(tensor, dtype=self._dtype)
