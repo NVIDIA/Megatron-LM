@@ -265,7 +265,7 @@ cleanup.selene:
     - set -x
     - EC() { echo -e '\e[1;33m'code $?'\e[m\n'; }
     - trap EC ERR
-    - which grep; grep -r "hello" *
+    - which grep; grep -r "hello" .
     - NUM_CLEANUP=$(find ${SELENE_ADLR_CI_PATH} -type d -ctime +20 | grep -v data)
     # - NUM_CLEANUP=$(find ${SELENE_ADLR_CI_PATH} -type d -ctime +20 | grep -v data | wc -l)
     #- find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
