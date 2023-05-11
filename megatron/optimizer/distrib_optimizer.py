@@ -388,7 +388,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_index, model in enumerate(self.models):
             current_param_buffers = {}
             for dtype, grad_buffer in model._grad_buffers.items():
-                param_buffer = torch.tensor(grad_buffer.data.storage()._untyped(),
+                param_buffer = torch.tensor(grad_buffer.data.storage().untyped(),
                                             dtype = params_dtype,
                                             device = grad_buffer.data.device)
                 param_buffer = param_buffer[:grad_buffer.numel_padded]
