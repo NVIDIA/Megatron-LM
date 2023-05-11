@@ -19,5 +19,5 @@ __homepage__ = 'https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/sta
 __repository_url__ = 'https://github.com/NVIDIA/Megatron-LM/megatron/core'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
 __description__ = 'Megatron Core - a library for efficient and scalable training of transformer based models'
-__license__ = 'Apache2' # TODO: is this right?
+__license__ = 'BSD-3'
 __keywords__ = 'deep learning, machine learning, gpu, NLP, NLU, language, transformer, nvidia, pytorch, torch'

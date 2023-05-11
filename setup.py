@@ -91,7 +91,7 @@ setuptools.setup(
         'Topic :: Software Development :: Libraries :: Python Modules',
         'Topic :: Utilities',
         # Pick your license as you wish (should match "license" above)
-        'License :: OSI Approved :: Apache Software License',
+        'License :: OSI Approved :: BSD License',
         # Supported python versions
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.8',
