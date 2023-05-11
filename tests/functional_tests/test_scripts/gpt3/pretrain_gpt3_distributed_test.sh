@@ -10,7 +10,6 @@ MAX_STEPS=$7
 VP_SIZE=$8
 MBS=$9
 GBS=${10}
-TRANSFORMER_IMPL=${11}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -23,7 +22,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
-options=" \
+python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+       pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
        --num-attention-heads 8 \
@@ -61,7 +61,4 @@ options=" \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        --no-gradient-accumulation-fusion \
-       --fp16 \
-       --transformer-impl $TRANSFORMER_IMPL"
-
-python -m torch.distributed.launch $DISTRIBUTED_ARGS pretrain_gpt.py ${options}
+       --fp16
