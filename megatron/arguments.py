@@ -11,6 +11,7 @@ import types
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
+from megatron.model.enums import PositionEmbeddingType
 from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
@@ -242,8 +243,7 @@ def validate_args(args, defaults={}):
         args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
-    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
+    required_args = ['num_layers', 'hidden_size', 'num_attention_heads']
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
@@ -270,10 +270,13 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    if args.add_position_embedding:
+        assert args.max_position_embeddings is not None
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:
@@ -539,8 +542,14 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
-    group.add_argument('--use-rotary-position-embeddings', action='store_true',
-                       help='Use rotary positional embeddings or not')
+    group.add_argument('--position-embedding-type',
+                       type=lambda x: PositionEmbeddingType[x],
+                       choices=list(PositionEmbeddingType),
+                       default=PositionEmbeddingType.none,
+                       help='Define position embedding type, which is added '
+                       'in addition to the learned embedding'
+                       '("none" | "alibi" | "rotary"). '
+                       '"none" by default.)')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
     group.add_argument('--no-position-embedding',

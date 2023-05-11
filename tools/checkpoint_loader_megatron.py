@@ -30,6 +30,7 @@ def _load_checkpoint(queue, args):
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
         from megatron.model import module
+        from megatron.model.enums import PositionEmbeddingType
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron import fused_kernels
@@ -81,7 +82,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('num_attention_heads')
     check_for_arg('max_position_embeddings')
     check_for_arg('add_position_embedding', True)
-    check_for_arg('use_rotary_position_embeddings', False)
+    check_for_arg('position_embedding_type', PositionEmbeddingType.absolute)
     check_for_arg('tokenizer_type')
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
