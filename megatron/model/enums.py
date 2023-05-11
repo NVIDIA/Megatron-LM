@@ -20,6 +20,7 @@ class AttnMaskType(enum.Enum):
 class PositionEmbeddingType(enum.Enum):
     learned_absolute = 1
     rope = 2
+    alibi = 3
 
 # For backward compatibility with old model checkpoints
 from megatron.core.enums import ModelType
