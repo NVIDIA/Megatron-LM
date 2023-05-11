@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 """Utility functions used throughout Megatron core"""
 from functools import reduce
 import operator
