@@ -18,6 +18,6 @@ __contact_emails__ = 'nemo-toolkit@nvidia.com' # use NeMo Email
 __homepage__ = 'https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/stable/' # use NeMo homepage
 __repository_url__ = 'https://github.com/NVIDIA/Megatron-LM/megatron/core'
 __download_url__ = 'https://github.com/NVIDIA/Megatron-LM/releases'
-__description__ = 'NeMo - a toolkit for Conversational AI'
+__description__ = 'Megatron Core - a library for efficient and scalable training of transformer based models'
 __license__ = 'Apache2' # TODO: is this right?
 __keywords__ = 'deep learning, machine learning, gpu, NLP, NLU, language, transformer, nvidia, pytorch, torch'
