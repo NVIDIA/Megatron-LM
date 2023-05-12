@@ -21,7 +21,7 @@ torch::Tensor fwd_cuda(
   // input is a 3d tensor with dimensions [attn_batches, seq_len, seq_len]
   const int attn_batches = input.size(0);
   const int seq_len = input.size(1);
-  TORCH_INTERNAL_ASSERT(seq_len <= 2048);
+  TORCH_INTERNAL_ASSERT(seq_len <= 16384);
 
   // Output 
   auto act_options = input.options().requires_grad(false);
