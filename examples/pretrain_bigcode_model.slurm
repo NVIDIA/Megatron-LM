@@ -135,6 +135,4 @@ SRUN_ARGS=" \
 # py-spy top -s -i -n -- $LAUNCHER --node_rank $SLURM_PROCID --role $SLURMD_NODENAME: $CMD
 clear; srun $SRUN_ARGS --jobid $SLURM_JOB_ID bash -c "$LAUNCHER --node_rank \$SLURM_PROCID --role \$SLURMD_NODENAME: $CMD" 2>&1 | tee $LOG_PATH
 
-rm -rf $CHECKPOINT_PATH
-
 echo "END TIME: $(date)"
