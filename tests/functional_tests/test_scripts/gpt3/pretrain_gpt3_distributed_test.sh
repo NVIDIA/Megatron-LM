@@ -31,9 +31,9 @@ else
 fi
 
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
 
-python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
