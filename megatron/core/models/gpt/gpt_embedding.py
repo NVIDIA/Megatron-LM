@@ -12,7 +12,7 @@ class GPTEmbedding(MegatronModule):
     """Language model embeddings.
 
     Arguments:
-        config (TransformerConfig): config object with all necessary configs for ParallelTransformerBlock 
+        config (TransformerConfig): config object with all necessary configs for TransformerBlock
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This
                              is used for positional embedding
@@ -20,7 +20,7 @@ class GPTEmbedding(MegatronModule):
     """
 
     def __init__(self, config: TransformerConfig, vocab_size: int, max_sequence_length: int):
-        super(GPTEmbedding, self).__init__(config=config)
+        super().__init__(config=config)
 
         self.config: TransformerConfig = config
         self.vocab_size: int = vocab_size

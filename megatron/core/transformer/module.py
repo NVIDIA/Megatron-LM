@@ -25,7 +25,7 @@ class MegatronModule(torch.nn.Module):
 
     # def __init__(self, config: TransformerConfig, share_word_embeddings=True):
     def __init__(self, config: TransformerConfig):
-        super(MegatronModule, self).__init__()
+        super().__init__()
         self.config = config
         # self.share_word_embeddings = share_word_embeddings
 
