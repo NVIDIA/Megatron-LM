@@ -127,9 +127,10 @@ class TransformerBlock(MegatronModule):
 
         def custom(start, end):
             def custom_forward(*args, **kwargs):
+                x_, *args = args
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_ = layer(*args, **kwargs)
+                    x_ = layer(x_, *args, **kwargs)
                 return x_
 
             return custom_forward
