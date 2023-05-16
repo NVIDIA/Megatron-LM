@@ -16,13 +16,13 @@ from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 
 
 class CoreAttention(MegatronModule):
-    """ 
+    """
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
     makes activation checkpointing more efficient for LLMs (20B+).
     See Reducing Activation Recomputation in Large Transformer Models: https://arxiv.org/abs/2205.05198 for more details.
 
-    We use the following notation: 
+    We use the following notation:
      h: hidden size
      n: number of attention heads
      p: number of tensor model parallel partitions
@@ -31,7 +31,7 @@ class CoreAttention(MegatronModule):
     """
 
     def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
-        super(CoreAttention, self).__init__(config=config)
+        super().__init__(config=config)
 
         self.config: TransformerConfig = config
 

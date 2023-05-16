@@ -6,15 +6,16 @@ from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.custom_layers.transformer_engine import \
+        TERowParallelLinear, TEColumnParallelLinear
 
-
-class ParallelMLP(MegatronModule):
+class MLP(MegatronModule):
     """
     MLP will take the input with h hidden state, project it to 4*h
     hidden dimension, perform nonlinear transformation, and project the
     state back into h hidden dimension.
 
-    We use the following notation: 
+    We use the following notation:
      h: hidden size
      p: number of tensor model parallel partitions
      b: batch size
@@ -22,24 +23,18 @@ class ParallelMLP(MegatronModule):
     """
 
     def __init__(self, config: TransformerConfig):
-        super(ParallelMLP, self).__init__(config=config)
+        super().__init__(config=config)
 
         self.config: TransformerConfig = config
 
         # Project to 4h.
         # @jcasper should we change the name dense_h_to_4h here?
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+        self.linear_fc1 = TEColumnParallelLinear(
             self.config.hidden_size,
             self.config.ffn_hidden_size,
-            gather_output=False,
-            init_method=self.config.init_method,
-            skip_bias_add=True,
-            async_tensor_model_parallel_allreduce=self.config.async_tensor_model_parallel_allreduce,
-            params_dtype=self.config.params_dtype,
-            use_cpu_initialization=self.config.use_cpu_initialization,
-            perform_initialization=self.config.perform_initialization,
-            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            self.config,
+            bias=True,
+            return_bias=True,
         )
 
         self.activation_func = F.gelu
@@ -53,23 +48,18 @@ class ParallelMLP(MegatronModule):
 
         # Project back to h.
         # @jcasper should we change the name here?
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
+        self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
-            input_is_parallel=True,
-            init_method=self.config.output_layer_init_method,
-            skip_bias_add=True,
-            params_dtype=self.config.params_dtype,
-            use_cpu_initialization=self.config.use_cpu_initialization,
-            perform_initialization=self.config.perform_initialization,
-            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-            sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            self.config,
+            bias=True,
+            return_bias=True,
         )
 
     def forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
         if self.config.bias_gelu_fusion:
             intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
@@ -77,5 +67,5 @@ class ParallelMLP(MegatronModule):
             intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel)
 
         # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        output, output_bias = self.linear_fc2(intermediate_parallel)
         return output, output_bias

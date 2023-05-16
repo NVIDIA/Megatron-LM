@@ -9,11 +9,11 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.fusions.fused_layer_norm import get_layer_norm
-from megatron.core.transformer.parallel_transformer_layer import ParallelTransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
 
-class ParallelTransformerBlock(MegatronModule):
+class TransformerBlock(MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -24,7 +24,7 @@ class ParallelTransformerBlock(MegatronModule):
         pre_process=True,
         post_process=True,
     ):
-        super(ParallelTransformerBlock, self).__init__(config=config)
+        super().__init__(config=config)
 
         self.config: TransformerConfig = config
 
@@ -54,7 +54,7 @@ class ParallelTransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_number):
-            return ParallelTransformerLayer(
+            return TransformerLayer(
                 config=self.config, layer_number=layer_number, self_attn_mask_type=self.self_attn_mask_type,
             )
 

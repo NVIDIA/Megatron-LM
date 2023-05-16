@@ -7,7 +7,7 @@ from megatron.core import parallel_state, tensor_parallel
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.parallel_transformer_block import ParallelTransformerBlock
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 
@@ -57,7 +57,7 @@ class GPTModel(MegatronModule):
             )
 
         # Transformer.
-        self.decoder = ParallelTransformerBlock(
+        self.decoder = TransformerBlock(
             config=self.config,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
