@@ -40,6 +40,10 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         output = get_datasets_weights_and_num_samples(data_prefix,
                                                       train_valid_test_num_samples)
         prefixes, weights, datasets_train_valid_test_num_samples = output
+        train_num_samples, valid_num_samples, test_num_samples = map(
+            sum,
+            zip(*datasets_train_valid_test_num_samples)
+        )
 
         # Build individual datasets.
         train_datasets = []
@@ -61,13 +65,13 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         # Blend.
         blending_train_dataset = None
         if train_datasets:
-            blending_train_dataset = BlendableDataset(train_datasets, weights)
+            blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples)
         blending_valid_dataset = None
         if valid_datasets:
-            blending_valid_dataset = BlendableDataset(valid_datasets, weights)
+            blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples)
         blending_test_dataset = None
         if test_datasets:
-            blending_test_dataset = BlendableDataset(test_datasets, weights)
+            blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples)
 
         return (blending_train_dataset, blending_valid_dataset,
                 blending_test_dataset)
@@ -153,6 +157,7 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
         # Parse the values.
         output = get_datasets_weights_and_num_samples(data_prefix, num_samples)
         prefixes, weights, dataset_num_samples = output
+        num_samples = sum(dataset_num_samples)
 
         # Build individual datasets.
         datasets = []
@@ -164,7 +169,7 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
                 datasets.append(ds)
 
         if datasets:
-            dataset = BlendableDataset(datasets, weights)
+            dataset = BlendableDataset(datasets, weights, num_samples)
 
     return dataset
 

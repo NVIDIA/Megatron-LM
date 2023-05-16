@@ -132,6 +132,9 @@ class BertModel(MegatronModule):
         super(BertModel, self).__init__()
         args = get_args()
 
+        # TODO this option is not yet implemented in BERT
+        assert args.untie_embeddings_and_output_weights is False
+
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.add_binary_head = add_binary_head
         self.parallel_output = parallel_output

@@ -12,8 +12,8 @@ from tqdm import tqdm
 from megatron import get_args, get_tokenizer, print_rank_0
 from megatron import core
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.model import BertModel
-from megatron.schedules import get_forward_backward_func
 from megatron.training import setup_model_and_optimizer
 
 from .dataset import BertEmbeddingDataset
