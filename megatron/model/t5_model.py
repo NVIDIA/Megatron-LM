@@ -8,7 +8,7 @@ from megatron import get_args
 from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits, get_language_model
-from megatron.model.transformer import LayerNorm
+from megatron.model import LayerNorm
 from megatron.model.utils import (
     openai_gelu,
     get_linear_layer,

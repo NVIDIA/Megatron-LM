@@ -18,6 +18,7 @@ from .utils import (unwrap_model,
 
 _CHECKPOINT_VERSION = None
 
+
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
     if _CHECKPOINT_VERSION is not None:
@@ -48,6 +49,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    _compare('add_position_embedding')
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -69,8 +71,12 @@ def ensure_directory_exists(filename):
         os.makedirs(dirname)
 
 
-def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release=False,
-                        pipeline_parallel=None, tensor_rank=None, pipeline_rank=None):
+def get_checkpoint_names(checkpoints_path, iteration,
+                         no_load_optim, use_distributed_optimizer,
+                         release=False,
+                         pipeline_parallel=None,
+                         tensor_rank=None,
+                         pipeline_rank=None):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
@@ -95,16 +101,33 @@ def get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer,
         common_path = os.path.join(checkpoints_path, directory,
                         f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
 
-    if use_distributed_optimizer:
-        model_name = os.path.join(common_path, "model_rng.pt")
-        optim_name = os.path.join(
+    # Set model/optimizer names based on use of the distributed optimizer. We
+    # additionally handle the special case where a model is pretrained using
+    # the standard optimizer, and finetuned using the distributed optimizer
+    # that's used without loading the pretraining optimizer.
+    unified_name = os.path.join(common_path, "model_optim_rng.pt")
+    distrib_model_name = os.path.join(common_path, "model_rng.pt")
+    if os.path.exists(unified_name) or not use_distributed_optimizer:
+        assert not os.path.exists(distrib_model_name)
+        if use_distributed_optimizer:
+            assert no_load_optim
+        model_name = optim_name = unified_name
+    elif os.path.exists(distrib_model_name) or use_distributed_optimizer:
+        assert use_distributed_optimizer
+        assert not os.path.exists(unified_name)
+        distrib_optim_name = os.path.join(
             common_path + "_%03d" % mpu.get_data_parallel_rank(),
             "optim.pt")
+        model_name = distrib_model_name
+        optim_name = distrib_optim_name
     else:
-        model_name = optim_name = os.path.join(common_path, "model_optim_rng.pt")
+        raise Exception("Handle case of unified exists (%d), distrib exists (%d), and use_distributed_optimizer (%d)." % (os.path.exists(unified_name), os.path.exists(distrib_model_name), use_distributed_optimizer))
+
     return model_name, optim_name
 
-def find_checkpoint_rank_0(checkpoints_path, iteration, use_distributed_optimizer, release=False):
+def find_checkpoint_rank_0(checkpoints_path, iteration,
+                           no_load_optim, use_distributed_optimizer,
+                           release=False):
     """Finds the checkpoint for rank 0 without knowing if we are using
     pipeline parallelism or not.
 
@@ -115,16 +138,20 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, use_distributed_optimize
     """
 
     # Look for checkpoint with no pipelining
-    filenames = get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release,
+    filenames = get_checkpoint_names(checkpoints_path, iteration,
+                                     no_load_optim, use_distributed_optimizer,
+                                     release,
                                      pipeline_parallel=False,
                                      tensor_rank=0, pipeline_rank=0)
     if os.path.isfile(filenames[0]):
         return filenames
 
     # Look for checkpoint with pipelining
-    filenames = get_checkpoint_names(checkpoints_path, iteration, use_distributed_optimizer, release,
-                                    pipeline_parallel=True,
-                                    tensor_rank=0, pipeline_rank=0)
+    filenames = get_checkpoint_names(checkpoints_path, iteration,
+                                     no_load_optim, use_distributed_optimizer,
+                                     release,
+                                     pipeline_parallel=True,
+                                     tensor_rank=0, pipeline_rank=0)
     if os.path.isfile(filenames[0]):
         return filenames
 
@@ -218,7 +245,8 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
 
     # Checkpoint file names.
     model_checkpoint_name, optim_checkpoint_name = \
-        get_checkpoint_names(args.save, iteration, args.use_distributed_optimizer)
+        get_checkpoint_names(args.save, iteration,
+                             args.no_load_optim, args.use_distributed_optimizer)
 
     # Collect args, model, RNG.
     model_state_dict = {}
@@ -357,7 +385,8 @@ def fix_query_key_value_ordering(model, checkpoint_version):
         print_rank_0(" succesfully fixed query-key-values ordering for"
                     " checkpoint version {}".format(checkpoint_version))
 
-def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False):
+def _load_base_checkpoint(load_dir, no_load_optim, use_distributed_optimizer,
+                          rank0=False):
     """ Load the base state_dict from the given directory
 
     If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
@@ -382,10 +411,14 @@ def _load_base_checkpoint(load_dir, use_distributed_optimizer, rank0=False):
 
     # Checkpoint.
     if rank0:
-        checkpoint_names = find_checkpoint_rank_0(load_dir, iteration, use_distributed_optimizer,
+        checkpoint_names = find_checkpoint_rank_0(load_dir, iteration,
+                                                  no_load_optim,
+                                                  use_distributed_optimizer,
                                                   release)
     else:
-        checkpoint_names = get_checkpoint_names(load_dir, iteration, use_distributed_optimizer,
+        checkpoint_names = get_checkpoint_names(load_dir, iteration,
+                                                no_load_optim,
+                                                use_distributed_optimizer,
                                                 release)
         if release:
             print_rank_0(f' loading release checkpoint from {load_dir}')
@@ -442,6 +475,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
 
     model_state_dict, optim_state_dict, release = \
         _load_base_checkpoint(load_dir,
+                              no_load_optim=args.no_load_optim,
                               use_distributed_optimizer=args.use_distributed_optimizer,
                               rank0=True)
 
@@ -460,6 +494,10 @@ def load_args_from_checkpoint(args, load_arg='load'):
     checkpoint_version = state_dict.get('checkpoint_version', 0)
     args.iteration = state_dict['iteration']
 
+    # One-off conversion for foundation models
+    if hasattr(checkpoint_args, 'disable_bias_linear'):
+        setattr(checkpoint_args, 'add_bias_linear', not getattr(checkpoint_args, 'disable_bias_linear'))
+
     def _set_arg(arg_name, old_arg_name=None, force=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
@@ -472,6 +510,8 @@ def load_args_from_checkpoint(args, load_arg='load'):
         if checkpoint_value is not None:
             print_rank_0(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
             setattr(args, arg_name, checkpoint_value)
+        else:
+            print_rank_0(f"Checkpoint did not provide arguments {arg_name}")
 
     _set_arg('num_layers')
     _set_arg('hidden_size')
@@ -480,6 +520,13 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('num_attention_heads')
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
+    _set_arg('add_position_embedding', force=True)
+    _set_arg('use_rotary_position_embeddings', force=True)
+    _set_arg('rotary_percent', force=True)
+    _set_arg('add_bias_linear', force=True)
+    _set_arg('swiglu', force=True)
+    _set_arg('untie_embeddings_and_output_weights', force=True)
+    _set_arg('apply_layernorm_1p', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
     if checkpoint_version < 3.0:
@@ -488,8 +535,9 @@ def load_args_from_checkpoint(args, load_arg='load'):
     else:
         _set_arg('tensor_model_parallel_size', force=True)
         _set_arg('pipeline_model_parallel_size', force=True)
+        _set_arg('virtual_pipeline_model_parallel_size', force=True)
         _set_arg('num_layers_per_virtual_pipeline_stage')
-    return args
+    return args, checkpoint_args
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True):
@@ -505,6 +553,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     model_state_dict, optim_state_dict, release = \
         _load_base_checkpoint(load_dir,
+                              no_load_optim=args.no_load_optim,
                               use_distributed_optimizer=args.use_distributed_optimizer,
                               rank0=False)
 
@@ -649,6 +698,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         iteration = int(f.read().strip())
 
     checkpoint_name, _ = get_checkpoint_names(load_path, iteration,
+                                              args.no_load_optim,
                                               args.use_distributed_optimizer,
                                               release=False)
 
