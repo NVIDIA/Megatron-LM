@@ -276,7 +276,13 @@ def _load_checkpoint(queue, args):
                 message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
                 if md.linear_bias:
                     message["qkv bias"] = torch.cat(qkv_bias, dim=0)
-                    message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
+                    if md.swiglu:
+                        for tp_rank in range(tp_size):
+                            mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
+                        message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias],dim=0)
+                        message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
+                    else:
+                        message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
 
                 queue_put(f"transformer layer {total_layer_num}", message)
 
