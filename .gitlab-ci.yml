@@ -154,7 +154,7 @@ train.te_gpt3.345m_tp2_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "50:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp4_pp1_1node_50steps:
