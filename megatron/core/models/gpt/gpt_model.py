@@ -182,12 +182,9 @@ class GPTModel(MegatronModule):
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-                self.vocab_size,
-                self.config.hidden_size,
-                init_method=self.config.init_method,
-                params_dtype=self.config.params_dtype,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                perform_initialization=self.config.perform_initialization,
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.config.hidden_size,
+                config=self.config
             )
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True

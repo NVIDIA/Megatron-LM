@@ -13,6 +13,8 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_next_rank,
 )
 
+from .pipeline_config import PipelineConfig
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -110,7 +112,7 @@ def _communicate(*, tensor_send_next: Optional[torch.Tensor],
                  recv_prev: bool,
                  recv_next: bool,
                  tensor_shape: Shape,
-                 config: core.BaseConfig) -> Tuple[torch.Tensor, torch.Tensor]:
+                 config: PipelineConfig) -> Tuple[torch.Tensor, torch.Tensor]:
     """Communicate tensors between stages. Used as helper method in other
     communication methods that are used in megatron/schedules.py.
 
@@ -219,7 +221,7 @@ def _communicate(*, tensor_send_next: Optional[torch.Tensor],
 
 
 def recv_forward(tensor_shape: Shape,
-                 config: core.BaseConfig) -> torch.Tensor:
+                 config: PipelineConfig) -> torch.Tensor:
     """ Receive tensor from previous rank in pipeline (forward receive).
 
 
@@ -244,7 +246,7 @@ def recv_forward(tensor_shape: Shape,
 
 
 def recv_backward(tensor_shape: Shape,
-                  config: core.BaseConfig) -> torch.Tensor:
+                  config: PipelineConfig) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
     See _communicate for argument details.
@@ -267,7 +269,7 @@ def recv_backward(tensor_shape: Shape,
 
 
 def send_forward(output_tensor: torch.Tensor,
-                 config: core.BaseConfig) -> None:
+                 config: PipelineConfig) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
     See _communicate for argument details.
@@ -288,7 +290,7 @@ def send_forward(output_tensor: torch.Tensor,
 
 
 def send_backward(input_tensor_grad: torch.Tensor,
-                  config: core.BaseConfig) -> None:
+                  config: PipelineConfig) -> None:
     """Send tensor to previous rank in pipeline (backward send).
 
     See _communicate for argument details.
@@ -309,7 +311,7 @@ def send_backward(input_tensor_grad: torch.Tensor,
 
 def send_forward_recv_backward(output_tensor: torch.Tensor,
                                tensor_shape: Shape,
-                               config: core.BaseConfig) -> torch.Tensor:
+                               config: PipelineConfig) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
     See _communicate for argument details.
@@ -333,7 +335,7 @@ def send_forward_recv_backward(output_tensor: torch.Tensor,
 
 def send_backward_recv_forward(input_tensor_grad: torch.Tensor,
                                tensor_shape: Shape,
-                               config: core.BaseConfig) -> torch.Tensor:
+                               config: PipelineConfig) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 
     See _communicate for argument details.
@@ -358,7 +360,7 @@ def send_backward_recv_forward(input_tensor_grad: torch.Tensor,
 def send_forward_recv_forward(output_tensor: torch.Tensor,
                               recv_prev: bool,
                               tensor_shape: Shape,
-                              config: core.BaseConfig) -> torch.Tensor:
+                              config: PipelineConfig) -> torch.Tensor:
     """Batched recv from previous rank and send to next rank in pipeline.
 
     See _communicate for argument details.
@@ -380,7 +382,7 @@ def send_forward_recv_forward(output_tensor: torch.Tensor,
 def send_backward_recv_backward(input_tensor_grad: torch.Tensor,
                                 recv_next: bool,
                                 tensor_shape: Shape,
-                                config: core.BaseConfig) -> torch.Tensor:
+                                config: PipelineConfig) -> torch.Tensor:
     """Batched recv from next rank and send to previous rank in pipeline.
 
     See _communicate for argument details.
@@ -405,7 +407,7 @@ def send_forward_backward_recv_forward_backward(
         recv_prev: bool,
         recv_next: bool,
         tensor_shape: Shape,
-        config: core.BaseConfig) -> torch.Tensor:
+        config: PipelineConfig) -> torch.Tensor:
     """Batched send and recv with previous and next ranks in pipeline.
 
     See _communicate for argument details.

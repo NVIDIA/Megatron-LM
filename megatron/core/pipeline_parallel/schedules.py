@@ -13,6 +13,8 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type
 
+from .pipeline_config import PipelineConfig
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -42,7 +44,7 @@ def get_forward_backward_func():
         checkpointed. A None value for this argument indicates that
         the default from the configuration should be used. This is
         used when the
-        num_micro_batches_with_partial_activation_checkpoints is used.
+        num_microbatches_with_partial_activation_checkpoints is used.
 
         For example:
 
@@ -75,8 +77,8 @@ def get_forward_backward_func():
     num_microbatches (int, required):
         The number of microbatches to go through
 
-    config (megatron.core.BaseConfig, required):
-        Configuration object, see megatron.core.BaseConfig
+    config (megatron.core.pipeline_parallel.PipelineConfig, required):
+        Configuration object, see megatron.core.pipeline_paralle.PipelineConfig
 
     forward_only (optional, default=False): Perform only the forward step
 
@@ -177,7 +179,7 @@ def forward_step(forward_step_func,
     set_input_tensor(input_tensor)
 
     if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=autocast_dtype)
+        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
     else:
         context_manager = contextlib.nullcontext()
     with context_manager:
@@ -281,7 +283,7 @@ def forward_backward_no_pipelining(*,
                                    data_iterator: Union[Iterator, List[Iterator]],
                                    model: Union[torch.nn.Module, List[torch.nn.Module]],
                                    num_microbatches: int,
-                                   config: core.BaseConfig,
+                                   config: PipelineConfig,
                                    forward_only: bool = False,
                                    collect_non_loss_data: bool = False,
                                    ):
@@ -336,7 +338,7 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   data_iterator: Union[Iterator, List[Iterator]],
                                                   model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                   num_microbatches: int,
-                                                  config: core.BaseConfig,
+                                                  config: PipelineConfig,
                                                   forward_only: bool = False,
                                                   collect_non_loss_data: bool = False,
                                                   ):
@@ -435,14 +437,14 @@ def forward_backward_pipelining_with_interleaving(*,
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
-    # Micro-batches with the ids less than 'num_micro_batches_with_partial_activation_checkpoints'
+    # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
     # checkpoint partial Transformer layers (or skip checkpointing) and
     # the rest of micro-batches within a window of micro-batches checkpoint
     # all Transformer layers. The window of micro-batches is set by the maximum
     # outstanding backpropagations and becomes smaller at later pipeline stages.
     # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf
     max_outstanding_backprops = None
-    if config.num_micro_batches_with_partial_activation_checkpoints is not None:
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     # Synchronize params for first two model chunks
@@ -569,7 +571,7 @@ def forward_backward_pipelining_with_interleaving(*,
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = k % max_outstanding_backprops >= \
-                config.num_micro_batches_with_partial_activation_checkpoints
+                config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
 
@@ -619,7 +621,7 @@ def forward_backward_pipelining_with_interleaving(*,
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
                 forward_k % max_outstanding_backprops >= \
-                config.num_micro_batches_with_partial_activation_checkpoints
+                config.num_microbatches_with_partial_activation_checkpoints
             )
         else:
             checkpoint_activations_microbatch = None
@@ -740,7 +742,7 @@ def get_tensor_shapes(*,
 
     assert (
         len(config.tensor_shape) == 3
-    ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {tensor_shape}"
+    ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {config.tensor_shape}"
 
     seq_length, micro_batch_size, hidden_size = config.tensor_shape
     decoder_seq_length = config.decoder_seq_length
@@ -832,7 +834,7 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      data_iterator: Union[Iterator, List[Iterator]],
                                                      model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                      num_microbatches: int,
-                                                     config: core.BaseConfig,
+                                                     config: PipelineConfig,
                                                      forward_only: bool = False,
                                                      collect_non_loss_data: bool = False,
                                                      ):
@@ -883,14 +885,14 @@ def forward_backward_pipelining_without_interleaving(*,
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
-    # Micro-batches with the ids less than 'num_micro_batches_with_partial_activation_checkpoints'
+    # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
     # checkpoint partial Transformer layers (or skip checkpointing) and
     # the rest of micro-batches within a window of micro-batches checkpoint
     # all Transformer layers. The window of micro-batches is set by the maximum
     # outstanding backpropagations and becomes smaller at later pipeline stages.
     # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf
     max_outstanding_backprops = None
-    if config.num_micro_batches_with_partial_activation_checkpoints is not None:
+    if config.num_microbatches_with_partial_activation_checkpoints is not None:
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     model_type = get_model_type(model)
@@ -916,7 +918,7 @@ def forward_backward_pipelining_without_interleaving(*,
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
-                i % max_outstanding_backprops >= config.num_micro_batches_with_partial_activation_checkpoints
+                i % max_outstanding_backprops >= config.num_microbatches_with_partial_activation_checkpoints
             )
         else:
             checkpoint_activations_microbatch = None
@@ -946,7 +948,7 @@ def forward_backward_pipelining_without_interleaving(*,
         if max_outstanding_backprops is not None:
             checkpoint_activations_microbatch = (
                 ((i+num_warmup_microbatches) % max_outstanding_backprops) >= \
-                config.num_micro_batches_with_partial_activation_checkpoints
+                config.num_microbatches_with_partial_activation_checkpoints
             )
         else:
             checkpoint_activations_microbatch = None

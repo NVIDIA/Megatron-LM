@@ -8,7 +8,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import \
         TERowParallelLinear, TEColumnParallelLinear
-#from megatron.core.tensor_parallel import RowParallelLinear, ColumnParallelLinear
+#from megatron.core.tensor_parallel import \
+#    RowParallelLinear as TERowParallelLinear, ColumnParallelLinear as TEColumnParallelLinear
 
 class MLP(MegatronModule):
     """

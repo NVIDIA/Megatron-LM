@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
-from ..arguments import core_config_from_args
+from ..arguments import core_transformer_config_from_args
 from .enums import LayerType, AttnMaskType
 from .module import MegatronModule
 from .retro_transformer import ParallelRetroEncoder, ParallelRetroTransformer
@@ -57,7 +57,7 @@ def get_language_model(num_tokentypes, add_pooler,
                        pre_process=True, post_process=True):
     """Build language model and return along with the key to save."""
     args = get_args()
-    config = core_config_from_args(args)
+    config = core_transformer_config_from_args(args)
     if config.init_method is None:
         config.init_method = init_method_normal(config.init_method_std)
 
