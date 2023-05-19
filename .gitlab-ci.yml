@@ -33,7 +33,7 @@ unit_tests:
   tags:
     - ssh_selene_runner
   stage: test
-  script: &selene-test-launcher-script
+  script: &selene-test-resume-launcher-script
     - echo "Running selene resume from checkpoint test. "
     - pwd
     - export BUILD_DIR=`pwd`
@@ -89,7 +89,9 @@ unit_tests:
     - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
-    - export RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
+    - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
+    - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
+    - export $RUN_NAME
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE
     - export MBS GBS
