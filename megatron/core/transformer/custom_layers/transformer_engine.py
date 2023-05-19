@@ -4,6 +4,7 @@ import transformer_engine as te
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.tensor_parallel import get_cuda_rng_tracker
 
 class TELayerNorm(te.pytorch.module.LayerNorm):
     """
@@ -39,7 +40,7 @@ class TELinear(te.pytorch.module.Linear):
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             tp_group=get_tensor_model_parallel_group(),
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=self.config.get_rng_state_tracker,
+            get_rng_state_tracker=get_cuda_rng_tracker,
             init_method=self.config.init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode=parallel_mode,
@@ -103,7 +104,7 @@ class TECoreAttention(te.pytorch.transformer.DotProductAttention):
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=self.config.get_rng_state_tracker,
+            get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(),
             **kwargs
         )
