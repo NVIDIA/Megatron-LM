@@ -2,6 +2,7 @@
 
 """GPT style dataset."""
 
+import hashlib
 import os
 import time
 
@@ -22,7 +23,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_data_prefix=None,
                                     valid_data_prefix=None,
                                     test_data_prefix=None,
-                                    return_doc_ids=False):
+                                    return_doc_ids=False, *,
+                                    data_cache_path=None):
     """Build train, valid, and test datasets."""
 
     if data_prefix:
@@ -33,7 +35,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             return _build_train_valid_test_datasets(data_prefix[0],
                                                     data_impl, splits_string,
                                                     train_valid_test_num_samples,
-                                                    seq_length, seed, skip_warmup)
+                                                    seq_length, seed, skip_warmup,
+                                                    data_cache_path=data_cache_path)
 
         # Blending dataset.
         # Parse the values.
@@ -54,7 +57,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                 prefixes[i], data_impl, splits_string,
                 datasets_train_valid_test_num_samples[i],
                 seq_length, seed, skip_warmup,
-                return_doc_ids)
+                return_doc_ids,
+                data_cache_path=data_cache_path)
             if train_ds:
                 train_datasets.append(train_ds)
             if valid_ds:
@@ -65,13 +69,16 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         # Blend.
         blending_train_dataset = None
         if train_datasets:
-            blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples)
+            blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples,
+                                                      data_cache_path=data_cache_path)
         blending_valid_dataset = None
         if valid_datasets:
-            blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples)
+            blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples,
+                                                      data_cache_path=data_cache_path)
         blending_test_dataset = None
         if test_datasets:
-            blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples)
+            blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples,
+                                                     data_cache_path=data_cache_path)
 
         return (blending_train_dataset, blending_valid_dataset,
                 blending_test_dataset)
@@ -84,17 +91,21 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if train_data_prefix is not None:
             train_dataset = build_dataset("train", train_data_prefix, data_impl,
                                           train_valid_test_num_samples[0],
-                                          seq_length, seed, skip_warmup)
+                                          seq_length, seed, skip_warmup,
+                                          data_cache_path=data_cache_path)
 
         if valid_data_prefix is not None:
             valid_dataset = build_dataset("valid", valid_data_prefix, data_impl,
                                           train_valid_test_num_samples[1],
-                                          seq_length, seed, False)
+                                          seq_length, seed, False,
+                                          data_cache_path=data_cache_path)
+
 
         if test_data_prefix is not None:
             test_dataset = build_dataset("test", test_data_prefix, data_impl,
                                          train_valid_test_num_samples[2],
-                                         seq_length, seed, False)
+                                         seq_length, seed, False,
+                                         data_cache_path=data_cache_path)
 
         return (train_dataset, valid_dataset, test_dataset)
 
@@ -102,7 +113,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                      train_valid_test_num_samples,
                                      seq_length, seed, skip_warmup,
-                                     return_doc_ids=False):
+                                     return_doc_ids=False, *,
+                                     data_cache_path=None):
     """Build train, valid, and test datasets."""
 
     # Indexed dataset.
@@ -134,7 +146,8 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                  documents, indexed_dataset,
                                  train_valid_test_num_samples[index],
                                  seq_length, seed,
-                                 return_doc_ids)
+                                 return_doc_ids,
+                                 data_cache_path=data_cache_path)
         return dataset
 
     train_dataset = build_dataset(0, 'train')
@@ -145,13 +158,15 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
 
 def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
-                  seq_length, seed, skip_warmup):
+                  seq_length, seed, skip_warmup, *,
+                  data_cache_path=None):
     dataset = None
     if len(data_prefix) == 1:
         dataset = _build_dataset(dataset_name,
-                        data_prefix[0], data_impl,
-                        num_samples, seq_length,
-                        seed, skip_warmup)
+                                 data_prefix[0], data_impl,
+                                 num_samples, seq_length,
+                                 seed, skip_warmup,
+                                 data_cache_path=data_cache_path)
     else:
         # Blending dataset.
         # Parse the values.
@@ -163,19 +178,22 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
         datasets = []
         for i in range(len(prefixes)):
             ds = _build_dataset(dataset_name, prefixes[i],
-                            data_impl, dataset_num_samples[i],
-                            seq_length, seed, skip_warmup)
+                                data_impl, dataset_num_samples[i],
+                                seq_length, seed, skip_warmup,
+                                data_cache_path=data_cache_path)
             if ds:
                 datasets.append(ds)
 
         if datasets:
-            dataset = BlendableDataset(datasets, weights, num_samples)
+            dataset = BlendableDataset(datasets, weights, num_samples,
+                                       data_cache_path=data_cache_path)
 
     return dataset
 
 
 def _build_dataset(dataset_name, data_prefix, data_impl,
-                   num_samples, seq_length, seed, skip_warmup):
+                   num_samples, seq_length, seed, skip_warmup, *,
+                   data_cache_path=None):
     """
     Build dataset. This method is called when individual
     train, valid, test datasets are provided
@@ -196,8 +214,9 @@ def _build_dataset(dataset_name, data_prefix, data_impl,
                         step=1, dtype=np.int32)
 
     dataset = GPTDataset(dataset_name, data_prefix,
-                        documents, indexed_dataset,
-                        num_samples, seq_length, seed)
+                         documents, indexed_dataset,
+                         num_samples, seq_length, seed,
+                         data_cache_path=data_cache_path)
 
     return dataset
 
@@ -220,9 +239,10 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
 
 class GPTDataset(torch.utils.data.Dataset):
 
-    def __init__(self, name, data_prefix, documents, indexed_dataset,
-                 num_samples, seq_length, seed,
-                 return_doc_ids=False):
+    def __init__(self, name, data_prefix, documents,
+                 indexed_dataset, num_samples, seq_length, seed,
+                 return_doc_ids=False, *,
+                 data_cache_path=None):
 
         self.name = name
         self.indexed_dataset = indexed_dataset
@@ -233,10 +253,11 @@ class GPTDataset(torch.utils.data.Dataset):
         assert np.max(documents) < indexed_dataset.sizes.shape[0]
 
         # Build index mappings.
-        self.doc_idx, self.sample_idx, self.shuffle_idx, self.index_prefix = \
+        self.doc_idx, self.sample_idx, self.shuffle_idx, self.desc = \
             _build_index_mappings(self.name, data_prefix,
                                   documents, self.indexed_dataset.sizes,
-                                  num_samples, seq_length, seed)
+                                  num_samples, seq_length, seed,
+                                  data_cache_path=data_cache_path)
 
 
     def __len__(self):
@@ -283,7 +304,8 @@ class GPTDataset(torch.utils.data.Dataset):
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
-                          num_samples, seq_length, seed):
+                          num_samples, seq_length, seed, *,
+                          data_cache_path):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
     sample-idx: is the start document index and document offset for each
@@ -298,94 +320,121 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     np_rng = np.random.RandomState(seed=seed)
 
     # Filename of the index mappings.
-    index_prefix = '{}_indexmap'.format(name)
-    index_prefix += '_{}ns'.format(num_samples)
-    index_prefix += '_{}sl'.format(seq_length)
-    index_prefix += '_{}s'.format(seed)
-    _filename = data_prefix + '_' + index_prefix
-    doc_idx_filename = _filename + '_doc_idx.npy'
-    sample_idx_filename = _filename + '_sample_idx.npy'
-    shuffle_idx_filename = _filename + '_shuffle_idx.npy'
+    desc = "GPT Dataset\n\n"
+    desc += f"Data prefix {data_prefix}\n"
+    desc += f"Dataset name {name}\n"
+    desc += f"Number of samples {num_samples}\n"
+    desc += f"Sequence length {seq_length}\n"
+    desc += f"Random seed {seed}\n"
+    desc_hash = hashlib.md5(desc.encode('utf-8')).hexdigest()
+    desc_filename = desc_hash + ".dsc"
+    doc_idx_filename = desc_hash + '_doc_idx.npy'
+    sample_idx_filename = desc_hash + '_sample_idx.npy'
+    shuffle_idx_filename = desc_hash + '_shuffle_idx.npy'
+
+    # Look for cache in main data dir first to avoid unnecessary
+    # duplication, then look in data-cache-path if specified,
+    # If nothing is found, use the last path looked in
+    build_indices = True
+    prefixes = [os.path.join(os.path.dirname(data_prefix), 'index-cache')]
+    if data_cache_path is not None:
+        prefixes.append(data_cache_path)
+    for prefix in prefixes:
+        idx_path = {
+            'desc': os.path.join(prefix, desc_filename),
+            'doc': os.path.join(prefix, doc_idx_filename),
+            'sample': os.path.join(prefix, sample_idx_filename),
+            'shuffle': os.path.join(prefix, shuffle_idx_filename)
+        }
+        for f in idx_path.values():
+            if not os.path.isfile(f):
+                break
+        else:
+            # Found our files!
+            build_indices = False
+            break
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0:
-        if (not os.path.isfile(doc_idx_filename)) or \
-           (not os.path.isfile(sample_idx_filename)) or \
-           (not os.path.isfile(shuffle_idx_filename)):
+    if build_indices and torch.distributed.get_rank() == 0:
+        print_rank_0(' > WARNING: could not find index map files, building '
+                     'the indices on rank 0 ...')
 
-            print_rank_0(' > WARNING: could not find index map files, building '
-                         'the indices on rank 0 ...')
+        # For the last epoch, decide whether include the entire epoch
+        # in the global shuffle or not.
 
-            # For the last epoch, decide whether include the entire epoch
-            # in the global shuffle or not.
+        # If we need only one epoch, then separating last epoch  does
+        # not mean anything.
+        if num_epochs == 1:
+            separate_last_epoch = False
+            print(' > only one epoch required, setting '
+                  'separate_last_epoch to False', flush=True)
 
-            # If we need only one epoch, then separating last epoch  does
-            # not mean anything.
-            if num_epochs == 1:
-                separate_last_epoch = False
-                print(' > only one epoch required, setting '
-                      'separate_last_epoch to False', flush=True)
-
-            else:
-                # Get the number of samples for the last epoch
-                num_samples_from_epochs_minus_one = (
-                    (num_epochs - 1) * tokens_per_epoch - 1) // seq_length
-                last_epoch_num_samples = num_samples - \
-                                         num_samples_from_epochs_minus_one
-                assert last_epoch_num_samples >= 0, \
-                    'last epoch number of samples should be non-negative.'
-                num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
-                assert last_epoch_num_samples < (num_samples_per_epoch + 1), \
-                    'last epoch number of samples exceeded max value.'
-                # If we have less than 80% of the samples for the last epoch,
-                # seperate out the epoch and treat it differently.
-                # Note: the 80% number is just based on common sense and can
-                # be adjusted if needed.
-                separate_last_epoch = (last_epoch_num_samples <
-                                       int(0.80 * num_samples_per_epoch))
-                if separate_last_epoch:
-                    string = ' > last epoch number of samples ({}) is smaller '\
-                             'than 80% of number of samples per epoch ({}), '\
-                             'setting separate_last_epoch to True'
-                else:
-                    string = ' > last epoch number of samples ({}) is larger '\
-                             'than 80% of number of samples per epoch ({}), '\
-                             'setting separate_last_epoch to False'
-                print(string.format(last_epoch_num_samples,
-                                    num_samples_per_epoch), flush=True)
-
-            # doc-idx.
-            start_time = time.time()
-            doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
-                                     separate_last_epoch)
-            np.save(doc_idx_filename, doc_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save doc-idx mapping '
-                         '(seconds): {:4f}'.format(time.time() - start_time))
-            # sample-idx.
-            start_time = time.time()
-            # Use C++ implementation for speed.
-            # First compile and then import.
-            from megatron.data import helpers
-            assert doc_idx.dtype == np.int32
-            assert sizes.dtype == np.int32
-            sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
-                                                  num_epochs, tokens_per_epoch)
-            np.save(sample_idx_filename, sample_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save sample-idx mapping '
-                         '(seconds): {:4f}'.format(time.time() - start_time))
-            # shuffle-idx.
-            start_time = time.time()
-            # -1 is due to data structure used to retieve the index:
-            #    sample i --> [sample_idx[i], sample_idx[i+1])
+        else:
+            # Get the number of samples for the last epoch
+            num_samples_from_epochs_minus_one = (
+                (num_epochs - 1) * tokens_per_epoch - 1) // seq_length
+            last_epoch_num_samples = num_samples - \
+                                     num_samples_from_epochs_minus_one
+            assert last_epoch_num_samples >= 0, \
+                'last epoch number of samples should be non-negative.'
+            num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
+            assert last_epoch_num_samples < (num_samples_per_epoch + 1), \
+                'last epoch number of samples exceeded max value.'
+            # If we have less than 80% of the samples for the last epoch,
+            # seperate out the epoch and treat it differently.
+            # Note: the 80% number is just based on common sense and can
+            # be adjusted if needed.
+            separate_last_epoch = (last_epoch_num_samples <
+                                   int(0.80 * num_samples_per_epoch))
             if separate_last_epoch:
-                num_samples_ = num_samples_from_epochs_minus_one
+                string = ' > last epoch number of samples ({}) is smaller '\
+                         'than 80% of number of samples per epoch ({}), '\
+                         'setting separate_last_epoch to True'
             else:
-                num_samples_ = sample_idx.shape[0] - 1
-            shuffle_idx = _build_shuffle_idx(num_samples_,
-                                             sample_idx.shape[0] - 1, np_rng)
-            np.save(shuffle_idx_filename, shuffle_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save shuffle-idx mapping'
-                         ' (seconds): {:4f}'.format(time.time() - start_time))
+                string = ' > last epoch number of samples ({}) is larger '\
+                         'than 80% of number of samples per epoch ({}), '\
+                         'setting separate_last_epoch to False'
+            print(string.format(last_epoch_num_samples,
+                                num_samples_per_epoch), flush=True)
+
+        os.makedirs(os.path.dirname(idx_path['desc']), exist_ok=True)
+
+        # description
+        with open(idx_path['desc'], 'wt') as fd:
+            fd.write(desc)
+
+        # doc-idx.
+        start_time = time.time()
+        doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
+                                 separate_last_epoch)
+        np.save(idx_path['doc'], doc_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save doc-idx mapping '
+                     '(seconds): {:4f}'.format(time.time() - start_time))
+        # sample-idx.
+        start_time = time.time()
+        # Use C++ implementation for speed.
+        # First compile and then import.
+        from megatron.data import helpers
+        assert doc_idx.dtype == np.int32
+        assert sizes.dtype == np.int32
+        sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
+                                              num_epochs, tokens_per_epoch)
+        np.save(idx_path['sample'], sample_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save sample-idx mapping '
+                     '(seconds): {:4f}'.format(time.time() - start_time))
+        # shuffle-idx.
+        start_time = time.time()
+        # -1 is due to data structure used to retieve the index:
+        #    sample i --> [sample_idx[i], sample_idx[i+1])
+        if separate_last_epoch:
+            num_samples_ = num_samples_from_epochs_minus_one
+        else:
+            num_samples_ = sample_idx.shape[0] - 1
+        shuffle_idx = _build_shuffle_idx(num_samples_,
+                                         sample_idx.shape[0] - 1, np_rng)
+        np.save(idx_path['shuffle'], shuffle_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save shuffle-idx mapping'
+                     ' (seconds): {:4f}'.format(time.time() - start_time))
 
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
@@ -399,22 +448,22 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
 
     # Load mappings.
     start_time = time.time()
-    print_rank_0(' > loading doc-idx mapping from {}'.format(
-        doc_idx_filename))
-    doc_idx = np.load(doc_idx_filename, allow_pickle=True, mmap_mode='r')
-    print_rank_0(' > loading sample-idx mapping from {}'.format(
-        sample_idx_filename))
-    sample_idx = np.load(sample_idx_filename, allow_pickle=True, mmap_mode='r')
-    print_rank_0(' > loading shuffle-idx mapping from {}'.format(
-        shuffle_idx_filename))
-    shuffle_idx = np.load(shuffle_idx_filename, allow_pickle=True, mmap_mode='r')
+    print_rank_0(f" > loading doc-idx mapping from {idx_path['doc']}")
+    doc_idx = np.load(idx_path['doc'], allow_pickle=True, mmap_mode='r')
+
+    print_rank_0(f" > loading sample-idx mapping from {idx_path['sample']}")
+    sample_idx = np.load(idx_path['sample'], allow_pickle=True, mmap_mode='r')
+
+    print_rank_0(f" > loading shuffle-idx mapping from {idx_path['shuffle']}")
+    shuffle_idx = np.load(idx_path['shuffle'], allow_pickle=True, mmap_mode='r')
+
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(
         sample_idx.shape[0]))
     print_rank_0('    total number of epochs: {}'.format(num_epochs))
 
-    return doc_idx, sample_idx, shuffle_idx, index_prefix
+    return doc_idx, sample_idx, shuffle_idx, desc
 
 
 def _num_tokens(documents, sizes):
