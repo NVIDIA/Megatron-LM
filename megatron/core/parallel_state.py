@@ -19,6 +19,8 @@ _EMBEDDING_GROUP = None
 _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
+# FP8 amax reduction group.
+_AMAX_REDUCTION_GROUP = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
@@ -53,9 +55,9 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    use_fp8: bool = False,
 ) -> None:
-    """
-    Initialize model data parallel groups.
+    """Initialize model data parallel groups.
 
     Arguments:
         tensor_model_parallel_size (int, default = 1):
@@ -93,6 +95,11 @@ def initialize_model_parallel(
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
 
+        use_fp8 (bool, default = False):
+            Construct GPU groups needed for FP8 training, namely for
+            amax reduction across the product of the data-parallel and
+            tensor-parallel groups.
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -108,6 +115,7 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
+
     """
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -226,6 +234,21 @@ def initialize_model_parallel(
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
+    # Build the FP8 groups.
+    global _AMAX_REDUCTION_GROUP
+    assert _AMAX_REDUCTION_GROUP is None, \
+        'FP8 amax reduction group is already initialized'
+    if use_fp8:
+        amax_group_size: int = tensor_model_parallel_size * data_parallel_size
+        num_amax_groups: int = world_size // amax_group_size
+        for i in range(num_amax_groups):
+            start_rank = i * amax_group_size
+            end_rank = (i + 1) * amax_group_size
+            ranks = range(start_rank, end_rank)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _AMAX_REDUCTION_GROUP = group
+
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
     # put this. If we end up with a more generic initialization of megatron-core
@@ -287,6 +310,13 @@ def get_position_embedding_group():
     assert _POSITION_EMBEDDING_GROUP is not None, \
         'position embedding group is not initialized'
     return _POSITION_EMBEDDING_GROUP
+
+
+def get_amax_reduction_group():
+    """Get the FP8 amax reduction group the caller rank belongs to."""
+    assert _AMAX_REDUCTION_GROUP is not None, \
+        'FP8 amax reduction group is not initialized'
+    return _AMAX_REDUCTION_GROUP
 
 
 def set_tensor_model_parallel_world_size(world_size):
@@ -554,6 +584,8 @@ def destroy_model_parallel():
     _EMBEDDING_GROUP = None
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
+    global _AMAX_REDUCTION_GROUP
+    _AMAX_REDUCTION_GROUP = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
