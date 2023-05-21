@@ -318,7 +318,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     'torch.cuda.FloatTensor,  '
                                     'torch.cuda.HalfTensor, or '
                                     'torch.cuda.BFloat16Tensor. '
-                                    'Received {}'.format(param.type()))
+                                    'Received {}'.format(model_param.type()))
 
             # Update optimizer's params.
             group_range["orig_group"]["params"] = [
