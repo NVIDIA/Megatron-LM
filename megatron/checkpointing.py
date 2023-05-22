@@ -631,7 +631,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
     else:
-        if args.fp16 and optimizer is not None:
+        if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
 
     # rng states.
