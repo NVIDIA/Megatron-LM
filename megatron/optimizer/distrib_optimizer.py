@@ -721,3 +721,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                           self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups,
                           self.model_fp32_groups)
+        
+    def _copy_model_params_to_main_params(self):
+        """
+        Copy model params to main params to
+        
+        """
+
+        # Utility method for copying group params.
+        def copy_group_params(model_groups,shard_main_groups):
+            for shard_main_group, model_group in zip(shard_main_groups,
+                                                     model_groups):
+                for shard_main_param, model_param in zip(shard_main_group,
+                                                         model_group):
+                    param_range_map = self.get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+
+                    model_grad = model_param.main_grad
+                    shard_model_grad = model_grad.view(-1) \
+                        [param_range.start:param_range.end]
+
+                    shard_main_param.copy_(shard_model_grad.data)
+
+        # Copy model groups to shard groups
+        copy_group_params(self.model_float16_groups,
+                          self.shard_fp32_from_float16_groups,
+                          )
+        copy_group_params(self.model_fp32_groups,
+                          self.shard_fp32_groups,
+                          )
