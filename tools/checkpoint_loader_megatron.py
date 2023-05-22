@@ -5,6 +5,8 @@ import types
 
 import torch
 
+from megatron.fused_kernels import cuda
+
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
 
@@ -32,7 +34,7 @@ def _load_checkpoint(queue, args):
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
         from megatron.model import ModelType, module
-        from megatron import mpu, fused_kernels
+        from megatron import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -131,7 +133,7 @@ def _load_checkpoint(queue, args):
     set_global_variables(margs)
     mpu.initialize.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
-    fused_kernels.load(margs)
+    cuda.load(margs)
 
     # Get true (non-padded) vocab size
     if args.true_vocab_size is not None:

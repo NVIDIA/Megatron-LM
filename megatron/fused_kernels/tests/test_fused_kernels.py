@@ -301,7 +301,7 @@ if __name__ == "__main__":
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
 
-    from megatron.fused_kernels import load
+    from megatron.fused_kernels.cuda import load
     load(DummyArgs())
 
     test_load_fused_kernels()

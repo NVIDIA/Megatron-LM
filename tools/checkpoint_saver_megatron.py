@@ -6,6 +6,8 @@ import sys
 
 import torch
 
+from megatron.fused_kernels import cuda
+
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
 
@@ -36,7 +38,7 @@ def save_checkpoint(queue, args):
         from megatron.global_vars import set_global_variables, get_args
         from megatron.model import ModelType
         from megatron.tokenizer.tokenizer import _vocab_size_with_padding
-        from megatron import mpu, fused_kernels
+        from megatron import mpu
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
@@ -159,7 +161,7 @@ def save_checkpoint(queue, args):
     mpu.initialize.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
     mpu.initialize.set_tensor_model_parallel_rank(0)
     mpu.initialize.set_pipeline_model_parallel_rank(0)
-    fused_kernels.load(margs)
+    cuda.load(margs)
 
     # Embeddings
     #-----------
