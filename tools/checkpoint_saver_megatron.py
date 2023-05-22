@@ -18,6 +18,8 @@ def add_arguments(parser):
     group.add_argument('--target-pipeline-parallel-size', type=int,
                        help='Target tensor model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument("--use-kernels-from-apex", action="store_true",
+                       help="use Apex kernels instead of Megatron")
 
 def save_checkpoint(queue, args):
 

@@ -15,6 +15,8 @@ def add_arguments(parser):
                        'trim padding from the embedding table.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of deepspeed repository')
+    group.add_argument("--use-kernels-from-apex", action="store_true",
+                       help="use Apex kernels instead of Megatron")
 
 def _load_checkpoint(queue, args):
 

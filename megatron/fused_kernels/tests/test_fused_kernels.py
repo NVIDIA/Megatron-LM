@@ -11,7 +11,7 @@ from megatron.model.utils import attention_mask_func
 
 def test_load_fused_kernels():
     try:
-        import fused_mix_prec_layer_norm_cuda
+        import fused_layer_norm_cuda
         import scaled_masked_softmax_cuda
         import scaled_upper_triang_masked_softmax_cuda
         import torch
@@ -279,6 +279,13 @@ def test_layer_norm():
         )
 
 
+class DummyArgs:
+    rank: int = 0
+    masked_softmax_fusion: bool = True
+    gradient_accumulation_fusion: bool = True
+    use_kernels_from_apex: bool = True
+
+
 if __name__ == "__main__":
     try:
         from transformers import BertTokenizer, GPT2Tokenizer
@@ -293,6 +300,9 @@ if __name__ == "__main__":
     except:
         print("\n[Fail] Please install `transformers` package to test fused kernels\n")
         exit(-1)
+
+    from megatron.fused_kernels import load
+    load(DummyArgs())
 
     test_load_fused_kernels()
     test_fused_softmax()

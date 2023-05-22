@@ -24,6 +24,8 @@ from torch.utils import cpp_extension
 
 
 def load(args):
+    if args.use_kernels_from_apex:
+        return
 
     # Check if cuda 11 is installed for compute capability 8.0
     cc_flag = []
@@ -88,7 +90,7 @@ def load(args):
     sources=[srcpath / 'layer_norm_cuda.cpp',
              srcpath / 'layer_norm_cuda_kernel.cu']
     fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
-        "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags)
+        "fused_layer_norm_cuda", sources, extra_cuda_flags)
 
     # =================================
     # Fused gradient accumulation to weight gradient computation of linear layer
