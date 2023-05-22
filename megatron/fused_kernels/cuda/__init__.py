@@ -13,20 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import pathlib
 import subprocess
 
 from torch.utils import cpp_extension
+from megatron.fused_kernels.utils import _create_build_dir
 
 # Do not override TORCH_CUDA_ARCH_LIST to allow for pre-compilation in Dockerfile
 # os.environ["TORCH_CUDA_ARCH_LIST"] = ""
 
 
 def load(args):
-    if args.use_kernels_from_apex:
-        return
-
     # Check if cuda 11 is installed for compute capability 8.0
     cc_flag = []
     _, bare_metal_major, _ = _get_cuda_bare_metal_version(
@@ -113,11 +110,3 @@ def _get_cuda_bare_metal_version(cuda_dir):
     bare_metal_minor = release[1][0]
 
     return raw_output, bare_metal_major, bare_metal_minor
-
-
-def _create_build_dir(buildpath):
-    try:
-        os.mkdir(buildpath)
-    except OSError:
-        if not os.path.isdir(buildpath):
-            print(f"Creation of the build directory {buildpath} failed")
