@@ -59,25 +59,34 @@ class BlendableDataset(torch.utils.data.Dataset):
             index_path = os.path.join(data_cache_path, desc_hash + "_index.npy")
             sample_index_path = os.path.join(data_cache_path, desc_hash + "_sample_index.npy")
             cache_hit = os.path.isfile(index_path) and os.path.isfile(sample_index_path)
+            cache_success = True
             if torch.distributed.get_rank() == 0 and not cache_hit:
                 print(' > WARNING: could not find index map files for blendable'
                       ' dataset, building indices on rank 0 ...', flush=True)
                 dataset_index, dataset_sample_index = _build_indices()
-                os.makedirs(os.path.dirname(index_path), exist_ok=True)
-                with open(desc_path, 'wt') as fd:
-                    fd.write(desc)
-                np.save(index_path, dataset_index, allow_pickle=True)
-                np.save(sample_index_path, dataset_sample_index,
-                        allow_pickle=True)
+                try:
+                    os.makedirs(os.path.dirname(index_path), exist_ok=True)
+                    with open(desc_path, 'wt') as fd:
+                        fd.write(desc)
+                        np.save(index_path, dataset_index, allow_pickle=True)
+                        np.save(sample_index_path, dataset_sample_index,
+                                allow_pickle=True)
+                except OSError:
+                    print(f'There was an error trying to create the data cache directory ({data_cache_path})')
+                    print('or a file in it. This is set with the --data-cache-path argument. Please')
+                    print('ensure you have write access to this directory or specify one that you do have')
+                    print('write access to.')
+                    cache_success = False
 
-            # This should be a barrier but nccl barrier assumes device_index=rank which is not the
-            # case for model parallel case
-            counts = torch.cuda.LongTensor([1])
+
+            counts = torch.cuda.LongTensor([cache_success])
             torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
             torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
-            assert counts[0].item() == (
+            if counts[0].item() != (
                 torch.distributed.get_world_size() //
-                torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))
+                torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group())):
+                print_rank_0("Data index creation unsuccessful, exiting.")
+                exit()
 
             # Load on all ranks.
             print_rank_0(f'> loading blendable dataset index: {index_path}')

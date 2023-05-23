@@ -353,6 +353,8 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             # Found our files!
             build_indices = False
             break
+    data_cache_dir = os.path.dirname(idx_path['desc'])
+    data_cache_success = True
 
     # Build the indexed mapping if not exist.
     if build_indices and torch.distributed.get_rank() == 0:
@@ -397,54 +399,62 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             print(string.format(last_epoch_num_samples,
                                 num_samples_per_epoch), flush=True)
 
-        os.makedirs(os.path.dirname(idx_path['desc']), exist_ok=True)
 
-        # description
-        with open(idx_path['desc'], 'wt') as fd:
-            fd.write(desc)
+        try:
+            os.makedirs(data_cache_dir, exist_ok=True)
 
-        # doc-idx.
-        start_time = time.time()
-        doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
-                                 separate_last_epoch)
-        np.save(idx_path['doc'], doc_idx, allow_pickle=True)
-        print_rank_0(' > elasped time to build and save doc-idx mapping '
-                     '(seconds): {:4f}'.format(time.time() - start_time))
-        # sample-idx.
-        start_time = time.time()
-        # Use C++ implementation for speed.
-        # First compile and then import.
-        from megatron.data import helpers
-        assert doc_idx.dtype == np.int32
-        assert sizes.dtype == np.int32
-        sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
-                                              num_epochs, tokens_per_epoch)
-        np.save(idx_path['sample'], sample_idx, allow_pickle=True)
-        print_rank_0(' > elasped time to build and save sample-idx mapping '
-                     '(seconds): {:4f}'.format(time.time() - start_time))
-        # shuffle-idx.
-        start_time = time.time()
-        # -1 is due to data structure used to retieve the index:
-        #    sample i --> [sample_idx[i], sample_idx[i+1])
-        if separate_last_epoch:
-            num_samples_ = num_samples_from_epochs_minus_one
-        else:
-            num_samples_ = sample_idx.shape[0] - 1
-        shuffle_idx = _build_shuffle_idx(num_samples_,
-                                         sample_idx.shape[0] - 1, np_rng)
-        np.save(idx_path['shuffle'], shuffle_idx, allow_pickle=True)
-        print_rank_0(' > elasped time to build and save shuffle-idx mapping'
-                     ' (seconds): {:4f}'.format(time.time() - start_time))
+            # description
+            with open(idx_path['desc'], 'wt') as fd:
+                fd.write(desc)
 
-    # This should be a barrier but nccl barrier assumes
-    # device_index=rank which is not the case for model
-    # parallel case
-    counts = torch.cuda.LongTensor([1])
+            # doc-idx.
+            start_time = time.time()
+            doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
+                                     separate_last_epoch)
+            np.save(idx_path['doc'], doc_idx, allow_pickle=True)
+            print_rank_0(' > elasped time to build and save doc-idx mapping '
+                         '(seconds): {:4f}'.format(time.time() - start_time))
+            # sample-idx.
+            start_time = time.time()
+            # Use C++ implementation for speed.
+            # First compile and then import.
+            from megatron.data import helpers
+            assert doc_idx.dtype == np.int32
+            assert sizes.dtype == np.int32
+            sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
+                                                  num_epochs, tokens_per_epoch)
+            np.save(idx_path['sample'], sample_idx, allow_pickle=True)
+            print_rank_0(' > elasped time to build and save sample-idx mapping '
+                         '(seconds): {:4f}'.format(time.time() - start_time))
+            # shuffle-idx.
+            start_time = time.time()
+            # -1 is due to data structure used to retieve the index:
+            #    sample i --> [sample_idx[i], sample_idx[i+1])
+            if separate_last_epoch:
+                num_samples_ = num_samples_from_epochs_minus_one
+            else:
+                num_samples_ = sample_idx.shape[0] - 1
+            shuffle_idx = _build_shuffle_idx(num_samples_,
+                                             sample_idx.shape[0] - 1, np_rng)
+            np.save(idx_path['shuffle'], shuffle_idx, allow_pickle=True)
+            print_rank_0(' > elasped time to build and save shuffle-idx mapping'
+                         ' (seconds): {:4f}'.format(time.time() - start_time))
+        except OSError:
+            print(f'There was an error trying to create the data cache directory ({data_cache_dir})')
+            print('or a file in it. This defaults to a directory "index-cache" within the directory')
+            print('the data files are in and can be set with the --data-cache-path argument. Please')
+            print('ensure you have write access to this directory or specify one that you do have')
+            print('write access to.')
+            data_cache_success = False
+
+    counts = torch.cuda.LongTensor([data_cache_success])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
-    assert counts[0].item() == (
+    if counts[0].item() != (
         torch.distributed.get_world_size() //
-        torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))
+        torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group())):
+        print_rank_0("Data index creation unsuccessful, exiting.")
+        exit()
 
     # Load mappings.
     start_time = time.time()
