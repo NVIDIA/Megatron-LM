@@ -734,13 +734,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                                      model_groups):
                 for shard_main_param, model_param in zip(shard_main_group,
                                                          model_group):
+                    
                     param_range_map = self.get_model_param_range_map(model_param)
-                    param_range = param_range_map["param"]
-                    assert param_range.size == shard_main_param.nelement()
+                    world_range = param_range_map["gbuf_world"]
+                    
+                    assert world_range.size == shard_main_param.nelement()
+                    
+                    
+                    model_id, dtype = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.param_buffers[model_id][dtype]
 
-                    model_grad = model_param.main_grad
-                    shard_model_grad = model_grad.view(-1) \
-                        [param_range.start:param_range.end]
+                    shard_model_param = model_param_buffer.view(-1) \
+                        [world_range.start:world_range.end]
 
                     shard_main_param.copy_(shard_model_grad.data)
 
