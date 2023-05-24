@@ -19,6 +19,7 @@ _EMBEDDING_GROUP = None
 _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
+_DATA_PARALLEL_GROUP_GLOO = None
 # FP8 amax reduction group.
 _AMAX_REDUCTION_GROUP = None
 
@@ -151,6 +152,7 @@ def initialize_model_parallel(
 
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
+    global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
     all_data_parallel_group_ranks = []
@@ -161,8 +163,10 @@ def initialize_model_parallel(
             ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks.append(list(ranks))
             group = torch.distributed.new_group(ranks)
+            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
+                _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the model-parallel groups.
@@ -296,6 +300,13 @@ def get_data_parallel_group():
     assert _DATA_PARALLEL_GROUP is not None, \
         'data parallel group is not initialized'
     return _DATA_PARALLEL_GROUP
+
+
+def get_data_parallel_group_gloo():
+    """Get the data parallel group-gloo the caller rank belongs to."""
+    assert _DATA_PARALLEL_GROUP_GLOO is not None, \
+        'data parallel group-gloo is not initialized'
+    return _DATA_PARALLEL_GROUP_GLOO
 
 
 def get_embedding_group():
