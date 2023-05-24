@@ -325,10 +325,6 @@ def validate_args(args, defaults={}):
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
 
-    if args.fp16:
-        assert args.transformer_impl == 'local', \
-            'transformer-engine not yet approved for fp16 training and inference'
-
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
