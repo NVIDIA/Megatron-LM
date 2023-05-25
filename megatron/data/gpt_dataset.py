@@ -1,6 +1,6 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-"""GPT style dataset."""
+"""GPT style dataset. Expanded with visual modality."""
 
 import os
 import time
@@ -22,7 +22,9 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                     train_data_prefix=None,
                                     valid_data_prefix=None,
                                     test_data_prefix=None,
-                                    return_doc_ids=False):
+                                    return_doc_ids=False,
+                                    multimodal=False,
+                                    img_h=None, img_w=None):
     """Build train, valid, and test datasets."""
 
     if data_prefix:
@@ -33,7 +35,9 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             return _build_train_valid_test_datasets(data_prefix[0],
                                                     data_impl, splits_string,
                                                     train_valid_test_num_samples,
-                                                    seq_length, seed, skip_warmup)
+                                                    seq_length, seed, skip_warmup,
+                                                    multimodal=multimodal,
+                                                    img_h=img_h, img_w=img_w)
 
         # Blending dataset.
         # Parse the values.
@@ -50,7 +54,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                 prefixes[i], data_impl, splits_string,
                 datasets_train_valid_test_num_samples[i],
                 seq_length, seed, skip_warmup,
-                return_doc_ids)
+                return_doc_ids, multimodal=multimodal, img_h=img_h, img_w=img_w)
             if train_ds:
                 train_datasets.append(train_ds)
             if valid_ds:
@@ -80,17 +84,23 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if train_data_prefix is not None:
             train_dataset = build_dataset("train", train_data_prefix, data_impl,
                                           train_valid_test_num_samples[0],
-                                          seq_length, seed, skip_warmup)
+                                          seq_length, seed, skip_warmup,
+                                          multimodal=multimodal,
+                                          img_h=img_h, img_w=img_w)
 
         if valid_data_prefix is not None:
             valid_dataset = build_dataset("valid", valid_data_prefix, data_impl,
                                           train_valid_test_num_samples[1],
-                                          seq_length, seed, False)
+                                          seq_length, seed, False,
+                                          multimodal=multimodal,
+                                          img_h=img_h, img_w=img_w)
 
         if test_data_prefix is not None:
             test_dataset = build_dataset("test", test_data_prefix, data_impl,
                                          train_valid_test_num_samples[2],
-                                         seq_length, seed, False)
+                                         seq_length, seed, False,
+                                         multimodal=multimodal,
+                                         img_h=img_h, img_w=img_w)
 
         return (train_dataset, valid_dataset, test_dataset)
 
@@ -98,15 +108,27 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                      train_valid_test_num_samples,
                                      seq_length, seed, skip_warmup,
-                                     return_doc_ids=False):
+                                     return_doc_ids=False,
+                                     multimodal=False, img_h=None, img_w=None):
     """Build train, valid, and test datasets."""
 
     # Indexed dataset.
-    indexed_dataset = get_indexed_dataset_(data_prefix,
-                                           data_impl,
-                                           skip_warmup)
+    if multimodal:
+        text_indexed_dataset = get_indexed_dataset_(data_prefix + "_text",
+                                                    data_impl,
+                                                    skip_warmup)
+        img_indexed_dataset = get_indexed_dataset_(data_prefix + "_img",
+                                                    data_impl,
+                                                    skip_warmup)
 
-    total_num_of_documents = indexed_dataset.sizes.shape[0]
+        assert(text_indexed_dataset.sizes.shape[0] == img_indexed_dataset.sizes.shape[0])
+        total_num_of_documents = text_indexed_dataset.sizes.shape[0]
+    else:
+        indexed_dataset = get_indexed_dataset_(data_prefix,
+                                               data_impl,
+                                               skip_warmup)
+        total_num_of_documents = indexed_dataset.sizes.shape[0]
+    
     splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
 
     # Print stats about the splits.
@@ -126,11 +148,18 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if splits[index + 1] > splits[index]:
             documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
-            dataset = GPTDataset(name, data_prefix,
-                                 documents, indexed_dataset,
-                                 train_valid_test_num_samples[index],
-                                 seq_length, seed,
-                                 return_doc_ids)
+            if multimodal:
+                dataset = MultiModalDataset(name, data_prefix,
+                                          documents, text_indexed_dataset, img_indexed_dataset,
+                                          train_valid_test_num_samples[index],
+                                          seq_length, seed, img_h, img_w,
+                                          return_doc_ids)
+            else:
+                dataset = GPTDataset(name, data_prefix,
+                                     documents, indexed_dataset,
+                                     train_valid_test_num_samples[index],
+                                     seq_length, seed,
+                                     return_doc_ids)
         return dataset
 
     train_dataset = build_dataset(0, 'train')
@@ -141,13 +170,13 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
 
 def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
-                  seq_length, seed, skip_warmup):
+                  seq_length, seed, skip_warmup, multimodal=False, img_h=None, img_w=None):
     dataset = None
     if len(data_prefix) == 1:
         dataset = _build_dataset(dataset_name,
                         data_prefix[0], data_impl,
                         num_samples, seq_length,
-                        seed, skip_warmup)
+                        seed, skip_warmup, multimodal=multimodal)
     else:
         # Blending dataset.
         # Parse the values.
@@ -159,7 +188,8 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
         for i in range(len(prefixes)):
             ds = _build_dataset(dataset_name, prefixes[i],
                             data_impl, dataset_num_samples[i],
-                            seq_length, seed, skip_warmup)
+                            seq_length, seed, skip_warmup, multimodal=multimodal,
+                            img_h=img_h, img_w=img_w)
             if ds:
                 datasets.append(ds)
 
@@ -170,18 +200,29 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
 
 
 def _build_dataset(dataset_name, data_prefix, data_impl,
-                   num_samples, seq_length, seed, skip_warmup):
+                   num_samples, seq_length, seed, skip_warmup, 
+                   multimodal=False, img_h=None, img_w=None):
     """
     Build dataset. This method is called when individual
     train, valid, test datasets are provided
     """
 
     # Indexed dataset.
-    indexed_dataset = get_indexed_dataset_(data_prefix,
-                                           data_impl,
-                                           skip_warmup)
+    if multimodal:
+        text_indexed_dataset = get_indexed_dataset_(data_prefix + "_text",
+                                                    data_impl,
+                                                    skip_warmup)
+        img_indexed_dataset = get_indexed_dataset_(data_prefix + "_img",
+                                                    data_impl,
+                                                    skip_warmup)
 
-    total_num_of_documents = indexed_dataset.sizes.shape[0]
+        assert(text_indexed_dataset.sizes.shape[0] == img_indexed_dataset.sizes.shape[0])
+        total_num_of_documents = text_indexed_dataset.sizes.shape[0]
+    else:
+        indexed_dataset = get_indexed_dataset_(data_prefix,
+                                               data_impl,
+                                               skip_warmup)
+        total_num_of_documents = indexed_dataset.sizes.shape[0]
 
     print_rank_0('    {}:'.format(dataset_name))
     print_rank_0('     document indices in [0, {}) total of {} '
@@ -190,9 +231,15 @@ def _build_dataset(dataset_name, data_prefix, data_impl,
     documents = np.arange(start=0, stop=total_num_of_documents,
                         step=1, dtype=np.int32)
 
-    dataset = GPTDataset(dataset_name, data_prefix,
-                        documents, indexed_dataset,
-                        num_samples, seq_length, seed)
+    if multimodal:
+        dataset = MultiModalDataset(name, data_prefix,
+                                  documents, text_indexed_dataset, img_indexed_dataset,
+                                  train_valid_test_num_samples[index],
+                                  seq_length, seed, img_h, img_w)
+    else:
+        dataset = GPTDataset(dataset_name, data_prefix,
+                             documents, indexed_dataset,
+                             num_samples, seq_length, seed)
 
     return dataset
 
@@ -275,6 +322,87 @@ class GPTDataset(torch.utils.data.Dataset):
                     'doc_ids': np.array(doc_ids, dtype=np.int64)}
         else:
             return {'text': np.array(sample, dtype=np.int64)}
+
+from PIL import Image
+
+try:
+    from torchvision.transforms import InterpolationMode
+    BICUBIC = InterpolationMode.BICUBIC
+except ImportError:
+    BICUBIC = Image.BICUBIC
+
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, ToPILImage
+
+def _convert_image_to_rgb(image):
+    return image.convert("RGB")
+
+def _transform(img_h, img_w):
+    return Compose([
+        ToPILImage(),
+        Resize((img_h, img_w), interpolation=BICUBIC),
+        CenterCrop((img_h, img_w)),
+        _convert_image_to_rgb,
+        ToTensor(),
+        Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+    ])
+
+class MultiModalDataset(torch.utils.data.Dataset):
+
+    def __init__(self, name, data_prefix, documents, 
+                 text_indexed_dataset, img_indexed_dataset,
+                 num_samples, seq_length, seed, img_h, img_w, 
+                 return_doc_ids=False):
+
+        self.name = name
+        self.text_indexed_dataset = text_indexed_dataset
+        self.img_indexed_dataset = img_indexed_dataset
+
+        self.return_doc_ids = return_doc_ids
+
+        assert np.min(documents) >= 0
+        assert np.max(documents) < text_indexed_dataset.sizes.shape[0]
+       
+        self.visual_transform = _transform(img_h, img_w)
+        
+        # Build index mappings.
+        self.doc_idx, self.sample_idx, self.shuffle_idx, self.index_prefix = \
+            _build_index_mappings(self.name, data_prefix, 
+                                  documents, self.text_indexed_dataset.sizes,
+                                  num_samples, seq_length, seed)
+
+        print("self.sample_idx.shape[0] - 1", self.sample_idx.shape[0] - 1)
+        print("self.num_samples", num_samples)
+
+    def __len__(self):
+        # -1 is due to data structure used to retieve the index:
+        #    sample i --> [sample_idx[i], sample_idx[i+1])
+        return self.sample_idx.shape[0] - 1
+
+    def __getitem__(self, idx):
+        # Get the shuffled index.
+        idx = self.shuffle_idx[idx]
+        
+        doc_index = self.sample_idx[idx][0]
+        doc_ids = []
+        doc_ids += self.doc_idx[doc_index].item(),
+
+        text_sample = self.text_indexed_dataset.get(self.doc_idx[doc_index])
+        img_sample = self.img_indexed_dataset.get(self.doc_idx[doc_index])
+
+        raw_h = img_sample[-4] * 256 + img_sample[-3]
+        raw_w = img_sample[-2] * 256 + img_sample[-1]
+            
+        assert (img_sample.shape[0] - 4) % (raw_h * raw_w) == 0
+            
+        img_sample = img_sample[:-4].reshape(-1, raw_h, raw_w)
+        img_sample = self.visual_transform(np.transpose(img_sample, (1, 2, 0))).reshape(-1)
+        
+        if self.return_doc_ids:
+            return {'text': np.array(sample, dtype=np.int64),
+                    'doc_ids': np.array(doc_ids, dtype=np.int64)}
+        else:
+            return {'text': np.array(text_sample, dtype=np.int64), 
+                    'img': np.array(img_sample, dtype=np.float32)}
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
