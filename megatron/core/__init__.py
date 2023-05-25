@@ -11,5 +11,5 @@ __all__ = [
     "parallel_state",
     "tensor_parallel",
     "utils",
-    "BaseConfig"
+    "ModelParallelConfig"
 ]

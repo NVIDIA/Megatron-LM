@@ -1,6 +1,6 @@
 import torch
 from tests.test_utilities import Utils
-from megatron.core import BaseConfig
+from megatron.core import ModelParallelConfig
 import megatron.core.pipeline_parallel.schedules as schedule
 from pytest_mock import mocker 
 import pytest
@@ -46,7 +46,7 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     assert(schedule.get_forward_backward_func() == schedule.forward_backward_no_pipelining)
 
     mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
-    config = BaseConfig(
+    config = ModelParallelConfig(
         pipeline_model_parallel_size = 1
     )
     losses_reduced = forward_backward_func(
@@ -88,7 +88,7 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
     micro_batch_size = 8
     hidden_size = 256
 
-    config = BaseConfig(
+    config = ModelParallelConfig(
         pipeline_model_parallel_size = 4,
         tensor_shape = [sequence_length, micro_batch_size, hidden_size],
         decoder_seq_length = sequence_length,

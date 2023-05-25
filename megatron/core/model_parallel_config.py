@@ -76,7 +76,7 @@ class ModelParallelConfig:
 
     enable_autocast (bool): If true runs the forward step function inside torch.autocast context. Default is False.
 
-    autocast_dtype (torch.dtype): dtype to pass to torch.amp.autocast when emabled. Default is pipeline_dtype.
+    autocast_dtype (torch.dtype): dtype to pass to torch.amp.autocast when enabled. Default is pipeline_dtype.
     
     variable_seq_lengths (bool, default=False): Support for variable sequence lengths across microbatches. Setting this
         communicates the size of tensors during pipeline parallelism communication, because of this extra overhead it

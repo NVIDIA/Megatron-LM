@@ -15,7 +15,7 @@ from torch.nn.parameter import Parameter
 
 from torch.cuda.amp import custom_fwd, custom_bwd
 
-from ..model_parallel_config import ModelParallelConfig
+from megatron.core.model_parallel_config import ModelParallelConfig
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,

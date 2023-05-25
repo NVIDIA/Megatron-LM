@@ -14,10 +14,6 @@ from megatron.core.transformer.enums import AttnType, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import \
         TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
-#from megatron.core.tensor_parallel import \
-#    ColumnParallelLinear as TEColumnParallelLinear, \
-#    RowParallelLinear as TERowParallelLinear
-#from megatron.core.transformer import CoreAttention as TECoreAttention
 
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
