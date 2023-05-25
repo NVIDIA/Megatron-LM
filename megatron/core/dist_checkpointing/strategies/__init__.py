@@ -2,10 +2,14 @@
 
 """ Various loading and saving strategies """
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 try:
     import zarr
     import tensorstore
     from .zarr import _import_trigger
     from .tensorstore import _import_trigger
 except ImportError:
-    print('Zarr strategies will not be registered because of missing packages')
+    logger.warning('Zarr-based strategies will not be registered because of missing packages')
