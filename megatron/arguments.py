@@ -13,7 +13,6 @@ from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.pipeline_parallel import PipelineConfig
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -410,18 +409,9 @@ def core_transformer_config_from_args(args):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
-    return TransformerConfig(**kw_args)
-
-def core_pipeline_config_from_args(args):
-    kw_args = {}
-    for f in dataclasses.fields(PipelineConfig):
-        if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['tensor_shape'] = (args.seq_length, args.micro_batch_size, args.hidden_size)
-    return PipelineConfig(**kw_args)
-
+    return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')

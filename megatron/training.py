@@ -19,7 +19,7 @@ from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
 from megatron import is_last_rank
 from megatron import update_num_microbatches
-from megatron.core import mpu, tensor_parallel, BaseConfig
+from megatron.core import mpu, tensor_parallel
 from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
@@ -40,7 +40,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-from megatron.arguments import core_pipeline_config_from_args
+from megatron.arguments import core_transformer_config_from_args
 
 
 def print_datetime(string):
@@ -403,7 +403,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, pipe_config):
+               model, optimizer, opt_param_scheduler, config):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -421,19 +421,21 @@ def train_step(forward_step_func, data_iterator,
 
     # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
     if args.timing_log_level < 2:
-        pipe_config.timers = None
+        config.timers = None
 
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
         model=model,
         num_microbatches=get_num_microbatches(),
-        config=pipe_config,
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
         forward_only=False)
 
     # reset timers if necessary
-    if pipe_config.timers is None:
-        pipe_config.timers = timers
+    if config.timers is None:
+        config.timers = timers
     timers('forward-backward').stop()
 
     # Empty unused memory.
@@ -695,9 +697,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     iteration = args.iteration
 
     # Translate args to core configuration
-    pipe_config = core_pipeline_config_from_args(args)
-    pipe_config.grad_scaler = optimizer.scale_loss
-    pipe_config.timers = timers
+    config = core_transformer_config_from_args(args)
+    config.grad_scale_func = optimizer.scale_loss
+    config.timers = timers
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
@@ -711,7 +713,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       pipe_config)
+                       config)
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -741,7 +743,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
-                                       False)
+                                       config, False)
 
         # Checkpointing
         saved_checkpoint = False
@@ -791,7 +793,7 @@ def evaluate(forward_step_func,
              data_iterator,
              model,
              process_non_loss_data_func,
-             pipe_config,
+             config,
              verbose=False):
     """Evaluation."""
     args = get_args()
@@ -815,15 +817,15 @@ def evaluate(forward_step_func,
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
-            pipe_config.timers = None
+            config.timers = None
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                config=pipe_config,
+                config=config,
                 forward_only=True)
-            pipe_config.timers = get_timers()
+            config.timers = get_timers()
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -857,6 +859,7 @@ def evaluate(forward_step_func,
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
                                iteration, process_non_loss_data_func,
+                               config,
                                verbose=False):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
@@ -864,7 +867,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
-        process_non_loss_data_func, verbose)
+        process_non_loss_data_func, config, verbose)
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())

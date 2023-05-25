@@ -2,7 +2,7 @@ import megatron.core.parallel_state
 import megatron.core.tensor_parallel
 import megatron.core.utils
 
-from .base_config import BaseConfig
+from .model_parallel_config import ModelParallelConfig
 
 # Alias parallel_state as mpu, its legacy name
 mpu = parallel_state

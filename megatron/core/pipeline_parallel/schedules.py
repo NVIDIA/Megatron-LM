@@ -11,9 +11,7 @@ from megatron import core
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
-from megatron.core.utils import get_attr_wrapped_model, get_model_type
-
-from .pipeline_config import PipelineConfig
+from megatron.core.utils import get_attr_wrapped_model, get_model_type, get_model_config
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -71,18 +69,26 @@ def get_forward_backward_func():
         passed as is to forward_step_func. Expected to be a list of
         iterators in the case of interleaved pipeline parallelism.
 
-    model (required): the actual model. Expected to be a list of
-        modules in the case of interleaved pipeline parallelism.
+    model (required): the actual model. Expected to be a list of modules in the case of interleaved
+        pipeline parallelism. Must be a (potentially wrapped) megatron.core.models.MegatronModule.
 
     num_microbatches (int, required):
         The number of microbatches to go through
 
-    config (megatron.core.pipeline_parallel.PipelineConfig, required):
-        Configuration object, see megatron.core.pipeline_paralle.PipelineConfig
+    seq_length (int, required): Sequence length of the current global batch. If this is a dual-stack
+        transformer, this is the encoder's sequence length. This is ignored if variable_seq_lengths
+        in the config is True. Otherwise, each microbatch in the current global batch size must use
+        this sequence length.
+
+    micro_batch_size (int, required): The number of sequences in a microbatch.
+
+    decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
+        transformer. This is ignored for a single-stack transformer.
 
     forward_only (optional, default=False): Perform only the forward step
 
     collect_non_loss_data (optional, bool, default=False): TODO
+
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
@@ -244,8 +250,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor_grad = [output_tensor_grad]
 
     # Backward pass.
-    if output_tensor_grad[0] is None and config.grad_scaler is not None:
-        output_tensor = config.grad_scaler(output_tensor[0])
+    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+        output_tensor = config.grad_scale_func(output_tensor[0])
 
     if config.deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
@@ -283,7 +289,9 @@ def forward_backward_no_pipelining(*,
                                    data_iterator: Union[Iterator, List[Iterator]],
                                    model: Union[torch.nn.Module, List[torch.nn.Module]],
                                    num_microbatches: int,
-                                   config: PipelineConfig,
+                                   seq_length: int, # unused
+                                   micro_batch_size: int, # unused
+                                   decoder_seq_length: int = None, # unused
                                    forward_only: bool = False,
                                    collect_non_loss_data: bool = False,
                                    ):
@@ -304,6 +312,8 @@ def forward_backward_no_pipelining(*,
         assert len(data_iterator) == 1, \
             "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None and isinstance(model, torchDDP):
@@ -338,7 +348,9 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   data_iterator: Union[Iterator, List[Iterator]],
                                                   model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                   num_microbatches: int,
-                                                  config: PipelineConfig,
+                                                  seq_length: int,
+                                                  micro_batch_size: int,
+                                                  decoder_seq_length: int = None,
                                                   forward_only: bool = False,
                                                   collect_non_loss_data: bool = False,
                                                   ):
@@ -352,6 +364,8 @@ def forward_backward_pipelining_with_interleaving(*,
         "invalid model chunking"
     assert isinstance(data_iterator, list), \
         "interleaved pipeline parallelism expected each model chunk to have a data iterator"
+
+    config = get_model_config(model)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -401,17 +415,12 @@ def forward_backward_pipelining_with_interleaving(*,
     if model_type == ModelType.encoder_and_decoder:
         raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
 
-    if config.decoder_seq_length is not None and config.decoder_seq_length != config.tensor_shape[0]:
+    if config.decoder_seq_length is not None and config.decoder_seq_length != tensor_shape[0]:
         raise RuntimeError("Interleaving is not supported with a different decoder sequence length.")
 
-    tensor_shape = config.tensor_shape
+    tensor_shape = (seq_length, micro_batch_size, config.hidden_size)
     if config.sequence_parallel:
-        seq_length, batch_size, hidden = config.tensor_shape
-        tensor_shape = (
-            seq_length // parallel_state.get_tensor_model_parallel_world_size(),
-            batch_size,
-            hidden,
-        )
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
@@ -729,6 +738,9 @@ def forward_backward_pipelining_with_interleaving(*,
 def get_tensor_shapes(*,
                       rank: int,
                       model_type: ModelType,
+                      seq_length: int,
+                      micro_batch_size: int,
+                      decoder_seq_length: int,
                       config):
     # Determine right tensor sizes (based on position of rank with respect to split
     # rank) and model size.
@@ -740,25 +752,18 @@ def get_tensor_shapes(*,
     # Otherwise, send one tensor (pre-transpose).
     tensor_shapes = []
 
-    assert (
-        len(config.tensor_shape) == 3
-    ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {config.tensor_shape}"
-
-    seq_length, micro_batch_size, hidden_size = config.tensor_shape
-    decoder_seq_length = config.decoder_seq_length
-
     if config.sequence_parallel:
         seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
         decoder_seq_length = decoder_seq_length // parallel_state.get_tensor_model_parallel_world_size()
 
     if model_type == ModelType.encoder_and_decoder:
         if parallel_state.is_pipeline_stage_before_split(rank):
-            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
         else:
-            tensor_shapes.append((decoder_seq_length, micro_batch_size, hidden_size))
-            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
+            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
     else:
-        tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+        tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
 
@@ -834,7 +839,9 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      data_iterator: Union[Iterator, List[Iterator]],
                                                      model: Union[torch.nn.Module, List[torch.nn.Module]],
                                                      num_microbatches: int,
-                                                     config: PipelineConfig,
+                                                     seq_length: int,
+                                                     micro_batch_size: int,
+                                                     decoder_seq_length: int = None,
                                                      forward_only: bool = False,
                                                      collect_non_loss_data: bool = False,
                                                      ):
@@ -851,6 +858,8 @@ def forward_backward_pipelining_without_interleaving(*,
         assert len(data_iterator) == 1, \
             "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
+
+    config = get_model_config(model)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -900,9 +909,15 @@ def forward_backward_pipelining_without_interleaving(*,
     rank = parallel_state.get_pipeline_model_parallel_rank()
     recv_tensor_shapes = get_tensor_shapes(rank=rank-1,
                                            model_type=model_type,
+                                           seq_length=seq_length,
+                                           micro_batch_size=micro_batch_size,
+                                           decoder_seq_length=decoder_seq_length,
                                            config=config)
     send_tensor_shapes = get_tensor_shapes(rank=rank,
                                            model_type=model_type,
+                                           seq_length=seq_length,
+                                           micro_batch_size=micro_batch_size,
+                                           decoder_seq_length=decoder_seq_length,
                                            config=config)
 
     # Input, output tensors only need to be saved when doing backward passes

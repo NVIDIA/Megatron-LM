@@ -15,7 +15,7 @@ from torch.nn.parameter import Parameter
 
 from torch.cuda.amp import custom_fwd, custom_bwd
 
-from ..base_config import BaseConfig
+from ..model_parallel_config import ModelParallelConfig
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -149,7 +149,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, *,
-                 config: BaseConfig):
+                 config: ModelParallelConfig):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
@@ -446,7 +446,7 @@ class ColumnParallelLinear(torch.nn.Module):
     """
 
     def __init__(self, input_size, output_size, *,
-                 config: BaseConfig,
+                 config: ModelParallelConfig,
                  bias=True, gather_output=False, stride=1,
                  keep_master_weight_for_test=False,
                  return_bias=False):
@@ -605,7 +605,7 @@ class RowParallelLinear(torch.nn.Module):
     """
 
     def __init__(self, input_size: int, output_size: int, *,
-                 config: BaseConfig,
+                 config: ModelParallelConfig,
                  bias: bool = True,
                  input_is_parallel: bool = False,
                  stride: int = 1,

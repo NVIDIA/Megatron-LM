@@ -7,7 +7,7 @@ import torch
 
 
 @dataclass
-class BaseConfig:
+class ModelParallelConfig:
     """Base configuration for Megatron Core
 
     Model Parallelism
@@ -52,6 +52,7 @@ class BaseConfig:
 
     params_dtype (torch.dtype): dtype used when intializing the weights. Defaults to torch.float32
 
+    timers (optional, default=None): TODO
 
     Optimizations
     -------------
@@ -65,6 +66,46 @@ class BaseConfig:
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
 
+    Pipeline Parallelism
+    --------------------
+
+    pipeline_dtype (required): dtype used in p2p communication, usually params_dtype
+
+    grad_scale_func (optional, default=None): If using loss scaling, this function should take the loss and return the
+        scaled loss. If None, no function is called on the loss.
+
+    enable_autocast (bool): If true runs the forward step function inside torch.autocast context. Default is False.
+
+    autocast_dtype (torch.dtype): dtype to pass to torch.amp.autocast when emabled. Default is pipeline_dtype.
+    
+    variable_seq_lengths (bool, default=False): Support for variable sequence lengths across microbatches. Setting this
+        communicates the size of tensors during pipeline parallelism communication, because of this extra overhead it
+        should only be set if the sequence length varies by microbatch within a global batch.
+
+    num_microbatches_with_partial_activation_checkpoints (int, default=None): If int, set the number of microbatches
+        where not all of the layers will be checkpointed and recomputed. The rest of the microbatches within the window
+        of maximum outstanding microbatches will recompute all layers (either full recompute or selective recompute). If
+        None, the checkpoint and recompute will be left up to the forward_step function.
+
+    batch_p2p_comm (bool, default = False): Use batch_isend_irecv instead of individual isend/irecv calls.
+
+    use_ring_exchange_p2p (bool, default = False): Use custom ring_exchange kernel instead of
+        torch.distributed.batch_isend_irecv(). Requires custom built torch with torch.distributed.ring_exchange.
+
+    deallocate_pipeline_outputs (optional, default=False): If True, output data is deallocated after the tensor is sent
+        to the next pipeline stage.  Helps with saving memory, does nothing when pipeline parallel is not used.
+
+    no_sync_func (optional): Function that creates a context that suppresses asynchronous data-parallel
+        communication. If the model is an instance of torch.nn.DistributedDataParallel, the default is to use
+        torch.nn.DistributedDataParallel.no_sync.
+
+    grad_sync_func (optional): Function that launches asynchronous gradient reductions (e.g. distributed optimizer
+        gradient reduce-scatters). The function should take one argument: an iterable of parameters whose gradients are
+        to be synchronized.
+
+    param_sync_func (optional): Function that launches asynchronous parameter synchronizations (e.g. distributed
+        optimizer parameter all-gathers). The function should take one argument: an iterable of parameters to be
+        synchronized.
 
     """
 
@@ -85,12 +126,25 @@ class BaseConfig:
     fp16: bool = False
     bf16: bool = False
     params_dtype: torch.dtype = torch.float32
+    timers: Callable = None
 
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
-
-    # Pipeline parallel
+    
+    # Pipeline Parallel
+    pipeline_dtype: torch.dtype = None
+    grad_scale_func: Callable = None
+    enable_autocast: bool = False
+    autocast_dtype: torch.dtype = None
+    variable_seq_lengths: bool = False
+    num_microbatches_with_partial_activation_checkpoints: int = None
+    batch_p2p_comm: bool = False
+    use_ring_exchange_p2p: bool = False
+    deallocate_pipeline_outputs: bool = False
+    no_sync_func: Callable = None
+    grad_sync_func: Callable = None
+    param_sync_func: Callable = None
 
     def __post__init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

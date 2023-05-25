@@ -6,10 +6,10 @@ from typing import Callable
 import torch
 import torch.nn.init as init
 from megatron.core.transformer.utils import init_method_normal, scaled_init_method_normal
-from megatron.core import BaseConfig
+from megatron.core import ModelParallelConfig
 
 @dataclass
-class TransformerConfig(BaseConfig):
+class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
 
         Attributes:

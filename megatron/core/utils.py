@@ -35,6 +35,8 @@ def get_attr_wrapped_model(model, attr):
 def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')
 
+def get_model_config(model):
+    return get_attr_wrapped_model(model, 'config')
 
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
