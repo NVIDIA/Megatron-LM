@@ -3,6 +3,7 @@
 # Small English Wikipedia dataset (~2M chunks).
 get_wiki_tiny_config() {
     RETRO_INDEX_STR="IVF4096_HNSW4,Flat"
+    RETRO_NCHUNKS_SAMPLED=2281307
     RETRO_GPT_TRAIN_SAMPLES=31250
     LR_DECAY_SAMPLES=2
     LR_WARMUP_SAMPLES=1
@@ -16,6 +17,7 @@ get_wiki_tiny_config() {
 # English Wikipedia dataset (~67M chunks).
 get_wiki_config() {
     RETRO_INDEX_STR="IVF262144_HNSW32,Flat"
+    RETRO_NCHUNKS_SAMPLED=66625331
     RETRO_GPT_TRAIN_SAMPLES=2037248
     LR_DECAY_SAMPLES=2
     LR_WARMUP_SAMPLES=1
@@ -28,7 +30,8 @@ get_wiki_config() {
 
 # Full corpus (~5B chunks).
 get_corpus_config() {
-    RETRO_INDEX_STR="OPQ32_256,IVF4194304_HNSW32,PQ32"
+    RETRO_INDEX_STR="OPQ64_128,IVF4194304_HNSW32,PQ64"
+    RETRO_NCHUNKS_SAMPLED=300000000
     RETRO_GPT_TRAIN_SAMPLES=192000000
     LR_DECAY_SAMPLES=166400000
     LR_WARMUP_SAMPLES=162761

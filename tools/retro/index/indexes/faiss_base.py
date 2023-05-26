@@ -8,6 +8,7 @@ inherit from this class (see FaissParAddIndex, for an example).
 """
 
 from datetime import timedelta
+import numpy as np
 import os
 import torch
 from tqdm import tqdm
@@ -15,13 +16,16 @@ from tqdm import tqdm
 from megatron import get_retro_args, print_rank_0
 from tools.bert_embedding import BertEmbedder
 from tools.retro.external_libs import faiss
-from tools.retro.index import Index
-from tools.retro.index.utils import num_samples_to_block_ranges
+from tools.retro.index.index import Index
+from tools.retro.index.utils import (
+    get_training_data_merged_path,
+    num_samples_to_block_ranges,
+)
 
 
 class FaissBaseIndex(Index):
 
-    def _train(self, input_data_loader):
+    def _train(self):
         '''Train index (rank 0's method).'''
 
         args = get_retro_args()
@@ -40,17 +44,24 @@ class FaissBaseIndex(Index):
             return
 
         # Load data.
-        inp = input_data_loader()
+        merged_path = get_training_data_merged_path()
+        inp = np.memmap(
+	    merged_path,
+            dtype = "f4",
+	    mode = "r",
+        ).reshape((-1, args.hidden_size))
 
         # Init index.
         index = faiss.index_factory(args.retro_index_nfeats,
                                     args.retro_index_str)
 
         # Move to GPU.
+        print("> move faiss index to gpu.")
         index_ivf = faiss.extract_index_ivf(index)
         clustering_index = \
             faiss.index_cpu_to_all_gpus(faiss.IndexFlatL2(index_ivf.d))
         index_ivf.clustering_index = clustering_index
+        print("> finished moving to gpu.")
         self.c_verbose(index, True)
         self.c_verbose(index_ivf, True)
         self.c_verbose(index_ivf.quantizer, True)
@@ -62,12 +73,12 @@ class FaissBaseIndex(Index):
         # Save index.
         faiss.write_index(index, empty_index_path)
 
-    def train(self, input_data_loader):
+    def train(self):
         '''Train index.'''
 
         # Single process only.
         if torch.distributed.get_rank() == 0:
-            self._train(input_data_loader)
+            self._train()
 
         torch.distributed.barrier()
 
