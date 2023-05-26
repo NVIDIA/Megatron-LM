@@ -1270,6 +1270,7 @@ class ParallelTransformer(MegatronModule):
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
         self.transformer_impl = args.transformer_impl
+        self.retro_add_retriever = args.retro_add_retriever
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = args.recompute_granularity
