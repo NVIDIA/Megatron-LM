@@ -655,6 +655,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+        log_string += ' tokens-per-second-per-gpu: {:.2f} |'.format(tokens_per_sec_per_gpu)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
