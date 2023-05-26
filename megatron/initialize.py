@@ -31,7 +31,7 @@ try:
 except ModuleNotFoundError:
     print('Wandb import failed', flush=True)
 
-import megatron.fused_kernels as fused_kernels
+from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer

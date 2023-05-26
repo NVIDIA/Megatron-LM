@@ -6,7 +6,7 @@ import sys
 
 import torch
 
-import megatron.fused_kernels as fused_kernels
+from megatron import fused_kernels
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
