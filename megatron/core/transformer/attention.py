@@ -55,7 +55,7 @@ class Attention(MegatronModule, ABC):
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
-            bias=True,
+            bias=config.add_bias_linear,
             return_bias=True,
         )
 
@@ -154,8 +154,7 @@ class Attention(MegatronModule, ABC):
         # Output. [sq, b, h]
         # =================
 
-        linear_proj_out = self.linear_proj(core_attn_out)
-        output, bias = linear_proj_out if isinstance(linear_proj_out, (tuple, list)) else (linear_proj_out, None)
+        output, bias = self.linear_proj(core_attn_out)
 
         return output, bias
 
@@ -180,7 +179,8 @@ class SelfAttention(Attention):
                 3 * self.projection_size,
                 config=self.config,
                 init_method=self.config.init_method,
-                bias=False,
+                bias=config.add_bias_linear,
+                return_bias=False
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -188,8 +188,7 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-        linear_qkv_out = self.linear_qkv(hidden_states)
-        mixed_qkv = linear_qkv_out[0] if isinstance(linear_qkv_out, (tuple, list)) else linear_qkv_out
+        mixed_qkv = self.linear_qkv(hidden_states)
 
         # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -224,7 +223,8 @@ class CrossAttention(Attention):
             self.projection_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=False,
+            bias=config.add_bias_linear,
+            return_bias=False
         )
 
         self.linear_kv = TEColumnParallelLinear(
@@ -232,7 +232,8 @@ class CrossAttention(Attention):
             2 * self.projection_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=False,
+            bias=config.add_bias_linear,
+            return_bias=False
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
@@ -241,8 +242,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        linear_kv_out = self.linear_kv(key_value_states)
-        mixed_kv = linear_kv_out[0] if isinstance(linear_kv_out, (tuple, list)) else linear_kv_out
+        mixed_kv = self.linear_kv(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -255,8 +255,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        linear_q_out = self.linear_q(hidden_states)
-        query = linear_q_out[0] if isinstance(linear_q_out, (tuple, list)) else linear_q_out
+        query = self.linear_q(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (

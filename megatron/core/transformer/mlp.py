@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
@@ -15,6 +16,10 @@ class MLP(MegatronModule):
     hidden dimension, perform nonlinear transformation, and project the
     state back into h hidden dimension.
 
+
+    Returns an output and a bias to be added to the output.
+    If config.add_bias_linear is False, the bias returned is None.
+
     We use the following notation:
      h: hidden size
      p: number of tensor model parallel partitions
@@ -27,30 +32,30 @@ class MLP(MegatronModule):
 
         self.config: TransformerConfig = config
 
+        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.linear_fc1 = TEColumnParallelLinear(
-            self.config.hidden_size,
-            self.config.ffn_hidden_size,
+            config.hidden_size,
+            config.ffn_hidden_size * 2 if config.gated_linear_unit else config.ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=True,
+            bias=config.add_bias_linear,
             return_bias=True,
         )
 
-        self.activation_func = F.gelu
-
-        # @jcasper should we remove openai_gelu?
-        # if args.openai_gelu:
-        #     self.activation_func = openai_gelu
-        # @jcasper should we remove onnx_safe?
-        # elif args.onnx_safe:
-        #     self.activation_func = erf_gelu
+        if config.gated_linear_unit:
+            def glu(x):
+                x = torch.chunk(x, 2, dim=-1)
+                return config.activation_func(x[0]) * x[1]
+            self.activation_func = glu
+        else:
+            self.activation_func = config.activation_func
 
         self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
-            bias=True,
+            bias=config.add_bias_linear,
             return_bias=True,
         )
 
@@ -60,9 +65,13 @@ class MLP(MegatronModule):
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
         if self.config.bias_gelu_fusion:
+            assert self.config.add_bias_linear is True
+            assert self.activation_func == F.gelu
             intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
         else:
-            intermediate_parallel = self.activation_func(intermediate_parallel + bias_parallel)
+            if bias_parallel is not None:
+                intermediate_parallel = intermediate_parallel + bias_parallel
+            intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)

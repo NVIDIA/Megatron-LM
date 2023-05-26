@@ -32,9 +32,12 @@ class TELinear(te.pytorch.module.Linear):
                  output_size: int,
                  config: TransformerConfig,
                  parallel_mode: str,
-                 init_method: Callable,
+                 init_method: Callable, *,
+                 bias: bool = True,
+                 return_bias: bool = False,
                  **kwargs):
         self.config = config
+        self.return_none_bias = return_bias and not bias
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -46,8 +49,21 @@ class TELinear(te.pytorch.module.Linear):
             init_method=init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode=parallel_mode,
+            bias=bias,
+            return_bias=(return_bias and bias),
             **kwargs
         )
+
+    # TE returns a zero length Tensor when bias=False and
+    # return_bias=True, but we prefer None.  So in that case we tell
+    # TE to not return the bias, and return None ourselves. This way
+    # our forward always returns two values when return_bias is True
+    # and we don't have to deal with the zero length Tensor.
+    def forward(self, x):
+        out = super().forward(x)
+        if self.return_none_bias:
+            return out, None
+        return out
 
 class TEColumnParallelLinear(TELinear):
     """
