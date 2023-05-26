@@ -85,7 +85,7 @@ class ParallelMLP(MegatronModule):
             config.ffn_hidden_size * 2 if args.swiglu else config.ffn_hidden_size,
             bias=self.add_bias,
             gather_output=False,
-            skip_bias_add=True,
+            return_bias=True,
             config=config
         )
 
@@ -436,9 +436,7 @@ class ParallelAttention(MegatronModule):
                 projection_size,
                 bias=args.add_bias_linear,
                 gather_output=False,
-                init_method=init_method,
-                async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
-                **_args_to_kwargs())
+                config=config)
 
 
             self.key_value = tensor_parallel.ColumnParallelLinear(

@@ -20,12 +20,19 @@ def divide(numerator, denominator):
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
 
-def get_attr_wrapped_model(model, attr):
+def get_attr_wrapped_model(model, attr, allow_none=True):
     """Get an attribute from a wrapped model"""
     if isinstance(model, list):
         raise RuntimeError("_get_attr_wrapped_model given a list of models")
 
-    while not hasattr(model, attr):
+    if allow_none:
+        def condition(model, attr):
+            return not hasattr(model, attr)
+    else:
+        def condition(model, attr):
+            return getattr(model, attr, None) is None
+
+    while condition(model, attr):
         if not hasattr(model, "module"):
             raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
 
@@ -36,7 +43,7 @@ def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')
 
 def get_model_config(model):
-    return get_attr_wrapped_model(model, 'config')
+    return get_attr_wrapped_model(model, 'config', allow_none=False)
 
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.

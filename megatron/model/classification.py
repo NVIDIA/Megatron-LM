@@ -21,7 +21,7 @@ class Classification(MegatronModule):
                  num_tokentypes=2,
                  pre_process=True,
                  post_process=True):
-        super(Classification, self).__init__(share_word_embeddings=False)
+        super(Classification, self).__init__(share_embeddings_and_output_weights=False)
         args = get_args()
 
         self.num_classes = num_classes

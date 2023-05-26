@@ -142,10 +142,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: size of hidden state.
 
     Keyword Arguments:
-        init_method: method to initialize weights.
-        params_dtype
-        use_cpu_initialization
-        perform_initialization
+        config: A megatron.core.ModelParallelConfig object
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, *,

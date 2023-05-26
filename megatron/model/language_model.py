@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 
-from ..arguments import core_transformer_config_from_args
 from .enums import LayerType, AttnMaskType
 from .module import MegatronModule
 from .retro_transformer import ParallelRetroEncoder, ParallelRetroTransformer
@@ -40,7 +39,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         bias=bias,
         gradient_accumulation_fusion=args.gradient_accumulation_fusion,
         async_grad_allreduce=async_grad_allreduce,
-        sequence_parallel_enabled=args.sequence_parallel)
+        sequence_parallel=args.sequence_parallel)
     # Gather if needed.
 
     if parallel_output:
@@ -49,7 +48,7 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
     return tensor_parallel.gather_from_tensor_model_parallel_region(logits_parallel)
 
 
-def get_language_model(num_tokentypes, add_pooler,
+def get_language_model(config, num_tokentypes, add_pooler,
                        encoder_attn_mask_type,
                        add_encoder=True,
                        add_decoder=False,
@@ -57,7 +56,6 @@ def get_language_model(num_tokentypes, add_pooler,
                        pre_process=True, post_process=True):
     """Build language model and return along with the key to save."""
     args = get_args()
-    config = core_transformer_config_from_args(args)
     if config.init_method is None:
         config.init_method = init_method_normal(config.init_method_std)
 
@@ -331,9 +329,9 @@ class TransformerLanguageModel(MegatronModule):
                  pre_process=True,
                  post_process=True):
         args = get_args()
-        # TODO: passing share_word_embeddings=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
+        # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
         if args.untie_embeddings_and_output_weights: assert not add_decoder
-        super(TransformerLanguageModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
+        super(TransformerLanguageModel, self).__init__(share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
         self.pre_process = pre_process
         self.post_process = post_process
