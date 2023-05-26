@@ -49,12 +49,15 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     config = ModelParallelConfig(
         pipeline_model_parallel_size = 1
     )
+    model.config = config
+
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=None,
         model=[model],
         num_microbatches=4,
-        config=config,
+        seq_length=None,
+        micro_batch_size=None,
         forward_only=False) 
     
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]
@@ -90,10 +93,9 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
 
     config = ModelParallelConfig(
         pipeline_model_parallel_size = 4,
-        tensor_shape = [sequence_length, micro_batch_size, hidden_size],
-        decoder_seq_length = sequence_length,
         sequence_parallel = False
     )
+    model.config = config
     
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
@@ -101,6 +103,8 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
         dtype=torch.float32,
         model=[model],
         num_microbatches= micro_batch_size,
+        seq_length=sequence_length,
+        micro_batch_size=micro_batch_size,
         forward_only=True) 
     
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]

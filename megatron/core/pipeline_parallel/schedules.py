@@ -365,7 +365,7 @@ def forward_backward_pipelining_with_interleaving(*,
     assert isinstance(data_iterator, list), \
         "interleaved pipeline parallelism expected each model chunk to have a data iterator"
 
-    config = get_model_config(model)
+    config = get_model_config(model[0])
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

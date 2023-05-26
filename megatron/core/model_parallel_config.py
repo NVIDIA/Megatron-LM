@@ -162,8 +162,5 @@ class ModelParallelConfig:
             if self.pipeline_dtype is None:
                 raise ValueError("When using pipeline parallelism, pipeline_dtype must be specified")
 
-            if self.tensor_shape is None:
-                raise ValueError("When using pipeline parallelism, tensor_shape must be specified")
-
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
