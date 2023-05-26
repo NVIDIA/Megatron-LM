@@ -31,7 +31,7 @@ try:
 except ModuleNotFoundError:
     print('Wandb import failed', flush=True)
 
-from megatron.fused_kernels import cuda
+import megatron.fused_kernels as fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
 from megatron import get_tensorboard_writer
@@ -198,11 +198,11 @@ def _compile_dependencies():
     if torch.distributed.get_rank() == 0:
         start_time = time.time()
         print('> compiling and loading fused kernels ...', flush=True)
-        cuda.load(args)
+        fused_kernels.load(args)
         torch.distributed.barrier()
     else:
         torch.distributed.barrier()
-        cuda.load(args)
+        fused_kernels.load(args)
     # Simple barrier to make sure all ranks have passed the
     # compilation phase successfully before moving on to the
     # rest of the program. We think this might ensure that

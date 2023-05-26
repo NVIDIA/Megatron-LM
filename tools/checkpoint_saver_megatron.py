@@ -6,7 +6,7 @@ import sys
 
 import torch
 
-from megatron.fused_kernels import cuda
+import megatron.fused_kernels as fused_kernels
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
@@ -161,7 +161,7 @@ def save_checkpoint(queue, args):
     mpu.initialize.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
     mpu.initialize.set_tensor_model_parallel_rank(0)
     mpu.initialize.set_pipeline_model_parallel_rank(0)
-    cuda.load(margs)
+    fused_kernels.load(margs)
 
     # Embeddings
     #-----------

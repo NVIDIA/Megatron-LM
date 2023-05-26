@@ -5,7 +5,7 @@ import types
 
 import torch
 
-from megatron.fused_kernels import cuda
+import megatron.fused_kernels as fused_kernels
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
@@ -133,7 +133,7 @@ def _load_checkpoint(queue, args):
     set_global_variables(margs)
     mpu.initialize.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
-    cuda.load(margs)
+    fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
     if args.true_vocab_size is not None:
