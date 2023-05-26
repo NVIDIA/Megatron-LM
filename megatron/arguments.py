@@ -378,6 +378,10 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    if args.use_flash_attn:
+        assert not args.reset_attention_mask, \
+            "Flash Attention doesn't support arbitrary attention masks. Please turn off reset-attention-mask"
+
     _print_args(args)
     return args
 
