@@ -18,8 +18,10 @@ from tools.retro.index.factory import IndexFactory
 from tools.retro.utils import GPTToTextDataset
 
 from .utils import (
-    get_training_data_dir,
-    get_training_data_merged,
+    get_training_data_block_dir,
+    get_training_data_block_paths,
+    get_training_data_merged_path,
+    get_training_data_root_dir,
 )
 
 
@@ -36,6 +38,43 @@ def get_empty_index_path():
     return empty_index_path
 
 
+def get_block_nload(block_path, load_fraction):
+    with h5py.File(block_path) as fi:
+        return int(load_fraction * fi["data"].shape[0])
+
+
+def merge_embedding_blocks():
+
+    if torch.distributed.get_rank() != 0:
+        return
+
+    args = get_retro_args()
+
+    # Get block, merged paths.
+    load_fraction = args.retro_index_train_load_fraction
+    block_paths = get_training_data_block_paths()
+    bin_path = get_training_data_merged_path()
+
+    # Skip, if already built.
+    if os.path.exists(bin_path):
+        return
+
+    # Merge blocks.
+    with open(bin_path, "wb") as fo:
+        byte_offset = 0
+        for block_idx, block_path in \
+            enumerate(tqdm(block_paths, "merge train embeddings")):
+            with h5py.File(block_path) as fi:
+
+                nload = get_block_nload(block_path, load_fraction)
+                block = np.array(fi["data"][:nload], copy = False)
+
+                fo.write(block.tobytes())
+
+                byte_offset += block.size * block.itemsize
+                fo.seek(byte_offset)
+
+
 def embed_db():
     '''Embed DB chunks.
 
@@ -44,6 +83,10 @@ def embed_db():
     '''
 
     args = get_retro_args()
+
+    merged_train_data_path = get_training_data_merged_path()
+    if os.path.exists(merged_train_data_path):
+        return
 
     # Get db dataset.
     gpt_dataset = get_merged_sampled_dataset()
@@ -54,14 +97,19 @@ def embed_db():
                                             args.retro_bert_max_chunk_length,
                                             args.retro_block_size,
                                             args.bert_embedder_type)
-    embedder.embed_text_dataset("index", get_training_data_dir(), text_dataset)
+    embedder.embed_text_dataset("index",
+                                get_training_data_block_dir(),
+                                text_dataset)
+
+    # Merge embeddings.
+    merge_embedding_blocks()
 
 
 def train_on_embeddings():
     '''Train index on embedded DB chunks.'''
     args = get_retro_args()
     index = IndexFactory.get_index(args.retro_index_type)
-    index.train(get_training_data_merged)
+    index.train()
 
 
 def remove_embeddings():
@@ -71,7 +119,7 @@ def remove_embeddings():
         return
     empty_index_path = get_empty_index_path()
     assert os.path.isfile(empty_index_path)
-    shutil.rmtree(get_training_data_dir(), ignore_errors=True)
+    shutil.rmtree(get_training_data_root_dir(), ignore_errors=True)
 
 
 def train_index():
@@ -92,7 +140,7 @@ def train_index():
     torch.distributed.barrier()
 
     # Remove embeddings.
-    if args.retro_delete_index_training_embeddings:
+    if args.retro_index_delete_training_embeddings:
         remove_embeddings()
 
 
