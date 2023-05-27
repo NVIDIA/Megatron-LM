@@ -1282,9 +1282,17 @@ class ParallelTransformer(MegatronModule):
         self.sequence_parallel = args.sequence_parallel
 
         # Transformer Engine Init.
+        self.transformer_engine_rope_available = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
+            from importlib.metadata import version
+            from pkg_resources import packaging
+
+            te_version = packaging.version.Version(version("transformer-engine"))
+            if te_version >= packaging.version.Version("0.10.0"):
+                self.transformer_engine_rope_available = True
+
         self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
         self.fp8_recipe = None
         self.fp8_group = None
