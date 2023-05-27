@@ -31,6 +31,7 @@ class TELinear(te.pytorch.module.Linear):
                  output_size: int,
                  config: TransformerConfig,
                  parallel_mode: str,
+                 init_method: Callable,
                  **kwargs):
         self.config = config
         super().__init__(
@@ -41,7 +42,7 @@ class TELinear(te.pytorch.module.Linear):
             tp_group=get_tensor_model_parallel_group(),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=self.config.init_method,
+            init_method=init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode=parallel_mode,
             **kwargs

@@ -31,6 +31,7 @@ class MLP(MegatronModule):
             self.config.hidden_size,
             self.config.ffn_hidden_size,
             config=self.config,
+            init_method=self.config.init_method,
             bias=True,
             return_bias=True,
         )
@@ -48,6 +49,7 @@ class MLP(MegatronModule):
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
+            init_method=self.config.output_layer_init_method,
             bias=True,
             return_bias=True,
         )
