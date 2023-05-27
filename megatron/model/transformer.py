@@ -1606,13 +1606,15 @@ class ParallelTransformer(MegatronModule):
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
                         'inference_params': inference_params,
-                        'rotary_pos_emb': rotary_pos_emb,
                     }
 
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
+                        if self.transformer_engine_rope_available:
+                            forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                     else:
+                        forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                         forward_kwargs['retriever_input'] = retriever_input
                         forward_kwargs['retriever_output'] = retriever_output
                         forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
