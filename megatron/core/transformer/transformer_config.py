@@ -5,7 +5,6 @@ from typing import Callable
 
 import torch
 import torch.nn.init as init
-from megatron.core.transformer.utils import init_method_normal, scaled_init_method_normal
 from megatron.core import ModelParallelConfig
 
 @dataclass
@@ -152,12 +151,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         f'num_layers: {self.num_layers} must be divisible by virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
                     )
-
-        if self.init_method is None:
-            self.init_method = init_method_normal(self.init_method_std)
-
-        if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True

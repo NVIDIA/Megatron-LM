@@ -635,7 +635,7 @@ class RowParallelLinear(torch.nn.Module):
             if config.perform_initialization:
                 self.master_weight = _initialize_affine_weight_cpu(
                     self.weight, self.output_size, self.input_size,
-                    self.input_size_per_partition, 1, config.init_method,
+                    self.input_size_per_partition, 1, config.output_layer_init_method,
                     stride=stride, return_master_weight=keep_master_weight_for_test,
                     params_dtype=config.params_dtype)
         else:
@@ -643,7 +643,7 @@ class RowParallelLinear(torch.nn.Module):
                 self.output_size, self.input_size_per_partition,
                 device=torch.cuda.current_device(), dtype=config.params_dtype))
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, config.init_method,
+                _initialize_affine_weight_gpu(self.weight, config.output_layer_init_method,
                                               partition_dim=1, stride=stride)
         if bias:
             if config.use_cpu_initialization:

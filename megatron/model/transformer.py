@@ -461,6 +461,7 @@ class ParallelAttention(MegatronModule):
             config.hidden_size,
             bias=args.add_bias_linear,
             input_is_parallel=True,
+            return_bias=True,
             config=config)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
@@ -763,6 +764,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
+
         # Self attention.
         attention_output, attention_bias = \
             self.self_attention(

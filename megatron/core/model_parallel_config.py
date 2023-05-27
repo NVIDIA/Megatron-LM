@@ -5,6 +5,7 @@ from typing import Callable
 
 import torch
 
+from megatron.core.utils import init_method_normal, scaled_init_method_normal
 
 @dataclass
 class ModelParallelConfig:
@@ -164,3 +165,9 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.init_method is None:
+            self.init_method = init_method_normal(self.init_method_std)
+
+        if self.output_layer_init_method is None:
+            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
