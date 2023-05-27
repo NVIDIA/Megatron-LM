@@ -1293,6 +1293,8 @@ class ParallelTransformer(MegatronModule):
             if te_version >= packaging.version.Version("0.10.0"):
                 self.transformer_engine_rope_available = True
 
+            del version, packaging
+
         self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
         self.fp8_recipe = None
         self.fp8_group = None
