@@ -78,7 +78,7 @@ class MegatronModule(torch.nn.Module):
             # stage's weights using all_reduce below.
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
                 args.padded_vocab_size, self.config.hidden_size,
-                config=self.config)
+                config=self.config, init_method=self.config.init_method)
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True
 

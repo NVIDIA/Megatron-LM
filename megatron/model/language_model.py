@@ -148,7 +148,7 @@ class Embedding(MegatronModule):
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-            vocab_size, self.hidden_size, config=config)
+            vocab_size, self.hidden_size, config=config, init_method=config.init_method)
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).

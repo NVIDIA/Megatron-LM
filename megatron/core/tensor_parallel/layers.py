@@ -5,7 +5,7 @@
 
 import math
 import os
-from typing import Optional
+from typing import Optional, Callable
 import warnings
 
 import torch
@@ -146,6 +146,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     """
 
     def __init__(self, num_embeddings: int, embedding_dim: int, *,
+                 init_method: Callable,
                  config: ModelParallelConfig):
         super(VocabParallelEmbedding, self).__init__()
         # Keep the input dimensions.
@@ -175,14 +176,14 @@ class VocabParallelEmbedding(torch.nn.Module):
             if config.perform_initialization:
                 _initialize_affine_weight_cpu(
                     self.weight, self.num_embeddings, self.embedding_dim,
-                    self.num_embeddings_per_partition, 0, config.init_method,
+                    self.num_embeddings_per_partition, 0, init_method,
                     params_dtype=config.params_dtype)
         else:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 device=torch.cuda.current_device(), dtype=config.params_dtype))
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, config.init_method,
+                _initialize_affine_weight_gpu(self.weight, init_method,
                                               partition_dim=0, stride=1)
 
     def forward(self, input_):
@@ -435,15 +436,12 @@ class ColumnParallelLinear(torch.nn.Module):
         return_bias: This was added to enable performance optimations where bias
                        can be fused with other elementwise operations. we skip
                        adding bias but instead return it.
-        async_tensor_model_parallel_allreduce:
-        params_dtype:
-        use_cpu_initialization:
-        gradient_accumulation_fusion:
-        sequence_parallel:
+        config: ModelParallelConfig object
     """
 
     def __init__(self, input_size, output_size, *,
                  config: ModelParallelConfig,
+                 init_method: Callable,
                  bias=True, gather_output=False, stride=1,
                  keep_master_weight_for_test=False,
                  return_bias=False):
@@ -470,14 +468,14 @@ class ColumnParallelLinear(torch.nn.Module):
             if config.perform_initialization:
                 self.master_weight = _initialize_affine_weight_cpu(
                     self.weight, self.output_size, self.input_size,
-                    self.output_size_per_partition, 0, config.init_method,
+                    self.output_size_per_partition, 0, init_method,
                     stride=stride, return_master_weight=keep_master_weight_for_test)
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size_per_partition, self.input_size,
                 device=torch.cuda.current_device(), dtype=config.params_dtype))
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, config.init_method,
+                _initialize_affine_weight_gpu(self.weight, init_method,
                                               partition_dim=0, stride=stride)
 
         if bias:
@@ -594,15 +592,12 @@ class RowParallelLinear(torch.nn.Module):
         return_bias: This was added to enable performance optimization where bias
                        can be fused with other elementwise operations. We skip
                        adding bias but instead return it.
-        params_dtype:
-        use_cpu_initialization:
-        perform_initialization:
-        gradient_accumulation_fusion:
-        sequence_parallel:
+        config: ModelParallelConfig object
     """
 
     def __init__(self, input_size: int, output_size: int, *,
                  config: ModelParallelConfig,
+                 init_method: Callable,
                  bias: bool = True,
                  input_is_parallel: bool = False,
                  stride: int = 1,
@@ -635,7 +630,7 @@ class RowParallelLinear(torch.nn.Module):
             if config.perform_initialization:
                 self.master_weight = _initialize_affine_weight_cpu(
                     self.weight, self.output_size, self.input_size,
-                    self.input_size_per_partition, 1, config.output_layer_init_method,
+                    self.input_size_per_partition, 1, init_method,
                     stride=stride, return_master_weight=keep_master_weight_for_test,
                     params_dtype=config.params_dtype)
         else:
@@ -643,7 +638,7 @@ class RowParallelLinear(torch.nn.Module):
                 self.output_size, self.input_size_per_partition,
                 device=torch.cuda.current_device(), dtype=config.params_dtype))
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, config.output_layer_init_method,
+                _initialize_affine_weight_gpu(self.weight, init_method,
                                               partition_dim=1, stride=stride)
         if bias:
             if config.use_cpu_initialization:

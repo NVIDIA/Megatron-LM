@@ -83,10 +83,11 @@ class ParallelMLP(MegatronModule):
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
             config.ffn_hidden_size * 2 if args.swiglu else config.ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
             bias=self.add_bias,
             gather_output=False,
             return_bias=True,
-            config=config
         )
 
         self.bias_gelu_fusion = False
@@ -114,9 +115,10 @@ class ParallelMLP(MegatronModule):
         self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
             config.ffn_hidden_size,
             config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
             bias=self.add_bias,
-            input_is_parallel=True,
-            config=config
+            input_is_parallel=True
         )
 
     def forward(self, hidden_states):
@@ -426,25 +428,28 @@ class ParallelAttention(MegatronModule):
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 3 * projection_size,
+                config=config,
+                init_method=config.init_method,
                 bias=args.add_bias_linear,
-                gather_output=False,
-                config=config)
+                gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 projection_size,
+                config=config,
+                init_method=config.init_method,
                 bias=args.add_bias_linear,
-                gather_output=False,
-                config=config)
+                gather_output=False)
 
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 2 * projection_size,
+                config=config,
+                init_method=config.init_method,
                 bias=args.add_bias_linear,
-                gather_output=False,
-                config=config)
+                gather_output=False)
 
         self.core_attention = CoreAttention(self.layer_number, config,
                                             self.attn_mask_type)
@@ -459,10 +464,11 @@ class ParallelAttention(MegatronModule):
         self.dense = tensor_parallel.RowParallelLinear(
             projection_size,
             config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
             bias=args.add_bias_linear,
             input_is_parallel=True,
-            return_bias=True,
-            config=config)
+            return_bias=True)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
