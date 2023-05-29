@@ -1169,13 +1169,13 @@ class ParallelTransformer(MegatronModule):
                         tensor_parallel.get_cuda_rng_tracker,
                         mpu.get_tensor_model_parallel_group(),
                         hidden_states, attention_mask, encoder_output,
-                        enc_dec_attn_mask, rotary_pos_emb)
+                        enc_dec_attn_mask, None, rotary_pos_emb)
                 else:
                     hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
                         hidden_states, attention_mask, encoder_output,
-                        enc_dec_attn_mask, rotary_pos_emb)
+                        enc_dec_attn_mask, None, rotary_pos_emb)
 
                 l += self.recompute_num_layers
 
@@ -1192,22 +1192,22 @@ class ParallelTransformer(MegatronModule):
                             tensor_parallel.get_cuda_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, None, rotary_pos_emb)
                     else:
                         hidden_states = tensor_parallel.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, None, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1, is_transformer_engine=True)(
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, None, rotary_pos_emb)
                     else:
                         hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, None, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
