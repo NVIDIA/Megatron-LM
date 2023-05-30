@@ -156,12 +156,13 @@ def pretrain(train_valid_test_dataset_provider,
                           process_non_loss_data_func)
     print_datetime('after training is done')
 
+    config = core_transformer_config_from_args(args)
     if args.do_valid:
         prefix = 'the end of training for val data'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func,
-                                   False)
+                                   config, False)
 
     if args.save and iteration != 0:
         save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -172,7 +173,7 @@ def pretrain(train_valid_test_dataset_provider,
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    0, process_non_loss_data_func,
-                                   True)
+                                   config, True)
 
 def update_train_iters(args):
 
@@ -823,7 +824,9 @@ def evaluate(forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                config=config,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
                 forward_only=True)
             config.timers = get_timers()
 
@@ -844,8 +847,15 @@ def evaluate(forward_step_func,
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
-                forward_step_func, data_iterator, model, optimizer=None,
-                timers=None, forward_only=True, collect_non_loss_data=True)
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True,
+                collect_non_loss_data=True)
 
     # Move model back to the train mode.
     for model_module in model:
