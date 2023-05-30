@@ -1474,7 +1474,8 @@ class ParallelTransformer(MegatronModule):
                         tensor_parallel.get_cuda_rng_tracker,
                         mpu.get_tensor_model_parallel_group(),
                         hidden_states, attention_mask, encoder_output,
-                        enc_dec_attn_mask, rotary_pos_emb)
+                        enc_dec_attn_mask, rotary_pos_emb=rotary_pos_emb,
+                        is_first_microbatch=is_first_microbatch)
                 else:
                     hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
@@ -1497,7 +1498,8 @@ class ParallelTransformer(MegatronModule):
                             tensor_parallel.get_cuda_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, rotary_pos_emb=rotary_pos_emb,
+                            is_first_microbatch=is_first_microbatch)
                     else:
                         hidden_states = tensor_parallel.checkpoint(
                             custom(l, l + 1),
@@ -1508,7 +1510,8 @@ class ParallelTransformer(MegatronModule):
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1, is_transformer_engine=True)(
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            enc_dec_attn_mask, rotary_pos_emb=rotary_pos_emb,
+                            is_first_microbatch=is_first_microbatch)
                     else:
                         hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, encoder_output,
