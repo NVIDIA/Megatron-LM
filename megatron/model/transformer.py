@@ -1459,12 +1459,7 @@ class ParallelTransformer(MegatronModule):
                     layer = self._get_layer(index)
                     x_ = layer(x_, *args, **kwargs)
                 return x_
-            def custom_forward_transformer_engine(*args, **kwargs):
-                return custom_forward(*args, is_first_microbatch=is_first_microbatch, **kwargs)
-            if not is_transformer_engine:
-                return custom_forward
-            else:
-                return custom_forward_transformer_engine
+            return custom_forward
 
         if self.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and
