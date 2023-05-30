@@ -13,7 +13,7 @@ if torch.cuda.is_available():
 
 
 class DummyModule(MegatronModule):
-    # def __init__(self, config: TransformerConfig, share_word_embeddings=True):
+    # def __init__(self, config: TransformerConfig, share_embeddings_and_output_weights=True):
     def __init__(self, config: TransformerConfig):
         super().__init__(config)
 

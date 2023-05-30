@@ -3,6 +3,8 @@ import transformer_engine as te
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.tensor_parallel import get_cuda_rng_tracker
 
 class TELayerNorm(te.pytorch.module.LayerNorm):
     """
@@ -29,17 +31,18 @@ class TELinear(te.pytorch.module.Linear):
                  output_size: int,
                  config: TransformerConfig,
                  parallel_mode: str,
+                 init_method: Callable,
                  **kwargs):
         self.config = config
         super().__init__(
             in_features=input_size,
             out_features=output_size,
-            sequence_parallel=self.config.sequence_parallel_enabled,
-            fuse_wgrad_accumulation=self.config.fuse_wgrad_accumulation,
-            tp_group=self.config.tp_group,
+            sequence_parallel=self.config.sequence_parallel,
+            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+            tp_group=get_tensor_model_parallel_group(),
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=self.config.get_rng_state_tracker,
-            init_method=self.config.init_method,
+            get_rng_state_tracker=get_cuda_rng_tracker,
+            init_method=init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode=parallel_mode,
             **kwargs
@@ -100,9 +103,9 @@ class TECoreAttention(te.pytorch.transformer.DotProductAttention):
             attention_dropout=self.config.attention_dropout,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type.name,
-            sequence_parallel=self.config.sequence_parallel_enabled,
+            sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=self.config.get_rng_state_tracker,
-            tp_group=self.config.tp_group,
+            get_rng_state_tracker=get_cuda_rng_tracker,
+            tp_group=get_tensor_model_parallel_group(),
             **kwargs
         )

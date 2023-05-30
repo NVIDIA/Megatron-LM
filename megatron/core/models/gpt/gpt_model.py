@@ -112,17 +112,10 @@ class GPTModel(MegatronModule):
     ):
         """LM logits using word embedding weights."""
         # Parallel logits.
-        if self.config.async_tensor_model_parallel_allreduce or self.config.sequence_parallel_enabled:
+        if self.config.async_tensor_model_parallel_allreduce or self.config.sequence_parallel:
             input_parallel = input_
-            model_parallel = parallel_state.get_tensor_model_parallel_world_size() > 1
-            async_grad_allreduce = (
-                self.config.async_tensor_model_parallel_allreduce
-                and model_parallel
-                and not self.config.sequence_parallel_enabled
-            )
         else:
             input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
-            async_grad_allreduce = False
 
         # Matrix multiply.
         logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
@@ -130,8 +123,8 @@ class GPTModel(MegatronModule):
             weight=word_embeddings_weight,
             bias=bias,
             gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-            async_grad_allreduce=async_grad_allreduce,
-            sequence_parallel_enabled=self.config.sequence_parallel_enabled,
+            async_grad_allreduce=self.config.async_tensor_model_parallel_allreduce,
+            sequence_parallel=self.config.sequence_parallel,
         )
 
         # Gather if needed.
@@ -189,12 +182,9 @@ class GPTModel(MegatronModule):
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-                self.vocab_size,
-                self.config.hidden_size,
-                init_method=self.config.init_method,
-                params_dtype=self.config.params_dtype,
-                use_cpu_initialization=self.config.use_cpu_initialization,
-                perform_initialization=self.config.perform_initialization,
+                num_embeddings=self.vocab_size,
+                embedding_dim=self.config.hidden_size,
+                config=self.config
             )
             self.word_embeddings.weight.data.fill_(0)
             self.word_embeddings.weight.shared = True

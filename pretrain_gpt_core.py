@@ -5,29 +5,34 @@
 import torch
 from functools import partial
 from megatron import get_args
+from megatron.arguments import core_transformer_config_from_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel
+from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
-from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
     model = GPTModel(
-        config,
-        num_tokentypes=0,
-        parallel_output=True,
+        config=config,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
-        post_process=post_process
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights
     )
     return model
 

@@ -20,7 +20,7 @@ class MultipleChoice(MegatronModule):
                  num_tokentypes=2,
                  pre_process=True,
                  post_process=True):
-        super(MultipleChoice, self).__init__(share_word_embeddings=False)
+        super(MultipleChoice, self).__init__(share_embeddings_and_output_weights=False)
         args = get_args()
 
         init_method = init_method_normal(args.init_method_std)

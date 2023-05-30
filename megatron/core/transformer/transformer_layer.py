@@ -5,13 +5,11 @@ import torch
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnType, AttnMaskType
-from megatron.core.fusions.fused_layer_norm import get_layer_norm
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
 from megatron.core.utils import make_viewless_tensor
-from megatron.core.transformer.custom_layers.transformer_engine import \
-        TELayerNorm
+from megatron.core.transformer.custom_layers.transformer_engine import TELayerNorm
 
 class TransformerLayer(MegatronModule):
     """A single transformer layer.
@@ -35,7 +33,8 @@ class TransformerLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel_enabled,
+            sequence_parallel=self.config.sequence_parallel,
+            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
         )
 
         # Self attention.
@@ -50,7 +49,8 @@ class TransformerLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel_enabled,
+            sequence_parallel=self.config.sequence_parallel,
+            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
         )
 
         # MLP

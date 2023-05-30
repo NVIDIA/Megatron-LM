@@ -136,7 +136,7 @@ class VitBackbone(MegatronModule):
                  single_token_output=False,
                  post_layer_norm=True,
                  drop_path_rate=0.0):
-        super(VitBackbone, self).__init__(share_word_embeddings=False)
+        super(VitBackbone, self).__init__(share_embeddings_and_output_weights=False)
         args = get_args()
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy

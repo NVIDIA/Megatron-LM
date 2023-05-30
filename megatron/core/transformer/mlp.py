@@ -27,12 +27,11 @@ class MLP(MegatronModule):
 
         self.config: TransformerConfig = config
 
-        # Project to 4h.
-        # @jcasper should we change the name dense_h_to_4h here?
         self.linear_fc1 = TEColumnParallelLinear(
             self.config.hidden_size,
             self.config.ffn_hidden_size,
-            self.config,
+            config=self.config,
+            init_method=self.config.init_method,
             bias=True,
             return_bias=True,
         )
@@ -46,12 +45,11 @@ class MLP(MegatronModule):
         # elif args.onnx_safe:
         #     self.activation_func = erf_gelu
 
-        # Project back to h.
-        # @jcasper should we change the name here?
         self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
-            self.config,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
             bias=True,
             return_bias=True,
         )

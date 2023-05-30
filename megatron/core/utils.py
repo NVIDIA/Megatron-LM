@@ -20,12 +20,19 @@ def divide(numerator, denominator):
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
 
-def get_attr_wrapped_model(model, attr):
+def get_attr_wrapped_model(model, attr, allow_none=True):
     """Get an attribute from a wrapped model"""
     if isinstance(model, list):
         raise RuntimeError("_get_attr_wrapped_model given a list of models")
 
-    while not hasattr(model, attr):
+    if allow_none:
+        def condition(model, attr):
+            return not hasattr(model, attr)
+    else:
+        def condition(model, attr):
+            return getattr(model, attr, None) is None
+
+    while condition(model, attr):
         if not hasattr(model, "module"):
             raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
 
@@ -35,6 +42,8 @@ def get_attr_wrapped_model(model, attr):
 def get_model_type(model):
     return get_attr_wrapped_model(model, 'model_type')
 
+def get_model_config(model):
+    return get_attr_wrapped_model(model, 'config', allow_none=False)
 
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
@@ -133,3 +142,21 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
     '''
     assert_viewless_tensor(tensor, extra_msg = "FYI, tensor._base has shape %s, and new_data_tensor has shape %s." % ("--" if tensor._base is None else tensor._base.shape, new_data_tensor.shape))
     tensor.data = new_data_tensor
+
+def init_method_normal(sigma):
+    """Init method based on N(0, sigma)."""
+
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
+
+    return init_
+
+
+def scaled_init_method_normal(sigma, num_layers):
+    """Init method based on N(0, sigma/sqrt(2*num_layers)."""
+    std = sigma / math.sqrt(2.0 * num_layers)
+
+    def init_(tensor):
+        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
+
+    return init_
