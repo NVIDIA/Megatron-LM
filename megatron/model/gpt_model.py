@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
 
@@ -76,16 +76,18 @@ class GPTModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor)
 
     def forward(self, input_ids, position_ids, attention_mask,
-                ret_input_ids=None, ret_position_ids=None, ret_attn_mask=None,
+                retriever_input_ids=None,
+                retriever_position_ids=None,
+                retriever_attn_mask=None,
                 labels=None, tokentype_ids=None, inference_params=None):
 
         lm_output = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
-            ret_input_ids=ret_input_ids,
-            ret_position_ids=ret_position_ids,
-            ret_attn_mask=ret_attn_mask,
+            retriever_input_ids=retriever_input_ids,
+            retriever_position_ids=retriever_position_ids,
+            retriever_attn_mask=retriever_attn_mask,
             inference_params=inference_params)
 
         if self.post_process:

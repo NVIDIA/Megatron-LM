@@ -5,6 +5,6 @@ import os
 from megatron import get_retro_args
 
 
-def get_pretraining_workdir():
+def get_query_workdir():
     args = get_retro_args()
-    return os.path.join(args.retro_workdir, "pretraining")
+    return os.path.join(args.retro_workdir, "query")

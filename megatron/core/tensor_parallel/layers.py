@@ -305,7 +305,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
                 fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input, grad_output, weight.main_grad)
-            elif weight.main_grad.dtype == torch.float16:
+            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
                 fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input, grad_output, weight.main_grad)
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")

@@ -3,6 +3,7 @@
 import json
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from megatron import get_args, print_rank_0
 from tools.retro.external_libs import h5py
@@ -27,9 +28,10 @@ class DBDataset(torch.utils.data.Dataset):
         self.db_path = db_path
         self.indexed_datasets = indexed_datasets
         self.chunks = chunks
+        self.doc_chunk_map = None
 
         self.max_chunk_length = max_chunk_length
-        self.eod_token_id = get_gpt_tokenizer().eod_id
+        self.eod_token_id = get_gpt_tokenizer().eod
 
     def __len__(self):
         return self.chunks.shape[0]
@@ -58,3 +60,15 @@ class DBDataset(torch.utils.data.Dataset):
             "doc_id" : doc_id,
             "text" : np.array(token_ids, dtype=np.int64),
         }
+
+    def load_doc_tuples(self):
+        '''Load the dataset & document ids.
+
+        Load the dataset id & document id of each chunk in the database, to
+        be used for causality filtering during querying.
+        '''
+        self.doc_tuples = np.zeros(shape=(len(self), 2), dtype="uint32")
+        block_size = int(1e6)
+        for start_idx in tqdm(range(0, len(self), block_size)):
+            end_idx = min(len(self), start_idx + block_size)
+            self.doc_tuples[start_idx:end_idx]=self.chunks[start_idx:end_idx,:2]

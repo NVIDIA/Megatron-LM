@@ -308,84 +308,84 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     shuffle_idx_filename = _filename + '_shuffle_idx.npy'
 
     # Build the indexed mapping if not exist.
-    if torch.distributed.get_rank() == 0:
-        if (not os.path.isfile(doc_idx_filename)) or \
-           (not os.path.isfile(sample_idx_filename)) or \
-           (not os.path.isfile(shuffle_idx_filename)):
+    if torch.distributed.get_rank() == 0 and \
+       (not os.path.isfile(doc_idx_filename) or
+        not os.path.isfile(sample_idx_filename) or
+        not os.path.isfile(shuffle_idx_filename)):
 
-            print_rank_0(' > WARNING: could not find index map files, building '
-                         'the indices on rank 0 ...')
+        print_rank_0(' > WARNING: could not find index map files, building '
+                     'the indices on rank 0 ...')
 
-            # For the last epoch, decide whether include the entire epoch
-            # in the global shuffle or not.
+        # For the last epoch, decide whether include the entire epoch
+        # in the global shuffle or not.
 
-            # If we need only one epoch, then separating last epoch  does
-            # not mean anything.
-            if num_epochs == 1:
-                separate_last_epoch = False
-                print(' > only one epoch required, setting '
-                      'separate_last_epoch to False', flush=True)
+        # If we need only one epoch, then separating last epoch  does
+        # not mean anything.
+        if num_epochs == 1:
+            separate_last_epoch = False
+            print(' > only one epoch required, setting '
+                  'separate_last_epoch to False', flush=True)
 
-            else:
-                # Get the number of samples for the last epoch
-                num_samples_from_epochs_minus_one = (
-                    (num_epochs - 1) * tokens_per_epoch - 1) // seq_length
-                last_epoch_num_samples = num_samples - \
-                                         num_samples_from_epochs_minus_one
-                assert last_epoch_num_samples >= 0, \
-                    'last epoch number of samples should be non-negative.'
-                num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
-                assert last_epoch_num_samples < (num_samples_per_epoch + 1), \
-                    'last epoch number of samples exceeded max value.'
-                # If we have less than 80% of the samples for the last epoch,
-                # seperate out the epoch and treat it differently.
-                # Note: the 80% number is just based on common sense and can
-                # be adjusted if needed.
-                separate_last_epoch = (last_epoch_num_samples <
-                                       int(0.80 * num_samples_per_epoch))
-                if separate_last_epoch:
-                    string = ' > last epoch number of samples ({}) is smaller '\
-                             'than 80% of number of samples per epoch ({}), '\
-                             'setting separate_last_epoch to True'
-                else:
-                    string = ' > last epoch number of samples ({}) is larger '\
-                             'than 80% of number of samples per epoch ({}), '\
-                             'setting separate_last_epoch to False'
-                print(string.format(last_epoch_num_samples,
-                                    num_samples_per_epoch), flush=True)
-
-            # doc-idx.
-            start_time = time.time()
-            doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
-                                     separate_last_epoch)
-            np.save(doc_idx_filename, doc_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save doc-idx mapping '
-                         '(seconds): {:4f}'.format(time.time() - start_time))
-            # sample-idx.
-            start_time = time.time()
-            # Use C++ implementation for speed.
-            # First compile and then import.
-            from megatron.data import helpers
-            assert doc_idx.dtype == np.int32
-            assert sizes.dtype == np.int32
-            sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
-                                                  num_epochs, tokens_per_epoch)
-            np.save(sample_idx_filename, sample_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save sample-idx mapping '
-                         '(seconds): {:4f}'.format(time.time() - start_time))
-            # shuffle-idx.
-            start_time = time.time()
-            # -1 is due to data structure used to retieve the index:
-            #    sample i --> [sample_idx[i], sample_idx[i+1])
+        else:
+            # Get the number of samples for the last epoch
+            num_samples_from_epochs_minus_one = (
+                (num_epochs - 1) * tokens_per_epoch - 1) // seq_length
+            last_epoch_num_samples = num_samples - \
+                                     num_samples_from_epochs_minus_one
+            assert last_epoch_num_samples >= 0, \
+                'last epoch number of samples should be non-negative.'
+            num_samples_per_epoch = (tokens_per_epoch - 1) // seq_length
+            assert last_epoch_num_samples < (num_samples_per_epoch + 1), \
+                'last epoch number of samples exceeded max value.'
+            # If we have less than 80% of the samples for the last epoch,
+            # seperate out the epoch and treat it differently.
+            # Note: the 80% number is just based on common sense and can
+            # be adjusted if needed.
+            separate_last_epoch = (last_epoch_num_samples <
+                                   int(0.80 * num_samples_per_epoch))
             if separate_last_epoch:
-                num_samples_ = num_samples_from_epochs_minus_one
+                string = ' > last epoch number of samples ({}) is smaller '\
+                         'than 80% of number of samples per epoch ({}), '\
+                         'setting separate_last_epoch to True'
             else:
-                num_samples_ = sample_idx.shape[0] - 1
-            shuffle_idx = _build_shuffle_idx(num_samples_,
-                                             sample_idx.shape[0] - 1, np_rng)
-            np.save(shuffle_idx_filename, shuffle_idx, allow_pickle=True)
-            print_rank_0(' > elasped time to build and save shuffle-idx mapping'
-                         ' (seconds): {:4f}'.format(time.time() - start_time))
+                string = ' > last epoch number of samples ({}) is larger '\
+                         'than 80% of number of samples per epoch ({}), '\
+                         'setting separate_last_epoch to False'
+            print(string.format(last_epoch_num_samples,
+                                num_samples_per_epoch), flush=True)
+
+        # doc-idx.
+        start_time = time.time()
+        doc_idx = _build_doc_idx(documents, num_epochs, np_rng,
+                                 separate_last_epoch)
+        np.save(doc_idx_filename, doc_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save doc-idx mapping '
+                     '(seconds): {:4f}'.format(time.time() - start_time))
+        # sample-idx.
+        start_time = time.time()
+        # Use C++ implementation for speed.
+        # First compile and then import.
+        from megatron.data import helpers
+        assert doc_idx.dtype == np.int32
+        assert sizes.dtype == np.int32
+        sample_idx = helpers.build_sample_idx(sizes, doc_idx, seq_length,
+                                              num_epochs, tokens_per_epoch)
+        np.save(sample_idx_filename, sample_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save sample-idx mapping '
+                     '(seconds): {:4f}'.format(time.time() - start_time))
+        # shuffle-idx.
+        start_time = time.time()
+        # -1 is due to data structure used to retieve the index:
+        #    sample i --> [sample_idx[i], sample_idx[i+1])
+        if separate_last_epoch:
+            num_samples_ = num_samples_from_epochs_minus_one
+        else:
+            num_samples_ = sample_idx.shape[0] - 1
+        shuffle_idx = _build_shuffle_idx(num_samples_,
+                                         sample_idx.shape[0] - 1, np_rng)
+        np.save(shuffle_idx_filename, shuffle_idx, allow_pickle=True)
+        print_rank_0(' > elasped time to build and save shuffle-idx mapping'
+                     ' (seconds): {:4f}'.format(time.time() - start_time))
 
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
