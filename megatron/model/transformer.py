@@ -1452,7 +1452,7 @@ class ParallelTransformer(MegatronModule):
                               encoder_output, enc_dec_attn_mask,
                               rotary_pos_emb, is_first_microbatch):
         """Forward method with activation checkpointing."""
-        def custom(start, end, is_transformer_engine=False):
+        def custom(start, end):
             def custom_forward(*args, **kwargs):
                 x_, *args = args
                 for index in range(start, end):
@@ -1469,7 +1469,7 @@ class ParallelTransformer(MegatronModule):
             while l < self.num_layers:
                 if self.transformer_impl == 'transformer_engine':
                     hidden_states = transformer_engine.pytorch.distributed.checkpoint(
-                        custom(l, l + self.recompute_num_layers, is_transformer_engine=True),
+                        custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
                         tensor_parallel.get_cuda_rng_tracker,
                         mpu.get_tensor_model_parallel_group(),
@@ -1493,7 +1493,7 @@ class ParallelTransformer(MegatronModule):
                 if l < self.recompute_num_layers:
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = transformer_engine.pytorch.distributed.checkpoint(
-                            custom(l, l + 1, is_transformer_engine=True),
+                            custom(l, l + 1),
                             self.distribute_saved_activations,
                             tensor_parallel.get_cuda_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
@@ -1508,7 +1508,7 @@ class ParallelTransformer(MegatronModule):
                             enc_dec_attn_mask, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
-                        hidden_states = custom(l, l + 1, is_transformer_engine=True)(
+                        hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, encoder_output,
                             enc_dec_attn_mask, rotary_pos_emb=rotary_pos_emb,
                             is_first_microbatch=is_first_microbatch)
