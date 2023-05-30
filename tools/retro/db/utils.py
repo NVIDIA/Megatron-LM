@@ -57,14 +57,14 @@ def get_indexed_dataset_infos():
 
 def get_individual_db_dir(name):
     '''Individual DB's directory.'''
-    return os.path.join(get_base_db_workdir(), "individual", name, "db")
+    return os.path.join(get_base_db_workdir(), "individual", name)
 
 
-def get_individual_db(ds_id, ds_info):
+def get_individual_chunk_db(ds_id, ds_info):
     '''Load individual dataset's chunk DB.'''
     db_paths = sorted(glob.glob(ds_info["db_dir"] + "/*hdf5"))
     # *Note*: convert to dataset, rather than copying to memory.
-    db = np.zeros((ds_info["n_chunks"], 5), dtype="i8")
+    db = np.zeros((ds_info["n_chunks"], 5), dtype="uint32")
     db[:, 0] = ds_id
     start_idx = 0
     for db_path in db_paths:
@@ -77,6 +77,27 @@ def get_individual_db(ds_id, ds_info):
     assert start_idx == ds_info["n_chunks"]
 
     return db
+
+
+def get_individual_doc_offsets(ds_id, ds_info):
+    '''Load individual dataset's chunk DB.'''
+    paths = sorted(glob.glob(ds_info["db_dir"] + "/*hdf5"))
+    # *Note*: convert to dataset, rather than copying to memory.
+    doc_offsets = np.zeros((ds_info["n_docs"], 3), dtype="uint64")
+    doc_offsets[:, 0] = ds_id
+    start_idx = 0
+    start_offset = 0
+    for path in paths:
+        with h5py.File(path) as f:
+            current_doc_offsets = np.copy(f["doc_offsets"])
+            current_doc_offsets[:, 1] += start_offset
+            current_ndocs = current_doc_offsets.shape[0]
+            doc_offsets[start_idx:(start_idx+current_ndocs), 1:] = \
+                current_doc_offsets
+            start_idx += current_ndocs
+            start_offset = current_doc_offsets[-1, 1].item()
+
+    return doc_offsets
 
 
 def get_merged_db_path_map():
@@ -120,28 +141,3 @@ def get_merged_train_dataset(indexed_dataset_infos=None):
 
 def get_merged_valid_dataset(indexed_dataset_infos=None):
     return get_merged_dataset("valid", indexed_dataset_infos)
-
-
-def get_train_doc_chunk_map_dir():
-    dirname = os.path.join(get_base_db_workdir(), "merged", "train_doc_chunk_map")
-    os.makedirs(dirname, exist_ok=True)
-    return dirname
-
-
-def get_train_doc_chunk_map():
-
-    paths = sorted(glob.glob(get_train_doc_chunk_map_dir() + "/*.json"))
-
-    doc_map = defaultdict(set)
-    for path in tqdm(paths, "load train doc maps"):
-
-        # Read file.
-        with open(path) as f:
-            crnt_doc_map = json.load(f)
-
-        # Add to doc map.
-        for key, chunk_ids in crnt_doc_map.items():
-            key = tuple(int(i) for i in key.split(","))
-            doc_map[key].update(chunk_ids)
-
-    return doc_map

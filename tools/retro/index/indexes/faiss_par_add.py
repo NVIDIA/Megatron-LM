@@ -10,6 +10,7 @@ the vast majority of the computational effort is embarrassingly parallel.
 
 import numpy as np
 import os
+import psutil
 import shutil
 import torch
 from tqdm import tqdm
@@ -104,6 +105,8 @@ class FaissParallelAddIndex(FaissBaseIndex):
         if os.path.exists(added_index_path):
             return
 
+        args = get_retro_args()
+
         # Index.
         print_rank_0("read empty index.")
         index = self.get_empty_index()
@@ -112,10 +115,19 @@ class FaissParallelAddIndex(FaissBaseIndex):
         # Add codes.
         print_rank_0("add codes.")
         code_paths = get_added_code_paths()
-        for code_path in tqdm(code_paths, "add codes"):
+        pbar = tqdm(code_paths)
+        for code_path in pbar:
+            pbar.set_description("add codes, mem %.3f gb, %.1f%%" % (
+                psutil.virtual_memory()[3] / 1024**3,
+                psutil.virtual_memory()[2],
+            ))
             with h5py.File(code_path) as f:
-                codes = np.copy(f["data"])
-                index_ivf.add_sa_codes(codes)
+
+                nload = int(args.retro_index_add_load_fraction*f["data"].shape[0])
+                offset = int(os.path.basename(code_path).split("-")[0])
+                xids = np.arange(offset, offset + nload)
+                codes = np.copy(f["data"][:nload])
+                index_ivf.add_sa_codes(codes, xids)
 
         # Update index's ntotal.
         index.ntotal = index_ivf.ntotal
@@ -129,18 +141,19 @@ class FaissParallelAddIndex(FaissBaseIndex):
         if torch.distributed.get_rank() != 0:
             return
         assert os.path.isfile(self.get_added_index_path())
-        shutil.rmtree(get_added_codes_dir(), ignore_errors=True)
+
+        args = get_retro_args()
+        if args.retro_index_delete_added_codes:
+            raise Exception("remove?")
+            shutil.rmtree(get_added_codes_dir(), ignore_errors=True)
 
     def add(self, text_dataset):
 
-        # Check if index already exists.
-        if not os.path.isfile(self.get_added_index_path()):
+        # Encode chunks.
+        self.encode(text_dataset)
 
-            # Encode chunks.
-            self.encode(text_dataset)
-
-            # Add codes to index.
-            self.add_codes()
+        # Add codes to index.
+        self.add_codes()
 
         # Wait for (single-process) adding to complete.
         torch.distributed.barrier()

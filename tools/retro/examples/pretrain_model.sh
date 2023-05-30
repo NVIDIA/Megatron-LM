@@ -29,7 +29,7 @@ DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 DATA_PATH=${DATA_BLEND}
 
 ######## Retro setup. ########
-RETRO_ADD_RETRIEVER=1
+RETRO_ADD_RETRIEVER=0
 RETRO_CYCLIC_TRAIN_ITERS=750000
 RETRO_NUM_NEIGHBORS=2
 
@@ -91,10 +91,11 @@ else
 fi
 
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "SCRIPT = '$SCRIPT'."
 echo "ARGS = '$ARGS'."
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-python -m torch.distributed.launch \
+python -m torch.distributed.run \
     --nproc_per_node ${NPROCS} \
     --nnodes 1 \
     --node_rank 0 \

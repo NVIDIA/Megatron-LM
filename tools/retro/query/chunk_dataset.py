@@ -12,7 +12,7 @@ from megatron.training import (
 from tools.retro.db.utils import get_indexed_dataset_infos
 from tools.retro.utils import get_num_chunks_per_sample
 
-from .utils import get_pretraining_workdir
+from .utils import get_query_workdir
 
 
 class ChunkDataset(torch.utils.data.Dataset):
@@ -127,7 +127,7 @@ def get_chunk_dataset_map():
     }
 
     # Info dict.
-    workdir = get_pretraining_workdir()
+    workdir = get_query_workdir()
     dataset_map = {
         key : {
             "neighbor_dir" : os.path.join(

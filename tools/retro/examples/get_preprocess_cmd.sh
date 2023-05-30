@@ -37,7 +37,6 @@ RETRO_GPT_SEQ_LENGTH=2048
 RETRO_GPT_CHUNK_LENGTH=64
 RETRO_GPT_MICRO_BATCH_SIZE=1 # *8
 RETRO_GPT_GLOBAL_BATCH_SIZE=256
-RETRO_NCHUNKS_SAMPLED=300000000
 
 ################ Retro tasks. ################
 # The '--retro-tasks' argument is a comma-separated list of tasks to run, in

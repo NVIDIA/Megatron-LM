@@ -15,8 +15,8 @@ import torch
 from megatron import get_args, initialize_megatron, print_rank_0
 from megatron.global_vars import set_retro_args
 from tools.retro.db import build_db
-from tools.retro.index.build import add_to_index, build_index, train_index
-from tools.retro.pretraining.query import query_pretraining_neighbors
+from tools.retro.index import add_to_index, build_index, train_index
+from tools.retro.query import query_pretraining_neighbors
 from tools.retro.utils import get_args_path
 
 
@@ -31,16 +31,44 @@ def add_retro_args(parser):
 
     group = parser.add_argument_group(title="Retro preprocessing.")
 
-    group.add_argument("--retro-gpt-vocab-file", required=True,
-                       help="GPT vocab file.")
-    group.add_argument("--retro-gpt-merge-file", required=True,
-                       help="GPT merge file.")
+    # Basic args.
+    group.add_argument("--retro-tasks", default="build",
+                       help="Comma-separated list of tasks to run. Run entire "
+                       "preprocesing pipeline by using '--retro-tasks build'. "
+                       "Alternatively, run individual stages with tasks (in "
+                       "this order) 'db-build', 'index-build', or "
+                       "'query-pretraining-neighbors'. For example, "
+                       "'--retro-tasks db-build,index-build,"
+                       "query-pretraining-neighbors' is equivalent to "
+                       "'--retro-tasks build'; or the argument can contain "
+                       "a subset of these tasks. Stages must always be run "
+                       "in the correct order (listed above).")
+    group.add_argument("--retro-block-size", type=int, default=100000,
+                       help="Number of chunks to process at a time when "
+                       "generating Bert embeddings and querying the search "
+                       "index. Partial results for each block are generally "
+                       "saved to disk in separate files.")
+    group.add_argument("--retro-doc-block-size", type=int, default=100000,
+                       help="Number of documents to processe at time when "
+                       "processing token datasets into chunk databases. The "
+                       "partial chunk database for each block is saved into "
+                       "a separate file.")
+
+    # GPT args.
     group.add_argument("--retro-gpt-tokenizer-type", required=True,
                        help="GPT tokenizer type.")
+    group.add_argument("--retro-gpt-vocab-file", help="GPT vocab file.")
+    group.add_argument("--retro-gpt-merge-file", help="GPT merge file.")
+    group.add_argument("--retro-gpt-tokenizer-model",
+                       help="GPT tokenizer model file.")
     group.add_argument("--retro-gpt-seq-length", type=int, default=2048,
                        help="GPT sequence length.")
+    group.add_argument("--retro-gpt-global-batch-size", type=int, default=2048,
+                       help="GPT global batch size.")
     group.add_argument("--retro-gpt-chunk-length", type=int, default=64,
                        help="GPT chunk length.")
+
+    # Bert args.
     group.add_argument("--retro-bert-vocab-file", required=True,
                        help="Bert vocab file.")
     group.add_argument("--retro-bert-tokenizer-type", required=True,
@@ -52,17 +80,8 @@ def add_retro_args(parser):
                        help="Maximum sequence length for Bert embeddings. "
                        "(Named 'chunk' here in reference to these Bert "
                        "sequences being converted from GPT chunks.)")
-    group.add_argument("--retro-tasks", default="build",
-                       help="Comma-separated list of tasks to run. Run entire "
-                       "preprocesing pipeline by using '--retro-tasks build'. "
-                       "Alternatively, run individual stages with tasks (in "
-                       "this order) 'db-build', 'index-build', or "
-                       "'pretraining-query-neighbors'. For example, "
-                       "'--retro-tasks db-build,index-build,"
-                       "pretraining-query-neighbors' is equivalent to "
-                       "'--retro-tasks build'; or the argument can contain "
-                       "a subset of these tasks. Stages must always be run "
-                       "in the correct order (listed above).")
+
+    # Index args.
     group.add_argument("--retro-index-nfeats", "-f", type=int, default=1024,
                        help="Dimension of Bert embeddings. Bert-large is "
                        "commonly used, so this value defaults to 1024.")
@@ -78,34 +97,10 @@ def add_retro_args(parser):
                        "faiss.index_factory(). For example, "
                        "'IVF262144_HNSW32,Flat' or "
                        "'OPQ32_256,IVF4194304_HNSW32,PQ32'.")
-    group.add_argument("--retro-ef-search", type=int, default=256,
-                       help="Index ef-search parameter for HNSW during "
-                       "querying.")
-    group.add_argument("--retro-nprobe", type=int, default=65536,
-                       help="Index nprobe parameter for IVF during "
-                       "querying.")
-    group.add_argument("--retro-nchunks-sampled", type=int, required=True,
+    group.add_argument("--retro-index-ntrain", type=int, required=True,
                        help="Number of database chunks to use for training "
                        "the index. This value must be less or equal to the "
                        "total number of chunks in the database.")
-    group.add_argument("--retro-doc-block-size", type=int, default=100000,
-                       help="Number of documents to processe at time when "
-                       "processing token datasets into chunk databases. The "
-                       "partial chunk database for each block is saved into "
-                       "a separate file.")
-    group.add_argument("--retro-block-size", type=int, default=100000,
-                       help="Number of chunks to process at a time when "
-                       "generating Bert embeddings and querying the search "
-                       "index. Partial results for each block are generally "
-                       "saved to disk in separate files.")
-    group.add_argument("--retro-index-train-block-size",
-                       type=int, default=3750000,
-                       help="As a memory fragmentation optimization, when "
-                       "loading training data for training the search index, "
-                       "enough data blocks loaded at a time until they reach "
-                       "retro_index_train_block_size, and then this "
-                       "data block is copied into the full training data "
-                       "array.")
     group.add_argument("--retro-index-train-load-fraction",
                        type=float, default=1.,
                        help="Fraction of sampled chunks to use for training "
@@ -113,19 +108,36 @@ def add_retro_args(parser):
                        "use too much memory; lowering the load fraction is "
                        "less costly than re-embedding a new sampled dataset "
                        "from scratch.")
-    group.add_argument("--retro-num-neighbors-query", type=int, default=2000,
+    group.add_argument("--retro-index-add-load-fraction",
+                       type=float, default=1.,
+                       help="Fraction of database chunks to use for adding to "
+                       "the index. Useful when our total index size would "
+                       "use too much memory; lowering the load fraction is "
+                       "less costly than re-designing our token datasets.")
+    group.add_argument("--retro-index-no-delete-training-embeddings",
+                       action='store_false',
+                       dest="retro_index_delete_training_embeddings",
+                       help="Skip deleting training embeddings for the search "
+                       "index. Useful for debugging.")
+    group.add_argument("--retro-index-no-delete-added-codes",
+                       action='store_false',
+                       dest="retro_index_delete_added_codes",
+                       help="Skip deleting added codes for the search "
+                       "index. Useful for debugging.")
+
+    # Query args.
+    group.add_argument("--retro-query-ef-search", type=int, default=256,
+                       help="Index ef-search parameter for HNSW during querying.")
+    group.add_argument("--retro-query-nprobe", type=int, default=65536,
+                       help="Index nprobe parameter for IVF during querying.")
+    group.add_argument("--retro-query-num-neighbors-query", type=int, default=200,
                        help="Number of neighbors to retrieve when calling "
                        "index.search().")
-    group.add_argument("--retro-num-neighbors-target", type=int, default=200,
+    group.add_argument("--retro-query-num-neighbors-save", type=int, default=20,
                        help="Number of neighbors to save to disk after "
                        "the index's returned neighbors. If longer than target "
                        "value, neighbors truncated; and if shorter than target "
                        "value, neighbors are padded with -1's.")
-    group.add_argument("--retro-no-delete-index-training-embeddings",
-                       action='store_false',
-                       dest="retro_delete_index_training_embeddings",
-                       help="Skip deleting training embeddings for the search "
-                       "index. Useful for debugging.")
 
     # Enforce argument naming convention.
     for action in group._group_actions:
@@ -140,10 +152,16 @@ def add_retro_args(parser):
 def save_args(args):
     '''Save copy of args within retro workdir.'''
 
+    def default_dump(obj):
+        if isinstance(obj, torch.dtype):
+            return str(obj)
+        else:
+            raise Exception("specialize for <%s>." % type(obj).__name__)
+
     if torch.distributed.get_rank() == 0:
         args_path = get_args_path(args.retro_workdir)
         with open(args_path, "w") as f:
-            json.dump(vars(args), f, indent=4, default=lambda o : "<skipped>")
+            json.dump(vars(args), f, indent=4, default=default_dump)
 
     torch.distributed.barrier()
 
@@ -188,7 +206,7 @@ if __name__ == "__main__":
             add_to_index() # add only
 
         # Pretraining.
-        elif task == "pretraining-query-neighbors":
+        elif task == "query-pretraining-neighbors":
             query_pretraining_neighbors()
 
         else:
