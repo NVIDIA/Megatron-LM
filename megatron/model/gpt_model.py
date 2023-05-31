@@ -11,8 +11,6 @@ from .module import MegatronModule
 from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
-from .utils import init_method_normal
-from .utils import scaled_init_method_normal
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
@@ -69,7 +67,7 @@ class GPTModel(MegatronModule):
             post_process=self.post_process)
         
         if not args.untie_embeddings_and_output_weights:
-            self.initialize_word_embeddings(init_method_normal)
+            self.initialize_word_embeddings()
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""

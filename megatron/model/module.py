@@ -47,7 +47,7 @@ class MegatronModule(torch.nn.Module):
             return self.word_embeddings.weight
 
 
-    def initialize_word_embeddings(self, init_method_normal):
+    def initialize_word_embeddings(self):
         args = get_args()
         if not self.share_embeddings_and_output_weights:
             raise Exception('initialize_word_embeddings() was called but '
