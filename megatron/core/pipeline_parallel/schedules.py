@@ -415,7 +415,7 @@ def forward_backward_pipelining_with_interleaving(*,
     if model_type == ModelType.encoder_and_decoder:
         raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
 
-    if config.decoder_seq_length is not None and config.decoder_seq_length != tensor_shape[0]:
+    if decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
         raise RuntimeError("Interleaving is not supported with a different decoder sequence length.")
 
     tensor_shape = (seq_length, micro_batch_size, config.hidden_size)
