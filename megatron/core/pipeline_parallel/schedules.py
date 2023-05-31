@@ -87,7 +87,7 @@ def get_forward_backward_func():
 
     overlap_p2p_communication (optional, default=False): When True
         some of the peer to peer communication for pipeline
-        parallelism will overlap with compuation. Must be False if
+        parallelism will overlap with computation. Must be False if
         batch_p2p_communication is true.
 
     batch_p2p_communication (optional, default=True): When true use
