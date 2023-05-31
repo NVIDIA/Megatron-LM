@@ -427,8 +427,8 @@ def train_step(forward_step_func, data_iterator,
         tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
         grad_scaler=optimizer.scale_loss,
         sequence_parallel=args.sequence_parallel,
-        overlap_p2p_communication=args.overlap_p2p_comm,
-        batch_p2p_communication=not args.overlap_p2p_comm,
+        overlap_p2p_comm=args.overlap_p2p_comm,
+        batch_p2p_comm=not args.overlap_p2p_comm,
         forward_only=False,
         timers=fwd_bwd_timers)
     timers('forward-backward').stop()

@@ -85,14 +85,14 @@ def get_forward_backward_func():
         tensor\_model\_parallel\_world\_size`.
         TODO: Do we need this? Just roll into tensor_shape arg?
 
-    overlap_p2p_communication (optional, default=False): When True
+    overlap_p2p_comm (optional, default=False): When True
         some of the peer to peer communication for pipeline
         parallelism will overlap with computation. Must be False if
-        batch_p2p_communication is true.
+        batch_p2p_comm is true.
 
-    batch_p2p_communication (optional, default=True): When true use
+    batch_p2p_comm (optional, default=True): When true use
         batch_isend_irecv, otherwise use individual isend and irecv
-        calls. Must be false if overlap_p2p_communication is True.
+        calls. Must be false if overlap_p2p_comm is True.
 
     forward_only (optional, default=False): Perform only the forward step
 
@@ -328,8 +328,8 @@ def forward_backward_no_pipelining(*,
                                    decoder_seq_length: Optional[int] = None, # unused
                                    grad_scaler: Callable = None,
                                    sequence_parallel: bool = False, # unused
-                                   overlap_p2p_communication: bool = False, # unused
-                                   batch_p2p_communication: bool = True, # unused
+                                   overlap_p2p_comm: bool = False, # unused
+                                   batch_p2p_comm: bool = True, # unused
                                    forward_only: bool = False,
                                    timers: Callable = None,
                                    collect_non_loss_data: bool = False,
@@ -398,8 +398,8 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   decoder_seq_length: Optional[int] = None,
                                                   grad_scaler: Callable = None,
                                                   sequence_parallel: bool = False,
-                                                  overlap_p2p_communication: bool = False,
-                                                  batch_p2p_communication: bool = True,
+                                                  overlap_p2p_comm: bool = False,
+                                                  batch_p2p_comm: bool = True,
                                                   forward_only: bool = False,
                                                   timers: Callable = None,
                                                   collect_non_loss_data: bool = False,
@@ -420,8 +420,8 @@ def forward_backward_pipelining_with_interleaving(*,
     assert isinstance(data_iterator, list), \
         "interleaved pipeline parallelism expected each model chunk to have a data iterator"
 
-    if overlap_p2p_communication and batch_p2p_communication:
-        raise ValueError("Can not use both overlap_p2p_communication and batch_p2p_communication")
+    if overlap_p2p_comm and batch_p2p_comm:
+        raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
     # Disable async grad reductions
     if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
@@ -635,7 +635,7 @@ def forward_backward_pipelining_with_interleaving(*,
     input_tensors[0].append(
         p2p_communication.recv_forward(tensor_shape,
                                        dtype=dtype,
-                                       batch_p2p_comm=batch_p2p_communication,
+                                       batch_p2p_comm=batch_p2p_comm,
                                        timers=timers))
 
     fwd_wait_handles = None
@@ -664,7 +664,7 @@ def forward_backward_pipelining_with_interleaving(*,
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
-        if not overlap_p2p_communication:
+        if not overlap_p2p_comm:
             if k == (num_warmup_microbatches - 1) and not forward_only and \
                     not all_warmup_microbatches:
                 input_tensor_grad = None
@@ -677,7 +677,7 @@ def forward_backward_pipelining_with_interleaving(*,
                         recv_prev=recv_prev, recv_next=recv_next,
                         tensor_shape=tensor_shape,
                         dtype=dtype,
-                        batch_p2p_comm=batch_p2p_communication,
+                        batch_p2p_comm=batch_p2p_comm,
                         timers=timers)
                 output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
             else:
@@ -686,7 +686,7 @@ def forward_backward_pipelining_with_interleaving(*,
                         output_tensor, recv_prev=recv_prev,
                         tensor_shape=tensor_shape,
                         dtype=dtype,
-                        batch_p2p_comm=batch_p2p_communication,
+                        batch_p2p_comm=batch_p2p_comm,
                         timers=timers)
             input_tensors[next_forward_model_chunk_id].append(input_tensor)
         else:
@@ -695,7 +695,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     output_tensor, recv_prev=recv_prev,
                     tensor_shape=tensor_shape,
                     dtype=dtype,
-                    batch_p2p_comm=batch_p2p_communication,
+                    batch_p2p_comm=batch_p2p_comm,
                     timers=timers,
                     overlap_p2p_comm=True)
 
@@ -709,7 +709,7 @@ def forward_backward_pipelining_with_interleaving(*,
                 output_tensor_grad, bwd_wait_handles = p2p_communication.send_backward_recv_backward(
                     input_tensor_grad, recv_next=recv_next,
                     tensor_shape=tensor_shape,
-                    batch_p2p_comm=batch_p2p_communication,
+                    batch_p2p_comm=batch_p2p_comm,
                     dtype=dtype,
                     timers=timers,
                     overlap_p2p_comm=True)
@@ -724,7 +724,7 @@ def forward_backward_pipelining_with_interleaving(*,
         # Forward pass.
         forward_k = k + num_warmup_microbatches
 
-        if overlap_p2p_communication:
+        if overlap_p2p_comm:
             if fwd_wait_handles is not None:
                 for req in fwd_wait_handles:
                     req.wait()
@@ -768,7 +768,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     output_tensor, recv_prev=recv_prev,
                     tensor_shape=tensor_shape,
                     dtype=dtype,
-                    batch_p2p_comm=batch_p2p_communication,
+                    batch_p2p_comm=batch_p2p_comm,
                     timers=timers,
                     overlap_p2p_comm=True)
             # assert fwd_wait_handles is not None
@@ -807,7 +807,7 @@ def forward_backward_pipelining_with_interleaving(*,
                 input_tensor_grad, recv_next=recv_next,
                 tensor_shape=tensor_shape,
                 dtype=dtype,
-                batch_p2p_comm=batch_p2p_communication,
+                batch_p2p_comm=batch_p2p_comm,
                 timers=timers,
                 overlap_p2p_comm=True)
 
@@ -871,7 +871,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     recv_prev=recv_prev, recv_next=recv_next,
                     tensor_shape=tensor_shape,
                     dtype=dtype,
-                    batch_p2p_comm=batch_p2p_communication,
+                    batch_p2p_comm=batch_p2p_comm,
                     timers=timers)
             deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
@@ -887,7 +887,7 @@ def forward_backward_pipelining_with_interleaving(*,
 
     # Run cooldown backward passes (flush out pipeline).
     if not forward_only:
-        if overlap_p2p_communication and bwd_wait_handles is not None:
+        if overlap_p2p_comm and bwd_wait_handles is not None:
             for wait_handle in bwd_wait_handles:
                 wait_handle.wait()
 
@@ -895,7 +895,7 @@ def forward_backward_pipelining_with_interleaving(*,
             output_tensor_grads[num_model_chunks-1].append(
                 p2p_communication.recv_backward(tensor_shape,
                                                 dtype=dtype,
-                                                batch_p2p_comm=batch_p2p_communication,
+                                                batch_p2p_comm=batch_p2p_comm,
                                                 timers=timers))
         for k in range(num_microbatches_remaining, total_num_microbatches):
             input_tensor_grad = backward_step_helper(k)
@@ -911,7 +911,7 @@ def forward_backward_pipelining_with_interleaving(*,
                     input_tensor_grad, recv_next=recv_next,
                     tensor_shape=tensor_shape,
                     dtype=dtype,
-                    batch_p2p_comm=batch_p2p_communication,
+                    batch_p2p_comm=batch_p2p_comm,
                     timers=timers))
 
     # Launch any remaining grad reductions
@@ -1045,8 +1045,8 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      decoder_seq_length: Optional[int] = None,
                                                      grad_scaler: Callable = None,
                                                      sequence_parallel: bool = False,
-                                                     overlap_p2p_communication: bool = False,
-                                                     batch_p2p_communication: bool = True,
+                                                     overlap_p2p_comm: bool = False,
+                                                     batch_p2p_comm: bool = True,
                                                      forward_only: bool = False,
                                                      timers: Callable = None,
                                                      collect_non_loss_data: bool = False,
@@ -1070,10 +1070,10 @@ def forward_backward_pipelining_without_interleaving(*,
             "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
 
-    if overlap_p2p_communication:
+    if overlap_p2p_comm:
         raise ValueError("Non-interleaved pipeline parallelism does not support overlapping p2p communication")
 
-    if not batch_p2p_communication:
+    if not batch_p2p_comm:
         raise ValueError("Non-interleaved pipeline parallelism only supports using batched p2p communication")
 
     # Disable async grad reductions
