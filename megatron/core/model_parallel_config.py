@@ -147,11 +147,10 @@ class ModelParallelConfig:
     grad_sync_func: Callable = None
     param_sync_func: Callable = None
 
-    def __post__init__(self):
+    def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
             See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
         """
-
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Can not use sequence paralllelism without tensor parallelism")

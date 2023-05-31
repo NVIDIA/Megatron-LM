@@ -184,6 +184,7 @@ class GPTModel(MegatronModule):
             self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
                 num_embeddings=self.vocab_size,
                 embedding_dim=self.config.hidden_size,
+                init_method=self.config.init_method,
                 config=self.config
             )
             self.word_embeddings.weight.data.fill_(0)

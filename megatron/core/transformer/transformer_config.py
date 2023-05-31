@@ -109,6 +109,7 @@ class TransformerConfig(ModelParallelConfig):
         """ Python dataclass method that is used to modify attributes after initialization.
             See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
         """
+        super().__post_init__()
         if self.fp16 and self.bf16:
             raise ValueError(f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.')
 

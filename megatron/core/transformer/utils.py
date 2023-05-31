@@ -2,8 +2,6 @@
 
 """Utilities for transformer layers."""
 
-import math
-
 import torch
 
 from megatron import get_args

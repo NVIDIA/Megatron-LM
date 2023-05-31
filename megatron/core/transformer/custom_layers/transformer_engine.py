@@ -1,5 +1,6 @@
 import torch
 import transformer_engine as te
+from typing import Callable
 
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType

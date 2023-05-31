@@ -2,6 +2,7 @@
 
 """Utility functions used throughout Megatron core"""
 from functools import reduce
+import math
 import operator
 
 import torch
