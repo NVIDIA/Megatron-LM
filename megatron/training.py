@@ -630,6 +630,33 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        
+        # Not checking for variable sequence length to compute throughput 
+        seq_len = args.seq_length
+        hidden_size = args.hidden_size
+        num_layers = args.num_layers
+        vocab_size = args.padded_vocab_size
+    
+        samples_per_sec = batch_size / elapsed_time_per_iteration
+
+        # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+        # https://arxiv.org/pdf/2104.04473.pdf).
+        # The factor of 4 is when used with activation check-pointing,
+        # otherwise it will be 3
+        checkpoint_activations_factor = 4 if args.recompute_granularity else 3
+        
+        # GLU activations double the hidden states in the upscaling feed-forward in each transformer layer
+        # This leads to 16bsh^2 instead of 8bsh^2 per first feed-forward layer in MLP, thus we increase the coefficient by 8.
+        # Refer to https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/283#issue-1260805063 for more details.
+        
+        coefficient = 24
+                         
+        flops_per_iteration = (coefficient * checkpoint_activations_factor * batch_size * seq_len * num_layers * \
+                              (hidden_size ** 2)) * (1. + (seq_len / (6. * hidden_size)) + \
+                              (vocab_size / (16. * num_layers * hidden_size)))
+        tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10 ** 12))
+        
+        
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
@@ -638,8 +665,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
-        log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
-            elapsed_time_per_iteration * 1000.0)
+        log_string += ' elapsed time per iteration (s): {:.1f} |'.format(
+            elapsed_time_per_iteration)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -661,6 +688,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
+        log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
+        log_string += ' TFLOPs: {:.2f} |'.format(tflops)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0

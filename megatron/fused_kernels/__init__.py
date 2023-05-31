@@ -3,7 +3,6 @@
 import os
 import pathlib
 import subprocess
-
 from torch.utils import cpp_extension
 
 # Setting this param to a list has a problem of generating different
@@ -23,9 +22,9 @@ def load(args):
     if int(bare_metal_major) >= 11:
         cc_flag.append('-gencode')
         cc_flag.append('arch=compute_80,code=sm_80')
-        if int(bare_metal_minor) >= 7:
-            cc_flag.append('-gencode')
-            cc_flag.append('arch=compute_90,code=sm_90')
+        # if int(bare_metal_minor) >= 7:
+        #     cc_flag.append('-gencode')
+        #     cc_flag.append('arch=compute_90,code=sm_90')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
