@@ -338,7 +338,7 @@ void dispatch_scaled_masked_softmax_forward(
     int attn_heads,
     int pad_batches)
 {
-    TORCH_INTERNAL_ASSERT(key_seq_len >= 0 && key_seq_len <= 2048 );
+    TORCH_INTERNAL_ASSERT(key_seq_len >= 0 && key_seq_len <= 8192 );
     if (key_seq_len == 0) {
         return;
     } else {
@@ -410,6 +410,14 @@ void dispatch_scaled_masked_softmax_forward(
                 scaled_masked_softmax_warp_forward<input_t, output_t, acc_t, 11>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, mask, scale, batch_count, key_seq_len, pad_batches);
                 break;
+            case 12: // 4096
+                scaled_masked_softmax_warp_forward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, mask, scale, batch_count, key_seq_len, pad_batches);
+                break;
+            case 13: // 8192
+                scaled_masked_softmax_warp_forward<input_t, output_t, acc_t, 13>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, mask, scale, batch_count, key_seq_len, pad_batches);
+                break;
             default:
                 break;
         }
@@ -427,7 +435,7 @@ void dispatch_scaled_masked_softmax_backward(
     int batches,
     int attn_heads)
 {
-    TORCH_INTERNAL_ASSERT( key_seq_len >= 0 && key_seq_len <= 2048 );
+    TORCH_INTERNAL_ASSERT( key_seq_len >= 0 && key_seq_len <= 8192 );
     if (key_seq_len == 0) {
        return;
     } else {
@@ -498,6 +506,15 @@ void dispatch_scaled_masked_softmax_backward(
                 scaled_masked_softmax_warp_backward<input_t, output_t, acc_t, 11>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, key_seq_len);
                 break;
+			case 12: // 4096
+                scaled_masked_softmax_warp_backward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, key_seq_len);
+                break;
+            case 13: // 8192
+                scaled_masked_softmax_warp_backward<input_t, output_t, acc_t, 13>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, key_seq_len);
+                break;
+
             default:
                 break;
         }
