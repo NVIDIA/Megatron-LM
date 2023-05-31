@@ -747,15 +747,14 @@ class ParallelTransformerLayer(MegatronModule):
                                LayerType.retro_decoder_with_retriever,
                                LayerType.retro_encoder):
             self.inter_attention = ParallelAttention(
-                config.init_method,
-                config.output_layer_init_method,
+                config,
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
             self.post_inter_attention_layernorm = LayerNorm(
                 config.hidden_size,
                 eps=config.layernorm_epsilon,
-                no_persist_layer_norm=config.no_persist_layer_norm,
+                no_persist_layer_norm=not config.persist_layer_norm,
                 sequence_parallel=config.sequence_parallel,
                 apply_layernorm_1p=args.apply_layernorm_1p)
 
