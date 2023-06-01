@@ -85,6 +85,15 @@ def get_forward_backward_func():
         tensor\_model\_parallel\_world\_size`.
         TODO: Do we need this? Just roll into tensor_shape arg?
 
+    overlap_p2p_comm (optional, default=False): When True
+        some of the peer to peer communication for pipeline
+        parallelism will overlap with computation. Must be False if
+        batch_p2p_comm is true.
+
+    batch_p2p_comm (optional, default=True): When true use
+        batch_isend_irecv, otherwise use individual isend and irecv
+        calls. Must be false if overlap_p2p_comm is True.
+
     forward_only (optional, default=False): Perform only the forward step
 
     timers (optional, default=None): TODO
@@ -94,11 +103,11 @@ def get_forward_backward_func():
     enable_autocast (optional, default=False): If True, runs the
         forward_step_func call inside torch.autocast context
 
-    deallocate_pipeline_outputs (optional, default=False): If True, output data 
+    deallocate_pipeline_outputs (optional, default=False): If True, output data
         is deallocated after the tensor is sent to the next pipeline stage.
-        Helps with saving memory, does nothing when pipeline parallel is 
+        Helps with saving memory, does nothing when pipeline parallel is
         not used.
-    
+
     no_sync_func (optional): Function that creates a context that
         suppresses asynchronous data-parallel communication. If the
         model is an instance of torch.nn.DistributedDataParallel, the
@@ -277,7 +286,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
     # Backward pass.
     if output_tensor_grad[0] is None and grad_scaler is not None:
         output_tensor = grad_scaler(output_tensor[0])
-    
+
     if deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
@@ -319,6 +328,8 @@ def forward_backward_no_pipelining(*,
                                    decoder_seq_length: Optional[int] = None, # unused
                                    grad_scaler: Callable = None,
                                    sequence_parallel: bool = False, # unused
+                                   overlap_p2p_comm: bool = False, # unused
+                                   batch_p2p_comm: bool = True, # unused
                                    forward_only: bool = False,
                                    timers: Callable = None,
                                    collect_non_loss_data: bool = False,
@@ -387,6 +398,8 @@ def forward_backward_pipelining_with_interleaving(*,
                                                   decoder_seq_length: Optional[int] = None,
                                                   grad_scaler: Callable = None,
                                                   sequence_parallel: bool = False,
+                                                  overlap_p2p_comm: bool = False,
+                                                  batch_p2p_comm: bool = True,
                                                   forward_only: bool = False,
                                                   timers: Callable = None,
                                                   collect_non_loss_data: bool = False,
@@ -406,6 +419,9 @@ def forward_backward_pipelining_with_interleaving(*,
         "invalid model chunking"
     assert isinstance(data_iterator, list), \
         "interleaved pipeline parallelism expected each model chunk to have a data iterator"
+
+    if overlap_p2p_comm and batch_p2p_comm:
+        raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
     # Disable async grad reductions
     if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
@@ -617,8 +633,20 @@ def forward_backward_pipelining_with_interleaving(*,
     # Run warmup forward passes.
     parallel_state.set_virtual_pipeline_model_parallel_rank(0)
     input_tensors[0].append(
-        p2p_communication.recv_forward(tensor_shape, dtype, timers=timers))
+        p2p_communication.recv_forward(tensor_shape,
+                                       dtype=dtype,
+                                       batch_p2p_comm=batch_p2p_comm,
+                                       timers=timers))
+
+    fwd_wait_handles = None
+    bwd_wait_handles = None
+
     for k in range(num_warmup_microbatches):
+
+        if fwd_wait_handles is not None:
+            for req in fwd_wait_handles:
+                req.wait()
+
         output_tensor = forward_step_helper(k)
 
         # Determine if tensor should be received from previous stage.
@@ -636,91 +664,216 @@ def forward_backward_pipelining_with_interleaving(*,
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
-        if k == (num_warmup_microbatches - 1) and not forward_only and \
-                not all_warmup_microbatches:
-            input_tensor_grad = None
-            recv_next = True
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                recv_next = False
-            input_tensor, output_tensor_grad = \
-                p2p_communication.send_forward_backward_recv_forward_backward(
+        if not overlap_p2p_comm:
+            if k == (num_warmup_microbatches - 1) and not forward_only and \
+                    not all_warmup_microbatches:
+                input_tensor_grad = None
+                recv_next = True
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    recv_next = False
+                input_tensor, output_tensor_grad = \
+                    p2p_communication.send_forward_backward_recv_forward_backward(
                         output_tensor, input_tensor_grad,
                         recv_prev=recv_prev, recv_next=recv_next,
-                        tensor_shape=tensor_shape, dtype=dtype,
+                        tensor_shape=tensor_shape,
+                        dtype=dtype,
+                        batch_p2p_comm=batch_p2p_comm,
                         timers=timers)
-            output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
+                output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
+            else:
+                input_tensor = \
+                    p2p_communication.send_forward_recv_forward(
+                        output_tensor, recv_prev=recv_prev,
+                        tensor_shape=tensor_shape,
+                        dtype=dtype,
+                        batch_p2p_comm=batch_p2p_comm,
+                        timers=timers)
+            input_tensors[next_forward_model_chunk_id].append(input_tensor)
         else:
-            input_tensor = \
+            input_tensor, fwd_wait_handles = \
                 p2p_communication.send_forward_recv_forward(
                     output_tensor, recv_prev=recv_prev,
-                    tensor_shape=tensor_shape, dtype=dtype,
-                    timers=timers)
-        input_tensors[next_forward_model_chunk_id].append(input_tensor)
+                    tensor_shape=tensor_shape,
+                    dtype=dtype,
+                    batch_p2p_comm=batch_p2p_comm,
+                    timers=timers,
+                    overlap_p2p_comm=True)
+
+            if k == (num_warmup_microbatches - 1) and not forward_only and \
+                    not all_warmup_microbatches:
+                input_tensor_grad = None
+                recv_next = True
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    recv_next = False
+
+                output_tensor_grad, bwd_wait_handles = p2p_communication.send_backward_recv_backward(
+                    input_tensor_grad, recv_next=recv_next,
+                    tensor_shape=tensor_shape,
+                    batch_p2p_comm=batch_p2p_comm,
+                    dtype=dtype,
+                    timers=timers,
+                    overlap_p2p_comm=True)
+
+                output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
+            input_tensors[next_forward_model_chunk_id].append(input_tensor)
+
         deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
-        output_tensor = forward_step_helper(forward_k)
 
-        # Backward pass.
-        backward_k = k
-        input_tensor_grad = backward_step_helper(backward_k)
+        if overlap_p2p_comm:
+            if fwd_wait_handles is not None:
+                for req in fwd_wait_handles:
+                    req.wait()
 
-        # Send output_tensor and input_tensor_grad, receive input_tensor
-        # and output_tensor_grad.
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
-        # Determine if current stage has anything to send in either direction,
-        # otherwise set tensor to None.
-        forward_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
-        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
-        if parallel_state.is_pipeline_last_stage():
-            output_tensor = None
+            output_tensor = forward_step_helper(forward_k)
 
-        backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)
-        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
-        if parallel_state.is_pipeline_first_stage():
-            input_tensor_grad = None
+            # Determine if current stage has anything to send in either direction,
+            # otherwise set tensor to None.
+            forward_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
+            parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
 
-        # Determine if peers are sending, and where in data structure to put
-        # received tensors.
-        recv_prev = True
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            # First stage is ahead of last stage by (pipeline_parallel_size - 1).
-            next_forward_model_chunk_id = get_model_chunk_id(
-                forward_k - (pipeline_parallel_size - 1), forward=True)
-            if next_forward_model_chunk_id == (num_model_chunks - 1):
+            # Last virtual stage no activation tensor to send
+            if parallel_state.is_pipeline_last_stage():
+                output_tensor = None
+
+            # Determine if peers are sending, and where in data structure to put
+            # received tensors.
+            recv_prev = True
+            if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                # First stage is ahead of last stage by (pipeline_parallel_size - 1).
+                next_forward_model_chunk_id = get_model_chunk_id(
+                    forward_k - (pipeline_parallel_size - 1), forward=True)
+                if next_forward_model_chunk_id == (num_model_chunks - 1):
+                    recv_prev = False
+                next_forward_model_chunk_id += 1
+            else:
+                next_forward_model_chunk_id = get_model_chunk_id(forward_k + 1,
+                                                                forward=True)
+
+            # If last iteration, don't receive; we already received one extra
+            # before the start of the for loop.
+            if k == (num_microbatches_remaining - 1):
                 recv_prev = False
-            next_forward_model_chunk_id += 1
-        else:
-            next_forward_model_chunk_id = get_model_chunk_id(forward_k + 1,
-                                                             forward=True)
 
-        recv_next = True
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            # Last stage is ahead of first stage by (pipeline_parallel_size - 1).
-            next_backward_model_chunk_id = get_model_chunk_id(
-                backward_k - (pipeline_parallel_size - 1), forward=False)
-            if next_backward_model_chunk_id == 0:
-                recv_next = False
-            next_backward_model_chunk_id -= 1
-        else:
-            next_backward_model_chunk_id = get_model_chunk_id(backward_k + 1,
-                                                              forward=False)
+            # Send activation tensor to the next stage and receive activation tensor from the
+            # previous stage
+            input_tensor, fwd_wait_handles = \
+                p2p_communication.send_forward_recv_forward(
+                    output_tensor, recv_prev=recv_prev,
+                    tensor_shape=tensor_shape,
+                    dtype=dtype,
+                    batch_p2p_comm=batch_p2p_comm,
+                    timers=timers,
+                    overlap_p2p_comm=True)
+            # assert fwd_wait_handles is not None
 
-        # If last iteration, don't receive; we already received one extra
-        # before the start of the for loop.
-        if k == (num_microbatches_remaining - 1):
-            recv_prev = False
+            if bwd_wait_handles is not None:
+                for req in bwd_wait_handles:
+                    req.wait()
 
-        # Communicate tensors.
-        input_tensor, output_tensor_grad = \
-            p2p_communication.send_forward_backward_recv_forward_backward(
+            # Backward pass.
+            backward_k = k
+            input_tensor_grad = backward_step_helper(backward_k)
+
+            backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)
+            parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+
+            # First virtual stage no activation gradient tensor to send
+            if parallel_state.is_pipeline_first_stage():
+                input_tensor_grad = None
+
+            # Determine if the current virtual stage has an activation gradient tensor to receive
+            recv_next = True
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                # Last stage is ahead of first stage by (pipeline_parallel_size - 1).
+                next_backward_model_chunk_id = get_model_chunk_id(
+                    backward_k - (pipeline_parallel_size - 1), forward=False
+                )
+                if next_backward_model_chunk_id == 0:
+                    recv_next = False
+                next_backward_model_chunk_id -= 1
+            else:
+                next_backward_model_chunk_id = get_model_chunk_id(
+                    backward_k + 1, forward=False
+                )
+
+            output_tensor_grad, bwd_wait_handles = p2p_communication.send_backward_recv_backward(
+                input_tensor_grad, recv_next=recv_next,
+                tensor_shape=tensor_shape,
+                dtype=dtype,
+                batch_p2p_comm=batch_p2p_comm,
+                timers=timers,
+                overlap_p2p_comm=True)
+
+        else: # no p2p overlap
+            output_tensor = forward_step_helper(forward_k)
+
+            # Backward pass.
+            backward_k = k
+            input_tensor_grad = backward_step_helper(backward_k)
+
+            # Send output_tensor and input_tensor_grad, receive input_tensor
+            # and output_tensor_grad.
+
+            # Determine if current stage has anything to send in either direction,
+            # otherwise set tensor to None.
+            forward_model_chunk_id = get_model_chunk_id(forward_k, forward=True)
+            parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
+            if parallel_state.is_pipeline_last_stage():
+                output_tensor = None
+
+            backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)
+            parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+            if parallel_state.is_pipeline_first_stage():
+                input_tensor_grad = None
+
+            # Determine if peers are sending, and where in data structure to put
+            # received tensors.
+            recv_prev = True
+            if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                # First stage is ahead of last stage by (pipeline_parallel_size - 1).
+                next_forward_model_chunk_id = get_model_chunk_id(
+                    forward_k - (pipeline_parallel_size - 1), forward=True)
+                if next_forward_model_chunk_id == (num_model_chunks - 1):
+                    recv_prev = False
+                next_forward_model_chunk_id += 1
+            else:
+                next_forward_model_chunk_id = get_model_chunk_id(forward_k + 1,
+                                                                 forward=True)
+
+            recv_next = True
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                # Last stage is ahead of first stage by (pipeline_parallel_size - 1).
+                next_backward_model_chunk_id = get_model_chunk_id(
+                    backward_k - (pipeline_parallel_size - 1), forward=False)
+                if next_backward_model_chunk_id == 0:
+                    recv_next = False
+                next_backward_model_chunk_id -= 1
+            else:
+                next_backward_model_chunk_id = get_model_chunk_id(backward_k + 1,
+                                                                  forward=False)
+
+            # If last iteration, don't receive; we already received one extra
+            # before the start of the for loop.
+            if k == (num_microbatches_remaining - 1):
+                recv_prev = False
+
+            # Communicate tensors.
+            input_tensor, output_tensor_grad = \
+                p2p_communication.send_forward_backward_recv_forward_backward(
                     output_tensor, input_tensor_grad,
                     recv_prev=recv_prev, recv_next=recv_next,
-                    tensor_shape=tensor_shape, dtype=dtype, timers=timers)
-        deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
+                    tensor_shape=tensor_shape,
+                    dtype=dtype,
+                    batch_p2p_comm=batch_p2p_comm,
+                    timers=timers)
+            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
 
         # Put input_tensor and output_tensor_grad in data structures in the
         # right location.
@@ -730,11 +883,20 @@ def forward_backward_pipelining_with_interleaving(*,
             output_tensor_grads[next_backward_model_chunk_id].append(
                 output_tensor_grad)
 
+    deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
+
     # Run cooldown backward passes (flush out pipeline).
     if not forward_only:
+        if overlap_p2p_comm and bwd_wait_handles is not None:
+            for wait_handle in bwd_wait_handles:
+                wait_handle.wait()
+
         if all_warmup_microbatches:
             output_tensor_grads[num_model_chunks-1].append(
-                p2p_communication.recv_backward(tensor_shape, dtype=dtype, timers=timers))
+                p2p_communication.recv_backward(tensor_shape,
+                                                dtype=dtype,
+                                                batch_p2p_comm=batch_p2p_comm,
+                                                timers=timers))
         for k in range(num_microbatches_remaining, total_num_microbatches):
             input_tensor_grad = backward_step_helper(k)
             next_backward_model_chunk_id = get_model_chunk_id(k+1, forward=False)
@@ -747,7 +909,9 @@ def forward_backward_pipelining_with_interleaving(*,
             output_tensor_grads[next_backward_model_chunk_id].append(
                 p2p_communication.send_backward_recv_backward(
                     input_tensor_grad, recv_next=recv_next,
-                    tensor_shape=tensor_shape, dtype=dtype,
+                    tensor_shape=tensor_shape,
+                    dtype=dtype,
+                    batch_p2p_comm=batch_p2p_comm,
                     timers=timers))
 
     # Launch any remaining grad reductions
@@ -881,6 +1045,8 @@ def forward_backward_pipelining_without_interleaving(*,
                                                      decoder_seq_length: Optional[int] = None,
                                                      grad_scaler: Callable = None,
                                                      sequence_parallel: bool = False,
+                                                     overlap_p2p_comm: bool = False,
+                                                     batch_p2p_comm: bool = True,
                                                      forward_only: bool = False,
                                                      timers: Callable = None,
                                                      collect_non_loss_data: bool = False,
@@ -903,6 +1069,12 @@ def forward_backward_pipelining_without_interleaving(*,
         assert len(data_iterator) == 1, \
             "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
+
+    if overlap_p2p_comm:
+        raise ValueError("Non-interleaved pipeline parallelism does not support overlapping p2p communication")
+
+    if not batch_p2p_comm:
+        raise ValueError("Non-interleaved pipeline parallelism only supports using batched p2p communication")
 
     # Disable async grad reductions
     if no_sync_func is None and isinstance(model, torchDDP):
