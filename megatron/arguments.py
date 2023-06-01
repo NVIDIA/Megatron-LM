@@ -407,6 +407,7 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):

@@ -85,6 +85,8 @@ def get_forward_backward_func():
     decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
         transformer. This is ignored for a single-stack transformer.
 
+    forward_only (optional, default = False): Perform only the forward step
+
     collect_non_loss_data (optional, bool, default=False): TODO
 
     """
@@ -610,7 +612,7 @@ def forward_backward_pipelining_with_interleaving(*,
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
-        if not overlap_p2p_comm:
+        if not config.overlap_p2p_comm:
             if k == (num_warmup_microbatches - 1) and not forward_only and \
                     not all_warmup_microbatches:
                 input_tensor_grad = None
@@ -634,7 +636,8 @@ def forward_backward_pipelining_with_interleaving(*,
             input_tensor, fwd_wait_handles = \
                 p2p_communication.send_forward_recv_forward(
                     output_tensor, recv_prev=recv_prev,
-                    tensor_shape=tensor_shape, config=config)
+                    tensor_shape=tensor_shape, config=config,
+                    overlap_p2p_comm=True)
 
             if k == (num_warmup_microbatches - 1) and not forward_only and \
                     not all_warmup_microbatches:
@@ -652,7 +655,7 @@ def forward_backward_pipelining_with_interleaving(*,
                 output_tensor_grads[num_model_chunks-1].append(output_tensor_grad)
             input_tensors[next_forward_model_chunk_id].append(input_tensor)
 
-        deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
+        deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
@@ -668,12 +671,12 @@ def forward_backward_pipelining_with_interleaving(*,
         else:
             checkpoint_activations_microbatch = None
 
-        if overlap_p2p_comm:
+        if config.overlap_p2p_comm:
             if fwd_wait_handles is not None:
                 for req in fwd_wait_handles:
                     req.wait()
 
-            deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
 
@@ -822,11 +825,11 @@ def forward_backward_pipelining_with_interleaving(*,
             output_tensor_grads[next_backward_model_chunk_id].append(
                 output_tensor_grad)
 
-    deallocate_output_tensor(output_tensor, deallocate_pipeline_outputs)
+    deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
     # Run cooldown backward passes (flush out pipeline).
     if not forward_only:
-        if overlap_p2p_comm and bwd_wait_handles is not None:
+        if config.overlap_p2p_comm and bwd_wait_handles is not None:
             for wait_handle in bwd_wait_handles:
                 wait_handle.wait()
 
@@ -987,9 +990,6 @@ def forward_backward_pipelining_without_interleaving(*,
     config = get_model_config(model)
     if config.overlap_p2p_comm:
         raise ValueError("Non-interleaved pipeline parallelism does not support overlapping p2p communication")
-
-    if not config.batch_p2p_comm:
-        raise ValueError("Non-interleaved pipeline parallelism only supports using batched p2p communication")
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

@@ -88,7 +88,14 @@ class ModelParallelConfig:
         of maximum outstanding microbatches will recompute all layers (either full recompute or selective recompute). If
         None, the checkpoint and recompute will be left up to the forward_step function.
 
-    batch_p2p_comm (bool, default = False): Use batch_isend_irecv instead of individual isend/irecv calls.
+    overlap_p2p_comm (bool, optional, default=False): When True some of the peer to peer communication for pipeline
+        parallelism will overlap with computation. Must be False if batch_p2p_comm is true.
+
+    batch_p2p_comm (bool, default=True): Use batch_isend_irecv instead of individual isend/irecv calls. Must be False
+        if overlap_p2p_comm is True.
+
+    batch_p2p_sync (bool, default=True): When using batch_isend_irecv, do a cuda.device.synchronize afterward to work
+        around a bug in older version of PyTorch.
 
     use_ring_exchange_p2p (bool, default = False): Use custom ring_exchange kernel instead of
         torch.distributed.batch_isend_irecv(). Requires custom built torch with torch.distributed.ring_exchange.
@@ -140,7 +147,9 @@ class ModelParallelConfig:
     autocast_dtype: torch.dtype = None
     variable_seq_lengths: bool = False
     num_microbatches_with_partial_activation_checkpoints: int = None
-    batch_p2p_comm: bool = False
+    overlap_p2p_comm: bool = False
+    batch_p2p_comm: bool = True
+    batch_p2p_sync: bool = True
     use_ring_exchange_p2p: bool = False
     deallocate_pipeline_outputs: bool = False
     no_sync_func: Callable = None
