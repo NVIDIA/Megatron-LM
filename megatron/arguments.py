@@ -408,6 +408,7 @@ def core_transformer_config_from_args(args):
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -954,6 +955,10 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--overlap-p2p-communication',
+                       action='store_true',
+                       help='overlap pipeline parallel communication with forward and backward chunks',
+                       dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
