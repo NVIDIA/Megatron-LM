@@ -283,7 +283,7 @@ class DummyArgs:
     rank: int = 0
     masked_softmax_fusion: bool = True
     gradient_accumulation_fusion: bool = True
-    use_kernels_from_apex: bool = True
+    use_kernels_from_apex: bool = False
 
 
 if __name__ == "__main__":
