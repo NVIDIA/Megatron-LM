@@ -340,7 +340,7 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 8192 );
     if (softmax_elements == 0) {
         return;
     } else {
@@ -361,6 +361,7 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
         TORCH_INTERNAL_ASSERT(attn_batches % batches_per_block == 0);
+
         int blocks_per_seq = attn_batches / batches_per_block;
         dim3 blocks(seq_len, blocks_per_seq, 1);
         dim3 threads(warp_size, warps_per_block, 1);
@@ -414,6 +415,14 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
                 scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 11>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
                 break;
+            case 12: // 4096
+                scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 13: // 8192
+                scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 13>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
             default:
                 break;
         }
@@ -430,7 +439,7 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 8192 );
     if (softmax_elements == 0) {
        return;
     } else {
@@ -503,6 +512,14 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
                 break;
             case 11: // 2048
                 scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 11>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 12: // 4096
+                scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 13: // 8192
+                scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 13>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
                 break;
             default:
