@@ -37,11 +37,15 @@ def check_checkpoint_args(checkpoint_args):
     arguments and the one retrieved from checkpoint."""
     args = get_args()
 
-    def _compare(arg_name, old_arg_name=None):
+    def _compare(arg_name, old_arg_name=None, default=None):
         if old_arg_name is not None:
-            checkpoint_value = getattr(checkpoint_args, old_arg_name)
+            ckpt_arg_name = old_arg_name
         else:
-            checkpoint_value = getattr(checkpoint_args, arg_name)
+            ckpt_arg_name = arg_name
+        if default is not None:
+            checkpoint_value = getattr(checkpoint_args, ckpt_arg_name, default)
+        else:
+            checkpoint_value = getattr(checkpoint_args, ckpt_arg_name)
         args_value = getattr(args, arg_name)
         error_message = '{} value from checkpoint ({}) is not equal to the ' \
                         'input argument value ({}).'.format(
@@ -51,7 +55,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-    _compare('add_position_embedding')
+    _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
