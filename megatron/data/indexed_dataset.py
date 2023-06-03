@@ -95,7 +95,7 @@ dtypes = {
     3: np.int16,
     4: np.int32,
     5: np.int64,
-    6: np.float,
+    6: np.float32,
     7: np.double,
     8: np.uint16
 }
@@ -460,7 +460,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         return self._path
 
     def __setstate__(self, state):
-        self._do_init(state)
+        self._do_init(state, skip_warmup=True)
 
     def _do_init(self, path, skip_warmup):
         self._path = path
@@ -484,7 +484,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     # @lru_cache(maxsize=8)
     def __getitem__(self, idx):
-        if isinstance(idx, int):
+        if isinstance(idx, (int, np.integer)):
             ptr, size = self._index[idx]
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=size, offset=ptr)
@@ -501,6 +501,8 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                                      count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
             return sents
+        else:
+            raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
     def get(self, idx, offset=0, length=None):
         """ Retrieves a single item from the dataset with the option to only
@@ -552,6 +554,12 @@ class MMapIndexedDatasetBuilder(object):
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
+
+    def add_doc(self, tensor, sizes):
+        np_array = np.array(tensor, dtype=self._dtype)
+        self._data_file.write(np_array.tobytes(order='C'))
+        self._sizes.extend(sizes)
+        self._doc_idx.append(len(self._sizes))
 
     def end_document(self):
         self._doc_idx.append(len(self._sizes))

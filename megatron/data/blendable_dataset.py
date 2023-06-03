@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Blendable dataset."""
 
@@ -21,21 +8,17 @@ import numpy as np
 import torch
 
 from megatron import print_rank_0
-from megatron import mpu
-
 
 class BlendableDataset(torch.utils.data.Dataset):
 
 
-    def __init__(self, datasets, weights):
+    def __init__(self, datasets, weights, size):
 
         self.datasets = datasets
         num_datasets = len(datasets)
         assert num_datasets == len(weights)
 
-        self.size = 0
-        for dataset in self.datasets:
-            self.size += len(dataset)
+        self.size = size
 
         # Normalize weights.
         weights = np.array(weights, dtype=np.float64)
@@ -43,7 +26,7 @@ class BlendableDataset(torch.utils.data.Dataset):
         assert sum_weights > 0.0
         weights /= sum_weights
 
-        # Build indecies.
+        # Build indicies.
         start_time = time.time()
         assert num_datasets < 255
         self.dataset_index = np.zeros(self.size, dtype=np.uint8)
@@ -57,6 +40,16 @@ class BlendableDataset(torch.utils.data.Dataset):
         print_rank_0('> elapsed time for building blendable dataset indices: '
                      '{:.2f} (sec)'.format(time.time() - start_time))
 
+        # Check size
+        _ = self.__getitem__(self.size - 1)
+        try:
+            _ = self.__getitem__(self.size)
+            raise RuntimeError('BlendedDataset size is improperly bounded')
+        except IndexError:
+            pass
+        print_rank_0('> size of blendable dataset: '
+                     '{} samples'.format(self.size))
+
 
     def __len__(self):
         return self.size
@@ -65,4 +58,7 @@ class BlendableDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         dataset_idx = self.dataset_index[idx]
         sample_idx = self.dataset_sample_index[idx]
-        return self.datasets[dataset_idx][sample_idx]
+        return {
+            "dataset_idx" : dataset_idx,
+            **self.datasets[dataset_idx][sample_idx],
+        }

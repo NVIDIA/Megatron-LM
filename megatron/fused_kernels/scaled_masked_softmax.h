@@ -1,18 +1,4 @@
-/* coding=utf-8
- * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+/* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved. */
 
 #pragma once
 
@@ -293,6 +279,13 @@ __global__ void scaled_masked_softmax_warp_forward(
     }
     warp_reduce<acc_t, WARP_BATCH, WARP_SIZE, Max>(max_value);
 
+    // compute scale value to account for full mask
+    acc_t scale_value[WARP_BATCH];
+    #pragma unroll
+    for (int i = 0;  i < WARP_BATCH;  ++i) {
+        scale_value[i] = (max_value[i] == -10000.0) ? 0.0 : 1.0;
+    }
+
     acc_t sum[WARP_BATCH] { 0.0f };
     #pragma unroll
     for (int i = 0;  i < WARP_BATCH;  ++i) {
@@ -316,7 +309,7 @@ __global__ void scaled_masked_softmax_warp_forward(
             if (element_index < element_count) {
                 #pragma unroll
                 for (int element = 0; element < ELEMENTS_PER_LDG_STG; ++element) {
-                    out[element] = elements[i][it + element] / sum[i];
+                    out[element] = elements[i][it + element] * scale_value[i] / sum[i];
                 }
                 copy_vector<output_t, ELEMENTS_PER_LDG_STG>(dst + i * element_count + it * WARP_SIZE, out);  
             } else {

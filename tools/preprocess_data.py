@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Processing data for pretraining."""
 
@@ -64,12 +51,14 @@ class Encoder(object):
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
                 exit()
-            splitter = nltk.load("tokenizers/punkt/english.pickle")
+            library = "tokenizers/punkt/{}.pickle".format(self.args.lang)
+            print("loading: " + library)
+            splitter = nltk.load(library)
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
+                    train_text=splitter._params,
+                    lang_vars=CustomLanguageVars())
             else:
                 Encoder.splitter = splitter
 
@@ -117,7 +106,9 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'TokenizerFromFile'],
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer', 
+                                'GPTSentencePieceTokenizer', 'NullTokenizer',
+                                'TokenizerFromFile'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
@@ -127,6 +118,12 @@ def get_args():
                        help='Path to the tokenizer file')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
+    group.add_argument('--lang', type=str, default='english',
+                       help='Language to use for NLTK-powered sentence splitting.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='sentencepeice tokenizer model.')
+    group.add_argument('--vocab-size', default=786,
+                       help='size of vocab for use with NullTokenizer')
 
 
     group = parser.add_argument_group(title='output data')
@@ -223,6 +220,7 @@ def main():
             print(f"Processed {i} documents",
                   f"({i/elapsed} docs/s, {mbs} MB/s).",
                   file=sys.stderr)
+    print("Done! Now finalizing.")
 
     for key in args.json_keys:
         builders[key].finalize(output_idx_files[key])

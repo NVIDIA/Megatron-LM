@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import datetime
 import torch
 import json
@@ -54,9 +41,15 @@ class MegatronGenerate(Resource):
             return "sentences is no longer used.  Replace with prompts", 400
 
         prompts = request.get_json()["prompts"]
+        if not isinstance(prompts, list):
+            return "prompts is not a list of strings", 400
+
+        if len(prompts) == 0:
+            return "prompts is empty", 400
+        
         if len(prompts) > 128:
             return "Maximum number of prompts is 128", 400
-
+        
         tokens_to_generate = 64  # Choosing hopefully sane default.  Full sequence is slow
         if "tokens_to_generate" in request.get_json():
             tokens_to_generate = request.get_json()["tokens_to_generate"]
@@ -141,6 +134,12 @@ class MegatronGenerate(Resource):
             if not isinstance(stop_on_eol, bool):
                 return "stop_on_eol must be a boolean value"
 
+        prevent_newline_after_colon = False
+        if "prevent_newline_after_colon" in request.get_json():
+            prevent_newline_after_colon = request.get_json()["prevent_newline_after_colon"]
+            if not isinstance(prevent_newline_after_colon, bool):
+                return "prevent_newline_after_colon must be a boolean value"
+
         random_seed = -1
         if "random_seed" in request.get_json():
             random_seed = request.get_json()["random_seed"]
@@ -196,7 +195,8 @@ class MegatronGenerate(Resource):
                         add_BOS=add_BOS,
                         stop_token=stop_token,
                         num_return_gen=beam_width,  # Returning whole beam
-                        length_penalty=length_penalty
+                        length_penalty=length_penalty,
+                        prevent_newline_after_colon=prevent_newline_after_colon
                         )
                     
                     return jsonify({"text": response,
@@ -219,6 +219,7 @@ class MegatronGenerate(Resource):
                         use_eod_token_for_early_termination=True,
                         stop_on_double_eol=stop_on_double_eol,
                         stop_on_eol=stop_on_eol,
+                        prevent_newline_after_colon=prevent_newline_after_colon,
                         random_seed=random_seed)
 
                     return jsonify({"text": response,
