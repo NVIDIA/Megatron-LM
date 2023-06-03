@@ -5,7 +5,6 @@ import types
 
 import torch
 
-from megatron import fused_kernels
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
@@ -34,7 +33,7 @@ def _load_checkpoint(queue, args):
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
         from megatron.model import ModelType, module
-        from megatron import mpu
+        from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")

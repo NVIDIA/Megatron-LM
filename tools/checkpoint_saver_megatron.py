@@ -6,7 +6,6 @@ import sys
 
 import torch
 
-from megatron import fused_kernels
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
@@ -38,7 +37,7 @@ def save_checkpoint(queue, args):
         from megatron.global_vars import set_global_variables, get_args
         from megatron.model import ModelType
         from megatron.tokenizer.tokenizer import _vocab_size_with_padding
-        from megatron import mpu
+        from megatron import mpu, fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         exit(1)
