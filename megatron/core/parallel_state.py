@@ -268,9 +268,10 @@ def get_model_parallel_group():
     return _MODEL_PARALLEL_GROUP
 
 
-def get_tensor_model_parallel_group():
+def get_tensor_model_parallel_group(check_initialized=True):
     """Get the tensor model parallel group the caller rank belongs to."""
-    assert _TENSOR_MODEL_PARALLEL_GROUP is not None, 'intra_layer_model parallel group is not initialized'
+    if check_initialized:
+        assert _TENSOR_MODEL_PARALLEL_GROUP is not None, 'tensor model parallel group is not initialized'
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 

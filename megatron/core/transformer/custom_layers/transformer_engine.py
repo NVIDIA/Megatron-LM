@@ -24,8 +24,11 @@ class TELayerNorm(te.pytorch.module.LayerNorm):
 
 class TELinear(te.pytorch.module.Linear):
     """
-    Wrapper for the Transformer-Engine's `Linear` layer but specialized similar
-    to megatron's `RowParallelLinear` layer.
+    Wrapper for the Transformer-Engine's `Linear` layer.
+
+    Note that if Megatron's parallel_state has not been initialized
+    yet, the tp_group passed to TE will be None and must be set later
+    via set_tensor_parallel_group().
     """
     def __init__(self,
                  input_size: int,
@@ -43,7 +46,7 @@ class TELinear(te.pytorch.module.Linear):
             out_features=output_size,
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=get_tensor_model_parallel_group(),
+            tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             init_method=init_method,
@@ -107,6 +110,10 @@ class TECoreAttention(te.pytorch.transformer.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
     has "flash attention" enabled.
+
+    Note that if Megatron's parallel_state has not been initialized
+    yet, the tp_group passed to TE will be None and must be set later
+    via set_tensor_parallel_group().
     """
     def __init__(self,
                  config: TransformerConfig,
@@ -123,6 +130,6 @@ class TECoreAttention(te.pytorch.transformer.DotProductAttention):
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
-            tp_group=get_tensor_model_parallel_group(),
+            tp_group=get_tensor_model_parallel_group(check_initialized=False),
             **kwargs
         )
