@@ -833,7 +833,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # All-reduce key-value grads if needed.
         if (
-            args.multi_query_attention
+            args.group_query_attention and 
+            args.num_query_groups < mpu.get_tensor_model_parallel_world_size()
             and mpu.get_tensor_model_parallel_world_size() > 1
             and args.sequence_parallel
         ):
