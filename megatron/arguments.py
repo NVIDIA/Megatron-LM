@@ -514,6 +514,9 @@ def _add_network_size_args(parser):
                        'if not provided.')
     group.add_argument('--multi-query-attention', action='store_true',
                           help='Use multi-query attention.')
+    group.add_argument('--group-query-attention', action='store_true',
+                          help='Use group-query attention.')
+    group.add_argument('--num-query-groups', type=int, default=1)
 
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
