@@ -362,6 +362,12 @@ def test_allmasked_softmax_backward():
             assert error < 1e-3
 
 
+class DummyArgs:
+    rank: int = 0
+    masked_softmax_fusion: bool = True
+    gradient_accumulation_fusion: bool = True
+
+
 if __name__ == "__main__":
     try:
         from transformers import BertTokenizer, GPT2Tokenizer
@@ -382,6 +388,10 @@ if __name__ == "__main__":
     test_masked_softmax_backward()
     test_allmasked_softmax_forward()
     test_allmasked_softmax_backward()
+    
+    from megatron.fused_kernels import load
+    load(DummyArgs())
+
     test_load_fused_kernels()
     test_fused_softmax()
     test_fused_upper_triangle_mask_softmax()
