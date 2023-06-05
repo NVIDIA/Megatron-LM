@@ -285,7 +285,7 @@ def backward_step(grad_scaler, input_tensor, output_tensor,
 
     # Backward pass.
     if output_tensor_grad[0] is None and grad_scaler is not None:
-        output_tensor = grad_scaler(output_tensor[0])
+        output_tensor[0] = grad_scaler(output_tensor[0])
 
     if deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
