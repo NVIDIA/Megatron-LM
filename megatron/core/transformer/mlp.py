@@ -33,29 +33,33 @@ class MLP(MegatronModule):
         self.config: TransformerConfig = config
 
         # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        ffn_hidden_size = self.config.ffn_hidden_size
+        if self.config.gated_linear_unit:
+            ffn_hidden_size *= 2
+
         self.linear_fc1 = TEColumnParallelLinear(
-            config.hidden_size,
-            config.ffn_hidden_size * 2 if config.gated_linear_unit else config.ffn_hidden_size,
+            self.config.hidden_size,
+            ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=config.add_bias_linear,
+            bias=self.config.add_bias_linear,
             return_bias=True,
         )
 
-        if config.gated_linear_unit:
+        if self.config.gated_linear_unit:
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
-                return config.activation_func(x[0]) * x[1]
+                return self.config.activation_func(x[0]) * x[1]
             self.activation_func = glu
         else:
-            self.activation_func = config.activation_func
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
-            bias=config.add_bias_linear,
+            bias=self.config.add_bias_linear,
             return_bias=True,
         )
 

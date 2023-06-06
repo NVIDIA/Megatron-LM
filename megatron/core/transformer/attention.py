@@ -55,7 +55,7 @@ class Attention(MegatronModule, ABC):
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
-            bias=config.add_bias_linear,
+            bias=self.config.add_bias_linear,
             return_bias=True,
         )
 
@@ -179,7 +179,7 @@ class SelfAttention(Attention):
                 3 * self.projection_size,
                 config=self.config,
                 init_method=self.config.init_method,
-                bias=config.add_bias_linear,
+                bias=self.config.add_bias_linear,
                 return_bias=False
         )
 
@@ -223,7 +223,7 @@ class CrossAttention(Attention):
             self.projection_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=config.add_bias_linear,
+            bias=self.config.add_bias_linear,
             return_bias=False
         )
 
@@ -232,7 +232,7 @@ class CrossAttention(Attention):
             2 * self.projection_size,
             config=self.config,
             init_method=self.config.init_method,
-            bias=config.add_bias_linear,
+            bias=self.config.add_bias_linear,
             return_bias=False
         )
 
