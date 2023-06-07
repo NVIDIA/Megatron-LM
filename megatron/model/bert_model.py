@@ -152,7 +152,7 @@ class BertModel(MegatronModule):
 
         self.initialize_word_embeddings()
         if self.post_process:
-            self.lm_head = BertLMHead(self.word_embeddings_weight().size(0), config.hidden_size,
+            self.lm_head = BertLMHead(self.shared_embeddings_or_output_weight().size(0), config.hidden_size,
                                       config, parallel_output)
             self._lm_head_key = 'lm_head'
             self.binary_head = None
@@ -206,7 +206,7 @@ class BertModel(MegatronModule):
             return post_language_model_processing(lm_output, pooled_output,
                                                   self.lm_head, self.binary_head,
                                                   lm_labels,
-                                                  self.word_embeddings_weight(),
+                                                  self.shared_embeddings_or_output_weight(),
                                                   self.fp16_lm_cross_entropy)
         else:
             return lm_output
