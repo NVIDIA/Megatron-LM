@@ -9,6 +9,7 @@ import os
 import torch
 import types
 
+import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
@@ -408,6 +409,10 @@ def core_transformer_config_from_args(args):
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_gelu_fusion'] = False
     return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):

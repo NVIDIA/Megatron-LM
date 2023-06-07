@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
-import torch.nn.init as init
+import torch.nn.functional as F
 
 from megatron.core import ModelParallelConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
@@ -33,6 +33,13 @@ class TransformerConfig(ModelParallelConfig):
 
         layernorm_zero_centered_gamma (bool): if set to 'True', the LayerNorm is adjusted to center the gamma values
                                               around 0. This improves numerical stability. Defaults to False.
+
+        add_bias_linear (bool): Include a bias term in all linear layers (QKV projections, after core attention, and two
+                                in MLP layer). Default is True.
+
+        gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
+
+        activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
 
         # initialization
         init_method (Callable): Method to initialize weights. Note that bias is always set to
@@ -104,6 +111,9 @@ class TransformerConfig(ModelParallelConfig):
     apply_residual_connection_post_layernorm: bool = False
     layernorm_epsilon: float = 1e-5
     layernorm_zero_centered_gamma: bool = False
+    add_bias_linear: bool = True
+    gated_linear_unit: bool = False
+    activation_func: Callable = F.gelu
 
     # initialization
     init_method: Callable = None
@@ -179,8 +189,16 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        if self.bias_gelu_fusion:
+            if not self.add_bias_linear:
+                raise ValueError("When bias_gelu_fusion is True, add_bias_linear must also be True.")
+
+            if self.activation_func != F.gelu:
+                raise ValueError(f'When bias_gelu_fusion is True, activation_func must be F.gelu.')
+
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
+

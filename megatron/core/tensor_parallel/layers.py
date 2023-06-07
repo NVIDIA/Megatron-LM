@@ -433,10 +433,12 @@ class ColumnParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: This was added for testing and should be
                                      set to False. It returns the master weights
                                      used for initialization.
-        return_bias: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip
-                       adding bias but instead return it.
+        skip_bias_add: If True, do not add the bias term, instead
+                       return it to be added by the caller. This
+                       enables performance optimations where bias can
+                       be fused with other elementwise operations.
         config: ModelParallelConfig object
+
     """
 
     def __init__(self, input_size, output_size, *,
@@ -444,7 +446,7 @@ class ColumnParallelLinear(torch.nn.Module):
                  init_method: Callable,
                  bias=True, gather_output=False, stride=1,
                  keep_master_weight_for_test=False,
-                 return_bias=False):
+                 skip_bias_add=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -454,7 +456,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
-        self.return_bias = return_bias
+        self.skip_bias_add = skip_bias_add
         self.config = config
 
         # Parameters.
@@ -536,7 +538,7 @@ class ColumnParallelLinear(torch.nn.Module):
             - output
             - bias
         """
-        bias = self.bias if not self.return_bias else None
+        bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
                 self.sequence_parallel:
@@ -558,7 +560,7 @@ class ColumnParallelLinear(torch.nn.Module):
             output = gather_from_tensor_model_parallel_region(output_parallel)
         else:
             output = output_parallel
-        output_bias = self.bias if self.return_bias else None
+        output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
 
@@ -589,10 +591,12 @@ class RowParallelLinear(torch.nn.Module):
         keep_master_weight_for_test: This was added for testing and should be
                                      set to False. It returns the master weights
                                      used for initialization.
-        return_bias: This was added to enable performance optimization where bias
-                       can be fused with other elementwise operations. We skip
-                       adding bias but instead return it.
+        skip_bias_add: If True, do not add the bias term, instead
+                       return it to be added by the caller. This
+                       enables performance optimations where bias can
+                       be fused with other elementwise operations.
         config: ModelParallelConfig object
+
     """
 
     def __init__(self, input_size: int, output_size: int, *,
@@ -602,7 +606,7 @@ class RowParallelLinear(torch.nn.Module):
                  input_is_parallel: bool = False,
                  stride: int = 1,
                  keep_master_weight_for_test: bool = False,
-                 return_bias: bool = False):
+                 skip_bias_add: bool = False):
         super(RowParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -612,7 +616,7 @@ class RowParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         world_size = get_tensor_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
-        self.return_bias = return_bias
+        self.skip_bias_add = skip_bias_add
         self.config = config
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
@@ -690,7 +694,7 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
-        if not self.return_bias:
+        if not self.skip_bias_add:
             output = output_ + self.bias if self.bias is not None else output_
             output_bias = None
         else:
