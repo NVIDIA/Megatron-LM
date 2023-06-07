@@ -312,6 +312,7 @@ def build_training_sample(sample, target_seq_length,
         eos_id: end of generation id
         sentinel_tokens: unique value to be substituted for every replaced span
     """
+    add_mask_tokens = sentinel_tokens is not None
 
     # Denoiser selection
     denoiser = denoisers[denoiser_index]
@@ -332,7 +333,11 @@ def build_training_sample(sample, target_seq_length,
         tokens = [cls_id] + tokens
 
     max_num_tokens = target_seq_length
-    if is_decoder_only(model_type) and denoiser != 'S':
+    if (
+            is_decoder_only(model_type)
+            and denoiser != 'S'
+            and add_mask_tokens
+    ):
         # Keep space for repeated `extra_id` tokens; not the most data
         # efficient since we calculate this based on the maximum number
         # of possible `extra_id` tokens.
@@ -340,10 +345,25 @@ def build_training_sample(sample, target_seq_length,
         truncated = len(tokens) > safe_max_seq_len
         tokens = tokens[:safe_max_seq_len]
     else:
-        # If we are S-denoising, we know only one `extra_id` token is
-        # going to be added.
-        if is_decoder_only(model_type) and denoiser == 'S':
-            max_num_tokens -= 1
+        # If we are S-denoising, we know three tokens are going to be
+        # added: `bos`, `sep`, and `eos`. Same when not adding mask
+        # tokens.
+        if (
+                is_decoder_only(model_type) and denoiser == 'S'
+                or not add_mask_tokens
+        ):
+            max_num_tokens -= 3
+
+        # If we have a decoder-only model and do not add mask tokens, we
+        # basically duplicate the sequence. So cut the maximum length in
+        # half.
+        if (
+                is_decoder_only(model_type)
+                and denoiser != 'S'
+                and not add_mask_tokens
+        ):
+            max_num_tokens = max_num_tokens // 2
+
         # Truncate to `target_sequence_length`.
         truncated = len(tokens) > max_num_tokens
         tokens = tokens[:max_num_tokens]
