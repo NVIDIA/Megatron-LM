@@ -56,7 +56,7 @@ class Attention(MegatronModule, ABC):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            return_bias=True,
+            skip_bias_add=True,
         )
 
     def _checkpointed_attention_forward(self, query, key, value, attention_mask):
@@ -180,7 +180,7 @@ class SelfAttention(Attention):
                 config=self.config,
                 init_method=self.config.init_method,
                 bias=self.config.add_bias_linear,
-                return_bias=False
+                skip_bias_add=False
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -224,7 +224,7 @@ class CrossAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            return_bias=False
+            skip_bias_add=False
         )
 
         self.linear_kv = TEColumnParallelLinear(
@@ -233,7 +233,7 @@ class CrossAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            return_bias=False
+            skip_bias_add=False
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):

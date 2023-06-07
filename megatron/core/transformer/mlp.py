@@ -43,7 +43,7 @@ class MLP(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            return_bias=True,
+            skip_bias_add=True,
         )
 
         if self.config.gated_linear_unit:
@@ -60,7 +60,7 @@ class MLP(MegatronModule):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
-            return_bias=True,
+            skip_bias_add=True,
         )
 
     def forward(self, hidden_states):

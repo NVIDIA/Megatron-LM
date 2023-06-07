@@ -37,7 +37,7 @@ class TELinear(te.pytorch.module.Linear):
                  parallel_mode: str,
                  init_method: Callable, *,
                  bias: bool = True,
-                 return_bias: bool = False,
+                 skip_bias_add: bool = False,
                  **kwargs):
         self.config = config
 
@@ -46,7 +46,7 @@ class TELinear(te.pytorch.module.Linear):
         # tell TE to not return the bias, and return None
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
-        self.te_return_bias = return_bias and bias
+        self.te_return_bias = skip_bias_add and bias
 
         super().__init__(
             in_features=input_size,
