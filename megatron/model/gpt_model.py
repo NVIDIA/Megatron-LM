@@ -91,7 +91,7 @@ class GPTModel(MegatronModule):
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
-                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
+                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
         else:
