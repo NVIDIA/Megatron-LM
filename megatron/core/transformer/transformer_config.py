@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import ModelParallelConfig
+from megatron.core.utils import init_method_normal, scaled_init_method_normal
 
 @dataclass
 class TransformerConfig(ModelParallelConfig):
@@ -39,6 +40,23 @@ class TransformerConfig(ModelParallelConfig):
         gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
 
         activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
+
+        # initialization
+        init_method (Callable): Method to initialize weights. Note that bias is always set to
+                                zero. Should be a function that takes a single Tensor and
+                                initializes it. Defaults to
+                                megatron.core.utils.init_method_normal(init_method_std) which is
+                                torch.nn.init.normal_ with mean=0.0 and std=init_method_Std.
+
+        output_layer_init_method (Callable): Method to initialize weights of the output layer of
+                                             both attention and MLP blocks. Defaults to
+                                             megatron.core.utils.scaled_init_method_normal(init_method_std)
+                                             which is torch.nn.init.normal_ with mean=0.0 and
+                                             std=init_method_std / math.sqrt(2.0 * num_layers).
+
+        init_method_std (float): Standard deviation of the zero mean normal for the default
+                                 initialization method, not used if init_method and
+                                 output_layer_init_method are provided. Defaults to 0.02.
 
         # mixed-precision
         apply_query_key_layer_scaling (bool): If true, scale Q * K^T by 1 / layer-number. Defaults to True.
@@ -96,6 +114,11 @@ class TransformerConfig(ModelParallelConfig):
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
+
+    # initialization
+    init_method: Callable = None
+    output_layer_init_method: Callable = None
+    init_method_std: float = 0.02
 
     # mixed-precision
     apply_query_key_layer_scaling: bool = True
@@ -172,3 +195,10 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.activation_func != F.gelu:
                 raise ValueError(f'When bias_gelu_fusion is True, activation_func must be F.gelu.')
+
+        if self.init_method is None:
+            self.init_method = init_method_normal(self.init_method_std)
+
+        if self.output_layer_init_method is None:
+            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
+
