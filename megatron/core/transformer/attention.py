@@ -188,7 +188,7 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
-        mixed_qkv = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
 
         # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -242,7 +242,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv = self.linear_kv(key_value_states)
+        mixed_kv, _ = self.linear_kv(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -255,7 +255,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query = self.linear_q(hidden_states)
+        query, _ = self.linear_q(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (
