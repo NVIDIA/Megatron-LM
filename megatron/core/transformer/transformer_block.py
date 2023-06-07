@@ -11,7 +11,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
-
+import transformer_engine
 
 class TransformerBlock(MegatronModule):
     """Transformer class."""
@@ -207,7 +207,12 @@ class TransformerBlock(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        with rng_context:
+        fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                margin=0, interval=1, fp8_format=transformer_engine.common.recipe.Format.E4M3
+            )
+        with rng_context and transformer_engine.pytorch.fp8_autocast(
+                enabled=True, fp8_recipe=fp8_recipe
+            ):
             # Forward pass.
             if self.config.recompute_granularity == 'full':
                 hidden_states = self._checkpointed_forward(hidden_states=hidden_states, attention_mask=attention_mask)
