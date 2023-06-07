@@ -420,6 +420,11 @@ def build_training_sample(sample, target_seq_length,
 
         # Move BOS token to start of sequence.
         tokens_dec_in = tokens_dec_in[1:]
+        if not add_mask_tokens:
+            # Do not reproduce objective token when not using masking
+            # tokens.
+            tokens_dec_in = tokens_dec_in[1:]
+            labels = labels[1:]
         tokens = (
             [bos_id]
             + tokens_enc
