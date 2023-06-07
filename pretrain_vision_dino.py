@@ -16,10 +16,12 @@ from megatron.utils import average_losses_across_data_parallel_group, unwrap_mod
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
+from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
-    return DINOPretrainModel(pre_process=pre_process, post_process=post_process)
+    config = core_transformer_config_from_args(get_args())
+    return DINOPretrainModel(config, pre_process=pre_process, post_process=post_process)
 
 def get_batch(data_iterator):
     """Build the batch."""

@@ -412,10 +412,9 @@ class TransformerLanguageModel(MegatronModule):
                 self.output_layer = tensor_parallel.ColumnParallelLinear(
                     args.hidden_size,
                     args.padded_vocab_size,
-                    bias=False, # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
+                    config=config,
                     init_method=self.init_method,
-                    use_cpu_initialization=args.use_cpu_initialization,
-                    perform_initialization=args.perform_initialization)
+                    bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):

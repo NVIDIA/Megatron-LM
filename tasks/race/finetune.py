@@ -9,6 +9,7 @@ from megatron.model.multiple_choice import MultipleChoice
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
 from tasks.race.data import RaceDataset
+from megatron.arguments import core_transformer_config_from_args
 
 
 def train_valid_datasets_provider():
@@ -26,9 +27,10 @@ def train_valid_datasets_provider():
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
-
+    config = core_transformer_config_from_args(get_args())
     print_rank_0('building multichoice model for RACE ...')
-    model = MultipleChoice(num_tokentypes=2,
+    model = MultipleChoice(config=config,
+                           num_tokentypes=2,
                            pre_process=pre_process,
                            post_process=post_process)
 

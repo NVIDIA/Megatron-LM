@@ -173,11 +173,12 @@ def cosine_scheduler(base_value, final_value, epochs, niter_per_ep,
     return schedule
 
 
-def get_student_backbone_and_num_features(pre_process=True, post_process=True):
+def get_student_backbone_and_num_features(config, pre_process=True, post_process=True):
     args = get_args()
 
     if args.vision_backbone_type == 'vit':
-        student = VitBackbone(pre_process=pre_process,
+        student = VitBackbone(config,
+                              pre_process=pre_process,
                               post_process=post_process,
                               drop_path_rate=0.1,
                               single_token_output=True)
@@ -194,11 +195,12 @@ def get_student_backbone_and_num_features(pre_process=True, post_process=True):
  
     return student, num_features
 
-def get_teacher_backbone_and_num_features(pre_process=True, post_process=True):
+def get_teacher_backbone_and_num_features(config, pre_process=True, post_process=True):
     args = get_args()
 
     if args.vision_backbone_type == 'vit':
-        teacher = VitBackbone(pre_process=pre_process,
+        teacher = VitBackbone(config,
+                              pre_process=pre_process,
                               post_process=post_process,
                               single_token_output=True)
         num_features = args.hidden_size
@@ -215,7 +217,7 @@ def get_teacher_backbone_and_num_features(pre_process=True, post_process=True):
 
 
 class DINOPretrainModel(MegatronModule):
-    def __init__(self, pre_process=True, post_process=True):
+    def __init__(self, config, pre_process=True, post_process=True):
         super(DINOPretrainModel, self).__init__()
         args = get_args()
         self.out_dim = 65536
@@ -234,7 +236,7 @@ class DINOPretrainModel(MegatronModule):
         self.momentum_teacher = 0.996
 
         student_backbone, num_features = \
-            get_student_backbone_and_num_features(pre_process, post_process)
+            get_student_backbone_and_num_features(config, pre_process, post_process)
 
         self.student = MultiCropWrapper(
             student_backbone,
@@ -249,7 +251,7 @@ class DINOPretrainModel(MegatronModule):
         )
 
         teacher_backbone, num_features = \
-            get_teacher_backbone_and_num_features(pre_process, post_process)
+            get_teacher_backbone_and_num_features(config, pre_process, post_process)
         self.teacher = MultiCropWrapper(
             teacher_backbone,
             DINOHead(num_features, self.out_dim)

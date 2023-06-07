@@ -17,23 +17,21 @@ from .module import MegatronModule
 class MultipleChoice(MegatronModule):
 
     def __init__(self,
+                 config,
                  num_tokentypes=2,
                  pre_process=True,
                  post_process=True):
         super(MultipleChoice, self).__init__(share_embeddings_and_output_weights=False)
         args = get_args()
 
-        init_method = init_method_normal(args.init_method_std)
         self.pre_process = pre_process
         self.post_process = post_process
 
         self.language_model, self._language_model_key = get_language_model(
+            config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=True,
             encoder_attn_mask_type=AttnMaskType.padding,
-            init_method=init_method,
-            scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process)
 

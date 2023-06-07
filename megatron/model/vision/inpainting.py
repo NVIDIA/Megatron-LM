@@ -18,7 +18,7 @@ from megatron.model.vision.utils import resize_
 
 class VitInpaintingModel(MegatronModule):
 
-    def __init__(self, pre_process=True, post_process=True):
+    def __init__(self, config, pre_process=True, post_process=True):
         super(VitInpaintingModel, self).__init__()
         args = get_args()
 
@@ -26,6 +26,7 @@ class VitInpaintingModel(MegatronModule):
         self.post_process = post_process
         self.hidden_size = args.hidden_size
         self.backbone = VitBackbone(
+            config=config,
             pre_process=self.pre_process,
             post_process=self.post_process,
             class_token=False,

@@ -130,6 +130,7 @@ class VitBackbone(MegatronModule):
     """Vision Transformer Model."""
 
     def __init__(self,
+                 config,
                  pre_process=True,
                  post_process=True,
                  class_token=True,
@@ -140,14 +141,6 @@ class VitBackbone(MegatronModule):
         args = get_args()
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
-        if args.init_method_xavier_uniform:
-            self.init_method = torch.nn.init.xavier_uniform_
-            self.scaled_init_method = torch.nn.init.xavier_uniform_
-        else:
-            self.init_method = init_method_normal(args.init_method_std)
-            self.scaled_init_method = scaled_init_method_normal(
-                args.init_method_std, args.num_layers
-            )
 
         self.pre_process = pre_process
         self.post_process = post_process
@@ -202,8 +195,7 @@ class VitBackbone(MegatronModule):
 
         # Transformer
         self.transformer = ParallelTransformer(
-            self.init_method,
-            self.scaled_init_method,
+            config,
             pre_process=self.pre_process,
             post_process=self.post_process,
             post_layer_norm=self.post_layer_norm,

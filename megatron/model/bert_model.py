@@ -54,10 +54,9 @@ class BertLMHead(MegatronModule):
     """
 
     def __init__(self, mpu_vocab_size, hidden_size, config, parallel_output):
-        super(BertLMHead, self).__init__()
+        super().__init__(config=config)
 
         args = get_args()
-        self.config = config
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
