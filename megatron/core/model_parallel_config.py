@@ -5,8 +5,6 @@ from typing import Callable
 
 import torch
 
-from megatron.core.utils import init_method_normal, scaled_init_method_normal
-
 @dataclass
 class ModelParallelConfig:
     """Base configuration for Megatron Core
@@ -31,12 +29,6 @@ class ModelParallelConfig:
 
     Initialization
     --------------
-
-    init_method (Callable, default=init.xavier_normal_): Method to initialize weights. Note that bias is always set to zero.
-
-    output_layer_init_method (Callable, default=init.xavier_normal_): Method to initialize weights of MLP output layer.
-
-    init_method_std (float, default=0.02): Standard deviation of the zero mean normal.
 
     perform_initialization (bool, default=True): If true, weights are initialized. This option can be useful when you
         know you are going to load values from a checkpoint.
@@ -124,9 +116,6 @@ class ModelParallelConfig:
     sequence_parallel: bool = False
 
     # Initialization
-    init_method: Callable = None
-    output_layer_init_method: Callable = None
-    init_method_std: float = 0.02
     perform_initialization: bool = True
     use_cpu_initialization: bool = False
 
@@ -173,9 +162,3 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
-
-        if self.init_method is None:
-            self.init_method = init_method_normal(self.init_method_std)
-
-        if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
