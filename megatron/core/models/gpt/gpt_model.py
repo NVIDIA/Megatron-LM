@@ -128,16 +128,14 @@ class GPTModel(MegatronModule):
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
-        else:
-            # [b s] => [s b]
-            labels = labels.transpose(0, 1).contiguous()
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
 
-            # [s b] => [b, s]
-            loss = loss.transpose(0, 1).contiguous()
-            return loss
+        # [b s] => [s b]
+        labels = labels.transpose(0, 1).contiguous()
+        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
 
-        return hidden_states
+        # [s b] => [b, s]
+        loss = loss.transpose(0, 1).contiguous()
+        return loss
 
     def shared_embedding_or_output_weight(self):
         if self.pre_process:
