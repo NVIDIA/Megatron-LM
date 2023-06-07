@@ -1316,6 +1316,8 @@ class ParallelTransformer(MegatronModule):
 
         # Transformer layers.
         if args.retro_add_retriever:
+            assert self.recompute_granularity != 'full', \
+                "Full recompute not supported for Retro."
             assert args.transformer_impl == 'local', \
                 "Transformer engine does not support Retro layers."
         def build_layer(layer_number):
@@ -1465,8 +1467,9 @@ class ParallelTransformer(MegatronModule):
                     hidden_states = tensor_parallel.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
-                        hidden_states, attention_mask, encoder_output,
-                        enc_dec_attn_mask, rotary_pos_emb)
+                        hidden_states, attention_mask,
+                        encoder_output, enc_dec_attn_mask,
+                        None, None, None, None, rotary_pos_emb)
 
                 l += self.recompute_num_layers
 
@@ -1488,8 +1491,9 @@ class ParallelTransformer(MegatronModule):
                         hidden_states = tensor_parallel.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
-                            hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            hidden_states, attention_mask,
+                            encoder_output, enc_dec_attn_mask,
+                            None, None, None, None, rotary_pos_emb)
                 else:
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1)(
@@ -1497,8 +1501,9 @@ class ParallelTransformer(MegatronModule):
                             enc_dec_attn_mask, **te_forward_kwargs)
                     else:
                         hidden_states = custom(l, l + 1)(
-                            hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, rotary_pos_emb)
+                            hidden_states, attention_mask,
+                            encoder_output, enc_dec_attn_mask,
+                            None, None, None, None, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1576,8 +1581,6 @@ class ParallelTransformer(MegatronModule):
 
                 # Forward pass.
                 if self.recompute_granularity == 'full':
-                    assert not self.retro_add_retriever, \
-                        "full recompute not supported for retro."
                     hidden_states = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
