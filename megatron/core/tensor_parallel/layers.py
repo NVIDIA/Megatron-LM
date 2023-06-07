@@ -486,6 +486,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 if config.perform_initialization:
                     _initialize_affine_weight_gpu(self.weight, init_method,
                                                   partition_dim=0, stride=stride)
+        else:
+            self.weight = None
 
         if bias:
             if config.use_cpu_initialization:
@@ -551,7 +553,11 @@ class ColumnParallelLinear(torch.nn.Module):
             - bias
 
         """
-        weight = weight if weight is not None else self.weight
+        if weight is None:
+            if self.weight is None:
+                raise RuntimeError("weight was not supplied to ColumnParallelLinear forward pass "
+                                   "and skip_weight_param_allocation is True.")
+            weight = self.weight
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
