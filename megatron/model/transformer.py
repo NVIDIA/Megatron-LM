@@ -89,7 +89,7 @@ class ParallelMLP(MegatronModule):
             init_method=config.init_method,
             bias=self.add_bias,
             gather_output=False,
-            return_bias=True,
+            skip_bias_add=True,
         )
 
         self.bias_gelu_fusion = False
@@ -472,7 +472,7 @@ class ParallelAttention(MegatronModule):
             init_method=config.output_layer_init_method,
             bias=args.add_bias_linear,
             input_is_parallel=True,
-            return_bias=True)
+            skip_bias_add=True)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
