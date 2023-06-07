@@ -497,19 +497,17 @@ def _num_epochs(tokens_per_epoch, seq_length, num_samples):
 
 
 def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
-    """Build an array with length = number-of-epochs * number-of-dcuments.
+    """Build an array with length = number-of-epochs * number-of-documents.
     Each index is mapped to a corresponding document."""
-    if not separate_last_epoch or num_epochs == 1:
-        doc_idx = np.mgrid[0:num_epochs, 0:len(documents)][1]
-        doc_idx[:] = documents
-        doc_idx = doc_idx.reshape(-1)
-        doc_idx = doc_idx.astype(np.int32)
-        np_rng.shuffle(doc_idx)
-        return doc_idx
 
-    doc_idx_first = _build_doc_idx(documents, num_epochs-1, np_rng, False)
-    doc_idx_last = _build_doc_idx(documents, 1, np_rng, False)
-    return np.concatenate((doc_idx_first, doc_idx_last))
+    doc_idx = np.tile(documents, num_epochs)
+    if num_epochs > 1 and separate_last_epoch:
+        np_rng.shuffle(doc_idx[:-len(documents)])
+        np_rng.shuffle(doc_idx[-len(documents):])
+    else:
+        np_rng.shuffle(doc_idx)
+
+    return doc_idx.astype(np.int32)
 
 
 def _build_sample_idx(sizes, doc_idx, seq_length,
