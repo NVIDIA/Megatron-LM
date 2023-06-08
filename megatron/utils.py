@@ -200,6 +200,13 @@ def print_rank_0(message):
     else:
         print(message, flush=True)
 
+def print_with_rank(message):
+    """If distributed is initialized, print only on rank 0."""
+    if torch.distributed.is_initialized():
+        print(f"rank {torch.distributed.get_rank()}: {message}", flush=True)
+    else:
+        print(message, flush=True)
+
 def is_last_rank():
     return torch.distributed.get_rank() == (
         torch.distributed.get_world_size() - 1)
