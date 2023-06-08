@@ -150,7 +150,9 @@ class BertModel(MegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method,
             pre_process=self.pre_process,
-            post_process=self.post_process)
+            post_process=self.post_process,
+            num_experts=args.num_experts,
+        )
 
         self.initialize_word_embeddings(init_method_normal)
         if self.post_process:

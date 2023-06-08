@@ -102,7 +102,9 @@ class T5Model(MegatronModule):
             add_decoder=True,
             encoder_attn_mask_type=AttnMaskType.padding,
             init_method=init_method,
-            scaled_init_method=scaled_init_method)
+            scaled_init_method=scaled_init_method,
+            num_experts=args.num_experts,
+        )
 
         self.lm_head = T5LMHead(
             self.language_model.embedding.word_embeddings.weight.size(0),
