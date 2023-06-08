@@ -584,14 +584,22 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
        If no mask is provided, the module will query `self._args.attn_mask`
        for the mask and only return `super().forward(...)`
     """
+    def __init__(self, isvit=False, **kwargs):
+        super(ParallelTransformerLayerPipe, self).__init__(**kwargs)
+        self.isvit = isvit
+
+
     def forward(self, inputs, **kwargs):
         assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
         if torch.is_tensor(inputs) or len(inputs) == 1:
             # No attention mask forwarded, search for args.attn_mask
             if not hasattr(self, '_args'):
                 self._args = get_args()
-            hidden_states, attention_mask = inputs, self._args.attn_mask
-            # HACK: currently MoE model does not support pipeline parallel, so
+            if not self.isvit:
+                hidden_states, attention_mask = inputs, self._args.attn_mask
+            else:
+                hidden_states, attention_mask = inputs, None
+                # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
             return super().forward(hidden_states, attention_mask, **kwargs)[0]
         elif len(inputs) == 2:

@@ -15,20 +15,28 @@
 
 """Vision Transformer(VIT) model."""
 
-import math
-import einops
 import torch
 import torch.nn.functional as F
 from megatron import get_args
 from megatron.model.transformer import ParallelTransformer
+from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+from .enums import AttnMaskType
 from megatron.model.utils import (
     get_linear_layer,
     init_method_normal,
     scaled_init_method_normal,
 )
-from .module import MegatronModule
-from deepspeed.accelerator import get_accelerator
 
+from megatron.mpu.utils import ClsUtility
+from megatron.mpu.initialize import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from megatron.mpu.mappings import reduce_from_tensor_model_parallel_region
+from .vit_embedding import VitEmbedding, VitEmbeddingPipe
+from .module import MegatronModule, fp32_to_float16
+from megatron.model.module import float16_to_fp32
+from .transformer import ParallelTransformerLayerPipe
+from megatron.model import LayerNorm
+from megatron import mpu
+from megatron.mpu.layers import ColumnParallelLinear
 
 class VitMlpHead(MegatronModule):
     """Pooler layer.
@@ -43,91 +51,40 @@ class VitMlpHead(MegatronModule):
     """
 
     def __init__(self, hidden_size, num_classes):
-        super(VitMlpHead, self).__init__()
-        self.dense_in = torch.nn.Linear(hidden_size, hidden_size)
-        self.dense_out = torch.nn.Linear(hidden_size, num_classes)
+        super(VitMlpHead, self).__init__(share_word_embeddings=False)
+        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+
+        self.dense_in = ColumnParallelLinear(hidden_size, hidden_size,gather_output=True)
+        self.dense_out = ColumnParallelLinear(hidden_size, num_classes, gather_output=False)
         torch.nn.init.constant_(self.dense_out.bias, -10)
 
     def forward(self, hidden_states, sequence_index=0):
-        # hidden_states: [b, s, h]
-        # sequence_index: index of the token to pool.
         x = hidden_states[:, sequence_index, :]
-        x = self.dense_in(x)
+        x, _ = self.dense_in(x)
         x = torch.tanh(x)
-        x = self.dense_out(x)
+        x, _ = self.dense_out(x)
         return x
 
-
-def twod_interpolate_position_embeddings_hook(
-    state_dict,
-    prefix,
-    local_metadata,
-    strict,
-    missing_keys,
-    unexpected_keys,
-    error_msgs,
-):
-
-    args = get_args()
-    num_patches_per_dim = args.img_dim // args.patch_dim
-    num_patches = num_patches_per_dim ** 2
-    seq_length = num_patches + 1
-    hidden_size = args.hidden_size
-
-    key = prefix + "weight"
-    # import pdb
-    # pdb.set_trace()
-    assert key in state_dict
-    if key in state_dict:
-        input_param = state_dict[key]
-
-        assert input_param.shape[1] == hidden_size
-        if input_param.shape[0] != seq_length:
-            # update input_param and load it to state_dict[key]
-
-            num_tok_input = input_param.shape[0] - 1
-            num_tok_new = seq_length - 1
-            input_param_tok, input_param_grid = (
-                input_param[:1, :],
-                input_param[1:, :],
-            )
-
-            gs_input = int(math.sqrt(num_tok_input))
-            gs_new = int(math.sqrt(num_tok_new))
-
-            input_param_grid = input_param_grid.transpose(0, 1).contiguous()
-            input_param_grid = input_param_grid.reshape(
-                (1, -1, gs_input, gs_input)
-            )
-            input_param_grid = input_param_grid.float()
-            scale_factor = gs_new / gs_input
-
-            input_param_grid = F.interpolate(
-                input_param_grid, scale_factor=scale_factor, mode="bilinear"
-            )
-
-            input_param_grid = input_param_grid.half()
-            input_param_grid = input_param_grid.reshape((-1, gs_new * gs_new))
-            input_param_grid = input_param_grid.transpose(0, 1).contiguous()
-
-            assert input_param_grid.shape[1] == hidden_size
-            input_param = torch.cat((input_param_tok, input_param_grid), dim=0)
-            assert (
-                input_param.shape[0] == seq_length
-                and input_param.shape[1] == hidden_size
-            )
-
-            state_dict[key] = input_param
+    @property
+    def dense_in_weight(self):
+        """Easy accessory for the DeepSpeed pipeline engine to tie embeddings across stages."""
+        return self.dense_in.weight
 
 
 class VitModel(MegatronModule):
     """Vision Transformer Model."""
 
-    def __init__(self, num_classes, finetune=False):
-        super(VitModel, self).__init__()
+    def __init__(self, num_classes, finetune=False,
+                 pre_process=True,
+                 post_process=True):
+        super(VitModel, self).__init__(share_word_embeddings=False)
         args = get_args()
-
+        self.pre_process = pre_process
+        self.post_process = post_process
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
+
+
+
         if args.init_method_xavier_uniform:
             self.init_method = torch.nn.init.xavier_uniform_
             self.scaled_init_method = torch.nn.init.xavier_uniform_
@@ -149,63 +106,136 @@ class VitModel(MegatronModule):
         self.seq_length = self.num_patches + 1
         self.flatten_dim = self.patch_dim * self.patch_dim * args.num_channels
 
-        # cls_token
-        self.cls_token = torch.nn.Parameter(torch.randn(1, 1, self.hidden_size))
-        torch.nn.init.zeros_(self.cls_token)
-
-        # Linear encoder
-        self.linear_encoder = torch.nn.Linear(
-            self.flatten_dim, self.hidden_size
-        )
-
-        # embedding
-        self.position_embeddings = torch.nn.Embedding(
-            self.seq_length, self.hidden_size
-        )
-        init_method_normal(args.init_method_std)(
-            self.position_embeddings.weight
-        )
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(get_accelerator().device_name())
-
-        self.position_embeddings._register_load_state_dict_pre_hook(
-            twod_interpolate_position_embeddings_hook
-        )
-
-        self.embedding_dropout = torch.nn.Dropout(args.hidden_dropout)
+        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+        self.cls_start_index, self.cls_end_index = \
+            ClsUtility.cls_range_from_global_num_classes(
+                self.num_classes, get_tensor_model_parallel_rank(),
+                self.tensor_model_parallel_size)
+        self.num_classes_per_partition = self.cls_end_index - \
+                                         self.cls_start_index
+        if self.pre_process:
+            self.embedding = VitEmbedding()
 
         # Transformer
         self.transformer = ParallelTransformer(
-            self.init_method, self.scaled_init_method
+            self.init_method, self.scaled_init_method, pre_process=pre_process, post_process=post_process
         )
+        
+        if self.post_process:
+            # MLP head
+            if not self.finetune:
+                self.mlp_head = VitMlpHead(self.hidden_size, self.num_classes)
+            else:
+                self.class_head = get_linear_layer(
+                    self.hidden_size, self.num_classes_per_partition, torch.nn.init.zeros_
+                )
 
-        # MLP head
-        if not self.finetune:
-            self.mlp_head = VitMlpHead(self.hidden_size, self.num_classes)
-        else:
-            self.class_head = get_linear_layer(
-                self.hidden_size, num_classes, torch.nn.init.zeros_
-            )
+    def set_input_tensor(self, input_tensor):
+        """ See megatron.model.transformer.set_input_tensor()"""
+        self.transformer.set_input_tensor(input_tensor)
 
     def forward(self, x):
-        x = einops.rearrange(
-            x,
-            "b c (h p1) (w p2) -> b (h w) (p1 p2 c)",
-            p1=self.patch_dim,
-            p2=self.patch_dim,
+        if self.pre_process:
+            embedding_output = self.embedding(x)
+            encoder_input = embedding_output
+        else:
+            encoder_input = None
+        x = self.transformer(encoder_input, None)[0]
+
+        if self.post_process:
+            x = self.mlp_head(x)
+        return x
+
+def CrossEntropy(output, labels):
+    labels, loss_mask = labels[0], labels[1]
+
+    args = get_args()
+
+    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(), labels)
+    loss_mask = loss_mask.view(-1)
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    return loss
+
+def vitCrossEntropy(output, labels):
+    losses = mpu.cls_parallel_cross_entropy(output.contiguous().float(), labels)
+    return losses.mean()
+
+class VitModelPipe(PipelineModule, MegatronModule):
+    """GPT-2 Language model."""
+
+    def __init__(self,
+                 num_tokentypes=0,
+                 parallel_output=True):
+        args = get_args()
+        self.parallel_output = parallel_output
+        init_method = init_method_normal(args.init_method_std)
+
+        self.specs = []
+
+        def _to_float16(inputs):
+            if args.fp16:
+                return fp32_to_float16(inputs, lambda v: v.half())
+            elif args.bf16:
+                return fp32_to_float16(inputs, lambda v: v.bfloat16())
+            else:
+                return inputs
+
+        self.specs.append(_to_float16)
+
+        # Embedding layer
+        self.specs.append(TiedLayerSpec('embed',
+                                        VitEmbeddingPipe,
+                                        tied_weight_attr='linear_encoder_weight'))
+
+        if args.fp32_residual_connection:
+            self.specs.append(lambda x: x.transpose(0, 1).contiguous().float())
+        else:
+            self.specs.append(lambda x: x.transpose(0, 1).contiguous())
+
+        for layer_idx in range(args.num_layers):
+            self.specs.append(
+                LayerSpec(ParallelTransformerLayerPipe,
+                          init_method=init_method,
+                          output_layer_init_method=scaled_init_method_normal(args.init_method_std,
+                                                                             args.num_layers),
+                          layer_number=layer_idx,
+                          isvit=True,
+                          self_attn_mask_type=AttnMaskType.causal))
+
+        # Undo data format change
+        self.specs.append(lambda x: x.transpose(0, 1).contiguous())
+
+        # Final layernorm after transformer layers
+        self.specs.append(
+            LayerSpec(LayerNorm,
+                      args.hidden_size,
+                      eps=args.layernorm_epsilon))
+
+        self.specs.append(
+            TiedLayerSpec('linear',
+                   VitMlpHead,
+                   args.hidden_size,
+                   args.num_classes,
+                   tied_weight_attr='dense_in_weight'
+                   )
         )
 
-        assert x.dtype == torch.half
-        x = self.linear_encoder(x)
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        # Convert to fp32 if needed
+        # if args.fp16 or args.bf16:
+        #     self.specs.append(float16_to_fp32)
 
-        x = x + self.position_embeddings(self.position_ids)
-        x = self.embedding_dropout(x)
-        x = self.transformer(x, None)
-
-        if not self.finetune:
-            x = self.mlp_head(x)
+        if args.checkpoint_activations:
+            interval = args.checkpoint_num_layers
         else:
-            x = self.class_head(x[:, 0, :])
+            interval = 0
 
-        return x
+        from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
+        topo = PipeModelDataParallelTopology(num_pp=mpu.get_pipeline_model_parallel_world_size(),
+                                             num_mp=mpu.get_tensor_model_parallel_world_size(),
+                                             num_dp=mpu.get_data_parallel_world_size())
+
+        super().__init__(layers=self.specs,
+                         loss_fn=vitCrossEntropy,
+                         topology=topo,
+                         activation_checkpoint_interval=interval,
+                         partition_method='type:transformer')
