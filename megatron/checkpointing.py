@@ -438,7 +438,7 @@ def _load_base_checkpoint(load_dir, no_load_optim, use_distributed_optimizer,
         from megatron.fp16_deprecated import loss_scaler
         # For backward compatibility.
         if not rank0:
-            print_rank_0(' > deserializing using the old code structure ...')
+            print_with_rank(' > deserializing using the old code structure ...')
         sys.modules['fp16.loss_scaler'] = sys.modules[
             'megatron.fp16_deprecated.loss_scaler']
         sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
@@ -448,8 +448,8 @@ def _load_base_checkpoint(load_dir, no_load_optim, use_distributed_optimizer,
         sys.modules.pop('fp16.loss_scaler', None)
         sys.modules.pop('megatron.fp16.loss_scaler', None)
     except BaseException as e:
-        print_rank_0('could not load the checkpoint')
-        print_rank_0(e)
+        print_with_rank('could not load the checkpoint')
+        print_with_rank(e)
         sys.exit()
 
     return model_state_dict, optim_state_dict, release
