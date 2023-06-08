@@ -45,128 +45,28 @@ def num_samples_to_block_ranges(num_samples):
     return ranges
 
 
-def get_training_data_dir():
-    return os.path.join(get_index_dir(), "train_tmp")
+def get_training_data_root_dir():
+    args = get_retro_args()
+    return os.path.join(args.retro_workdir, "index", "train_emb")
 
 
-def get_training_data_paths():
-    return sorted(glob.glob(get_training_data_dir() + "/*.hdf5"))
+def get_training_data_block_dir():
+    return os.path.join(get_training_data_root_dir(), "blocks")
+
+
+def get_training_data_block_paths():
+    return sorted(glob.glob(get_training_data_block_dir() + "/*.hdf5"))
+
+
+def get_training_data_merged_path():
+    args = get_retro_args()
+    return os.path.join(get_training_data_root_dir(),
+                        "train_%.3f.bin" % args.retro_index_train_load_fraction)
 
 
 def get_added_codes_dir():
-    return os.path.join(get_index_dir(), "add_tmp")
+    return os.path.join(get_index_dir(), "add_codes")
 
 
 def get_added_code_paths():
     return sorted(glob.glob(get_added_codes_dir() + "/*.hdf5"))
-
-
-def get_training_data_group_infos():
-
-    args = get_retro_args()
-
-    block_paths = get_training_data_paths()
-    max_group_size = args.retro_index_train_block_size
-
-    groups = []
-    group = []
-    group_size = 0
-    for block_path in block_paths:
-        with h5py.File(block_path) as f:
-            block_size = f["data"].shape[0]
-        group.append(block_path)
-        group_size += block_size
-
-        if group_size >= max_group_size:
-            groups.append({
-                "paths" : group,
-                "size" : group_size,
-            })
-            group = []
-            group_size = 0
-    if group:
-        groups.append({
-            "paths" : group,
-            "size" : group_size,
-        })
-
-    return groups
-
-
-def load_training_block(path, load_fraction):
-    with h5py.File(path) as f:
-        n_load = int(load_fraction * f["data"].shape[0])
-        return np.copy(f["data"][:n_load])
-
-
-def load_training_group(executor, group_info, load_fraction):
-
-    # Launch threads to load block data.
-    futures = []
-    for path in group_info["paths"]:
-        futures.append(executor.submit(load_training_block, path, load_fraction))
-
-    # Collect block data.
-    block_datas = []
-    for future in futures:
-        block_datas.append(future.result())
-
-    # Concatenate blocks.
-    group_data = np.concatenate(block_datas, axis=0)
-
-    # Garbage collect.
-    for d in block_datas:
-        del d
-    gc.collect()
-
-    return group_data
-
-
-def get_training_data_merged():
-    '''Merge embeddings into single dataset.'''
-
-    args = get_retro_args()
-
-    # Setup.
-    ds_infos = get_indexed_dataset_infos()
-    n_chunks_sampled = sum(d["n_chunks_sampled"] for d in ds_infos)
-    load_fraction = args.retro_index_train_load_fraction
-
-    # Initialize merged data.
-    print("allocate training data array.")
-    t = time.time()
-    data = np.empty((n_chunks_sampled, args.retro_index_nfeats), dtype="f4")
-    print("  time : %.3f sec." % (time.time() - t))
-
-    # Data groups (minimizing fragmentation).
-    group_infos = get_training_data_group_infos()
-
-    # Load data blocks.
-    n_threads = max(len(group["paths"]) for group in group_infos)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
-
-        # Load data blocks.
-        print("load training data blocks.")
-        start_idx = 0
-        pbar = tqdm(group_infos)
-        for group_info in pbar:
-
-            pbar.set_description("mem %.0f gb, %.1f%%" % (
-                psutil.virtual_memory()[3] / 1024**3,
-                psutil.virtual_memory()[2],
-            ))
-
-            # Load group data.
-            group_data = load_training_group(executor, group_info, load_fraction)
-            data[start_idx:(start_idx+len(group_data))] = group_data
-            start_idx += len(group_data)
-
-            # Garbage collect.
-            del group_data
-            gc.collect()
-
-        # Handle load ratio <1.
-        data = data[:start_idx]
-        print("> training block data.shape = %s." % str(data.shape))
-
-    return data

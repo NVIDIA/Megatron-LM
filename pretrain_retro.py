@@ -14,7 +14,7 @@ from megatron.core.enums import ModelType
 from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
-from tools.retro.pretraining.retro_dataset import get_retro_datasets
+from tools.retro.query.retro_dataset import get_retro_datasets
 
 from pretrain_gpt import (
     loss_func,
@@ -96,9 +96,9 @@ def forward_step(data_iterator, model):
     timers('batch-generator').stop()
 
     output_tensor = model(tokens, position_ids, attention_mask,
-                          ret_input_ids=neighbor_tokens,
-                          ret_position_ids=neighbor_position_ids,
-                          ret_attn_mask=neighbor_attention_mask,
+                          retriever_input_ids=neighbor_tokens,
+                          retriever_position_ids=neighbor_position_ids,
+                          retriever_attn_mask=neighbor_attention_mask,
                           labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
@@ -115,6 +115,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    pretrain(train_valid_test_datasets_provider,
+             model_provider,
+             ModelType.retro_decoder,
+             forward_step,
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+                            'retro_add_retriever': True})

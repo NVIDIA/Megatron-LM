@@ -325,10 +325,6 @@ def validate_args(args, defaults={}):
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
 
-    if args.fp16:
-        assert args.transformer_impl == 'local', \
-            'transformer-engine not yet approved for fp16 training and inference'
-
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
@@ -939,6 +935,10 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--overlap-p2p-communication',
+                       action='store_true',
+                       help='overlap pipeline parallel communication with forward and backward chunks',
+                       dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
@@ -1030,6 +1030,8 @@ def _add_data_args(parser):
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
                        'dataset2-path ...')
+    group.add_argument('--data-cache-path', default=None,
+                       help='Path to a directory to hold cached index files.')
 
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')

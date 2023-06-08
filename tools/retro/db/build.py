@@ -24,11 +24,13 @@ from tools.retro.external_libs import h5py
 from tools.retro.utils import get_gpt_tokenizer, get_bert_tokenizer
 
 from .utils import (
-    get_individual_db,
+    get_indexed_dataset_infos,
+    get_indexed_dataset_infos_path,
     get_individual_db_dir,
+    get_individual_chunk_db,
+    get_individual_doc_offsets,
     get_merged_dataset,
     get_merged_db_path_map,
-    get_train_doc_chunk_map_dir,
     save_indexed_dataset_infos,
 )
 
@@ -52,7 +54,7 @@ def init_indexed_dataset_infos():
         prefix = args.data_path[i + 1]
         path = prefix + ".bin"
         name = os.path.basename(prefix)
-        assert os.path.exists(path)
+        assert os.path.exists(path), "couldn't find '%s'." % path
         infos.append({
             "ratio" : ratio,
             "prefix" : prefix,
@@ -114,6 +116,7 @@ def build_partial_db(
     # Iterate documents & parse chunks.
     chunk_db_valid = []
     chunk_db_invalid = []
+    doc_size_map = {}
     for doc_id in pbar:
 
         # Progress description.
@@ -130,7 +133,7 @@ def build_partial_db(
 
         # Remove EOD token.
         doc = indexed_dataset.get(doc_id)
-        if doc[-1].item() == tokenizers.gpt.eod_id:
+        if doc[-1].item() == tokenizers.gpt.eod:
             doc = doc[:-1]
         doc_len = len(doc)
 
@@ -140,6 +143,7 @@ def build_partial_db(
                           for s in chunk_start_idxs]
 
         # Re-tokenize each chunk to Bert/Wordpiece (empty bert -> 'invalid').
+        doc_size_map[doc_id] = 0
         for i, chunk_start_idx in enumerate(chunk_start_idxs):
 
             # Re-tokenize.
@@ -149,13 +153,15 @@ def build_partial_db(
                 offset=chunk_start_idx,
                 length=chunk_end_idx - chunk_start_idx,
             )
-            text = tokenizers.gpt.detokenize(gpt_token_ids)
+            text = tokenizers.gpt.detokenize(gpt_token_ids.tolist())
             bert_token_ids = tokenizers.bert.tokenize(text)
 
             # 'Valid' for non-empty Bert chunks; 'invalid' otherwise.
-            _chunk_db = chunk_db_invalid \
-                if len(bert_token_ids) == 0 else \
-                   chunk_db_valid
+            if len(bert_token_ids) == 0:
+                _chunk_db = chunk_db_invalid
+            else:
+                _chunk_db = chunk_db_valid
+                doc_size_map[doc_id] += 1
             _chunk_db.append((
                 doc_id,
                 chunk_start_idx,
@@ -163,7 +169,7 @@ def build_partial_db(
                 len(bert_token_ids),
             ))
 
-    return proc_id, chunk_db_valid, chunk_db_invalid
+    return proc_id, chunk_db_valid, chunk_db_invalid, doc_size_map
 
 
 def build_individual_db(dataset_idx, n_datasets, dataset_info, tokenizers):
@@ -181,9 +187,10 @@ def build_individual_db(dataset_idx, n_datasets, dataset_info, tokenizers):
     # Missing db blocks.
     n_missing_world, missing_db_blocks = get_missing_blocks_by_rank(
         db_dir,
-        len(indexed_dataset.doc_idx) - 1,
+        len(indexed_dataset),
         args.retro_doc_block_size,
-        validate=lambda f : f["chunks_valid"].shape[1] == 4)
+        validate=lambda f : f["chunks_valid"].shape == (0,) \
+            or f["chunks_valid"].shape[1] == 4)
 
     # Prevent missing-path-write race condition.
     torch.distributed.barrier()
@@ -208,6 +215,8 @@ def build_individual_db(dataset_idx, n_datasets, dataset_info, tokenizers):
         for block_idx, block in enumerate(missing_db_blocks):
 
             if block is not None:
+
+                db_path = block["path"]
 
                 # Build partial dbs.
                 print_rank_0(' > build partial dbs.')
@@ -240,15 +249,27 @@ def build_individual_db(dataset_idx, n_datasets, dataset_info, tokenizers):
 
                 # Convert to numpy.
                 print_rank_0(' > converting chunk db to numpy.')
-                chunk_db_valid = np.array(chunk_db_valid)
-                chunk_db_invalid = np.array(chunk_db_invalid)
+                chunk_db_valid = np.array(chunk_db_valid, dtype="uint32")
+                chunk_db_invalid = np.array(chunk_db_invalid, dtype="uint32")
+
+                # Document offsets.
+                doc_sizes = [(d, s)
+                             for partial_chunk_db in partial_chunk_dbs
+                             for d, s in partial_chunk_db[3].items()]
+                doc_sizes.sort(key = lambda item : item[0])
+                doc_offsets = np.cumsum([item[1] for item in doc_sizes]) \
+                                .astype("uint64")
+                doc_offsets = np.stack((
+                    np.array([item[0] for item in doc_sizes], dtype="uint64"),
+                    doc_offsets), axis=1)
 
                 # Save DB.
                 print_rank_0(" > saving individual db.")
-                f = h5py.File(block["path"], "w")
-                dset = f.create_dataset("chunks_valid", data=chunk_db_valid)
-                dset = f.create_dataset("chunks_invalid", data=chunk_db_invalid)
-                f.close()
+                with h5py.File(db_path, "w") as f:
+                    dset = f.create_dataset("chunks_valid", data=chunk_db_valid)
+                    dset = f.create_dataset("chunks_invalid",
+                                            data=chunk_db_invalid)
+                    dset = f.create_dataset("doc_offsets", data=doc_offsets)
 
             # Wait for all ranks to finish block.
             print_rank_0(" > waiting for all ranks to finish block.")
@@ -292,14 +313,16 @@ def update_chunk_counts(indexed_dataset_infos):
     if torch.distributed.get_rank() != 0:
         return
 
+    # Data ratio sum (for setting index training chunks).
+    data_ratio_sum = sum([ d["ratio"] for d in indexed_dataset_infos ])
+
     # Training split size (split at document level).
     train_fraction = float(args.split.split(",")[0]) / 100
     assert train_fraction > 0 and train_fraction <= 1
 
     # Set n_chunks (including n_chunks_sampled for unambiguity).
     print_rank_0(" > compute n_chunks.")
-    for ds_index, ds_info in \
-        enumerate(tqdm(indexed_dataset_infos, "count_chunks")):
+    for ds_index, ds_info in enumerate(indexed_dataset_infos):
 
         db_dir = ds_info["db_dir"]
         db_paths = sorted(glob.glob(db_dir + "/*.hdf5"))
@@ -310,16 +333,17 @@ def update_chunk_counts(indexed_dataset_infos):
         ds_info["n_chunks"] = 0 # previously, 'n_chunks_valid'
         ds_info["n_chunks_train"] = 0
         ds_info["n_chunks_invalid"] = 0
-        for db_path in db_paths:
-            with h5py.File(db_path, "r") as f:
+        for db_path in tqdm(db_paths, "%d/%d, %s" % (
+                ds_index, len(indexed_dataset_infos), ds_info["name"])):
+           with h5py.File(db_path, "r") as f:
                 ds_info["n_chunks"] += len(f["chunks_valid"])
                 ds_info["n_chunks_invalid"] += len(f["chunks_invalid"])
                 ds_info["n_chunks_train"] += \
                     (np.copy(f["chunks_valid"][:, 0]) < ds_info["n_docs_train"]) \
                     .sum().item()
 
-        ds_info["n_chunks_sampled"] = \
-            int(round(args.retro_nchunks_sampled * ds_info["ratio"]))
+        ds_info["n_chunks_sampled"] = int(args.retro_index_ntrain *
+                                          ds_info["ratio"] / data_ratio_sum)
 
         # Verify counts.
         assert ds_info["n_chunks_train"] <= ds_info["n_chunks"], \
@@ -339,15 +363,14 @@ def merge_dbs(indexed_dataset_infos, db_type):
     print(" > build %s chunk db." % db_type)
 
     # Count chunks.
-    if db_type == "full":
-        raise Exception("deprecated; use 'train' or 'sampled'.")
-        n_chunks_key = "n_chunks"
-    elif db_type == "sampled":
+    if db_type == "sampled":
         n_chunks_key = "n_chunks_sampled"
+        n_docs_key = None
     elif db_type == "train":
         n_chunks_key = "n_chunks_train"
+        n_docs_key = "n_docs_train"
     elif db_type == "valid":
-        pass
+        n_docs_key = None
     else:
         raise Exception("handle db_type '%s'." % db_type)
 
@@ -356,6 +379,8 @@ def merge_dbs(indexed_dataset_infos, db_type):
                        for m in indexed_dataset_infos)
     else:
         n_chunks = sum(m[n_chunks_key] for m in indexed_dataset_infos)
+        n_docs = None if n_docs_key is None else \
+            sum(m[n_docs_key] for m in indexed_dataset_infos)
 
     # DB path.
     db_path = get_merged_db_path_map()[db_type]
@@ -375,10 +400,10 @@ def merge_dbs(indexed_dataset_infos, db_type):
 
         except Exception as e:
             if isinstance(e, OSError):
-                os.remove(full_db_path)
+                os.remove(db_path)
             elif isinstance(e, KeyError):
                 f.close()
-                os.remove(full_db_path)
+                os.remove(db_path)
             else:
                 raise e
 
@@ -389,119 +414,58 @@ def merge_dbs(indexed_dataset_infos, db_type):
         f = h5py.File(db_path, "w")
 
         # Initialize output arrays.
-        merged_db = f.create_dataset("chunks", (n_chunks, 5), dtype="i8")
+        merged_chunk_db = \
+            f.create_dataset("chunks", (n_chunks, 5), dtype="uint32")
+        merged_doc_offsets = None if n_docs_key is None else \
+            f.create_dataset("doc_offsets", (n_docs, 3), dtype="uint64")
         n_written = f.create_dataset("n_written", (1,), dtype="uint64")
         n_written[0] = 0
 
         # Iterate indexed datasets & collect chunks.
-        start_index = 0
+        chunk_start_index = 0
+        doc_start_index = 0
+        doc_start_offset = 0
         for ds_idx, ds_info in enumerate(indexed_dataset_infos):
             print(" > merging dbs; '%s', dataset %d / %d ... '%s'." %
                   (db_type, ds_idx, len(indexed_dataset_infos), ds_info["name"]))
-            individual_db = get_individual_db(ds_idx, ds_info)
+            individual_chunk_db = get_individual_chunk_db(ds_idx, ds_info)
+            individual_doc_offsets = None if n_docs_key is None else \
+                get_individual_doc_offsets(ds_idx, ds_info)
 
             if db_type == "valid":
-                individual_db = individual_db[ds_info["n_chunks_train"]:]
-            else:
-                individual_db = individual_db[:ds_info[n_chunks_key]]
+                individual_chunk_db = \
+                    individual_chunk_db[ds_info["n_chunks_train"]:]
+                if n_docs_key is None:
+                    individual_doc_offsets = None
+                else:
+                    train_doc_offset = \
+                        individual_doc_offsets[ds_info["n_docs_train"] - 1, 2]
+                    individual_doc_offsets = \
+                        np.copy(individual_doc_offsets[ds_info["n_docs_train"]:])
+                    individual_doc_offsets[:, 2] -= train_doc_offset
 
-            merged_db[start_index:start_index+len(individual_db)] = individual_db
-            start_index += len(individual_db)
-            n_written[0] = start_index
+                    print("~~~")
+                    print(individual_doc_offsets)
+                    print(train_doc_offset)
+                    raise Exception("test me.")
+            else:
+                individual_chunk_db = \
+                    individual_chunk_db[:ds_info[n_chunks_key]]
+                individual_doc_offsets = None if n_docs_key is None else \
+                    np.copy(individual_doc_offsets[:ds_info[n_docs_key]])
+
+            merged_chunk_db[chunk_start_index:chunk_start_index+len(individual_chunk_db)] = individual_chunk_db
+            chunk_start_index += len(individual_chunk_db)
+            n_written[0] = chunk_start_index
+            if n_docs_key is not None:
+                individual_doc_offsets[:, 2] += doc_start_offset
+                doc_end_index = doc_start_index + individual_doc_offsets.shape[0]
+                merged_doc_offsets[doc_start_index:doc_end_index] = \
+                    individual_doc_offsets
+                doc_start_index = doc_end_index
+                doc_start_offset = individual_doc_offsets[-1, 2].item()
 
         f.close()
-
-
-def get_partial_banned_chunk_map(proc_id, db_path, chunk_range_info):
-    '''Build partial mapping of {(dataset_id,doc_id):[chunk_ids]}.
-
-    In this method, only chunks within the range (start_chunk_id, end_chunk_id]
-    are processed.'''
-
-    start_chunk_id = chunk_range_info["start"]
-    end_chunk_id = chunk_range_info["end"]
-    output_path = chunk_range_info["path"]
-
-    # Skip, if output file exists.
-    if os.path.exists(output_path):
-        return
-
-    # Chunk subset.
-    with h5py.File(db_path) as f:
-        sub_chunk_db = np.copy(f["chunks"][start_chunk_id:end_chunk_id, :2])
-
-    # Map docs to chunks.
-    banned_chunk_map = defaultdict(list)
-    for rel_chunk_id, (dataset_id, doc_id) in enumerate(tqdm(
-            sub_chunk_db,
-            "map banned docs, proc %d" % proc_id,
-            total=sub_chunk_db.shape[0],
-    )):
-        chunk_id = start_chunk_id + rel_chunk_id
-        banned_chunk_map["%d,%d" % (dataset_id.item(), doc_id.item())] \
-            .append(chunk_id)
-
-    # Save output.
-    with open(output_path, "w") as f:
-        json.dump(banned_chunk_map, f)
-
-
-def build_doc_chunk_map(indexed_dataset_infos, db_type):
-    '''Build mapping of {(dataset_id,doc_id):[chunk_ids]}.'''
-
-    if torch.distributed.get_rank() != 0:
-        return
-
-    print(" > build %s doc-chunk map." % db_type)
-
-    n_procs = 128
-
-    # Get dataset.
-    db_dataset = get_merged_dataset(db_type, indexed_dataset_infos)
-
-    # Sub-ranges for parallel processing.
-    n_chunks = db_dataset.chunks.shape[0]
-    n_chunks_per_proc = max(1, int(np.ceil(n_chunks / n_procs)))
-    chunk_id_starts = list(range(0, n_chunks, n_chunks_per_proc))
-    chunk_id_ranges = [(s, min(n_chunks, s + n_chunks_per_proc))
-                       for s in chunk_id_starts]
-
-    # Wrap range info with output path.
-    n_digits = int(np.ceil(np.log(n_chunks) / np.log(10)) + 1)
-    output_dirname = get_train_doc_chunk_map_dir()
-    chunk_range_infos = [{
-        "start" : start_id,
-        "end" : end_id,
-        "path" : os.path.join(output_dirname, "%s-%s.json" % (
-            str(start_id).zfill(n_digits),
-            str(end_id).zfill(n_digits),
-        )),
-    } for start_id, end_id in chunk_id_ranges ]
-
-    # Build doc-chunk map.
-    print_rank_0("build doc-chunk-map.")
-    with ProcessPoolExecutor(max_workers=n_procs) as executor:
-
-        # Build partial chunk maps.
-        futures = []
-        for proc_id, chunk_range_info in enumerate(chunk_range_infos):
-
-            if os.path.exists(chunk_range_info["path"]):
-                continue
-
-            # Submit job.
-            futures.append(executor.submit(
-                get_partial_banned_chunk_map,
-                proc_id,
-                db_dataset.db_path,
-                chunk_range_info,
-            ))
-
-        # Wait for processes to finish.
-        banned_chunk_paths = []
-        for finished_idx, future in enumerate(as_completed(futures)):
-            print("finished %d / %d." % (finished_idx, n_procs))
-            future.result()
 
 
 def build_db():
@@ -521,14 +485,13 @@ def build_db():
     if torch.distributed.get_rank() != 0:
         return
 
-    # Update n_chunks.
-    update_chunk_counts(indexed_dataset_infos)
+    # Update n_chunks & save indexed dataset infos.
+    if not os.path.exists(get_indexed_dataset_infos_path()):
+        update_chunk_counts(indexed_dataset_infos)
+        save_indexed_dataset_infos(indexed_dataset_infos)
+    indexed_dataset_infos = get_indexed_dataset_infos()
 
     # Merge dbs.
     merge_dbs(indexed_dataset_infos, "sampled")
     merge_dbs(indexed_dataset_infos, "train")
     merge_dbs(indexed_dataset_infos, "valid")
-    build_doc_chunk_map(indexed_dataset_infos, "train")
-
-    # Save (fully annotated) indexed dataset infos.
-    save_indexed_dataset_infos(indexed_dataset_infos)

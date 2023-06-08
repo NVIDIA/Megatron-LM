@@ -36,7 +36,7 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
 FULL_CMD="\
     pwd && cd ${REPO_DIR} && pwd && \
     export PYTHONPATH=$PYTHONPATH:${REPO_DIR} && \
-    python -m torch.distributed.launch \
+    python -m torch.distributed.run \
     --nproc_per_node ${NPROCS} \
     --nnodes 1 \
     --node_rank ${NODE_RANK} \
