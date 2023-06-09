@@ -479,9 +479,12 @@ class ParallelAttention(MegatronModule):
                 raise ImportError('einops is not installed, please install with pip install einops')
 
         projection_size = args.kv_channels * args.num_attention_heads
-        
+
+        self.multi_head_attention = True
+           
         if self.group_query_attention:
             key_projection_size = args.kv_channels * args.num_query_groups
+            self.multi_head_attention = args.num_query_groups == args.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
@@ -537,6 +540,10 @@ class ParallelAttention(MegatronModule):
                     **_args_to_kwargs())
         else:
             assert attention_type == AttnType.cross_attn
+
+            if self.group_query_attention:
+                raise NotImplementedError("Grouped multi-query attention not implemented for cross-attention.")
+            
             self.query = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 projection_size,
@@ -655,7 +662,7 @@ class ParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
         if self.group_query_attention:
-            key_value_inputs = hidden_states if AttnType.self_attn else encoder_output
+            key_value_inputs = hidden_states
             query_layer, _ = self.query(hidden_states)
             # [sq, b, hp] --> [sq, b, np, hn]
             new_tensor_shape = query_layer.size()[:-1] + (
@@ -788,15 +795,9 @@ class ParallelAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-
-        if not self.use_flash_attn or self.group_query_attention:
-            if self.checkpoint_core_attention:
-                context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask)
-            else:
-                context_layer = self.core_attention(
-                    query_layer, key_layer, value_layer, attention_mask)
-        else:
+                
+        if self.use_flash_attn and self.multi_head_attention:
+            # currently we only support flash_attn for multi_head
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                     for x in (query_layer, key_layer, value_layer)]
             if not self.sequence_parallel:
@@ -805,6 +806,14 @@ class ParallelAttention(MegatronModule):
             else:
                 context_layer = self.core_attention_flash(q, k, v)
             context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+        
+        else:
+            if self.checkpoint_core_attention:
+                context_layer = self._checkpointed_attention_forward(
+                    query_layer, key_layer, value_layer, attention_mask)
+            else:
+                context_layer = self.core_attention(
+                    query_layer, key_layer, value_layer, attention_mask)
 
         # =================
         # Output. [sq, b, h]
