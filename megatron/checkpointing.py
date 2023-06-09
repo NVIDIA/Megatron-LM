@@ -172,7 +172,7 @@ def read_metadata(tracker_filename):
             print('WARNING: on rank {} found iteration {} in the '
                   'metadata while max iteration across the ranks '
                   'is {}, replacing it with max iteration.'.format(
-                      rank, iteration, max_iter), flush=True)
+                      torch.distributed.get_rank(), iteration, max_iter), flush=True)
     else:
         # When loading a checkpoint outside of training (for example,
         # when editing it), we might not have torch distributed
