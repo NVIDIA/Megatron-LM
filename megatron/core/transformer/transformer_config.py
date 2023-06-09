@@ -141,7 +141,6 @@ class TransformerConfig(ModelParallelConfig):
     # fp8 related
     fp8: bool = True
     fp8_e4m3: bool = False
-    fp8_hybrid: bool = True
     fp8_margin: int = 0
     fp8_interval: int = 1
     fp8_amax_history_len: int = 1
