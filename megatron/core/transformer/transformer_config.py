@@ -95,6 +95,24 @@ class TransformerConfig(ModelParallelConfig):
         distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
                                              group. Defaults to None.
 
+        # fp8 related (via Transformer Engine). For detailed info, refer the the Transformer Engine docs at
+        # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html
+
+        fp8 (bool): Enables the use of FP8 precision through Transformer Engine.
+
+        fp8_e4m3 (bool): Enables the use of FP8 tensors in e4m3 format for both forward and backward passes.
+
+        fp8_margin (int): Enables the use of FP8 tensors in e4m3 format in the forward pass and e5m2 format in the
+                          backward pass.
+
+        fp8_interval (int): Controls how often the scaling factor is recomputed.
+
+        fp8_amax_history_len (int): The length of the amax history window used for scaling factor computation.
+
+        fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation.
+                                     There are 2 predefined choices: `max` chooses the largest `amax` in the history
+                                     window, while `most_recent` always chooses the most recently seen value.
+
     """
 
     # model architecture
