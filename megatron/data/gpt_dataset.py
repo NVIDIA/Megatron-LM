@@ -485,7 +485,7 @@ def _num_tokens(documents, sizes):
 def _num_epochs(tokens_per_epoch, seq_length, num_samples):
     """Based on number of samples and sequence length, calculate how many
     epochs will be needed."""
-    return math.ceil((num_samples * seq_length + 1) / (tokens_per_epoch))
+    return math.ceil((num_samples * seq_length + 1) / tokens_per_epoch)
 
 
 def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
