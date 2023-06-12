@@ -15,9 +15,7 @@ from megatron.utils import print_rank_0
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-# TODO: which import?
-# from megatron.model import LayerNorm
-from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
+from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType, PositionEmbeddingType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
