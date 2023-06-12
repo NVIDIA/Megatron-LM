@@ -564,6 +564,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
+    mem_stats = None
 
     # Tensorboard values.
     # Timer requires all the ranks to call.
@@ -665,6 +666,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+        if args.log_memory_to_tensorboard and mem_stats is not None:
+            log_string += ' mem-reserved (GB): {:.2f} |'.format(mem_stats["reserved_bytes.all.current"]*1e-9)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
@@ -1023,14 +1026,14 @@ def build_train_valid_test_data_loaders(
                                 mpu.get_tensor_model_parallel_src_rank(),
                                 group=mpu.get_tensor_model_parallel_group())
     args.do_train = flags[0].item()
-    num_valid_ds = flags[1].item()
-    num_test_ds = flags[2].item()
-    assert num_test_ds >= 0
-    assert num_valid_ds >= 0
-    args.do_valid = num_valid_ds > 0
-    args.do_test = num_test_ds > 0
+    args.num_valid_ds = flags[1].item()
+    args.num_test_ds = flags[2].item()
+    assert args.num_test_ds >= 0
+    assert args.num_valid_ds >= 0
+    args.do_valid = args.num_valid_ds > 0
+    args.do_test = args.num_test_ds > 0
 
-    return train_dataloader, valid_dataloader, test_dataloader
+    return train_dataloader, valid_dataloaders, test_dataloaders
 
 
 def build_train_valid_test_data_iterators(
@@ -1039,7 +1042,7 @@ def build_train_valid_test_data_iterators(
     args = get_args()
 
     # Build loaders.
-    train_dataloader, valid_dataloader, test_dataloader = \
+    train_dataloader, valid_dataloaders, test_dataloaders = \
         build_train_valid_test_data_loaders(
             build_train_valid_test_datasets_provider)
 
@@ -1058,13 +1061,13 @@ def build_train_valid_test_data_iterators(
                               else iter(cyclic_iter(valid_dataloaders))
                                  for vdl in valid_dataloaders]
     else:
-        valid_data_iterators = [None] * num_valid_ds
+        valid_data_iterators = [None] * args.num_valid_ds
 
     if test_dataloaders is not None:
         test_data_iterators = [iter(tdl) if dl_type == 'single' \
                              else iter(cyclic_iter(test_dataloaders))
                             for tdl in test_dataloaders]
     else:
-        test_data_iterators = [None] * num_test_ds
+        test_data_iterators = [None] * args.num_test_ds
 
     return train_data_iterator, valid_data_iterators, test_data_iterators

@@ -577,6 +577,8 @@ class ParallelAttention(MegatronModule):
         self.attention_head_type = args.attention_head_type
         self.sequence_parallel = args.sequence_parallel
 
+        self.use_flash_attn = args.use_flash_attn
+
         projection_size = args.kv_channels * args.num_attention_heads
 
         # Per attention head and per partition values.
