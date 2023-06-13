@@ -6,9 +6,6 @@ import subprocess
 from torch.utils import cpp_extension
 from megatron.fused_kernels.utils import _create_build_dir
 
-# Do not override TORCH_CUDA_ARCH_LIST to allow for pre-compilation in Dockerfile
-# os.environ["TORCH_CUDA_ARCH_LIST"] = ""
-
 
 def load(args):
 

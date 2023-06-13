@@ -19,14 +19,6 @@ from torch.utils import cpp_extension
 from megatron.fused_kernels.utils import _create_build_dir
 
 
-# Setting this param to a list has a problem of generating different
-# compilation commands (with diferent order of architectures) and
-# leading to recompilation of fused kernels. Set it to empty string
-# to avoid recompilation and assign arch flags explicity in
-# extra_cuda_cflags below
-os.environ["TORCH_CUDA_ARCH_LIST"] = ""
-
-
 def load(args):
 
     # Build path
