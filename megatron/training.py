@@ -888,9 +888,35 @@ def cyclic_iter(iter):
             yield x
 
 
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+    """Build pretraining datasets."""
+
+    args = get_args()
+
+    # Number of train/valid/test samples.
+    if args.train_samples:
+        train_samples = args.train_samples
+    else:
+        train_samples = args.train_iters * args.global_batch_size
+    eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                 args.eval_iters
+    test_iters = args.eval_iters
+    train_val_test_num_samples = [train_samples,
+                                  eval_iters * args.global_batch_size,
+                                  test_iters * args.global_batch_size]
+    print_rank_0(' > datasets target sizes (minimum size):')
+    print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+    print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+    print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+    # Build the datasets.
+    return build_train_valid_test_datasets_provider(train_val_test_num_samples)
+
+
 def build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider):
-    """XXX"""
+    """Build pretraining data loaders."""
+
     args = get_args()
 
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
@@ -910,25 +936,9 @@ def build_train_valid_test_data_loaders(
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Number of train/valid/test samples.
-        if args.train_samples:
-            train_samples = args.train_samples
-        else:
-            train_samples = args.train_iters * args.global_batch_size
-        eval_iters = (args.train_iters // args.eval_interval + 1) * \
-                     args.eval_iters
-        test_iters = args.eval_iters
-        train_val_test_num_samples = [train_samples,
-                                      eval_iters * args.global_batch_size,
-                                      test_iters * args.global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
-
-        # Build the datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
-            train_val_test_num_samples)
+        # Build datasets.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            build_train_valid_test_datasets_provider)
 
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
@@ -960,6 +970,7 @@ def build_train_valid_test_data_loaders(
 
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
+    """Build pretraining data iterators."""
 
     args = get_args()
 

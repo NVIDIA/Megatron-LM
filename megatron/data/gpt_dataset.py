@@ -90,12 +90,14 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         # Single dataset.
         if train_data_prefix is not None:
             train_dataset = build_dataset("train", train_data_prefix, data_impl,
+                                          splits_string,
                                           train_valid_test_num_samples[0],
                                           seq_length, seed, skip_warmup,
                                           data_cache_path=data_cache_path)
 
         if valid_data_prefix is not None:
             valid_dataset = build_dataset("valid", valid_data_prefix, data_impl,
+                                          splits_string,
                                           train_valid_test_num_samples[1],
                                           seq_length, seed, False,
                                           data_cache_path=data_cache_path)
@@ -103,6 +105,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
         if test_data_prefix is not None:
             test_dataset = build_dataset("test", test_data_prefix, data_impl,
+                                         splits_string,
                                          train_valid_test_num_samples[2],
                                          seq_length, seed, False,
                                          data_cache_path=data_cache_path)
@@ -142,8 +145,8 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if splits[index + 1] > splits[index]:
             documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
-            dataset = GPTDataset(name, data_prefix,
-                                 documents, indexed_dataset,
+            dataset = GPTDataset(name, data_prefix, documents, indexed_dataset,
+                                 splits_string,
                                  train_valid_test_num_samples[index],
                                  seq_length, seed,
                                  return_doc_ids,
@@ -157,14 +160,15 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     return (train_dataset, valid_dataset, test_dataset)
 
 
-def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
-                  seq_length, seed, skip_warmup, *,
+def build_dataset(dataset_name, data_prefix, data_impl,
+                  splits_string, num_samples,
+                  seq_length, seed, skip_warmup,
+                  *,
                   data_cache_path=None):
     dataset = None
     if len(data_prefix) == 1:
-        dataset = _build_dataset(dataset_name,
-                                 data_prefix[0], data_impl,
-                                 num_samples, seq_length,
+        dataset = _build_dataset(dataset_name, data_prefix[0], data_impl,
+                                 splits_string, num_samples, seq_length,
                                  seed, skip_warmup,
                                  data_cache_path=data_cache_path)
     else:
@@ -177,8 +181,8 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
         # Build individual datasets.
         datasets = []
         for i in range(len(prefixes)):
-            ds = _build_dataset(dataset_name, prefixes[i],
-                                data_impl, dataset_num_samples[i],
+            ds = _build_dataset(dataset_name, prefixes[i], data_impl,
+                                splits_string, dataset_num_samples[i],
                                 seq_length, seed, skip_warmup,
                                 data_cache_path=data_cache_path)
             if ds:
@@ -191,8 +195,9 @@ def build_dataset(dataset_name, data_prefix, data_impl, num_samples,
     return dataset
 
 
-def _build_dataset(dataset_name, data_prefix, data_impl,
-                   num_samples, seq_length, seed, skip_warmup, *,
+def _build_dataset(dataset_name, data_prefix, data_impl, splits_string,
+                   num_samples, seq_length, seed, skip_warmup,
+                   *,
                    data_cache_path=None):
     """
     Build dataset. This method is called when individual
@@ -213,9 +218,8 @@ def _build_dataset(dataset_name, data_prefix, data_impl,
     documents = np.arange(start=0, stop=total_num_of_documents,
                         step=1, dtype=np.int32)
 
-    dataset = GPTDataset(dataset_name, data_prefix,
-                         documents, indexed_dataset,
-                         num_samples, seq_length, seed,
+    dataset = GPTDataset(dataset_name, data_prefix, documents, indexed_dataset,
+                         splits_string, num_samples, seq_length, seed,
                          data_cache_path=data_cache_path)
 
     return dataset
@@ -239,8 +243,8 @@ def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
 
 class GPTDataset(torch.utils.data.Dataset):
 
-    def __init__(self, name, data_prefix, documents,
-                 indexed_dataset, num_samples, seq_length, seed,
+    def __init__(self, name, data_prefix, documents, indexed_dataset,
+                 splits_string, num_samples, seq_length, seed,
                  return_doc_ids=False, *,
                  data_cache_path=None):
 
@@ -253,10 +257,10 @@ class GPTDataset(torch.utils.data.Dataset):
         assert np.max(documents) < indexed_dataset.sizes.shape[0]
 
         # Build index mappings.
-        self.doc_idx, self.sample_idx, self.shuffle_idx, self.desc = \
+        self.doc_idx, self.sample_idx, self.shuffle_idx, self.desc, self.desc_hash = \
             _build_index_mappings(self.name, data_prefix,
                                   documents, self.indexed_dataset.sizes,
-                                  num_samples, seq_length, seed,
+                                  splits_string, num_samples, seq_length, seed,
                                   data_cache_path=data_cache_path)
 
 
@@ -304,7 +308,8 @@ class GPTDataset(torch.utils.data.Dataset):
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
-                          num_samples, seq_length, seed, *,
+                          splits_string, num_samples, seq_length, seed,
+                          *,
                           data_cache_path):
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
@@ -326,6 +331,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
     desc += f"Number of samples {num_samples}\n"
     desc += f"Sequence length {seq_length}\n"
     desc += f"Random seed {seed}\n"
+    desc += f"Split {splits_string}\n"
     desc_hash = hashlib.md5(desc.encode('utf-8')).hexdigest()
     desc_filename = desc_hash + ".dsc"
     doc_idx_filename = desc_hash + '_doc_idx.npy'
@@ -473,7 +479,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
         sample_idx.shape[0]))
     print_rank_0('    total number of epochs: {}'.format(num_epochs))
 
-    return doc_idx, sample_idx, shuffle_idx, desc
+    return doc_idx, sample_idx, shuffle_idx, desc, desc_hash
 
 
 def _num_tokens(documents, sizes):
