@@ -145,7 +145,8 @@ def build_dataset_group(dataset_group_name, paths, weights, splits, data_impl,
             assert ds is not None, \
                 f"Got an empty split when trying to create dataset: {prefixes[i], splits[i]}"
             datasets.append(ds)
-        all_datasets = BlendableDataset(datasets, weights)
+        total_size = sum(len(ds) for ds in datasets)
+        all_datasets = BlendableDataset(datasets, weights, total_size)
 
         return all_datasets
 
