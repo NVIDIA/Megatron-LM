@@ -106,6 +106,7 @@ def build_dataset_group(dataset_group_name, paths, weights, splits, data_impl,
     '''
 
     assert train_valid_test in ["train","valid","test"]
+    index = ["train","valid","test"].index(train_valid_test)
 
     # Single dataset.
     if len(paths) == 1:
@@ -145,8 +146,7 @@ def build_dataset_group(dataset_group_name, paths, weights, splits, data_impl,
             assert ds is not None, \
                 f"Got an empty split when trying to create dataset: {prefixes[i], splits[i]}"
             datasets.append(ds)
-        total_size = sum(len(ds) for ds in datasets)
-        all_datasets = BlendableDataset(datasets, weights, total_size)
+        all_datasets = BlendableDataset(datasets, weights, train_valid_test_num_samples[index])
 
         return all_datasets
 
