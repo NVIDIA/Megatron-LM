@@ -490,16 +490,8 @@ def _num_tokens(documents, sizes):
 def _num_epochs(tokens_per_epoch, seq_length, num_samples):
     """Based on number of samples and sequence lenght, calculate how many
     epochs will be needed."""
-    num_epochs = 0
-    total_tokens = 0
-    while True:
-        num_epochs += 1
-        total_tokens += tokens_per_epoch
-        # -1 is because we need to retrieve seq_length + 1 token each time
-        # but the last token will overlap with the first token of the next
-        # sample except for the last sample.
-        if ((total_tokens - 1) // seq_length) >= num_samples:
-            return num_epochs
+    num_epochs = seq_length * num_samples // tokens_per_epoch + 1
+    return num_epochs
 
 
 def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
