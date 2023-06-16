@@ -110,7 +110,9 @@ python tools/preprocess_data.py \
        --vocab-file bert-vocab.txt \
        --dataset-impl mmap \
        --tokenizer-type BertWordPieceLowerCase \
-       --split-sentences
+       --split-sentences \
+       --workers 8 \
+       --chunk-size 512
 </pre>
 
 The output will be two files named, in this case, `my-bert_text_sentence.bin` and `my-bert_text_sentence.idx`. The `--data-path` specified in later BERT training is the full path and new filename, but without the file extension.
@@ -129,7 +131,9 @@ python tools/preprocess_data.py \
        --dataset-impl mmap \
        --tokenizer-type GPT2BPETokenizer \
        --merge-file gpt2-merges.txt \
-       --append-eod
+       --append-eod \
+       --workers 8 \
+       --chunk-size 512
 </pre>
 
 Here the output files are named `my-gpt2_text_document.bin` and `my-gpt2_text_document.idx`. As before, in GPT training, use the longer name without the extension as `--data-path`.
