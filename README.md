@@ -107,7 +107,7 @@ The loose json is then processed into a binary format for training. To convert t
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-bert \
-       --vocab bert-vocab.txt \
+       --vocab-file bert-vocab.txt \
        --dataset-impl mmap \
        --tokenizer-type BertWordPieceLowerCase \
        --split-sentences
@@ -125,7 +125,7 @@ Some minor modifications are required for GPT data preprocessing, namely, the ad
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-gpt2 \
-       --vocab gpt2-vocab.json \
+       --vocab-file gpt2-vocab.json \
        --dataset-impl mmap \
        --tokenizer-type GPT2BPETokenizer \
        --merge-file gpt2-merges.txt \
