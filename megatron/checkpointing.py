@@ -140,7 +140,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     if os.path.isfile(filename):
         return filename
 
-    return None, None
+    return None
 
 
 def get_checkpoint_tracker_filename(checkpoints_path):
