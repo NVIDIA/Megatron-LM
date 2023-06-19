@@ -959,9 +959,6 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-checkpoint-args', action='store_true',
                        help='Override any command line arguments with arguments '
                        'from the checkpoint')
-    group.add_argument('--finetune-from', type=str, default=None,
-                       help='Directory containing a model checkpoint for finetuning.'
-                       'Will be loaded if the `--load` directory contains no checkpoint')
     group.add_argument('--exit-on-missing-checkpoint', action='store_true',
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "

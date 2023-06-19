@@ -505,57 +505,10 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
-    
-    # TODO: remove this redundant code. the tracker is already handled in _load_base_checkpoint
-    # TODO: retire the finetune_from arguments
-    # Determine from which directory we'll try to load
-    # ======
-    if iteration is None:
-        # Read the tracker file and set the iteration.
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        
-        # If we can directly load from load_dir, we resume an experiment
-        if os.path.isfile(tracker_filename) and load_arg != 'finetune_from':
-            args.finetune=False
-            print_rank_0(f"Resuming from {load_dir}")
-        # Finetuning from a pretrained model
-        elif os.path.isfile(tracker_filename) and load_arg == 'finetune_from':
-            assert arg.finetune
-            print_rank_0(f"Finetuning from {load_dir}")
-        else:
-            assert not os.path.isfile(tracker_filename)
-            # No tracker file and we are in finetuning, try to load from the `finetune_from` dir
-            if args.finetune:
-                print_rank_0('WARNING: could not find the metadata file {} '.format(
-                tracker_filename))
-                print_rank_0('    will try to load from `--finetune-from` instead')
-                load_dir = getattr(args, 'finetune_from')
-                tracker_filename = get_checkpoint_tracker_filename(load_dir)
-            # If no tracker file, return iteration zero.
-            if not os.path.isfile(tracker_filename):
-                print_rank_0('WARNING: could not find the metadata file {} '.format(
-                    tracker_filename))
-                print_rank_0('    will not load any checkpoints and will start from '
-                            'random')
-                return 0
-        
-        assert os.path.isfile(tracker_filename)
-        
-        # read the tracker file and either set the iteration or
-        # mark it as a release checkpoint.
-        iteration, release = read_metadata(tracker_filename)
-    else:
-        # Iteration given as argument: do nothing
-        release = False
-    # =======
 
     model = unwrap_model(model)
 
-    state_dict, release = \
-        _load_base_checkpoint(load_dir,
-                              rank0=False,
-                              iteration=iteration,
-                              release=release)
+    state_dict, release = _load_base_checkpoint(load_dir, rank0=False, iteration=iteration)
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -593,12 +546,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
         check_checkpoint_args(checkpoint_args)
-        if not args.finetune:
-            args.consumed_train_samples = getattr(checkpoint_args,
-                                                'consumed_train_samples', 0)
-            update_num_microbatches(consumed_samples=args.consumed_train_samples)
-            args.consumed_valid_samples = getattr(checkpoint_args,
-                                                'consumed_valid_samples', 0)
+        args.consumed_train_samples = getattr(checkpoint_args,
+                                              'consumed_train_samples', 0)
+        update_num_microbatches(consumed_samples=args.consumed_train_samples)
+        args.consumed_valid_samples = getattr(checkpoint_args,
+                                              'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
