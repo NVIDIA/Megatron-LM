@@ -29,8 +29,10 @@ def _load_checkpoint(queue, args):
         from megatron.arguments import parse_args, validate_args
         from megatron.global_vars import set_args, set_global_variables
         from megatron.checkpointing import load_args_from_checkpoint, load_checkpoint
-        from megatron.model import ModelType, module
-        from megatron import mpu, fused_kernels
+        from megatron.model import module
+        from megatron.core import mpu
+        from megatron.core.enums import ModelType
+        from megatron import fused_kernels
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -41,6 +43,7 @@ def _load_checkpoint(queue, args):
                 '--no-masked-softmax-fusion',
                 '--no-bias-gelu-fusion',
                 '--no-bias-dropout-fusion',
+                '--no-async-tensor-model-parallel-allreduce',
                 '--use-cpu-initialization',
                 '--micro-batch-size', '1',
                 '--no-load-optim',
@@ -55,7 +58,7 @@ def _load_checkpoint(queue, args):
 
 
     margs = parse_args()
-    margs = load_args_from_checkpoint(margs)
+    margs, checkpoint_args = load_args_from_checkpoint(margs)
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes
@@ -63,12 +66,15 @@ def _load_checkpoint(queue, args):
 
     margs = validate_args(margs)
 
-    def check_for_arg(arg_name):
+    def check_for_arg(arg_name, default=None):
         if getattr(margs, arg_name, None) is None:
-            print(f"Checkpoint does not specify the argument {arg_name}. Exiting.")
-            print(f"Arguments: {margs}")
-            queue.put("exit")
-            exit(1)
+            if default is not None:
+                setattr(margs, arg_name, default)
+            else:
+                print(f"Checkpoint does not specify the argument {arg_name}. Exiting.")
+                print(f"Arguments: {margs}")
+                queue.put("exit")
+                exit(1)
 
     check_for_arg('tensor_model_parallel_size')
     check_for_arg('pipeline_model_parallel_size')
@@ -77,11 +83,15 @@ def _load_checkpoint(queue, args):
     check_for_arg('seq_length')
     check_for_arg('num_attention_heads')
     check_for_arg('max_position_embeddings')
+    check_for_arg('add_position_embedding', True)
+    check_for_arg('use_rotary_position_embeddings', False)
     check_for_arg('tokenizer_type')
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
+    check_for_arg('disable_bias_linear', False)
     check_for_arg('params_dtype')
     check_for_arg('attention_head_type')
+    check_for_arg('swiglu', False)
 
     # Determine how to make our models
     if args.model_type == 'GPT':
@@ -98,18 +108,38 @@ def _load_checkpoint(queue, args):
 
     consumed_train_samples = None
     consumed_valid_samples = None
-    def get_models(count, dtype, pre_process, post_process):
+    def get_models(count, dtype):
         nonlocal consumed_train_samples
         nonlocal consumed_valid_samples
-        models = []
+        model_array_len = margs.virtual_pipeline_model_parallel_size
+        if model_array_len is None:
+            model_array_len = 1
+        models = [[] for _ in range(model_array_len)]
+        pre_process = mpu.is_pipeline_first_stage()
+        post_process = mpu.is_pipeline_last_stage()
         for rank in range(count):
-            mpu.initialize.set_tensor_model_parallel_rank(rank)
-            model_ = [model_provider(pre_process, post_process).to(dtype)]
+            mpu.set_tensor_model_parallel_rank(rank)
+            if margs.virtual_pipeline_model_parallel_size is not None:
+                model_ = []
+                for i in range(margs.virtual_pipeline_model_parallel_size):
+                    mpu.set_virtual_pipeline_model_parallel_rank(i)
+                    # Set pre_process and post_process only after virtual rank is set.
+                    pre_process = mpu.is_pipeline_first_stage()
+                    post_process = mpu.is_pipeline_last_stage()
+                    this_model = model_provider(
+                        pre_process=pre_process,
+                        post_process=post_process
+                    ).to(dtype)
+                    model_.append(this_model)
+            else:
+                pre_process = mpu.is_pipeline_first_stage()
+                post_process = mpu.is_pipeline_last_stage()
+                model_rank = 0
+                model_ = [model_provider(pre_process, post_process).to(dtype)]
             margs.consumed_train_samples = 0
             margs.consumed_valid_samples = 0
             load_checkpoint(model_, None, None)
-            assert(len(model_) == 1)
-            model_ = model_[0]
+
             if consumed_train_samples is not None:
                 assert(margs.consumed_train_samples == consumed_train_samples)
             else:
@@ -118,17 +148,14 @@ def _load_checkpoint(queue, args):
                 assert(margs.consumed_valid_samples == consumed_valid_samples)
             else:
                 consumed_valid_samples = margs.consumed_valid_samples
-            models.append(model_)
+            for vp_rank in range(model_array_len):
+                models[vp_rank].append(model_[vp_rank])
         return models
 
-    if margs.num_layers_per_virtual_pipeline_stage is not None:
-        print("Model with an interleaved pipeline schedule are not yet supported.")
-        queue.put("exit")
-        exit(1)
-
-    set_global_variables(margs)
-    mpu.initialize.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
-    mpu.initialize.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
+    set_global_variables(margs, build_tokenizer=False)
+    mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
+    mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
+    mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size
@@ -147,6 +174,9 @@ def _load_checkpoint(queue, args):
     # short aliases
     tp_size = margs.tensor_model_parallel_size
     pp_size = margs.pipeline_model_parallel_size
+    vp_size = margs.virtual_pipeline_model_parallel_size
+    if vp_size is None:
+        vp_size = 1
 
     # metadata
     md = types.SimpleNamespace()
@@ -161,15 +191,20 @@ def _load_checkpoint(queue, args):
     md.iteration = margs.iteration
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
+    md.output_layer = margs.untie_embeddings_and_output_weights
+    md.position_embeddings = margs.add_position_embedding
+    md.linear_bias = margs.add_bias_linear
+    md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
     md.true_vocab_size = true_vocab_size
     md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
+    md.checkpoint_args = checkpoint_args
 
     # Get first pipe stage
-    mpu.initialize.set_pipeline_model_parallel_rank(0)
-    post_process = pp_size == 1
-    models = get_models(tp_size, md.params_dtype, True, post_process)
+    mpu.set_pipeline_model_parallel_rank(0)
+    all_models = [get_models(tp_size, md.params_dtype)]
+    models = all_models[0][0]
 
     md.consumed_train_samples = consumed_train_samples
     md.consumed_valid_samples = consumed_valid_samples
@@ -182,73 +217,101 @@ def _load_checkpoint(queue, args):
 
     # Send embeddings
     message = {
-        "position embeddings": models[0].language_model.embedding.position_embeddings.weight.data,
         "word embeddings": torch.cat(
             [models[tp_rank].language_model.embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
             dim = 0)
     }
+    if md.position_embeddings:
+        message["position embeddings"] = models[0].language_model.embedding.position_embeddings.weight.data
 
     queue_put("embeddings", message)
 
     total_layer_num = 0
-    for pp_rank in range(pp_size):
-        if pp_rank > 0:
-            mpu.initialize.set_pipeline_model_parallel_rank(pp_rank)
-            post_process = pp_rank == pp_size - 1
-            models = get_models(tp_size, md.params_dtype, False, post_process)
-        for layer_num in range(len(models[0].language_model.encoder.layers)):
-            message = {}
+    for vp_rank in range(vp_size):
+        mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
+        for pp_rank in range(pp_size):
+            if pp_rank > 0:
+                mpu.set_pipeline_model_parallel_rank(pp_rank)
+                if vp_rank == 0:
+                    all_models.append(get_models(tp_size, md.params_dtype))
+            models = all_models[pp_rank][vp_rank]
+            for layer_num in range(len(models[0].language_model.encoder.layers)):
+                message = {}
 
-            # Get non-parallel tensors from tp_rank 0
-            layer = models[0].language_model.encoder.layers[layer_num]
-            message["input layernorm weight"] = layer.input_layernorm.weight.data
-            message["input layernorm bias"] = layer.input_layernorm.bias.data
-            message["dense bias"] = layer.self_attention.dense.bias.data
-            message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
-            message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
-            message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
-            if margs.attention_head_type == "multiquery":
-                # MQA: kv is shared across tp-ranks
-                message["kv weight"] = layer.self_attention.key_value.weight.data
-                message["kv bias"] = layer.self_attention.key_value.bias.data
+                # Get non-parallel tensors from tp_rank 0
+                layer = models[0].language_model.encoder.layers[layer_num]
+                message["input layernorm weight"] = layer.input_layernorm.weight.data
+                message["input layernorm bias"] = layer.input_layernorm.bias.data
+                message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
+                message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
+                if md.linear_bias:
+                    message["dense bias"] = layer.self_attention.dense.bias.data
+                    message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
+                if md.attention_head_type == "multiquery":
+                    # MQA: kv is shared across tp-ranks
+                    message["kv weight"] = layer.self_attention.key_value.weight.data
+                    if md.linear_bias:
+                        message["kv bias"] = layer.self_attention.key_value.bias.data
 
-            # Grab all parallel tensors for this layer
-            qkv_weight = []
-            qkv_bias = []
-            q_weight = []
-            q_bias = []
-            dense_weight = []
-            mlp_l0_weight = []
-            mlp_l0_bias = []
-            mlp_l1_weight = []
-            for tp_rank, model in enumerate(models):
-                layer = model.language_model.encoder.layers[layer_num]
-                if margs.attention_head_type == "multihead":
-                    qkv_weight.append(layer.self_attention.query_key_value.weight.data)
-                    qkv_bias.append(layer.self_attention.query_key_value.bias.data)
-                elif margs.attention_head_type == "multiquery":
-                    q_weight.append(layer.self_attention.query.weight.data)
-                    q_bias.append(layer.self_attention.query.bias.data)
-                dense_weight.append(layer.self_attention.dense.weight.data)
-                mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
-                mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
-                mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+                # Grab all parallel tensors for this layer
+                qkv_weight = []
+                qkv_bias = []
+                q_weight = []
+                q_bias = []
+                dense_weight = []
+                mlp_l0_weight = []
+                mlp_l0_bias = []
+                mlp_l1_weight = []
+                for tp_rank, model in enumerate(models):
+                    layer = model.language_model.encoder.layers[layer_num]
+                    if md.attention_head_type == "multihead":
+                        qkv_weight.append(layer.self_attention.query_key_value.weight.data)
+                        if md.linear_bias:
+                            qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+                    elif md.attention_head_type == "multiquery":
+                        q_weight.append(layer.self_attention.query.weight.data)
+                        if md.linear_bias:
+                            q_bias.append(layer.self_attention.query.bias.data)
+                    dense_weight.append(layer.self_attention.dense.weight.data)
+                    mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
+                    mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
+                    if md.linear_bias:
+                        mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
 
-            # concat them
-            if margs.attention_head_type == "multihead":
-                message["qkv weight"] = torch.cat(qkv_weight, dim=0)
-                message["qkv bias"] = torch.cat(qkv_bias, dim=0)
-            elif margs.attention_head_type == "multiquery":
-                message["q weight"] = torch.cat(q_weight, dim=0)
-                message["q bias"] = torch.cat(q_bias, dim=0)
-            message["dense weight"] = torch.cat(dense_weight, dim=1)
-            message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
-            message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
-            message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
+                # Handle gated linear units
+                if md.swiglu:
+                    # concat all the first halves ('W's) and all the second halves ('V's)
+                    for tp_rank in range(tp_size):
+                        mlp_l0_weight[tp_rank] = torch.chunk(mlp_l0_weight[tp_rank], 2, dim=0)
+                    message["mlp l0 weight W"] = torch.cat([w[0] for w in mlp_l0_weight], dim=0)
+                    message["mlp l0 weight V"] = torch.cat([w[1] for w in mlp_l0_weight], dim=0)
+                else:
+                    message["mlp l0 weight"] = torch.cat(mlp_l0_weight, dim=0)
 
-            queue_put(f"transformer layer {total_layer_num}", message)
+                # simple concat of the rest
+                if md.attention_head_type == "multihead":
+                    message["qkv weight"] = torch.cat(qkv_weight, dim=0)
+                    if md.linear_bias:
+                        message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+                elif md.attention_head_type == "multiquery":
+                    message["q weight"] = torch.cat(q_weight, dim=0)
+                    if md.linear_bias:
+                        message["q bias"] = torch.cat(q_bias, dim=0)
+                
+                message["dense weight"] = torch.cat(dense_weight, dim=1)
+                message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
+                if md.linear_bias:
+                    if md.swiglu:
+                        for tp_rank in range(tp_size):
+                            mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
+                        message["mlp l0 bias W"] = torch.cat([b[0] for b in mlp_l0_bias],dim=0)
+                        message["mlp l0 bias V"] = torch.cat([b[1] for b in mlp_l0_bias],dim=0)
+                    else:
+                        message["mlp l0 bias"] = torch.cat(mlp_l0_bias, dim=0)
 
-            total_layer_num = total_layer_num + 1
+                queue_put(f"transformer layer {total_layer_num}", message)
+
+                total_layer_num = total_layer_num + 1
 
     # Send final layernorm from tp_rank 0
     message = {
@@ -257,9 +320,17 @@ def _load_checkpoint(queue, args):
     }
     queue_put("final layernorm", message)
 
+    if md.output_layer:
+        message = {
+            "weight": torch.cat(
+                [models[tp_rank].language_model.output_layer.weight.data for tp_rank in range(tp_size)],
+                dim = 0)
+        }
+        queue_put("output layer", message)
+
+
     # Send BERT lm head and binary head if it exists
     if md.model_type == 'BERT':
-        print("Sending LM Pooler")
         message = {
             "weight": models[0].language_model.pooler.dense.weight.data,
             "bias": models[0].language_model.pooler.dense.bias.data
@@ -275,8 +346,6 @@ def _load_checkpoint(queue, args):
         queue_put("lm head", message)
 
         if md.bert_binary_head:
-            print("Sending BERT Binary head")
-            queue.put("binary head")
             message = {
                 "weight": models[0].binary_head.weight.data,
                 "bias": models[0].binary_head.bias.data

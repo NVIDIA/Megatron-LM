@@ -1,24 +1,12 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Generation utilities."""
 
 import torch
 import torch.nn.functional as F
 
-from megatron import get_args, get_tokenizer, mpu
+from megatron import get_args, get_tokenizer
+from megatron.core import mpu
 from megatron.utils import get_ltor_masks_and_position_ids
 from .communication import (
     copy_from_last_to_first_pipeline_stage,
@@ -27,8 +15,6 @@ from .communication import (
 from .forward_step import ForwardStep
 from .sampling import sample
 from .beam_utils import BeamHypotheses
-
-MAX_TOKENS_TO_OOM = 128000  # (rprenger) Perfect value depends on hardware and network
 
 def score_and_return_on_first_stage(model, tokens, lengths):
     """Function for just scoring.
@@ -47,10 +33,15 @@ def score_and_return_on_first_stage(model, tokens, lengths):
     batch_size = tokens.size(0)
     max_prompt_length = lengths.max().item()
     assert max_prompt_length == tokens.size(1)
-    max_sequence_length = min(max_prompt_length, args.max_position_embeddings)
+    
+    if max_prompt_length > args.max_position_embeddings:
+        raise ValueError("Length of prompt + tokens_to_generate longer than allowed")
+    
+    if max_prompt_length * batch_size > args.max_tokens_to_oom:
+        raise ValueError("Too many tokens.  " + str(max_prompt_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
-    forward_step = ForwardStep(model, batch_size, max_sequence_length)
+    forward_step = ForwardStep(model, batch_size, max_prompt_length)
 
     # ===================
     # Pre-allocate memory
@@ -58,7 +49,7 @@ def score_and_return_on_first_stage(model, tokens, lengths):
 
     # Log probability of the sequence (prompt + generated tokens).
     output_log_probs = None
-    output_log_probs_size = (batch_size, max_sequence_length - 1)
+    output_log_probs_size = (batch_size, max_prompt_length - 1)
     
     if mpu.is_pipeline_last_stage():
         output_log_probs = torch.empty(output_log_probs_size,
@@ -101,7 +92,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         temperature=1.0,
         use_eod_token_for_early_termination=True,
         stop_on_double_eol=False,
-        stop_on_eol=False
+        stop_on_eol=False,
+        prevent_newline_after_colon=True
         ):
     """Main token generation function.
     Arguments:
@@ -119,6 +111,7 @@ def generate_tokens_probs_and_return_on_first_stage(
         temperature: sampling temperature.
         use_eod_token_for_early_termination: if True, do early termination if
             all the sequences have reached this token.
+        prevent_newline_after_colon: if True, it will disable generating new line \n after :
     Note: Outside of model, other parameters only need to be available on
           rank 0.
     Outputs: Note that is size is adjusted to a lower value than
@@ -139,8 +132,8 @@ def generate_tokens_probs_and_return_on_first_stage(
     if max_sequence_length > args.max_position_embeddings:
         raise ValueError("Length of prompt + tokens_to_generate longer than allowed")
     
-    if max_sequence_length * batch_size >= MAX_TOKENS_TO_OOM:
-        raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(MAX_TOKENS_TO_OOM))
+    if max_sequence_length * batch_size > args.max_tokens_to_oom:
+        raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
     forward_step = ForwardStep(model, batch_size, max_sequence_length)
@@ -194,6 +187,8 @@ def generate_tokens_probs_and_return_on_first_stage(
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
             if mpu.is_pipeline_last_stage():
+                if prevent_newline_after_colon:
+                    logits[tokens2use[:, -1] == tokenizer.tokenize(':')[0], -1, tokenizer.tokenize('\n')[0]] = -1e10 # disable "\n" after ":"
                 # Always the last stage should have an output.
                 assert logits is not None
 
@@ -289,7 +284,7 @@ def generate_tokens_probs_and_return_on_first_stage(
 
     return tokens, generated_sequence_lengths, output_log_probs
 
-def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty):
+def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, stop_token, num_return_gen, length_penalty, prevent_newline_after_colon=True):
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -332,6 +327,8 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
             if mpu.is_pipeline_last_stage():
+                if prevent_newline_after_colon:
+                    logits[tokens2use[:, -1] == tokenizer.tokenize(':')[0], -1, tokenizer.tokenize('\n')[0]] = -1e10 # disable "\n" after ":"
                 vocab_size = logits.size(2)
                 log_probs = F.log_softmax(logits, dim=2)
                 new_scores = log_probs[:, -1, :] + scores
@@ -395,7 +392,7 @@ def beam_search_and_return_on_first_stage(model, tokens, lengths, beam_size, sto
             # if cannot find stop token, add open beams to hyps
             if not done:
                 for beam_id in range(beam_size):
-                    beam_hyp.add(tokens[beam_id].clone(), scores[beam_id], context_length + 1 - prompt_length)
+                    beam_hyp.add(tokens[beam_id].clone(), scores[beam_id].squeeze(), context_length + 1 - prompt_length)
 
             # rank based on scores
             sorted_hyps = sorted(beam_hyp.beams, key=lambda x: x[0], reverse=True)

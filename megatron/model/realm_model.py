@@ -5,7 +5,7 @@ from megatron import get_args, print_rank_0
 from megatron.checkpointing import get_checkpoint_tracker_filename, get_checkpoint_name
 from megatron.model import BertModel
 from .module import MegatronModule
-from megatron import mpu
+from megatron.core import mpu
 from megatron.model.enums import AttnMaskType
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
@@ -87,18 +87,18 @@ class ICTBertModel(MegatronModule):
         else:
             raise ValueError("Cannot embed block without block model.")
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='', keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Save dict with state dicts of each of the models."""
         state_dict_ = {}
         if self.use_query_model:
             state_dict_[self._query_key] \
                 = self.query_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+                    prefix=prefix, keep_vars=keep_vars)
 
         if self.use_block_model:
             state_dict_[self._block_key] \
                 = self.block_model.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+                    prefix=prefix, keep_vars=keep_vars)
 
         return state_dict_
 
@@ -181,17 +181,17 @@ class IREncoderBertModel(MegatronModule):
         ict_logits = self.ict_head(pooled_output)
         return ict_logits, None
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
-            = self.language_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+            = self.language_model.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         state_dict_[self._ict_head_key] \
-            = self.ict_head.state_dict(destination, prefix, keep_vars)
+            = self.ict_head.state_dict(prefix=prefix,
+                                       keep_vars=keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):

@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron optimizer."""
 
@@ -24,12 +11,11 @@ from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_timers
-from megatron import mpu
 from megatron import print_rank_0
+from megatron.core import mpu, tensor_parallel
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
-from megatron.mpu.layers import param_is_not_tensor_parallel_duplicate
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
@@ -115,7 +101,7 @@ class MegatronOptimizer(ABC):
             grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
 
@@ -318,21 +304,24 @@ class MegatronOptimizer(ABC):
         """All-reduce all grads, and all-reduce embeddings."""
 
         # All-reduce layer-norm grads (for sequence parallelism).
-        timers('backward-layernorm-all-reduce').start()
+        timers('layernorm-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_layernorm_grads(args)
-        timers('backward-layernorm-all-reduce').stop()
+        timers('layernorm-grads-all-reduce').stop()
 
         # All-reduce if needed.
         if args.DDP_impl == 'local':
-            timers('backward-params-all-reduce').start()
+            timers('grads-all-reduce', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
             for model in self.models:
                 model.allreduce_gradients()
-            timers('backward-params-all-reduce').stop()
+            timers('grads-all-reduce').stop()
 
         # All-reduce embedding grads.
-        timers('backward-embedding-all-reduce').start()
+        timers('embedding-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
-        timers('backward-embedding-all-reduce').stop()
+        timers('embedding-grads-all-reduce').stop()
 
         # All-reduce key-value grads if needed.
         if (
@@ -367,6 +356,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             is using a contiguous buffer to hold the model grads.
         fp16: if true, the model is running in fp16.
         bf16: if true, the model is running in bfloat16.
+        params_dtype: used by distributed optimizer.
         grad_scaler: used for scaling gradients. Note that this can be
             None. This case happens when `bf16 = True` and we don't
             use any loss scale. Note that for `bf16 = True`, we can have
@@ -378,7 +368,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, grad_scaler,
+                 fp16, bf16, params_dtype, grad_scaler,
                  models):
 
         super().__init__(
@@ -388,6 +378,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         self.fp16 = fp16
         self.bf16 = bf16
+        self.params_dtype = params_dtype
         self.grad_scaler = grad_scaler
 
         # None grad scaler is only supported for bf16.
@@ -451,7 +442,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     def step(self, args, timers):
 
         # Copy gradients from model params to main params.
-        timers('optimizer-copy-to-main-grad').start()
+        timers('optimizer-copy-to-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self._copy_model_grads_to_main_grads()
         timers('optimizer-copy-to-main-grad').stop()
 
@@ -460,7 +452,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler:
 
             # Unscale and check for inf/nan.
-            timers('optimizer-unscale-and-check-inf').start()
+            timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
             found_inf_flag = self._unscale_main_grads_and_check_for_nan()
             timers('optimizer-unscale-and-check-inf').stop()
 
@@ -473,25 +466,29 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 return False, None, None
 
         # Clip the main gradients.
-        timers('optimizer-clip-main-grad').start()
+        timers('optimizer-clip-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # Count the zeros in the grads.
-        timers('optimizer-count-zeros').start()
+        timers('optimizer-count-zeros', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
 
         # Step the optimizer.
-        timers('optimizer-inner-step').start()
+        timers('optimizer-inner-step', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
 
         # Update params from main params.
-        timers('optimizer-copy-main-to-model-params').start()
+        timers('optimizer-copy-main-to-model-params', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
 
@@ -531,12 +528,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
                  params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, grad_scaler, models):
+                 fp16, bf16, params_dtype, grad_scaler, models):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
             params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-            fp16, bf16, grad_scaler, models)
+            fp16, bf16, params_dtype, grad_scaler, models)
 
         # ======================
         # main parameter stuff
@@ -566,8 +563,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # Create a copy
                         main_param = param.detach().clone().float()
                         # Copy tensor model parallel attributes.
-                        mpu.copy_tensor_model_parallel_attributes(main_param,
-                                                                  param)
+                        tensor_parallel.copy_tensor_model_parallel_attributes(main_param,
+                                                                              param)
                         if hasattr(param, 'shared'):
                             main_param.shared = param.shared
                         # Replace the optimizer params with the new fp32 copy.
@@ -706,8 +703,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
-            print_rank_0('***WARNING*** found an old checkpoint, will not '
-                         'load grad scaler ...')
+            if self.fp16:
+                print_rank_0('***WARNING*** found an old checkpoint, will not '
+                             'load grad scaler ...')
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
@@ -760,7 +758,8 @@ class FP32Optimizer(MegatronOptimizer):
         Always return successful since there is no overflow."""
 
         # Copy main_grads to grads.
-        timers('optimizer-copy-to-main-grad').start()
+        timers('optimizer-copy-to-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         if self.params_have_main_grad:
             for param_group in self.optimizer.param_groups:
                 for param in param_group['params']:
@@ -774,20 +773,23 @@ class FP32Optimizer(MegatronOptimizer):
         timers('optimizer-copy-to-main-grad').stop()
 
         # Clip gradients.
-        timers('optimizer-clip-main-grad').start()
+        timers('optimizer-clip-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         grad_norm = None
         if self.clip_grad > 0.0:
             grad_norm = self.clip_grad_norm(self.clip_grad)
         timers('optimizer-clip-main-grad').stop()
 
         # count the zeros in the grads
-        timers('optimizer-count-zeros').start()
+        timers('optimizer-count-zeros', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         num_zeros_in_grad = self.count_zeros() if \
                             self.log_num_zeros_in_grad else None
         timers('optimizer-count-zeros').stop()
 
         # Update parameters.
-        timers('optimizer-inner-step').start()
+        timers('optimizer-inner-step', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
         self.optimizer.step()
         timers('optimizer-inner-step').stop()
 
