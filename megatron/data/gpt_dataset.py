@@ -488,7 +488,7 @@ def _num_tokens(documents, sizes):
 
 
 def _num_epochs(tokens_per_epoch, seq_length, num_samples):
-    """Based on number of samples and sequence lenght, calculate how many
+    """Based on number of samples and sequence length, calculate how many
     epochs will be needed."""
     num_epochs = seq_length * num_samples // tokens_per_epoch + 1
     return num_epochs
