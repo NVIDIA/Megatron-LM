@@ -4,7 +4,8 @@ import time
 import numpy as np
 import torch
 
-from megatron import get_args, get_tokenizer, mpu, print_rank_0
+from megatron import get_args, get_tokenizer, print_rank_0
+from megatron.core import mpu, tensor_parallel
 from megatron.data.dataset_utils import create_masked_lm_predictions, \
                                             pad_and_convert_to_numpy
 from megatron.data.data_samplers import MegatronPretrainingSampler
@@ -57,7 +58,7 @@ def get_ict_batch(data_iterator):
         data = None
     else:
         data = next(data_iterator)
-    data_b = mpu.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     query_tokens = data_b['query_tokens'].long()

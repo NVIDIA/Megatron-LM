@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """
  Data Loader for Google NQ dataset
@@ -26,7 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset, BatchSampler
 
-from megatron import print_rank_0, get_args, get_tokenizer, mpu
+from megatron import print_rank_0, get_args, get_tokenizer
 from megatron.data.biencoder_dataset_utils import make_attention_mask
 
 def get_nq_dataset(qa_data, split):

@@ -1,25 +1,18 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
 import argparse
+import json
 import os
 import re
 
 import torch
+import types
+
+from megatron.global_vars import set_retro_args, get_retro_args
+from tools.retro.utils import get_args_path as get_retro_args_path
+
 
 import megatron
 from megatron.model.enums import PositionEmbeddingType
@@ -46,6 +39,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_vision_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_inference_args(parser)
+    parser = _add_transformer_engine_args(parser)
+    parser = _add_retro_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -137,12 +132,10 @@ def validate_args(args, defaults={}):
     del args.model_parallel_size
 
     if args.checkpoint_activations:
-        args.recompute_granularity = 'full'
-        args.recompute_method = 'uniform'
         if args.rank == 0:
-            print('--checkpoint-activations is no longer valid, '
-                  'use --recompute-granularity and --recompute-method  instead. '
-                  'Defaulting to recompute-granularity=full and recompute-method=uniform.')
+            print('--checkpoint-activations is no longer valid, use --recompute-activations, '
+                  'or, for more control, --recompute-granularity and --recompute-method.')
+        exit()
     del args.checkpoint_activations
 
     if args.recompute_activations:
@@ -210,14 +203,6 @@ def validate_args(args, defaults={}):
     if args.accumulate_allreduce_grads_in_fp32:
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    else:
-        if args.gradient_accumulation_fusion:
-            args.gradient_accumulation_fusion = False
-            if args.rank == 0:
-                print('Gradient accumulation fusion to linear layer weight '
-                      'gradient computation is supported only with fp32 '
-                      'gradient accumulation. Setting gradient_accumulation_fusion '
-                      'to False', flush=True)
 
     # If we use the distributed optimizer, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is on.
@@ -235,6 +220,13 @@ def validate_args(args, defaults={}):
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+
+    # Support for variable sequence lengths across batches/microbatches.
+    # set it if the dataloader supports generation of variable sequence lengths
+    # across batches/microbatches. Due to additional communication overhead
+    # during pipeline parallelism, it should not be set if sequence length
+    # is constant during training.
+    args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -267,6 +259,15 @@ def validate_args(args, defaults={}):
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
 
+    if args.num_layers is not None:
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
+        args.encoder_num_layers = args.num_layers
+    else:
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
+        args.num_layers = args.encoder_num_layers
+
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
                      'max_position_embeddings']
@@ -276,6 +277,16 @@ def validate_args(args, defaults={}):
     # Checks.
     if args.ffn_hidden_size is None:
         args.ffn_hidden_size = 4 * args.hidden_size
+
+    if args.swiglu:
+        # reduce the dimnesion for MLP since projections happens on
+        # two linear layers. this keeps the number of paramters in
+        # the same ballpark as the counterpart with 4*h size
+        # we keep it a multiple of 64, which means the actual tensor size
+        # will be a multiple of 64 / tp_size
+        args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+        assert not args.glu_activation, \
+            "--glu-activation is not compatible with --swiglu. Use only one of the two."
 
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
@@ -362,6 +373,14 @@ def validate_args(args, defaults={}):
     if args.local_rank is None and "LOCAL_RANK" in os.environ:
         args.local_rank = int(os.environ["LOCAL_RANK"])
 
+    # Tranformer-Engine/FP8 related checking
+    if args.fp8_e4m3 or args.fp8_hybrid:
+        assert args.transformer_impl == 'transformer_engine', \
+            'transformer-engine required for fp8 training and inference'
+
+    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
+        'cannot train with both fp8 e4m3 and hybrid formatting'
+
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
@@ -382,14 +401,45 @@ def validate_args(args, defaults={}):
         assert not args.reset_attention_mask, \
             "Flash Attention doesn't support arbitrary attention masks. Please turn off reset-attention-mask"
 
-    _print_args(args)
+    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if args.sequence_parallel:
+            raise RuntimeError(
+                "Using sequence parallelism requires setting the environment variable "
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+        if args.async_tensor_model_parallel_allreduce:
+            raise RuntimeError(
+                "Using async gradient all reduce requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+
+    # Disable bias gelu fusion if we are disabling bias altogether
+    if not args.add_bias_linear:
+        args.bias_gelu_fusion = False
+
+    # Load retro args.
+    if args.retro_workdir:
+        retro_args_path = get_retro_args_path(args.retro_workdir)
+        if os.path.exists(retro_args_path):
+            with open(retro_args_path) as f:
+                retro_args = types.SimpleNamespace(**json.load(f))
+                retro_args.retro_return_doc_ids = args.retro_return_doc_ids
+                retro_args.retro_gpt_retrieved_length = \
+                    args.retro_num_retrieved_chunks * \
+                    retro_args.retro_gpt_chunk_length
+                set_retro_args(retro_args)
+
+    # Print arguments.
+    _print_args("arguments", args)
+    retro_args = get_retro_args()
+    if retro_args and args != retro_args:
+        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
+
     return args
 
 
-def _print_args(args):
+def _print_args(title, args):
     """Print arguments."""
     if args.rank == 0:
-        print('------------------------ arguments ------------------------',
+        print(f'------------------------ {title} ------------------------',
               flush=True)
         str_list = []
         for arg in vars(args):
@@ -397,13 +447,40 @@ def _print_args(args):
             str_list.append('  {} {} {}'.format(arg, dots, getattr(args, arg)))
         for arg in sorted(str_list, key=lambda x: x.lower()):
             print(arg, flush=True)
-        print('-------------------- end of arguments ---------------------',
+        print(f'-------------------- end of {title} ---------------------',
               flush=True)
 
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
+
+def _add_transformer_engine_args(parser):
+    group = parser.add_argument_group(title='Transformer-Engine')
+
+    group.add_argument('--fp8-e4m3', action='store_true',
+                        help='E4M3 TransformerLayer', dest='fp8_e4m3')
+    group.add_argument('--fp8-hybrid', action='store_true',
+                        help='Hybrid FP8 TransformerLayer', dest='fp8_hybrid')
+    group.add_argument('--no-fp8-wgrad', action='store_false',
+                        help='Execute wgrad in higher precision even for FP8 runs', dest='fp8_wgrad')
+    group.add_argument('--fp8-margin', type=int, default=0,
+                        help='Scaling margin for fp8', dest='fp8_margin')
+    group.add_argument('--fp8-interval', type=int, default=1,
+                        help='Scaling update interval for fp8', dest='fp8_interval')
+    group.add_argument('--transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.',
+                       dest='transformer_impl')
+    group.add_argument('--fp8-amax-history-len', type=int, default=1,
+                        help='Number of steps for which amax history is recorded per tensor',
+                        dest='fp8_amax_history_len')
+    group.add_argument('--fp8-amax-compute-algo', default='most_recent',
+                       choices=['most_recent', 'max'],
+                       help='Algorithm for computing amax from history',
+                       dest='fp8_amax_compute_algo')
+
+    return parser
 
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
@@ -413,15 +490,76 @@ def _add_inference_args(parser):
                        help='During inference, if batch-size times '
                        'sequence-length is smaller than this threshold '
                        'then we will not use pipelining, otherwise we will.')
+    group.add_argument('--max-tokens-to-oom',
+                       type=int, default=12000,
+                       help='Maximum number of tokens during inference'
+                       'tokens here is # in prompt + # to generate'
+                       'Allows us to throw an error before OOM crashes server')
+    group.add_argument('--output-bert-embeddings', action='store_true',
+                       help='Output Bert embeddings (via mean pooling) from '
+                       'model, rather than its binary head output or entire '
+                       'hidden batch.')
+    group.add_argument('--bert-embedder-type', default="megatron",
+                       choices=["megatron", "huggingface"],
+                       help='Select either Megatron or Huggingface as the '
+                       'Bert embedder.')
 
     return parser
 
-    
+
+def _add_retro_args(parser):
+    group = parser.add_argument_group(title='retro')
+
+    group.add_argument('--retro-workdir', default=None,
+                       help='Retro working directory, which contains the '
+                       'preprocessed data for for pretraining. This directory '
+                       'is built during preprocessing (see '
+                       'tools/retro/README.md), and contains subdirectories '
+                       'for the chunk database and pretraining neighbors.')
+    group.add_argument('--retro-add-retriever',
+                       action='store_true', default=False,
+                       help='Add a retriever to the transformer, for use in '
+                       'pretraining a Retro model.')
+    group.add_argument('--retro-cyclic-train-iters', type=int, default=None,
+                       help='Set number of training iterations for cyclic '
+                       'Retro training.')
+    group.add_argument('--retro-encoder-layers', type=int, default=2,
+                       help='Number of layers to use for the retrieval '
+                       'encoder.')
+    group.add_argument('--retro-encoder-hidden-dropout',
+                       type=float, default=0.1, help='Hidden dropout for '
+                       'retrieval encoder.')
+    group.add_argument('--retro-encoder-attention-dropout',
+                       type=float, default=0.1, help='Attention dropout for '
+                       'retrieval encoder.')
+    group.add_argument("--retro-num-neighbors", type=int, default=2,
+                       help='Number of neighbors to retrieve during '
+                       'pretraining.')
+    group.add_argument("--retro-num-retrieved-chunks", type=int, default=2,
+                       help='Number of chunks to retrieve from the retrieval '
+                       'database.')
+    group.add_argument("--retro-return-doc-ids", action="store_true",
+                       help="Turn this on when preprocessing retro data.")
+
+    # Enforce argument naming convention.
+    for action in group._group_actions:
+        prefix = action.dest.split("_")[0]
+        assert prefix == "retro", \
+            "Retro args must be prefixed with '--retro-*', for consistent " \
+            "styling. Please fix '%s'." % ", ".join(action.option_strings)
+
+    return parser
+
+
 def _add_network_size_args(parser):
     group = parser.add_argument_group(title='network size')
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--encoder-num-layers', type=int, default=None,
+                       help='Number of encoder transformer layers.')
+    group.add_argument('--decoder-num-layers', type=int, default=None,
+                       help='Number of decoder transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -441,11 +579,22 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
+    group.add_argument('--use-rotary-position-embeddings', action='store_true',
+                       help='Use rotary positional embeddings or not')
+    group.add_argument('--rotary-percent', type=float, default=1.0,
+                       help='Percent of rotary dimension to use, default 100%')
+    group.add_argument('--no-position-embedding',
+                       action='store_false',
+                       help='Disable position embedding.',
+                       dest='add_position_embedding')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
     group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
                        help='Layer norm epsilon.')
+    group.add_argument('--apply-layernorm-1p', action='store_true',
+                       help='Adjust LayerNorm weights such that they are centered '
+                       'around zero. This improves numerical stability.')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '
@@ -454,6 +603,10 @@ def _add_network_size_args(parser):
                        help='Use OpenAIs GeLU implementation. This option'
                        'should not be used unless for backward compatibility'
                        'reasons.')
+    group.add_argument('--squared-relu', action='store_true',
+                       help='Use squared relu activation instead of default gelu')
+    group.add_argument('--swiglu', action='store_true',
+                       help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')
@@ -471,6 +624,8 @@ def _add_network_size_args(parser):
                        )
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
+    group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
+                       help='Untie embeddings and output weights.'),
     return parser
 
 
@@ -481,6 +636,32 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
+    group.add_argument('--timing-log-level', type=int,
+                       default=0, choices=range(0,3),
+                       help='Granularity level to measure and report timing. '
+                       '   0: report only iteration time and make sure timing '
+                       '      does not introduce extra overhead.'
+                       '   1: report timing for operations that are executed '
+                       '      very limited times (basically once) during '
+                       '      each iteration (such as gradient all-reduce) '
+                       '   2: report timing for operations that migh be '
+                       '      executed numerous times during each iteration. '
+                       'Note that setting the level to 1 or 2 might '
+                       'cause increase in iteration time.')
+    group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
+                       help='If not set, use barrier with level 1 time '
+                       'measurements. Note that this is up to the user '
+                       'to make sure calling barrier with their timers '
+                       'will not result in hangs. This can happen if for '
+                       'example the user adds a level 1 timer that is not '
+                       'called by all ranks.',
+                       dest='barrier_with_L1_time')
+    group.add_argument('--timing-log-option', type=str, default='minmax',
+                       choices=['max', 'minmax', 'all'],
+                       help='Options for logging timing:'
+                       '  max: report the max timing across all ranks'
+                       '  minmax: report min and max timings across all ranks'
+                       '  all: report timings of all ranks.')
     group.add_argument('--tensorboard-log-interval', type=int, default=1,
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
@@ -655,6 +836,9 @@ def _add_training_args(parser):
     group.add_argument('--use-flash-attn', action='store_true',
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
+    group.add_argument('--disable-bias-linear', action='store_false',
+                       help='Disable bias in the linear layers',
+                       dest='add_bias_linear')
     group.add_argument('--optimizer', type=str, default='adam',
                        choices=['adam', 'sgd'],
                        help='Optimizer function')
@@ -708,7 +892,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -775,9 +959,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--use-checkpoint-args', action='store_true',
                        help='Override any command line arguments with arguments '
                        'from the checkpoint')
-    group.add_argument('--finetune-from', type=str, default=None,
-                       help='Directory containing a model checkpoint for finetuning.'
-                       'Will be loaded if the `--load` directory contains no checkpoint')
+    group.add_argument('--exit-on-missing-checkpoint', action='store_true',
+                       help="If '--load' is set, but checkpoint is not found "
+                       "(e.g., path typo), then exit instead of random "
+                       "initialization.")
 
     return parser
 
@@ -838,6 +1023,8 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
+    group.add_argument('--distributed-timeout-minutes', type=int, default=10,
+                       help='Timeout minutes for torch.distributed.')
     group.add_argument('--DDP-impl', default='local',
                        choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
@@ -849,6 +1036,10 @@ def _add_distributed_args(parser):
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
+    group.add_argument('--use-ring-exchange-p2p', action='store_true',
+                       default=False, help='If set, use custom-built ring exchange '
+                       'for p2p communications. Note that this option will require '
+                       'a custom built image that support ring-exchange p2p.')
     group.add_argument('--local_rank', type=int, default=None,
                        help='local rank passed from distributed launcher.')
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
@@ -900,7 +1091,10 @@ def _add_data_args(parser):
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
                        'form: dataset1-weight dataset1-path dataset2-weight '
-                       'dataset2-path ...')
+                       'dataset2-path ... It is used with --split when a '
+                       'single dataset used for all three: train, valid '
+                       'and test. It is exclusive to the other '
+                       '--*-data-path args')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -1003,6 +1197,24 @@ def _add_data_args(parser):
     group.add_argument('--valid-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
     group.add_argument('--test-weighted-split-paths-path', type=str, action=parse_data_paths_path, default=None)
 
+    group.add_argument('--train-data-path', nargs='*', default=None,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--valid-data-path', nargs='*', default=None,
+                       help='Path to the validation dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+    group.add_argument('--test-data-path', nargs='*', default=None,
+                       help='Path to the test dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ...')
+
+    group.add_argument('--vocab-size', type=int, default=None,
+                       help='Size of vocab before EOD or padding.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
@@ -1021,7 +1233,7 @@ def _add_data_args(parser):
                        help="Maximum decoder sequence length to process.")
     group.add_argument('--retriever-seq-length', type=int, default=256,
                        help='Maximum sequence length for the biencoder model '
-                        ' for retriever')
+                       'for retriever')
     group.add_argument('--sample-rate', type=float, default=1.0,
                        help='sample rate for training data. Supposed to be 0 '
                             ' < sample_rate < 1')
@@ -1042,8 +1254,13 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'GPT2BPETokenizerWithFIM',
                                 'TokenizerFromFile',
-                                'TokenizerFromFileWithFIM'],
+                                'TokenizerFromFileWithFIM',
+                                'SentencePieceTokenizer',
+                                'GPTSentencePieceTokenizer',
+                                'NullTokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='Sentencepiece tokenizer model.')
     group.add_argument('--data-impl', type=str, default='infer',
                        choices=['lazy', 'cached', 'mmap', 'infer'],
                        help='Implementation of indexed datasets.')

@@ -1,0 +1,5 @@
+[html]
+directory = coverage
+
+[run]
+data_file = .coverage_$LOCAL_RANK
