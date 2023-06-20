@@ -312,7 +312,7 @@ def validate_args(args, defaults={}):
         assert args.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
