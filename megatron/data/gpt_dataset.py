@@ -109,11 +109,11 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
                                      train_valid_test_num_samples,
                                      seq_length, seed, skip_warmup,
                                      return_doc_ids=False,
-                                     multimodal=False, img_h=None, img_w=None):
+                                     multimodal=False):
     """Build train, valid, and test datasets."""
 
     # Indexed dataset.
-    if multimodal:
+    if multimodal == True:
         text_indexed_dataset = get_indexed_dataset_(data_prefix + "_text",
                                                     data_impl,
                                                     skip_warmup)
@@ -148,7 +148,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if splits[index + 1] > splits[index]:
             documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
-            if multimodal:
+            if multimodal == True:
                 dataset = MultiModalDataset(name, data_prefix,
                                           documents, text_indexed_dataset, img_indexed_dataset,
                                           train_valid_test_num_samples[index],
@@ -212,7 +212,7 @@ def _build_dataset(dataset_name, data_prefix, data_impl,
         text_indexed_dataset = get_indexed_dataset_(data_prefix + "_text",
                                                     data_impl,
                                                     skip_warmup)
-        img_indexed_dataset = get_indexed_dataset_(data_prefix + "_img",
+        img_indexed_dataset = get_indexed_dataset_(data_prefix + "_raw",
                                                     data_impl,
                                                     skip_warmup)
 
@@ -339,8 +339,7 @@ def _convert_image_to_rgb(image):
 def _transform(img_h, img_w):
     return Compose([
         ToPILImage(),
-        Resize((img_h, img_w), interpolation=BICUBIC),
-        CenterCrop((img_h, img_w)),
+        RandomResizedCrop((img_h, img_w), scale=(0.5, 1.0), interpolation=BICUBIC),
         _convert_image_to_rgb,
         ToTensor(),
         Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
@@ -363,39 +362,21 @@ class MultiModalDataset(torch.utils.data.Dataset):
         assert np.max(documents) < text_indexed_dataset.sizes.shape[0]
        
         self.visual_transform = _transform(img_h, img_w)
-        
-        # Build index mappings.
-        self.doc_idx, self.sample_idx, self.shuffle_idx, self.index_prefix = \
-            _build_index_mappings(self.name, data_prefix, 
-                                  documents, self.text_indexed_dataset.sizes,
-                                  num_samples, seq_length, seed)
-
-        print("self.sample_idx.shape[0] - 1", self.sample_idx.shape[0] - 1)
-        print("self.num_samples", num_samples)
 
     def __len__(self):
         # -1 is due to data structure used to retieve the index:
         #    sample i --> [sample_idx[i], sample_idx[i+1])
-        return self.sample_idx.shape[0] - 1
+        return self.text_indexed_dataset.sizes.shape[0]
 
     def __getitem__(self, idx):
-        # Get the shuffled index.
-        idx = self.shuffle_idx[idx]
+
+        text_sample = self.text_indexed_dataset.get(idx)
+        img_sample = self.img_indexed_dataset.get(idx)
+
+        img_sample = np.array(Image.open(io.BytesIO(img_sample.tobytes(order='C'))))
+        raw_h, raw_w = img_sample.shape[0], img_sample.shape[1]
         
-        doc_index = self.sample_idx[idx][0]
-        doc_ids = []
-        doc_ids += self.doc_idx[doc_index].item(),
-
-        text_sample = self.text_indexed_dataset.get(self.doc_idx[doc_index])
-        img_sample = self.img_indexed_dataset.get(self.doc_idx[doc_index])
-
-        raw_h = img_sample[-4] * 256 + img_sample[-3]
-        raw_w = img_sample[-2] * 256 + img_sample[-1]
-            
-        assert (img_sample.shape[0] - 4) % (raw_h * raw_w) == 0
-            
-        img_sample = img_sample[:-4].reshape(-1, raw_h, raw_w)
-        img_sample = self.visual_transform(np.transpose(img_sample, (1, 2, 0))).reshape(-1)
+        img_sample = self.visual_transform(img_sample).reshape(-1)
         
         if self.return_doc_ids:
             return {'text': np.array(sample, dtype=np.int64),

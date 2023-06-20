@@ -63,15 +63,13 @@ def main():
     count = 0
     for img_file in img_files:
         count += 1
-        img_raw = Image.open(img_file[:-1])
-        img_emb = ToTensor()(img_raw) * 255.
-        dim_info = torch.FloatTensor([img_emb.shape[1] // 256, img_emb.shape[1] % 256, 
-                                      img_emb.shape[2] // 256, img_emb.shape[2] % 256])
+        with open(img_file[:-1], "rb") as tf:
+            img_raw = np.frombuffer(tf.read(), dtype=np.uint8)
         startup_end = time.time()
         if count % 1000 == 0:
             print("Time to process %d samples:" % (count), startup_end - startup_start)
-        img_emb = torch.cat([img_emb.reshape(-1), dim_info])
-        builders.add_item(img_emb)
+        builders.add_item(ToTensor(img_raw))
+        builders.end_document()
 
     builders.finalize(output_idx_files)
 
