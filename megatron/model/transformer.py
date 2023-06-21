@@ -218,7 +218,6 @@ class CoreAttention(MegatronModule):
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
         self.sequence_parallel = args.sequence_parallel
-        self.group_query_attention = args.group_query_attention
 
         projection_size = args.kv_channels * args.num_attention_heads
 
@@ -230,12 +229,6 @@ class CoreAttention(MegatronModule):
             projection_size, args.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             args.num_attention_heads, world_size)
-        self.query_groups_divide_flag = args.num_query_groups >= world_size
-        if self.query_groups_divide_flag:
-            self.num_query_groups_per_partition = core.utils.divide(
-                args.num_query_groups, world_size)
-        else:
-            self.num_query_groups_per_partition = 1
 
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
@@ -268,49 +261,24 @@ class CoreAttention(MegatronModule):
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
-
-        if self.group_query_attention:
-            # [sq, b, np, hn] -> [b * ng, np/ng * sq, hn]
-            query_layer = query_layer.permute([1, 2, 0, 3]).reshape(output_size[0] * self.num_query_groups_per_partition \
-                                        , int(output_size[1] / self.num_query_groups_per_partition) * output_size[2], -1)
-            
-            # [sk, b, 1*self.num_query_groups_per_partition, hn] -> [b * ng, sk, hn]
-            key_layer = key_layer.permute([1, 2, 0, 3]).reshape(output_size[0] * self.num_query_groups_per_partition,
-                                                                 output_size[3], -1)
-            # preallocting input tensor: # [b * ng, np/ng * sq, sk]
-
-            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-                (output_size[0] * self.num_query_groups_per_partition, 
-                 int(output_size[1] / self.num_query_groups_per_partition) * output_size[2], output_size[3]),
-                query_layer.dtype, "mpu")
-
-            # Raw attention scores. [b * ng, np/ng * sq, sk]
-            matmul_result = torch.baddbmm(
-                matmul_input_buffer,
-                query_layer,  # [b * ng, np/ng * sq, hn]
-                key_layer.transpose(1, 2),  # [b * ng, hn, sk]
-                beta=0.0,
-                alpha=(1.0 / self.norm_factor)
-            )
-        else:
-            # [sq, b, np, hn] -> [sq, b * np, hn]
-            query_layer = query_layer.view(output_size[2],
-                                        output_size[0] * output_size[1], -1)
-            # [sk, b, np, hn] -> [sk, b * np, hn]
-            key_layer = key_layer.view(output_size[3],
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2],
                                     output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3],
+                                output_size[0] * output_size[1], -1)
 
-            # preallocting input tensor: [b * np, sq, sk]
-            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-                (output_size[0]*output_size[1], output_size[2], output_size[3]),
-                query_layer.dtype, "mpu")
+        # preallocting input tensor: [b * np, sq, sk]
+        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+            (output_size[0]*output_size[1], output_size[2], output_size[3]),
+            query_layer.dtype, "mpu")
 
-            # Raw attention scores. [b * np, sq, sk]
-            matmul_result = torch.baddbmm(
-                matmul_input_buffer,
-                query_layer.transpose(0, 1),   # [b * np, sq, hn]
-                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-                beta=0.0, alpha=(1.0/self.norm_factor))
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer.transpose(0, 1),   # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0, alpha=(1.0/self.norm_factor))
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -341,35 +309,119 @@ class CoreAttention(MegatronModule):
         # context layer shape: [b, np, sq, hn]
         context_output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
 
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
 
-        if self.group_query_attention:
-            # change view [sk, b, ng, hn]  --> [sk, b * ng, hn]
-            value_layer = value_layer.view(value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(context_output_size[0] * context_output_size[1], context_output_size[2], -1)
 
-            # change view from [b, np, sq, sk] --->  [b * ng, np/ng * sq, sk]
-            attention_probs = attention_probs.view(output_size[0] * self.num_query_groups_per_partition,
-                                int(output_size[1] / self.num_query_groups_per_partition) * output_size[2]
-                                                    , -1)
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
-            # matmul: [b * ng, np/ng * sq, hn]
-            context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*context_output_size)
 
-            # change view [b, np, sq, hn]
-            context_layer = context_layer.view(output_size[0], output_size[1], output_size[2], -1)
 
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + \
+            (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+
+        return context_layer
+
+
+class GroupQueryCoreAttention(CoreAttention):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        args = get_args()
+        world_size = mpu.get_tensor_model_parallel_world_size()
+        if args.num_query_groups >= world_size:
+            self.num_query_groups_per_partition = core.utils.divide(
+                args.num_query_groups, world_size)
         else:
-            # change view [sk, b * np, hn]
-            value_layer = value_layer.view(value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
+            self.num_query_groups_per_partition = 1
 
-            # change view [b * np, sq, sk]
-            attention_probs = attention_probs.view(context_output_size[0] * context_output_size[1], context_output_size[2], -1)
+    def forward(self, query_layer, key_layer,
+                value_layer, attention_mask):
 
-            # matmul: [b * np, sq, hn]
-            context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
 
-            # change view [b, np, sq, hn]
-            context_layer = context_layer.view(*context_output_size)
+        # [b, np, sq, sk]
+        output_size = (query_layer.size(1),
+                       query_layer.size(2),
+                       query_layer.size(0),
+                       key_layer.size(0))
 
+        # [sq, b, np, hn] -> [b * ng, np/ng * sq, hn]
+        query_layer = query_layer.permute([1, 2, 0, 3]).reshape(output_size[0] * self.num_query_groups_per_partition \
+                                    , int(output_size[1] / self.num_query_groups_per_partition) * output_size[2], -1)
+        
+        # [sk, b, 1*self.num_query_groups_per_partition, hn] -> [b * ng, sk, hn]
+        key_layer = key_layer.permute([1, 2, 0, 3]).reshape(output_size[0] * self.num_query_groups_per_partition,
+                                                                output_size[3], -1)
+        # preallocting input tensor: # [b * ng, np/ng * sq, sk]
+
+        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+            (output_size[0] * self.num_query_groups_per_partition, 
+                int(output_size[1] / self.num_query_groups_per_partition) * output_size[2], output_size[3]),
+            query_layer.dtype, "mpu")
+
+        # Raw attention scores. [b * ng, np/ng * sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_input_buffer,
+            query_layer,  # [b * ng, np/ng * sq, hn]
+            key_layer.transpose(1, 2),  # [b * ng, hn, sk]
+            beta=0.0,
+            alpha=(1.0 / self.norm_factor)
+        )
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = self.scale_mask_softmax(attention_scores,
+                                                  attention_mask)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        if not self.sequence_parallel:
+            with tensor_parallel.get_cuda_rng_tracker().fork():
+                attention_probs = self.attention_dropout(attention_probs)
+        else:
+            attention_probs = self.attention_dropout(attention_probs)
+
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        context_output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
+
+        # change view [sk, b, ng, hn]  --> [sk, b * ng, hn]
+        value_layer = value_layer.view(value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
+
+        # change view from [b, np, sq, sk] --->  [b * ng, np/ng * sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * self.num_query_groups_per_partition,
+                            int(output_size[1] / self.num_query_groups_per_partition) * output_size[2]
+                                                , -1)
+
+        # matmul: [b * ng, np/ng * sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(output_size[0], output_size[1], output_size[2], -1)
 
         # [b, np, sq, hn] --> [sq, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
@@ -464,9 +516,23 @@ class ParallelAttention(MegatronModule):
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
 
+        # By default, we use self.multi_head_attention
+        self.multi_head_attention = True
+        
+        # when self.group_query_attention is True, the self.multi_head_attention is True only when 
+        # args.num_query_groups == args.num_attention_heads, else it will be False
+        if self.group_query_attention:
+            key_projection_size = args.kv_channels * args.num_query_groups
+            self.multi_head_attention = args.num_query_groups == args.num_attention_heads
+
+        if args.use_flash_attn and not self.multi_head_attention:
+            raise NotImplementedError("Flash attention is only supported for multi-head attention.")
+        
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
-            and self.attn_mask_type == AttnMaskType.causal
+            and self.attn_mask_type == AttnMaskType.causal \
+            and self.multi_head_attention
+        
         if self.use_flash_attn:
             if flash_attn_unpadded_func is None:
                 raise ImportError('FlashAttention is not installed, please install with '
@@ -480,11 +546,6 @@ class ParallelAttention(MegatronModule):
 
         projection_size = args.kv_channels * args.num_attention_heads
 
-        self.multi_head_attention = True
-           
-        if self.group_query_attention:
-            key_projection_size = args.kv_channels * args.num_query_groups
-            self.multi_head_attention = args.num_query_groups == args.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
@@ -492,7 +553,6 @@ class ParallelAttention(MegatronModule):
             projection_size, args.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             args.num_attention_heads, world_size)
-        # self.num_query_groups_per_partition = max(int(args.num_query_groups / world_size), 1)
         self.query_groups_divide_flag = args.num_query_groups >= world_size
         if self.query_groups_divide_flag:
             self.num_query_groups_per_partition = core.utils.divide(
@@ -502,13 +562,12 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            if self.group_query_attention:
+            if self.group_query_attention and not self.multi_head_attention:
                 self.query = tensor_parallel.ColumnParallelLinear(
                     args.hidden_size,
                     projection_size,
                     gather_output=False,
                     init_method=init_method,
-                    bias=args.add_bias_linear,
                     async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                     **_args_to_kwargs())
 
@@ -518,7 +577,6 @@ class ParallelAttention(MegatronModule):
                         2 * key_projection_size,
                         gather_output=False,
                         init_method=init_method,
-                        bias=args.add_bias_linear,
                         async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                         **_args_to_kwargs())
                 else:
@@ -527,8 +585,6 @@ class ParallelAttention(MegatronModule):
                         2 * key_projection_size, # one for key and one for value
                         init_method=init_method,
                     )
-
-
             else:
                 self.query_key_value = tensor_parallel.ColumnParallelLinear(
                     args.hidden_size,
@@ -538,6 +594,7 @@ class ParallelAttention(MegatronModule):
                     init_method=init_method,
                     async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                     **_args_to_kwargs())
+
         else:
             assert attention_type == AttnType.cross_attn
 
@@ -553,7 +610,6 @@ class ParallelAttention(MegatronModule):
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                 **_args_to_kwargs())
 
-
             self.key_value = tensor_parallel.ColumnParallelLinear(
                 args.hidden_size,
                 2 * projection_size,
@@ -563,8 +619,13 @@ class ParallelAttention(MegatronModule):
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                 **_args_to_kwargs())
 
-        self.core_attention = CoreAttention(self.layer_number,
-                                            self.attn_mask_type)
+        if self.multi_head_attention:
+            self.core_attention = CoreAttention(self.layer_number,
+                                                self.attn_mask_type)
+        else:
+            self.core_attention = GroupQueryCoreAttention(self.layer_number,
+                                                self.attn_mask_type)
+
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
@@ -661,7 +722,7 @@ class ParallelAttention(MegatronModule):
         # =====================
         # Query, Key, and Value
         # =====================
-        if self.group_query_attention:
+        if self.group_query_attention and not self.multi_head_attention:
             key_value_inputs = hidden_states
             query_layer, _ = self.query(hidden_states)
             # [sq, b, hp] --> [sq, b, np, hn]

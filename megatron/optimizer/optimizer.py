@@ -282,7 +282,6 @@ class MegatronOptimizer(ABC):
         Coalesce the bias grads to avoid too many small reductions,
         but not the weight grads since it could cause memory issues.
         """
-        # print("Hi this is the allreduce_key_value_grads!!")
         grads=[]
         for model_module in self.models:
             unwrapped_model = unwrap_model(
