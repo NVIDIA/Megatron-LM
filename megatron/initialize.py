@@ -158,6 +158,15 @@ def _compile_dependencies():
         print('>>> done with dataset index builder. Compilation time: {:.3f} '
               'seconds'.format(time.time() - start_time), flush=True)
 
+    try:
+        # Skip the rest if the kernels are unnecessary or already available (ex. from apex)
+        if args.use_flash_attn or args.masked_softmax_fusion:
+            import scaled_upper_triang_masked_softmax_cuda
+            import scaled_masked_softmax_cuda
+        return
+    except ImportError:
+        pass
+
     # ==================
     # Load fused kernels
     # ==================
