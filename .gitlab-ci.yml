@@ -1,4 +1,4 @@
-image: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
+image: nvcr.io/nvidia/pytorch:23.04-py3
 
 stages:
   - test
@@ -20,6 +20,7 @@ unit_tests:
     - docker_local_runner
   stage: test
   script:
+    - pip install pytest-cov
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
