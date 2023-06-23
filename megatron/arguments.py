@@ -997,6 +997,9 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument('--skip-train', action='store_true',
+                       default=False, help='If set, bypass the training loop, '
+                       'optionally do evaluation for validation/test, and exit.')
 
     return parser
 
