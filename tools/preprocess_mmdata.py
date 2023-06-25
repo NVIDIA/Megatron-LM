@@ -8,6 +8,8 @@ import json
 import multiprocessing
 import os
 import sys
+import numpy as np
+from torchvision.transforms import ToTensor
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 import time
@@ -21,6 +23,7 @@ except ImportError:
 
 from megatron.tokenizer import build_tokenizer
 from megatron.data import indexed_dataset
+from megatron.data.indexed_dataset import MMapIndexedDatasetBuilder
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
@@ -47,49 +50,32 @@ class Encoder(object):
     def initializer(self):
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
-        if self.args.split_sentences:
-            if not nltk_available:
-                print("NLTK is not available to split sentences.")
-                exit()
-            splitter = nltk.load("tokenizers/punkt/english.pickle")
-            if self.args.keep_newlines:
-                # this prevents punkt from eating newlines after sentences
-                Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
-            else:
-                Encoder.splitter = splitter
 
-        else:
-            Encoder.splitter = IdentitySplitter()
-
-    def encode(self, json_line):
+    def encode(self, input_pair):
+        json_line, img_file = input_pair
         data = json.loads(json_line)
-        ids = {}
         key = "text"
         text = data[key]
-        doc_ids = []
-        for sentence in Encoder.splitter.tokenize(text):
-            sentence_ids = Encoder.tokenizer.tokenize(sentence)
-            if len(sentence_ids) > 0:
-                doc_ids.append(sentence_ids)
-
+        sentence_ids = Encoder.tokenizer.tokenize(text)
         pad_len = self.args.pad_length
-        if len(doc_ids) > 0 and self.args.append_eod:
-            doc_ids[-1] = doc_ids[-1][:pad_len]
-            current_length = len(doc_ids[-1])
-            doc_ids[-1].extend([Encoder.tokenizer.eod for _ in range(max(0,pad_len-current_length))])
-        return doc_ids, len(json_line)
+        if len(sentence_ids) > 0 and self.args.append_eod:
+            sentence_ids = sentence_ids[:pad_len]
+            current_length = len(sentence_ids)
+            sentence_ids.extend([Encoder.tokenizer.eod for _ in range(max(0,pad_len-current_length))])
+
+        with open(img_file[:-1], "rb") as tf:
+            img_raw = np.frombuffer(tf.read(), dtype=np.int32)
+
+        return sentence_ids, img_raw, len(json_line)
 
 def get_args():
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
-    group.add_argument('--start', type=int, required=True,
-                       help='Start of input JSON index')
-    group.add_argument('--end', type=int, required=True,
-                       help='End of input JSON index')
+    group.add_argument('--input-image', type=str, required=True,
+                       help='Path to input image folder')
+
     group.add_argument('--pad-length', type=int, required=True,
                        help='Pad length of preprocessed text')
 
@@ -114,9 +100,6 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-    group.add_argument('--dataset-impl', type=str, default='mmap',
-                       choices=['lazy', 'cached', 'mmap'])
-
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, default=1,
                        help='Number of worker processes to launch')
@@ -124,10 +107,6 @@ def get_args():
                        help='Interval between progress updates')
     args = parser.parse_args()
     args.keep_empty = False
-
-    if args.tokenizer_type.lower().startswith('bert'):
-        if not args.split_sentences:
-            print("Bert tokenizer detected, are you sure you don't want to split sentences?")
 
     # some default/dummy values for the tokenizer
     args.rank = 0
@@ -141,53 +120,44 @@ def main():
     args = get_args()
     startup_start = time.time()
 
-    if nltk_available and args.split_sentences:
-        nltk.download("punkt", quiet=True)
-
     encoder = Encoder(args)
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
 
-    for i in range(args.start, args.end):
+    fin = open(args.input + ".json", 'r', encoding='utf-8')
+    img_files = open(args.input_image)
 
-        fin = open(args.input + "%d.json" % (i), 'r', encoding='utf-8')
+    encoded_docs = pool.imap(encoder.encode, zip(fin, img_files), 25)
 
-        encoded_docs = pool.imap(encoder.encode, fin, 25)
+    print(f"Vocab size: {tokenizer.vocab_size}")
+    print(f"Output prefix: {args.output_prefix}")
+    
+    output_bin_files = "{}_text.bin".format(args.output_prefix)
+    output_idx_files = "{}_text.idx".format(args.output_prefix)
 
-        print(f"Vocab size: {tokenizer.vocab_size}")
-        print(f"Output prefix: {args.output_prefix}")
-        
-        output_bin_files = "{}_text.bin".format(args.output_prefix)
-        output_idx_files = "{}_text.idx".format(args.output_prefix)
+    builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32)
 
-        builders = indexed_dataset.make_builder(output_bin_files,
-                                                   impl=args.dataset_impl,
-                                                   vocab_size=tokenizer.vocab_size)
+    startup_end = time.time()
+    proc_start = time.time()
+    total_bytes_processed = 0
 
-        startup_end = time.time()
-        proc_start = time.time()
-        total_bytes_processed = 0
+    print("Time to startup:", startup_end - startup_start)
+    
+    for i, (sentence, img_raw, bytes_processed) in enumerate(encoded_docs, start=1):
+        total_bytes_processed += bytes_processed
+        builders.add_item(torch.IntTensor(sentence))
+        builders.add_item(ToTensor(img_raw))
+        builders.end_document()
+        if i % args.log_interval == 0:
+            current = time.time()
+            elapsed = current - proc_start
+            mbs = total_bytes_processed/elapsed/1024/1024
+            print(f"Processed {i} documents",
+                  f"({i/elapsed} docs/s, {mbs} MB/s).",
+                  file=sys.stderr)
+    
+    builders.finalize(output_idx_files)
 
-        print("Time to startup:", startup_end - startup_start)
-        
-        for i, (sentences, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
-            mx = max(mx, len(sentences[0]))
-            dl.append(len(sentences[0]))
-            count = 0
-            for sentence in sentences:
-                builders.add_item(torch.IntTensor(sentence))
-                count += 1
-            builders.end_document()
-            if i % args.log_interval == 0:
-                current = time.time()
-                elapsed = current - proc_start
-                mbs = total_bytes_processed/elapsed/1024/1024
-                print(f"Processed {i} documents",
-                      f"({i/elapsed} docs/s, {mbs} MB/s).",
-                      file=sys.stderr)
-        
-        builders.finalize(output_idx_files)
 
 if __name__ == '__main__':
     main()
