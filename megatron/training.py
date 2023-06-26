@@ -345,6 +345,7 @@ def get_optimizer_param_scheduler(optimizer):
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
+        init_lr=args.lr_warmup_init,
         max_lr=args.lr,
         min_lr=args.min_lr,
         lr_warmup_steps=lr_warmup_steps,

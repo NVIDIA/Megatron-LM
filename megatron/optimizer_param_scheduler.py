@@ -9,7 +9,7 @@ from megatron import print_rank_0
 class OptimizerParamScheduler(object):
     """Anneals learning rate and weight decay"""
 
-    def __init__(self, optimizer, max_lr, min_lr,
+    def __init__(self, optimizer, init_lr, max_lr, min_lr,
                  lr_warmup_steps, lr_decay_steps, lr_decay_style,
                  start_wd, end_wd, wd_incr_steps, wd_incr_style,
                  use_checkpoint_opt_param_scheduler=True,
@@ -18,6 +18,7 @@ class OptimizerParamScheduler(object):
         # Class values.
         self.optimizer = optimizer
 
+        self.init_lr = init_lr
         self.max_lr = float(max_lr)
         self.min_lr = min_lr
         assert self.min_lr >= 0.0
@@ -80,8 +81,14 @@ class OptimizerParamScheduler(object):
 
         # Use linear warmup for the initial part.
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
-            return self.max_lr * float(self.num_steps) / \
-                float(self.lr_warmup_steps)
+            return (
+                self.init_lr
+                + (
+                    (self.max_lr - self.init_lr)
+                    * float(self.num_steps)
+                    / float(self.lr_warmup_steps)
+                )
+            )
 
         # If the learning rate is constant, just return the initial value.
         if self.lr_decay_style == 'constant':
