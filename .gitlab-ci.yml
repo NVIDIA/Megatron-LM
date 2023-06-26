@@ -40,7 +40,7 @@ unit_tests:
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS 
+    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS
     - export DATA_DIR=$DATA_DIR
     - echo "Run name is $RUN_NAME"
     - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
@@ -65,7 +65,7 @@ unit_tests:
     # Gitlab logs collapsible section markers
     - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
     # Follow output of the job
-    - echo "Finished job"  
+    - echo "Finished job"
     - export SLURM_STATE=$(sacct -j "${SLURM_JOBID}" --format State --parsable2 --noheader |& head -n 1)
     - echo "Slurm job state $SLURM_STATE"
     - if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
@@ -79,7 +79,7 @@ unit_tests:
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always      
+      when: always
   allow_failure: false
 
 .selene_test_launcher: &selene-test-launcher
@@ -146,7 +146,7 @@ unit_tests:
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
-      when: always      
+      when: always
   allow_failure: false
 
 train.te_gpt3.345m_tp2_pp2_1node_50steps:
@@ -199,7 +199,7 @@ train.gpt3.345m_tp1_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0 
+    TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -224,7 +224,7 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     PP_SIZE: 2
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
-    TEST_LEVEL: L0 
+    TEST_LEVEL: L0
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher
@@ -260,7 +260,7 @@ train.bert.345m_tp1_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0 
+    TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -284,7 +284,7 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     PP_SIZE: 2
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
-    TEST_LEVEL: L0       
+    TEST_LEVEL: L0
 
 cleanup.selene:
   tags:
