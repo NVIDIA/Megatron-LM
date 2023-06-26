@@ -425,10 +425,13 @@ def build_training_sample(sample, target_seq_length,
             # tokens.
             tokens_dec_in = tokens_dec_in[1:]
             labels = labels[1:]
+
+        # Do not add separator token if S-denoising.
+        separator = [sep_id] if denoiser != 'S' else []
         tokens = (
             [bos_id]
             + tokens_enc
-            + [sep_id]
+            + separator
             + tokens_dec_in
         )
 
@@ -441,7 +444,7 @@ def build_training_sample(sample, target_seq_length,
         tokens = np.array(tokens + filler, dtype=np.int64)
         labels = np.array((
             tokens_enc
-            + [sep_id]
+            + separator
             + labels
             + filler
         ), dtype=np.int64)
