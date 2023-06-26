@@ -102,13 +102,12 @@ The training data requires preprocessing. First, place your training data in a l
 
 The name of the `text` field of the json can be changed by using the `--json-key` flag in [`preprocess_data.py`](./tools/preprocess_data.py) The other metadata are optional and are not used in training.
 
-The loose json is then processed into a binary format for training. To convert the json into mmap, cached index file, or the lazy loader format use `preprocess_data.py`. Set the `--dataset-impl` flag to `mmap`, `cached`, or `lazy`, respectively (default is `mmap`). An example script to prepare data for BERT training is:
+The loose json is then processed into a binary format for training. To convert the json into mmap format use `preprocess_data.py`. An example script to prepare data for BERT training is:
 <pre>
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-bert \
-       --vocab bert-vocab.txt \
-       --dataset-impl mmap \
+       --vocab-file bert-vocab.txt \
        --tokenizer-type BertWordPieceLowerCase \
        --split-sentences
 </pre>
@@ -125,7 +124,7 @@ Some minor modifications are required for GPT data preprocessing, namely, the ad
 python tools/preprocess_data.py \
        --input my-corpus.json \
        --output-prefix my-gpt2 \
-       --vocab gpt2-vocab.json \
+       --vocab-file gpt2-vocab.json \
        --dataset-impl mmap \
        --tokenizer-type GPT2BPETokenizer \
        --merge-file gpt2-merges.txt \
