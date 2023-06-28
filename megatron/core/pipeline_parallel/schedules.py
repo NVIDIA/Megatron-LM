@@ -251,7 +251,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
-        output_tensor = config.grad_scale_func(output_tensor[0])
+        output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
     if config.deallocate_pipeline_outputs:
         custom_backward(output_tensor[0], output_tensor_grad[0])
@@ -474,7 +474,7 @@ def forward_backward_pipelining_with_interleaving(*,
     def is_first_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the first for a model chunk."""
         microbatch_group_size = pipeline_parallel_size * num_model_chunks
-        num_microbatch_groups = num_microbatches // microbatch_group_size
+        num_microbatch_groups = total_num_microbatches // microbatch_group_size
         microbatch_group_id = microbatch_id // microbatch_group_size
         microbatch_id_in_group = microbatch_id % microbatch_group_size
         if microbatch_group_id == 0:
@@ -485,7 +485,7 @@ def forward_backward_pipelining_with_interleaving(*,
     def is_last_microbatch_for_model_chunk(microbatch_id: int) -> bool:
         """Check if an iteration is the last for a model chunk."""
         microbatch_group_size = pipeline_parallel_size * num_model_chunks
-        num_microbatch_groups = num_microbatches // microbatch_group_size
+        num_microbatch_groups = total_num_microbatches // microbatch_group_size
         microbatch_group_id = microbatch_id // microbatch_group_size
         microbatch_id_in_group = microbatch_id % microbatch_group_size
         if microbatch_group_id == num_microbatch_groups - 1:

@@ -141,39 +141,45 @@ def pretrain(train_valid_test_dataset_provider,
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
                 'train/valid/test-data-iterators-setup'], barrier=True)
-    print_rank_0('training ...')
 
-    iteration = 0
+    if not args.skip_train:
+        print_rank_0('training ...')
 
-    if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
-        args.train_iters = args.retro_cyclic_train_iters
-        print_rank_0("retro cyclic train iters : %d" % args.train_iters)
+        if args.dataloader_type == 'cyclic' and args.retro_add_retriever:
+            args.train_iters = args.retro_cyclic_train_iters
+            print_rank_0("retro cyclic train iters : %d" % args.train_iters)
 
-    if args.do_train and args.train_iters > 0:
-        iteration = train(forward_step_func,
-                          model, optimizer, opt_param_scheduler,
-                          train_data_iterator, valid_data_iterator,
-                          process_non_loss_data_func)
-    print_datetime('after training is done')
+        iteration = 0
+        if args.do_train and args.train_iters > 0:
+            iteration = train(forward_step_func,
+                            model, optimizer, opt_param_scheduler,
+                            train_data_iterator, valid_data_iterator,
+                            process_non_loss_data_func)
+
+        print_datetime('after training is done')
+
+        if args.save and iteration != 0:
+            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+    else:
+        print_rank_0('skipping training (--skip-train is on) ...')
+
+        iteration = args.iteration
 
     config = core_transformer_config_from_args(args)
     if args.do_valid:
-        prefix = 'the end of training for val data'
+        prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
-                                   iteration, process_non_loss_data_func,
-                                   config, False)
-
-    if args.save and iteration != 0:
-        save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+                                   iteration, process_non_loss_data_func, config,
+                                   verbose=True, write_to_tensorboard=not args.skip_train)
 
     if args.do_test:
-        # Run on test data.
-        prefix = 'the end of training for test data'
+        prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
-                                   0, process_non_loss_data_func,
-                                   config, True)
+                                   iteration, process_non_loss_data_func, config,
+                                   verbose=True, write_to_tensorboard=not args.skip_train)
+
 
 def update_train_iters(args):
 
@@ -868,12 +874,14 @@ def evaluate(forward_step_func,
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
-                               iteration, process_non_loss_data_func,
-                               config,
-                               verbose=False):
+                               iteration, process_non_loss_data_func, config,
+                               verbose=False, write_to_tensorboard=True):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
-    writer = get_tensorboard_writer()
+    if write_to_tensorboard:
+        writer = get_tensorboard_writer()
+    else:
+        writer = None
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
@@ -911,9 +919,35 @@ def cyclic_iter(iter):
             yield x
 
 
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
+    """Build pretraining datasets."""
+
+    args = get_args()
+
+    # Number of train/valid/test samples.
+    if args.train_samples:
+        train_samples = args.train_samples
+    else:
+        train_samples = args.train_iters * args.global_batch_size
+    eval_iters = (args.train_iters // args.eval_interval + 1) * \
+                 args.eval_iters
+    test_iters = args.eval_iters
+    train_val_test_num_samples = [train_samples,
+                                  eval_iters * args.global_batch_size,
+                                  test_iters * args.global_batch_size]
+    print_rank_0(' > datasets target sizes (minimum size):')
+    print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
+    print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
+    print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
+
+    # Build the datasets.
+    return build_train_valid_test_datasets_provider(train_val_test_num_samples)
+
+
 def build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider):
-    """XXX"""
+    """Build pretraining data loaders."""
+
     args = get_args()
 
     (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
@@ -933,25 +967,9 @@ def build_train_valid_test_data_loaders(
     # Data loader only on rank 0 of each model parallel group.
     if mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Number of train/valid/test samples.
-        if args.train_samples:
-            train_samples = args.train_samples
-        else:
-            train_samples = args.train_iters * args.global_batch_size
-        eval_iters = (args.train_iters // args.eval_interval + 1) * \
-                     args.eval_iters
-        test_iters = args.eval_iters
-        train_val_test_num_samples = [train_samples,
-                                      eval_iters * args.global_batch_size,
-                                      test_iters * args.global_batch_size]
-        print_rank_0(' > datasets target sizes (minimum size):')
-        print_rank_0('    train:      {}'.format(train_val_test_num_samples[0]))
-        print_rank_0('    validation: {}'.format(train_val_test_num_samples[1]))
-        print_rank_0('    test:       {}'.format(train_val_test_num_samples[2]))
-
-        # Build the datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets_provider(
-            train_val_test_num_samples)
+        # Build datasets.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            build_train_valid_test_datasets_provider)
 
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
@@ -983,6 +1001,7 @@ def build_train_valid_test_data_loaders(
 
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
+    """Build pretraining data iterators."""
 
     args = get_args()
 

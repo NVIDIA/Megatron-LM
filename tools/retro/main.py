@@ -55,15 +55,40 @@ def add_retro_args(parser):
                        "a separate file.")
 
     # GPT args.
+    group.add_argument('--retro-gpt-seed', type=int, default=1234,
+                       help='Random seed used for python, numpy, '
+                       'pytorch, and cuda.')
+    group.add_argument('--retro-gpt-data-impl', type=str, default='infer',
+                       choices=['lazy', 'cached', 'mmap', 'infer'],
+                       help='Implementation of indexed datasets.')
+    group.add_argument('--retro-gpt-data-path', nargs='*', required=True,
+                       help='Path to the training dataset. Accepted format:'
+                       '1) a single data path, 2) multiple datasets in the'
+                       'form: dataset1-weight dataset1-path dataset2-weight '
+                       'dataset2-path ... It is used with --split when a '
+                       'single dataset used for all three: train, valid '
+                       'and test. It is exclusive to the other '
+                       '--*-data-path args')
+    group.add_argument('--retro-gpt-split', type=str, default='969,30,1',
+                       help='Comma-separated list of proportions for training,'
+                       ' validation, and test split. For example the split '
+                       '`90,5,5` will use 90%% of data for training, 5%% for '
+                       'validation and 5%% for test.')
+    group.add_argument('--retro-gpt-mmap-warmup', action='store_true',
+                       help='Warm up mmap files.')
+    group.add_argument("--retro-gpt-eval-interval", type=int, required=True,
+                       help="GPT evaluation interval.")
+    group.add_argument("--retro-gpt-eval-iters", type=int, required=True,
+                       help="GPT evaluation iterations.")
     group.add_argument("--retro-gpt-tokenizer-type", required=True,
                        help="GPT tokenizer type.")
     group.add_argument("--retro-gpt-vocab-file", help="GPT vocab file.")
     group.add_argument("--retro-gpt-merge-file", help="GPT merge file.")
     group.add_argument("--retro-gpt-tokenizer-model",
                        help="GPT tokenizer model file.")
-    group.add_argument("--retro-gpt-seq-length", type=int, default=2048,
+    group.add_argument("--retro-gpt-seq-length", type=int, required=True,
                        help="GPT sequence length.")
-    group.add_argument("--retro-gpt-global-batch-size", type=int, default=2048,
+    group.add_argument("--retro-gpt-global-batch-size", type=int, required=True,
                        help="GPT global batch size.")
     group.add_argument("--retro-gpt-chunk-length", type=int, default=64,
                        help="GPT chunk length.")
