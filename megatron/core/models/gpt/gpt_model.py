@@ -41,7 +41,7 @@ class GPTModel(MegatronModule):
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = True,
+        share_embeddings_and_output_weights: bool = False,
     ):
         super(GPTModel, self).__init__(config=config)
 
