@@ -52,7 +52,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-        
+
     return args
 
 def validate_args(args, defaults={}):
@@ -577,6 +577,8 @@ def _add_network_size_args(parser):
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
+    group.add_argument('--embedding-weights-in-fp32', action='store_true',
+                       help='Cast word embedding weights to fp32 before embedding fwd.'),
     return parser
 
 
@@ -1019,6 +1021,9 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument('--skip-train', action='store_true',
+                       default=False, help='If set, bypass the training loop, '
+                       'optionally do evaluation for validation/test, and exit.')
 
     return parser
 
@@ -1099,7 +1104,7 @@ def _add_data_args(parser):
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--data-impl', type=str, default='infer',
-                       choices=['lazy', 'cached', 'mmap', 'infer'],
+                       choices=['mmap', 'infer'],
                        help='Implementation of indexed datasets.')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
@@ -1217,14 +1222,14 @@ def _add_vision_args(parser):
     group.add_argument('--swin-backbone-type', type=str, default='tiny',
                        choices=['tiny', 'base', 'h3'],
                        help='pretraining objectives')
-    
+
     # inpainting arguments
     group.add_argument('--mask-type', type=str, default='random',
                        choices=['random', 'row'],
                        help='mask types')
     group.add_argument('--mask-factor', type=float, default=1.0,
                        help='mask size scaling parameter')
- 
+
     # dino arguments
     group.add_argument('--iter-per-epoch', type=int, default=1250,
                        help='iterations per epoch')
