@@ -81,7 +81,7 @@ class GPTModel(MegatronModule):
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
-                skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights)
+                skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights)
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
@@ -123,7 +123,10 @@ class GPTModel(MegatronModule):
             return hidden_states
 
         # logits and loss
-        logits, _ = self.output_layer(hidden_states, weight=self.shared_embedding_or_output_weight())
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+        logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
         if labels is None:
             # [s b h] => [b s h]
@@ -155,7 +158,6 @@ class GPTModel(MegatronModule):
 
         if self.post_process and not self.pre_process:
             assert not parallel_state.is_pipeline_first_stage()
-            self._word_embeddings_for_head_key = 'word_embeddings_for_head'
             # set word_embeddings weights to 0 here, then copy first
             # stage's weights using all_reduce below.
             self.output_layer.weight.data.fill_(0)

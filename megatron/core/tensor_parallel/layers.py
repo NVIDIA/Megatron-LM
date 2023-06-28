@@ -439,8 +439,9 @@ class ColumnParallelLinear(torch.nn.Module):
                        be fused with other elementwise operations.
 
         skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed
-                                      as a keyword argument `weight` during the forward
-                                      pass. Defaults to False.
+                                      as a keyword argument `weight` during the forward pass. Note
+                                      that this does not affect bias, which will be allocated if
+                                      bias is True. Defaults to False.
 
         config: ModelParallelConfig object
 
@@ -558,6 +559,13 @@ class ColumnParallelLinear(torch.nn.Module):
                 raise RuntimeError("weight was not supplied to ColumnParallelLinear forward pass "
                                    "and skip_weight_param_allocation is True.")
             weight = self.weight
+        else:
+            # Check the weight passed in is the correct shape
+            expected_shape = (self.output_size_per_partition, self.input_size)
+            if weight.shape != expected_shape:
+                raise RuntimeError(f"supplied weight's shape is {tuple(weight.shape)}, "
+                                   f"not {expected_shape} as expected")
+
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
