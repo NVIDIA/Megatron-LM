@@ -32,7 +32,9 @@ def model_provider(pre_process=True, post_process=True):
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        use_rotary_position_embeddings=args.use_rotary_position_embeddings,
+        rotary_percent=args.rotary_percent
     )
     return model
 
