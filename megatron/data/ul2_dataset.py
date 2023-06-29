@@ -416,8 +416,6 @@ def build_training_sample(sample, target_seq_length,
             tokens_dec_in.append(eos_id)
             labels.append(eos_id)
 
-        num_labels = len(labels)
-
         # Move BOS token to start of sequence.
         tokens_dec_in = tokens_dec_in[1:]
         if not add_mask_tokens:
@@ -425,6 +423,8 @@ def build_training_sample(sample, target_seq_length,
             # tokens.
             tokens_dec_in = tokens_dec_in[1:]
             labels = labels[1:]
+
+        num_labels = len(labels)
 
         # Do not add separator token if S-denoising.
         separator = [sep_id] if denoiser != 'S' else []
