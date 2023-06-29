@@ -79,12 +79,16 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
-        self.add_bias = args.add_bias_linear
+        self.add_bias = config.add_bias_linear
+
+        ffn_hidden_size = config.ffn_hidden_size
+        if config.gated_linear_unit:
+            ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
-            config.ffn_hidden_size * 2 if args.swiglu else config.ffn_hidden_size,
+            ffn_hidden_size,
             config=config,
             init_method=config.init_method,
             bias=self.add_bias,
@@ -443,7 +447,7 @@ class ParallelAttention(MegatronModule):
                 projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=config.add_bias_linear,
                 gather_output=False)
 
 
@@ -452,7 +456,7 @@ class ParallelAttention(MegatronModule):
                 2 * projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=config.add_bias_linear,
                 gather_output=False)
 
         self.core_attention = CoreAttention(self.layer_number, config,
