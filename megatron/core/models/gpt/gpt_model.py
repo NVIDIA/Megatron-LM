@@ -16,13 +16,20 @@ class GPTModel(MegatronModule):
     """Transformer language model.
 
     Arguments:
-        transformer_hparams: transformer hyperparameters
-        vocab_size: vocabulary size
-        max_sequence_length: maximum size of sequence. This
-                             is used for positional embedding
-        embedding_dropout_prob: dropout probability for embeddings
-        num_tokentypes: size of the token-type embeddings. 0 value
-                        will ignore this embedding
+        config (TransformerConfig): transformer config
+
+        vocab_size (int): vocabulary size
+
+        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
+
+        pre_process (bool): Include embedding layer (used with pipeline parallelism)
+        post_process (bool): Include an output layer (used with pipeline parallelism)
+
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
+
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
+            shared. Defaults to False.
+
     """
 
     def __init__(
@@ -34,7 +41,7 @@ class GPTModel(MegatronModule):
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = True,
+        share_embeddings_and_output_weights: bool = False,
     ):
         super(GPTModel, self).__init__(config=config)
 
@@ -64,7 +71,20 @@ class GPTModel(MegatronModule):
             post_process=self.post_process,
         )
 
-        self.initialize_last_stage_word_embeddings()
+        # Output
+        if post_process:
+            self.output_layer = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                self.vocab_size,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                gather_output=not self.parallel_output,
+                skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights)
+
+        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
+            self.initialize_last_stage_with_word_embeddings()
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
@@ -99,70 +119,49 @@ class GPTModel(MegatronModule):
             hidden_states=decoder_input, attention_mask=attention_mask, inference_params=inference_params
         )
 
-        if self.post_process:
-            logits = self.post_language_model_processing(
-                hidden_states=hidden_states, labels=labels, logit_weights=self.word_embeddings_weight(),
-            )
-            return logits
+        if not self.post_process:
+            return hidden_states
 
-        return hidden_states
-
-    def parallel_lm_logits(
-        self, input_: Tensor, word_embeddings_weight: Tensor, bias: Tensor = None,
-    ):
-        """LM logits using word embedding weights."""
-        # Parallel logits.
-        if self.config.async_tensor_model_parallel_allreduce or self.config.sequence_parallel:
-            input_parallel = input_
-        else:
-            input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
-
-        # Matrix multiply.
-        logits_parallel = tensor_parallel.linear_with_grad_accumulation_and_async_allreduce(
-            input=input_parallel,
-            weight=word_embeddings_weight,
-            bias=bias,
-            gradient_accumulation_fusion=self.config.gradient_accumulation_fusion,
-            async_grad_allreduce=self.config.async_tensor_model_parallel_allreduce,
-            sequence_parallel=self.config.sequence_parallel,
-        )
-
-        # Gather if needed.
-        if self.parallel_output:
-            return logits_parallel
-        else:
-            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits_parallel)
-
-        return logits
-
-    def post_language_model_processing(self, hidden_states: Tensor, labels: Tensor, logit_weights: Tensor):
-
-        # Output. Format [s b h]
-        output = self.parallel_lm_logits(hidden_states, logit_weights)
+        # logits and loss
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+        logits, _ = self.output_layer(hidden_states, weight=output_weight)
 
         if labels is None:
             # [s b h] => [b s h]
-            return output.transpose(0, 1).contiguous()
-        else:
-            # [b s] => [s b]
-            labels = labels.transpose(0, 1).contiguous()
-            if self.fp16_lm_cross_entropy:
-                assert output.dtype == torch.half
-                loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
-            else:
-                loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
+            return logits.transpose(0, 1).contiguous()
 
-            # [s b] => [b, s]
-            loss = loss.transpose(0, 1).contiguous()
-            return loss
+        # [b s] => [s b]
+        labels = labels.transpose(0, 1).contiguous()
+        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
 
-    def initialize_last_stage_word_embeddings(self):
+        # [s b] => [b, s]
+        loss = loss.transpose(0, 1).contiguous()
+        return loss
+
+    def shared_embedding_or_output_weight(self):
+        if self.pre_process:
+            return self.embedding.word_embeddings.weight
+        elif self.post_process:
+            return self.output_layer.weight
+        return None
+
+    def initialize_last_stage_with_word_embeddings(self):
 
         # This function just initializes the word embeddings in the final stage
-        # when we are using pipeline parallelism. Nothing to do if we aren't
-        # using pipeline parallelism.
-        if self.config.pipeline_model_parallel_size == 1:
+        # when we are using pipeline parallelism and sharing word
+        # embeddings. Nothing to do if we aren't sharing weights or aren't using
+        # pipeline parallelism.
+        if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
             return
+
+        if self.post_process and not self.pre_process:
+            assert not parallel_state.is_pipeline_first_stage()
+            # set word_embeddings weights to 0 here, then copy first
+            # stage's weights using all_reduce below.
+            self.output_layer.weight.data.fill_(0)
+            self.output_layer.weight.shared = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
@@ -176,54 +175,23 @@ class GPTModel(MegatronModule):
         # 3. In the training loop, before an all-reduce between the grads of
         #    the two word_embeddings layers to ensure that every applied weight
         #    update is the same on both stages.
-        if parallel_state.is_pipeline_last_stage() and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage()
-            self._word_embeddings_for_head_key = 'word_embeddings_for_head'
-            # set word_embeddings weights to 0 here, then copy first
-            # stage's weights using all_reduce below.
-            self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
-                num_embeddings=self.vocab_size,
-                embedding_dim=self.config.hidden_size,
-                init_method=self.config.init_method,
-                config=self.config
-            )
-            self.word_embeddings.weight.data.fill_(0)
-            self.word_embeddings.weight.shared = True
-
-        self.sync_first_and_last_stage_word_embeddings()
-
-    def word_embeddings_weight(self):
-        if self.pre_process:
-            return self.embedding.word_embeddings.weight
-        else:
-            if not self.share_embeddings_and_output_weights:
-                raise Exception(
-                    'word_embeddings_weight() called for last '
-                    'stage, but share_embeddings_and_output_weights is false'
-                )
-            return self.word_embeddings.weight
-
-    def sync_first_and_last_stage_word_embeddings(self):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
             if parallel_state.is_rank_in_embedding_group():
-                torch.distributed.all_reduce(
-                    self.word_embeddings_weight().data, group=parallel_state.get_embedding_group()
-                )
-        else:
-            # TODO: this should be log not print
-            if not getattr(MegatronModule, "embedding_warning_printed", False):
-                print(
-                    "WARNING! Distributed processes aren't initialized, so "
-                    "word embeddings in the last layer are not initialized. "
-                    "If you are just manipulating a model this is fine, but "
-                    "this needs to be handled manually. If you are training "
-                    "something is definitely wrong."
-                )
-                MegatronModule.embedding_warning_printed = True
-            return
+                weight = self.shared_embedding_or_output_weight()
+                torch.distributed.all_reduce(weight.data, group=parallel_state.get_embedding_group())
+
+        elif not getattr(GPTModel, "embedding_warning_printed", False):
+            logging.getLogger(__name__).warning(
+                "Distributed processes aren't initialized, so the output layer "
+                "is not initialized with weights from the word embeddings. "
+                "If you are just manipulating a model this is fine, but "
+                "this needs to be handled manually. If you are training "
+                "something is definitely wrong."
+            )
+            GPTModel.embedding_warning_printed = True
 
     # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):

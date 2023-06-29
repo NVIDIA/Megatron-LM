@@ -37,12 +37,12 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
 
-    def word_embeddings_weight(self):
+    def shared_embedding_or_output_weight(self):
         if self.pre_process:
             return self.language_model.embedding.word_embeddings.weight
         else:
             if not self.share_embeddings_and_output_weights:
-                raise Exception('word_embeddings_weight() called for last '
+                raise Exception('shared_embedding_or_output_weight() called for last '
                                 'stage, but share_embeddings_and_output_weights is false')
             return self.word_embeddings.weight
 
@@ -101,7 +101,7 @@ class MegatronModule(torch.nn.Module):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if mpu.is_rank_in_embedding_group():
-            torch.distributed.all_reduce(self.word_embeddings_weight().data,
+            torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
                                          group=mpu.get_embedding_group())
 
         # Ensure that encoder(first stage) and decoder(split stage) position

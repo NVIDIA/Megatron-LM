@@ -270,9 +270,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.sequence_parallel:
             handle.wait()
 
-        # Doing gather + slicing during the NeMo forward pass can make this tensor 
-        # not be contiguous. PyTorch only checks if the tensor is contiguous, and only 
-        # clones it if it's not contiguous: 
+        # Doing gather + slicing during the NeMo forward pass can make this tensor
+        # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
+        # clones it if it's not contiguous:
         # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
         grad_output = grad_output.contiguous()
         # Convert the tensor shapes to 2D for execution compatibility
@@ -437,6 +437,12 @@ class ColumnParallelLinear(torch.nn.Module):
                        return it to be added by the caller. This
                        enables performance optimations where bias can
                        be fused with other elementwise operations.
+
+        skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed
+                                      as a keyword argument `weight` during the forward pass. Note
+                                      that this does not affect bias, which will be allocated if
+                                      bias is True. Defaults to False.
+
         config: ModelParallelConfig object
 
     """
@@ -446,7 +452,8 @@ class ColumnParallelLinear(torch.nn.Module):
                  init_method: Callable,
                  bias=True, gather_output=False, stride=1,
                  keep_master_weight_for_test=False,
-                 skip_bias_add=False):
+                 skip_bias_add=False,
+                 skip_weight_param_allocation: bool=False):
         super(ColumnParallelLinear, self).__init__()
 
         # Keep input parameters
@@ -463,22 +470,25 @@ class ColumnParallelLinear(torch.nn.Module):
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
         # we allocate the transpose.
         # Initialize weight.
-        if config.use_cpu_initialization:
-            self.weight = Parameter(torch.empty(self.output_size_per_partition,
-                                                self.input_size,
-                                                dtype=config.params_dtype))
-            if config.perform_initialization:
-                self.master_weight = _initialize_affine_weight_cpu(
-                    self.weight, self.output_size, self.input_size,
-                    self.output_size_per_partition, 0, init_method,
-                    stride=stride, return_master_weight=keep_master_weight_for_test)
+        if not skip_weight_param_allocation:
+            if config.use_cpu_initialization:
+                self.weight = Parameter(torch.empty(self.output_size_per_partition,
+                                                    self.input_size,
+                                                    dtype=config.params_dtype))
+                if config.perform_initialization:
+                    self.master_weight = _initialize_affine_weight_cpu(
+                        self.weight, self.output_size, self.input_size,
+                        self.output_size_per_partition, 0, init_method,
+                        stride=stride, return_master_weight=keep_master_weight_for_test)
+            else:
+                self.weight = Parameter(torch.empty(
+                    self.output_size_per_partition, self.input_size,
+                    device=torch.cuda.current_device(), dtype=config.params_dtype))
+                if config.perform_initialization:
+                    _initialize_affine_weight_gpu(self.weight, init_method,
+                                                  partition_dim=0, stride=stride)
         else:
-            self.weight = Parameter(torch.empty(
-                self.output_size_per_partition, self.input_size,
-                device=torch.cuda.current_device(), dtype=config.params_dtype))
-            if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=stride)
+            self.weight = None
 
         if bias:
             if config.use_cpu_initialization:
@@ -528,16 +538,34 @@ class ColumnParallelLinear(torch.nn.Module):
             )
 
 
-    def forward(self, input_):
+    def forward(self,
+                input_: torch.Tensor,
+                weight: Optional[torch.Tensor] = None):
         """Forward of ColumnParallelLinear
 
         Args:
             input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
 
+            weight (optional): weight tensor to use, compulsory when
+                skip_weight_param_allocation is True.
+
         Returns:
             - output
             - bias
+
         """
+        if weight is None:
+            if self.weight is None:
+                raise RuntimeError("weight was not supplied to ColumnParallelLinear forward pass "
+                                   "and skip_weight_param_allocation is True.")
+            weight = self.weight
+        else:
+            # Check the weight passed in is the correct shape
+            expected_shape = (self.output_size_per_partition, self.input_size)
+            if weight.shape != expected_shape:
+                raise RuntimeError(f"supplied weight's shape is {tuple(weight.shape)}, "
+                                   f"not {expected_shape} as expected")
+
         bias = self.bias if not self.skip_bias_add else None
 
         if self.async_tensor_model_parallel_allreduce or \
@@ -548,7 +576,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Matrix multiply.
         output_parallel = linear_with_grad_accumulation_and_async_allreduce(
             input=input_parallel,
-            weight=self.weight,
+            weight=weight,
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=self.async_tensor_model_parallel_allreduce,
