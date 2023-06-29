@@ -151,7 +151,6 @@ class T5Dataset(torch.utils.data.Dataset):
                 prev_len,
                 prev_len_dec,
                 self.pad_id,
-                self.eos_id,
             )
             if maybe_lens is None:
                 # We are exceeding our sequence length already.
@@ -467,7 +466,6 @@ def update_samples_dict(
         prev_len,
         prev_len_dec,
         pad_id,
-        eos_id,
 ):
     _remove_padding(result_sample, pad_id)
 
@@ -475,54 +473,16 @@ def update_samples_dict(
     len_dec = len(result_sample['text_dec'])
 
     if (
-            (
-                prev_len
-                + len_enc
-                + int(result_sample['text_enc'][-1] != eos_id)
-            ) > max_seq_len
-            or (
-                prev_len_dec
-                + len_dec
-                + int(result_sample['text_dec'][-1] != eos_id)
-            ) > max_seq_len_dec
+            prev_len + len_enc > max_seq_len
+            or prev_len_dec + len_dec > max_seq_len_dec
     ):
         return None
 
-    eos_added = {
-        'text_enc': False,
-        'text_dec': False,
-        'labels': False,
-    }
-    for (key, is_enc) in zip(
-            ['text_enc', 'text_dec', 'labels'],
-            [True, False, False],
-    ):
+    for key in ['text_enc', 'text_dec', 'labels']:
         curr_sample = result_sample[key]
         offset, length = get_lens(
             key, prev_len, prev_len_dec, len_enc, len_dec)
         samples_dict[key][offset:offset + length] = curr_sample
-
-        # Add EOS token if not present.
-        if (
-                curr_sample[-1] != eos_id
-                or key == 'labels' and eos_added['text_dec']
-        ):
-            samples_dict[key][offset + length] = eos_id
-            eos_added[key] = True
-
-    need_extras = {
-        'loss_mask': False,
-        'enc_mask': False,
-        'dec_mask': False,
-        'enc_dec_mask': [False, False],
-    }
-    if eos_added['text_enc']:
-        need_extras['enc_mask'] = True
-        need_extras['enc_dec_mask'][1] = True
-    if eos_added['text_dec']:
-        need_extras['loss_mask'] = True
-        need_extras['dec_mask'] = True
-        need_extras['enc_dec_mask'][0] = True
 
     samples_dict['loss_mask'][
         prev_len_dec:prev_len_dec + len_dec,
@@ -540,42 +500,7 @@ def update_samples_dict(
         prev_len:prev_len + len_enc,
     ] += result_sample['enc_dec_mask']
 
-    if need_extras['loss_mask']:
-        samples_dict['loss_mask'][prev_len_dec + len_dec] = 1
-
-    for key in ['enc_mask', 'dec_mask']:
-        if need_extras[key]:
-            all_samples = samples_dict[key]
-            offset, length = get_lens(
-                key, prev_len, prev_len_dec, len_enc, len_dec)
-            all_samples[
-                offset + length,
-                offset:offset + length,
-            ] = 1
-            all_samples[
-                offset:offset + length,
-                offset + length,
-            ] = 1
-
-    if need_extras['enc_dec_mask'][0] or need_extras['enc_dec_mask'][1]:
-        all_samples = samples_dict['enc_dec_mask']
-        if need_extras['enc_dec_mask'][0]:
-            all_samples[
-                prev_len_dec + len_dec,
-                prev_len:prev_len + len_enc,
-            ] = 1
-        elif need_extras['enc_dec_mask'][1]:
-            all_samples[
-                prev_len_dec:prev_len_dec + len_dec,
-                prev_len + len_enc,
-            ] = 1
     samples_dict['truncated'] += result_sample['truncated']
-
-    if eos_added['text_enc']:
-        len_enc += 1
-    if eos_added['text_dec']:
-        len_dec += 1
-
     return len_enc, len_dec
 
 

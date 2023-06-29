@@ -228,7 +228,6 @@ class UL2Dataset(torch.utils.data.Dataset):
                     self.max_seq_length,
                     prev_len,
                     self.pad_id,
-                    self.eos_id,
                 )
             else:
                 maybe_lens = update_samples_dict(
@@ -239,7 +238,6 @@ class UL2Dataset(torch.utils.data.Dataset):
                     prev_len,
                     prev_len_dec,
                     self.pad_id,
-                    self.eos_id,
                 )
             if maybe_lens is None:
                 # We are exceeding our sequence length already.
@@ -525,32 +523,16 @@ def update_samples_dict_decoder_only(
         max_seq_len,
         prev_len,
         pad_id,
-        eos_id,
 ):
     _remove_padding(result_sample, pad_id)
     len_enc = len(result_sample['text'])
 
-    if (
-            (
-                prev_len
-                + len_enc
-                + int(result_sample['text'][-1] != eos_id)
-            ) > max_seq_len
-    ):
+    if prev_len + len_enc > max_seq_len:
         return None
 
-    eos_added = False
     for key in ['text', 'labels']:
         curr_sample = result_sample[key]
         samples_dict[key][prev_len:prev_len + len_enc] = curr_sample
-
-        # Add EOS token if not present.
-        if (
-                curr_sample[-1] != eos_id
-                or key == 'labels' and eos_added
-        ):
-            samples_dict[key][prev_len + len_enc] = eos_id
-            eos_added = True
 
     samples_dict['loss_mask'][
         prev_len:prev_len + len_enc,
@@ -560,21 +542,5 @@ def update_samples_dict_decoder_only(
         prev_len:prev_len + len_enc,
     ] += result_sample['dec_mask']
 
-    if eos_added:
-        samples_dict['loss_mask'][prev_len + len_enc] = 1
-
-        all_samples = samples_dict['dec_mask']
-        all_samples[
-            prev_len + len_enc,
-            prev_len:prev_len + len_enc,
-        ] = 1
-        all_samples[
-            prev_len:prev_len + len_enc,
-            prev_len + len_enc,
-        ] = 1
-
-        len_enc += 1
-
     samples_dict['truncated'] += result_sample['truncated']
-
     return len_enc
