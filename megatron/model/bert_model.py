@@ -184,19 +184,14 @@ class BertModel(MegatronModule):
             tokentype_ids=tokentype_ids
         )
 
-        if self.post_process and self.add_binary_head:
-            lm_output, pooled_output = lm_output[0], lm_output[1]
-        else:
-            lm_output, pooled_output = lm_output[0], None
-
         if self.post_process:
-            return post_language_model_processing(lm_output, pooled_output,
+            pooled_output = lm_output[1] if self.add_binary_head else None
+            return post_language_model_processing(lm_output[0], pooled_output,
                                                   self.lm_head, self.binary_head,
                                                   lm_labels,
                                                   self.word_embeddings_weight(),
                                                   self.fp16_lm_cross_entropy)
-        else:
-            return lm_output
+        return lm_output
 
 
     def state_dict_for_save_checkpoint(self, destination=None, prefix='',
