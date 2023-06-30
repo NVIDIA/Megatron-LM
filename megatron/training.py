@@ -40,6 +40,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
+from megatron.arguments import core_transformer_config_from_args
 
 
 def print_datetime(string):
@@ -164,18 +165,19 @@ def pretrain(train_valid_test_dataset_provider,
 
         iteration = args.iteration
 
+    config = core_transformer_config_from_args(args)
     if args.do_valid:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
-                                   iteration, process_non_loss_data_func,
+                                   iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
     if args.do_test:
         prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
-                                   iteration, process_non_loss_data_func,
+                                   iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
 
@@ -408,7 +410,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler):
+               model, optimizer, opt_param_scheduler, config):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -423,20 +425,24 @@ def train_step(forward_step_func, data_iterator,
     timers('forward-backward', log_level=1).start(
         barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
-    fwd_bwd_timers = timers if args.timing_log_level > 1 else None
+
+    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
+    if args.timing_log_level < 2:
+        config.timers = None
+
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
         model=model,
         num_microbatches=get_num_microbatches(),
-        dtype=args.params_dtype,
-        tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
-        grad_scaler=optimizer.scale_loss,
-        sequence_parallel=args.sequence_parallel,
-        overlap_p2p_comm=args.overlap_p2p_comm,
-        batch_p2p_comm=not args.overlap_p2p_comm,
-        forward_only=False,
-        timers=fwd_bwd_timers)
+        seq_length=args.seq_length,
+        micro_batch_size=args.micro_batch_size,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False)
+
+    # reset timers if necessary
+    if config.timers is None:
+        config.timers = timers
     timers('forward-backward').stop()
 
     # Empty unused memory.
@@ -697,6 +703,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Iterations.
     iteration = args.iteration
 
+    # Translate args to core configuration
+    config = core_transformer_config_from_args(args)
+    config.grad_scale_func = optimizer.scale_loss
+    config.timers = timers
+
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
@@ -708,7 +719,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        train_data_iterator,
                        model,
                        optimizer,
-                       opt_param_scheduler)
+                       opt_param_scheduler,
+                       config)
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
@@ -738,7 +750,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
-                                       False)
+                                       config, False)
 
         # Checkpointing
         saved_checkpoint = False
@@ -788,6 +800,7 @@ def evaluate(forward_step_func,
              data_iterator,
              model,
              process_non_loss_data_func,
+             config,
              verbose=False):
     """Evaluation."""
     args = get_args()
@@ -810,16 +823,18 @@ def evaluate(forward_step_func,
                                                             args.eval_iters))
 
             forward_backward_func = get_forward_backward_func()
+            # Don't care about timing during evaluation
+            config.timers = None
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                dtype=args.params_dtype,
-                tensor_shape=(args.seq_length, args.micro_batch_size, args.hidden_size),
-                sequence_parallel=args.sequence_parallel,
-                forward_only=True,
-                timers=None)
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True)
+            config.timers = get_timers()
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
@@ -838,8 +853,15 @@ def evaluate(forward_step_func,
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
-                forward_step_func, data_iterator, model, optimizer=None,
-                timers=None, forward_only=True, collect_non_loss_data=True)
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=get_num_microbatches(),
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=True,
+                collect_non_loss_data=True)
 
     # Move model back to the train mode.
     for model_module in model:
@@ -852,7 +874,7 @@ def evaluate(forward_step_func,
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
-                               iteration, process_non_loss_data_func,
+                               iteration, process_non_loss_data_func, config,
                                verbose=False, write_to_tensorboard=True):
     """Helper function to evaluate and dump results on screen."""
     args = get_args()
@@ -863,7 +885,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     total_loss_dict, collected_non_loss_data = evaluate(
         forward_step_func, data_iterator, model,
-        process_non_loss_data_func, verbose)
+        process_non_loss_data_func, config, verbose)
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())

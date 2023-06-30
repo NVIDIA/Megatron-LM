@@ -3,14 +3,17 @@
 """Megatron arguments."""
 
 import argparse
+import dataclasses
 import json
 import os
 import torch
 import types
 
+import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
+from megatron.core.transformer import TransformerConfig
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -394,6 +397,27 @@ def _print_args(title, args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
+def core_transformer_config_from_args(args):
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(TransformerConfig):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_gelu_fusion'] = False
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+
+    return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
