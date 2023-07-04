@@ -22,7 +22,7 @@ from megatron.data.dataset_utils import (
 class BertDataset(torch.utils.data.Dataset):
 
     def __init__(self, name, indexed_dataset, data_prefix,
-                 num_epochs, max_num_samples, masked_lm_prob,
+                 splits_string, num_epochs, max_num_samples, masked_lm_prob,
                  max_seq_length, short_seq_prob, seed, binary_head):
 
         # Params to store.
@@ -38,6 +38,7 @@ class BertDataset(torch.utils.data.Dataset):
         # Build the samples mapping.
         self.samples_mapping = get_samples_mapping(self.indexed_dataset,
                                                    data_prefix,
+                                                   splits_string,
                                                    num_epochs,
                                                    max_num_samples,
                                                    self.max_seq_length - 3, # account for added tokens
