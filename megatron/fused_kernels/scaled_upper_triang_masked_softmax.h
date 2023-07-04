@@ -1,18 +1,4 @@
-/* coding=utf-8
- * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+/* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved. */
 
 #pragma once
 
@@ -125,7 +111,7 @@ __global__ void scaled_upper_triang_masked_softmax_warp_forward(
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
     constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
-    constexpr int ELEMENTS_PER_LDG_STG = 4;
+    constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4;
 
     int first_batch = (blockDim.y * blockIdx.y + threadIdx.y) * gridDim.x * WARP_BATCH + blockIdx.x;
     int local_seq = blockIdx.x + 1; 
@@ -245,7 +231,7 @@ __global__ void scaled_upper_triang_masked_softmax_warp_backward(
     constexpr int WARP_SIZE = (next_power_of_two < C10_WARP_SIZE) ? next_power_of_two : C10_WARP_SIZE;
     constexpr int WARP_ITERATIONS = next_power_of_two / WARP_SIZE;
     constexpr int WARP_BATCH = (next_power_of_two <= 128) ? 2 : 1;
-    constexpr int ELEMENTS_PER_LDG_STG = 4;
+    constexpr int ELEMENTS_PER_LDG_STG = (WARP_ITERATIONS < 4) ? 1 : 4;
 
     int first_batch = (blockDim.y * blockIdx.y + threadIdx.y) * gridDim.x * WARP_BATCH + blockIdx.x;
     int local_seq = blockIdx.x + 1; 
@@ -340,7 +326,7 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT(softmax_elements >= 0 && softmax_elements <= 16384 );
     if (softmax_elements == 0) {
         return;
     } else {
@@ -361,6 +347,7 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
         TORCH_INTERNAL_ASSERT(attn_batches % batches_per_block == 0);
+
         int blocks_per_seq = attn_batches / batches_per_block;
         dim3 blocks(seq_len, blocks_per_seq, 1);
         dim3 threads(warp_size, warps_per_block, 1);
@@ -414,6 +401,19 @@ void dispatch_scaled_upper_triang_masked_softmax_forward(
                 scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 11>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
                 break;
+            case 12: // 4096
+                scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+	    case 13: // 8192
+                scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 13>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+	    case 14: // 16384
+                scaled_upper_triang_masked_softmax_warp_forward<input_t, output_t, acc_t, 14>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(dst, src, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+
             default:
                 break;
         }
@@ -430,7 +430,7 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
     int softmax_elements_stride, 
     int attn_batches)
 {
-    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 2048 );
+    TORCH_INTERNAL_ASSERT( softmax_elements >= 0 && softmax_elements <= 16384 );
     if (softmax_elements == 0) {
        return;
     } else {
@@ -451,6 +451,7 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
         int warps_per_block = (threads_per_block / warp_size);
         int batches_per_block = warps_per_block * batches_per_warp;
         TORCH_INTERNAL_ASSERT(attn_batches % batches_per_block == 0);
+
         int blocks_per_seq = attn_batches / batches_per_block;
         dim3 blocks(seq_len, blocks_per_seq, 1);
         dim3 threads(warp_size, warps_per_block, 1);
@@ -502,6 +503,18 @@ void dispatch_scaled_upper_triang_masked_softmax_backward(
                 break;
             case 11: // 2048
                 scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 11>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 12: // 4096
+                scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 12>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 13: // 8192
+                scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 13>
+                    <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
+                break;
+            case 14: // 16384
+                scaled_upper_triang_masked_softmax_warp_backward<input_t, output_t, acc_t, 14>
                     <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(grad_input, grad, output, scale, batch_count, softmax_elements_stride, softmax_elements);
                 break;
             default:

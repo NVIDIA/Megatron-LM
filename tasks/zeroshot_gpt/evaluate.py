@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """GPT zero-shot evaluation."""
 
@@ -22,7 +9,7 @@ import torch
 from megatron import get_args
 from megatron import print_rank_0, is_last_rank
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron.core import parallel_state, tensor_parallel
 from megatron.checkpointing import load_checkpoint
 from megatron.model import GPTModel
 from megatron.training import get_model
@@ -103,10 +90,10 @@ def forward_step(batch, model, eval_metric):
 
     send_forward(output)
 
-    if mpu.is_pipeline_last_stage():
+    if parallel_state.is_pipeline_last_stage():
         # For loss, return the unreduced loss.
         if eval_metric == 'loss':
-            losses = mpu.vocab_parallel_cross_entropy(
+            losses = tensor_parallel.vocab_parallel_cross_entropy(
                 output.contiguous().float(), labels.contiguous())
             loss = torch.sum(
                 losses.view(-1) * loss_mask.contiguous().view(-1).float())
@@ -142,9 +129,9 @@ def evaluate(data_loader, model, eval_metric):
             output = forward_step(batch, model, eval_metric)
 
             # Reduce across processes.
-            if mpu.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 torch.distributed.all_reduce(output,
-                                             group=mpu.get_data_parallel_group())
+                                             group=parallel_state.get_data_parallel_group())
 
                 total_output += output
 
@@ -205,7 +192,7 @@ def main():
             args.task))
 
     # Set up model and load checkpoint.
-    model = get_model(get_model_provider(eval_metric))
+    model = get_model(get_model_provider(eval_metric), wrap_with_ddp=False)
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 

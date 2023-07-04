@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import os
 import pathlib
@@ -33,11 +20,14 @@ def load(args):
     # Check if cuda 11 is installed for compute capability 8.0
     cc_flag = []
     if torch.version.hip is None:
-        _, bare_metal_major, _ = _get_cuda_bare_metal_version(
+        _, bare_metal_major, bare_metal_minor = _get_cuda_bare_metal_version(
             cpp_extension.CUDA_HOME)
         if int(bare_metal_major) >= 11:
             cc_flag.append('-gencode')
             cc_flag.append('arch=compute_80,code=sm_80')
+            if int(bare_metal_minor) >= 7:
+                cc_flag.append('-gencode')
+                cc_flag.append('arch=compute_90,code=sm_90')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
@@ -95,19 +85,11 @@ def load(args):
         scaled_masked_softmax_cuda = _cpp_extention_load_helper(
             "scaled_masked_softmax_cuda", sources, extra_cuda_flags, extra_include_paths)
 
-    # =================================
-    # Mixed precision fused layer norm.
-    # =================================
-
-    if torch.version.hip is not None:
-        extra_cuda_flags = []
-    else:
-        extra_cuda_flags = ['-maxrregcount=50']
-
-    sources=[srcpath / 'layer_norm_cuda.cpp',
-             srcpath / 'layer_norm_cuda_kernel.cu']
-    fused_mix_prec_layer_norm_cuda = _cpp_extention_load_helper(
-        "fused_mix_prec_layer_norm_cuda", sources, extra_cuda_flags, extra_include_paths)
+        # Softmax
+        sources=[srcpath / 'scaled_softmax.cpp',
+                 srcpath / 'scaled_softmax_cuda.cu']
+        scaled_softmax_cuda = _cpp_extention_load_helper(
+            "scaled_softmax_cuda", sources, extra_cuda_flags, extra_include_paths)
 
 
 def _get_cuda_bare_metal_version(cuda_dir):

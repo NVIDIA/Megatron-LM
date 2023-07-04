@@ -1,0 +1,124 @@
+<!-- coding=utf-8-->
+<!-- Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Megatron</title>
+<style>
+
+.wrapper {
+max-width: 75%;
+margin: auto;
+}
+
+h1 { 
+margin: 3rem 0 1rem 0; 
+padding: 0;
+font-size: 1.5rem;
+}
+
+textarea {
+width: 100%;
+min-height: 300px;
+resize: none;
+border-radius: 8px;
+border: 1px solid #ddd;
+padding: 0.5rem;
+box-shadow: inset 0 0 0.25rem #ddd;
+&:focus {
+outline: none;
+border: 1px solid darken(#ddd, 5%);
+box-shadow: inset 0 0 0.5rem darken(#ddd, 5%);
+}
+}
+
+#the-count {
+float: right;
+padding: 0.1rem 0 0 0;
+font-size: 0.875rem;
+}
+/* Chat containers */
+.container {
+font-family: 'Arial', sans-serif;
+font-size: 16px;
+border: 2px solid #dedede;
+background-color: #f1f1f1;
+border-radius: 5px;
+padding: 15px;
+margin: 10px 0;
+}
+
+
+/* Clear floats */
+.container::after {
+content: "";
+clear: both;
+display: table;
+}
+
+/* Style images */
+.container img {
+float: left;
+max-width: 60px;
+width: 100%;
+margin-right: 20px;
+border-radius: 50%;
+}
+
+</style>
+</head>
+<body>
+<div class="wrapper">
+<h1>Prompt Megatron</h1>
+<textarea name="prompt" id="prompt" maxlength="1024" placeholder="Add prompt"autofocus></textarea>
+<label for="tokens_to_generate">Number tokens to generate (1-1024):</label>
+<input type="number" id="tokens_to_generate" name="tokens_to_generate" min="10" max="256", value=32>
+<button onclick="submit_query()">Submit</button>
+
+<div id="the-count">
+<span id="current">0</span>
+<span id="maximum">/ 1000</span>
+</div>
+<textarea name="response" id="response" maxlength="2048" placeholder="Megatron response..."></textarea>
+</div>
+<script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+<script type="text/javascript">
+
+	function submit_query() {
+		$("#response").val("Waiting for Megatron response...");
+		$.ajax({
+			url:"api",
+			type:"PUT",
+			data:JSON.stringify({prompts: [$("#prompt").val()], tokens_to_generate: parseInt($("#tokens_to_generate").val(),10)}),
+			contentType:"application/json; charset=utf-8",
+			dataType:"json",
+			success: function(data){
+				data.max_len=35;
+				$("#response").val(data.text);
+			}
+		});
+	}
+	
+$('textarea').keyup(function() {
+var characterCount = $(this).val().length,
+current = $('#current'),
+maximum = $('#maximum'),
+theCount = $('#the-count');
+
+current.text(characterCount);
+
+if (characterCount >= 800) {
+maximum.css('color', '#8f0001');
+current.css('color', '#8f0001');
+theCount.css('font-weight','bold');
+} else {
+maximum.css('color','#666');
+theCount.css('font-weight','normal');
+}
+});
+</script>
+</body>
+</html>
+

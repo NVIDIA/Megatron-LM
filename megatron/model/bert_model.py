@@ -1,24 +1,11 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """BERT model."""
 
 import torch
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
@@ -28,6 +15,7 @@ from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
 from megatron.model.utils import scaled_init_method_normal
 from .module import MegatronModule
+
 
 def bert_extended_attention_mask(attention_mask):
     # We create a 3D attention mask from a 2D tensor mask.
@@ -59,26 +47,27 @@ class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
     Arguments:
+        config: TransformerConfig object
         mpu_vocab_size: model parallel size of vocabulary.
         hidden_size: hidden size
-        init_method: init method for weight initialization
-        layernorm_epsilon: tolerance for layer norm divisions
         parallel_output: whether output logits being distributed or not.
     """
 
-    def __init__(self, mpu_vocab_size, hidden_size, init_method,
-                 layernorm_epsilon, parallel_output):
-
-        super(BertLMHead, self).__init__()
+    def __init__(self, mpu_vocab_size, hidden_size, config, parallel_output):
+        super().__init__(config=config)
 
         args = get_args()
-
         self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        mpu.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+        tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
-        self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
-        self.layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method)
+        setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
+        setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
+
+        self.layernorm = LayerNorm(hidden_size,
+                                   eps=config.layernorm_epsilon,
+                                   sequence_parallel=config.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -110,14 +99,20 @@ def post_language_model_processing(lm_output, pooled_output,
         binary_logits = binary_head(pooled_output)
 
     if lm_labels is None:
-        return lm_logits, binary_logits
+        # [s b h] => [b s h]
+        return lm_logits.transpose(0,1).contiguous(), binary_logits
     else:
+        # [b s] => [s b]
+        lm_labels = lm_labels.transpose(0,1).contiguous()
+        # lm_logits : [s, b, h] and lm_labels: [s, b]
         if fp16_lm_cross_entropy:
             assert lm_logits.dtype == torch.half
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits, lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits, lm_labels)
         else:
-            lm_loss = mpu.vocab_parallel_cross_entropy(lm_logits.float(),
-                                                       lm_labels)
+            lm_loss = tensor_parallel.vocab_parallel_cross_entropy(lm_logits.float(),
+                                                        lm_labels)
+        # [s, b] => [b s]
+        lm_loss = lm_loss.transpose(0,1).contiguous()
         return lm_loss, binary_logits
 
 
@@ -125,13 +120,17 @@ class BertModel(MegatronModule):
     """Bert Language model."""
 
     def __init__(self,
+                 config,
                  num_tokentypes=2,
                  add_binary_head=True,
                  parallel_output=True,
                  pre_process=True,
                  post_process=True):
-        super(BertModel, self).__init__()
+        super().__init__(config=config)
         args = get_args()
+
+        # TODO this option is not yet implemented in BERT
+        assert args.untie_embeddings_and_output_weights is False
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.add_binary_head = add_binary_head
@@ -139,31 +138,29 @@ class BertModel(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
 
-        init_method = init_method_normal(args.init_method_std)
-        scaled_init_method = scaled_init_method_normal(args.init_method_std,
-                                                       args.num_layers)
+        self.return_embeddings = args.output_bert_embeddings
+        if self.return_embeddings:
+            assert self.post_process and self.add_binary_head
 
         self.language_model, self._language_model_key = get_language_model(
+            config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=self.add_binary_head,
             encoder_attn_mask_type=AttnMaskType.padding,
-            init_method=init_method,
-            scaled_init_method=scaled_init_method,
             pre_process=self.pre_process,
             post_process=self.post_process,
             num_experts=args.num_experts,
         )
 
-        self.initialize_word_embeddings(init_method_normal)
+        self.initialize_word_embeddings()
         if self.post_process:
-            self.lm_head = BertLMHead(
-                self.word_embeddings_weight().size(0),
-                args.hidden_size, init_method, args.layernorm_epsilon, parallel_output)
+            self.lm_head = BertLMHead(self.shared_embedding_or_output_weight().size(0), config.hidden_size,
+                                      config, parallel_output)
             self._lm_head_key = 'lm_head'
             self.binary_head = None
             if self.add_binary_head:
-                self.binary_head = get_linear_layer(args.hidden_size, 2,
-                                                    init_method)
+                self.binary_head = get_linear_layer(config.hidden_size, 2,
+                                                    config.init_method)
                 self._binary_head_key = 'binary_head'
 
     def set_input_tensor(self, input_tensor):
@@ -184,36 +181,57 @@ class BertModel(MegatronModule):
             tokentype_ids=tokentype_ids
         )
 
+        if self.post_process and self.add_binary_head:
+            lm_output, pooled_output = lm_output
+
+            # Return pooled output (e.g., when computing Bert embeddings).
+            if self.return_embeddings:
+
+                # Sum attention mask.
+                embeddings = torch.transpose(lm_output, 0, 1)
+                masks = torch.sum(attention_mask, dim=1)
+
+                # Collect masked embeddings.
+                output = torch.zeros(
+                    size=(embeddings.shape[0], embeddings.shape[2]),
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device())
+                for i, (embedding, mask) in enumerate(zip(embeddings, masks)):
+                    output[i, :] = torch.mean(embedding[1: mask - 1], dim=0)
+
+                return output
+
+        else:
+            pooled_output = None
+
         if self.post_process:
-            pooled_output = lm_output[1] if self.add_binary_head else None
-            return post_language_model_processing(lm_output[0], pooled_output,
+            return post_language_model_processing(lm_output, pooled_output,
                                                   self.lm_head, self.binary_head,
                                                   lm_labels,
-                                                  self.word_embeddings_weight(),
+                                                  self.shared_embedding_or_output_weight(),
                                                   self.fp16_lm_cross_entropy)
         return lm_output
 
 
-    def state_dict_for_save_checkpoint(self, destination=None, prefix='',
-                                       keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
         state_dict_[self._language_model_key] \
-            = self.language_model.state_dict_for_save_checkpoint(
-            destination, prefix, keep_vars)
+            = self.language_model.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         if self.post_process:
             state_dict_[self._lm_head_key] \
-                = self.lm_head.state_dict_for_save_checkpoint(
-                destination, prefix, keep_vars)
+                = self.lm_head.state_dict_for_save_checkpoint(prefix=prefix,
+                                                              keep_vars=keep_vars)
         if self.post_process and self.add_binary_head:
             state_dict_[self._binary_head_key] \
-                = self.binary_head.state_dict(destination, prefix, keep_vars)
+                = self.binary_head.state_dict(prefix=prefix, keep_vars=keep_vars)
         # Save word_embeddings.
         if self.post_process and not self.pre_process:
             state_dict_[self._word_embeddings_for_head_key] \
-                = self.word_embeddings.state_dict(destination, prefix, keep_vars)
+                = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):

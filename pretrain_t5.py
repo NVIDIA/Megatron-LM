@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain T5"""
 
@@ -22,22 +9,66 @@ import torch
 from megatron import (
     get_args,
     get_timers,
-    mpu,
     print_rank_0
 )
+from megatron.core import tensor_parallel
+from megatron.core.enums import ModelType
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import T5Model
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 
-def model_provider(pre_process=True, post_process=True):
+"""
+Pipeline parallelism for T5
+===========================
+
+T5 is a model architecture with both encoder and decoder blocks.
+Consequently, pipeline parallelism is implemented slightly differently
+compared to architectures like GPT and BERT.
+
+In particular, when pipeline_model_parallel_world_size > 1, each stage
+either executes an encoder block or a decoder block. The
+--pipeline-model-parallel-split-rank argument controls the rank at which
+the split happens: all ranks lower than this argument execute the
+encoder block, and all ranks equal to or higher than this argument value
+execute the decoder block.
+
+In the encoder section of the model, only one tensor is sent downstream:
+the intermediate encoder_hidden_state. In the decoder section of the
+model, two tensors are sent downstream in the forward pass: the fully
+computed encoder_hidden_state, and the intermediate decoder_hidden_state.
+
+In particular, these are the shapes of the tensors sent between
+different workers:
+    If rank is in decoder section:
+        intermediate decoder_hidden_state (pre-transpose),
+        complete encoder_hidden_state (post-transpose).
+    If rank is at boundary between encoder and decoder sections:
+        complete encoder_hidden_state (post-transpose).
+    If rank is in encoder section:
+        intermediate encoder_hidden_state (pre-transpose).
+
+Additionally, we have code in the backward_step function in schedules.py
+to accumulate the encoder_hidden_state gradient across skip connections
+(encoder_hidden_state fed in as input to each layer in the decoder).
+"""
+
+
+def model_provider(pre_process=True, post_process=True,
+                   add_encoder=True, add_decoder=True):
     """Build the model."""
-    assert pre_process and post_process, "T5 doesn't yet support pipelining"
 
     print_rank_0('building T5 model ...')
-    model = T5Model(num_tokentypes=0,
-                    parallel_output=True)
+    config = core_transformer_config_from_args(get_args())
+    model = T5Model(config=config,
+                    num_tokentypes=0,
+                    parallel_output=True,
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    add_encoder=add_encoder,
+                    add_decoder=add_decoder)
     return model
 
 
@@ -53,7 +84,7 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    data_b = mpu.broadcast_data(keys, data, datatype)
+    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
     tokens_enc = data_b['text_enc'].long()
@@ -70,9 +101,7 @@ def get_batch(data_iterator):
 
 
 def loss_func(loss_mask, output_tensor):
-    lm_loss_, _ = output_tensor
-
-    lm_loss_ = lm_loss_.float()
+    lm_loss_ = output_tensor.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
 
@@ -88,7 +117,7 @@ def forward_step(data_iterator, model):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch generator').start()
+    timers('batch generator', log_level=2).start()
     tokens_enc, tokens_dec, loss_mask, lm_labels, enc_mask, dec_mask, enc_dec_mask \
         = get_batch(data_iterator)
     timers('batch generator').stop()
@@ -130,5 +159,5 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider, forward_step,
-             args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+    pretrain(train_valid_test_datasets_provider, model_provider, ModelType.encoder_and_decoder,
+             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

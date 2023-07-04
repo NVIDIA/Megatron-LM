@@ -1,27 +1,14 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """GLUE finetuning/evaluation."""
 
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron import mpu
 from megatron.model.classification import Classification
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune, mse_forward_step
+from megatron.arguments import core_transformer_config_from_args
 
 
 def glue_classification(num_classes, Dataset,
@@ -42,10 +29,11 @@ def glue_classification(num_classes, Dataset,
     def model_provider(pre_process=True, post_process=True):
         """Build the model."""
         args = get_args()
+        config = core_transformer_config_from_args()
 
         print_rank_0('building classification model for {} ...'.format(
             args.task))
-        model = Classification(num_classes=num_classes, num_tokentypes=2,
+        model = Classification(config=config, num_classes=num_classes, num_tokentypes=2,
                                pre_process=pre_process, post_process=post_process)
 
         return model

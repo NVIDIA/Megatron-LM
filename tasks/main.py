@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Main tasks functionality."""
 
@@ -62,6 +49,29 @@ def get_tasks_args(parser):
     group.add_argument('--faiss-topk-retrievals', type=int, default=100,
                        help='Number of blocks to use as top-k during retrieval')
 
+    # finetune for retriever
+    group.add_argument('--eval-micro-batch-size', type=int, default=None,
+                       help='Eval Batch size per model instance (local batch '
+                            'size). Global batch size is local batch size '
+                            'times data parallel size.')
+    group.add_argument('--train-with-neg', action='store_true',
+                       help='Whether to use negative examples during model '
+                        'training')
+    group.add_argument('--train-hard-neg', type=int, default=0,
+                       help='Number of hard negative exmaples to use during '
+                        'training')
+
+
+    # parameters for Av.rank validation method
+    # Following options/arguments have been taken directly from DPR codebase
+    group.add_argument('--val-av-rank-hard-neg', type=int, default=30,
+                        help='Av.rank validation: how many hard negatives to'
+                        ' take from each question pool')
+    group.add_argument('--val-av-rank-other-neg', type=int, default=30,
+                        help='Av.rank validation: how many other negatives to'
+                        ' take from each question pool')
+
+
     return parser
 
 
@@ -81,8 +91,10 @@ if __name__ == '__main__':
         from glue.finetune import main
     elif args.task in ['LAMBADA', 'WIKITEXT103']:
         from zeroshot_gpt.evaluate import main
-    elif args.task in ['ICT-ZEROSHOT-NQ']:
+    elif args.task in ['ICT-ZEROSHOT-NQ', 'RETRIEVER-EVAL']:
         from orqa.evaluate_orqa import main
+    elif args.task in ['RET-FINETUNE-NQ']:
+        from orqa.supervised.finetune import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

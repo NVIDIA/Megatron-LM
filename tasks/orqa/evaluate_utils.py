@@ -1,31 +1,20 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import torch
 
 from megatron import get_args, print_rank_0
 from megatron.checkpointing import load_biencoder_checkpoint
 from megatron.data.orqa_wiki_dataset import get_open_retrieval_wiki_dataset
-from tasks.orqa.natural_questions.nq import get_nq_dataset
-from tasks.orqa.natural_questions.nq import get_one_epoch_nq_dataloader
-from tasks.orqa.natural_questions.nq import process_nq_batch
-from tasks.orqa.natural_questions.qa_utils import calculate_matches
 from megatron.data.realm_index import OpenRetreivalDataStore, FaissMIPSIndex
-from megatron.model.biencoder_model import biencoder_model_provider
+from megatron.model.biencoder_model import get_model_provider
 from megatron.training import get_model
 from deepspeed.accelerator import get_accelerator
+from tasks.orqa.unsupervised.nq import get_nq_dataset
+from tasks.orqa.unsupervised.nq import get_one_epoch_nq_dataloader
+from tasks.orqa.unsupervised.nq import process_nq_batch
+from tasks.orqa.unsupervised.qa_utils import calculate_matches
+
+
 class ORQAEvaluator(object):
     def __init__(self):
         args = get_args()
@@ -44,9 +33,8 @@ class ORQAEvaluator(object):
         if args.biencoder_shared_query_context_model:
             only_query_model = False
 
-        model = get_model(lambda: biencoder_model_provider(only_query_model=\
-            only_query_model, biencoder_shared_query_context_model=\
-            args.biencoder_shared_query_context_model))
+        model = get_model(get_model_provider(only_query_model=only_query_model,
+            biencoder_shared_query_context_model=args.biencoder_shared_query_context_model))
 
         self.model = load_biencoder_checkpoint(model,
                 only_query_model=only_query_model)

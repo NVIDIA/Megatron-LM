@@ -1,19 +1,8 @@
-# coding=utf-8
-# Copyright (c) 2019, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain BERT for Inverse Cloze Task"""
+
+from functools import partial
 import math
 
 import torch
@@ -23,7 +12,8 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
-from megatron import mpu
+from megatron.core import mpu
+from megatron.core.enums import ModelType
 from megatron.data.biencoder_dataset_utils import get_ict_batch
 from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model.biencoder_model import biencoder_model_provider
@@ -31,13 +21,16 @@ from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from deepspeed.accelerator import get_accelerator
 
-def pretrain_ict_model_provider():
+def pretrain_ict_model_provider(pre_process=True, post_process=True):
     args = get_args()
+
     model = biencoder_model_provider(
                 only_context_model=False,
                 only_query_model=False,
                 biencoder_shared_query_context_model=\
-                    args.biencoder_shared_query_context_model)
+                args.biencoder_shared_query_context_model,
+                pre_process=pre_process, post_process=post_process)
+
     return model
 
 def get_group_world_size_rank():
@@ -77,25 +70,9 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
         output = output_list[rank].contiguous()
         return output
 
-def forward_step(data_iterator, model, input_tensor):
-    """Forward step."""
+def loss_func(output_tensor):
     args = get_args()
-    timers = get_timers()
-
-    # Get the batch.
-    timers('batch-generator').start()
-    query_tokens, query_mask, \
-    context_tokens, context_mask, context_indices = get_ict_batch(data_iterator)
-    timers('batch-generator').stop()
-
-    # Query and Context Types
-    query_types = get_accelerator().LongTensor(*query_tokens.shape).fill_(0)
-    context_types = get_accelerator().LongTensor(*context_tokens.shape).fill_(0)
-
-    # Forward model.
-    query_logits, context_logits = model(query_tokens, query_mask,
-                                    query_types, context_tokens,
-                                    context_mask, context_types)
+    query_logits, context_logits = output_tensor
 
     micro_batch_size = query_logits.shape[0]
     # recall we assert that tensor_model_parallel_size == 1
@@ -137,6 +114,28 @@ def forward_step(data_iterator, model, input_tensor):
     return loss, stats_dict
 
 
+
+def forward_step(data_iterator, model):
+    """Forward step."""
+    args = get_args()
+    timers = get_timers()
+
+    # Get the batch.
+    timers('batch-generator', log_level=2).start()
+    query_tokens, query_mask, \
+    context_tokens, context_mask, context_indices = get_ict_batch(data_iterator)
+    timers('batch-generator').stop()
+
+    # Query and Context Types
+    query_types = get_accelerator().LongTensor(*query_tokens.shape).fill_(0)
+    context_types = get_accelerator().LongTensor(*context_tokens.shape).fill_(0)
+
+    # Forward model.
+    output_tensor = model(query_tokens, query_mask, query_types, context_tokens,
+                        context_mask, context_types)
+
+    return output_tensor, partial(loss_func)
+
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid and test datasets."""
     args = get_args()
@@ -163,5 +162,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider,
              pretrain_ict_model_provider,
+             ModelType.encoder_or_decoder,
              forward_step,
              args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})

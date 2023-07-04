@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from megatron import get_args
-from megatron import mpu
+from megatron.core import mpu
 
 
 def detach(tensor):
@@ -50,10 +50,10 @@ class OpenRetreivalDataStore(object):
     def load_from_file(self):
         """Populate members from instance saved to file"""
 
-        if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+        if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
             print("\n> Unpickling BlockData", flush=True)
         state_dict = pickle.load(open(self.embedding_path, 'rb'))
-        if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+        if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
             print(">> Finished unpickling BlockData\n", flush=True)
 
         self.embed_data = state_dict['embed_data']
@@ -137,7 +137,7 @@ class FaissMIPSIndex(object):
         except ImportError:
             raise Exception("Error: Please install faiss to use FaissMIPSIndex")
 
-        if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+        if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
             print("\n> Building index", flush=True)
 
         cpu_index = faiss.IndexFlatIP(self.embed_size)
@@ -149,12 +149,12 @@ class FaissMIPSIndex(object):
             config.useFloat16 = True
             gpu_index = faiss.index_cpu_to_all_gpus(cpu_index, co=config)
             self.mips_index = faiss.IndexIDMap(gpu_index)
-            if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+            if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
                 print(">> Initialized index on GPU", flush=True)
         else:
             # CPU index supports IDs so wrap with IDMap
             self.mips_index = faiss.IndexIDMap(cpu_index)
-            if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+            if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
                 print(">> Initialized index on CPU", flush=True)
 
         # if we were constructed with a BlockData, then automatically load it
@@ -199,7 +199,7 @@ class FaissMIPSIndex(object):
 
         self.mips_index.add_with_ids(embeds_arr, indices_arr)
 
-        if mpu.is_unitialized() or mpu.get_data_parallel_rank() == 0:
+        if not mpu.model_parallel_is_initialized() or mpu.get_data_parallel_rank() == 0:
             print(">>> Finished adding block data to index", flush=True)
 
     def search_mips_index(self, query_embeds, top_k, reconstruct=True):
