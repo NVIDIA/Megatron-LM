@@ -738,6 +738,20 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--profile', action='store_true',
+                       help='Enable nsys profiling. When using this option, nsys '
+                       'options should be specified in commandline. An example '
+                       'nsys commandline is `nsys profile -s none -t nvtx,cuda '
+                       '-o <path/to/output_file> --force-overwrite true '
+                       '--capture-range=cudaProfilerApi '
+                       '--capture-range-end=stop`.')
+    group.add_argument('--profile-step-start', type=int, default=10,
+                       help='Gloable step to start profiling.')
+    group.add_argument('--profile-step-end', type=int, default=12,
+                       help='Gloable step to stop profiling.')
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
+                       help='Global ranks to profile.')
+
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
