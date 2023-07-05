@@ -167,14 +167,14 @@ def pretrain(train_valid_test_dataset_provider,
 
     config = core_transformer_config_from_args(args)
     if args.do_valid:
-        prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from validation set'
+        prefix = f'iteration {iteration} on validation set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    valid_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train)
 
     if args.do_test:
-        prefix = f'iteration {iteration} on {args.eval_iters * args.global_batch_size}-sample draw from test set'
+        prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(prefix, forward_step_func,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
@@ -814,13 +814,19 @@ def evaluate(forward_step_func,
 
     total_loss_dict = {}
 
+    # make validation batch size independent from training batch size
+    eval_batch_size = args.global_batch_size
+    eval_num_microbatches = eval_batch_size // \
+        (args.micro_batch_size * args.data_parallel_size)
+
     with torch.no_grad():
         iteration = 0
+        if verbose:
+            print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
         while iteration < args.eval_iters:
             iteration += 1
-            if verbose and iteration % args.log_interval == 0:
-                print_rank_0('Evaluating iter {}/{}'.format(iteration,
-                                                            args.eval_iters))
+            if verbose:
+                print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
@@ -829,7 +835,7 @@ def evaluate(forward_step_func,
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -847,9 +853,8 @@ def evaluate(forward_step_func,
                         total_loss_dict[key] = total_loss_dict.get(
                             key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
-            args.consumed_valid_samples += mpu.get_data_parallel_world_size() \
-                                           * args.micro_batch_size \
-                                           * get_num_microbatches()
+            args.consumed_valid_samples += eval_batch_size
+        
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -868,7 +873,7 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * get_num_microbatches()
+        total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
 
     return total_loss_dict, collected_non_loss_data
 
@@ -974,8 +979,11 @@ def build_train_valid_test_data_loaders(
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
-        valid_dataloader = build_pretraining_data_loader(
-            valid_ds, args.consumed_valid_samples)
+        if args.skip_train:
+            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+        else:
+            valid_dataloader = build_pretraining_data_loader(
+                valid_ds, args.consumed_valid_samples)
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
