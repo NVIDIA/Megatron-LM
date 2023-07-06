@@ -470,6 +470,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('num_attention_heads')
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
+    _set_arg('position_embedding_type', force=True)
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)

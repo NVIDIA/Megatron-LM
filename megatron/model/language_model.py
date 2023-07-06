@@ -159,7 +159,7 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.add_position_embedding = args.add_position_embedding
+        self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
         if self.add_position_embedding:
             self.position_embeddings = torch.nn.Embedding(
                 max_sequence_length, self.hidden_size)
@@ -372,8 +372,8 @@ class TransformerLanguageModel(MegatronModule):
 
         # Rotary positional embeddings
         self.use_rotary_position_embeddings = \
-            args.use_rotary_position_embeddings
-        if args.use_rotary_position_embeddings:
+            args.position_embedding_type == 'rope'
+        if self.use_rotary_position_embeddings:
             self.seq_length = args.seq_length
             rotary_dim = args.hidden_size // args.num_attention_heads \
                 if args.kv_channels is None else args.kv_channels

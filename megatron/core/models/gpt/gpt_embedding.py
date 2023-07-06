@@ -39,13 +39,10 @@ class GPTEmbedding(MegatronModule):
             init_method=self.config.init_method,
             config=self.config
         )
-        # @jcasper are these keys needed?
-        self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
         if self.add_position_embedding:
             self.position_embeddings = torch.nn.Embedding(self.max_sequence_length, self.config.hidden_size)
-            self._position_embeddings_key = 'position_embeddings'
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:

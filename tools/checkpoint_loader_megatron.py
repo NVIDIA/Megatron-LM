@@ -80,8 +80,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('seq_length')
     check_for_arg('num_attention_heads')
     check_for_arg('max_position_embeddings')
-    check_for_arg('add_position_embedding', True)
-    check_for_arg('use_rotary_position_embeddings', False)
+    check_for_arg('position_embedding_type')
     check_for_arg('tokenizer_type')
     check_for_arg('iteration')
     check_for_arg('bert_binary_head')
@@ -187,7 +186,7 @@ def _load_checkpoint(queue, args):
     md.params_dtype = margs.params_dtype
     md.bert_binary_head = margs.bert_binary_head
     md.output_layer = margs.untie_embeddings_and_output_weights
-    md.position_embeddings = margs.add_position_embedding
+    md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
@@ -216,8 +215,10 @@ def _load_checkpoint(queue, args):
             [models[tp_rank].language_model.embedding.word_embeddings.weight.data for tp_rank in range(tp_size)],
             dim = 0)
     }
-    if md.position_embeddings:
+    if md.position_embedding_type == 'learned_absolute':
         message["position embeddings"] = models[0].language_model.embedding.position_embeddings.weight.data
+    else:
+        assert not hasattr(models[0].language_model.embedding, 'position_embeddings')
 
     queue_put("embeddings", message)
 
