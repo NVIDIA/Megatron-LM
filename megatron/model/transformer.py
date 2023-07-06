@@ -1267,7 +1267,7 @@ class ParallelTransformer(MegatronModule):
         self.sequence_parallel = config.sequence_parallel
 
         # Transformer Engine Init.
-        self.transformer_engine_rope_available = False
+        self.transformer_engine_v_0_10 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1276,7 +1276,7 @@ class ParallelTransformer(MegatronModule):
 
             te_version = packaging.version.Version(version("transformer-engine"))
             if te_version >= packaging.version.Version("0.10.0"):
-                self.transformer_engine_rope_available = True
+                self.transformer_engine_v_0_10 = True
 
             del version, packaging
 
@@ -1450,7 +1450,7 @@ class ParallelTransformer(MegatronModule):
         te_forward_kwargs = {}
         if self.transformer_impl == 'transformer_engine':
             te_forward_kwargs['is_first_microbatch'] = is_first_microbatch
-            if self.transformer_engine_rope_available:
+            if self.transformer_engine_v_0_10:
                 te_forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
 
         if self.recompute_method == 'uniform':
@@ -1601,7 +1601,7 @@ class ParallelTransformer(MegatronModule):
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
-                        if self.transformer_engine_rope_available:
+                        if self.transformer_engine_v_0_10:
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
