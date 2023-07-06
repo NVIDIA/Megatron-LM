@@ -163,7 +163,7 @@ def save_checkpoint(queue, args):
 
     validate_args(margs)
 
-    set_global_variables(margs)
+    set_global_variables(margs, build_tokenizer=False)
 
     # margs = megatron args
     margs = get_args()
