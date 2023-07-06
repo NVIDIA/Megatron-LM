@@ -148,7 +148,7 @@ def _load_checkpoint(queue, args):
                 models[vp_rank].append(model_[vp_rank])
         return models
 
-    set_global_variables(margs)
+    set_global_variables(margs, build_tokenizer=False)
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
