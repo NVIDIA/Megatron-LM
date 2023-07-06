@@ -537,6 +537,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 "cannot be enabled at the same time."
             )
 
+        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+
 
     def forward(self,
                 input_: torch.Tensor,
@@ -574,7 +576,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+        output_parallel = self._forward_impl(
             input=input_parallel,
             weight=weight,
             bias=bias,
@@ -689,6 +691,7 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.register_parameter('bias', None)
 
+        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
 
     def forward(self, input_):
@@ -708,7 +711,7 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = linear_with_grad_accumulation_and_async_allreduce(
+        output_parallel = self._forward_impl(
             input=input_parallel,
             weight=self.weight,
             bias=None,
