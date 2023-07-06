@@ -1338,6 +1338,10 @@ class ParallelTransformer(MegatronModule):
                     self_attn_mask_type=self_attn_mask_type,
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
+                # This argument is only available from TE v0.10 onwards.
+                activation_kwarg = {}
+                if self.transformer_engine_v_0_10:
+                    activation_kwarg["activation"] = "swiglu" if args.swiglu else "gelu"
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1365,7 +1369,7 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
                     fuse_qkv_params=True,
-                    activation="swiglu" if args.swiglu and self.transformer_engine_v_0_10 else "gelu")
+                    **activation_kwarg)
 
         if config.virtual_pipeline_model_parallel_size is not None:
             assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
