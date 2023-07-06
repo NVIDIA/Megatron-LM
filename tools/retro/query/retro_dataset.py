@@ -5,11 +5,12 @@ import os
 import torch
 
 from megatron import get_args, get_retro_args
-from tools.bert_embedding.utils import get_index_path_map
+from tools.bert_embedding.utils import BlockPathMap
 from tools.retro.db.utils import get_merged_train_dataset as get_db_dataset
 from tools.retro.external_libs import h5py
 
 from .chunk_dataset import get_chunk_dataset_map
+from .utils import get_neighbor_dirname
 
 
 class RetroDataset(torch.utils.data.Dataset):
@@ -100,7 +101,7 @@ class RetroDataset(torch.utils.data.Dataset):
         return sample
 
 
-def get_retro_datasets():
+def get_retro_datasets(verify_sizes=True):
     '''Get train, valid, test retro datasets.'''
 
     args = get_args()
@@ -116,24 +117,39 @@ def get_retro_datasets():
 
         chunk_dataset = chunk_ds_info["data"]
         neighbor_dir = chunk_ds_info["neighbor_dir"]
-        neighbor_path_map = get_index_path_map(neighbor_dir)
+        neighbor_path_map = BlockPathMap.from_dir(neighbor_dir,
+                                                  retro_args.retro_block_size)
 
         # Verify dataset prefixes.
-        sample_prefix = chunk_dataset.sample_dataset.datasets[0].index_prefix
-        neighbor_prefix = os.path.basename(neighbor_dir)
-        assert sample_prefix == neighbor_prefix, \
+        expected_dir = get_neighbor_dirname(data_key, chunk_dataset.sample_dataset)
+        assert expected_dir == neighbor_dir, \
             "inconsistent dataset source; '%s' vs. '%s'." % \
-            (sample_prefix, neighbor_prefix)
+            (expected_dir, neighbor_dir)
 
         # Verify num chunks.
         n_sample_chunks = len(chunk_dataset)
-        n_neighbor_chunks = len(neighbor_path_map.id_index_map)
+        n_neighbor_chunks = neighbor_path_map.max_idx
 
-        if n_sample_chunks != n_neighbor_chunks:
-            print("neighbor_dir : %s" % neighbor_dir)
-            print("neighbor_path_map : %s" % neighbor_path_map)
-            raise Exception("num sampled chunks (%d) != num neighbor chunks (%d)"
-                            % (n_sample_chunks, n_neighbor_chunks))
+        if not os.path.isdir(neighbor_dir):
+            if torch.distributed.get_rank() == 0:
+                raise Exception("neighbor directory '%s' not found; please "
+                                "compare --train-samples, --seq-length, --seed, "
+                                "--eval-iters, and --eval-interval, with "
+                                "retro preprocessing args." %
+                                neighbor_dir)
+            torch.distributed.barrier()
+            exit()
+
+        if verify_sizes and n_sample_chunks != n_neighbor_chunks:
+            if torch.distributed.get_rank() == 0:
+                print("neighbor_dir : %s" % neighbor_dir)
+                print("neighbor_path_map : %s" % neighbor_path_map)
+                raise Exception("num sampled chunks (%d) != num neighbor chunks "
+                                "(%d); did you complete querying the entire "
+                                "pretraining dataset?"
+                                % (n_sample_chunks, n_neighbor_chunks))
+            torch.distributed.barrier()
+            exit()
 
         # Retro dataset.
         retro_dataset_map[data_key] = RetroDataset(

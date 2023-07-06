@@ -3,13 +3,14 @@
 DATA_PATH=$1
 CHECKPOINT_PATH=$2
 TENSORBOARD_DIR=$3
-TP_SIZE=$4
-PP_SIZE=$5
-NNODES=$6
-MAX_STEPS=$7
-VP_SIZE=$8
-MBS=$9
-GBS=${10}
+USE_TE=$4
+TP_SIZE=$5
+PP_SIZE=$6
+NNODES=$7
+MAX_STEPS=$8
+VP_SIZE=$9
+MBS=${10}
+GBS=${11}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -18,11 +19,21 @@ NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+TRANSFORMER_IMPL=local
+TRAINING_DTYPE=fp16
+
+if [[ $USE_TE -eq 1 ]]; then
+       echo "Running with TransformerEngine ..."
+       TRANSFORMER_IMPL=transformer_engine
+       TRAINING_DTYPE=bf16
+else
+       echo "Running with local transformer implementation ..."
+fi
 
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
 
-python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
@@ -57,8 +68,9 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
+       --transformer-impl $TRANSFORMER_IMPL \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        --no-gradient-accumulation-fusion \
-       --fp16
+       --${TRAINING_DTYPE}
