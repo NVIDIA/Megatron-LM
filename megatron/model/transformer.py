@@ -1362,7 +1362,8 @@ class ParallelTransformer(MegatronModule):
                     layer_type="encoder",
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
-                    fuse_qkv_params=True)
+                    fuse_qkv_params=True,
+                    activation="swiglu" if args.swiglu and self.transformer_engine_v_0_10 else "gelu")
 
         if config.virtual_pipeline_model_parallel_size is not None:
             assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
