@@ -1280,6 +1280,8 @@ class ParallelTransformer(MegatronModule):
 
             del version, packaging
 
+            assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
+
         self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
         self.fp8_recipe = None
         self.fp8_group = None
