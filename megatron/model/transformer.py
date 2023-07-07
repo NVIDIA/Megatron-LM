@@ -510,8 +510,10 @@ class ParallelAttention(MegatronModule):
             key_layer = inputs[1]
             value_layer = inputs[2]
             attention_mask = inputs[3]
+            alibi = inputs[6]
             output_ = self.core_attention(query_layer, key_layer,
-                                          value_layer, attention_mask)
+                                          value_layer, attention_mask,
+                                          alibi=alibi)
             return output_
 
         q_pos_emb, k_pos_emb = (None, None) if rotary_pos_emb is None \
@@ -520,7 +522,7 @@ class ParallelAttention(MegatronModule):
         hidden_states = tensor_parallel.checkpoint(
             custom_forward,
             False, query_layer, key_layer, value_layer, attention_mask,
-            q_pos_emb, k_pos_emb)
+            q_pos_emb, k_pos_emb, alibi)
 
         return hidden_states
 
@@ -664,7 +666,8 @@ class ParallelAttention(MegatronModule):
         if not self.use_flash_attn:
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask)
+                    query_layer, key_layer, value_layer, attention_mask,
+                    alibi=alibi)
             else:
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask,
