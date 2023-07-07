@@ -84,40 +84,9 @@ class GPTEmbedding(MegatronModule):
 
         return embeddings
 
+    # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """For easy load."""
-
-        state_dict_ = {}
-        state_dict_[self._word_embeddings_key] = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
-        if self.add_position_embedding:
-            state_dict_[self._position_embeddings_key] = self.position_embeddings.state_dict(
-                prefix=prefix, keep_vars=keep_vars
-            )
-
-        return state_dict_
+        pass
 
     def load_state_dict(self, state_dict, strict=True):
-        """Customized load."""
-
-        # Word embedding.
-        if self._word_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._word_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'word_embeddings' in key:
-                    state_dict_[key.split('word_embeddings.')[1]] = state_dict[key]
-        self.word_embeddings.load_state_dict(state_dict_, strict=strict)
-
-        # Position embedding.
-        if self.add_position_embedding:
-            if self._position_embeddings_key in state_dict:
-                state_dict_ = state_dict[self._position_embeddings_key]
-            else:
-                # for backward compatibility.
-                state_dict_ = {}
-                for key in state_dict.keys():
-                    if 'position_embeddings' in key:
-                        state_dict_[key.split('position_embeddings.')[1]] = state_dict[key]
-            self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+        pass
