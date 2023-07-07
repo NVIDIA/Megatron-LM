@@ -518,7 +518,6 @@ class ParallelAttention(MegatronModule):
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        is_first_step = False
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -529,7 +528,6 @@ class ParallelAttention(MegatronModule):
                     inf_max_seq_len, inf_max_batch_size)
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory, inference_value_memory)
-                is_first_step = True
             else:
                 inference_key_memory, inference_value_memory = \
                     inference_params.key_value_memory_dict[self.layer_number]
@@ -606,20 +604,7 @@ class ParallelAttention(MegatronModule):
             # adjust the key rotary positional embedding
             if rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
-                # need to cross check this condition during inference
-                # if not set_inference_key_value_memory:
-                if not is_first_step:
-                    # In inference, we compute one token at a time.
-                    # Select the correct positional embedding
-                    # (only the last token in the sequence)
-                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-                else:
-                    # In the first forward pass of inference,
-                    # we use the entire provided prefix.
-                    # q_pos_emb here has the rope embeddings of the entire
-                    # prefix + to-be-generated output so
-                    # we slice to just the prefix.
-                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+                q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
                 k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
                 rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
