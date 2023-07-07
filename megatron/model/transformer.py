@@ -10,7 +10,7 @@ from typing import Optional
 
 from megatron import get_timers, get_args, get_retro_args, core, get_num_microbatches
 from .module import MegatronModule
-from megatron.core import mpu, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
@@ -220,7 +220,7 @@ class CoreAttention(MegatronModule):
         projection_size = config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = core.utils.divide(projection_size,
                                                            world_size)
         self.hidden_size_per_attention_head = core.utils.divide(
@@ -268,7 +268,7 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
             (output_size[0]*output_size[1], output_size[2], output_size[3]),
             query_layer.dtype, "mpu")
 
@@ -432,7 +432,7 @@ class ParallelAttention(MegatronModule):
         projection_size = config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
             projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
@@ -1241,7 +1241,7 @@ def _get_num_layers(args, model_type, is_decoder=False):
     is_encoder_and_decoder_model = (model_type == ModelType.encoder_and_decoder)
     if model_type == ModelType.retro_encoder:
         num_layers = args.retro_encoder_layers
-    elif mpu.get_pipeline_model_parallel_world_size() > 1:
+    elif parallel_state.get_pipeline_model_parallel_world_size() > 1:
         if is_encoder_and_decoder_model:
             assert args.pipeline_model_parallel_split_rank is not None
 
@@ -1259,11 +1259,11 @@ def _get_num_layers(args, model_type, is_decoder=False):
                     'encoder_num_layers (%d) must be divisible by number of ranks given to encoder (%d)' % (args.encoder_num_layers, num_ranks_in_encoder)
             assert args.decoder_num_layers % num_ranks_in_decoder == 0, \
                     'decoder_num_layers (%d) must be divisible by number of ranks given to decoder (%d)' % (args.decoder_num_layers, num_ranks_in_decoder)
-            if mpu.is_pipeline_stage_before_split():
+            if parallel_state.is_pipeline_stage_before_split():
                 num_layers = (
                     0
                     if args.standalone_embedding_stage
-                    and mpu.get_pipeline_model_parallel_rank() == 0 else
+                    and parallel_state.get_pipeline_model_parallel_rank() == 0 else
                     args.encoder_num_layers // num_ranks_in_encoder
                 )
             else:
@@ -1280,7 +1280,7 @@ def _get_num_layers(args, model_type, is_decoder=False):
             num_layers = (
                 0
                 if args.standalone_embedding_stage
-                and mpu.get_pipeline_model_parallel_rank() == 0 else
+                and parallel_state.get_pipeline_model_parallel_rank() == 0 else
                 args.num_layers // args.transformer_pipeline_model_parallel_size
             )
     else:
@@ -1363,7 +1363,7 @@ class ParallelTransformer(MegatronModule):
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
-            self.fp8_group = mpu.get_data_parallel_group()
+            self.fp8_group = parallel_state.get_data_parallel_group()
             if args.fp8_e4m3:
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
             elif args.fp8_hybrid:
@@ -1428,7 +1428,7 @@ class ParallelTransformer(MegatronModule):
                     layer_number=layer_number,
                     kv_channels=config.kv_channels,
                     self_attn_mask_type=self_attn_mask_type.name,
-                    tp_group=mpu.get_tensor_model_parallel_group(),
+                    tp_group=parallel_state.get_tensor_model_parallel_group(),
                     get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                     apply_query_key_layer_scaling=config.apply_query_key_layer_scaling,
@@ -1460,21 +1460,21 @@ class ParallelTransformer(MegatronModule):
             # layers to stages like (each list is a model chunk):
             # Stage 0: [0, 1]  [4, 5]
             # Stage 1: [2, 3]  [6, 7]
-            offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
+            offset = parallel_state.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
-                (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
+                (parallel_state.get_pipeline_model_parallel_rank() * self.num_layers)
         else:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
-                    mpu.get_pipeline_model_parallel_world_size() > 1:
-                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+                    parallel_state.get_pipeline_model_parallel_world_size() > 1:
+                pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
                 else:
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
@@ -1555,10 +1555,10 @@ class ParallelTransformer(MegatronModule):
 
             moe_losses = []
             # Make sure memory is freed.
-            mpu.reset_checkpointed_activations_memory_buffer()
+            tensor_parallel.reset_checkpointed_activations_memory_buffer()
             l = 0
             while l < self.num_layers:
-                hidden_states, *local_moe_losses = mpu.checkpoint(
+                hidden_states, *local_moe_losses = tensor_parallel.checkpoint(
                     custom(l, l + self.checkpoint_num_layers), False,
                     hidden_states, attention_mask, encoder_output, enc_dec_attn_mask,
                     None, None, None, None, rotary_pos_emb)
