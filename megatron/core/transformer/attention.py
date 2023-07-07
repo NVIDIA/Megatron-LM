@@ -89,6 +89,72 @@ class Attention(MegatronModule, ABC):
             device=torch.cuda.current_device(),
         )
 
+    def _adjust_key_value_for_inference(self, inference_params, key, value, rotary_pos_emb):
+        """
+        Saves the generated key and value tensors to the end of the buffers in inference_params.
+        Returns the full size keys and values from the provided inference_params, as well as
+        adjusted rotary_pos_emb.
+
+        Returns a tuple: (key, value, rotary_pos_emb)
+
+        """
+        if inference_params is None:
+            return key, value, rotary_pos_emb
+
+        # =================================================
+        # Pre-allocate memory for key-values for inference.
+        # =================================================
+        is_first_step = False
+        if self.layer_number not in inference_params.key_value_memory_dict:
+            inf_max_seq_len = inference_params.max_sequence_len
+            inf_max_batch_size = inference_params.max_batch_size
+            inference_key_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
+            inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
+            inference_params.key_value_memory_dict[self.layer_number] = (
+                inference_key_memory,
+                inference_value_memory,
+            )
+            is_first_step = True
+        else:
+            # Get the pre-allocated buffers for this layer
+            inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
+                self.layer_number
+            ]
+
+        batch_start = inference_params.batch_size_offset
+        batch_end = batch_start + key.size(1)
+        assert batch_end <= inference_key_memory.size(1)
+        sequence_start = inference_params.sequence_len_offset
+        sequence_end = sequence_start + key.size(0)
+        assert sequence_end <= inference_key_memory.size(0)
+        # Copy key and values.
+        inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
+        inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
+        key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
+        value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+
+        # adjust the key rotary positional embedding
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            # need to cross check this condition during inference
+            # if not set_inference_key_value_memory:
+            if not is_first_step:
+                # In inference, we compute one token at a time.
+                # Select the correct positional embedding
+                # (only the last token in the sequence)
+                q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+            else:
+                # In the first forward pass of inference,
+                # we use the entire provided prefix.
+                # q_pos_emb here has the rope embeddings of the entire
+                # prefix + to-be-generated output so
+                # we slice to just the prefix.
+                q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+            k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+            rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
+        return key, value, rotary_pos_emb
+
     @abstractmethod
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
         """
@@ -100,28 +166,9 @@ class Attention(MegatronModule, ABC):
                 rotary_pos_emb=None):
         # hidden_states: [sq, b, h]
 
-        # =================================================
-        # Pre-allocate memory for key-values for inference.
-        # =================================================
-        # @jcasper how should we do inference_params?
-        # can do 1. args, 2. add inference params to TransformerConfig
-        # 3. create another config object 4. something else?
-        is_first_step = False
-        if inference_params:
-            if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
-                inf_max_batch_size = inference_params.max_batch_size
-                inference_key_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
-                inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
-                inference_params.key_value_memory_dict[self.layer_number] = (
-                    inference_key_memory,
-                    inference_value_memory,
-                )
-                is_first_step = True
-            else:
-                inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
-                    self.layer_number
-                ]
+        # For self attention we just duplicate the rotary_pos_emb if it isn't already
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = ((rotary_pos_emb,) * 2)
 
         # =====================
         # Query, Key, and Value
@@ -130,52 +177,15 @@ class Attention(MegatronModule, ABC):
         # self or cross attn.
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
 
-        # ==================================
-        # Adjust key and value for inference
-        # ==================================
+        # ===================================================
+        # Adjust key, value, and rotary_pos_emb for inference
+        # ===================================================
+        key, value, rotary_pos_emb = self._adjust_key_value_for_inference(inference_params,
+                                                                          key, value, rotary_pos_emb)
 
-        # For self attention we just duplicate the rotary_pos_emb if it isn't already
-        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = ((rotary_pos_emb,) * 2)
-
-        if inference_params:
-            batch_start = inference_params.batch_size_offset
-            batch_end = batch_start + key.size(1)
-            assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_params.sequence_len_offset
-            sequence_end = sequence_start + key.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
-            inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
-            inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
-            key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
-            value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
-
-            # adjust the key rotary positional embedding
-            if rotary_pos_emb is not None:
-                q_pos_emb, k_pos_emb = rotary_pos_emb
-                # need to cross check this condition during inference
-                # if not set_inference_key_value_memory:
-                if not is_first_step:
-                    # In inference, we compute one token at a time.
-                    # Select the correct positional embedding
-                    # (only the last token in the sequence)
-                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
-                else:
-                    # In the first forward pass of inference,
-                    # we use the entire provided prefix.
-                    # q_pos_emb here has the rope embeddings of the entire
-                    # prefix + to-be-generated output so
-                    # we slice to just the prefix.
-                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
-                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-                rotary_pos_emb = (q_pos_emb, k_pos_emb)
-
-        # ==================================
-        # core attention computation
-        # ==================================
-
-        # apply relative positional encoding (rotary embedding)
+        # ================================================
+        # relative positional embedding (rotary embedding)
+        # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
             query = apply_rotary_pos_emb(query, q_pos_emb)
@@ -185,6 +195,9 @@ class Attention(MegatronModule, ABC):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
+        # ==================================
+        # core attention computation
+        # ==================================
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
