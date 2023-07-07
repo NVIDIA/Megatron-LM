@@ -24,7 +24,7 @@ class VitInpaintingModel(MegatronModule):
 
         self.pre_process = pre_process
         self.post_process = post_process
-        self.hidden_size = args.hidden_size
+        self.hidden_size = config.hidden_size
         self.backbone = VitBackbone(
             config=config,
             pre_process=self.pre_process,

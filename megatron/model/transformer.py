@@ -16,7 +16,7 @@ from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
 try:
@@ -79,12 +79,16 @@ class ParallelMLP(MegatronModule):
         super(ParallelMLP, self).__init__()
         args = get_args()
 
-        self.add_bias = args.add_bias_linear
+        self.add_bias = config.add_bias_linear
+
+        ffn_hidden_size = config.ffn_hidden_size
+        if config.gated_linear_unit:
+            ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
-            config.ffn_hidden_size * 2 if args.swiglu else config.ffn_hidden_size,
+            ffn_hidden_size,
             config=config,
             init_method=config.init_method,
             bias=self.add_bias,
@@ -443,7 +447,7 @@ class ParallelAttention(MegatronModule):
                 projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=config.add_bias_linear,
                 gather_output=False)
 
 
@@ -452,7 +456,7 @@ class ParallelAttention(MegatronModule):
                 2 * projection_size,
                 config=config,
                 init_method=config.init_method,
-                bias=args.add_bias_linear,
+                bias=config.add_bias_linear,
                 gather_output=False)
 
         self.core_attention = CoreAttention(self.layer_number, config,
@@ -1263,7 +1267,7 @@ class ParallelTransformer(MegatronModule):
         self.sequence_parallel = config.sequence_parallel
 
         # Transformer Engine Init.
-        self.transformer_engine_rope_available = False
+        self.transformer_engine_v_0_10 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1272,9 +1276,11 @@ class ParallelTransformer(MegatronModule):
 
             te_version = packaging.version.Version(version("transformer-engine"))
             if te_version >= packaging.version.Version("0.10.0"):
-                self.transformer_engine_rope_available = True
+                self.transformer_engine_v_0_10 = True
 
             del version, packaging
+
+            assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
 
         self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
         self.fp8_recipe = None
@@ -1332,6 +1338,10 @@ class ParallelTransformer(MegatronModule):
                     self_attn_mask_type=self_attn_mask_type,
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
+                # This argument is only available from TE v0.10 onwards.
+                activation_kwarg = {}
+                if self.transformer_engine_v_0_10:
+                    activation_kwarg["activation"] = "swiglu" if args.swiglu else "gelu"
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1358,7 +1368,8 @@ class ParallelTransformer(MegatronModule):
                     layer_type="encoder",
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
-                    fuse_qkv_params=True)
+                    fuse_qkv_params=True,
+                    **activation_kwarg)
 
         if config.virtual_pipeline_model_parallel_size is not None:
             assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
@@ -1446,7 +1457,7 @@ class ParallelTransformer(MegatronModule):
         te_forward_kwargs = {}
         if self.transformer_impl == 'transformer_engine':
             te_forward_kwargs['is_first_microbatch'] = is_first_microbatch
-            if self.transformer_engine_rope_available:
+            if self.transformer_engine_v_0_10:
                 te_forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
 
         if self.recompute_method == 'uniform':
@@ -1597,7 +1608,7 @@ class ParallelTransformer(MegatronModule):
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
-                        if self.transformer_engine_rope_available:
+                        if self.transformer_engine_v_0_10:
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb

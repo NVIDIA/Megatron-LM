@@ -122,7 +122,7 @@ class TransformerBlock(MegatronModule):
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
-    def _checkpointed_forward(self, hidden_states, attention_mask):
+    def _checkpointed_forward(self, hidden_states, attention_mask, rotary_pos_emb):
         """Forward method with activation checkpointing."""
 
         def custom(start, end):
@@ -146,6 +146,7 @@ class TransformerBlock(MegatronModule):
                     self.config.distribute_saved_activations,
                     hidden_states,
                     attention_mask,
+                    rotary_pos_emb,
                 )
 
                 l += self.recompute_num_layers
@@ -157,10 +158,14 @@ class TransformerBlock(MegatronModule):
             for l in range(self.num_layers_per_pipeline_rank):
                 if l < self.config.recompute_num_layers:
                     hidden_states = tensor_parallel.checkpoint(
-                        custom(l, l + 1), self.config.distribute_saved_activations, hidden_states, attention_mask,
+                        custom(l, l + 1),
+                        self.config.distribute_saved_activations,
+                        hidden_states,
+                        attention_mask,
+                        rotary_pos_emb,
                     )
                 else:
-                    hidden_states = custom(l, l + 1)(hidden_states, attention_mask)
+                    hidden_states = custom(l, l + 1)(hidden_states, attention_mask, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -176,7 +181,7 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(self, hidden_states, attention_mask, inference_params=None):
+    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -226,10 +231,14 @@ class TransformerBlock(MegatronModule):
         with rng_context and fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full':
-                hidden_states = self._checkpointed_forward(hidden_states=hidden_states, attention_mask=attention_mask)
+                hidden_states = self._checkpointed_forward(hidden_states=hidden_states,
+                                                           attention_mask=attention_mask,
+                                                           rotary_pos_emb=rotary_pos_emb)
             else:
                 for layer in self.layers:
-                    hidden_states = layer(hidden_states=hidden_states, attention_mask=attention_mask)
+                    hidden_states = layer(hidden_states=hidden_states,
+                                          attention_mask=attention_mask,
+                                          rotary_pos_emb=rotary_pos_emb)
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

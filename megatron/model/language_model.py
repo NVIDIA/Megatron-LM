@@ -8,10 +8,10 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
-from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal
@@ -60,8 +60,8 @@ def get_language_model(config, num_tokentypes, add_pooler,
         config.init_method = init_method_normal(config.init_method_std)
 
     if config.output_layer_init_method is None:
-        config.output_layer_init_method = scaled_init_method_normal(args.init_method_std,
-                                                                    args.num_layers)
+        config.output_layer_init_method = scaled_init_method_normal(config.init_method_std,
+                                                                    config.num_layers)
 
     # Language model.
     language_model = TransformerLanguageModel(
@@ -129,6 +129,10 @@ class Embedding(MegatronModule):
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
+        embedding_weights_in_fp32: casts word embedding weights to
+                                   fp32 before sampling. Required to
+                                   maintain reproducibility when
+                                   training in bf16.
     """
 
     def __init__(self,
@@ -137,7 +141,8 @@ class Embedding(MegatronModule):
                  max_sequence_length,
                  embedding_dropout_prob,
                  config,
-                 num_tokentypes=0):
+                 num_tokentypes=0,
+                 embedding_weights_in_fp32=False):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
@@ -147,12 +152,14 @@ class Embedding(MegatronModule):
         args = get_args()
 
         # Word embeddings (parallel).
+        self.embedding_weights_in_fp32 = embedding_weights_in_fp32
+        self.params_dtype = args.params_dtype
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             vocab_size, self.hidden_size, config=config, init_method=config.init_method)
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.add_position_embedding = args.add_position_embedding
+        self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
         if self.add_position_embedding:
             self.position_embeddings = torch.nn.Embedding(
                 max_sequence_length, self.hidden_size)
@@ -175,7 +182,7 @@ class Embedding(MegatronModule):
         else:
             self.tokentype_embeddings = None
 
-        self.fp32_residual_connection = args.fp32_residual_connection 
+        self.fp32_residual_connection = args.fp32_residual_connection
         self.sequence_parallel = args.sequence_parallel
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
@@ -210,7 +217,12 @@ class Embedding(MegatronModule):
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
+        if self.embedding_weights_in_fp32:
+            self.word_embeddings = self.word_embeddings.to(torch.float32)
         words_embeddings = self.word_embeddings(input_ids)
+        if self.embedding_weights_in_fp32:
+            words_embeddings = words_embeddings.to(self.params_dtype)
+            self.word_embeddings = self.word_embeddings.to(self.params_dtype)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
@@ -354,13 +366,14 @@ class TransformerLanguageModel(MegatronModule):
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
                                        config,
-                                       self.num_tokentypes)
+                                       self.num_tokentypes,
+                                       args.embedding_weights_in_fp32)
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings
         self.use_rotary_position_embeddings = \
-            args.use_rotary_position_embeddings
-        if args.use_rotary_position_embeddings:
+            args.position_embedding_type == 'rope'
+        if self.use_rotary_position_embeddings:
             self.seq_length = args.seq_length
             rotary_dim = args.hidden_size // args.num_attention_heads \
                 if args.kv_channels is None else args.kv_channels

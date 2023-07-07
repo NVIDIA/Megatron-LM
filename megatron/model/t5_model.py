@@ -96,7 +96,7 @@ class T5Model(MegatronModule):
 
         if self.post_process and self.add_decoder:
             self.lm_head = T5LMHead(
-                self.word_embeddings_weight().size(0),
+                self.shared_embedding_or_output_weight().size(0),
                 parallel_output)
             self._lm_head_key = 'lm_head'
 
@@ -129,7 +129,7 @@ class T5Model(MegatronModule):
             decoder_output, encoder_output = lm_output
             # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
-                                     self.word_embeddings_weight())
+                                     self.shared_embedding_or_output_weight())
 
             if lm_labels is None:
                 # [s b h] => [b s h]

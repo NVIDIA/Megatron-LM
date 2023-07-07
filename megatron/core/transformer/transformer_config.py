@@ -191,7 +191,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.recompute_method is not None:
                 if not self.recompute_method in ['block', 'uniform']:
                     raise ValueError(f'recompute_method: {self.recompute_method} must be "block" or "uniform".')
-            else:
+            elif self.recompute_granularity != 'selective':
                 raise ValueError(
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
                 )

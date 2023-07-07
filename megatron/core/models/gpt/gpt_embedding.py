@@ -16,15 +16,21 @@ class GPTEmbedding(MegatronModule):
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This
                              is used for positional embedding
+        add_position_embedding (bool): Add a position embedding.
         embedding_dropout_prob float): dropout probability for embeddings
     """
 
-    def __init__(self, config: TransformerConfig, vocab_size: int, max_sequence_length: int):
+    def __init__(self,
+                 config: TransformerConfig,
+                 vocab_size: int,
+                 max_sequence_length: int,
+                 add_position_embedding: bool):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
+        self.add_position_embedding: bool = add_position_embedding
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -33,16 +39,14 @@ class GPTEmbedding(MegatronModule):
             init_method=self.config.init_method,
             config=self.config
         )
-        # @jcasper are these keys needed?
-        self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.position_embeddings = torch.nn.Embedding(self.max_sequence_length, self.config.hidden_size)
-        self._position_embeddings_key = 'position_embeddings'
+        if self.add_position_embedding:
+            self.position_embeddings = torch.nn.Embedding(self.max_sequence_length, self.config.hidden_size)
 
-        # Initialize the position embeddings.
-        if self.config.perform_initialization:
-            self.config.init_method(self.position_embeddings.weight)
+            # Initialize the position embeddings.
+            if self.config.perform_initialization:
+                self.config.init_method(self.position_embeddings.weight)
 
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
@@ -56,9 +60,12 @@ class GPTEmbedding(MegatronModule):
 
     def forward(self, input_ids, position_ids):
         # Embeddings.
-        words_embeddings = self.word_embeddings(input_ids)
-        position_embeddings = self.position_embeddings(position_ids)
-        embeddings = words_embeddings + position_embeddings
+        word_embeddings = self.word_embeddings(input_ids)
+        if self.add_position_embedding:
+            position_embeddings = self.position_embeddings(position_ids)
+            embeddings = word_embeddings + position_embeddings
+        else:
+            embeddings = word_embeddings
 
         # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
         embeddings = embeddings.transpose(0, 1).contiguous()
@@ -77,38 +84,9 @@ class GPTEmbedding(MegatronModule):
 
         return embeddings
 
+    # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """For easy load."""
-
-        state_dict_ = {}
-        state_dict_[self._word_embeddings_key] = self.word_embeddings.state_dict(prefix=prefix, keep_vars=keep_vars)
-        state_dict_[self._position_embeddings_key] = self.position_embeddings.state_dict(
-            prefix=prefix, keep_vars=keep_vars
-        )
-
-        return state_dict_
+        pass
 
     def load_state_dict(self, state_dict, strict=True):
-        """Customized load."""
-
-        # Word embedding.
-        if self._word_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._word_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'word_embeddings' in key:
-                    state_dict_[key.split('word_embeddings.')[1]] = state_dict[key]
-        self.word_embeddings.load_state_dict(state_dict_, strict=strict)
-
-        # Position embedding.
-        if self._position_embeddings_key in state_dict:
-            state_dict_ = state_dict[self._position_embeddings_key]
-        else:
-            # for backward compatibility.
-            state_dict_ = {}
-            for key in state_dict.keys():
-                if 'position_embeddings' in key:
-                    state_dict_[key.split('position_embeddings.')[1]] = state_dict[key]
-        self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+        pass

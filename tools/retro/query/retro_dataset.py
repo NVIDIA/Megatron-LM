@@ -10,6 +10,7 @@ from tools.retro.db.utils import get_merged_train_dataset as get_db_dataset
 from tools.retro.external_libs import h5py
 
 from .chunk_dataset import get_chunk_dataset_map
+from .utils import get_neighbor_dirname
 
 
 class RetroDataset(torch.utils.data.Dataset):
@@ -120,11 +121,10 @@ def get_retro_datasets(verify_sizes=True):
                                                   retro_args.retro_block_size)
 
         # Verify dataset prefixes.
-        sample_prefix = chunk_dataset.sample_dataset.datasets[0].index_prefix
-        neighbor_prefix = os.path.basename(neighbor_dir)
-        assert sample_prefix == neighbor_prefix, \
+        expected_dir = get_neighbor_dirname(data_key, chunk_dataset.sample_dataset)
+        assert expected_dir == neighbor_dir, \
             "inconsistent dataset source; '%s' vs. '%s'." % \
-            (sample_prefix, neighbor_prefix)
+            (expected_dir, neighbor_dir)
 
         # Verify num chunks.
         n_sample_chunks = len(chunk_dataset)
