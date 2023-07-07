@@ -14,7 +14,8 @@ from megatron.checkpointing import load_checkpoint
 from megatron.model import GPTModel
 from megatron.training import get_model
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
-from megatron.p2p_communication import recv_forward, send_forward
+from megatron.core.pipeline_parallel.p2p_communication import recv_forward, send_forward
+from megatron.arguments import core_transformer_config_from_args
 from tasks.finetune_utils import build_data_loader
 
 from .datasets import build_dataset
@@ -31,6 +32,8 @@ def get_model_provider(eval_metric):
     def model_provider(pre_process=True, post_process=True):
         """Build the model."""
 
+        config = core_transformer_config_from_args(get_args())
+
         if eval_metric == 'loss':
             parallel_output = True
         elif eval_metric == 'accuracy':
@@ -40,7 +43,7 @@ def get_model_provider(eval_metric):
                                       'is not supported.'.format(eval_metric))
 
         print_rank_0('building GPT model ...')
-        model = GPTModel(num_tokentypes=0, parallel_output=parallel_output,
+        model = GPTModel(config, num_tokentypes=0, parallel_output=parallel_output,
                          pre_process=pre_process, post_process=post_process)
 
         return model
@@ -69,7 +72,7 @@ def process_batch(batch):
     return tokens, labels, attention_mask, position_ids, loss_mask
 
 
-def forward_step(batch, model, eval_metric):
+def forward_step(batch, model, eval_metric, config):
     """Forward step."""
 
     # Get the batch.
@@ -80,7 +83,8 @@ def forward_step(batch, model, eval_metric):
     args = get_args()
     args.micro_batch_size = len(labels)
 
-    input_tensor = recv_forward()
+    tensor_shape = (args.seq_length, args.micro_batch_size, args.hidden_size)
+    input_tensor = recv_forward(tensor_shape, config)
 
     # Forward pass through the model.
     unwrapped_model = unwrap_model(
@@ -88,7 +92,7 @@ def forward_step(batch, model, eval_metric):
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)
 
-    send_forward(output)
+    send_forward(output, config)
 
     if parallel_state.is_pipeline_last_stage():
         # For loss, return the unreduced loss.
@@ -115,7 +119,8 @@ def forward_step(batch, model, eval_metric):
 def evaluate(data_loader, model, eval_metric):
     """Evaluation."""
     args = get_args()
-
+    config = core_transformer_config_from_args(args)
+    
     # Turn on evaluation mode which disables dropout.
     model.eval()
 
@@ -126,7 +131,7 @@ def evaluate(data_loader, model, eval_metric):
             if iteration % args.log_interval == 0:
                 print_rank_0('> working on iteration: {}'.format(iteration))
             # Forward evaluation.
-            output = forward_step(batch, model, eval_metric)
+            output = forward_step(batch, model, eval_metric, config)
 
             # Reduce across processes.
             if parallel_state.is_pipeline_last_stage():
