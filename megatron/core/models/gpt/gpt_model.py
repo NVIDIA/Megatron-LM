@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -12,7 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
-
+from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 
 class GPTModel(MegatronModule):
     """Transformer language model.
@@ -32,6 +33,11 @@ class GPTModel(MegatronModule):
         share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
             shared. Defaults to False.
 
+        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
+            Defaults is 'learned_absolute'.
+
+        rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
+            Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
     """
 
     def __init__(
@@ -44,6 +50,8 @@ class GPTModel(MegatronModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        rotary_percent: float = 1.0,
     ):
         super(GPTModel, self).__init__(config=config)
 
@@ -55,6 +63,7 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.position_embedding_type = position_embedding_type
 
         # megatron core pipelining currently depends on model type
         self.model_type = ModelType.encoder_or_decoder
@@ -63,7 +72,18 @@ class GPTModel(MegatronModule):
         if self.pre_process:
             self.embedding = GPTEmbedding(
                 config=self.config, vocab_size=self.vocab_size, max_sequence_length=self.max_sequence_length,
+                add_position_embedding=(self.position_embedding_type == 'learned_absolute')
             )
+
+        # Rotary Position Embeddings
+        if self.position_embedding_type == 'rope':
+            rotary_dim = self.config.kv_channels
+            if rotary_percent < 1.0:
+                rotary_dim = int(rotary_dim * rotary_percent)
+
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+        else:
+            self.rotary_pos_emb = None
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -108,17 +128,28 @@ class GPTModel(MegatronModule):
         inference_params=None,
     ):
 
-        # Encoder embedding.
+        # Decoder embedding.
         if self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
-            # encoder will get hidden_states from encoder.input_tensor
+            # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # Run encoder.
+        # Rotary positional embeddings
+        rotary_pos_emb = None
+        if self.rotary_pos_emb is not None:
+            rotary_seq_len = self.max_sequence_length
+            if inference_params is not None:
+                rotary_seq_len = inference_params.max_sequence_length
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Run decoder.
         hidden_states = self.decoder(
-            hidden_states=decoder_input, attention_mask=attention_mask, inference_params=inference_params
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb
         )
 
         if not self.post_process:

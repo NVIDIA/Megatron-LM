@@ -15,6 +15,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import \
         TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
 
+from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
+
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
 
@@ -41,6 +43,7 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(self.projection_size, self.config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
 
+
         self.core_attention = TECoreAttention(
             config=self.config,
             layer_number=self.layer_number,
@@ -59,7 +62,7 @@ class Attention(MegatronModule, ABC):
             skip_bias_add=True,
         )
 
-    def _checkpointed_attention_forward(self, query, key, value, attention_mask):
+    def _checkpointed_attention_forward(self, query, key, value, attention_mask, rotary_pos_emb=None):
         """Forward method with selective activation checkpointing."""
 
         def custom_forward(*inputs):
@@ -71,7 +74,7 @@ class Attention(MegatronModule, ABC):
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask
+            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb
         )
 
         return hidden_states
@@ -93,7 +96,8 @@ class Attention(MegatronModule, ABC):
         is "self-attn" or "cross-attn".
         """
 
-    def forward(self, hidden_states, attention_mask, key_value_states=None, inference_params=None):
+    def forward(self, hidden_states, attention_mask, key_value_states=None, inference_params=None,
+                rotary_pos_emb=None):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -102,6 +106,7 @@ class Attention(MegatronModule, ABC):
         # @jcasper how should we do inference_params?
         # can do 1. args, 2. add inference params to TransformerConfig
         # 3. create another config object 4. something else?
+        is_first_step = False
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
                 inf_max_seq_len = inference_params.max_sequence_len
@@ -112,6 +117,7 @@ class Attention(MegatronModule, ABC):
                     inference_key_memory,
                     inference_value_memory,
                 )
+                is_first_step = True
             else:
                 inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                     self.layer_number
@@ -128,6 +134,10 @@ class Attention(MegatronModule, ABC):
         # Adjust key and value for inference
         # ==================================
 
+        # For self attention we just duplicate the rotary_pos_emb if it isn't already
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = ((rotary_pos_emb,) * 2)
+
         if inference_params:
             batch_start = inference_params.batch_size_offset
             batch_end = batch_start + key.size(1)
@@ -141,9 +151,39 @@ class Attention(MegatronModule, ABC):
             key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
             value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
 
+            # adjust the key rotary positional embedding
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                # need to cross check this condition during inference
+                # if not set_inference_key_value_memory:
+                if not is_first_step:
+                    # In inference, we compute one token at a time.
+                    # Select the correct positional embedding
+                    # (only the last token in the sequence)
+                    q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+                else:
+                    # In the first forward pass of inference,
+                    # we use the entire provided prefix.
+                    # q_pos_emb here has the rope embeddings of the entire
+                    # prefix + to-be-generated output so
+                    # we slice to just the prefix.
+                    q_pos_emb = q_pos_emb[:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+                rotary_pos_emb = (q_pos_emb, k_pos_emb)
+
         # ==================================
         # core attention computation
         # ==================================
+
+        # apply relative positional encoding (rotary embedding)
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            query = apply_rotary_pos_emb(query, q_pos_emb)
+            key = apply_rotary_pos_emb(key, k_pos_emb)
+            # TODO, can apply positional embedding to value_layer so it has
+            # absolute positional embedding.
+            # otherwise, only relative positional embedding takes effect
+            # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)

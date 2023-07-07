@@ -70,16 +70,16 @@ class TransformerLayer(MegatronModule):
         )
 
     # TODO: decide how to do inference_params
-    def forward(
-        self, hidden_states, attention_mask, encoder_output=None, enc_dec_attn_mask=None, inference_params=None
-    ):
+    def forward(self, hidden_states, attention_mask, encoder_output=None, enc_dec_attn_mask=None,
+                inference_params=None, rotary_pos_emb=None):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
         attention_output_with_bias = self.self_attention(
-            layernorm_output, attention_mask, inference_params=inference_params
+            layernorm_output, attention_mask, inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb
         )
 
         # Residual connection.

@@ -370,6 +370,15 @@ def validate_args(args, defaults={}):
                     retro_args.retro_gpt_chunk_length
                 set_retro_args(retro_args)
 
+    # Legacy RoPE arguments
+    if args.use_rotary_position_embeddings:
+        args.position_embedding_type = 'rope'
+
+    # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
+    # don't allow it to keep things simple
+    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+        raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -539,13 +548,17 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
+    group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
+                       choices=['learned_absolute', 'rope'],
+                       help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
-                       help='Use rotary positional embeddings or not')
+                       help='Use rotary positional embeddings or not. '
+                       'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
     group.add_argument('--no-position-embedding',
                        action='store_false',
-                       help='Disable position embedding.',
+                       help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
