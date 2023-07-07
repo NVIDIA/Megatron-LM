@@ -265,13 +265,15 @@ class CoreAttention(MegatronModule):
         key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
 
-        # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-            (output_size[0]*output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype, "mpu")
-
         # Raw attention scores. [b * np, sq, sk]
         if alibi is None:
+            # preallocting input tensor: [b * np, sq, sk]
+            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+                (output_size[0]*output_size[1],
+                 output_size[2],
+                 output_size[3]),
+                query_layer.dtype, "mpu")
+
             matmul_result = torch.baddbmm(
                 matmul_input_buffer,
                 query_layer.transpose(0, 1),   # [b * np, sq, hn]
