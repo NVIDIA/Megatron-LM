@@ -280,7 +280,6 @@ python pretrain_ict.py \
     --max-position-embeddings 256 \
     --ict-head-size 128 \
     --train-iters 100000 \
-    --activations-checkpoint-method uniform \
     --bert-load /path/to/pretrained_bert \
     --load checkpoints \
     --save checkpoints \
@@ -310,7 +309,6 @@ python tools/create_doc_index.py \
     --ict-head-size 128 \
     --num-attention-heads 12 \
     --batch-size 128 \
-    --activations-checkpoint-method uniform \
     --seq-length 256 \
     --max-position-embeddings 256 \
     --ict-load /path/to/pretrained_ict \
@@ -399,7 +397,6 @@ python tasks/main.py \
        --merge-file $MERGE_FILE \
        --load $CHECKPOINT_PATH \
        --micro-batch-size 8 \
-       --activations-checkpoint-method uniform \
        --log-interval 10 \
        --no-load-optim \
        --no-load-rng
@@ -429,7 +426,6 @@ python tasks/main.py \
        --merge-file $MERGE_FILE \
        --load $CHECKPOINT_PATH \
        --micro-batch-size 8 \
-       --activations-checkpoint-method uniform \
        --log-interval 10 \
        --no-load-optim \
        --no-load-rng
@@ -459,7 +455,6 @@ COMMON_TASK_ARGS="--num-layers 24 \
 COMMON_TASK_ARGS_EXT="--train-data $TRAIN_DATA \
                       --valid-data $VALID_DATA \
                       --pretrained-checkpoint $PRETRAINED_CHECKPOINT \
-                      --activations-checkpoint-method uniform \
                       --save-interval 10000 \
                       --save $CHECKPOINT_PATH \
                       --log-interval 100 \
