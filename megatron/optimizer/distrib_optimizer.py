@@ -537,7 +537,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     init_shard = lambda : torch.empty(
                         (numel,),
                         dtype=torch.float32,
-                        device=torch.cuda.current_device())
+                        device='cpu')
 
                     state_dict_state.append((state_order, {
                         "exp_avg" : init_shard(),
