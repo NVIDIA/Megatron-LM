@@ -141,7 +141,8 @@ class ParallelMLP(MegatronModule):
 
         if self.bias_gelu_fusion:
             assert self.add_bias is True
-            assert self.activation_func == F.gelu
+            # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
+            assert hasattr(self, "__flops__") or self.activation_func == F.gelu
             intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
         else:
             if bias_parallel is not None:
