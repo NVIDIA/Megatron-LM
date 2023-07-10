@@ -25,8 +25,8 @@ jobs:
         days-before-issue-close: 7
         stale-issue-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 7 days.'
         stale-pr-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 7 days.'
-        close-issue-reason: 'No activity on stale issue in 7 days.'
-        close-pr-reason: 'No activity on stale PR in 7 days.'
+        close-issue-message: 'No activity on stale issue in 7 days.'
+        close-pr-message: 'No activity on stale PR in 7 days.'
         stale-issue-label: 'stale'
         stale-pr-label: 'stale'
         remove-stale-when-updated: true
