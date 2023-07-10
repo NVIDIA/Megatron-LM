@@ -7,7 +7,7 @@ name: Mark stale issues and pull requests
 
 on:
   schedule:
-  - cron: '00 18 * * *'
+  - cron: '15 18 * * *'
 
 jobs:
   stale:
@@ -30,3 +30,4 @@ jobs:
         stale-issue-label: 'stale'
         stale-pr-label: 'stale'
         remove-stale-when-updated: true
+        operations-per-run: 1000
