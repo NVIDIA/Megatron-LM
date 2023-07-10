@@ -20,6 +20,17 @@ class TELayerNorm(te.pytorch.LayerNorm):
         super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
 
+class TERMSNorm(te.pytorch.RMSNorm):
+    """
+    Wrapper for the Transformer-Engine's `RMSNorm`.
+    """
+
+    def __init__(
+        self, hidden_size: int, eps: float = 1e-5, sequence_parallel: bool = False, **kwargs
+    ):
+        super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
+
+
 class TELinear(te.pytorch.Linear):
     """
     Wrapper for the Transformer-Engine's `Linear` layer.
