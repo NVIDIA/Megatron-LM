@@ -16,6 +16,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -24,8 +25,10 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building BERT model ...')
 
     args = get_args()
+    config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
     model = BertModel(
+        config=config,
         num_tokentypes=num_tokentypes,
         add_binary_head=args.bert_binary_head,
         parallel_output=True,

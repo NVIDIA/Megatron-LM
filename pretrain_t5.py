@@ -17,6 +17,7 @@ from megatron.data.dataset_utils import build_train_valid_test_datasets
 from megatron.model import T5Model
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 
 """
@@ -60,7 +61,9 @@ def model_provider(pre_process=True, post_process=True,
     """Build the model."""
 
     print_rank_0('building T5 model ...')
-    model = T5Model(num_tokentypes=0,
+    config = core_transformer_config_from_args(get_args())
+    model = T5Model(config=config,
+                    num_tokentypes=0,
                     parallel_output=True,
                     pre_process=pre_process,
                     post_process=post_process,

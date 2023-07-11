@@ -13,12 +13,15 @@ from megatron.model.vision.inpainting import MitInpaintingModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from tasks.vision.metrics import SSIM, PSNR
+from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
     args = get_args()
+    config = core_transformer_config_from_args(args)
     if args.vision_backbone_type == 'vit':
-        model = VitInpaintingModel(pre_process=pre_process,
+        model = VitInpaintingModel(config,
+                                   pre_process=pre_process,
                                    post_process=post_process)
     elif args.vision_backbone_type == 'mit':
         model = MitInpaintingModel(pre_process=pre_process,

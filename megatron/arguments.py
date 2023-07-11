@@ -3,14 +3,17 @@
 """Megatron arguments."""
 
 import argparse
+import dataclasses
 import json
 import os
 import torch
 import types
 
+import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
+from megatron.core.transformer import TransformerConfig
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -367,6 +370,15 @@ def validate_args(args, defaults={}):
                     retro_args.retro_gpt_chunk_length
                 set_retro_args(retro_args)
 
+    # Legacy RoPE arguments
+    if args.use_rotary_position_embeddings:
+        args.position_embedding_type = 'rope'
+
+    # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
+    # don't allow it to keep things simple
+    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+        raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -394,6 +406,27 @@ def _print_args(title, args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
+def core_transformer_config_from_args(args):
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(TransformerConfig):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_gelu_fusion'] = False
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+
+    return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
@@ -515,13 +548,17 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
+    group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
+                       choices=['learned_absolute', 'rope'],
+                       help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
-                       help='Use rotary positional embeddings or not')
+                       help='Use rotary positional embeddings or not. '
+                       'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
     group.add_argument('--no-position-embedding',
                        action='store_false',
-                       help='Disable position embedding.',
+                       help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
@@ -714,6 +751,20 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--profile', action='store_true',
+                       help='Enable nsys profiling. When using this option, nsys '
+                       'options should be specified in commandline. An example '
+                       'nsys commandline is `nsys profile -s none -t nvtx,cuda '
+                       '-o <path/to/output_file> --force-overwrite true '
+                       '--capture-range=cudaProfilerApi '
+                       '--capture-range-end=stop`.')
+    group.add_argument('--profile-step-start', type=int, default=10,
+                       help='Gloable step to start profiling.')
+    group.add_argument('--profile-step-end', type=int, default=12,
+                       help='Gloable step to stop profiling.')
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
+                       help='Global ranks to profile.')
+
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -997,6 +1048,9 @@ def _add_validation_args(parser):
     group.add_argument('--eval-interval', type=int, default=1000,
                        help='Interval between running evaluation on '
                        'validation set.')
+    group.add_argument('--skip-train', action='store_true',
+                       default=False, help='If set, bypass the training loop, '
+                       'optionally do evaluation for validation/test, and exit.')
 
     return parser
 
@@ -1077,7 +1131,7 @@ def _add_data_args(parser):
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--data-impl', type=str, default='infer',
-                       choices=['lazy', 'cached', 'mmap', 'infer'],
+                       choices=['mmap', 'infer'],
                        help='Implementation of indexed datasets.')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')

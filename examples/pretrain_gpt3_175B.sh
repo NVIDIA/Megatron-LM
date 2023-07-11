@@ -41,15 +41,14 @@ options=" \
 	--save-interval 1000 \
 	--save <PATH TO CHECKPOINTS DIRECTORY> \
 	--load <PATH TO CHECKPOINTS DIRECTORY> \
-        --split 98,2,0 \
-        --clip-grad 1.0 \
+	--split 98,2,0 \
+	--clip-grad 1.0 \
 	--weight-decay 0.1 \
 	--adam-beta1 0.9 \
 	--adam-beta2 0.95 \
 	--init-method-std 0.006 \
 	--tensorboard-dir <TENSORBOARD DIRECTORY> \
-        --fp16 \
-	--activations-checkpoint-method uniform "
+	--fp16 "
 
 
 run_cmd="python -u ${DIR}/pretrain_gpt.py $@ ${options}"
