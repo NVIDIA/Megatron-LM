@@ -22,11 +22,11 @@ jobs:
       with:
         repo-token: ${{ secrets.GITHUB_TOKEN }}
         days-before-stale: 60
-        days-before-issue-close: 7
-        stale-issue-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 7 days.'
-        stale-pr-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 7 days.'
-        close-issue-message: 'No activity on stale issue in 7 days.'
-        close-pr-message: 'No activity on stale PR in 7 days.'
+        days-before-issue-close: 21
+        stale-issue-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 21 days.'
+        stale-pr-message: 'Marking as stale. No activity in 60 days. Remove stale label or comment or this will be closed in 21 days.'
+        close-issue-message: 'No activity on stale issue in 21 days.'
+        close-pr-message: 'No activity on stale PR in 21 days.'
         stale-issue-label: 'stale'
         stale-pr-label: 'stale'
         remove-stale-when-updated: true
