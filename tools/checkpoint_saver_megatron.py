@@ -159,7 +159,7 @@ def save_checkpoint(queue, args):
             if getattr(margs, arg) != value:
                 print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
                 setattr(margs, arg, value)
-    
+
     validate_args(margs)
 
     set_global_variables(margs, build_tokenizer=False)
