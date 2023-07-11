@@ -216,11 +216,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @custom_fwd
     def forward(ctx, input, weight, bias, gradient_accumulation_fusion,
                 async_grad_allreduce, sequence_parallel):
-        ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel = sequence_parallel
+        ctx.compute_weight_gradient = weight.requires_grad
+        if ctx.compute_weight_gradient:
+            ctx.save_for_backward(input, weight)
+        else:
+            ctx.save_for_backward(weight)
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -245,27 +249,35 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output):
-        input, weight = ctx.saved_tensors
+        if ctx.compute_weight_gradient:
+            input, weight = ctx.saved_tensors
+        else:
+            weight = ctx.saved_tensors[0]
+            input = None
         use_bias = ctx.use_bias
 
-        if ctx.sequence_parallel:
-            world_size = get_tensor_model_parallel_world_size()
-            dim_size = list(input.size())
-            dim_size[0] = dim_size[0] * world_size
+        if ctx.compute_weight_gradient:
+            if ctx.sequence_parallel:
+                world_size = get_tensor_model_parallel_world_size()
+                dim_size = list(input.size())
+                dim_size[0] = dim_size[0] * world_size
 
-            all_gather_buffer = \
-                get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            handle = torch.distributed._all_gather_base(
-                all_gather_buffer,
-                input,
-                group=get_tensor_model_parallel_group(), async_op=True)
+                all_gather_buffer = \
+                    get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+                handle = torch.distributed._all_gather_base(
+                    all_gather_buffer,
+                    input,
+                    group=get_tensor_model_parallel_group(), async_op=True)
 
-            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-            # gather is scheduled before the input gradient computation
-            total_input = all_gather_buffer
-        else:
-            total_input = input
+                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                # gather is scheduled before the input gradient computation
+                total_input = all_gather_buffer
+            else:
+                total_input = input
+
         grad_input = grad_output.matmul(weight)
+        if not ctx.compute_weight_gradient:
+            return grad_input, None, None, None, None, None
 
         if ctx.sequence_parallel:
             handle.wait()
