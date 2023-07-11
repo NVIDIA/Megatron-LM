@@ -1,0 +1,72 @@
+Here are the steps to reproduce pre training using the code parrot dataset. This work requires the use of
+an NVIDIA docker container with all dependencies install.
+
+Set Up Docker Container
+
+Starting The Docker Container
+We used the latest docker container as of July 7, but you can try other containers taht are listed here:
+https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags
+
+docker run --gpus all -it --name pytorch_container_rajk-3 --shm-size=50gb -d nvcr.io/nvidia/pytorch:23.06-py3
+
+Note: shm size is set to 50gb because if this is too small (~1 GB) you will see an error stating an GPU physical
+address is not available. There is no mention of GPU in the error so keep this mind.
+You will need the docker container name and docker container id for the next steps. You can get this by typing
+docker ps -a on the command line.
+
+
+Entering The Docker Container
+docker exec -it $CONTAINER_NAME /bin/bash
+Example:
+docker exec -it pytorch_container_rajk-3 /bin/bash
+
+Copy Megatron-LM to docker container
+<set container ID to correspond with the docker container created above>
+docker cp Megatron-LM-Fork $CONTAINER_ID:/workspace/remote/Megatron-LM
+Example:
+docker cp Megatron-LM-Fork pytorch_container_rajk-3:/workspace/remote/Megatron-LM
+
+Retrieve Requisite Model Artifacts From GPT2:
+You need the vocab.json and merges.txt file from GPT2 to build the tokenizer for code parrot.
+<on box with A10 gpus Installed, not the docker container>
+sudo apt install git-lfs
+git lfs install
+git clone https://huggingface.co/gpt2
+cd gpt2
+Example:
+export CONTAINER_ID=650fb8a9509e
+docker cp vocab.json $CONTAINER_ID:/workspace/remote/Megatron-LM
+docker cp merges.txt $CONTAINER_ID:/workspace//remote/Megatron-LM
+
+/workspace/remote/Megatron-LM
+
+Retrieve Data
+<enter docker container>
+<enter Megatron-LM base directory>
+python examples/code_parrot/retrieve_dataset_codeparrot.py codeparrot_data.json
+This should create a json file in the Megatron LM base directory called: codeparrot_data.json
+
+Pre-Process Data
+<enter docker container>
+<enter Megatron-LM base directory>
+python tools/preprocess_data.py \
+       --input codeparrot_data.json \
+       --output-prefix codeparrot \
+       --vocab-file vocab.json \
+       --dataset-impl mmap \
+       --tokenizer-type GPT2BPETokenizer \
+       --merge-file merges.txt \
+       --json-keys content \
+       --workers 32 \
+       --append-eod
+This will contain two artifacts:
+codeparrot_content_document.bin
+codeparrot_content_document.idx
+On this demo it takes about 1 hour to generate the dataset.
+
+Run Pre Training
+The script below is set up to run on a single instance with two A10 GPUs and sequence parallel enabled.
+<enter Megatron-LM base directory>
+cp examples/code_parrot/pretrain_parrot_torchrun_seq_parallel.sh .
+chmod +x pretrain_parrot_torchrun_seq_parallel.sh
+./pretrain_parrot_torchrun_seq_parallel.sh
