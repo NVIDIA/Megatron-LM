@@ -221,21 +221,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                                         embedding_weights_in_fp32=args.embedding_weights_in_fp32,
                                         tied_weight_attr='word_embeddings_weight'))
 
-        if args.fp32_residual_connection:
-            self.specs.append(lambda x: x.transpose(0, 1).contiguous().float())
-        else:
-            self.specs.append(lambda x: x.transpose(0, 1).contiguous())
-
         for layer_idx in range(args.num_layers):
             self.specs.append(
                 LayerSpec(ParallelTransformerLayerPipe,
                     config,
                     layer_number=layer_idx,
                     self_attn_mask_type=AttnMaskType.causal))
-
-
-        # Undo data format change
-        self.specs.append(lambda x: x.transpose(0, 1).contiguous())
 
         # Final layernorm after transformer layers
         self.specs.append(
