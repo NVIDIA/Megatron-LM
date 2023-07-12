@@ -296,6 +296,7 @@ cleanup.selene:
     - set +e
     - NUM_CLEANUP=`find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | wc -l`
     - find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
+    - find ${SELENE_ADLR_CI_PATH}/* -type d -name "checkpoints" -ctime +2 | grep -v data | xargs rm -rf
     - echo "Finished cleaning $NUM_CLEANUP directories older than 20 days everything in Selene"
   allow_failure: true
   rules:
