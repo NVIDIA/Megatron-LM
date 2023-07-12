@@ -22,5 +22,37 @@ In addition, below is a performance/convergence comparison between before and af
 
 At last, we provide a [toy example script](ds_pretrain_gpt_125M.sh) that users can try as the first test.
 
+## Flash attention
+We also tested and verified that flash attention feature introduced by this sync works properly for GPT pretraining. We compare the training using the [toy example script](ds_pretrain_gpt_125M.sh) and the [toy example script with flash attention](ds_pretrain_gpt_125M_flashattn.sh) on 8 A100 GPUs, and found that the training throughput (TFLOPs per GPU) increases from 25 to 32.
+
+The installation of flash attention is a bit complex. Below is an example of how we install it.
+
+```shell
+WORK_DIR=flash_attn_repro
+mkdir ${WORK_DIR} && cd ${WORK_DIR}
+python -m venv venv/flash_attn_repro
+source venv/flash_attn_repro/bin/activate
+pip install packaging
+
+# install triton
+git clone -b legacy-backend https://github.com/openai/triton
+cd triton/python/
+pip install cmake; # build-time dependency
+pip install -e .
+
+# install
+cd ${WORK_DIR}
+git clone -b v1.0.4 https://github.com/HazyResearch/flash-attention
+cd flash-attention
+### Edit the source here ###
+# Disable bias because the implementation doesn't support it
+# See https://github.com/tohtana/flash-attention/commit/957c1549735e2e7348a1d2032b0fbc628f5d50c3
+########################
+python setup.py install
+```
+
+## Rotary Positional Embedding (RoPE)
+We also tested and verified that the Rotary Positional Embedding (RoPE) introduced by this sync works properly for GPT pretraining (except that currently it cannot be used with DeepSpeed's pipeline parallelism. We are working on to support this combination). By comparing the training between [without RoPE](ds_pretrain_gpt_1.3B.sh) and [with RoPE](ds_pretrain_gpt_1.3B_rope.sh), we are able to observe that RoPE helps improving the model convergence just like [previous observation](https://blog.eleuther.ai/rotary-embeddings/).
+
 ## Notes/TODOs
 * After the sync, DeepSpeed still relies on the older activation checkpointing mechanism (see function ```_checkpointed_forward``` in ```Megatron-DeepSpeed/megatron/model/transformer.py```) since we didn't have time to integrate with the new version yet. Contribution is very welcomed.
