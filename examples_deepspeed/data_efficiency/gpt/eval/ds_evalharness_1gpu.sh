@@ -1,8 +1,8 @@
-## CAUTION: first read Megatron-DeepSpeed/blob/main/examples/MoE/readme_evalharness.md
+## CAUTION: first read Megatron-DeepSpeed/blob/main/examples_deepspeed/MoE/readme_evalharness.md
 ## and follow the steps of installation/data downloading.
 
 ## Code below only works when you run each evalharness task on a single GPU.
-## For multi-GPU evalharness, check Megatron-DeepSpeed/blob/main/examples/MoE/ds_evalharness.sh
+## For multi-GPU evalharness, check Megatron-DeepSpeed/blob/main/examples_deepspeed/MoE/ds_evalharness.sh
 checkpoint_path=$1
 config_path=$2
 result_path=$3

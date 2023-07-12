@@ -24,8 +24,8 @@ some symlinks due to lm-harness' issues with relative position of data
 ```
 mkdir data
 cd ../../tasks/eval_harness/
-ln -s ../../examples/MoE/data/ data
-cd ../../examples/MoE/
+ln -s ../../examples_deepspeed/MoE/data/ data
+cd ../../examples_deepspeed/MoE/
 ```
 <!-- Also make sure `data` is not on one of the limited paritions like WORKSF. -->
 
@@ -53,7 +53,7 @@ You know there is a custom tokenizer if the training script had something like:
 <!-- Prepare the run script, replace `variant` with a unique identifier for the current eval so that multiple evals could run in parallel and not all log into the same `results.json` file. so, e.g., `tr9c-1B3-swiglu`
 
 ```
-cp examples/run_evalharness_deepspeed.slurm run_evalharness-variant.slurm
+cp examples_deepspeed/run_evalharness_deepspeed.slurm run_evalharness-variant.slurm
 ```
 
 now edit `run_evalharness-variant.slurm`

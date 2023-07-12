@@ -4,7 +4,7 @@ The recipes have been tested on command line on a cluster setup using Azure VMs 
 
 To run any of the examples in this folder, please go to the base directory of Megatron-DeepSpeed and run as follows
 
-```bash examples/azure/run-benchmark-model.sh```
+```bash examples_deepspeed/azure/run-benchmark-model.sh```
 
 ### Pre-requisites
 
@@ -18,9 +18,9 @@ To run the above script, you will need to either setup your own dataset and modi
 
 We have included two recipes for the 175B model and the 1T model. To train the model, we assume that the users will modify and tune hyperparameters and configurations by themselves. To facilitate initial training, we have made the recipes runnable with the Books dataset as follows.
 
-```bash examples/azure/run-175b.sh```
+```bash examples_deepspeed/azure/run-175b.sh```
 
-```bash examples/azure/run-1t.sh```
+```bash examples_deepspeed/azure/run-1t.sh```
 
 ### Note about ZeRO stage 3 and CPU offload 
 

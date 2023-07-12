@@ -1,4 +1,4 @@
-## CAUTION: first read Megatron-DeepSpeed/blob/main/examples/MoE/readme_evalharness.md
+## CAUTION: first read Megatron-DeepSpeed/blob/main/examples_deepspeed/MoE/readme_evalharness.md
 ## and follow the steps of installation/data downloading.
 checkpoint_paths=(
     /vc_data_blob/users/conglli/project/data_efficient_gpt/checkpoint/gpt-pile-0.125B-tok300B-lr6.0e-4-min6.0e-5-wup375M-dcy260B-sty-cosine-gbs256-mbs4-gpu64-zero0-mp1-pp1-nopp-seed1234-bwup4B/global_step591581/
@@ -50,7 +50,7 @@ cuda_id=-1
 total_mem=$(nvidia-smi --query-gpu=memory.total --format=csv -i 0 | grep -Eo [0-9]+)
 
 ## Code below only works when you run each evalharness task on a single GPU.
-## For multi-GPU evalharness, check Megatron-DeepSpeed/blob/main/examples/MoE/ds_evalharness.sh
+## For multi-GPU evalharness, check Megatron-DeepSpeed/blob/main/examples_deepspeed/MoE/ds_evalharness.sh
 for l in "${!checkpoint_paths[@]}"; do 
     checkpoint_path=${checkpoint_paths[l]}
     for ((i=0;i<${#tasks[@]};++i)); do
