@@ -249,7 +249,7 @@ data_options=" \
          --data-impl mmap"
         
 megatron_options=" \
-        --override-lr-scheduler \
+        --override-opt_param-scheduler \
         --adam-beta1 0.9 \
         --adam-beta2 0.95 \
         --tensor-model-parallel-size ${MP_SIZE} \

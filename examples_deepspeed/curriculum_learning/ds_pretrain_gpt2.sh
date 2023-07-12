@@ -111,7 +111,7 @@ gpt_options=" \
         --data-impl mmap \
         --split 949,50,1 \
         --distributed-backend nccl \
-        --override-lr-scheduler \
+        --override-opt_param-scheduler \
         --lr $LR \
         --lr-decay-style cosine \
         --min-lr 1.0e-5 \

@@ -340,7 +340,7 @@ data_options=" \
 ## If CL is used, make sure to set "--split" the same as what you used during
 ## offline data analysis&indexing.
 megatron_options=" \
-    --override-lr-scheduler \
+    --override-opt_param-scheduler \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
     --tensor-model-parallel-size ${mp_size} \
