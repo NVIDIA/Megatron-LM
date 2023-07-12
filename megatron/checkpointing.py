@@ -280,7 +280,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         #state_dict is used by deepspeed for module saving so it needs to point to the right function
         if args.no_pipeline_parallel:
             original_state_dict = model[0].module.state_dict
-            model[0].module.state_dict = model[0].module.state_dict_for_save_checkpoint
+            def state_dict_for_save_checkpoint_deepspeed(destination=None, prefix='', keep_vars=False):
+                return model[0].module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
+            model[0].module.state_dict = state_dict_for_save_checkpoint_deepspeed
 
         # Saving is a collective communication
         checkpoint_name = get_checkpoint_name(args.save, iteration)
