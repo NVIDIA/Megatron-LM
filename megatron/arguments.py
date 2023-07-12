@@ -367,6 +367,12 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    # TODO: currently DeepSpeed seems to be incompatible with
+    # async_tensor_model_parallel_allreduce thus temporarily disabling it.
+    # Need further investigation.
+    if args.deepspeed:
+        args.async_tensor_model_parallel_allreduce = False
+
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
         if args.sequence_parallel:
             raise RuntimeError(
