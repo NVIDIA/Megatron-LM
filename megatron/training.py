@@ -530,10 +530,10 @@ def setup_model_and_optimizer(model_provider_func,
         opt_param_scheduler = None
     else:
         if teacher:
-          optimizer = None
+            optimizer = None
         else:
-          optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
+            optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
+                                               scale_lr_cond, lr_mult)
         # opt_param_scheduler is the old lr_scheduler plus weight decay scheduling
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -681,51 +681,18 @@ def train_step(forward_step_func, data_iterator,
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
-    # # Reduce gradients.
-    # optimizer.reduce_model_grads(args, timers)
-
-    # # Vision gradients.
-    # if args.vision_pretraining and args.vision_pretraining_type == "dino":
-    #     unwrapped_model = unwrap_model(model[0],
-    #                                    (torchDDP, LocalDDP, Float16Module))
-    #     unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
-    # All-reduce if needed.
-    if not args.deepspeed and args.DDP_impl == 'local':
-        timers('backward-params-all-reduce').start()
-        for model_module in model:
-            model_module.allreduce_gradients()
-        timers('backward-params-all-reduce').stop()
-
-    # All-reduce word_embeddings' grad across first and last stages to ensure
-    # that word_embeddings parameters stay in sync.
-    # This should only run for models that support pipelined model parallelism
-    # (BERT and GPT-2).
-    timers('backward-embedding-all-reduce').start()
+    # Reduce gradients.
     if not args.deepspeed:
-        if (mpu.is_pipeline_first_stage(ignore_virtual=True) or
-            mpu.is_pipeline_last_stage(ignore_virtual=True)) and \
-                mpu.get_pipeline_model_parallel_world_size() > 1:
-            if mpu.is_pipeline_first_stage(ignore_virtual=True):
-                unwrapped_model = model[0]
-            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-                unwrapped_model = model[-1]
-            unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+        optimizer.reduce_model_grads(args, timers)
 
-            if unwrapped_model.share_word_embeddings:
-                word_embeddings_weight = unwrapped_model.word_embeddings_weight()
-                if args.DDP_impl == 'local':
-                    grad = word_embeddings_weight.main_grad
-                else:
-                    grad = word_embeddings_weight.grad
-                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
-    timers('backward-embedding-all-reduce').stop()
+    # Vision gradients.
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0],
+                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
-    # timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    # update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
-    # timers('optimizer').stop()
-    timers('optimizer').start()
+    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
@@ -733,18 +700,18 @@ def train_step(forward_step_func, data_iterator,
         model[0].step(lr_kwargs={'increment': increment})
         update_successful = model[0].was_step_applied()
     else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
 
-    # # Gather params.
-    # if update_successful:
-    #     optimizer.gather_model_params(args, timers)
+    # Gather params.
+    if not args.deepspeed and update_successful:
+        optimizer.gather_model_params(args, timers)
 
-    # # Vision momentum.
-    # if args.vision_pretraining and args.vision_pretraining_type == "dino":
-    #     unwrapped_model = unwrap_model(model[0],
-    #                                    (torchDDP, LocalDDP, Float16Module))
-    #     unwrapped_model.update_momentum(args.curr_iteration)
+    # Vision momentum.
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
+        unwrapped_model = unwrap_model(model[0],
+                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
     if args.deepspeed:
@@ -780,275 +747,6 @@ def train_step(forward_step_func, data_iterator,
             return loss_reduced, skipped_iter, grad_norm, num_zeros_in_grad
     return {}, skipped_iter, grad_norm, num_zeros_in_grad
 
-
-# def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
-#                  loss_scale, report_memory_flag, skipped_iter,
-#                  grad_norm, params_norm, num_zeros_in_grad,
-#                  model=None, optimizer=None):
-#     """Log training information such as losses, timing, ...."""
-#     args = get_args()
-#     timers = get_timers()
-#     writer = get_tensorboard_writer()
-
-#     # Advanced, skipped, and Nan iterations.
-#     advanced_iters_key = 'advanced iterations'
-#     skipped_iters_key = 'skipped iterations'
-#     nan_iters_key = 'nan iterations'
-#     # Advanced iterations.
-#     if not skipped_iter:
-#         total_loss_dict[advanced_iters_key] = total_loss_dict.get(
-#             advanced_iters_key, 0) + 1
-#     else:
-#         if advanced_iters_key not in total_loss_dict:
-#             total_loss_dict[advanced_iters_key] = 0
-#     # Skipped iterations.
-#     total_loss_dict[skipped_iters_key] = total_loss_dict.get(
-#         skipped_iters_key, 0) + skipped_iter
-#     # Update losses and set nan iterations
-#     got_nan = False
-#     for key in loss_dict:
-#         if not skipped_iter:
-#             total_loss_dict[key] = total_loss_dict.get(
-#                 key, get_accelerator().FloatTensor([0.0])) + loss_dict[key]
-#         else:
-#             value = loss_dict[key].float().sum().item()
-#             is_nan = value == float('inf') or \
-#                      value == -float('inf') or \
-#                      value != value
-#             got_nan = got_nan or is_nan
-#     total_loss_dict[nan_iters_key] = total_loss_dict.get(
-#         nan_iters_key, 0) + int(got_nan)
-
-#     # Logging.
-#     timers_to_log = [
-#         'forward-backward',
-#         'forward-compute',
-#         'backward-compute',
-#         'batch-generator',
-#         'forward-recv',
-#         'forward-send',
-#         'backward-recv',
-#         'backward-send',
-#         'forward-send-forward-recv',
-#         'forward-send-backward-recv',
-#         'backward-send-forward-recv',
-#         'backward-send-backward-recv',
-#         'forward-backward-send-forward-backward-recv',
-#         'layernorm-grads-all-reduce',
-#         'embedding-grads-all-reduce',
-#         'grads-all-reduce',
-#         'grads-reduce-scatter',
-#         'params-all-gather',
-#         'optimizer-copy-to-main-grad',
-#         'optimizer-unscale-and-check-inf',
-#         'optimizer-clip-main-grad',
-#         'optimizer-count-zeros',
-#         'optimizer-inner-step',
-#         'optimizer-copy-main-to-model-params',
-#         'optimizer']
-
-#     # Calculate batch size.
-#     batch_size = args.micro_batch_size * args.data_parallel_size * \
-#         get_num_microbatches()
-#     total_iterations = total_loss_dict[advanced_iters_key] + \
-#                        total_loss_dict[skipped_iters_key]
-
-#     # Tensorboard values.
-#     # Timer requires all the ranks to call.
-#     if args.log_timers_to_tensorboard and \
-#        (iteration % args.tensorboard_log_interval == 0):
-#         timers.write(timers_to_log, writer, iteration,
-#                      normalizer=total_iterations)
-#     if writer and (iteration % args.tensorboard_log_interval == 0):
-#         if args.log_learning_rate_to_tensorboard:
-#             writer.add_scalar('learning-rate/learning-rate', learning_rate, iteration)
-#             writer.add_scalar('learning-rate/learning-rate vs samples', learning_rate,
-#                               args.consumed_train_samples)
-#             writer.add_scalar('learning-rate/learning-rate vs tokens', learning_rate,
-#                               args.consumed_train_tokens)
-#         if args.log_batch_size_to_tensorboard:
-#             writer.add_scalar('batch-size/batch-size', batch_size, iteration)
-#             writer.add_scalar('batch-size/batch-size vs samples', batch_size,
-#                               args.consumed_train_samples)
-#         for key in loss_dict:
-#             writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key], iteration)
-#             writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
-#                               args.consumed_train_samples)
-#             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
-#                               args.consumed_train_tokens)
-#         if args.log_loss_scale_to_tensorboard:
-#             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
-#             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
-#                               args.consumed_train_samples)
-#         if args.log_world_size_to_tensorboard:
-#             writer.add_scalar('world-size', args.world_size, iteration)
-#             writer.add_scalar('world-size vs samples', args.world_size,
-#                               args.consumed_train_samples)
-#         if grad_norm is not None:
-#             writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
-#             writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
-#                               args.consumed_train_samples)
-#             writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
-#                               args.consumed_train_tokens)
-#         if num_zeros_in_grad is not None:
-#             writer.add_scalar('num-zeros/num-zeros', num_zeros_in_grad, iteration)
-#             writer.add_scalar('num-zeros/num-zeros vs samples', num_zeros_in_grad,
-#                               args.consumed_train_samples)
-#             writer.add_scalar('num-zeros/num-zeros vs tokens', num_zeros_in_grad,
-#                               args.consumed_train_tokens)
-#         if params_norm is not None:
-#             writer.add_scalar('params-norm/params-norm', params_norm, iteration)
-#             writer.add_scalar('params-norm/params-norm vs samples', params_norm,
-#                               args.consumed_train_samples)
-#         if args.log_memory_to_tensorboard:
-#             mem_stats = torch.cuda.memory_stats()
-#             writer.add_scalar(
-#                 "mem-reserved-bytes",
-#                 mem_stats["reserved_bytes.all.current"],
-#                 iteration,
-#             )
-#             writer.add_scalar(
-#                 "mem-allocated-bytes",
-#                 mem_stats["allocated_bytes.all.current"],
-#                 iteration,
-#             )
-#             writer.add_scalar(
-#                 "mem-allocated-count",
-#                 mem_stats["allocation.all.current"],
-#                 iteration,
-#             )
-
-#     if iteration % args.tensorboard_log_interval == 0:
-#         # This logging write various optimizer states to tensorboard. This
-#         # feature may consume extra GPU memory thus is set at false by default.
-#         if args.log_optimizer_states_to_tensorboard and optimizer is not None:
-#             opt_stats = [0.0] * 8
-#             opt_stats_2 = [0.0] * 4
-#             for _, group in enumerate(optimizer.param_groups):
-#                 for _, param in enumerate(group['params']):
-#                     opt_stats[0] += (torch.norm(optimizer.state[param]['exp_avg_sq']).item())**2
-#                     opt_stats[1] += (torch.norm(optimizer.state[param]['exp_avg_sq'].sqrt()).item())**2
-#                     opt_stats[2] += (torch.norm(optimizer.state[param]['exp_avg']).item())**2
-#                     opt_stats[3] += (torch.norm(param).item())**2
-#                     opt_stats[4] += torch.norm(optimizer.state[param]['exp_avg_sq'],p=1).item()
-#                     opt_stats[5] += torch.norm(optimizer.state[param]['exp_avg_sq'].sqrt(),p=1).item()
-#                     opt_stats[6] += torch.norm(optimizer.state[param]['exp_avg'],p=1).item()
-#                     opt_stats[7] += torch.norm(param,p=1).item()
-#                     opt_stats_2[0] = max(opt_stats_2[0], abs(optimizer.state[param]['exp_avg_sq'].max().item()), abs(optimizer.state[param]['exp_avg_sq'].min().item()))
-#                     opt_stats_2[1] = max(opt_stats_2[1], optimizer.state[param]['exp_avg_sq'].sqrt().abs_().max().item())
-#                     opt_stats_2[2] = max(opt_stats_2[2], abs(optimizer.state[param]['exp_avg'].max().item()), abs(optimizer.state[param]['exp_avg'].min().item()))
-#                     opt_stats_2[3] = max(opt_stats_2[3], abs(param.max().item()), abs(param.min().item()))
-#             # print('step {} rank {} before sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
-#             if args.zero_stage > 0:
-#                 # ZeRO partiions optimizer states
-#                 opt_stats = get_accelerator().FloatTensor(opt_stats)
-#                 torch.distributed.all_reduce(opt_stats, group=mpu.get_data_parallel_group())
-#                 opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
-#                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
-#                     group=mpu.get_data_parallel_group())
-
-#             if args.tensor_model_parallel_size > 1:
-#                 opt_stats = get_accelerator().FloatTensor(opt_stats)
-#                 torch.distributed.all_reduce(opt_stats, group=mpu.get_tensor_model_parallel_group())
-#                 opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
-#                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
-#                     group=mpu.get_tensor_model_parallel_group())
-
-#             if args.pipeline_model_parallel_size > 1:
-#                 opt_stats = get_accelerator().FloatTensor(opt_stats)
-#                 torch.distributed.all_reduce(opt_stats, group=mpu.get_pipeline_model_parallel_group())
-#                 opt_stats_2 = get_accelerator().FloatTensor(opt_stats_2)
-#                 torch.distributed.all_reduce(opt_stats_2, op=torch.distributed.ReduceOp.MAX,
-#                     group=mpu.get_pipeline_model_parallel_group())
-
-#             # print('step {} rank {} after sync opt_stats {}, {}'.format(iteration, torch.distributed.get_rank(), opt_stats_2, opt_stats))
-#             if writer and is_last_rank():
-#                 writer.add_scalar('optimizer/variance_l2 vs tokens', opt_stats[0]**0.5, args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/variance_sqrt_l2 vs tokens', opt_stats[1]**0.5, args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/momentum_l2 vs tokens', opt_stats[2]**0.5, args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/weight_l2 vs tokens', opt_stats[3]**0.5, args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/variance_l1 vs tokens', opt_stats[4], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/variance_sqrt_l1 vs tokens', opt_stats[5], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/momentum_l1 vs tokens', opt_stats[6], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/weight_l1 vs tokens', opt_stats[7], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/variance_abs_max vs tokens', opt_stats_2[0], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/variance_sqrt_abs_max vs tokens', opt_stats_2[1], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/momentum_abs_max vs tokens', opt_stats_2[2], args.consumed_train_tokens)
-#                 writer.add_scalar('optimizer/weight_abs_max vs tokens', opt_stats_2[3], args.consumed_train_tokens)
-
-#                 writer.add_scalar('optimizer/variance_l2', opt_stats[0]**0.5, iteration)
-#                 writer.add_scalar('optimizer/variance_sqrt_l2', opt_stats[1]**0.5, iteration)
-#                 writer.add_scalar('optimizer/momentum_l2', opt_stats[2]**0.5, iteration)
-#                 writer.add_scalar('optimizer/weight_l2', opt_stats[3]**0.5, iteration)
-#                 writer.add_scalar('optimizer/variance_l1', opt_stats[4], iteration)
-#                 writer.add_scalar('optimizer/variance_sqrt_l1', opt_stats[5], iteration)
-#                 writer.add_scalar('optimizer/momentum_l1', opt_stats[6], iteration)
-#                 writer.add_scalar('optimizer/weight_l1', opt_stats[7], iteration)
-#                 writer.add_scalar('optimizer/variance_abs_max', opt_stats_2[0], iteration)
-#                 writer.add_scalar('optimizer/variance_sqrt_abs_max', opt_stats_2[1], iteration)
-#                 writer.add_scalar('optimizer/momentum_abs_max', opt_stats_2[2], iteration)
-#                 writer.add_scalar('optimizer/weight_abs_max', opt_stats_2[3], iteration)
-
-#     if iteration % args.log_interval == 0:
-#         elapsed_time = timers('interval-time').elapsed(barrier=True)
-#         elapsed_time_per_iteration = elapsed_time / total_iterations
-#         if writer:
-#             if args.log_timers_to_tensorboard:
-#                 writer.add_scalar('iteration-time/iteration-time',
-#                                   elapsed_time_per_iteration, iteration)
-#                 writer.add_scalar('iteration-time/iteration-time vs samples',
-#                                   elapsed_time_per_iteration, args.consumed_train_samples)
-#                 writer.add_scalar('iteration-time/iteration-time vs tokens',
-#                                   elapsed_time_per_iteration, args.consumed_train_tokens)
-#         log_string = ' iteration {:8d}/{:8d} |'.format(
-#             iteration, args.train_iters)
-#         log_string += ' consumed samples: {:12d} |'.format(
-#             args.consumed_train_samples)
-#         log_string += ' consumed tokens: {:12d} |'.format(
-#             args.consumed_train_tokens)
-#         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
-#             elapsed_time_per_iteration * 1000.0)
-#         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
-#         log_string += ' global batch size: {:5d} |'.format(batch_size)
-#         for key in total_loss_dict:
-#             if key not in [advanced_iters_key, skipped_iters_key,
-#                            nan_iters_key]:
-#                 avg = total_loss_dict[key].item() / \
-#                       float(max(1, total_loss_dict[advanced_iters_key]))
-#                 if avg > 0.0:
-#                     log_string += ' {}: {:.6E} |'.format(key, avg)
-#                 total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
-#         if loss_scale is not None:
-#             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
-#         if grad_norm is not None:
-#             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
-#         if num_zeros_in_grad is not None:
-#             log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
-#         if params_norm is not None:
-#             log_string += ' params norm: {:.3f} |'.format(params_norm)
-#         if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
-#             log_string += ' curriculum seqlen: {:5d} |'.format(args.curriculum_seqlen)
-#         if args.random_ltd:
-#             log_string += ' random ltd reserved length: {:5d} |'.format(args.random_ltd_reserved_length)
-#         log_string += ' actual seqlen: {:5d} |'.format(seq_len)
-#         log_string += ' number of skipped iterations: {:3d} |'.format(
-#             total_loss_dict[skipped_iters_key])
-#         log_string += ' number of nan iterations: {:3d} |'.format(
-#             total_loss_dict[nan_iters_key])
-#         log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
-#         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
-#         total_loss_dict[advanced_iters_key] = 0
-#         total_loss_dict[skipped_iters_key] = 0
-#         total_loss_dict[nan_iters_key] = 0
-#         print_rank_last(log_string)
-#         if report_memory_flag and learning_rate > 0.:
-#             # Report memory after optimizer state has been initialized.
-#             report_memory('(after {} iterations)'.format(iteration))
-#             report_memory_flag = False
-#         timers.log(timers_to_log, normalizer=args.log_interval)
-
-
-#     return report_memory_flag
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
@@ -1089,69 +787,47 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         nan_iters_key, 0) + int(got_nan)
 
     # Logging.
-    timers_to_log = []
+    timers_to_log = [
+        'forward-backward',
+        'forward-compute',
+        'backward-compute',
+        'batch-generator',
+        'forward-recv',
+        'forward-send',
+        'backward-recv',
+        'backward-send',
+        'forward-send-forward-recv',
+        'forward-send-backward-recv',
+        'backward-send-forward-recv',
+        'backward-send-backward-recv',
+        'forward-backward-send-forward-backward-recv',
+        'layernorm-grads-all-reduce',
+        'embedding-grads-all-reduce',
+        'grads-all-reduce',
+        'grads-reduce-scatter',
+        'params-all-gather',
+        'optimizer-copy-to-main-grad',
+        'optimizer-unscale-and-check-inf',
+        'optimizer-clip-main-grad',
+        'optimizer-count-zeros',
+        'optimizer-inner-step',
+        'optimizer-copy-main-to-model-params',
+        'optimizer']
 
-    def add_to_logging(name):
-        if timers is not None and name in timers.timers:
-            timers_to_log.append(name)
-
-    add_to_logging('forward-compute')
-    add_to_logging('forward-recv')
-    add_to_logging('forward-send')
-    add_to_logging('forward-backward-send-forward-backward-recv')
-    add_to_logging('backward-compute')
-    add_to_logging('backward-recv')
-    add_to_logging('backward-send')
-    add_to_logging('backward-send-forward-recv')
-    add_to_logging('backward-send-backward-recv')
-    add_to_logging('backward-params-all-reduce')
-    add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('optimizer-copy-to-main-grad')
-    add_to_logging('optimizer-unscale-and-check-inf')
-    add_to_logging('optimizer-clip-main-grad')
-    add_to_logging('optimizer-copy-main-to-model-params')
-    add_to_logging('optimizer')
-    add_to_logging('batch-generator')
-    add_to_logging('save-checkpoint')
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * \
         get_num_microbatches()
+
     total_iterations = total_loss_dict[advanced_iters_key] + \
                        total_loss_dict[skipped_iters_key]
 
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0) and \
-       is_last_rank():
-        tdata = {
-            'iteration': iteration,
-            'consumed_train_samples': args.consumed_train_samples,
-            'consumed_train_tokens': args.consumed_train_tokens,
-            'learning_rate': learning_rate,
-            'batch_size': batch_size,
-            'loss_scale': loss_scale,
-            'grad_norm': grad_norm,
-        }
-        for key in loss_dict:
-            tdata[f'lm-loss/{key}'] = loss_dict[key]
-
-        tdata = {f'train/{k}': v for k, v in tdata.items()}
-
-        elapsed_time = timers('interval-time').elapsed()
-        elapsed_time_per_iteration = elapsed_time / total_iterations
-        seq_len = args.seq_length
-        if hasattr(args, 'actual_seq_length'):
-            seq_len = args.actual_seq_length
-        hidden_size = args.hidden_size
-        num_layers = args.num_layers
-        vocab_size = args.padded_vocab_size
-
-        samples_per_sec, tflops, approx_parameters_in_billions = throughput_calculator(model, args, elapsed_time, total_iterations)
-
-        # Compute throughput.
-        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
-        tokens_per_sec = samples_per_sec * seq_len
-        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
-
+    # Timer requires all the ranks to call.
+    if args.log_timers_to_tensorboard and \
+       (iteration % args.tensorboard_log_interval == 0):
+        timers.write(timers_to_log, writer, iteration,
+                     normalizer=total_iterations)
+    if writer and (iteration % args.tensorboard_log_interval == 0):
         writer.add_scalar('steps-vs-samples/y=steps,x=samples', iteration, args.consumed_train_samples)
         writer.add_scalar('steps-vs-samples/y=samples,x=steps', args.consumed_train_samples, iteration)
         writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_tokens)
@@ -1166,6 +842,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('batch-size/batch-size', batch_size, iteration)
             writer.add_scalar('batch-size/batch-size vs samples', batch_size,
                               args.consumed_train_samples)
+            writer.add_scalar('batch-size/batch-size vs tokens', batch_size,
+                              args.consumed_train_tokens)
         for key in loss_dict:
             writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key], iteration)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
@@ -1177,6 +855,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
             writer.add_scalar('loss-scale/loss-scale vs tokens', loss_scale,
+                              args.consumed_train_tokens)
+        if args.log_world_size_to_tensorboard:
+            writer.add_scalar('world-size/world-size', args.world_size, iteration)
+            writer.add_scalar('world-size/world-size vs samples', args.world_size,
+                              args.consumed_train_samples)
+            writer.add_scalar('world-size/world-size vs tokens', args.world_size,
                               args.consumed_train_tokens)
         if grad_norm is not None:
             writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
@@ -1217,14 +901,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar('seqlen/random_ltd_reserved_length vs tokens', args.random_ltd_reserved_length,
                               args.consumed_train_tokens)
-        # if args.log_timers_to_tensorboard:
-        if timers is not None and args.log_timers_to_tensorboard:
-            print_rank_0('Caught timers, writing...')
-            _ = timers.write(timers_to_log, writer, iteration,
-                             normalizer=total_iterations)
-            timers.log(
-                timers_to_log,
-                normalizer=total_iterations
+        if args.log_memory_to_tensorboard:
+            mem_stats = torch.cuda.memory_stats()
+            writer.add_scalar(
+                "mem-reserved-bytes",
+                mem_stats["reserved_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-bytes",
+                mem_stats["allocated_bytes.all.current"],
+                iteration,
+            )
+            writer.add_scalar(
+                "mem-allocated-count",
+                mem_stats["allocation.all.current"],
+                iteration,
             )
 
     if iteration % args.tensorboard_log_interval == 0:
@@ -1284,6 +976,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 writer.add_scalar('optimizer/variance_sqrt_abs_max vs tokens', opt_stats_2[1], args.consumed_train_tokens)
                 writer.add_scalar('optimizer/momentum_abs_max vs tokens', opt_stats_2[2], args.consumed_train_tokens)
                 writer.add_scalar('optimizer/weight_abs_max vs tokens', opt_stats_2[3], args.consumed_train_tokens)
+
                 writer.add_scalar('optimizer/variance_l2', opt_stats[0]**0.5, iteration)
                 writer.add_scalar('optimizer/variance_sqrt_l2', opt_stats[1]**0.5, iteration)
                 writer.add_scalar('optimizer/momentum_l2', opt_stats[2]**0.5, iteration)
@@ -1298,30 +991,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 writer.add_scalar('optimizer/weight_abs_max', opt_stats_2[3], iteration)
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval-time').elapsed()
+        elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         seq_len = args.seq_length
         if hasattr(args, 'actual_seq_length'):
             seq_len = args.actual_seq_length
-        hidden_size = args.hidden_size
-        num_layers = args.num_layers
-        vocab_size = args.padded_vocab_size
-
         samples_per_sec, tflops, approx_parameters_in_billions = throughput_calculator(model, args, elapsed_time, total_iterations)
-
-        # Compute throughput.
-        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
-        tokens_per_sec = samples_per_sec * seq_len
-        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
-
-        # only the last rank process has a non-None _GLOBAL_TENSORBOARD_WRITER
-        if writer and is_last_rank():
-            iter_timers = {
-                'iteration': iteration,
-                'consumed_samples': args.consumed_train_samples,
-                'consumed_tokens': args.consumed_train_tokens,
-                'iteartion-time': elapsed_time_per_iteration,
-            }
+        if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time/iteration-time',
                                   elapsed_time_per_iteration, iteration)
@@ -1374,6 +1050,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
+        timers.log(timers_to_log, normalizer=args.log_interval)
+
     return report_memory_flag
 
 
@@ -1415,7 +1093,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Translate args to core configuration
     config = core_transformer_config_from_args(args)
-    config.grad_scale_func = optimizer.scale_loss
+    if not args.deepspeed:
+        config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
 
     timers('interval-time', log_level=0).start(barrier=True)

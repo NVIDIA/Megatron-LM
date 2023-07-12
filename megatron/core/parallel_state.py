@@ -57,6 +57,7 @@ def initialize_model_parallel(
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_fp8: bool = False,
+    use_distributed_optimizer: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -161,7 +162,10 @@ def initialize_model_parallel(
             ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks.append(list(ranks))
             group = torch.distributed.new_group(ranks)
-            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            if use_distributed_optimizer:
+                group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            else:
+                group_gloo = None
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo

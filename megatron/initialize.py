@@ -228,7 +228,8 @@ def _initialize_distributed():
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                            args.pipeline_model_parallel_size,
                                            args.virtual_pipeline_model_parallel_size,
-                                           args.pipeline_model_parallel_split_rank)
+                                           args.pipeline_model_parallel_split_rank,
+                                           use_distributed_optimizer=args.use_distributed_optimizer)
             if args.rank == 0:
                 print(f'> initialized tensor model parallel with size '
                       f'{mpu.get_tensor_model_parallel_world_size()}')
