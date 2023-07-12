@@ -53,6 +53,9 @@ if __name__ == "__main__":
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
+    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text "
+                 "generation.")
+    args.exit_on_missing_checkpoint = True
     # Set up model and load checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
 
