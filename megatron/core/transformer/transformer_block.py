@@ -12,7 +12,6 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
-
 class TransformerBlock(MegatronModule):
     """Transformer class."""
 
@@ -212,7 +211,24 @@ class TransformerBlock(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        with rng_context:
+        if self.config.fp8:
+            import transformer_engine # To keep out TE dependency when not training in fp8
+            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
+                margin=self.config.fp8_margin,
+                interval=self.config.fp8_interval,
+                fp8_format=transformer_engine.common.recipe.Format.E4M3
+                             if self.config.fp8_e4m3 else
+                               transformer_engine.common.recipe.Format.HYBRID,
+                fp8_amax_compute_algo=self.config.fp8_amax_compute_algo,
+                fp8_amax_history_len=self.config.fp8_amax_history_len
+            )
+            fp8_context = transformer_engine.pytorch.fp8_autocast(
+                enabled=True, fp8_recipe=fp8_recipe
+            )
+        else:
+            fp8_context = nullcontext()
+
+        with rng_context and fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full':
                 hidden_states = self._checkpointed_forward(hidden_states=hidden_states,
