@@ -147,8 +147,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_valid_test_num_samples=train_val_test_num_samples,
         max_seq_length=args.encoder_seq_length,
         max_seq_length_dec=args.decoder_seq_length,
-        masked_lm_prob=args.mask_prob,
-        short_seq_prob=args.short_seq_prob,
         seed=args.seed,
         skip_warmup=(not args.mmap_warmup),
         dataset_type='t5')
