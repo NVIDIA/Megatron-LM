@@ -1,4 +1,6 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+# WARNING! This file contains a blacklist of known malicious sites and thus contains some NSFW language.
 
 
 import glob
@@ -47,6 +49,7 @@ domain_blacklist = set([
     'google',
     'gunprime',
     'gyazo',
+    'horsefucker',
     'hotdealstar',
     'imagefap',
     'imageshack',

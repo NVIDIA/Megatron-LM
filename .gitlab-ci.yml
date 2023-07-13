@@ -70,8 +70,9 @@ unit_tests:
     - echo "Slurm job state $SLURM_STATE"
     - if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
     - source $PYTHON_VIRTUAL_ENV
-    - cmd="pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py"
-    - if $cmd; then echo "Pytest succeded"; else  echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; fi
+    - PYTEST_EXIT=0
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py || PYTEST_EXIT=$?
+    - if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
@@ -136,8 +137,9 @@ unit_tests:
       if [[ $USE_TE -ne 1 ]]; then
         echo "Checking against ground truth file"
         export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
-        cmd="pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py"
-        if $cmd; then echo "Pytest succeded"; else  echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; fi
+        PYTEST_EXIT=0
+        pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py || PYTEST_EXIT=$?
+        if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
       fi
     - echo "Completed the job"
   rules:
@@ -296,6 +298,7 @@ cleanup.selene:
     - set +e
     - NUM_CLEANUP=`find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | wc -l`
     - find ${SELENE_ADLR_CI_PATH}/* -type d -ctime +20 | grep -v data | xargs rm -rf
+    - find ${SELENE_ADLR_CI_PATH}/* -type d -name "checkpoints" -ctime +2 | grep -v data | xargs rm -rf
     - echo "Finished cleaning $NUM_CLEANUP directories older than 20 days everything in Selene"
   allow_failure: true
   rules:

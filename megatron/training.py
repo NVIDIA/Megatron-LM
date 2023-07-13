@@ -20,6 +20,7 @@ from megatron import get_num_microbatches
 from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
+from megatron.core.utils import get_model_config
 from megatron import print_rank_0
 from megatron import print_rank_last
 from megatron.checkpointing import load_checkpoint
@@ -40,7 +41,6 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-from megatron.arguments import core_transformer_config_from_args
 
 
 def print_datetime(string):
@@ -114,6 +114,7 @@ def pretrain(train_valid_test_dataset_provider,
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
+    config = get_model_config(model[0])
 
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
@@ -152,9 +153,9 @@ def pretrain(train_valid_test_dataset_provider,
         iteration = 0
         if args.do_train and args.train_iters > 0:
             iteration = train(forward_step_func,
-                            model, optimizer, opt_param_scheduler,
-                            train_data_iterator, valid_data_iterator,
-                            process_non_loss_data_func)
+                              model, optimizer, opt_param_scheduler,
+                              train_data_iterator, valid_data_iterator,
+                              process_non_loss_data_func, config)
 
         print_datetime('after training is done')
 
@@ -165,7 +166,6 @@ def pretrain(train_valid_test_dataset_provider,
 
         iteration = args.iteration
 
-    config = core_transformer_config_from_args(args)
     if args.do_valid:
         prefix = f'iteration {iteration} on validation set'
         evaluate_and_print_results(prefix, forward_step_func,
@@ -685,7 +685,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
 
 def train(forward_step_func, model, optimizer, opt_param_scheduler,
           train_data_iterator, valid_data_iterator,
-          process_non_loss_data_func):
+          process_non_loss_data_func, config):
     """Train the model function."""
     args = get_args()
     timers = get_timers()
@@ -703,8 +703,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Iterations.
     iteration = args.iteration
 
-    # Translate args to core configuration
-    config = core_transformer_config_from_args(args)
+    # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
 
