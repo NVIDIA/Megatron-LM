@@ -64,8 +64,12 @@ class Encoder(object):
             sentence_ids.extend([Encoder.tokenizer.eod for _ in range(max(0,pad_len-current_length))])
 
         with open(img_file[:-1], "rb") as tf:
-            img_raw = np.frombuffer(tf.read(), dtype=np.int32)
-
+            xs = bytearray(tf.read())
+            img_pad = (4 - len(xs) % 4) % 4
+            xs.extend([0 for _ in range(img_pad)])
+            img_raw = np.frombuffer(xs, dtype=np.int32)
+            img_raw = np.insert(img_raw, 0, img_pad)
+        
         return sentence_ids, img_raw, len(json_line)
 
 def get_args():
@@ -87,7 +91,7 @@ def get_args():
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer'],
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer', 'GPTSentencePieceTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file')
@@ -95,7 +99,10 @@ def get_args():
                        help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
-
+    group.add_argument('--lang', type=str, default='english',
+                       help='Language to use for NLTK-powered sentence splitting.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='sentencepeice tokenizer model.')
 
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
@@ -132,8 +139,8 @@ def main():
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"Output prefix: {args.output_prefix}")
     
-    output_bin_files = "{}_text.bin".format(args.output_prefix)
-    output_idx_files = "{}_text.idx".format(args.output_prefix)
+    output_bin_files = "{}_mmdata.bin".format(args.output_prefix)
+    output_idx_files = "{}_mmdata.idx".format(args.output_prefix)
 
     builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32)
 
@@ -146,7 +153,7 @@ def main():
     for i, (sentence, img_raw, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         builders.add_item(torch.IntTensor(sentence))
-        builders.add_item(ToTensor(img_raw))
+        builders.add_item(torch.from_numpy(img_raw))
         builders.end_document()
         if i % args.log_interval == 0:
             current = time.time()
@@ -161,3 +168,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
