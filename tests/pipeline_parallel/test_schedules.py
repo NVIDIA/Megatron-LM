@@ -1,5 +1,6 @@
 import torch
 from tests.test_utilities import Utils
+from megatron.core import ModelParallelConfig
 import megatron.core.pipeline_parallel.schedules as schedule
 from pytest_mock import mocker 
 import pytest
@@ -45,12 +46,18 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     assert(schedule.get_forward_backward_func() == schedule.forward_backward_no_pipelining)
 
     mocker.patch("megatron.core.pipeline_parallel.schedules.custom_backward", return_value=2)
-    
+    config = ModelParallelConfig(
+        pipeline_model_parallel_size = 1
+    )
+    model.config = config
+
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=None,
         model=[model],
         num_microbatches=4,
+        seq_length=None,
+        micro_batch_size=None,
         forward_only=False) 
     
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]
@@ -83,6 +90,12 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
     sequence_length = 512
     micro_batch_size = 8
     hidden_size = 256
+
+    config = ModelParallelConfig(
+        pipeline_model_parallel_size = 4,
+        sequence_parallel = False
+    )
+    model.config = config
     
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
@@ -90,9 +103,8 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
         dtype=torch.float32,
         model=[model],
         num_microbatches= micro_batch_size,
-        tensor_shape=[sequence_length, micro_batch_size, hidden_size],
-        decoder_seq_length=sequence_length,
-        sequence_parallel=False,
+        seq_length=sequence_length,
+        micro_batch_size=micro_batch_size,
         forward_only=True) 
     
     loss_reduced_expected = [{'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}, {'loss_reduced': rank}]
