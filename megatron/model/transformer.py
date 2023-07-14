@@ -785,8 +785,7 @@ class ParallelTransformerLayer(MegatronModule):
         # Retriever (bi-directional transformer with cross attention)
         if layer_type == LayerType.retro_decoder_with_retriever:
             self.retriever = ParallelTransformer(
-                init_method,
-                output_layer_init_method,
+                config=config,
                 model_type=ModelType.retro_encoder,
                 self_attn_mask_type=AttnMaskType.padding,
                 pre_process=True,
