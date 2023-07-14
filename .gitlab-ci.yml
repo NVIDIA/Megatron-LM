@@ -35,9 +35,11 @@ formatting:
     - docker_local_runner
   stage: test
   script:
-    - pip install black==19.10b0 isort
-    - black megatron/core --check --verbose --diff --color
+    - pip install --upgrade black==19.10b0 isort click==8.0.2
+    - black megatron/core --check --verbose --diff
     - isort megatron/core --check
+  rules:
+    - when: always
 
 .selene_test_resume_checkpoint_launcher: &selene-test-resume-checkpoint-launcher
   tags:
