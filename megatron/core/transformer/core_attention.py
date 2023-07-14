@@ -7,12 +7,12 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.utils import divide
+from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.utils import attention_mask_func
-from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.utils import divide
 
 
 class CoreAttention(MegatronModule):
@@ -30,7 +30,9 @@ class CoreAttention(MegatronModule):
      s: sequence length
     """
 
-    def __init__(self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding):
+    def __init__(
+        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+    ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -67,14 +69,21 @@ class CoreAttention(MegatronModule):
         # on average it should not be partition dependent.
         self.attention_dropout = torch.nn.Dropout(self.config.attention_dropout)
 
-    def forward(self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor):
+    def forward(
+        self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor
+    ):
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
         # ===================================
 
         # [b, np, sq, sk]
-        output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
+        output_size = (
+            query_layer.size(1),
+            query_layer.size(2),
+            query_layer.size(0),
+            key_layer.size(0),
+        )
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
@@ -83,7 +92,9 @@ class CoreAttention(MegatronModule):
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query_layer.dtype, "mpu"
+            (output_size[0] * output_size[1], output_size[2], output_size[3]),
+            query_layer.dtype,
+            "mpu",
         )
 
         # Raw attention scores. [b * np, sq, sk]
@@ -122,7 +133,12 @@ class CoreAttention(MegatronModule):
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
+        output_size = (
+            value_layer.size(1),
+            value_layer.size(2),
+            query_layer.size(0),
+            value_layer.size(3),
+        )
 
         # change view [sk, b * np, hn]
         value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)

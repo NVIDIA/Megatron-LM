@@ -30,6 +30,15 @@ unit_tests:
   only:
     - merge_requests
 
+formatting:
+  tags:
+    - docker_local_runner
+  stage: test
+  script:
+    - pip install black==19.10b0 isort
+    - black megatron/core --check --verbose --diff --color
+    - isort megatron/core --check
+
 .selene_test_resume_checkpoint_launcher: &selene-test-resume-checkpoint-launcher
   tags:
     - ssh_selene_runner

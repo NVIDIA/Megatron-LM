@@ -1,21 +1,25 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
-from .enums import AttnMaskType
-from .transformer_config import TransformerConfig
+
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.transformer.core_attention import CoreAttention
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
+    TECoreAttention,
+    TERowParallelLinear,
+)
+from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.enums import AttnType, AttnMaskType
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.custom_layers.transformer_engine import \
-        TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
+from .enums import AttnMaskType
+from .transformer_config import TransformerConfig
 
-from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
@@ -25,10 +29,7 @@ class Attention(MegatronModule, ABC):
     """
 
     def __init__(
-        self,
-        config: TransformerConfig,
-        layer_number: int = 1,
-        attn_mask_type=AttnMaskType.padding,
+        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding,
     ):
         super().__init__(config=config)
 
@@ -40,14 +41,13 @@ class Attention(MegatronModule, ABC):
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = divide(self.projection_size, self.config.num_attention_heads)
+        self.hidden_size_per_attention_head = divide(
+            self.projection_size, self.config.num_attention_heads
+        )
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
 
-
         self.core_attention = TECoreAttention(
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type
+            config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -62,7 +62,9 @@ class Attention(MegatronModule, ABC):
             skip_bias_add=True,
         )
 
-    def _checkpointed_attention_forward(self, query, key, value, attention_mask, rotary_pos_emb=None):
+    def _checkpointed_attention_forward(
+        self, query, key, value, attention_mask, rotary_pos_emb=None
+    ):
         """Forward method with selective activation checkpointing."""
 
         def custom_forward(*inputs):
@@ -162,13 +164,19 @@ class Attention(MegatronModule, ABC):
         is "self-attn" or "cross-attn".
         """
 
-    def forward(self, hidden_states, attention_mask, key_value_states=None, inference_params=None,
-                rotary_pos_emb=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        key_value_states=None,
+        inference_params=None,
+        rotary_pos_emb=None,
+    ):
         # hidden_states: [sq, b, h]
 
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = ((rotary_pos_emb,) * 2)
+            rotary_pos_emb = (rotary_pos_emb,) * 2
 
         # =====================
         # Query, Key, and Value
@@ -180,8 +188,9 @@ class Attention(MegatronModule, ABC):
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
-        key, value, rotary_pos_emb = self._adjust_key_value_for_inference(inference_params,
-                                                                          key, value, rotary_pos_emb)
+        key, value, rotary_pos_emb = self._adjust_key_value_for_inference(
+            inference_params, key, value, rotary_pos_emb
+        )
 
         # ================================================
         # relative positional embedding (rotary embedding)
@@ -211,29 +220,26 @@ class Attention(MegatronModule, ABC):
 
         return output, bias
 
+
 class SelfAttention(Attention):
     """Self-attention layer class
 
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
     """
-    def __init__(self,
-                 config: TransformerConfig,
-                 layer_number: int = 1,
-                 attn_mask_type=AttnMaskType.padding):
-        super().__init__(
-            config=config,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type
-        )
+
+    def __init__(
+        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+    ):
+        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
 
         self.linear_qkv = TEColumnParallelLinear(
-                self.config.hidden_size,
-                3 * self.projection_size,
-                config=self.config,
-                init_method=self.config.init_method,
-                bias=self.config.add_bias_linear,
-                skip_bias_add=False
+            self.config.hidden_size,
+            3 * self.projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -255,21 +261,18 @@ class SelfAttention(Attention):
 
         return query, key, value
 
+
 class CrossAttention(Attention):
     """Cross-attention layer class
 
     Cross-attention layer takes input with size [s, b, h] and context with size
     [s, b, h] and returns output of the same size.
     """
-    def __init__(self,
-                 config: TransformerConfig,
-                 layer_number: int = 1,
-                 attn_mask_type=AttnMaskType.padding):
-        super().__init__(
-            config=config,
-            layer_number=layer_number,
-            attn_mask_type=attn_mask_type
-        )
+
+    def __init__(
+        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+    ):
+        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
 
         self.linear_q = TEColumnParallelLinear(
             self.config.hidden_size,
@@ -277,7 +280,7 @@ class CrossAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=False
+            skip_bias_add=False,
         )
 
         self.linear_kv = TEColumnParallelLinear(
@@ -286,7 +289,7 @@ class CrossAttention(Attention):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=False
+            skip_bias_add=False,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):

@@ -7,13 +7,13 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.enums import AttnMaskType, ModelType
-from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
+from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_config import TransformerConfig
+
 
 class GPTModel(MegatronModule):
     """Transformer language model.
@@ -71,8 +71,10 @@ class GPTModel(MegatronModule):
         # Embeddings.
         if self.pre_process:
             self.embedding = GPTEmbedding(
-                config=self.config, vocab_size=self.vocab_size, max_sequence_length=self.max_sequence_length,
-                add_position_embedding=(self.position_embedding_type == 'learned_absolute')
+                config=self.config,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.max_sequence_length,
+                add_position_embedding=(self.position_embedding_type == 'learned_absolute'),
             )
 
         # Rotary Position Embeddings
@@ -103,7 +105,9 @@ class GPTModel(MegatronModule):
                 bias=False,
                 skip_bias_add=False,
                 gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process and self.share_embeddings_and_output_weights)
+                skip_weight_param_allocation=self.pre_process
+                and self.share_embeddings_and_output_weights,
+            )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
@@ -149,7 +153,7 @@ class GPTModel(MegatronModule):
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb
+            rotary_pos_emb=rotary_pos_emb,
         )
 
         if not self.post_process:
@@ -214,7 +218,9 @@ class GPTModel(MegatronModule):
         if torch.distributed.is_initialized():
             if parallel_state.is_rank_in_embedding_group():
                 weight = self.shared_embedding_or_output_weight()
-                torch.distributed.all_reduce(weight.data, group=parallel_state.get_embedding_group())
+                torch.distributed.all_reduce(
+                    weight.data, group=parallel_state.get_embedding_group()
+                )
 
         elif not getattr(GPTModel, "embedding_warning_printed", False):
             logging.getLogger(__name__).warning(

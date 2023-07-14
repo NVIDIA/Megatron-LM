@@ -3,7 +3,6 @@
 import torch
 
 from megatron.core import tensor_parallel
-
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -20,11 +19,13 @@ class GPTEmbedding(MegatronModule):
         embedding_dropout_prob float): dropout probability for embeddings
     """
 
-    def __init__(self,
-                 config: TransformerConfig,
-                 vocab_size: int,
-                 max_sequence_length: int,
-                 add_position_embedding: bool):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        vocab_size: int,
+        max_sequence_length: int,
+        add_position_embedding: bool,
+    ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -37,12 +38,14 @@ class GPTEmbedding(MegatronModule):
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
             init_method=self.config.init_method,
-            config=self.config
+            config=self.config,
         )
 
         # Position embedding (serial).
         if self.add_position_embedding:
-            self.position_embeddings = torch.nn.Embedding(self.max_sequence_length, self.config.hidden_size)
+            self.position_embeddings = torch.nn.Embedding(
+                self.max_sequence_length, self.config.hidden_size
+            )
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:
