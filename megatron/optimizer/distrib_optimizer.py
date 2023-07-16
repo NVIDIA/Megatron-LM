@@ -237,11 +237,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     local_param_group_map[param] = \
                         (group_index, len(group_range["params"]) - 1)
 
-        # Squeeze zero-size group ranges.
         for group_index, group_range in enumerate(group_ranges):
             group_range["orig_group"] = param_groups[group_index]
-            group_range["orig_group_idx"] = param_groups[group_index]
-
+            group_range["orig_group_idx"] = group_index
+            
+        # Squeeze zero-size group ranges.    
+        group_ranges = [ g for g in group_ranges if len(g["params"]) > 0 ]
+        
         return local_param_group_map, group_ranges
 
 
