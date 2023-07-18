@@ -7,7 +7,7 @@ stages:
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTORCH_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
+  PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.04-py3
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
@@ -180,6 +180,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps:
     PP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
+    USE_CORE: 0
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
@@ -193,6 +194,7 @@ train.gpt3.345m_tp2_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
+    USE_CORE: 0
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
@@ -221,6 +223,7 @@ train.gpt3.345m_tp1_pp4_1node_50steps:
     VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
+    USE_CORE: 0
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
