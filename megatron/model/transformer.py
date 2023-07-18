@@ -414,7 +414,7 @@ class MultiQueryCoreAttention(CoreAttention):
             # alibi: (batch_size * num_attention_heads, 1, max_seq_len)
             # TODO: ideally, alibi would have the shape: (1, num_heads * sq, sk)
             matmul_input_buffer = alibi[:bs * np, :, :sk].view(bs, np, sk)
-            matmul_input_buffer = matmul_input_buffer.repeat(1, sq, 1)  # [b, np * sq, sk]
+            matmul_input_buffer = matmul_input_buffer.unsqueeze(2).expand(bs, np, sq, sk).reshape(bs, np * sq, sk) # [b, np * sq, sk]
 
         if alibi is None:
             # Raw attention scores. [b, np * sq, sk]
