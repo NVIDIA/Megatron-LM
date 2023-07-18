@@ -11,7 +11,7 @@ variables: &VARS
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests train.gpt3.345m_tp4_pp1_1node_50steps
   TEST_REGEX_ON_THIS_COMMIT: NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
@@ -92,9 +92,11 @@ unit_tests:
     - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
-    if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
-       echo "Cannot run megatron core and transformer engine together"
-       exit 1
+    - |
+      if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
+        echo "Cannot run megatron core and transformer engine together"
+        exit 1
+      fi
     - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
     - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
     - if [[ $USE_CORE == "True" ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
