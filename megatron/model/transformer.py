@@ -733,12 +733,17 @@ class ParallelTransformerLayer(MegatronModule):
         self.fp32_residual_connection = config.fp32_residual_connection
 
         # Layernorm on the input data.
-        self.input_layernorm = LayerNorm(
-            config.hidden_size,
-            eps=config.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm,
-            sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+        if get_accelerator().device_name() == 'cuda':
+            self.input_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+        else:
+            self.input_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -751,12 +756,17 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
-            config.hidden_size,
-            eps=config.layernorm_epsilon,
-            no_persist_layer_norm=not config.persist_layer_norm,
-            sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+        if get_accelerator().device_name() == 'cuda':
+            self.post_attention_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=not config.persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+        else:
+            self.post_attention_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon)
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,
@@ -1520,12 +1530,17 @@ class ParallelTransformer(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+            if get_accelerator().device_name() == 'cuda':
+                self.final_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon,
+                    no_persist_layer_norm=args.no_persist_layer_norm,
+                    sequence_parallel=config.sequence_parallel,
+                    apply_layernorm_1p=args.apply_layernorm_1p)
+            else:
+                self.final_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon)
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint

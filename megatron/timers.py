@@ -186,7 +186,7 @@ class Timers:
         # it should be ok to use all-gather instead of gather.
         rank_name_to_time = torch.zeros((world_size, len(names)),
                                         dtype=torch.float,
-                                        device=get_accelerator().current_device())
+                                        device=get_accelerator().current_device_name())
         for i, name in enumerate(names):
             if name in self._timers:
                 # Here we don't need to pass the barrier flag as all

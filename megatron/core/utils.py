@@ -10,6 +10,8 @@ import torch
 from megatron.core import parallel_state
 from megatron import get_args
 
+from deepspeed import get_accelerator
+
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
@@ -67,7 +69,7 @@ class GlobalMemoryBuffer:
             self.buffer[(name, dtype)] = \
                 torch.empty(required_len,
                             dtype=dtype,
-                            device=torch.cuda.current_device(),
+                            device=get_accelerator().current_device_name(),
                             requires_grad=False)
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
