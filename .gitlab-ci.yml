@@ -11,7 +11,7 @@ variables: &VARS
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests train.bert.345m_tp1_pp2_1node_50steps
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests train.gpt3.345m_tp1_pp2_1node_50steps
   TEST_REGEX_ON_THIS_COMMIT: NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
@@ -206,6 +206,7 @@ train.gpt3.345m_tp1_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
+    USE_CORE: 1
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
@@ -267,7 +268,6 @@ train.bert.345m_tp1_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    USE_CORE: 1
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
