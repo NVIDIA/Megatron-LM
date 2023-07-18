@@ -92,11 +92,15 @@ unit_tests:
     - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
     - export BUILD_DIR=`pwd`
+    if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
+       echo "Cannot run megatron core and transformer engine together"
+       exit 1
     - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
     - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
+    - if [[ $USE_CORE == "True" ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
     - export $RUN_NAME
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE
+    - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE
     - export MBS GBS
     - export DATA_DIR=$DATA_DIR
     - echo "Run name is $RUN_NAME"
@@ -174,6 +178,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps:
     PP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
+    USE_CORE: 1
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 

@@ -11,6 +11,7 @@ MAX_STEPS=$8
 VP_SIZE=$9
 MBS=${10}
 GBS=${11}
+USE_CORE=${12}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -21,6 +22,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
+CALLING_SCRIPT=pretrain_gpt.py
+
+if [[ $USE_CORE -eq 1 ]]; then
+       echo "Running using megatron core"
+       TRANSFORMER_IMPL=local
+       TRAINING_DTYPE=bf16
+       CALLING_SCRIPT=pretrain_gpt_core.py
+fi
 
 if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
@@ -34,7 +43,7 @@ fi
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
 
 torchrun $DISTRIBUTED_ARGS \
-       pretrain_gpt.py \
+       $CALLING_SCRIPT \
        --num-layers 12 \
        --hidden-size 512 \
        --num-attention-heads 8 \
