@@ -8,10 +8,10 @@ TP_SIZE=$5
 PP_SIZE=$6
 NNODES=$7
 MAX_STEPS=$8
-VP_SIZE=$9
-MBS=${10}
-GBS=${11}
-USE_CORE=${12}
+USE_CORE=$9
+VP_SIZE=${10}
+MBS=${11}
+GBS=${12}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
