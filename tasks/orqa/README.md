@@ -1,6 +1,6 @@
 ## End-to-End Training of Neural Retrievers for Open-Domain Question Answering
 
-Below we present the steps to run unsupervised and supervised trainining and evaluation of the retriever for [open domain question answering](https://arxiv.org/abs/2101.00408).
+Below we present the steps to run unsupervised and supervised training and evaluation of the retriever for [open domain question answering](https://arxiv.org/abs/2101.00408).
 
 ## Retriever Training
 
