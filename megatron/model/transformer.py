@@ -28,9 +28,17 @@ except ImportError:
     rearrange = None
 
 try:
+    # FlashAttention (1.x)
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
     flash_attn_unpadded_func = None
+
+try:
+    # FlashAttention-2
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:
+    flash_attn_varlen_func = None
+
 
 FlashAttentionBuilder = get_accelerator().get_op_builder("FlashAttentionBuilder")
 try:
@@ -355,12 +363,15 @@ class FlashSelfAttention(torch.nn.Module):
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
                  device=None, dtype=None):
         super().__init__()
-        assert flash_attn_unpadded_func is not None or flash_attn_builder is not None, ('Please install FlashAttention first,'
-                                                      'e.g., with pip install flash-attn or implement your own flash attention')
+        assert flash_attn_unpadded_func is not None or flash_attn_varlen_func is not None or flash_attn_builder is not None, \
+            ('Please install FlashAttention first, e.g., with pip install flash-attn or implement your own flash attention')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+
+        # Use FlashAttention-2 when available
+        self.flash_attn_func = flash_attn_unpadded_func if flash_attn_varlen_func is None else flash_attn_varlen_func
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -401,7 +412,7 @@ class FlashSelfAttention(torch.nn.Module):
                         device=q.device) if get_accelerator().device_name() == 'cuda' else None
             self.dropout_p = 0
 
-        output = flash_attn_unpadded_func(
+        output = self.flash_attn_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
             self.dropout_p,
             softmax_scale=self.softmax_scale, causal=is_causal
@@ -436,7 +447,7 @@ class ParallelAttention(MegatronModule):
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         if self.use_flash_attn:
-            if flash_attn_unpadded_func is None and flash_attn_builder is None:
+            if flash_attn_unpadded_func is None and flash_attn_varlen_func is None and flash_attn_builder is None:
                 raise ImportError('FlashAttention is not installed, please install with '
                                   'pip install flash-attn or or implement your own flash attention')
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
