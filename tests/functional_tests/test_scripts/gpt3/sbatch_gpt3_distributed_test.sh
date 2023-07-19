@@ -11,7 +11,7 @@ CHECKPOINT_PATH=/workspace/checkpoints
 TENSORBOARD_DIR=/workspace/logs
 IMAGE=gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
-if [[ $USE_TE -eq 1 ]]; then
+if [[ $USE_TE -eq 1 || $USE_CORE -eq 1 ]]; then
   echo "Using container nvcr.io/nvidia/pytorch:23.04-py3 for running with TE ..."
   IMAGE=nvcr.io/nvidia/pytorch:23.04-py3
 fi
