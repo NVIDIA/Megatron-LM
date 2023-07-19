@@ -59,7 +59,7 @@ The corresponding maintainers at this time are @jaredcasper and @jon-barker.
 
 ### Is there a policy for issues and PRs that haven't been touched in X days? Should they be closed?
 
-Yes, starting in July 2023 we have a bot that will mark untouched PRs as "stale" after 60 days, and close them after another 21 days if nothing happens. If you think an issue/PR should be re-opened or requires additional attention at that point then ping a maintainer.
+Yes, starting in July 2023 we have a bot that will mark untouched PRs as "stale" after 60 days.
 
 We have a long backlog of issues and PRs dating back 3.5 years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may recieve a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
 
