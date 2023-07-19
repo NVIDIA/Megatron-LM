@@ -32,6 +32,11 @@ try:
 except ImportError:
     flash_attn_unpadded_func = None
 
+FlashAttentionBuilder = get_accelerator().get_op_builder("FlashAttentionBuilder")
+try:
+    flash_attn_builder = FlashAttentionBuilder().load()
+except TypeError:
+    flash_attn_builder = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -350,8 +355,8 @@ class FlashSelfAttention(torch.nn.Module):
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0,
                  device=None, dtype=None):
         super().__init__()
-        assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
-                                                      'e.g., with pip install flash-attn')
+        assert flash_attn_unpadded_func is not None or flash_attn_builder is not None, ('Please install FlashAttention first,'
+                                                      'e.g., with pip install flash-attn or implement your own flash attention')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -365,36 +370,47 @@ class FlashSelfAttention(torch.nn.Module):
         """
 
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
-        assert all((i.is_cuda for i in (q,k,v)))
+        if get_accelerator().device_name() == 'cuda':
+            assert all((i.is_cuda for i in (q,k,v)))
+        else:
+            assert all((i.is_xpu for i in (q,k,v)))
 
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
 
-        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
-        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                    device=q.device)
+        if get_accelerator().device_name() == 'cuda':
+            # goes for cuda device
+            q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+            cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
+                                        device=q.device)
+        else:
+            # goes for other device
+            q, k, v = [rearrange(x, 'b s h d -> b h s d').contiguous() for x in [q, k, v]]
 
         if self.training:
             # during training q,k,v always have same seqlen
             assert seqlen_k == seqlen_q
 
             is_causal = self.causal
-            cu_seqlens_k = cu_seqlens_q
+            cu_seqlens_k = cu_seqlens_q if get_accelerator().device_name() == 'cuda' else None
         else:
             # turn off FA causal mask after first inference autoregressive iteration
             # only on first autoregressive step q,k,v have same seqlen
             is_causal = seqlen_q == seqlen_k
             cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
-                        device=q.device)
+                        device=q.device) if get_accelerator().device_name() == 'cuda' else None
             self.dropout_p = 0
 
         output = flash_attn_unpadded_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
             self.dropout_p,
             softmax_scale=self.softmax_scale, causal=is_causal
+        ) if get_accelerator().device_name() == 'cuda' else flash_attn_builder.flash_attn_func(
+            q, k, v, self.dropout_p, self.softmax_scale, is_causal
         )
 
-        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size) if get_accelerator().device_name() == 'cuda' else rearrange(
+            output, 'b h s d -> b s h d').contiguous()
         return output
 
 
@@ -420,9 +436,9 @@ class ParallelAttention(MegatronModule):
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
         if self.use_flash_attn:
-            if flash_attn_unpadded_func is None:
+            if flash_attn_unpadded_func is None and flash_attn_builder is None:
                 raise ImportError('FlashAttention is not installed, please install with '
-                                  'pip install flash-attn')
+                                  'pip install flash-attn or or implement your own flash attention')
             assert attention_type == AttnType.self_attn, ('FlashAttention code path only supports '
                                                           'self-attention for now')
             assert self.attn_mask_type == AttnMaskType.causal, ('FlashAttention code path only '
