@@ -592,11 +592,10 @@ class ParallelAttention(MegatronModule):
                                                        dim=2)
             
             # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-            key_layer = key_layer.repeat(1, 1, int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
-                                        1)
-            value_layer = value_layer.repeat(1, 1, 
-                                            int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
-                                            1)
+            key_layer = key_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
+                                                dim = 2)
+            value_layer = value_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
+                                                dim = 2)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
