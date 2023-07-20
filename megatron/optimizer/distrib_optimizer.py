@@ -831,17 +831,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.allreduce_embedding_grads(args)
         timers('embedding-grads-all-reduce').stop()
 
-        # All-reduce key-value grads if needed.
-        if (
-            args.group_query_attention and 
-            args.num_query_groups < mpu.get_tensor_model_parallel_world_size()
-            and mpu.get_tensor_model_parallel_world_size() > 1
-            and args.sequence_parallel
-        ):
-            timers('backward-key-value-all-reduce').start()
-            self.allreduce_key_value_grads(args)
-            timers('backward-key-value-all-reduce').stop()
-
         # Reduce-scatter setup.
         timers('grads-reduce-scatter', log_level=1).start(
             barrier=args.barrier_with_L1_time)
