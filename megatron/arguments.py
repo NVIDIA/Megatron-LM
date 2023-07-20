@@ -291,6 +291,10 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.seq_length
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
+    # When rotary position embeddings is used, set add_position_embedding
+    # to false to turn off absolute position embedding.
+    if args.use_rotary_position_embeddings:
+        args.add_position_embedding = False
     if args.lr is not None:
         assert args.min_lr <= args.lr
     if args.save is not None:

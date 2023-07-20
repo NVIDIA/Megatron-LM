@@ -24,14 +24,14 @@ At last, we provide a [toy example script](ds_pretrain_gpt_125M.sh) that users c
 
 ## Flash attention
 We tested and verified that flash attention feature introduced by this sync works properly for GPT pretraining. 
-Our code automatically uses [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) when avaiable. (As of now, Megatron-LM only supports FlashAttention 1.x)
+Our code automatically uses [FlashAttention-2](https://github.com/Dao-AILab/flash-attention) when avaiable.
 
 We compared the training using the [toy example script](ds_pretrain_gpt_125M.sh) and the [toy example script with flash attention](ds_pretrain_gpt_125M_flashattn.sh) on 8 A100 GPUs, and found that FlashAttention (1.0,4) increased training throughput (TFLOPs per GPU) from 25 to 32. When scaling up the model to 2.7B using the same script, FlashAttention-2 improved the training throughput 121 TFLOPs to 132 TFLOPs in comparison to FlashAttention 1.x.
 
 For installation instructions, please refer to [FlashAttention's repository](https://github.com/Dao-AILab/flash-attention).
 
 ## Rotary Positional Embedding (RoPE)
-We also tested and verified that the Rotary Positional Embedding (RoPE) introduced by this sync works properly for GPT pretraining (except that currently it cannot be used with DeepSpeed's pipeline parallelism. We are working on to support this combination). By comparing the training between [without RoPE](ds_pretrain_gpt_1.3B.sh) and [with RoPE](ds_pretrain_gpt_1.3B_rope.sh), we are able to observe that RoPE helps improving the model convergence just like [previous observation](https://blog.eleuther.ai/rotary-embeddings/).
+We also tested and verified that the Rotary Positional Embedding (RoPE) introduced by this sync works properly for GPT pretraining. By comparing the training between [without RoPE](ds_pretrain_gpt_1.3B.sh) and [with RoPE](ds_pretrain_gpt_1.3B_rope.sh), we are able to observe that RoPE helps improving the model convergence just like [previous observation](https://blog.eleuther.ai/rotary-embeddings/).
 
 ## Notes/TODOs
 * After the sync, DeepSpeed still relies on the older activation checkpointing mechanism (see function ```_checkpointed_forward``` in ```Megatron-DeepSpeed/megatron/model/transformer.py```) since we didn't have time to integrate with the new version yet. Contribution is very welcomed.
