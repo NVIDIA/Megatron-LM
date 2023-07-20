@@ -45,6 +45,8 @@ try:
     flash_attn_builder = FlashAttentionBuilder().load()
 except TypeError:
     flash_attn_builder = None
+from apex.normalization import MixedFusedRMSNorm
+
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -760,18 +762,20 @@ class ParallelTransformerLayer(MegatronModule):
         self.fp32_residual_connection = config.fp32_residual_connection
 
         # Layernorm on the input data.
-        if get_accelerator().device_name() == 'cuda':
-            self.input_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm,
-                sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+        if args.normalization == 'layernorm':
+            if get_accelerator().device_name() == 'cuda':
+                self.input_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon,
+                    no_persist_layer_norm=args.no_persist_layer_norm,
+                    sequence_parallel=config.sequence_parallel,
+                    apply_layernorm_1p=args.apply_layernorm_1p)
+            else:
+                self.input_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon)
         else:
-            self.input_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon)
-
+            self.input_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
         # Self attention.
         self.self_attention = ParallelAttention(
             config,
@@ -783,19 +787,21 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        if get_accelerator().device_name() == 'cuda':
-            self.post_attention_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon,
-                no_persist_layer_norm=not config.persist_layer_norm,
-                sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+        if args.normalization == 'layernorm':
+            if get_accelerator().device_name() == 'cuda':
+                self.post_attention_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon,
+                    no_persist_layer_norm=not config.persist_layer_norm,
+                    sequence_parallel=config.sequence_parallel,
+                    apply_layernorm_1p=args.apply_layernorm_1p)
+            else:
+                self.post_attention_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon)
         else:
-            self.post_attention_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon)
-
-        # Cross attention.
+            self.post_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
+                 # Cross attention.
         if self.layer_type in (LayerType.decoder,
                                LayerType.retro_decoder,
                                LayerType.retro_decoder_with_retriever,
@@ -805,12 +811,15 @@ class ParallelTransformerLayer(MegatronModule):
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
-            self.post_inter_attention_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon,
-                no_persist_layer_norm=not config.persist_layer_norm,
-                sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+            if args.normalization == 'layernorm':
+                self.post_inter_attention_layernorm = LayerNorm(
+                    config.hidden_size,
+                    eps=config.layernorm_epsilon,
+                    no_persist_layer_norm=not config.persist_layer_norm,
+                    sequence_parallel=config.sequence_parallel,
+                    apply_layernorm_1p=args.apply_layernorm_1p)
+            else:
+                self.post_inter_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
 
         # MLP
         self.num_experts = num_experts
@@ -825,7 +834,7 @@ class ParallelTransformerLayer(MegatronModule):
                                 ParallelMLP(config,
                                     moe=True,
                                     enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
-                                num_experts=self.num_experts, 
+                                num_experts=self.num_experts,
                                 ep_size=args.moe_expert_parallel_size,
                                 k=args.topk,
                                 use_residual=(args.mlp_type == 'residual'),
@@ -1230,20 +1239,21 @@ class ParallelTransformerLayerPipe(ParallelTransformerLayer):
     """
     def forward(self, inputs, **kwargs):
         assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+        rotary_pos_emb = self._args.rotary_pos_emb if self._args.use_rotary_position_embeddings else None
         if torch.is_tensor(inputs) or len(inputs) == 1:
             # No attention mask forwarded, search for args.attn_mask
-            if not hasattr(self, '_args'):
-                self._args = get_args()
             hidden_states, attention_mask = inputs, self._args.attn_mask
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
-            return super().forward(hidden_states, attention_mask, **kwargs)[0]
+            return super().forward(hidden_states, attention_mask, **kwargs, rotary_pos_emb=rotary_pos_emb)[0]
         elif len(inputs) == 2:
             # Attention mask is an activation.
             hidden_states, attention_mask = inputs[0], inputs[1]
             # HACK: currently MoE model does not support pipeline parallel, so
             # here we just ignore the moe_loss returned by forward()
-            return super().forward(*inputs, **kwargs)[0], attention_mask
+            return super().forward(*inputs, **kwargs, rotary_pos_emb=rotary_pos_emb)[0], attention_mask
         else:
             raise RuntimeError('Received more inputs than understood.')
 
@@ -1557,18 +1567,20 @@ class ParallelTransformer(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            if get_accelerator().device_name() == 'cuda':
-                self.final_layernorm = LayerNorm(
-                    config.hidden_size,
-                    eps=config.layernorm_epsilon,
-                    no_persist_layer_norm=args.no_persist_layer_norm,
-                    sequence_parallel=config.sequence_parallel,
-                    apply_layernorm_1p=args.apply_layernorm_1p)
+            if args.normalization == 'layernorm':
+                if get_accelerator().device_name() == 'cuda':
+                    self.final_layernorm = LayerNorm(
+                        config.hidden_size,
+                        eps=config.layernorm_epsilon,
+                        no_persist_layer_norm=args.no_persist_layer_norm,
+                        sequence_parallel=config.sequence_parallel,
+                        apply_layernorm_1p=args.apply_layernorm_1p)
+                else:
+                    self.final_layernorm = LayerNorm(
+                        config.hidden_size,
+                        eps=config.layernorm_epsilon)
             else:
-                self.final_layernorm = LayerNorm(
-                    config.hidden_size,
-                    eps=config.layernorm_epsilon)
-
+                self.final_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint
             get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
@@ -1710,7 +1722,7 @@ class ParallelTransformer(MegatronModule):
             assert self.recompute_granularity is None, \
                 'inference does not work with activation checkpointing'
 
-        # TODO: Below old DeepSpeed code are commented because it's unsure whether 
+        # TODO: Below old DeepSpeed code are commented because it's unsure whether
         # it is still relevant.
         # # Reza's note: DeepSpeed inference does not support transposes
         # if not self.ds_inference:
@@ -1837,7 +1849,7 @@ class ParallelTransformer(MegatronModule):
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
-            # TODO: Below old DeepSpeed code are commented because it's unsure whether 
+            # TODO: Below old DeepSpeed code are commented because it's unsure whether
             # it is still relevant.
             # if not self.ds_inference:
             #     # Reverting data format change [s b h] --> [b s h].
@@ -1845,3 +1857,47 @@ class ParallelTransformer(MegatronModule):
             hidden_states = self.final_layernorm(hidden_states)
 
         return (hidden_states, *moe_losses)
+
+class LMHeadPipe(MegatronModule):
+    """
+    Arguments:
+        vocab_size: size of vocabulary.
+        hidden_size: hidden size
+        gather_output: wether output logits being gathered or not.
+        init_method: init method for weight initialization
+        config:
+    """
+
+    def __init__(self, hidden_size, vocab_size, config):
+        args = get_args()
+        super(LMHeadPipe, self).__init__()
+        self.lm_head = tensor_parallel.ColumnParallelLinear(input_size=hidden_size,
+                                                            output_size=vocab_size,
+                                                            bias=False,
+                                                            config=config,
+                                                            init_method=config.init_method,)
+
+    def forward(self, inputs, **kwargs):
+        assert torch.is_tensor(inputs) or isinstance(inputs, tuple)
+        if isinstance(inputs, tuple):
+            hidden_states = inputs[0]
+        else:
+            hidden_states = inputs
+
+        if not hasattr(self, '_args'):
+            self._args = get_args()
+
+        if hasattr(self._args, 'attn_mask'):
+            attention_mask = None
+        else:
+            attention_mask = inputs[1]
+
+        logits, _ = self.lm_head(hidden_states)
+
+        # If cmd args has attn_mask, we don't forward it as an activation.
+        if hasattr(self._args, 'attn_mask'):
+            return logits
+        else:
+            return logits, attention_mask
+
+

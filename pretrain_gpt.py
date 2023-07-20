@@ -13,6 +13,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel, GPTModelPipe
+from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -66,6 +67,25 @@ def model_provider(pre_process=True, post_process=True):
 
             # Attention mask must be bool.
             args.attn_mask = attention_mask.to(torch.bool)
+
+            # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
+            if args.use_rotary_position_embeddings:
+                rotary_dim = args.hidden_size // args.num_attention_heads \
+                    if args.kv_channels is None else args.kv_channels
+
+                if args.rotary_percent < 1.0:
+                    rotary_dim = int(rotary_dim * args.rotary_percent)
+
+                # partial rotary embeddings, which is better than full rotary
+                # Wang and Komatsuzaki et al
+                # https://github.com/kingoflolz/mesh-transformer-jax/
+                rotary_pos_emb = RotaryEmbedding(rotary_dim)(args.seq_length).to(
+                    get_accelerator().current_device_name())
+                if args.fp16:
+                    rotary_pos_emb = rotary_pos_emb.half()
+                elif args.bf16:
+                    rotary_pos_emb = rotary_pos_emb.bfloat16()
+                args.rotary_pos_emb = rotary_pos_emb
 
         else:
             model = GPTModel(
@@ -176,7 +196,7 @@ def loss_func(loss_mask, moe_loss, mos_loss, output_tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-    
+
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
     if args.mos or args.kd:
@@ -199,7 +219,7 @@ def calculate_mos_loss(args, stu_output, teacher_model, tokens, position_ids, at
     alpha = args.kd_alpha_ce
     beta = args.kd_beta_ce
     kd_temp = args.kd_temp
-    
+
     if teacher_model:
         with torch.no_grad():
             if args.curriculum_learning_legacy and args.curriculum_seqlen < args.seq_length:
@@ -262,7 +282,7 @@ def forward_step(data_iterator, model):
         if args.teacher_forward and args.teacher_model is not None:
             mos_loss = calculate_mos_loss(args, stu_output,
                 args.teacher_model[0], tokens, position_ids, attention_mask)
-    
+
     # Output_tensor stores the standard loss, loos_func calculates the total loss.
     return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
 

@@ -16,8 +16,10 @@ from .utils import scaled_init_method_normal
 
 from megatron.model import LayerNorm
 from .language_model import EmbeddingPipe
-from .transformer import ParallelTransformerLayerPipe
+from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+
+from apex.normalization import MixedFusedRMSNorm
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
@@ -40,7 +42,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
             loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
-        
+
         # [s b] => [b, s]
         loss = loss.transpose(0,1).contiguous()
         return loss
@@ -74,7 +76,7 @@ class GPTModel(MegatronModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             num_experts=args.num_experts)
-        
+
         if not args.untie_embeddings_and_output_weights:
             self.initialize_word_embeddings()
 
@@ -210,16 +212,26 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         self.specs.append(_to_float16)
 
         # Embedding layer
-        self.specs.append(TiedLayerSpec('embed',
-                                        EmbeddingPipe,
+        if args.untie_embeddings_and_output_weights:
+            self.specs.append(LayerSpec(EmbeddingPipe,
                                         args.hidden_size,
                                         args.padded_vocab_size,
                                         args.max_position_embeddings,
                                         args.hidden_dropout,
                                         config,
                                         num_tokentypes=num_tokentypes,
-                                        embedding_weights_in_fp32=args.embedding_weights_in_fp32,
-                                        tied_weight_attr='word_embeddings_weight'))
+                                        embedding_weights_in_fp32=args.embedding_weights_in_fp32,))
+        else:
+            self.specs.append(TiedLayerSpec('embed',
+                                            EmbeddingPipe,
+                                            args.hidden_size,
+                                            args.padded_vocab_size,
+                                            args.max_position_embeddings,
+                                            args.hidden_dropout,
+                                            config,
+                                            num_tokentypes=num_tokentypes,
+                                            embedding_weights_in_fp32=args.embedding_weights_in_fp32,
+                                            tied_weight_attr='word_embeddings_weight'))
 
         for layer_idx in range(args.num_layers):
             self.specs.append(
@@ -229,10 +241,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                     self_attn_mask_type=AttnMaskType.causal))
 
         # Final layernorm after transformer layers
-        self.specs.append(
-            LayerSpec(LayerNorm,
-                      args.hidden_size,
-                      eps=args.layernorm_epsilon))
+        if args.normalization == 'layernorm':
+            self.specs.append(LayerSpec(LayerNorm,
+                          args.hidden_size,
+                          eps=args.layernorm_epsilon))
+        else:
+            self.specs.append(LayerSpec(MixedFusedRMSNorm, args.hidden_size, args.layernorm_epsilon))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
@@ -240,20 +254,24 @@ class GPTModelPipe(PipelineModule,MegatronModule):
                 lm_output,
                 embedding.word_embeddings_weight,
                 self.parallel_output)
-
-        self.specs.append(
-            TiedLayerSpec('embed',
-                          EmbeddingPipe,
-                          args.hidden_size,
-                          args.padded_vocab_size,
-                          args.max_position_embeddings,
-                          args.hidden_dropout,
-                          config,
-                          num_tokentypes=num_tokentypes,
-                          embedding_weights_in_fp32=args.embedding_weights_in_fp32,
-                          forward_fn=_logits_helper,
-                          tied_weight_attr='word_embeddings_weight')
-        )
+        if args.untie_embeddings_and_output_weights:
+            self.specs.append(
+                LayerSpec(LMHeadPipe, args.hidden_size, args.padded_vocab_size, config)
+            )
+        else:
+            self.specs.append(
+                TiedLayerSpec('embed',
+                              EmbeddingPipe,
+                              args.hidden_size,
+                              args.padded_vocab_size,
+                              args.max_position_embeddings,
+                              args.hidden_dropout,
+                              config,
+                              num_tokentypes=num_tokentypes,
+                              embedding_weights_in_fp32=args.embedding_weights_in_fp32,
+                              forward_fn=_logits_helper,
+                              tied_weight_attr='word_embeddings_weight')
+            )
 
         # Convert to fp32 if needed
         if args.fp16 or args.bf16:
