@@ -96,6 +96,7 @@ def save_checkpoint(queue, args):
                 '--seq-length', str(md.seq_length),
                 '--num-attention-heads', str(md.num_attention_heads),
                 '--max-position-embeddings', str(md.max_position_embeddings),
+                '--position-embedding-type', str(md.position_embedding_type),
                 '--tokenizer-type', str(md.tokenizer_type),
                 '--tensor-model-parallel-size', str(args.target_tensor_parallel_size),
                 '--pipeline-model-parallel-size', str(args.target_pipeline_parallel_size),
@@ -123,8 +124,6 @@ def save_checkpoint(queue, args):
 
     if md.output_layer:
         sys.argv.append('--untie-embeddings-and-output-weights')
-    if not md.position_embeddings:
-        sys.argv.append('--no-position-embedding')
     if not md.linear_bias:
         sys.argv.append('--disable-bias-linear')
 
@@ -137,7 +136,7 @@ def save_checkpoint(queue, args):
     if hasattr (md, 'checkpoint_args'):
         # These are arguments that we are either changing, or cause problems for validation if they are set
         # Note that some of these deal with T5 so will need to be changed if we support T5.
-        args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'params_dtype',
+        args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'world_size', 'params_dtype',
                         'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                         'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                         'sequence_parallel', 'async_tensor_model_parallel_allreduce',
@@ -163,7 +162,7 @@ def save_checkpoint(queue, args):
 
     validate_args(margs)
 
-    set_global_variables(margs)
+    set_global_variables(margs, build_tokenizer=False)
 
     # margs = megatron args
     margs = get_args()
@@ -201,7 +200,8 @@ def save_checkpoint(queue, args):
     #-----------
     embeddings_msg = queue_get("embeddings")
 
-    if md.position_embeddings:
+    pos_embed = None
+    if md.position_embedding_type == 'learned_absolute':
         pos_embed = embeddings_msg.pop("position embeddings")
     orig_word_embed = embeddings_msg.pop("word embeddings")
     check_message(embeddings_msg)
@@ -242,7 +242,7 @@ def save_checkpoint(queue, args):
     models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
     for tp_rank, model in enumerate(models):
         model.language_model.embedding.word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
-        if md.position_embeddings:
+        if pos_embed is not None:
             model.language_model.embedding.position_embeddings.weight.data.copy_(pos_embed)
         else:
             assert not hasattr(model.language_model.embedding, "position_embeddings")

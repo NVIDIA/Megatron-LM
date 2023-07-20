@@ -12,16 +12,18 @@ from megatron.model.vision.classification import VitClassificationModel
 from megatron.model.vision.classification import MitClassificationModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     args = get_args()
-
+    config = core_transformer_config_from_args(args)
     if args.vision_backbone_type == 'vit':
         print_rank_0("building VIT model ...")
-        model = VitClassificationModel(num_classes=args.num_classes,
+        model = VitClassificationModel(config=config,
+                                       num_classes=args.num_classes,
                                        pre_process=pre_process,
                                        post_process=post_process)
     elif args.vision_backbone_type == 'mit':

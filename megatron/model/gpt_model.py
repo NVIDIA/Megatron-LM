@@ -11,8 +11,6 @@ from .module import MegatronModule
 from .enums import AttnMaskType
 from .language_model import parallel_lm_logits
 from .language_model import get_language_model
-from .utils import init_method_normal
-from .utils import scaled_init_method_normal
 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
@@ -46,12 +44,13 @@ class GPTModel(MegatronModule):
     """GPT-2 Language model."""
 
     def __init__(self,
+                 config,
                  num_tokentypes=0,
                  parallel_output=True,
                  pre_process=True,
                  post_process=True):
         args = get_args()
-        super(GPTModel, self).__init__(share_word_embeddings=not args.untie_embeddings_and_output_weights)
+        super().__init__(config=config, share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
         self.parallel_output = parallel_output
         self.pre_process = pre_process
@@ -60,17 +59,15 @@ class GPTModel(MegatronModule):
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
         self.language_model, self._language_model_key = get_language_model(
+            config=config,
             num_tokentypes=num_tokentypes,
             add_pooler=False,
             encoder_attn_mask_type=AttnMaskType.causal,
-            init_method=init_method_normal(args.init_method_std),
-            scaled_init_method=scaled_init_method_normal(args.init_method_std,
-                                                         args.num_layers),
             pre_process=self.pre_process,
             post_process=self.post_process)
         
         if not args.untie_embeddings_and_output_weights:
-            self.initialize_word_embeddings(init_method_normal)
+            self.initialize_word_embeddings()
 
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
@@ -94,7 +91,7 @@ class GPTModel(MegatronModule):
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
-                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.word_embeddings_weight(),
+                self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
         else:

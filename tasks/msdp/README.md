@@ -7,7 +7,7 @@ Below we present the steps to run our multi-stage dialogue prompting (MSDP) fram
 
 ### Data Preparation
 1. Dataset Download: [Wizard of Wikipedia](https://parl.ai/projects/wizard_of_wikipedia/) and [Wizard of Internet](https://parl.ai/projects/sea/)
-2. Data Processing: We provide the script to run the [`data processing`](../../examples/msdp/data_processing.sh) of the datatsets.
+2. Data Processing: We provide the script to run the [`data processing`](../../examples/msdp/data_processing.sh) of the datasets.
 
 ### Stage-1: Prompting for Knowledge Generation
 1. We provide the script to perform the [`first-stage prompting`](../../examples/msdp/prompt_knwl_gen.sh) for the knowledge generation.

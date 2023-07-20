@@ -4,15 +4,16 @@ import os
 import torch
 
 from megatron import get_retro_args, print_rank_0
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.data.gpt_dataset import build_train_valid_test_datasets \
+    as build_gpt_train_valid_test_datasets
 from megatron.training import (
-    build_train_valid_test_data_loaders,
+    build_train_valid_test_datasets as build_pretraining_train_valid_test_datasets,
     update_train_iters,
 )
 from tools.retro.db.utils import get_indexed_dataset_infos
 from tools.retro.utils import get_num_chunks_per_sample
 
-from .utils import get_query_workdir
+from .utils import get_neighbor_dirname, get_query_workdir
 
 
 class ChunkDataset(torch.utils.data.Dataset):
@@ -86,14 +87,14 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        data_impl=args.data_impl,
-        splits_string=args.split,
+    train_ds, valid_ds, test_ds = build_gpt_train_valid_test_datasets(
+        data_prefix=args.retro_gpt_data_path,
+        data_impl=args.retro_gpt_data_impl,
+        splits_string=args.retro_gpt_split,
         train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.retro_gpt_seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
+        seed=args.retro_gpt_seed,
+        skip_warmup=(not args.retro_gpt_mmap_warmup),
         return_doc_ids=args.retro_return_doc_ids)
     print_rank_0("> finished creating pretrained GPT datasets ...")
 
@@ -115,28 +116,23 @@ def get_chunk_dataset_map():
     verify_indexed_dataset_order()
 
     # Datasets.
-    print_rank_0(" > data loader.")
-    train_data_loader, valid_data_loader, test_data_loader \
-        = build_train_valid_test_data_loaders(
-            train_valid_test_datasets_provider)
+    print_rank_0(" > datasets.")
+    train_ds, valid_ds, test_ds = build_pretraining_train_valid_test_datasets(
+        train_valid_test_datasets_provider)
 
-    data_loader_map = {
-        "train" : train_data_loader,
-        "valid" : valid_data_loader,
-        "test" : test_data_loader,
+    sample_dataset_map = {
+        "train" : train_ds,
+        "valid" : valid_ds,
+        "test" : test_ds,
     }
 
     # Info dict.
-    workdir = get_query_workdir()
-    dataset_map = {
+    chunk_dataset_map = {
         key : {
-            "neighbor_dir" : os.path.join(
-                workdir,
-                os.path.basename(loader.dataset.datasets[0].index_prefix),
-            ),
-            "data" : ChunkDataset(loader.dataset, args.retro_gpt_chunk_length),
+            "neighbor_dir" : get_neighbor_dirname(key, sample_ds),
+            "data" : ChunkDataset(sample_ds, args.retro_gpt_chunk_length),
         }
-        for key, loader in data_loader_map.items() if loader
+        for key, sample_ds in sample_dataset_map.items() if sample_ds
     }
 
-    return dataset_map
+    return chunk_dataset_map
