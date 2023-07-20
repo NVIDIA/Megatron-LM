@@ -1,4 +1,4 @@
-# Sync with NVIDIA/Megatron-LM
+# July 2023 sync with NVIDIA/Megatron-LM
 This folder includes details about the recent sync with the NVIDIA/Megatron-LM repo (where this repo is forked from). It includes example scripts we used to test after the sync, together with this README documentation about what were tested.
 
 We also created a [backup branch](https://github.com/microsoft/Megatron-DeepSpeed/tree/before_rebase) which is the version before this sync. This branch is just for comparison tests and for temporary use when debugging the main branch. We do not plan to continue supporting the version before sync.

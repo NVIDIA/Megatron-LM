@@ -1,3 +1,6 @@
+## Latest News
+* [2023/07] Synced with [upstream](https://github.com/NVIDIA/Megatron-LM) over 1k commits, see [rebase folder for more details](https://github.com/microsoft/Megatron-DeepSpeed/tree/main/examples_deepspeed/rebase) in terms of features and updated performance.
+
 ## Megatron-DeepSpeed
 DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE model training, Curriculum Learning, 3D Parallelism, and others. The ```examples_deepspeed/``` folder includes example scripts about the features supported by DeepSpeed.
 
