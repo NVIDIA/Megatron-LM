@@ -435,6 +435,9 @@ def core_transformer_config_from_args(args):
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
+    kw_args['fp8_e4m3'] = args.fp8_e4m3
+    kw_args['fp8_margin'] = args.fp8_hybrid
 
     return TransformerConfig(**kw_args)
 
