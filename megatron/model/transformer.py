@@ -45,7 +45,12 @@ try:
     flash_attn_builder = FlashAttentionBuilder().load()
 except TypeError:
     flash_attn_builder = None
-from apex.normalization import MixedFusedRMSNorm
+
+try:
+    from apex.normalization import MixedFusedRMSNorm
+except ImportError:
+    MixedFusedRMSNorm = None
+
 
 
 """ We use the following notation throughout this file:
@@ -383,10 +388,11 @@ class FlashSelfAttention(torch.nn.Module):
         """
 
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
-        if get_accelerator().device_name() == 'cuda':
-            assert all((i.is_cuda for i in (q,k,v)))
-        else:
-            assert all((i.is_xpu for i in (q,k,v)))
+        assert all((get_accelerator().on_accelerator(i) for i in (q, k, v)))
+        # if get_accelerator().device_name() == 'cuda':
+        #     assert all((i.is_cuda for i in (q,k,v)))
+        # else:
+        #     assert all((i.is_xpu for i in (q,k,v)))
 
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]

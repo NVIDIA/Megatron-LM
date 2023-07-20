@@ -19,7 +19,11 @@ from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
 
-from apex.normalization import MixedFusedRMSNorm
+try:
+    from apex.normalization import MixedFusedRMSNorm
+except ImportError:
+    MixedFusedRMSNorm = None
+
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
