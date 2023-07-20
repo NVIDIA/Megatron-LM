@@ -18,7 +18,6 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
 try:
     from einops import rearrange
 except ImportError:
@@ -685,25 +684,23 @@ class ParallelAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-                
-        if self.use_flash_attn:
-            # currently we only support flash_attn for multi_head
-            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
-                    for x in (query_layer, key_layer, value_layer)]
-            if not self.sequence_parallel:
-                with tensor_parallel.get_cuda_rng_tracker().fork():
-                    context_layer = self.core_attention_flash(q, k, v)
-            else:
-                context_layer = self.core_attention_flash(q, k, v)
-            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
-        
-        else:
+
+        if not self.use_flash_attn:
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
                     query_layer, key_layer, value_layer, attention_mask)
             else:
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask)
+        else:
+            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       for x in (query_layer, key_layer, value_layer)]
+            if not self.sequence_parallel:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    context_layer = self.core_attention_flash(q, k, v)
+            else:
+                context_layer = self.core_attention_flash(q, k, v)
+            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
         # Output. [sq, b, h]
