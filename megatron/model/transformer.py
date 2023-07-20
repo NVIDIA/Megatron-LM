@@ -18,6 +18,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+
 try:
     from einops import rearrange
 except ImportError:
@@ -229,14 +230,6 @@ class CoreAttention(MegatronModule):
         self.num_attention_heads_per_partition = core.utils.divide(
             args.num_attention_heads, world_size)
 
-        self.group_query_attention = args.group_query_attention
-
-        if self.group_query_attention:
-            self.num_query_groups_per_partition = core.utils.divide(
-                    args.num_query_groups, world_size)
-        else:
-            self.num_query_groups_per_partition = self.num_attention_heads_per_partition
-
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         if self.apply_query_key_layer_scaling:
@@ -268,12 +261,13 @@ class CoreAttention(MegatronModule):
                        query_layer.size(2),
                        query_layer.size(0),
                        key_layer.size(0))
+
         # [sq, b, np, hn] -> [sq, b * np, hn]
         query_layer = query_layer.view(output_size[2],
-                                    output_size[0] * output_size[1], -1)
-        # [sk, b, ng, hn] -> [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.repeat(1, 1, int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
-                                     1).view(output_size[3],output_size[0] * output_size[1], -1)
+                                       output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3],
+                                   output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
@@ -311,25 +305,27 @@ class CoreAttention(MegatronModule):
         # =========================
 
         # value_layer -> context layer.
-        # [sk, b, ng, hn] --> [b, np, sq, hn]
+        # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
-        context_output_size = (value_layer.size(1), output_size[1], query_layer.size(0), value_layer.size(3))
+        output_size = (value_layer.size(1),
+                       value_layer.size(2),
+                       query_layer.size(0),
+                       value_layer.size(3))
 
-        # change view [sk, b, ng, hn]  --> [sk, b, np, hn] --> [sk, b * np, hn]
-        value_layer = value_layer.repeat(1, 1, 
-                                        int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
-                                         1).view(
-                                value_layer.size(0), context_output_size[0] * context_output_size[1], -1)
-        
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0),
+                                       output_size[0] * output_size[1], -1)
+
         # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(context_output_size[0] * context_output_size[1], context_output_size[2], -1)
+        attention_probs = attention_probs.view(output_size[0] * output_size[1],
+                                               output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
         context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
         # change view [b, np, sq, hn]
-        context_layer = context_layer.view(*context_output_size)
+        context_layer = context_layer.view(*output_size)
 
         # [b, np, sq, hn] --> [sq, b, np, hn]
         context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
@@ -340,6 +336,7 @@ class CoreAttention(MegatronModule):
         context_layer = context_layer.view(*new_context_layer_shape)
 
         return context_layer
+
 
 class FlashSelfAttention(torch.nn.Module):
     """Implement the scaled dot product attention with softmax.
@@ -401,6 +398,7 @@ class FlashSelfAttention(torch.nn.Module):
         output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
         return output
 
+
 class ParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
@@ -427,14 +425,10 @@ class ParallelAttention(MegatronModule):
             key_projection_size = args.kv_channels * args.num_query_groups
         else:
             key_projection_size = args.kv_channels * args.num_attention_heads
-
-        if args.use_flash_attn and self.group_query_attention:
-            raise NotImplementedError("Flash attention is not supported for group-query attention.")
         
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
-        
         if self.use_flash_attn:
             if flash_attn_unpadded_func is None:
                 raise ImportError('FlashAttention is not installed, please install with '
@@ -448,7 +442,6 @@ class ParallelAttention(MegatronModule):
 
         projection_size = args.kv_channels * args.num_attention_heads
 
-
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
@@ -456,7 +449,8 @@ class ParallelAttention(MegatronModule):
         self.num_attention_heads_per_partition = core.utils.divide(
             args.num_attention_heads, world_size)
         if self.group_query_attention:
-            assert args.num_query_groups % world_size == 0, ('The num_query_groups should be '
+            if args.num_query_groups % world_size != 0: 
+                raise NotImplementedError('Currently the num_query_groups should be '
                                                             'greater or equal to tensor parallel size')
             self.num_query_groups_per_partition = core.utils.divide(
                         args.num_query_groups, world_size)
@@ -473,7 +467,6 @@ class ParallelAttention(MegatronModule):
                 init_method=init_method,
                 async_tensor_model_parallel_allreduce=args.async_tensor_model_parallel_allreduce,
                 **_args_to_kwargs())
-
         else:
             assert attention_type == AttnType.cross_attn
 
@@ -500,7 +493,6 @@ class ParallelAttention(MegatronModule):
 
         self.core_attention = CoreAttention(self.layer_number,
                                                 self.attn_mask_type)
-
         self.checkpoint_core_attention = args.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
@@ -540,7 +532,6 @@ class ParallelAttention(MegatronModule):
             q_pos_emb, k_pos_emb)
 
         return hidden_states
-
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size, num_attention_heads):
         return torch.empty(
@@ -599,7 +590,13 @@ class ParallelAttention(MegatronModule):
                                                        self.num_query_groups_per_partition,
                                                        self.num_query_groups_per_partition], 
                                                        dim=2)
-
+            
+            # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
+            key_layer = key_layer.repeat(1, 1, int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
+                                        1)
+            value_layer = value_layer.repeat(1, 1, 
+                                            int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition), 
+                                            1)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
