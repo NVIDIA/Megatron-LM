@@ -74,7 +74,7 @@ def validate_args(args, defaults={}):
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
-    assert args.world_size % model_parallel_size == 0, 'world size is not'\
+    assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
         ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
@@ -315,7 +315,7 @@ def validate_args(args, defaults={}):
         assert args.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
@@ -435,6 +435,9 @@ def core_transformer_config_from_args(args):
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
+    kw_args['fp8_e4m3'] = args.fp8_e4m3
+    kw_args['fp8_margin'] = args.fp8_hybrid
 
     return TransformerConfig(**kw_args)
 
