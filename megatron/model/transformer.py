@@ -445,7 +445,7 @@ class ParallelAttention(MegatronModule):
         if self.group_query_attention:
             if args.num_query_groups % world_size != 0: 
                 raise NotImplementedError('Currently the num_query_groups should be '
-                                                            'greater or equal to tensor parallel size')
+                                          'a multiple of the tensor parallel size')
             self.num_query_groups_per_partition = core.utils.divide(
                         args.num_query_groups, world_size)
         else:
