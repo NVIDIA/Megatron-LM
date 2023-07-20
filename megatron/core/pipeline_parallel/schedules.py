@@ -422,7 +422,8 @@ def forward_backward_pipelining_with_interleaving(*,
         raise RuntimeError("Interleaving is not supported with a different decoder sequence length.")
 
     if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        sharded_seq_length = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        tensor_shape = (sharded_seq_length, micro_batch_size, config.hidden_size)
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
