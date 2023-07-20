@@ -28,3 +28,4 @@ jobs:
         stale-pr-label: 'stale'
         remove-stale-when-updated: true
         operations-per-run: 1000
+        days-before-close: -1
