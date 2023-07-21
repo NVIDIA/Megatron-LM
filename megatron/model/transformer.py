@@ -570,17 +570,27 @@ class ParallelAttention(MegatronModule):
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + (
                 self.num_query_groups_per_partition,
-                (int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition) + 2) * self.hidden_size_per_attention_head, 
+                (
+                    (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                    * self.hidden_size_per_attention_head
+                ),
             )
             mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
             # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
             (query_layer,
             key_layer,
-            value_layer) = torch.split(mixed_x_layer, [int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition) * self.hidden_size_per_attention_head, 
-                                                       self.hidden_size_per_attention_head,
-                                                       self.hidden_size_per_attention_head], 
-                                                       dim=3)
+            value_layer) = torch.split(
+                mixed_x_layer,
+                [
+                    (
+                        self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+                        * self.hidden_size_per_attention_head
+                    ),
+                    self.hidden_size_per_attention_head,
+                    self.hidden_size_per_attention_head
+                ],
+                dim=3)
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
             query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head) 
         else:
@@ -659,10 +669,14 @@ class ParallelAttention(MegatronModule):
         # ==================================
         
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        key_layer = key_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
-                                            dim = 2)
-        value_layer = value_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
-                                            dim = 2)
+        key_layer = key_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+        value_layer = value_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:

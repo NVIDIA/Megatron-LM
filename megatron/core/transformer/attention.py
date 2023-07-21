@@ -209,11 +209,11 @@ class Attention(MegatronModule, ABC):
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
         key = key.repeat_interleave(
-            int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
             dim = 2
         )
         value = value.repeat_interleave(
-            int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
             dim = 2
         )
 
@@ -266,7 +266,7 @@ class SelfAttention(Attention):
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
             (
-                (int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition) + 2)
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
                 * self.hidden_size_per_attention_head
             ),
         )
@@ -277,7 +277,7 @@ class SelfAttention(Attention):
              mixed_qkv,
              [
                  (
-                     int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition)
+                     self.num_attention_heads_per_partition // self.num_query_groups_per_partition
                      * self.hidden_size_per_attention_head
                  ),
                  self.hidden_size_per_attention_head,
