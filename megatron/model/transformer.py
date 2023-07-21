@@ -484,7 +484,7 @@ class ParallelAttention(MegatronModule):
 
         self.core_attention = CoreAttention(self.layer_number, config,
                                             self.attn_mask_type)
-        self.checkpoint_core_attention = args.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
         if self.use_flash_attn:
             self.core_attention_flash = FlashSelfAttention(
