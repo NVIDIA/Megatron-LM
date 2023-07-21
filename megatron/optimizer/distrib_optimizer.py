@@ -857,6 +857,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         timers('grads-reduce-scatter').stop()
 
 
+
     def gather_model_params(self, args, timers):
         """
         All-gather updated model params.
