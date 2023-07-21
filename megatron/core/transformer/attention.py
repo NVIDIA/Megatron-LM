@@ -6,14 +6,13 @@ from .transformer_config import TransformerConfig
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.transformer.core_attention import CoreAttention
 from megatron.core.utils import divide
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.enums import AttnType, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.custom_layers.transformer_engine import \
-        TECoreAttention, TEColumnParallelLinear, TERowParallelLinear
+        TEDotProductAttention, TEColumnParallelLinear, TERowParallelLinear
 
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 
@@ -44,13 +43,13 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
 
 
-        self.core_attention = TECoreAttention(
+        self.dot_product_attention = TEDotProductAttention(
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type
         )
 
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
         self.linear_proj = TERowParallelLinear(
@@ -70,7 +69,7 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.core_attention(query, key, value, attention_mask)
+            output_ = self.dot_product_attention(query, key, value, attention_mask)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -198,10 +197,10 @@ class Attention(MegatronModule, ABC):
         # ==================================
         # core attention computation
         # ==================================
-        if self.checkpoint_core_attention:
+        if self.checkpoint_dot_product_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
-            core_attn_out = self.core_attention(query, key, value, attention_mask)
+            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
 
         # =================
         # Output. [sq, b, h]
