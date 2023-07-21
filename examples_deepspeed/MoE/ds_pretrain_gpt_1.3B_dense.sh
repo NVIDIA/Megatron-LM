@@ -113,7 +113,6 @@ LR_DECAY_TOKENS=260000000000
 BATCH_SIZE=2
 
 ## Model parallelism, 1 is no MP
-## Currently MoE models have divergence issue when MP > 1.
 MP_SIZE=4
 
 ## Pipeline parallelism
