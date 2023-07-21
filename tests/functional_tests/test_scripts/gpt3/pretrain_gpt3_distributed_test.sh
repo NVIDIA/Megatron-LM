@@ -29,6 +29,7 @@ if [[ $USE_CORE -eq 1 ]]; then
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
        CALLING_SCRIPT=pretrain_gpt_core.py
+       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
