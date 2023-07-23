@@ -413,6 +413,17 @@ def validate_args(args, defaults={}):
             data_paths.append(f"{args.aml_data_download_path}/{path}")
         args.data_path = data_paths
 
+    # GQA
+    if args.num_key_value_heads is None:
+        args.num_key_value_heads = args.num_attention_heads
+    assert args.num_attention_heads % args.num_key_value_heads == 0, \
+        f"num_attention_heads must be divisible by num_key_value_heads (got `num_attention_heads`: {args.num_attention_heads} " \
+        f"and `num_key_value_heads`: {args.num_key_value_heads})."
+    if args.num_key_value_heads != args.num_attention_heads:
+        # if GQA
+        assert not args.mos, 'GQA currently does not support args.mos'
+        assert not args.kd, 'GQA currently does not support args.kd'
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -582,6 +593,8 @@ def _add_network_size_args(parser):
                        'This is set to 4*hidden-size if not provided')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
+    group.add_argument('--num-key-value-heads', type=int, default=None,
+                       help='Number of key_value heads that should be used to implement Grouped Query Attention.')
     group.add_argument('--kv-channels', type=int, default=None,
                        help='Projection weights dimension in multi-head '
                        'attention. This is set to '

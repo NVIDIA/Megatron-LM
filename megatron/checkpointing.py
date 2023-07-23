@@ -57,6 +57,7 @@ def check_checkpoint_args(checkpoint_args):
         _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
+    _compare('num_key_value_heads')
     _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
@@ -496,6 +497,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
+    _set_arg('num_key_value_heads')
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
     _set_arg('add_position_embedding', force=True)

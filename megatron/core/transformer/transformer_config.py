@@ -21,6 +21,11 @@ class TransformerConfig(ModelParallelConfig):
         ffn_hidden_size (int): Transformer Feed-Forward Network hidden size.
                                 This is set to 4*hidden_size if not provided. Defaults to None.')
         num_attention_heads (int): Number of transformer attention heads.
+        num_key_value_heads (int): This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+                                   `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+                                   `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used.
+                                   For more details checkout [this paper](https://arxiv.org/pdf/2305.13245.pdf).
+                                   If it is not specified, will default to `num_attention_heads`.
         kv_channels (int): Projection weights dimension in multi-head attention.
                             This is set to hidden_size // num_attention_heads if not provided.
                             Defaults to None.
@@ -101,6 +106,7 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     hidden_size: int = 0
     num_attention_heads: int = 0
+    num_key_value_heads: int = None
 
     ffn_hidden_size: int = None
     kv_channels: int = None
@@ -148,6 +154,10 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
+
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
+        assert self.num_attention_heads % self.num_key_value_heads == 0
 
         if self.kv_channels is None:
             self.kv_channels = self.hidden_size // self.num_attention_heads

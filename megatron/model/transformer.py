@@ -450,6 +450,9 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.use_gqa = (self.num_attention_heads != self.num_key_value_heads)
 
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
@@ -474,14 +477,39 @@ class ParallelAttention(MegatronModule):
         self.num_attention_heads_per_partition = core.utils.divide(
             config.num_attention_heads, world_size)
 
+        # Per GQA head and per partition values
+        if self.use_gqa:
+            kv_projection_size = config.kv_channels * config.num_key_value_heads
+            self.num_key_value_heads_per_partition = core.utils.divide(
+                config.num_key_value_heads, world_size)
+            self.num_key_value_groups = core.utils.divide(
+                config.num_attention_heads, config.num_key_value_heads)
+            assert self.hidden_size_per_attention_head == core.utils.divide(
+                kv_projection_size, config.num_key_value_heads)
+
         # Strided linear layer.
-        if attention_type == AttnType.self_attn:
+        if attention_type == AttnType.self_attn and not self.use_gqa:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 3 * projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=args.add_bias_linear,
+                gather_output=False)
+        elif attention_type == AttnType.self_attn and self.use_gqa:
+            self.query = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                gather_output=False)
+            self.key_value = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                2 * kv_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
                 gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
@@ -558,6 +586,16 @@ class ParallelAttention(MegatronModule):
             dtype=self.params_dtype,
             device=get_accelerator().current_device_name())
 
+    def repeat_kv(self, hidden_states, n_rep):
+        slen, batch, num_key_value_heads_per_partition, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, :, None, :].expand(
+            slen, batch, num_key_value_heads_per_partition, n_rep, head_dim)
+        return hidden_states.reshape(slen, batch,
+                                     num_key_value_heads_per_partition * n_rep,
+                                     head_dim)
+
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
                 rotary_pos_emb=None):
@@ -586,7 +624,7 @@ class ParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
 
-        if self.attention_type == AttnType.self_attn:
+        if self.attention_type == AttnType.self_attn and not self.use_gqa:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
@@ -600,7 +638,34 @@ class ParallelAttention(MegatronModule):
             (query_layer,
              key_layer,
              value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+        elif self.attention_type == AttnType.self_attn and self.use_gqa:
+            # Attention head [sq, b, h] --> [sq, b, hp]
+            query_layer, _ = self.query(hidden_states)
+            # [sq, b, hp] --> [sq, b, np, hn]
+            new_tensor_shape = query_layer.size()[:-1] + \
+                (self.num_attention_heads_per_partition,
+                 self.hidden_size_per_attention_head)
+            query_layer = query_layer.view(*new_tensor_shape)
+
+            # Attention heads [sq, b, h] --> [sq, b, (np * 2 * hn)]
+            mixed_kv_layer, _ = self.key_value(hidden_states)
+            # [sq, b, (np * 2 * hn)] --> [sq, b, np, 2 * hn]
+            new_tensor_shape = mixed_kv_layer.size()[:-1] + \
+                (self.num_key_value_heads_per_partition,
+                 2 * self.hidden_size_per_attention_head)
+            mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
+            # [sq, b, np, 2 * hn] --> 2 [sq, b, np, hn]
+            (key_layer,
+             value_layer) = tensor_parallel.split_tensor_along_last_dim(
+                 mixed_kv_layer, 2)
+
+            # Repeat kv
+            key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
+            value_layer = self.repeat_kv(value_layer,
+                                         self.num_key_value_groups)
         else:
+            assert not self.use_gqa, 'GQA + cross-attn not tested yet'
+
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
 
@@ -754,7 +819,7 @@ class ParallelTransformerLayer(MegatronModule):
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
                  drop_path_rate=0., num_experts=1):
-                 # retriever=None):
+        # retriever=None):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()
@@ -807,7 +872,7 @@ class ParallelTransformerLayer(MegatronModule):
                     eps=config.layernorm_epsilon)
         else:
             self.post_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
-                 # Cross attention.
+            # Cross attention.
         if self.layer_type in (LayerType.decoder,
                                LayerType.retro_decoder,
                                LayerType.retro_decoder_with_retriever,
@@ -1470,6 +1535,8 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     num_experts=n_e)
             else:
+                assert config.num_attention_heads == config.num_key_value_heads, \
+                        'Transformer_engine does not support GQA'
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1905,5 +1972,3 @@ class LMHeadPipe(MegatronModule):
             return logits
         else:
             return logits, attention_mask
-
-
