@@ -7,7 +7,8 @@ import contextlib
 
 import torch
 from torch import _C
-from torch.cuda import _lazy_call, device as device_ctx_manager
+from torch.cuda import _lazy_call
+from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (
@@ -16,13 +17,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-
-from .utils import (
-    split_tensor_into_1d_equal_chunks,
-    gather_split_1d_tensor,
-)
-
 from megatron.core.utils import safely_set_viewless_tensor_data
+
+from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -42,6 +39,7 @@ def _set_cuda_rng_state(new_state, device=-1):
         def cb():
             with device_ctx_manager(device):
                 _C._cuda_setRNGState(new_state)
+
     else:
         # newer PyTorch
         if device == -1:
@@ -59,7 +57,6 @@ def _set_cuda_rng_state(new_state, device=-1):
             default_generator.set_state(new_state)
 
     _lazy_call(cb)
-
 
 
 class CudaRNGStatesTracker:
@@ -169,8 +166,7 @@ def model_parallel_cuda_manual_seed(seed):
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
     # and model parallel state.
-    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME,
-                                tensor_model_parallel_seed)
+    _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -180,11 +176,11 @@ class CheckpointFunction(torch.autograd.Function):
            2) the states in the model parallel tracker are also properly
               tracked/set/reset.
     """
+
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
         ctx.run_function = run_function
-        ctx.distribute_saved_activations \
-            = distribute_saved_activations
+        ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -199,8 +195,8 @@ class CheckpointFunction(torch.autograd.Function):
         if distribute_saved_activations:
             ctx.input_0_shape = args[0].data.shape
             safely_set_viewless_tensor_data(
-                args[0],
-                split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
+                args[0], split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True)
+            )
 
         # Store everything.
         ctx.save_for_backward(*args)
@@ -210,13 +206,15 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *args):
         if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError("Checkpointing is not compatible with .grad(), "
-                               "please use .backward() if possible")
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), "
+                "please use .backward() if possible"
+            )
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
-                inputs[0],
-                gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
+                inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
+            )
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
@@ -241,13 +239,11 @@ class CheckpointFunction(torch.autograd.Function):
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
         torch.autograd.backward(outputs, args)
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp
-                      for inp in detached_inputs)
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads
 
 
 def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
-    return CheckpointFunction.apply(function,
-                                    distribute_saved_activations, *args)
+    return CheckpointFunction.apply(function, distribute_saved_activations, *args)

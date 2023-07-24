@@ -2,8 +2,9 @@
 
 """Model and data parallel groups."""
 
-import torch
 from typing import Optional
+
+import torch
 
 from .utils import GlobalMemoryBuffer
 
@@ -128,7 +129,9 @@ def initialize_model_parallel(
             f"({tensor_model_parallel_size}) x pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
-    data_parallel_size: int = world_size // (tensor_model_parallel_size * pipeline_model_parallel_size)
+    data_parallel_size: int = world_size // (
+        tensor_model_parallel_size * pipeline_model_parallel_size
+    )
 
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
@@ -136,7 +139,9 @@ def initialize_model_parallel(
 
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 2:
-            raise RuntimeError("pipeline-model-parallel size should be greater than 2 with " "interleaved schedule")
+            raise RuntimeError(
+                "pipeline-model-parallel size should be greater than 2 with " "interleaved schedule"
+            )
         global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
         global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
@@ -171,14 +176,19 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for i in range(data_parallel_size):
-        ranks = [data_parallel_group_ranks[i] for data_parallel_group_ranks in all_data_parallel_group_ranks]
+        ranks = [
+            data_parallel_group_ranks[i]
+            for data_parallel_group_ranks in all_data_parallel_group_ranks
+        ]
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
-    assert _TENSOR_MODEL_PARALLEL_GROUP is None, 'tensor model parallel group is already initialized'
+    assert (
+        _TENSOR_MODEL_PARALLEL_GROUP is None
+    ), 'tensor model parallel group is already initialized'
     for i in range(num_tensor_model_parallel_groups):
         ranks = range(i * tensor_model_parallel_size, (i + 1) * tensor_model_parallel_size)
         group = torch.distributed.new_group(ranks)
@@ -189,7 +199,9 @@ def initialize_model_parallel(
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
-    assert _PIPELINE_MODEL_PARALLEL_GROUP is None, 'pipeline model parallel group is already initialized'
+    assert (
+        _PIPELINE_MODEL_PARALLEL_GROUP is None
+    ), 'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
     global _EMBEDDING_GLOBAL_RANKS
     assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
@@ -209,7 +221,11 @@ def initialize_model_parallel(
             position_embedding_ranks = [ranks[0]]
             if pipeline_model_parallel_split_rank is not None:
                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
-                    embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank], ranks[-1]]
+                    embedding_ranks = [
+                        ranks[0],
+                        ranks[pipeline_model_parallel_split_rank],
+                        ranks[-1],
+                    ]
                 if ranks[pipeline_model_parallel_split_rank] not in position_embedding_ranks:
                     position_embedding_ranks = [ranks[0], ranks[pipeline_model_parallel_split_rank]]
         else:
@@ -230,8 +246,7 @@ def initialize_model_parallel(
 
     # Build the FP8 groups.
     global _AMAX_REDUCTION_GROUP
-    assert _AMAX_REDUCTION_GROUP is None, \
-        'FP8 amax reduction group is already initialized'
+    assert _AMAX_REDUCTION_GROUP is None, 'FP8 amax reduction group is already initialized'
     if use_fp8:
         amax_group_size: int = tensor_model_parallel_size * data_parallel_size
         num_amax_groups: int = world_size // amax_group_size
@@ -257,7 +272,11 @@ def is_unitialized():
 
 def model_parallel_is_initialized():
     """Check if model and data parallel groups are initialized."""
-    if _TENSOR_MODEL_PARALLEL_GROUP is None or _PIPELINE_MODEL_PARALLEL_GROUP is None or _DATA_PARALLEL_GROUP is None:
+    if (
+        _TENSOR_MODEL_PARALLEL_GROUP is None
+        or _PIPELINE_MODEL_PARALLEL_GROUP is None
+        or _DATA_PARALLEL_GROUP is None
+    ):
         return False
     return True
 
@@ -271,13 +290,17 @@ def get_model_parallel_group():
 def get_tensor_model_parallel_group(check_initialized=True):
     """Get the tensor model parallel group the caller rank belongs to."""
     if check_initialized:
-        assert _TENSOR_MODEL_PARALLEL_GROUP is not None, 'tensor model parallel group is not initialized'
+        assert (
+            _TENSOR_MODEL_PARALLEL_GROUP is not None
+        ), 'tensor model parallel group is not initialized'
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
 def get_pipeline_model_parallel_group():
     """Get the pipeline model parallel group the caller rank belongs to."""
-    assert _PIPELINE_MODEL_PARALLEL_GROUP is not None, 'pipeline_model parallel group is not initialized'
+    assert (
+        _PIPELINE_MODEL_PARALLEL_GROUP is not None
+    ), 'pipeline_model parallel group is not initialized'
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
@@ -289,8 +312,7 @@ def get_data_parallel_group():
 
 def get_data_parallel_group_gloo():
     """Get the data parallel group-gloo the caller rank belongs to."""
-    assert _DATA_PARALLEL_GROUP_GLOO is not None, \
-        'data parallel group-gloo is not initialized'
+    assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
     return _DATA_PARALLEL_GROUP_GLOO
 
 
@@ -308,8 +330,7 @@ def get_position_embedding_group():
 
 def get_amax_reduction_group():
     """Get the FP8 amax reduction group the caller rank belongs to."""
-    assert _AMAX_REDUCTION_GROUP is not None, \
-        'FP8 amax reduction group is not initialized'
+    assert _AMAX_REDUCTION_GROUP is not None, 'FP8 amax reduction group is not initialized'
     return _AMAX_REDUCTION_GROUP
 
 
@@ -324,10 +345,12 @@ def set_pipeline_model_parallel_world_size(world_size):
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
+
 def set_virtual_pipeline_model_parallel_world_size(world_size):
     """Set the pipeline model parallel size"""
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
+
 
 def set_virtual_pipeline_model_parallel_world_size(world_size):
     """Set the virtual pipeline model parallel size"""
@@ -405,7 +428,9 @@ def is_pipeline_first_stage(ignore_virtual=False):
 def is_pipeline_last_stage(ignore_virtual=False):
     """Return True if in the last pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
-        virtual_pipeline_model_parallel_world_size = get_virtual_pipeline_model_parallel_world_size()
+        virtual_pipeline_model_parallel_world_size = (
+            get_virtual_pipeline_model_parallel_world_size()
+        )
         if virtual_pipeline_model_parallel_world_size is not None and get_virtual_pipeline_model_parallel_rank() != (
             virtual_pipeline_model_parallel_world_size - 1
         ):

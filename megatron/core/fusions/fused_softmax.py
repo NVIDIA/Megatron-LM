@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+
 from megatron.core.transformer.enums import AttnMaskType
 
 
@@ -19,9 +20,7 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
         import scaled_upper_triang_masked_softmax_cuda
 
         scale_t = torch.tensor([scale])
-        softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(
-            inputs, scale_t[0]
-        )
+        softmax_results = scaled_upper_triang_masked_softmax_cuda.forward(inputs, scale_t[0])
 
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
@@ -62,9 +61,7 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
 
         softmax_results, scale_t = ctx.saved_tensors
 
-        input_grads = scaled_masked_softmax_cuda.backward(
-            output_grads, softmax_results, scale_t[0]
-        )
+        input_grads = scaled_masked_softmax_cuda.backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
 
 
@@ -81,9 +78,7 @@ class ScaledSoftmax(torch.autograd.Function):
 
         scale_t = torch.tensor([scale])
 
-        softmax_results = scaled_softmax_cuda.forward(
-            inputs, scale_t[0]
-        )
+        softmax_results = scaled_softmax_cuda.forward(inputs, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
         return softmax_results
 
@@ -93,9 +88,7 @@ class ScaledSoftmax(torch.autograd.Function):
 
         softmax_results, scale_t = ctx.saved_tensors
 
-        input_grads = scaled_softmax_cuda.backward(
-            output_grads, softmax_results, scale_t[0]
-        )
+        input_grads = scaled_softmax_cuda.backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
 
 
@@ -136,9 +129,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.softmax_in_fp32 = softmax_in_fp32
         self.scale = scale
 
-        assert (
-            self.scale is None or softmax_in_fp32
-        ), "softmax should be in fp32 when scaled"
+        assert self.scale is None or softmax_in_fp32, "softmax should be in fp32 when scaled"
 
     def forward(self, input, mask):
         # [b, np, sq, sk]
@@ -157,7 +148,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             and self.input_in_float16  # input must be fp16
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4
-            and sk % 4 == 0  # sk must be divisor of 4 
+            and sk % 4 == 0  # sk must be divisor of 4
             and attn_batches % 4 == 0  # np * b must be divisor of 4
         ):
             if 0 <= sk <= 4096:

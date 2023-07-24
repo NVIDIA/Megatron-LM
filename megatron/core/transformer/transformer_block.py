@@ -1,16 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from contextlib import nullcontext
+
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
+
 
 class TransformerBlock(MegatronModule):
     """Transformer class."""
@@ -54,7 +55,9 @@ class TransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_number):
             return TransformerLayer(
-                config=self.config, layer_number=layer_number, self_attn_mask_type=self.self_attn_mask_type,
+                config=self.config,
+                layer_number=layer_number,
+                self_attn_mask_type=self.self_attn_mask_type,
             )
 
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -204,7 +207,9 @@ class TransformerBlock(MegatronModule):
         #   likely redundant, since p2p_communication.py (likely originator)
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True,)
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=True, keep_graph=True,
+        )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -212,15 +217,16 @@ class TransformerBlock(MegatronModule):
             rng_context = nullcontext()
 
         if self.config.fp8:
-            import transformer_engine # To keep out TE dependency when not training in fp8
+            import transformer_engine  # To keep out TE dependency when not training in fp8
+
             fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
                 margin=self.config.fp8_margin,
                 interval=self.config.fp8_interval,
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
-                             if self.config.fp8_e4m3 else
-                               transformer_engine.common.recipe.Format.HYBRID,
+                if self.config.fp8_e4m3
+                else transformer_engine.common.recipe.Format.HYBRID,
                 fp8_amax_compute_algo=self.config.fp8_amax_compute_algo,
-                fp8_amax_history_len=self.config.fp8_amax_history_len
+                fp8_amax_history_len=self.config.fp8_amax_history_len,
             )
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe
@@ -231,14 +237,18 @@ class TransformerBlock(MegatronModule):
         with rng_context and fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full':
-                hidden_states = self._checkpointed_forward(hidden_states=hidden_states,
-                                                           attention_mask=attention_mask,
-                                                           rotary_pos_emb=rotary_pos_emb)
+                hidden_states = self._checkpointed_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                )
             else:
                 for layer in self.layers:
-                    hidden_states = layer(hidden_states=hidden_states,
-                                          attention_mask=attention_mask,
-                                          rotary_pos_emb=rotary_pos_emb)
+                    hidden_states = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                    )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
