@@ -86,7 +86,10 @@ class DotProductAttention(MegatronModule):
         )
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+        # This will be a simple view when doing normal attention, but in group query attention
+        # the key and value tensors are repeated to match the queries so you can't use simple strides
+        # to extract the queries.
+        query_layer = query_layer.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
