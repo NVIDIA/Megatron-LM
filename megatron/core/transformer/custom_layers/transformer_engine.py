@@ -20,7 +20,7 @@ class TELayerNorm(te.pytorch.LayerNorm):
         super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
 
-class TELinear(te.pytorch.module.Linear):
+class TELinear(te.pytorch.Linear):
     """
     Wrapper for the Transformer-Engine's `Linear` layer.
 
