@@ -21,32 +21,32 @@ GPT_ARGS="\
        --tensor-model-parallel-size 1 \
        --pipeline-model-parallel-size 1 \
        --recompute-activations \
---num-layers 24 \
---hidden-size 2048 \
---num-attention-heads 16 \
---attention-head-type multiquery \
---init-method-std 0.022 \
+       --num-layers 24 \
+       --hidden-size 2048 \
+       --num-attention-heads 16 \
+       --attention-head-type multiquery \
+       --init-method-std 0.022 \
        --seq-length 2048 \
        --max-position-embeddings 2048 \
---attention-dropout 0.1 \
---hidden-dropout 0.1 \
+       --attention-dropout 0.1 \
+       --hidden-dropout 0.1 \
        --micro-batch-size 2 \
        --global-batch-size 192 \
---lr 0.0002 \
---train-iters 3000 \
---lr-decay-iters 600000 \
---lr-decay-style cosine \
---lr-warmup-fraction 0.02 \
---weight-decay .1 \
---adam-beta2 .95 \
---clip-grad 1.0 \
---fp16 \
+       --lr 0.0002 \
+       --train-iters 300000 \
+       --lr-decay-iters 600000 \
+       --lr-decay-style cosine \
+       --lr-warmup-fraction 0.02 \
+       --weight-decay .1 \
+       --adam-beta2 .95 \
+       --clip-grad 1.0 \
+       --fp16 \
        --log-interval 10 \
        --save-interval 4000 \
        --eval-interval 200 \
        --eval-iters 10 \
---initial-loss-scale 65536 \
---fim-rate 0.5 \
+       --initial-loss-scale 65536 \
+       --fim-rate 0.5 \
 "
 
 TENSORBOARD_ARGS="--tensorboard-dir ${CHECKPOINT_PATH}/tensorboard"
