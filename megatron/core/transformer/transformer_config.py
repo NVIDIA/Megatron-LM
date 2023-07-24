@@ -24,6 +24,8 @@ class TransformerConfig(ModelParallelConfig):
         kv_channels (int): Projection weights dimension in multi-head attention.
                             This is set to hidden_size // num_attention_heads if not provided.
                             Defaults to None.
+        num_query_groups (int): Number of query groups for group query attention. If None, normal attention is used.
+
         hidden_dropout (float): Dropout probability for transformer hidden state. Defaults to 0.1.
         attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
         fp32_residual_connection (bool): If true, move residual connections to fp32.
@@ -119,6 +121,7 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     hidden_size: int = 0
     num_attention_heads: int = 0
+    num_query_groups: int = None
 
     ffn_hidden_size: int = None
     kv_channels: int = None
@@ -173,11 +176,26 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp16 and self.bf16:
             raise ValueError(f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.')
 
+        if self.num_attention_heads % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
+
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
 
         if self.kv_channels is None:
             self.kv_channels = self.hidden_size // self.num_attention_heads
+
+        if self.num_query_groups is None:
+            self.num_query_groups = self.num_attention_heads
+
+        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True

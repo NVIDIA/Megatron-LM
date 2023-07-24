@@ -414,10 +414,11 @@ class ParallelAttention(MegatronModule):
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
         
+        query_projection_size = config.kv_channels * config.num_attention_heads
         if self.group_query_attention:
-            key_projection_size = args.kv_channels * args.num_query_groups
+            kv_projection_size = args.kv_channels * args.num_query_groups
         else:
-            key_projection_size = args.kv_channels * args.num_attention_heads
+            kv_projection_size = args.kv_channels * args.num_attention_heads
         
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
@@ -433,12 +434,10 @@ class ParallelAttention(MegatronModule):
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
 
-        projection_size = config.kv_channels * config.num_attention_heads
-
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, config.num_attention_heads)
+            query_projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             config.num_attention_heads, world_size)
 
@@ -455,7 +454,7 @@ class ParallelAttention(MegatronModule):
         if attention_type == AttnType.self_attn:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                projection_size + 2 * key_projection_size,
+                query_projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=args.add_bias_linear,
@@ -465,10 +464,11 @@ class ParallelAttention(MegatronModule):
 
             if self.group_query_attention:
                 raise NotImplementedError("Grouped query attention not implemented for cross-attention.")
-            
+            assert query_projection_size == kv_projection_size
+
             self.query = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                projection_size,
+                query_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=config.add_bias_linear,
@@ -476,7 +476,7 @@ class ParallelAttention(MegatronModule):
 
             self.key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                2 * projection_size,
+                2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=config.add_bias_linear,
@@ -493,7 +493,7 @@ class ParallelAttention(MegatronModule):
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
-            projection_size,
+            query_projection_size,
             config.hidden_size,
             config=config,
             init_method=config.output_layer_init_method,
@@ -570,17 +570,27 @@ class ParallelAttention(MegatronModule):
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + (
                 self.num_query_groups_per_partition,
-                (int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition) + 2) * self.hidden_size_per_attention_head, 
+                (
+                    (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                    * self.hidden_size_per_attention_head
+                ),
             )
             mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
             # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
             (query_layer,
             key_layer,
-            value_layer) = torch.split(mixed_x_layer, [int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition) * self.hidden_size_per_attention_head, 
-                                                       self.hidden_size_per_attention_head,
-                                                       self.hidden_size_per_attention_head], 
-                                                       dim=3)
+            value_layer) = torch.split(
+                mixed_x_layer,
+                [
+                    (
+                        self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+                        * self.hidden_size_per_attention_head
+                    ),
+                    self.hidden_size_per_attention_head,
+                    self.hidden_size_per_attention_head
+                ],
+                dim=3)
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
             query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head) 
         else:
@@ -659,10 +669,14 @@ class ParallelAttention(MegatronModule):
         # ==================================
         
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        key_layer = key_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
-                                            dim = 2)
-        value_layer = value_layer.repeat_interleave(int(self.num_attention_heads_per_partition / self.num_query_groups_per_partition),
-                                            dim = 2)
+        key_layer = key_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+        value_layer = value_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:

@@ -36,13 +36,16 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
 
-        self.projection_size = self.config.kv_channels * self.config.num_attention_heads
+        # For normal attention without groups, num_query_groups == num_attention_heads,
+        # so these two will be the same
+        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
+        self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.hidden_size_per_attention_head = divide(self.projection_size, self.config.num_attention_heads)
+        self.hidden_size_per_attention_head = divide(self.query_projection_size, self.config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         self.core_attention = TECoreAttention(
             config=self.config,
@@ -54,7 +57,7 @@ class Attention(MegatronModule, ABC):
 
         # Output.
         self.linear_proj = TERowParallelLinear(
-            self.projection_size,
+            self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
@@ -80,10 +83,12 @@ class Attention(MegatronModule, ABC):
         return hidden_states
 
     def _allocate_memory(self, inference_max_sequence_len, batch_size):
+        """Allocate memory to store kv cache during inference."""
+
         return torch.empty(
             inference_max_sequence_len,
             batch_size,
-            self.num_attention_heads_per_partition,
+            self.num_query_groups_per_partition,
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
             device=torch.cuda.current_device(),
@@ -198,6 +203,20 @@ class Attention(MegatronModule, ABC):
         # ==================================
         # core attention computation
         # ==================================
+
+        # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
+        # This is a noop for normal attention where ng == np. When using group query attention this
+        # creates a view that has the keys and values virtually repeated along their dimension to
+        # match the number of queries.
+        key = key.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+        value = value.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
@@ -229,7 +248,7 @@ class SelfAttention(Attention):
 
         self.linear_qkv = TEColumnParallelLinear(
                 self.config.hidden_size,
-                3 * self.projection_size,
+                self.query_projection_size + 2 * self.kv_projection_size,
                 config=self.config,
                 init_method=self.config.init_method,
                 bias=self.config.add_bias_linear,
@@ -240,18 +259,34 @@ class SelfAttention(Attention):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
-        # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+        # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
-        # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
-            self.num_attention_heads_per_partition,
-            3 * self.hidden_size_per_attention_head,
+            self.num_query_groups_per_partition,
+            (
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                * self.hidden_size_per_attention_head
+            ),
         )
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
-        # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
-        (query, key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_qkv, 3)
+        # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+        (query, key, value) = torch.split(
+             mixed_qkv,
+             [
+                 (
+                     self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+                     * self.hidden_size_per_attention_head
+                 ),
+                 self.hidden_size_per_attention_head,
+                 self.hidden_size_per_attention_head
+             ],
+             dim=3
+        )
+        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
 
@@ -271,9 +306,13 @@ class CrossAttention(Attention):
             attn_mask_type=attn_mask_type
         )
 
+        if self.config.num_query_groups != self.config.num_attention_heads:
+            raise ValueError(f"Group query attention is not currently supported in cross attention.")
+        assert self.query_projection_size == self.kv_projection_size
+
         self.linear_q = TEColumnParallelLinear(
             self.config.hidden_size,
-            self.projection_size,
+            self.query_projection_size,
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
@@ -282,7 +321,7 @@ class CrossAttention(Attention):
 
         self.linear_kv = TEColumnParallelLinear(
             self.config.hidden_size,
-            2 * self.projection_size,
+            2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
