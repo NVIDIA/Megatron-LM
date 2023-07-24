@@ -49,7 +49,6 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.core_attention = TECoreAttention(
         self.dot_product_attention = TEDotProductAttention(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
