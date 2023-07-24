@@ -160,7 +160,7 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: bool = None
 
     # fp8 related
-    fp8: bool = True
+    fp8: bool = False
     fp8_e4m3: bool = False
     fp8_margin: int = 0
     fp8_interval: int = 1
