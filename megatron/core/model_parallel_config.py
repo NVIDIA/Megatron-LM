@@ -5,6 +5,7 @@ from typing import Callable
 
 import torch
 
+
 @dataclass
 class ModelParallelConfig:
     """Base configuration for Megatron Core
@@ -128,7 +129,7 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
-    
+
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None
     grad_scale_func: Callable = None
@@ -158,7 +159,9 @@ class ModelParallelConfig:
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
-                raise ValueError("When using pipeline parallelism, pipeline_dtype must be specified")
+                raise ValueError(
+                    "When using pipeline parallelism, pipeline_dtype must be specified"
+                )
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype

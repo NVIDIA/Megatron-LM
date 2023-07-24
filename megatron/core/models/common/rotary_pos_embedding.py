@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import importlib.util
-import torch
 
+import torch
 from torch import einsum, nn
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim):
