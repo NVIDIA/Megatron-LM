@@ -14,7 +14,7 @@ The following steps show how to prepare training dataset to train the mode.
 1. Download the deduplicated URLs from [jcpeterson](https://mega.nz/#F!EZZD0YwJ!9_PlEQzdMVLaNdKv_ICNVQ!cc4RgQQZ)
 2. Remove blacklisted URLs.
 ```
-python blacklist_urls.py <path to the dowloaded deduplicated URLs> <filename for clean urls. e.g. clean_urls.txt>
+python blacklist_urls.py <path to the downloaded deduplicated URLs> <filename for clean urls. e.g. clean_urls.txt>
 ```
 3. Download the content from the clean urls with [openwebtext's utilities](https://github.com/eukaryote31/openwebtext/blob/master/download.py). 
 
@@ -37,7 +37,7 @@ python group_duplicate_urls.py <possible duplicate urls file> <output file conta
 ```
 4. Remove similar documents that were detected in the last step.
 ```
-python remove_group_duplicates.py <file containing simialr documents> <cleaned data file> <outputfile containing deduplicate data>
+python remove_group_duplicates.py <file containing similar documents> <cleaned data file> <outputfile containing deduplicate data>
 ```
 
 5. Shuffle the dataset.

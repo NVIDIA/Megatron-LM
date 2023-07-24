@@ -27,8 +27,10 @@ except ImportError:
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
-    flash_attn_unpadded_func = None
-
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
+    except ImportError:
+        flash_attn_unpadded_func = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -254,8 +256,8 @@ class CoreAttention(MegatronModule):
                        key_layer.size(0))
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2],
-                                       output_size[0] * output_size[1], -1)
+        query_layer = query_layer.reshape(output_size[2],
+                                          output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3],
                                    output_size[0] * output_size[1], -1)
@@ -409,6 +411,15 @@ class ParallelAttention(MegatronModule):
         self.params_dtype = config.params_dtype
         self.sequence_parallel = config.sequence_parallel
 
+        self.group_query_attention = args.group_query_attention
+        self.num_query_groups = args.num_query_groups
+        
+        query_projection_size = config.kv_channels * config.num_attention_heads
+        if self.group_query_attention:
+            kv_projection_size = args.kv_channels * args.num_query_groups
+        else:
+            kv_projection_size = args.kv_channels * args.num_attention_heads
+        
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
@@ -423,38 +434,49 @@ class ParallelAttention(MegatronModule):
             if rearrange is None:
                 raise ImportError('einops is not installed, please install with pip install einops')
 
-        projection_size = config.kv_channels * config.num_attention_heads
-
         # Per attention head and per partition values.
         world_size = mpu.get_tensor_model_parallel_world_size()
         self.hidden_size_per_attention_head = core.utils.divide(
-            projection_size, config.num_attention_heads)
+            query_projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
             config.num_attention_heads, world_size)
+
+        if self.group_query_attention:
+            if args.num_query_groups % world_size != 0: 
+                raise NotImplementedError('Currently the num_query_groups should be '
+                                          'a multiple of the tensor parallel size')
+            self.num_query_groups_per_partition = core.utils.divide(
+                        args.num_query_groups, world_size)
+        else:
+            self.num_query_groups_per_partition = self.num_attention_heads_per_partition
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
             self.query_key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                3 * projection_size,
+                query_projection_size + 2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=args.add_bias_linear,
                 gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
+
+            if self.group_query_attention:
+                raise NotImplementedError("Grouped query attention not implemented for cross-attention.")
+            assert query_projection_size == kv_projection_size
+
             self.query = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                projection_size,
+                query_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=config.add_bias_linear,
                 gather_output=False)
 
-
             self.key_value = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                2 * projection_size,
+                2 * kv_projection_size,
                 config=config,
                 init_method=config.init_method,
                 bias=config.add_bias_linear,
@@ -471,7 +493,7 @@ class ParallelAttention(MegatronModule):
 
         # Output.
         self.dense = tensor_parallel.RowParallelLinear(
-            projection_size,
+            query_projection_size,
             config.hidden_size,
             config=config,
             init_method=config.output_layer_init_method,
@@ -502,11 +524,11 @@ class ParallelAttention(MegatronModule):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+    def _allocate_memory(self, inference_max_sequence_len, batch_size, num_attention_heads):
         return torch.empty(
             inference_max_sequence_len,
             batch_size,
-            self.num_attention_heads_per_partition,
+            num_attention_heads,
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
             device=torch.cuda.current_device())
@@ -525,9 +547,12 @@ class ParallelAttention(MegatronModule):
                 inf_max_seq_len = inference_params.max_sequence_len
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
+                    inf_max_seq_len, inf_max_batch_size, 
+                    self.num_query_groups_per_partition)
                 inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size)
+                    inf_max_seq_len, inf_max_batch_size, 
+                    self.num_query_groups_per_partition)
+
                 inference_params.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory, inference_value_memory)
                 is_first_step = True
@@ -538,21 +563,36 @@ class ParallelAttention(MegatronModule):
         # =====================
         # Query, Key, and Value
         # =====================
-
         if self.attention_type == AttnType.self_attn:
-            # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
+            # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
-            # [sq, b, (np * 3 * hn)] --> [sq, b, np, 3 * hn]
-            new_tensor_shape = mixed_x_layer.size()[:-1] + \
-                (self.num_attention_heads_per_partition,
-                 3 * self.hidden_size_per_attention_head)
+            # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+            new_tensor_shape = mixed_x_layer.size()[:-1] + (
+                self.num_query_groups_per_partition,
+                (
+                    (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                    * self.hidden_size_per_attention_head
+                ),
+            )
             mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
-            # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
+            # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
             (query_layer,
-             key_layer,
-             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+            key_layer,
+            value_layer) = torch.split(
+                mixed_x_layer,
+                [
+                    (
+                        self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+                        * self.hidden_size_per_attention_head
+                    ),
+                    self.hidden_size_per_attention_head,
+                    self.hidden_size_per_attention_head
+                ],
+                dim=3)
+            # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
+            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head) 
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -560,19 +600,19 @@ class ParallelAttention(MegatronModule):
             # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
             new_tensor_shape = mixed_kv_layer.size()[:-1] + \
                 (self.num_attention_heads_per_partition,
-                 2 * self.hidden_size_per_attention_head)
+                2 * self.hidden_size_per_attention_head)
             mixed_kv_layer = mixed_kv_layer.view(*new_tensor_shape)
 
             # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
             (key_layer,
-             value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
+            value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_kv_layer, 2)
 
             # Attention head [sq, b, h] --> [sq, b, hp]
             query_layer, _ = self.query(hidden_states)
             # [sq, b, hp] --> [sq, b, np, hn]
             new_tensor_shape = query_layer.size()[:-1] + \
                 (self.num_attention_heads_per_partition,
-                 self.hidden_size_per_attention_head)
+                self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
 
         # ==================================
@@ -624,10 +664,19 @@ class ParallelAttention(MegatronModule):
                 k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
                 rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
-
         # ==================================
         # core attention computation
         # ==================================
+        
+        # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
+        key_layer = key_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
+        value_layer = value_layer.repeat_interleave(
+            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+            dim = 2
+        )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
@@ -785,8 +834,7 @@ class ParallelTransformerLayer(MegatronModule):
         # Retriever (bi-directional transformer with cross attention)
         if layer_type == LayerType.retro_decoder_with_retriever:
             self.retriever = ParallelTransformer(
-                init_method,
-                output_layer_init_method,
+                config=config,
                 model_type=ModelType.retro_encoder,
                 self_attn_mask_type=AttnMaskType.padding,
                 pre_process=True,
