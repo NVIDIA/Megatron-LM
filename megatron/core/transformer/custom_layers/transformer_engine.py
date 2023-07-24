@@ -9,7 +9,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class TELayerNorm(te.pytorch.module.LayerNorm):
+class TELayerNorm(te.pytorch.LayerNorm):
     """
     Wrapper for the Transformer-Engine's `LayerNorm`.
     """
