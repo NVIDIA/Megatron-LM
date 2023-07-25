@@ -111,7 +111,7 @@ class TERowParallelLinear(TELinear):
         )
 
 
-class TECoreAttention(te.pytorch.DotProductAttention):
+class TEDotProductAttention(te.pytorch.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
     has "flash attention" enabled.

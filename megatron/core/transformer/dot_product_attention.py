@@ -15,7 +15,7 @@ from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 
 
-class CoreAttention(MegatronModule):
+class DotProductAttention(MegatronModule):
     """
     Region where selective activation recomputation is applied.
     This region is memory intensive but less compute intensive which
