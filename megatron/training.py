@@ -577,38 +577,54 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
+        writer.add_scalar('steps-vs-samples/y=steps,x=samples', iteration, args.consumed_train_samples)
+        writer.add_scalar('steps-vs-samples/y=samples,x=steps', args.consumed_train_samples, iteration)
+        writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_sample * args.seq_length)
+        writer.add_scalar('steps-vs-tokens/y=tokens,x=steps', args.consumed_train_sample * args.seq_length, iteration)
         if args.log_learning_rate_to_tensorboard:
-            writer.add_scalar('learning-rate', learning_rate, iteration)
-            writer.add_scalar('learning-rate vs samples', learning_rate,
+            writer.add_scalar('learning-rate/learning-rate', learning_rate, iteration)
+            writer.add_scalar('learning-rate/learning-rate vs samples', learning_rate,
                               args.consumed_train_samples)
+            writer.add_scalar('learning-rate/learning-rate vs tokens', learning_rate,
+                              args.consumed_train_sample * args.seq_length)
         if args.log_batch_size_to_tensorboard:
-            writer.add_scalar('batch-size', batch_size, iteration)
-            writer.add_scalar('batch-size vs samples', batch_size,
+            writer.add_scalar('batch-size/batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size/batch-size vs samples', batch_size,
                               args.consumed_train_samples)
-        for key in loss_dict:
-            writer.add_scalar(key , loss_dict[key], iteration)
-            writer.add_scalar(key + ' vs samples', loss_dict[key],
+        for key in loss_dict and args.fp16:
+            writer.add_scalar(f"lm-loss-training/{key}", loss_dict[key], iteration)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
+            writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
+                              args.consumed_train_sample * args.seq_length)
         if args.log_loss_scale_to_tensorboard:
-            writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale,
+            writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
+            writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
+            writer.add_scalar('loss-scale/loss-scale vs tokens', loss_scale,
+                              args.consumed_train_sample * args.seq_length)
         if args.log_world_size_to_tensorboard:
             writer.add_scalar('world-size', args.world_size, iteration)
             writer.add_scalar('world-size vs samples', args.world_size,
                               args.consumed_train_samples)
         if grad_norm is not None:
-            writer.add_scalar('grad-norm', grad_norm, iteration)
-            writer.add_scalar('grad-norm vs samples', grad_norm,
+            writer.add_scalar('grad-norm/grad-norm', grad_norm, iteration)
+            writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
+            writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
+                              args.consumed_train_sample * args.seq_length)
         if num_zeros_in_grad is not None:
-            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-            writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
+            writer.add_scalar('num-zeros/num-zeros', num_zeros_in_grad, iteration)
+            writer.add_scalar('num-zeros/num-zeros vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
+            writer.add_scalar('num-zeros/num-zeros vs tokens', num_zeros_in_grad,
+                              args.consumed_train_sample * args.seq_length)
         if params_norm is not None:
-            writer.add_scalar('params-norm', params_norm, iteration)
-            writer.add_scalar('params-norm vs samples', params_norm,
+            writer.add_scalar('params-norm/params-norm', params_norm, iteration)
+            writer.add_scalar('params-norm/params-norm vs samples', params_norm,
                               args.consumed_train_samples)
+            writer.add_scalar('params-norm/params-norm vs tokens', params_norm,
+                              args.consumed_train_sample * args.seq_length)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -638,6 +654,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         vocab_size = args.padded_vocab_size
 
         samples_per_sec = batch_size / elapsed_time_per_iteration
+        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
+        tokens_per_sec = samples_per_sec * seq_len
+        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
 
         # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
         # https://arxiv.org/pdf/2104.04473.pdf).
@@ -670,8 +689,23 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
         if writer:
             if args.log_timers_to_tensorboard:
-                writer.add_scalar('iteration-time',
+                writer.add_scalar('iteration-time/iteration-time',
                                   elapsed_time_per_iteration, iteration)
+                writer.add_scalar('iteration-time/iteration-time vs samples',
+                                  elapsed_time_per_iteration, args.consumed_train_samples)
+                writer.add_scalar('iteration-time/iteration-time vs tokens',
+                                  elapsed_time_per_iteration, args.consumed_train_sample * args.seq_length)
+                writer.add_scalar('iteration-time/samples per second',
+                                  samples_per_sec, iteration)
+                writer.add_scalar('iteration-time/samples per second per replica',
+                                  samples_per_sec_per_replica, iteration)
+                writer.add_scalar('iteration-time/tokens per second',
+                                  tokens_per_sec, iteration)
+                writer.add_scalar('iteration-time/tokens per second per replica',
+                                  tokens_per_sec_per_replica, iteration)
+                writer.add_scalar('iteration-time/TFLOPs per gpu (estimated)',
+                                  tflops, iteration)
+                
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
@@ -939,11 +973,16 @@ def evaluate_and_print_results(prefix, forward_step_func,
             writer.add_scalar('{} validation vs samples'.format(key),
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
+            writer.add_scalar('{} validation vs tokens'.format(key),
+                              total_loss_dict[key].item(),
+                              args.consumed_train_samples * args.seq_length)
             if args.log_validation_ppl_to_tensorboard:
                 writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
                                   ppl, args.consumed_train_samples)
+                writer.add_scalar('{} validation ppl vs tokens'.format(key),
+                                  ppl, args.consumed_train_samples * args.seq_length)
 
     if process_non_loss_data_func is not None and writer and is_last_rank():
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
