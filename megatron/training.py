@@ -694,7 +694,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 writer.add_scalar('iteration-time/iteration-time vs samples',
                                   elapsed_time_per_iteration, args.consumed_train_samples)
                 writer.add_scalar('iteration-time/iteration-time vs tokens',
-                                  elapsed_time_per_iteration, args.consumed_train_sample * args.seq_length)
+                                  elapsed_time_per_iteration, args.consumed_train_samples * args.seq_length)
                 writer.add_scalar('iteration-time/samples per second',
                                   samples_per_sec, iteration)
                 writer.add_scalar('iteration-time/samples per second per replica',
