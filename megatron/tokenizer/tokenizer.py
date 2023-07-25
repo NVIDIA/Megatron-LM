@@ -39,6 +39,12 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
+    elif args.tokenizer_type == "OpenGPTX-HFTokenizer":
+        tokenizer = HFTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
+    elif args.tokenizer_type == "OpenGPTX-PretrainedHFTokenizer":
+        tokenizer = PretrainedHFTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
+    elif args.tokenizer_type == "OpenGPTX-SPTokenizer":
+        tokenizer = SPTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
