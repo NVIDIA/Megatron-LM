@@ -9,7 +9,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class TELayerNorm(te.pytorch.module.LayerNorm):
+class TELayerNorm(te.pytorch.LayerNorm):
     """
     Wrapper for the Transformer-Engine's `LayerNorm`.
     """
@@ -20,7 +20,7 @@ class TELayerNorm(te.pytorch.module.LayerNorm):
         super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
 
-class TELinear(te.pytorch.module.Linear):
+class TELinear(te.pytorch.Linear):
     """
     Wrapper for the Transformer-Engine's `Linear` layer.
 
@@ -111,7 +111,7 @@ class TERowParallelLinear(TELinear):
         )
 
 
-class TEDotProductAttention(te.pytorch.transformer.DotProductAttention):
+class TEDotProductAttention(te.pytorch.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
     has "flash attention" enabled.
