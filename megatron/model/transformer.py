@@ -26,10 +26,15 @@ except ImportError:
 
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+    flash_attn_func = None
 except ImportError:
     try:
-        from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
+        from flash_attn.flash_attn_interface import (
+            flash_attn_func,
+            flash_attn_varlen_func as flash_attn_unpadded_func
+        )
     except ImportError:
+        flash_attn_func = None
         flash_attn_unpadded_func = None
 
 """ We use the following notation throughout this file:
@@ -347,9 +352,18 @@ class FlashSelfAttention(torch.nn.Module):
         assert flash_attn_unpadded_func is not None, ('Please install FlashAttention first, '
                                                       'e.g., with pip install flash-attn')
         assert rearrange is not None, 'Please install einops first, e.g., with pip install einops'
+        args = get_args()
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
+        self.uses_varlen = not (
+            # Are we using GPT pretraining (i.e. all samples in the
+            # batch have the same length and no padding?)
+            hasattr(args, '_is_gpt')
+            and args._is_gpt
+            # Do we actually have support for non-varlen FlashAttention?
+            and flash_attn_func is not None
+        )
 
     def forward(self, q, k, v):
         """Implements the multihead softmax attention.
@@ -364,32 +378,44 @@ class FlashSelfAttention(torch.nn.Module):
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
 
-        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
-        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                    device=q.device)
+        if self.uses_varlen:
+            q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+            cu_seqlens_q = torch.arange(
+                0, (batch_size + 1) * seqlen_q, step=seqlen_q,
+                dtype=torch.int32, device=q.device)
 
         if self.training:
             # during training q,k,v always have same seqlen
             assert seqlen_k == seqlen_q
 
             is_causal = self.causal
-            cu_seqlens_k = cu_seqlens_q
+            if self.uses_varlen:
+                cu_seqlens_k = cu_seqlens_q
             dropout_p = self.dropout_p
         else:
             # turn off FA causal mask after first inference autoregressive iteration
             # only on first autoregressive step q,k,v have same seqlen
             is_causal = seqlen_q == seqlen_k
-            cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32,
-                        device=q.device)
+            if self.uses_varlen:
+                cu_seqlens_k = torch.arange(
+                    0, (batch_size + 1) * seqlen_k, step=seqlen_k,
+                    dtype=torch.int32, device=q.device)
             dropout_p = 0
 
-        output = flash_attn_unpadded_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
-            dropout_p,
-            softmax_scale=self.softmax_scale, causal=is_causal
-        )
+        if self.uses_varlen:
+            output = flash_attn_unpadded_func(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen_k,
+                dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal
+            )
+            output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+        else:
+            output = flash_attn_func(
+                q, k, v,
+                dropout_p,
+                softmax_scale=self.softmax_scale, causal=is_causal
+            )
 
-        output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
         return output
 
 
