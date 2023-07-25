@@ -55,7 +55,7 @@ def make_builder(out_file, impl, vocab_size=None):
         return IndexedDatasetBuilder(out_file)
 
 
-def make_dataset(path, impl, skip_warmup=False):
+def make_dataset(path, impl, skip_warmup=False, multimodal=False):
     if not IndexedDataset.exists(path):
         print(f"Dataset does not exist: {path}")
         print("Path should be a basename that both .idx and .bin can be appended to get full filenames.")
@@ -67,7 +67,7 @@ def make_dataset(path, impl, skip_warmup=False):
     elif impl == 'cached' and IndexedDataset.exists(path):
         return IndexedCachedDataset(path)
     elif impl == 'mmap' and MMapIndexedDataset.exists(path):
-        return MMapIndexedDataset(path, skip_warmup)
+        return MMapIndexedDataset(path, skip_warmup, multimodal)
     print(f"Unknown dataset implementation: {impl}")
     return None
 
@@ -365,7 +365,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
                     return pointers
 
-                def write(self, sizes, doc_idx):
+                def write(self, sizes, modes, doc_idx):
                     pointers = self._get_pointers(sizes)
 
                     self._file.write(struct.pack('<Q', len(sizes)))
@@ -374,6 +374,11 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                     sizes = np.array(sizes, dtype=np.int32)
                     self._file.write(sizes.tobytes(order='C'))
                     del sizes
+
+                    if modes is not None:
+                        modes = np.array(modes, dtype=np.int32)
+                        self._file.write(modes.tobytes(order='C'))
+                        del modes
 
                     pointers = np.array(pointers, dtype=np.int64)
                     self._file.write(pointers.tobytes(order='C'))
@@ -387,7 +392,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
             return _Writer()
 
-        def __init__(self, path, skip_warmup=False):
+        def __init__(self, path, skip_warmup=False, multimodal=False):
             with open(path, 'rb') as stream:
                 magic_test = stream.read(9)
                 assert self._HDR_MAGIC == magic_test, (
@@ -400,6 +405,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                 dtype_code, = struct.unpack('<B', stream.read(1))
                 self._dtype = dtypes[dtype_code]
                 self._dtype_size = self._dtype().itemsize
+                self.multimodal = multimodal
 
                 self._len = struct.unpack('<Q', stream.read(8))[0]
                 self._doc_count = struct.unpack('<Q', stream.read(8))[0]
@@ -417,12 +423,21 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
                 dtype=np.int32,
                 count=self._len,
                 offset=offset)
+
             print_rank_0("    reading pointers...")
             self._pointers = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._len,
                                            offset=offset + self._sizes.nbytes)
             print_rank_0("    reading document index...")
             self._doc_idx = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._doc_count,
                                           offset=offset + self._sizes.nbytes + self._pointers.nbytes)
+            self._modes = None
+            if multimodal:
+                print_rank_0("    reading modes...")
+                self._modes = np.frombuffer(
+                    self._bin_buffer,
+                    dtype=np.int8,
+                    count=self._len,
+                    offset=offset + self._sizes.nbytes + self._pointers.nbytes + self._doc_idx.nbytes)
 
         def __del__(self):
             self._bin_buffer_mmap._mmap.close()
@@ -437,34 +452,39 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             return self._sizes
 
         @property
+        def modes(self):
+            return self._modes
+
+        @property
         def doc_idx(self):
             return self._doc_idx
 
         @lru_cache(maxsize=8)
         def __getitem__(self, i):
-            return self._pointers[i], self._sizes[i]
+            return self._pointers[i], self._sizes[i], self._modes[i] if self.multimodal else None
 
         def __len__(self):
             return self._len
 
-    def __init__(self, path, skip_warmup=False):
+    def __init__(self, path, skip_warmup=False, multimodal=False):
         super().__init__()
 
         self._path = None
         self._index = None
         self._bin_buffer = None
+        self.multimodal = multimodal
 
-        self._do_init(path, skip_warmup)
+        self._do_init(path, skip_warmup, multimodal)
 
     def __getstate__(self):
         return self._path
 
     def __setstate__(self, state):
-        self._do_init(state, skip_warmup=True)
+        self._do_init(state, skip_warmup=True, multimodal=False)
 
-    def _do_init(self, path, skip_warmup):
+    def _do_init(self, path, skip_warmup, multimodal):
         self._path = path
-        self._index = self.Index(index_file_path(self._path), skip_warmup)
+        self._index = self.Index(index_file_path(self._path), skip_warmup, multimodal)
 
         if not skip_warmup:
             print_rank_0("    warming up data mmap file...")
@@ -485,22 +505,23 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
     # @lru_cache(maxsize=8)
     def __getitem__(self, idx):
         if isinstance(idx, (int, np.integer)):
-            ptr, size = self._index[idx]
+            ptr, size, mode = self._index[idx]
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=size, offset=ptr)
-            return np_array
+            return np_array, mode if mode is not None else np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into indexed_dataset must be contiguous")
             ptr = self._index._pointers[start]
             sizes = self._index._sizes[idx]
+            modes = self._index._modes[idx] if self.multimodal else None
             offsets = list(accumulate(sizes))
             total_size = sum(sizes)
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
-            return sents
+            return sents, modes if modes is not None else sents
         else:
             raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
@@ -510,17 +531,22 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
         get(idx) is the same as [idx] but get() does not support slicing.
         """
-        ptr, size = self._index[idx]
+        ptr, size, mode = self._index[idx]
         if length is None:
             length = size - offset
         ptr += offset * np.dtype(self._index.dtype).itemsize
         np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                  count=length, offset=ptr)
-        return np_array
+        return np_array, mode if mode is not None else np_array
+            
 
     @property
     def sizes(self):
         return self._index.sizes
+
+    @property
+    def modes(self):
+        return self._index.modes
 
     @property
     def doc_idx(self):
@@ -544,34 +570,47 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
 
 class MMapIndexedDatasetBuilder(object):
-    def __init__(self, out_file, dtype=np.int64):
+    def __init__(self, out_file, dtype=np.int64, multimodal=False):
         self._data_file = open(out_file, 'wb')
         self._dtype = dtype
+        self._multimodal = multimodal
         self._sizes = []
         self._doc_idx = [0]
+        self._modes = [] if self._multimodal else None
 
-    def add_item(self, tensor):
+    def add_item(self, tensor, mode=0):
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.append(np_array.size)
+        
+        if self._multimodal:
+            self._modes.append(mode)
 
-    def add_doc(self, tensor, sizes):
+    def add_doc(self, tensor, sizes, modes=None):
         np_array = np.array(tensor, dtype=self._dtype)
         self._data_file.write(np_array.tobytes(order='C'))
         self._sizes.extend(sizes)
         self._doc_idx.append(len(self._sizes))
+        
+        if self._multimodal:
+            self._modes.extend(modes if modes is not None else [0]*sizes)
 
     def end_document(self):
         self._doc_idx.append(len(self._sizes))
 
     def merge_file_(self, another_file):
         # Concatenate index
-        index = MMapIndexedDataset.Index(index_file_path(another_file))
+        index = MMapIndexedDataset.Index(
+                index_file_path(another_file),
+                multimodal=self._multimodal)
         assert index.dtype == self._dtype
 
         offset = len(self._sizes)
         self._sizes.extend(index.sizes)
         self._doc_idx.extend((offset + index.doc_idx)[1:])
+        
+        if self._multimodal:
+            self._modes.extend(index.modes)
 
         # Concatenate data
         with open(data_file_path(another_file), 'rb') as f:
@@ -581,4 +620,4 @@ class MMapIndexedDatasetBuilder(object):
         self._data_file.close()
 
         with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
-            index.write(self._sizes, self._doc_idx)
+            index.write(self._sizes, self._modes, self._doc_idx)
