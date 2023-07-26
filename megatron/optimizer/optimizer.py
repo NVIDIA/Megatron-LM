@@ -275,7 +275,6 @@ class MegatronOptimizer(ABC):
                     coalesced, grads)):
                 buf.copy_(synced)
 
-
     def reduce_model_grads(self, args, timers):
         """All-reduce all grads, and all-reduce embeddings."""
 

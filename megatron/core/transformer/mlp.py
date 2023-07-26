@@ -5,10 +5,13 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
+    TERowParallelLinear,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.custom_layers.transformer_engine import \
-        TERowParallelLinear, TEColumnParallelLinear
+
 
 class MLP(MegatronModule):
     """
@@ -47,9 +50,11 @@ class MLP(MegatronModule):
         )
 
         if self.config.gated_linear_unit:
+
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
                 return self.config.activation_func(x[0]) * x[1]
+
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func

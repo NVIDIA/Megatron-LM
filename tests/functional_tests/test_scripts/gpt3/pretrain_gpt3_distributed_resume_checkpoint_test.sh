@@ -106,3 +106,4 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \
        --fp16
+

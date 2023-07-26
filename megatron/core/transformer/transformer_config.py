@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import ModelParallelConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 
+
 @dataclass
 class TransformerConfig(ModelParallelConfig):
     """Configuration object for megatron-core transformers.
@@ -24,6 +25,8 @@ class TransformerConfig(ModelParallelConfig):
         kv_channels (int): Projection weights dimension in multi-head attention.
                             This is set to hidden_size // num_attention_heads if not provided.
                             Defaults to None.
+        num_query_groups (int): Number of query groups for group query attention. If None, normal attention is used.
+
         hidden_dropout (float): Dropout probability for transformer hidden state. Defaults to 0.1.
         attention_dropout (float): Post attention dropout probability. Defaults to 0.1.
         fp32_residual_connection (bool): If true, move residual connections to fp32.
@@ -119,6 +122,7 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     hidden_size: int = 0
     num_attention_heads: int = 0
+    num_query_groups: int = None
 
     ffn_hidden_size: int = None
     kv_channels: int = None
@@ -157,13 +161,12 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: bool = None
 
     # fp8 related
-    fp8: bool = True
+    fp8: bool = False
     fp8_e4m3: bool = False
     fp8_margin: int = 0
     fp8_interval: int = 1
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
-
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -171,13 +174,30 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         if self.fp16 and self.bf16:
-            raise ValueError(f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.')
+            raise ValueError(
+                f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
+            )
+
+        if self.num_attention_heads % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
+                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
 
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
 
         if self.kv_channels is None:
             self.kv_channels = self.hidden_size // self.num_attention_heads
+
+        if self.num_query_groups is None:
+            self.num_query_groups = self.num_attention_heads
+
+        if self.num_query_groups % self.tensor_model_parallel_size != 0:
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a multiple of "
+                f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+            )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -190,7 +210,9 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.recompute_method is not None:
                 if not self.recompute_method in ['block', 'uniform']:
-                    raise ValueError(f'recompute_method: {self.recompute_method} must be "block" or "uniform".')
+                    raise ValueError(
+                        f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
+                    )
             elif self.recompute_granularity != 'selective':
                 raise ValueError(
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
@@ -218,7 +240,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.bias_gelu_fusion:
             if not self.add_bias_linear:
-                raise ValueError("When bias_gelu_fusion is True, add_bias_linear must also be True.")
+                raise ValueError(
+                    "When bias_gelu_fusion is True, add_bias_linear must also be True."
+                )
 
             if self.activation_func != F.gelu:
                 raise ValueError(f'When bias_gelu_fusion is True, activation_func must be F.gelu.')
@@ -227,5 +251,6 @@ class TransformerConfig(ModelParallelConfig):
             self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
-
+            self.output_layer_init_method = scaled_init_method_normal(
+                self.init_method_std, self.num_layers
+            )
