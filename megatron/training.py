@@ -579,14 +579,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if writer and (iteration % args.tensorboard_log_interval == 0):
         writer.add_scalar('steps-vs-samples/y=steps,x=samples', iteration, args.consumed_train_samples)
         writer.add_scalar('steps-vs-samples/y=samples,x=steps', args.consumed_train_samples, iteration)
-        writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_sample * args.seq_length)
-        writer.add_scalar('steps-vs-tokens/y=tokens,x=steps', args.consumed_train_sample * args.seq_length, iteration)
+        writer.add_scalar('steps-vs-tokens/y=steps,x=tokens', iteration, args.consumed_train_samples * args.seq_length)
+        writer.add_scalar('steps-vs-tokens/y=tokens,x=steps', args.consumed_train_samples * args.seq_length, iteration)
         if args.log_learning_rate_to_tensorboard:
             writer.add_scalar('learning-rate/learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate/learning-rate vs samples', learning_rate,
                               args.consumed_train_samples)
             writer.add_scalar('learning-rate/learning-rate vs tokens', learning_rate,
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if args.log_batch_size_to_tensorboard:
             writer.add_scalar('batch-size/batch-size', batch_size, iteration)
             writer.add_scalar('batch-size/batch-size vs samples', batch_size,
@@ -596,13 +596,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if args.log_loss_scale_to_tensorboard and args.fp16:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
             writer.add_scalar('loss-scale/loss-scale vs tokens', loss_scale,
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if args.log_world_size_to_tensorboard:
             writer.add_scalar('world-size', args.world_size, iteration)
             writer.add_scalar('world-size vs samples', args.world_size,
@@ -612,19 +612,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             writer.add_scalar('grad-norm/grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
             writer.add_scalar('grad-norm/grad-norm vs tokens', grad_norm,
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros/num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar('num-zeros/num-zeros vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
             writer.add_scalar('num-zeros/num-zeros vs tokens', num_zeros_in_grad,
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if params_norm is not None:
             writer.add_scalar('params-norm/params-norm', params_norm, iteration)
             writer.add_scalar('params-norm/params-norm vs samples', params_norm,
                               args.consumed_train_samples)
             writer.add_scalar('params-norm/params-norm vs tokens', params_norm,
-                              args.consumed_train_sample * args.seq_length)
+                              args.consumed_train_samples * args.seq_length)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
