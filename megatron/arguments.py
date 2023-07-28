@@ -320,11 +320,6 @@ def validate_args(args, defaults={}):
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
-    # Tranformer-Engine/FP8 related checking
-    if args.fp8_e4m3 or args.fp8_hybrid:
-        assert args.transformer_impl == 'transformer_engine', \
-            'transformer-engine required for fp8 training and inference'
-
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
 
