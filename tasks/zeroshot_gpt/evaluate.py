@@ -13,6 +13,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.checkpointing import load_checkpoint
 from megatron.model import GPTModel
 from megatron.training import get_model
+from megatron.arguments import core_transformer_config_from_args
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
 from tasks.finetune_utils import build_data_loader
@@ -31,6 +32,8 @@ def get_model_provider(eval_metric):
     def model_provider(pre_process=True, post_process=True):
         """Build the model."""
 
+        config = core_transformer_config_from_args(get_args())
+
         if eval_metric == 'loss':
             parallel_output = True
         elif eval_metric == 'accuracy':
@@ -40,7 +43,7 @@ def get_model_provider(eval_metric):
                                       'is not supported.'.format(eval_metric))
 
         print_rank_0('building GPT model ...')
-        model = GPTModel(num_tokentypes=0, parallel_output=parallel_output,
+        model = GPTModel(config=config, num_tokentypes=0, parallel_output=parallel_output,
                          pre_process=pre_process, post_process=post_process)
 
         return model

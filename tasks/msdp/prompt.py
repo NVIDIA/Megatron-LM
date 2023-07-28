@@ -12,6 +12,7 @@ from megatron import get_tokenizer
 from megatron.core import mpu
 from megatron.model import GPTModel
 from megatron.training import get_model
+from megatron.arguments import core_transformer_config_from_args
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.text_generation import generate_and_post_process
@@ -19,7 +20,7 @@ from megatron.text_generation import generate_and_post_process
 
 def call_model_api(inputs, tokens_to_generate):
     """Calling the model api to get the output generations"""
-    
+
     args = get_args()
 
     # The following is an example of using the Megatron API
@@ -32,7 +33,7 @@ def call_model_api(inputs, tokens_to_generate):
     input_len = len(inputs)
     outputs = outputs[input_len:]
     outputs = outputs.split("\n")[0].strip()
-    
+
     return outputs
 
 
@@ -48,7 +49,7 @@ def read_prompts(prompt_path, prompt_type, n_example):
                 line = line.strip()
                 line_dict = json.loads(line)
                 key = list(line_dict.keys())[0]
-                
+
                 if key not in prompt_examples_dict:
                     prompt_examples = line_dict[key]
                     prompt = ""
@@ -83,7 +84,7 @@ def generate_samples_by_calling_api():
         # read knowledge generation prompts
         knwl_gen_prompt_dict = read_prompts(
             args.prompt_file, args.prompt_type, args.num_prompt_examples)
-        
+
     else:
         resp_gen_prompt = read_prompts(
             args.prompt_file, args.prompt_type, args.num_prompt_examples)
@@ -130,7 +131,7 @@ def generate_samples_by_calling_api():
             inputs += "We know that: " + knowledge + " "
             inputs += "System replies:"
 
-        # get the output generations from the api, 
+        # get the output generations from the api,
         # and write to the output file
         generations = call_model_api(inputs, args.out_seq_length)
         fname_out.write(generations)
@@ -143,8 +144,11 @@ def generate_samples_by_calling_api():
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
+    config = core_transformer_config_from_args(get_args())
+
     print_rank_0('building GPT model ...')
     model = GPTModel(
+        config=config,
         num_tokentypes=0,
         parallel_output=True,
         pre_process=pre_process,
@@ -155,7 +159,7 @@ def model_provider(pre_process=True, post_process=True):
 
 def generate_samples_by_prompting_input_from_file(model):
     """Prompt a pretrained language model to generate knowledge/response"""
-    
+
     # get tokenizer
     args = get_args()
     tokenizer = get_tokenizer()
@@ -234,7 +238,7 @@ def generate_samples_by_prompting_input_from_file(model):
                     # construct inputs for knowledge generation
                     # then add the constructed inputs into the raw_text
                     raw_text += "( " + last_turn + " ) " + topic + " =>"
-                
+
                 else:
                     # first add the prompt into the raw_text
                     raw_text = prompt
@@ -255,7 +259,7 @@ def generate_samples_by_prompting_input_from_file(model):
 
                 input_pos += 1
                 raw_text_len = len(raw_text)
-            
+
             else:
                 raw_text = "EMPTY TEXT"
 
@@ -263,8 +267,8 @@ def generate_samples_by_prompting_input_from_file(model):
                 print_rank_0("input_pos: %d" % input_pos)
 
             outputs = generate_and_post_process(
-                        model=model, 
-                        prompts=[raw_text], 
+                        model=model,
+                        prompts=[raw_text],
                         tokens_to_generate=args.out_seq_length,
                         top_k_sampling=1)
             prompts_plus_generations = outputs[0]

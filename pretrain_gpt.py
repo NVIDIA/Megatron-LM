@@ -43,7 +43,7 @@ def model_provider(pre_process=True, post_process=True):
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
             model = GPTModelPipe(
-                config,
+                config=config,
                 num_tokentypes=0,
                 parallel_output=True
             )
@@ -89,7 +89,7 @@ def model_provider(pre_process=True, post_process=True):
 
         else:
             model = GPTModel(
-                config,
+                config=config,
                 num_tokentypes=0,
                 parallel_output=True,
                 pre_process=pre_process,

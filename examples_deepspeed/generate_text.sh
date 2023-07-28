@@ -1,8 +1,8 @@
 #!/bin/bash
 export TORCH_CUDA_ARCH_LIST=8.6+PTX
-CHECKPOINT_PATH=checkpoints/gpt2_345m
-VOCAB_FILE=gpt2-vocab.json
-MERGE_FILE=gpt2-merges.txt
+CHECKPOINT_PATH=dataset/checkpoints/gpt2_345m
+VOCAB_FILE=dataset/gpt2-vocab.json
+MERGE_FILE=dataset/gpt2-merges.txt
 b=8
 mp=1
 experts=1
@@ -14,8 +14,10 @@ use_tutel=""
 #use_tutel="--use-tutel"
 
 
-#ds_inference=""
-ds_inference="--ds-inference"
+ds_inference=""
+#ds_inference="--ds-inference"
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 launch_cmd="deepspeed --num_nodes $nodes --num_gpus $gpus"
 L=24

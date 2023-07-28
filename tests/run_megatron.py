@@ -2,16 +2,21 @@ import torch
 import deepspeed
 import megatron
 from megatron import get_args
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
+from megatron.arguments import core_transformer_config_from_args
 from megatron.text_generation_utils import generate_samples_eval
 
 
 def model_provider(pre_process=True, post_process=True):
+
+    config = core_transformer_config_from_args(get_args())
+
     model = GPTModel(
+        config=config,
         num_tokentypes=0,
         parallel_output=False,
         pre_process=pre_process,

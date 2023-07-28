@@ -18,6 +18,7 @@ from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel
+from megatron.arguments import core_transformer_config_from_args
 from megatron.core.enums import ModelType
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
@@ -26,8 +27,11 @@ from megatron.utils import average_losses_across_data_parallel_group
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
+    config = core_transformer_config_from_args(args)
+
     print_rank_0('building GPT model ...')
     model = GPTModel(
+        config=config,
         num_tokentypes=0,
         parallel_output=True,
         pre_process=pre_process,

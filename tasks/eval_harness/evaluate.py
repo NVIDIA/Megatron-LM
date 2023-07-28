@@ -23,7 +23,7 @@ import torch
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron.core import mpu
 from megatron.training import setup_model_and_optimizer, get_model
 from megatron.mpu.mappings import gather_from_tensor_model_parallel_region
 
@@ -61,7 +61,7 @@ class EvalHarnessAdaptor(GPT2LM):
         self.is_pipe_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
         self.is_data_parallel = mpu.get_data_parallel_world_size() > 1
         self.adaptive_seq_len = args.adaptive_seq_len
-        if self.is_data_parallel and args.moe_expert_parallel_size == 1: # For MoE model, allow a "fake data parallel" in order to partition model into multiple gpus 
+        if self.is_data_parallel and args.moe_expert_parallel_size == 1: # For MoE model, allow a "fake data parallel" in order to partition model into multiple gpus
             raise NotImplementedError("Data parallelism is currently not supported for evaluation")
 
         self.is_last_stage = True if not self.is_pipe_parallel else mpu.is_pipeline_last_stage()  # only the last stage of the pipeline model will receive the logits

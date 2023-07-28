@@ -25,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
@@ -36,11 +36,17 @@ from megatron.text_generation_utils import generate_samples_interactive
 import deepspeed
 import torch
 
+from megatron.arguments import core_transformer_config_from_args
+from megatron import get_args
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+
     print_rank_0('building GPT model ...')
-    model = GPTModel(num_tokentypes=0, parallel_output=False,
+    model = GPTModel(config=config, num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process,
                      return_moe_loss=False) # we need to set "return_moe_loss" for the inference_mode
     return model
@@ -73,6 +79,8 @@ def add_text_generate_args(parser):
     group.add_argument("--recompute", action='store_true',
                        help='During generation recompute all attention '
                        'instead of using previously computed keys/values.')
+    group.add_argument("--local_rank", type=int, default=0,
+                       help='local_rank')
 
     return parser
 

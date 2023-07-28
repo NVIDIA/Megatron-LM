@@ -17,14 +17,17 @@ from megatron.core import mpu
 from megatron.initialize import initialize_megatron
 from megatron.model import GPTModel
 from megatron.training import get_model
+from megatron.arguments import core_transformer_config_from_args
 from megatron.text_generation import generate_and_post_process
 
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
+    config = core_transformer_config_from_args(args)
+
     print_rank_0('building GPT model ...')
-    model = GPTModel(num_tokentypes=0, parallel_output=False,
+    model = GPTModel(config=config, num_tokentypes=0, parallel_output=False,
                      pre_process=pre_process, post_process=post_process)
 
     return model

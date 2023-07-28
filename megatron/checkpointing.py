@@ -320,8 +320,8 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
     # specific to self attention so should work for cross attention as well
     while hasattr(model, 'module'):
         model = model.module
-    #attention_module = model.language_model.encoder.layers[0].self_attention
-    attention_module = model.language_model.encoder.layers[0].attention
+    attention_module = model.language_model.encoder.layers[0].self_attention
+    #attention_module = model.language_model.encoder.layers[0].attention
     hidden_size_per_attention_head = attention_module.hidden_size_per_attention_head
     num_attention_heads_per_partition = attention_module.num_attention_heads_per_partition
     if num_splits_first:

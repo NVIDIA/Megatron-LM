@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 from megatron import get_args
 from megatron import get_tokenizer
-from megatron import mpu
+from megatron.core import mpu
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
 
