@@ -12,9 +12,12 @@ dist/
 *.swp
 
 # AML workspace config file
-*config.json
+config.json
 
 .coverage_*
 *~
 slurm*
 logs
+
+# Data folder
+bookcorpus_data/
