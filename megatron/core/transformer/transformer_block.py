@@ -225,8 +225,8 @@ class TransformerBlock(MegatronModule):
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
                 if self.config.fp8_e4m3
                 else transformer_engine.common.recipe.Format.HYBRID,
-                fp8_amax_compute_algo=self.config.fp8_amax_compute_algo,
-                fp8_amax_history_len=self.config.fp8_amax_history_len,
+                amax_compute_algo=self.config.fp8_amax_compute_algo,
+                amax_history_len=self.config.fp8_amax_history_len,
             )
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe
