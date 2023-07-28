@@ -413,13 +413,13 @@ class ParallelAttention(MegatronModule):
 
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
-        
+
         query_projection_size = config.kv_channels * config.num_attention_heads
         if self.group_query_attention:
             kv_projection_size = args.kv_channels * args.num_query_groups
         else:
             kv_projection_size = args.kv_channels * args.num_attention_heads
-        
+
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
@@ -442,7 +442,7 @@ class ParallelAttention(MegatronModule):
             config.num_attention_heads, world_size)
 
         if self.group_query_attention:
-            if args.num_query_groups % world_size != 0: 
+            if args.num_query_groups % world_size != 0:
                 raise NotImplementedError('Currently the num_query_groups should be '
                                           'a multiple of the tensor parallel size')
             self.num_query_groups_per_partition = core.utils.divide(
@@ -547,10 +547,10 @@ class ParallelAttention(MegatronModule):
                 inf_max_seq_len = inference_params.max_sequence_len
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size, 
+                    inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
                 inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size, 
+                    inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
 
                 inference_params.key_value_memory_dict[self.layer_number] = (
@@ -592,7 +592,7 @@ class ParallelAttention(MegatronModule):
                 ],
                 dim=3)
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
-            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head) 
+            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -667,7 +667,7 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-        
+
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
         key_layer = key_layer.repeat_interleave(
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
@@ -1335,6 +1335,8 @@ class ParallelTransformer(MegatronModule):
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
+            assert args.transformer_impl == 'transformer_engine', \
+                'transformer-engine required for fp8 training and inference'
             self.fp8_group = mpu.get_data_parallel_group()
             if args.fp8_e4m3:
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
