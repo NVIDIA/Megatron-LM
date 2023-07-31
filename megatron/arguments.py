@@ -386,7 +386,7 @@ def validate_args(args, defaults={}):
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
-    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+    if not args.add_position_embedding and args.position_embedding_type == 'learned_absolute':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Print arguments.
