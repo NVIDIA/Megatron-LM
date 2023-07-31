@@ -11,6 +11,7 @@ import types
 
 import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
+from megatron.model.enums import PositionEmbeddingType
 from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
@@ -382,11 +383,14 @@ def validate_args(args, defaults={}):
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
-        args.position_embedding_type = 'rope'
+        args.position_embedding_type = PositionEmbeddingType.rope
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
     # don't allow it to keep things simple
-    if not args.add_position_embedding and args.position_embedding_type == 'learned_absolute':
+    if (
+            not args.add_position_embedding
+            and args.position_embedding_type is PositionEmbeddingType.learned_absolute
+    ):
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Print arguments.
@@ -569,8 +573,10 @@ def _add_network_size_args(parser):
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
-    group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                       choices=['learned_absolute', 'rope'],
+    group.add_argument('--position-embedding-type',
+                       type=lambda x: PositionEmbeddingType[x],
+                       default=PositionEmbeddingType.learned_absolute,
+                       choices=list(PositionEmbeddingType),
                        help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not. '

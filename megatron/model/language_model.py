@@ -10,7 +10,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 
-from .enums import AttnMaskType, LayerType
+from .enums import AttnMaskType, LayerType, PositionEmbeddingType
 from .module import MegatronModule
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
@@ -159,7 +159,8 @@ class Embedding(MegatronModule):
         self._word_embeddings_key = 'word_embeddings'
 
         # Position embedding (serial).
-        self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
+        self.add_position_embedding = \
+            args.position_embedding_type is PositionEmbeddingType.learned_absolute
         if self.add_position_embedding:
             self.position_embeddings = torch.nn.Embedding(
                 max_sequence_length, self.hidden_size)
@@ -372,7 +373,7 @@ class TransformerLanguageModel(MegatronModule):
 
         # Rotary positional embeddings
         self.use_rotary_position_embeddings = \
-            args.position_embedding_type == 'rope'
+            args.position_embedding_type is PositionEmbeddingType.rope
         if self.use_rotary_position_embeddings:
             self.seq_length = args.seq_length
             rotary_dim = args.hidden_size // args.num_attention_heads \
