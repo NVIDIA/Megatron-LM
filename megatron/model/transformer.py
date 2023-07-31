@@ -1317,6 +1317,7 @@ class ParallelTransformer(MegatronModule):
 
         # Transformer Engine Init.
         self.transformer_engine_v_0_10 = False
+        self.transformer_engine_v_0_11 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1326,6 +1327,8 @@ class ParallelTransformer(MegatronModule):
             te_version = packaging.version.Version(version("transformer-engine"))
             if te_version >= packaging.version.Version("0.10.0"):
                 self.transformer_engine_v_0_10 = True
+            if te_version >= packaging.version.Version("0.11.0"):
+                self.transformer_engine_v_0_11 = True
 
             del version, packaging
 
@@ -1390,9 +1393,11 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
                 # This argument is only available from TE v0.10 onwards.
-                activation_kwarg = {}
+                extra_transformer_engine_kwargs = {}
                 if self.transformer_engine_v_0_10:
-                    activation_kwarg["activation"] = "swiglu" if args.swiglu else "gelu"
+                    extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
+                if self.transformer_engine_v_0_11:
+                    extra_transformer_engine_kwargs["normalization"] = args.normalization
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1420,7 +1425,7 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
                     fuse_qkv_params=True,
-                    **activation_kwarg)
+                    **extra_transformer_engine_kwargs)
 
         if config.virtual_pipeline_model_parallel_size is not None:
             assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \

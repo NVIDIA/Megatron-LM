@@ -375,6 +375,10 @@ def validate_args(args, defaults={}):
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
 
+    # Normalization args
+    if args.normalization == "RMSNorm":
+        assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -464,6 +468,10 @@ def _add_transformer_engine_args(parser):
                        choices=['most_recent', 'max'],
                        help='Algorithm for computing amax from history',
                        dest='fp8_amax_compute_algo')
+    group.add_argument('--normalization', default='LayerNorm',
+                       choices=['LayerNorm', 'RMSNorm'],
+                       help='Which normalization technique to use.',
+                       dest='normalization')
 
     return parser
 
