@@ -37,11 +37,15 @@ def check_checkpoint_args(checkpoint_args):
     arguments and the one retrieved from checkpoint."""
     args = get_args()
 
-    def _compare(arg_name, old_arg_name=None):
+    def _compare(arg_name, old_arg_name=None, default=None):
         if old_arg_name is not None:
-            checkpoint_value = getattr(checkpoint_args, old_arg_name)
+            ckpt_arg_name = old_arg_name
         else:
-            checkpoint_value = getattr(checkpoint_args, arg_name)
+            ckpt_arg_name = arg_name
+        if default is not None:
+            checkpoint_value = getattr(checkpoint_args, ckpt_arg_name, default)
+        else:
+            checkpoint_value = getattr(checkpoint_args, ckpt_arg_name)
         args_value = getattr(args, arg_name)
         error_message = '{} value from checkpoint ({}) is not equal to the ' \
                         'input argument value ({}).'.format(
@@ -51,7 +55,7 @@ def check_checkpoint_args(checkpoint_args):
     _compare('num_layers')
     _compare('hidden_size')
     _compare('num_attention_heads')
-    _compare('add_position_embedding')
+    _compare('add_position_embedding', default=True)
     if args.vocab_file:
         _compare('max_position_embeddings')
         _compare('make_vocab_size_divisible_by')
@@ -169,6 +173,7 @@ def read_metadata(tracker_filename):
         # If not, print a warning and chose the maximum
         # iteration across all ranks.
         if iteration != max_iter:
+            rank = torch.distributed.get_rank()
             print('WARNING: on rank {} found iteration {} in the '
                   'metadata while max iteration across the ranks '
                   'is {}, replacing it with max iteration.'.format(
@@ -320,6 +325,7 @@ def _transpose_first_dim(t, num_splits, num_splits_first, model):
 
     return t
 
+
 def fix_query_key_value_ordering(model, checkpoint_version):
     """Fix up query/key/value matrix ordering if checkpoint
     version is smaller than 2.0
@@ -348,7 +354,7 @@ def fix_query_key_value_ordering(model, checkpoint_version):
                     sys.exit()
                 param.data.copy_(fixed_param)
         print_rank_0(" succesfully fixed query-key-values ordering for"
-                    " checkpoint version {}".format(checkpoint_version))
+                     " checkpoint version {}".format(checkpoint_version))
 
 
 def _load_base_checkpoint(load_dir, rank0=False):
@@ -367,7 +373,7 @@ def _load_base_checkpoint(load_dir, rank0=False):
                 tracker_filename))
             print_rank_0('    will not load any checkpoints and will start from '
                          'random')
-        return None, False
+        return None, "", False
 
     # Otherwise, read the tracker file and either set the iteration or
     # mark it as a release checkpoint.
@@ -403,7 +409,7 @@ def _load_base_checkpoint(load_dir, rank0=False):
         print_rank_0(e)
         sys.exit()
 
-    return state_dict, release
+    return state_dict, checkpoint_name, release
 
 
 def load_args_from_checkpoint(args, load_arg='load'):
@@ -425,7 +431,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
         print_rank_0('No load directory specified, using provided arguments.')
         return args
 
-    state_dict, release = _load_base_checkpoint(load_dir, rank0=True)
+    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=True)
 
     # Args.
     if not state_dict:
@@ -466,6 +472,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('num_attention_heads')
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
+    _set_arg('position_embedding_type', force=True)
     _set_arg('add_position_embedding', force=True)
     _set_arg('use_rotary_position_embeddings', force=True)
     _set_arg('rotary_percent', force=True)
@@ -497,7 +504,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     model = unwrap_model(model)
 
-    state_dict, release = _load_base_checkpoint(load_dir, rank0=False)
+    state_dict, checkpoint_name, release = _load_base_checkpoint(load_dir, rank0=False)
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -637,7 +644,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
 
 def load_biencoder_checkpoint(model, only_query_model=False,
-        only_context_model=False, custom_load_path=None):
+                              only_context_model=False, custom_load_path=None):
     """
     selectively load retrieval models for indexing/retrieving
     from saved checkpoints
@@ -661,7 +668,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
         print('global rank {} is loading checkpoint {}'.format(
             torch.distributed.get_rank(), checkpoint_name))
 
-    state_dict = torch.load(model_checkpoint_name, map_location='cpu')
+    state_dict = torch.load(checkpoint_name, map_location='cpu')
     ret_state_dict = state_dict['model']
 
     if only_query_model:

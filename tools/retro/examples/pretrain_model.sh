@@ -1,104 +1,100 @@
 #!/bin/bash
 
-##################################################
-# Example script for pretraining Retro.
-##################################################
-
 set -u
+
 unset NCCL_DEBUG
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-NPROCS=8 # NPROCS must be <= number of GPUs.
+######## GPT or Retro?. ########
 
-################ Dataset configs. ################
-# This script contains methods to customize arguments to specific dataset
-# types. Customize this script as needed for your datasets.
-DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-. $DIR/get_dataset_configs.sh
+# 0 : GPT.
+# 1 : Retro
 
-################ Environment variables. ################
-# *Note*: See 'Required environment variables' in 'get_preprocess_cmd.sh' for
-# a description of the required environment variables. These variables can be
-# set however a user would like. In our setup, we use another bash script
-# (location defined by $RETRO_ENV_VARS) that sets all the environment variables
-# at once.
-. $RETRO_ENV_VARS
+ADD_RETRIEVER=1
 
-################ Data blend. ################
-. ${DATA_BLEND_SCRIPT}
-DATA_PATH=${DATA_BLEND}
+######## Megatron, Retro dirs. ########
 
-######## Retro setup. ########
-RETRO_ADD_RETRIEVER=1
-RETRO_CYCLIC_TRAIN_ITERS=750000
-RETRO_NUM_NEIGHBORS=2
+REPO_DIR="<path/to/megatron/repo>"
+RETRO_WORKDIR="<path/to/retro/data/directory>"
 
-######## Arguments. ########
-CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/${RETRO_ADD_RETRIEVER}
-TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
-mkdir -p ${TENSORBOARD_DIR}
+######## Data. ########
+
+DATA_BLEND="<see --data-path in arguments.py>"
+
+######## Args. ########
+
 ARGS=" \
-    --save-interval 1000 \
-    --save ${CHECKPOINT_DIR} \
-    --load ${CHECKPOINT_DIR} \
-    --tensorboard-dir ${TENSORBOARD_DIR} \
-    --log-interval 5 \
+    --log-interval 1 \
+    --use-flash-attn \
+    --apply-layernorm-1p \
+    --untie-embeddings-and-output-weights \
+    --disable-bias-linear \
+    --no-position-embedding \
+    --use-rotary-position-embeddings \
+    --rotary-percent 0.5 \
+    --swiglu \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --exit-duration-in-mins 220 \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
-    --num-layers 12 \
-    --hidden-size 768 \
-    --num-attention-heads 12 \
-    --seq-length 2048 \
-    --max-position-embeddings 2048 \
-    --micro-batch-size 4 \
+    --num-layers 24 \
+    --hidden-size 1024 \
+    --num-attention-heads 16 \
+    --seq-length 512 \
+    --max-position-embeddings 512 \
+    --micro-batch-size 16 \
     --global-batch-size 256 \
-    --train-samples ${RETRO_GPT_TRAIN_SAMPLES}  \
-    --lr-decay-samples ${LR_DECAY_SAMPLES} \
-    --lr-warmup-samples ${LR_WARMUP_SAMPLES} \
-    --lr 6.0e-4 \
-    --min-lr 6.0e-5 \
+    --train-samples 200000 \
+    --lr-decay-samples 175000 \
+    --lr-warmup-samples 10000 \
+    --lr 2.5e-5 \
+    --min-lr 2.5e-6 \
     --lr-decay-style cosine \
-    --eval-interval ${RETRO_GPT_EVAL_INTERVAL} \
-    --eval-iters ${RETRO_GPT_EVAL_ITERS} \
-    --data-path ${DATA_PATH} \
-    --vocab-file ${GPT_VOCAB_FILE} \
-    --merge-file ${GPT_MERGE_FILE} \
+    --eval-iters 50 \
+    --eval-interval 2000 \
+    --tokenizer-type GPTSentencePieceTokenizer \
+    --tokenizer-model <path/to/gpt/tokenizer/model> \
+    --data-path ${DATA_BLEND} \
     --split 98,2,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
     --adam-beta2 0.95 \
-    --init-method-std 0.023 \
+    --init-method-std 0.007 \
     --log-params-norm \
     --log-num-zeros-in-grad \
-    --fp16 \
+    --bf16 \
     --DDP-impl local \
-    --dataloader-type ${DATALOADER_TYPE} \
-    --no-data-sharding \
-    --no-gradient-accumulation-fusion \
 "
 
-if [ "$RETRO_ADD_RETRIEVER" = "0" ]; then
+######## Retro. ########
+
+if [ "$ADD_RETRIEVER" = "0" ]; then
     SCRIPT=pretrain_gpt.py
 else
     ARGS="${ARGS} \
-    --retro-add-retriever \
     --retro-workdir ${RETRO_WORKDIR} \
-    --retro-cyclic-train-iters ${RETRO_CYCLIC_TRAIN_ITERS} \
-    --retro-num-neighbors ${RETRO_NUM_NEIGHBORS} \
+    --retro-add-retriever \
     "
     SCRIPT=pretrain_retro.py
 fi
 
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
-echo "ARGS = '$ARGS'."
-echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+######## Command. ########
 
-python -m torch.distributed.launch \
+NPROCS=8
+CMD="\
+    pwd && cd ${REPO_DIR} && pwd && \
+    export PYTHONPATH=$PYTHONPATH:${REPO_DIR} && \
+    python -m torch.distributed.run \
     --nproc_per_node ${NPROCS} \
     --nnodes 1 \
-    --node_rank 0 \
-    --master_addr localhost \
+    --node_rank ${NODE_RANK} \
+    --master_addr ${MASTER_ADDR} \
     --master_port 6000 \
-    ${SCRIPT} \
-    ${ARGS} \
+    ${SCRIPT} ${ARGS} \
+"
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+echo "CMD = '$CMD'."
+echo "~~~~~~~~~~~~~~~~~~~~~~~~~~"
+eval $CMD

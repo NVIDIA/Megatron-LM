@@ -29,7 +29,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS ./tasks/main.py \
                --hidden-size 1024 \
                --num-attention-heads 16 \
                --batch-size 8 \
-               --activations-checkpoint-method uniform \
                --seq-length 1024 \
                --max-position-embeddings 1024 \
                --log-interval 10 \

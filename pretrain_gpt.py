@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain GPT"""
 
@@ -15,12 +15,15 @@ from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
+from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     print_rank_0('building GPT model ...')
+    config = core_transformer_config_from_args(get_args())
     model = GPTModel(
+        config,
         num_tokentypes=0,
         parallel_output=True,
         pre_process=pre_process,
@@ -104,7 +107,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         skip_warmup=(not args.mmap_warmup),
         train_data_prefix=args.train_data_path,
         valid_data_prefix=args.valid_data_path,
-        test_data_prefix=args.test_data_path)
+        test_data_prefix=args.test_data_path,
+        data_cache_path=args.data_cache_path)
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
@@ -112,8 +116,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
-    pretrain(train_valid_test_datasets_provider, model_provider,
+    pretrain(train_valid_test_datasets_provider,
+             model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
-    )
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})

@@ -8,6 +8,7 @@ from megatron import get_retro_args
 from megatron.tokenizer.tokenizer import (
     _BertWordPieceTokenizer,
     _GPT2BPETokenizer,
+    _GPTSentencePieceTokenizer,
 )
 
 
@@ -28,10 +29,18 @@ def get_num_chunks_per_sample():
 def get_gpt_tokenizer():
     '''GPT (BPE) tokenizer.'''
     args = get_retro_args()
-    return _GPT2BPETokenizer(
-        vocab_file=args.retro_gpt_vocab_file,
-        merge_file=args.retro_gpt_merge_file,
-    )
+    tokenizer_type = args.retro_gpt_tokenizer_type
+    if tokenizer_type == "GPT2BPETokenizer":
+        assert args.retro_gpt_vocab_file and args.retro_gpt_merge_file
+        return _GPT2BPETokenizer(
+            vocab_file=args.retro_gpt_vocab_file,
+            merge_file=args.retro_gpt_merge_file,
+        )
+    elif tokenizer_type == 'GPTSentencePieceTokenizer':
+        assert args.retro_gpt_tokenizer_model is not None
+        return _GPTSentencePieceTokenizer(args.retro_gpt_tokenizer_model)
+    else:
+        raise Exception("unrecognized gpt tokenizer, '%s'." % tokenizer_type)
 
 
 def get_bert_tokenizer():
