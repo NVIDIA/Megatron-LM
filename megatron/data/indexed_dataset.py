@@ -461,7 +461,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
         @lru_cache(maxsize=8)
         def __getitem__(self, i):
-            return self._pointers[i], self._sizes[i], self._modes[i] if self.multimodal else None
+            return self._pointers[i], self._sizes[i], (self._modes[i] if self.multimodal else None)
 
         def __len__(self):
             return self._len
@@ -508,7 +508,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             ptr, size, mode = self._index[idx]
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=size, offset=ptr)
-            return np_array, mode if mode is not None else np_array
+            return (np_array, mode) if mode is not None else np_array
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step != 1:
@@ -521,7 +521,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
             np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                      count=total_size, offset=ptr)
             sents = np.split(np_array, offsets[:-1])
-            return sents, modes if modes is not None else sents
+            return (sents, modes) if modes is not None else sents
         else:
             raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
