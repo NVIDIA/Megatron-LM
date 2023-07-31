@@ -537,7 +537,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         ptr += offset * np.dtype(self._index.dtype).itemsize
         np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
                                  count=length, offset=ptr)
-        return np_array, mode if mode is not None else np_array
+        return (np_array, mode) if mode is not None else np_array
             
 
     @property
