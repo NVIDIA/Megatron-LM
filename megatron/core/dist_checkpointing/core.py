@@ -1,12 +1,11 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
 CONFIG_FNAME = 'metadata.json'
-
 
 
 class CheckpointingException(Exception):
@@ -16,6 +15,7 @@ class CheckpointingException(Exception):
 @dataclass
 class CheckpointingConfig:
     """ Documents backends used in the checkpoint. """
+
     sharded_backend: str
     sharded_backend_version: int = 1
     common_backend: str = 'torch'

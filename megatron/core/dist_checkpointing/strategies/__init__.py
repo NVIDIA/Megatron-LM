@@ -7,9 +7,10 @@ import logging
 logger = logging.getLogger(__name__)
 
 try:
-    import zarr
     import tensorstore
-    from .zarr import _import_trigger
+    import zarr
+
     from .tensorstore import _import_trigger
+    from .zarr import _import_trigger
 except ImportError:
     logger.warning('Zarr-based strategies will not be registered because of missing packages')

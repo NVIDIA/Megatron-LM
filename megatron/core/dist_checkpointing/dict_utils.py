@@ -2,13 +2,15 @@
 
 """ Utilities for operating with dicts and lists. """
 
+from collections import defaultdict
+from typing import Any, Callable, Iterable, Optional, Tuple, Union
+
 import torch
 
-from collections import defaultdict
-from typing import Callable, Tuple, Optional, Iterable, Union, Any
 
-
-def extract_matching_values(x: Union[dict, list], predicate: Callable) -> Tuple[Union[dict, list], Union[dict, list]]:
+def extract_matching_values(
+    x: Union[dict, list], predicate: Callable
+) -> Tuple[Union[dict, list], Union[dict, list]]:
     """ Return matching and nonmatching values. Keeps hierarchy. """
     if isinstance(x, dict):
         matching_vals = {}
@@ -184,8 +186,12 @@ def merge(x1: dict, x2: dict):
     return x1
 
 
-def map_reduce(xs: Iterable, key_fn: Callable = lambda x: x,
-               value_fn: Callable = lambda x: x, reduce_fn: Callable = lambda x: x) -> dict:
+def map_reduce(
+    xs: Iterable,
+    key_fn: Callable = lambda x: x,
+    value_fn: Callable = lambda x: x,
+    reduce_fn: Callable = lambda x: x,
+) -> dict:
     res = defaultdict(list)
     for x in xs:
         res[key_fn(x)].append(value_fn(x))

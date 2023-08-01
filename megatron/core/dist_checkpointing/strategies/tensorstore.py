@@ -9,11 +9,11 @@ from pathlib import Path
 import tensorstore as ts
 import torch
 
-from .zarr import postprocess_numpy_array
 from ..core import CheckpointingException
-from ..mapping import ShardedTensor, ShardedStateDict
 from ..dict_utils import dict_list_map_inplace
-from .base import default_strategies, StrategyAction, LoadShardedStrategy
+from ..mapping import ShardedStateDict, ShardedTensor
+from .base import LoadShardedStrategy, StrategyAction, default_strategies
+from .zarr import postprocess_numpy_array
 
 _import_trigger = None
 
@@ -28,8 +28,11 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
             print(f'Loading distributed checkpoint with {self.__class__.__name__}')
             if self.load_directly_on_device:
                 print(f'Loading distributed checkpoint directly on the GPU')
-        load_fn = partial(_load_from_array, checkpoint_dir=checkpoint_dir,
-                          load_directly_on_device=self.load_directly_on_device)
+        load_fn = partial(
+            _load_from_array,
+            checkpoint_dir=checkpoint_dir,
+            load_directly_on_device=self.load_directly_on_device,
+        )
         dict_list_map_inplace(load_fn, sharded_state_dict)
         return sharded_state_dict
 
@@ -43,7 +46,9 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
 def merge_global_slice_with_shape(global_slice, actual_shape, key):
     def _merge_slice(dim_slice, dim_size):
         if isinstance(dim_slice, slice):
-            assert dim_slice.start < dim_size, f'Got empty slice for ShardedTensor {key} ({dim_slice}, {dim_size})'
+            assert (
+                dim_slice.start < dim_size
+            ), f'Got empty slice for ShardedTensor {key} ({dim_slice}, {dim_size})'
             if dim_slice.stop > dim_size:
                 dim_slice = slice(dim_slice.start, dim_size, dim_slice.step)
         return dim_slice
@@ -52,9 +57,12 @@ def merge_global_slice_with_shape(global_slice, actual_shape, key):
     return tuple(starmap(_merge_slice, zip(global_slice, actual_shape)))
 
 
-def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path,
-                     load_directly_on_device: bool = False,
-                     apply_flattened_range: bool = True):
+def _load_from_array(
+    sharded_tensor: ShardedTensor,
+    checkpoint_dir: Path,
+    load_directly_on_device: bool = False,
+    apply_flattened_range: bool = True,
+):
     x = _load_regular_chunk(sharded_tensor, checkpoint_dir)
     ten = postprocess_numpy_array(x, sharded_tensor, apply_flattened_range)
     if load_directly_on_device:
@@ -62,7 +70,6 @@ def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path,
         return sharded_tensor.data
     else:
         return ten
-
 
 
 def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
@@ -75,19 +82,29 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
     try:
         arr = ts.open(ts.Spec(spec), open=True).result()
     except Exception as e:
-        raise CheckpointingException(f'Array {checkpoint_dir / sharded_tensor.key} could not be loaded. Error: {e}') from e
+        raise CheckpointingException(
+            f'Array {checkpoint_dir / sharded_tensor.key} could not be loaded. Error: {e}'
+        ) from e
 
     if sharded_tensor.global_shape == arr.shape:
-        x = arr[sharded_tensor.global_slice()].read().result()  # flattened tensors loading is delayed
+        x = (
+            arr[sharded_tensor.global_slice()].read().result()
+        )  # flattened tensors loading is delayed
     elif sharded_tensor.allow_shape_mismatch:
-        global_slice = merge_global_slice_with_shape(sharded_tensor.global_slice(), arr.shape, sharded_tensor.key)
+        global_slice = merge_global_slice_with_shape(
+            sharded_tensor.global_slice(), arr.shape, sharded_tensor.key
+        )
         x = arr[global_slice].read().result()  # flattened tensors loading is delayed
     else:
-        _msg = f'Global shape mismatch for loaded ({arr.shape})' \
-               f' and expected ({sharded_tensor.global_shape}) tensor' \
-               f' for key {sharded_tensor.key}'
+        _msg = (
+            f'Global shape mismatch for loaded ({arr.shape})'
+            f' and expected ({sharded_tensor.global_shape}) tensor'
+            f' for key {sharded_tensor.key}'
+        )
         raise CheckpointingException(_msg)
     return x
 
 
-default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = TensorStoreLoadShardedStrategy()
+default_strategies[StrategyAction.LOAD_SHARDED.value][
+    ('zarr', 1)
+] = TensorStoreLoadShardedStrategy()

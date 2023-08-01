@@ -2,12 +2,11 @@
 
 """ Core library classes. """
 
+from dataclasses import dataclass, replace
 from itertools import chain
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
-from dataclasses import dataclass, replace
-from typing import Dict, Any, Optional, Tuple, Union
-
 import torch
 
 from .core import CheckpointingException
@@ -47,6 +46,7 @@ class ShardedTensor:
         flattened_range: specifies a slice that should be applied to a flattened
             tensor with `local_shape` in order to get the tensor stored as `data`
     """
+
     key: str
     data: Optional[torch.Tensor]
     dtype: torch.dtype
@@ -61,25 +61,42 @@ class ShardedTensor:
 
     def global_slice(self) -> Tuple[Union[int, slice], ...]:
         assert len(self.global_offset) == len(self.local_shape) + self.prepend_axis_num
-        return tuple(chain(
-            (off for off in self.global_offset[:self.prepend_axis_num]),
-            (slice(off, off + sh) for off, sh in zip(self.global_offset[self.prepend_axis_num:], self.local_shape))
-        ))
+        return tuple(
+            chain(
+                (off for off in self.global_offset[: self.prepend_axis_num]),
+                (
+                    slice(off, off + sh)
+                    for off, sh in zip(
+                        self.global_offset[self.prepend_axis_num :], self.local_shape
+                    )
+                ),
+            )
+        )
 
     def global_coordinates(self) -> Tuple[np.ndarray, ...]:
         if self.flattened_range is None:
-            raise CheckpointingException(f'`global_coordinates` is undefined for'
-                                         f' {self.__class__.__name__} without `flattened_range`')
+            raise CheckpointingException(
+                f'`global_coordinates` is undefined for'
+                f' {self.__class__.__name__} without `flattened_range`'
+            )
 
         local_coords = self.local_coordinates()
-        assert len(local_coords) + self.prepend_axis_num == len(self.global_offset), (len(local_coords), self)
-        global_coords = tuple(c + off for c, off in zip((0,) * self.prepend_axis_num + local_coords, self.global_offset))
+        assert len(local_coords) + self.prepend_axis_num == len(self.global_offset), (
+            len(local_coords),
+            self,
+        )
+        global_coords = tuple(
+            c + off
+            for c, off in zip((0,) * self.prepend_axis_num + local_coords, self.global_offset)
+        )
         return global_coords
 
     def local_coordinates(self) -> Tuple[np.ndarray, ...]:
         if self.flattened_range is None:
-            raise CheckpointingException(f'`local_coordinates` is undefined for'
-                                         f' {self.__class__.__name__} without `flattened_range`')
+            raise CheckpointingException(
+                f'`local_coordinates` is undefined for'
+                f' {self.__class__.__name__} without `flattened_range`'
+            )
 
         # TODO: np.unravel_index?
         mask = np.zeros(np.product(self.local_shape), dtype=bool)
@@ -90,8 +107,9 @@ class ShardedTensor:
         chunks = []
         for axis_sh, axis_fragm in zip(self.global_shape, self.axis_fragmentations):
             if not self.allow_shape_mismatch and axis_sh % axis_fragm != 0:
-                raise CheckpointingException(f'Axis shape ({axis_sh}) not divisible'
-                                             f' by axis fragmentation ({axis_fragm}')
+                raise CheckpointingException(
+                    f'Axis shape ({axis_sh}) not divisible' f' by axis fragmentation ({axis_fragm}'
+                )
             axis_chunk_size = axis_sh // axis_fragm
             chunks.append(axis_chunk_size)
         return tuple(chunks)
@@ -100,8 +118,15 @@ class ShardedTensor:
         return replace(self, data=None)
 
     @classmethod
-    def from_rank_offsets(cls, key: str, data: torch.Tensor, *rank_offsets: Tuple[int, int, int],
-                          replica_id: ReplicaId = 0, prepend_axis_num: int = 0, allow_shape_mismatch: bool = False):
+    def from_rank_offsets(
+        cls,
+        key: str,
+        data: torch.Tensor,
+        *rank_offsets: Tuple[int, int, int],
+        replica_id: ReplicaId = 0,
+        prepend_axis_num: int = 0,
+        allow_shape_mismatch: bool = False,
+    ):
         """Allows to construct the ShardedTensor given offset specified in process ranks.
         Arguments:
             key: unique key
@@ -119,8 +144,14 @@ class ShardedTensor:
         axis_fragmentations = [1] * (data.ndim + prepend_axis_num)
         _seen_axis = set()
         for axis, axis_rank_offset, axis_fragm in rank_offsets:
-            assert axis >= 0 and axis_rank_offset >= 0 and axis_fragm >= 0, (axis, axis_rank_offset, axis_fragm)
-            assert axis_rank_offset < axis_fragm, 'Rank offset must be lower than axis fragmentation'
+            assert axis >= 0 and axis_rank_offset >= 0 and axis_fragm >= 0, (
+                axis,
+                axis_rank_offset,
+                axis_fragm,
+            )
+            assert (
+                axis_rank_offset < axis_fragm
+            ), 'Rank offset must be lower than axis fragmentation'
             if axis in _seen_axis:
                 raise CheckpointingException('Duplicated axis specified')
             _seen_axis.add(axis)
@@ -130,9 +161,18 @@ class ShardedTensor:
             global_offset[axis] = axis_rank_offset * local_axis_shape
             axis_fragmentations[axis] = axis_fragm
 
-        return cls(key, data, data.dtype, tuple(data.shape),
-                   tuple(global_shape), tuple(global_offset), tuple(axis_fragmentations),
-                   replica_id, prepend_axis_num, allow_shape_mismatch)
+        return cls(
+            key,
+            data,
+            data.dtype,
+            tuple(data.shape),
+            tuple(global_shape),
+            tuple(global_offset),
+            tuple(axis_fragmentations),
+            replica_id,
+            prepend_axis_num,
+            allow_shape_mismatch,
+        )
 
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
@@ -152,9 +192,9 @@ class LocalNonpersitentObject:
     - during saving, this object will *not* be stored in the checkpoint
     - during loading, a local version of this object will be placed in a state dict
     """
+
     def __init__(self, obj):
         self.obj = obj
 
     def unwrap(self):
         return self.obj
-
