@@ -5,7 +5,7 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -114,12 +114,13 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = FusedLayerNorm(
+            self.final_layernorm = TENorm(
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
                 persist_layer_norm=self.config.persist_layer_norm,
                 sequence_parallel=self.config.sequence_parallel,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                normalization=self.config.normalization
             )
 
     def _get_layer(self, layer_number):

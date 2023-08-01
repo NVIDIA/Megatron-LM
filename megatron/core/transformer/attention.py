@@ -7,7 +7,7 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
+    TELayernormLinear,
     TEDotProductAttention,
     TERowParallelLinear,
 )
@@ -250,7 +250,7 @@ class SelfAttention(Attention):
     ):
         super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
 
-        self.linear_qkv = TEColumnParallelLinear(
+        self.linear_qkv = TELayernormLinear(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -314,7 +314,7 @@ class CrossAttention(Attention):
             )
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = TEColumnParallelLinear(
+        self.linear_q = TELayernormLinear(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -323,7 +323,7 @@ class CrossAttention(Attention):
             skip_bias_add=False,
         )
 
-        self.linear_kv = TEColumnParallelLinear(
+        self.linear_kv = TELayernormLinear(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
