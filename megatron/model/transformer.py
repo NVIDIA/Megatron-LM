@@ -1417,6 +1417,7 @@ class ParallelTransformer(MegatronModule):
                     apply_residual_connection_post_layernorm=config.apply_residual_connection_post_layernorm,
                     output_layernorm=False,
                     layer_type="encoder",
+                    bias=args.add_bias_linear,
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
                     fuse_qkv_params=True,
