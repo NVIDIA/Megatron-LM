@@ -432,6 +432,7 @@ class TransformerLanguageModel(MegatronModule):
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                num_experts=self.num_experts
             )
             self._encoder_key = 'encoder'
         else:
