@@ -116,6 +116,11 @@ class TransformerConfig(ModelParallelConfig):
                                      There are 2 predefined choices: `max` chooses the largest `amax` in the history
                                      window, while `most_recent` always chooses the most recently seen value.
 
+        # Experimental
+        normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily
+                             used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+
+
     """
 
     # model architecture
