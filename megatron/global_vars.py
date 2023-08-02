@@ -80,7 +80,7 @@ def _set_signal_handler():
 
 
 
-def set_global_variables(args):
+def set_global_variables(args, build_tokenizer=True):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
 
     assert args is not None
@@ -89,7 +89,8 @@ def set_global_variables(args):
     set_args(args)
 
     _build_num_microbatches_calculator(args)
-    _ = _build_tokenizer(args)
+    if build_tokenizer:
+        _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
     _set_timers(args)

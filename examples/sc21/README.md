@@ -9,6 +9,11 @@ scripts use [Slurm](https://slurm.schedmd.com/documentation.html) with the
 schedulers as well.
 
 
+## Git commit
+
+To replicate these results use Megatron-LM commit: 6985e58938d40ad91ac07b0fddcfad8132e1447e
+
+
 ## Setup
 
 All the cluster-dependent variables are in [`CONFIG.sh`](./CONFIG.sh). Please

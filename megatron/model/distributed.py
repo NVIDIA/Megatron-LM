@@ -73,7 +73,7 @@ class DistributedDataParallelBase(MegatronModule, ABC):
 
 
 class DistributedDataParallel(DistributedDataParallelBase):
-    """DDP with contiguous buffers options to storre and accumulate gradients.
+    """DDP with contiguous buffers options to store and accumulate gradients.
     This class:
         - has the potential to reduce memory fragmentation.
         - provides the option to do the gradient accumulation

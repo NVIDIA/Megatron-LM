@@ -1,42 +1,38 @@
-# coding=utf-8
-
-# The following code has been taken from https://github.com/NVIDIA/NeMo/blob/ \
-# 782b4e1652aaa43c8be390d9db0dc89544afa080/nemo/collections/nlp/modules/ \
-# common/megatron/rotary_pos_embedding.py
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import importlib.util
-import torch
 
+import torch
 from torch import einsum, nn
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
+
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, seq_len_interpolation_factor=None):
         super().__init__()
+        self.seq_len_interpolation_factor = seq_len_interpolation_factor
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
-        if importlib.util.find_spec('einops') is None:
-            raise RuntimeError("einops is required for Rotary Embedding")
 
     def forward(self, max_seq_len, offset=0):
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
+        if self.seq_len_interpolation_factor is not None:
+            seq = seq.type_as(self.inv_freq)
+            seq *= 1 / self.seq_len_interpolation_factor
         freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
-        from einops import rearrange
-        return rearrange(emb, 'n d -> n 1 1 d')
+        return emb[:, None, None, :]
 
 
 def _rotate_half(x):
     """
     change sign so the last dimension becomes [-odd, +even]
     """
-    from einops import rearrange
-    x = rearrange(x, '... (j d) -> ... j d', j=2)
-    x1, x2 = x.unbind(dim=-2)
+    x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 

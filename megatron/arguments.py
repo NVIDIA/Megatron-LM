@@ -3,14 +3,17 @@
 """Megatron arguments."""
 
 import argparse
+import dataclasses
 import json
 import os
 import torch
 import types
 
+import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
+from megatron.core.transformer import TransformerConfig
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -71,7 +74,7 @@ def validate_args(args, defaults={}):
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
-    assert args.world_size % model_parallel_size == 0, 'world size is not'\
+    assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
         ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
                            args.pipeline_model_parallel_size)
@@ -312,15 +315,10 @@ def validate_args(args, defaults={}):
         assert args.recompute_method is not None, \
             'for distributed recompute activations to work you '\
             'need to use a recompute method '
-        assert TORCH_MAJOR >= 1 and TORCH_MINOR >= 10, \
+        assert (TORCH_MAJOR, TORCH_MINOR) >= (1, 10), \
             'distributed recompute activations are supported for pytorch ' \
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
-
-    # Tranformer-Engine/FP8 related checking
-    if args.fp8_e4m3 or args.fp8_hybrid:
-        assert args.transformer_impl == 'transformer_engine', \
-            'transformer-engine required for fp8 training and inference'
 
     assert not (args.fp8_e4m3 and args.fp8_hybrid), \
         'cannot train with both fp8 e4m3 and hybrid formatting'
@@ -355,17 +353,40 @@ def validate_args(args, defaults={}):
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
 
-    # Load retro args.
-    if args.retro_workdir:
+    # Retro checks.
+    if args.retro_add_retriever:
+
+        # Sequence parallelism unsupported.
+        assert not args.sequence_parallel, \
+            "retro currently does not support sequence parallelism."
+
+        # Pipeline parallelism unsupported.
+        assert args.pipeline_model_parallel_size == 1, \
+            "retro currently does not support pipeline parallelism."
+
+        # Load retro args.
         retro_args_path = get_retro_args_path(args.retro_workdir)
-        if os.path.exists(retro_args_path):
-            with open(retro_args_path) as f:
-                retro_args = types.SimpleNamespace(**json.load(f))
-                retro_args.retro_return_doc_ids = args.retro_return_doc_ids
-                retro_args.retro_gpt_retrieved_length = \
-                    args.retro_num_retrieved_chunks * \
-                    retro_args.retro_gpt_chunk_length
-                set_retro_args(retro_args)
+        assert os.path.exists(retro_args_path), "retro workdir missing args.json"
+        with open(retro_args_path) as f:
+            retro_args = types.SimpleNamespace(**json.load(f))
+            retro_args.retro_return_doc_ids = args.retro_return_doc_ids
+            retro_args.retro_gpt_retrieved_length = \
+                args.retro_num_retrieved_chunks * \
+                retro_args.retro_gpt_chunk_length
+            set_retro_args(retro_args)
+
+    # Normalization args
+    if args.normalization == "RMSNorm":
+        assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
+
+    # Legacy RoPE arguments
+    if args.use_rotary_position_embeddings:
+        args.position_embedding_type = 'rope'
+
+    # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
+    # don't allow it to keep things simple
+    if not args.add_position_embedding and args.position_embedding_type != 'rope':
+        raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Print arguments.
     _print_args("arguments", args)
@@ -394,6 +415,34 @@ def _print_args(title, args):
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
+def core_transformer_config_from_args(args):
+
+    # Translate args to core transformer configuration
+    kw_args = {}
+    for f in dataclasses.fields(TransformerConfig):
+        if hasattr(args, f.name):
+            kw_args[f.name] = getattr(args, f.name)
+    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
+    kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+    kw_args['deallocate_pipeline_outputs'] = True
+    kw_args['pipeline_dtype'] = args.params_dtype
+    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    if args.swiglu:
+        kw_args['activation_func'] = F.silu
+        kw_args['gated_linear_unit'] = True
+        kw_args['bias_gelu_fusion'] = False
+    if args.init_method_xavier_uniform:
+        kw_args['init_method'] = torch.nn.init.xavier_uniform_
+        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
+    kw_args['fp8_e4m3'] = args.fp8_e4m3
+    kw_args['fp8_margin'] = args.fp8_hybrid
+    if args.group_query_attention:
+        kw_args['num_query_groups'] = args.num_query_groups
+    else:
+        kw_args['num_query_groups'] = None
+
+    return TransformerConfig(**kw_args)
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
@@ -419,6 +468,10 @@ def _add_transformer_engine_args(parser):
                        choices=['most_recent', 'max'],
                        help='Algorithm for computing amax from history',
                        dest='fp8_amax_compute_algo')
+    group.add_argument('--normalization', default='LayerNorm',
+                       choices=['LayerNorm', 'RMSNorm'],
+                       help='Which normalization technique to use.',
+                       dest='normalization')
 
     return parser
 
@@ -512,16 +565,26 @@ def _add_network_size_args(parser):
                        'attention. This is set to '
                        '   args.hidden_size // args.num_attention_heads '
                        'if not provided.')
+    group.add_argument('--group-query-attention', action='store_true',
+                          help='Use group-query attention.')
+    group.add_argument('--num-query-groups', type=int, default=1)
+
     group.add_argument('--max-position-embeddings', type=int, default=None,
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
+    group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
+                       choices=['learned_absolute', 'rope'],
+                       help='Position embedding type.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
-                       help='Use rotary positional embeddings or not')
+                       help='Use rotary positional embeddings or not. '
+                       'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
+    group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
+                       help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',
                        action='store_false',
-                       help='Disable position embedding.',
+                       help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
@@ -714,6 +777,20 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--profile', action='store_true',
+                       help='Enable nsys profiling. When using this option, nsys '
+                       'options should be specified in commandline. An example '
+                       'nsys commandline is `nsys profile -s none -t nvtx,cuda '
+                       '-o <path/to/output_file> --force-overwrite true '
+                       '--capture-range=cudaProfilerApi '
+                       '--capture-range-end=stop`.')
+    group.add_argument('--profile-step-start', type=int, default=10,
+                       help='Gloable step to start profiling.')
+    group.add_argument('--profile-step-end', type=int, default=12,
+                       help='Gloable step to stop profiling.')
+    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
+                       help='Global ranks to profile.')
+
 
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
