@@ -19,6 +19,7 @@ class TELayerNorm(te.pytorch.LayerNorm):
     ):
         super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
+
 class TERMSNorm(te.pytorch.RMSNorm):
     """
     Wrapper for the Transformer-Engine's `RMSNorm`.
@@ -29,11 +30,13 @@ class TERMSNorm(te.pytorch.RMSNorm):
     ):
         super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
     `LayerNorm` or `RMSNorm` based on input
     """
+
     def __new__(
         cls,
         hidden_size: int,
@@ -44,20 +47,17 @@ class TENorm:
     ):
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=sequence_parallel
+                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
             )
         elif normalization == "RMSNorm":
             instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
-                eps=eps,
-                sequence_parallel=sequence_parallel
+                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
 
         return instance
+
 
 class TELinear(te.pytorch.Linear):
     """
@@ -115,7 +115,8 @@ class TELinear(te.pytorch.Linear):
             return out
         return out, None
 
-class TELayernormLinear(te.pytorch.LayerNormLinear):
+
+class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
     Wrapper for the Transformer-Engine's `LayerNormLinear` layer that combines
     layernorm and linear layers

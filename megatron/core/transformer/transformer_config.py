@@ -169,7 +169,7 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_compute_algo: str = "most_recent"
 
     # experimental section (TODO: move to apt. section above once stable)
-    normalization: bool = "LayerNorm" # alt value supported by TE: "RMSNorm"
+    normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

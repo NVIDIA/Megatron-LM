@@ -4,13 +4,12 @@ import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
-from megatron.core.transformer.custom_layers.transformer_engine import TELayerNorm
-from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
-from megatron.core.transformer.transformer_layer_noop import IdentityOp
 
 
 class TransformerLayer(MegatronModule):
@@ -40,7 +39,7 @@ class TransformerLayer(MegatronModule):
             persist_layer_norm=self.config.persist_layer_norm,
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization
+            normalization=self.config.normalization,
         )
 
         # Self attention.
@@ -55,7 +54,7 @@ class TransformerLayer(MegatronModule):
             persist_layer_norm=self.config.persist_layer_norm,
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization
+            normalization=self.config.normalization,
         )
 
         # MLP
