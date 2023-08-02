@@ -241,6 +241,9 @@ class CheckpointFunction(torch.autograd.Function):
                 args[0],
                 split_tensor_into_1d_equal_chunks(args[0].data, new_buffer=True))
 
+        # HACK: currently when DeepSpeed is used, we always set
+        # distribute_saved_activations to false, and use the following older
+        # activation checkpointing mechanisms
         if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
             ctx.input_0_shape = args[0].data.shape
             args[0].data = split_tensor_into_1d_equal_chunks(args[0].data)
@@ -262,6 +265,9 @@ class CheckpointFunction(torch.autograd.Function):
             safely_set_viewless_tensor_data(
                 inputs[0],
                 gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape))
+        # HACK: currently when DeepSpeed is used, we always set
+        # distribute_saved_activations to false, and use the following older
+        # activation checkpointing mechanisms
         if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
             inputs[0].data = gather_split_1d_tensor(inputs[0].data)
             inputs[0].data = inputs[0].data.view(ctx.input_0_shape)

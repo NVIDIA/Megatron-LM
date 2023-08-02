@@ -187,16 +187,8 @@ def forward_step(forward_step_func,
         input_tensor = [input_tensor]
         unwrap_output_tensor = True
 
-    # set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
-    # set_input_tensor(input_tensor)
-    unwrapped_model = unwrap_model(model, (torchDDP, LocalDDP, Float16Module))
-    try:
-        if not args.deepspeed:
-            unwrapped_model.set_input_tensor(input_tensor)
-        else:
-            unwrapped_model.module.set_input_tensor(input_tensor)
-    except:
-        print('unwrapped_model set_input_tensor fail !!! ')
+    set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+    set_input_tensor(input_tensor)
 
     if config.enable_autocast:
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
