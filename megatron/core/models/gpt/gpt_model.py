@@ -143,9 +143,10 @@ class GPTModel(MegatronModule):
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.rotary_pos_emb is not None:
-            rotary_seq_len = self.max_sequence_length
             if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_length
+                rotary_seq_len = inference_params.max_sequence_len
+            else:
+                rotary_seq_len = min(self.max_sequence_length, decoder_input.size(0))
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
@@ -155,6 +156,10 @@ class GPTModel(MegatronModule):
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
         )
+
+        # Advance inference sequence offset.
+        if inference_params is not None:
+            inference_params.sequence_len_offset += hidden_states.size(0)
 
         if not self.post_process:
             return hidden_states
