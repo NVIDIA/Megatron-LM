@@ -1318,6 +1318,7 @@ class ParallelTransformer(MegatronModule):
         # Transformer Engine Init.
         self.transformer_engine_v_0_10 = False
         self.transformer_engine_v_0_11 = False
+        self.transformer_engine_v_0_8 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1325,6 +1326,8 @@ class ParallelTransformer(MegatronModule):
             from pkg_resources import packaging
 
             te_version = packaging.version.Version(version("transformer-engine"))
+            if te_version >= packaging.version.Version("0.8.0"):
+                self.transformer_engine_v_0_8 = True
             if te_version >= packaging.version.Version("0.10.0"):
                 self.transformer_engine_v_0_10 = True
             if te_version >= packaging.version.Version("0.11.0"):
@@ -1394,6 +1397,8 @@ class ParallelTransformer(MegatronModule):
             else:
                 # This argument is only available from TE v0.10 onwards.
                 extra_transformer_engine_kwargs = {}
+                if self.transformer_engine_v_0_8:
+                    extra_transformer_engine_kwargs["bias"] = args.add_bias_linear
                 if self.transformer_engine_v_0_10:
                     extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
                 if self.transformer_engine_v_0_11:
@@ -1422,7 +1427,6 @@ class ParallelTransformer(MegatronModule):
                     apply_residual_connection_post_layernorm=config.apply_residual_connection_post_layernorm,
                     output_layernorm=False,
                     layer_type="encoder",
-                    bias=args.add_bias_linear,
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
                     fuse_qkv_params=True,
