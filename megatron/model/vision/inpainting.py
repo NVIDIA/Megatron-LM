@@ -41,7 +41,8 @@ class VitInpaintingModel(MegatronModule):
             self.linear_decoder = get_linear_layer(
                 self.hidden_size,
                 self.backbone.flatten_dim,
-                torch.nn.init.zeros_
+                torch.nn.init.zeros_,
+                gather_params_on_init=args.zero_stage == 3
             )
 
     def set_input_tensor(self, input_tensor):

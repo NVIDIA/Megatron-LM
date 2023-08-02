@@ -273,7 +273,8 @@ class PretrainedBertModel(MegatronModule):
         if args.biencoder_projection_dim > 0:
             self.projection_enc = get_linear_layer(args.hidden_size,
                                                    args.biencoder_projection_dim,
-                                                   init_method)
+                                                   init_method,
+                                                   gather_params_on_init=args.zero_stage == 3)
             self._projection_enc_key = 'projection_enc'
 
     def forward(self, input_ids, attention_mask, tokentype_ids=None):

@@ -163,7 +163,7 @@ class IREncoderBertModel(MegatronModule):
             init_method=init_method,
             scaled_init_method=scaled_init_method)
 
-        self.ict_head = get_linear_layer(args.hidden_size, ict_head_size, init_method)
+        self.ict_head = get_linear_layer(args.hidden_size, ict_head_size, init_method, gather_params_on_init=args.zero_stage == 3)
         self._ict_head_key = 'ict_head'
 
     def forward(self, input_ids, attention_mask, tokentype_ids=None):

@@ -8,6 +8,8 @@ import torch
 
 from megatron import get_args
 
+from deepspeed.runtime.zero import GatheredParameters
+
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
     def init_(tensor):
@@ -26,6 +28,11 @@ def scaled_init_method_normal(sigma, num_layers):
     return init_
 
 
+def gather_and_init(param, init_method):
+    with GatheredParameters(param, modifier_rank=0):
+        init_method(param)
+        
+
 def attention_mask_func(attention_scores, attention_mask):
     args = get_args()
     if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
@@ -40,13 +47,15 @@ def attention_mask_func(attention_scores, attention_mask):
     return attention_scores
 
 
-def get_linear_layer(rows, columns, init_method):
+def get_linear_layer(rows, columns, init_method, gather_params_on_init=False):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
     if get_args().perform_initialization:
-        init_method(layer.weight)
+        with GatheredParameters(layer.weight, modifier_rank=0, enable=gather_params_on_init):
+            init_method(layer.weight)
     with torch.no_grad():
-        layer.bias.zero_()
+        with GatheredParameters(layer.bias, modifier_rank=0, enable=gather_params_on_init):
+            layer.bias.zero_()
     return layer
 
 @torch.jit.script

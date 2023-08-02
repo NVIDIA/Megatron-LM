@@ -61,7 +61,7 @@ class BertLMHead(MegatronModule):
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
-        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method)
+        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method, gather_params_on_init=args.zero_stage == 3)
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
@@ -160,7 +160,8 @@ class BertModel(MegatronModule):
             self.binary_head = None
             if self.add_binary_head:
                 self.binary_head = get_linear_layer(config.hidden_size, 2,
-                                                    config.init_method)
+                                                    config.init_method,
+                                                    args.zero_stage == 3)
                 self._binary_head_key = 'binary_head'
 
     def set_input_tensor(self, input_tensor):

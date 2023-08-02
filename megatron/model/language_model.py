@@ -14,7 +14,7 @@ from .module import MegatronModule
 from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from .transformer import ParallelTransformer
 from .utils import get_linear_layer
-from .utils import init_method_normal, scaled_init_method_normal
+from .utils import init_method_normal, scaled_init_method_normal, gather_and_init
 
 
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
@@ -96,7 +96,7 @@ class Pooler(MegatronModule):
     def __init__(self, hidden_size, init_method):
         super(Pooler, self).__init__()
         args = get_args()
-        self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        self.dense = get_linear_layer(hidden_size, hidden_size, init_method, gather_params_on_init=args.zero_stage == 3)
         self.sequence_parallel = args.sequence_parallel
 
 
@@ -166,7 +166,10 @@ class Embedding(MegatronModule):
             self._position_embeddings_key = 'position_embeddings'
             # Initialize the position embeddings.
             if args.perform_initialization:
-                self.init_method(self.position_embeddings.weight)
+                if args.zero_stage == 3:
+                    gather_and_init(self.position_embeddings.weight, self.init_method)
+                else:
+                    self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -178,7 +181,10 @@ class Embedding(MegatronModule):
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
             if args.perform_initialization:
-                self.init_method(self.tokentype_embeddings.weight)
+                if args.zero_stage == 3:
+                    gather_and_init(self.tokentype_embeddings.weight, self.init_method)
+                else:
+                    self.init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 

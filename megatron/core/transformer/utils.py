@@ -6,18 +6,22 @@ import torch
 
 from megatron import get_args
 
+from deepspeed.runtime.zero import GatheredParameters
+
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
 
 
-def get_linear_layer(rows, columns, init_method):
+def get_linear_layer(rows, columns, init_method, gather_params_on_init=False):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
     if get_args().perform_initialization:
-        init_method(layer.weight)
+        with GatheredParameters(layer.weight, modifier_rank=0, enable=gather_params_on_init):
+            init_method(layer.weight)
     with torch.no_grad():
-        layer.bias.zero_()
+        with GatheredParameters(layer.weight, modifier_rank=0, enable=gather_params_on_init):
+            layer.bias.zero_()
     return layer
 
 
