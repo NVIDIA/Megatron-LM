@@ -28,9 +28,9 @@ import torch
 
 from megatron import (
     get_args,
-    mpu,
     print_rank_0
 )
+from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
 
@@ -63,12 +63,18 @@ def get_datasets_weights_and_num_samples(data_prefix,
     # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
     # not uniformly distribute the number of samples, we still have
     # samples left to feed to the network.
-    datasets_train_valid_test_num_samples = []
-    for weight in weights:
-        datasets_train_valid_test_num_samples.append(
-            [int(math.ceil(val * weight * 1.005))
-             for val in train_valid_test_num_samples])
-
+    if isinstance(train_valid_test_num_samples, list):
+        datasets_train_valid_test_num_samples = []
+        for weight in weights:
+            datasets_train_valid_test_num_samples.append(
+                [int(math.ceil(val * weight * 1.005))
+                for val in train_valid_test_num_samples])
+    else:
+        # Used when separate dataset files are provided for train,
+        # valid and test
+        datasets_train_valid_test_num_samples = [
+            int(math.ceil(train_valid_test_num_samples * weight * 1.005))
+            for weight in weights]
 
     return prefixes, weights, datasets_train_valid_test_num_samples
 
@@ -436,6 +442,10 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     output = get_datasets_weights_and_num_samples(data_prefix,
                                                   train_valid_test_num_samples)
     prefixes, weights, datasets_train_valid_test_num_samples = output
+    train_num_samples, valid_num_samples, test_num_samples = map(
+        sum,
+        zip(*datasets_train_valid_test_num_samples)
+    )
 
     # Build individual datasets.
     train_datasets = []
@@ -446,7 +456,8 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             prefixes[i], data_impl, splits_string,
             datasets_train_valid_test_num_samples[i],
             max_seq_length, masked_lm_prob, short_seq_prob,
-            seed, skip_warmup, binary_head, dataset_type=dataset_type)
+            seed, skip_warmup, binary_head, max_seq_length_dec,
+            dataset_type=dataset_type)
         if train_ds:
             train_datasets.append(train_ds)
         if valid_ds:
@@ -454,16 +465,16 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
         if test_ds:
             test_datasets.append(test_ds)
 
-        # Blend.
+    # Blend.
     blending_train_dataset = None
     if train_datasets:
-        blending_train_dataset = BlendableDataset(train_datasets, weights)
+        blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples)
     blending_valid_dataset = None
     if valid_datasets:
-        blending_valid_dataset = BlendableDataset(valid_datasets, weights)
+        blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples)
     blending_test_dataset = None
     if test_datasets:
-        blending_test_dataset = BlendableDataset(test_datasets, weights)
+        blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples)
 
     return (blending_train_dataset, blending_valid_dataset,
             blending_test_dataset)

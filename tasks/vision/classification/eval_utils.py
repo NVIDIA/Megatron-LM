@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Evaluation utilities."""
 
@@ -22,7 +9,7 @@ import torch
 
 from megatron import get_args
 from megatron import print_rank_0, print_rank_last
-from megatron import mpu
+from megatron.core import mpu
 from megatron.schedules import get_forward_backward_func
 from tasks.vision.finetune_utils import build_data_loader
 from tasks.vision.finetune_utils import process_batch
@@ -33,11 +20,10 @@ def accuracy_func_provider():
     """Provide function that calculates accuracies."""
     args = get_args()
     data_path = args.data_path
-    crop_size = args.img_dim
+    crop_size = (args.img_h, args.img_w)
 
-    # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
     # Build dataloaders.
-    val_data_path = os.path.join(data_path[0], "val")
+    val_data_path = data_path[1]
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     transform_val = transforms.Compose(
         [
@@ -54,6 +40,7 @@ def accuracy_func_provider():
         args.micro_batch_size,
         num_workers=args.num_workers,
         drop_last=(mpu.get_data_parallel_world_size() > 1),
+        shuffle=False
     )
 
     def metrics_func(model, epoch):
@@ -71,7 +58,6 @@ def accuracy_func_provider():
 def calculate_correct_answers(model, dataloader, epoch):
     """Calculate correct over total answers"""
 
-    args = get_args()
     forward_backward_func = get_forward_backward_func()
     for m in model:
         m.eval()
@@ -98,7 +84,6 @@ def calculate_correct_answers(model, dataloader, epoch):
         images, labels = process_batch(batch_)
 
         # Forward model.
-        args = get_args()
         output_tensor = model(images)
 
         return output_tensor, partial(loss_func, labels)

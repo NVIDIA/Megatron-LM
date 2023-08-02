@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Tokenization utilities."""
 
@@ -19,7 +6,7 @@
 import torch
 
 
-from megatron import get_tokenizer
+from megatron import get_tokenizer, get_args
 from .communication import broadcast_int_list, broadcast_tensor
 
 
@@ -29,7 +16,7 @@ def detokenize_generations(tokens_gpu_tensor,
     """Detokenize the generated tokens."""
 
     tokenizer = get_tokenizer()
-
+    args = get_args()
     prompts_plus_generations = []
     if return_segments:
         prompts_plus_generations_segments = []
@@ -43,10 +30,16 @@ def detokenize_generations(tokens_gpu_tensor,
         if return_segments:
             words = []
             for token in sequence_tokens:
-                word = tokenizer.tokenizer.decoder[token]
-                word = bytearray(
-                    [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                        'utf-8', errors='replace')
+                if args.tokenizer_type in ['SentencePieceTokenizer', 
+                        'GPTSentencePieceTokenizer']:
+                    word = tokenizer.decoder[token]
+                elif args.tokenizer_type == 'NullTokenizer':
+                    word = str(token)
+                else:
+                    word = tokenizer.tokenizer.decoder[token]
+                    word = bytearray(
+                        [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                            'utf-8', errors='replace')
                 words.append(word)
             prompts_plus_generations_segments.append(words)
 

@@ -1,28 +1,16 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Inference API."""
 
 
 import torch
 
-from megatron import mpu
+from megatron.core import mpu
 from .communication import broadcast_float_list
 from .generation import (
         generate_tokens_probs_and_return_on_first_stage,
-        score_and_return_on_first_stage)
+        score_and_return_on_first_stage,
+        beam_search_and_return_on_first_stage)
 from .tokenization import (
     tokenize_prompts,
     detokenize_generations)
@@ -33,11 +21,14 @@ def generate_and_post_process(model,
                               return_output_log_probs=False,
                               top_k_sampling=0,
                               top_p_sampling=0.0,
+                              top_p_decay=0.0,
+                              top_p_bound=0.0,
                               temperature=1.0,
                               add_BOS=False,
                               use_eod_token_for_early_termination=True,
                               stop_on_double_eol=False,
                               stop_on_eol=False,
+                              prevent_newline_after_colon=False,
                               random_seed=-1):
     """Run inference and post-process outputs, i.e., detokenize,
     move to cpu and convert to list."""
@@ -50,11 +41,14 @@ def generate_and_post_process(model,
         return_output_log_probs=return_output_log_probs,
         top_k_sampling=top_k_sampling,
         top_p_sampling=top_p_sampling,
+        top_p_decay=top_p_decay,
+        top_p_bound=top_p_bound,
         temperature=temperature,
         add_BOS=add_BOS,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
+        prevent_newline_after_colon=prevent_newline_after_colon,
         random_seed=random_seed)
 
     # Only post-process on first stage.
@@ -78,11 +72,14 @@ def generate(model,
              return_output_log_probs=False,
              top_k_sampling=0,
              top_p_sampling=0.0,
+             top_p_decay=0.0,
+             top_p_bound=0.0,
              temperature=1.0,
              add_BOS=False,
              use_eod_token_for_early_termination=True,
              stop_on_double_eol=False,
              stop_on_eol=False,
+             prevent_newline_after_colon=False,
              random_seed=-1):
     """Given prompts and input parameters, run inference and return:
        tokens: prompts plus the generated tokens.
@@ -95,22 +92,26 @@ def generate(model,
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               return_output_log_probs,
-              top_k_sampling, top_p_sampling,
+              top_k_sampling, top_p_sampling, top_p_decay, top_p_bound,
               temperature, add_BOS, use_eod_token_for_early_termination,
               stop_on_double_eol,
               stop_on_eol,
+              prevent_newline_after_colon,
               random_seed]
-    values_float_tensor = broadcast_float_list(10, float_list=values)
+    values_float_tensor = broadcast_float_list(len(values), float_list=values)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
     top_p_sampling = values_float_tensor[3].item()
-    temperature = values_float_tensor[4].item()
-    add_BOS = bool(values_float_tensor[5].item())
-    use_eod_token_for_early_termination = bool(values_float_tensor[6].item())
-    stop_on_double_eol = bool(values_float_tensor[7].item())
-    stop_on_eol = bool(values_float_tensor[8].item())
-    random_seed = int(values_float_tensor[9].item())
+    top_p_decay = values_float_tensor[4].item()
+    top_p_bound = values_float_tensor[5].item()
+    temperature = values_float_tensor[6].item()
+    add_BOS = bool(values_float_tensor[7].item())
+    use_eod_token_for_early_termination = bool(values_float_tensor[8].item())
+    stop_on_double_eol = bool(values_float_tensor[9].item())
+    stop_on_eol = bool(values_float_tensor[10].item())
+    prevent_newline_after_colon = bool(values_float_tensor[11].item())
+    random_seed = int(values_float_tensor[12].item())
 
     if random_seed != -1:
         torch.random.manual_seed(random_seed)
@@ -134,7 +135,66 @@ def generate(model,
         return_output_log_probs=return_output_log_probs,
         top_k=top_k_sampling,
         top_p=top_p_sampling,
+        top_p_decay=top_p_decay,
+        top_p_bound=top_p_bound,
         temperature=temperature,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
-        stop_on_eol=stop_on_eol)
+        stop_on_eol=stop_on_eol,
+        prevent_newline_after_colon=prevent_newline_after_colon)
+
+def beam_search_and_post_process(model,
+                                 prompts=None,
+                                 tokens_to_generate=0,
+                                 beam_size=0,
+                                 add_BOS=False,
+                                 stop_token=50256,
+                                 num_return_gen=1,
+                                 length_penalty=1,
+                                 prevent_newline_after_colon=False):
+    """Run beam search and post-process outputs, i.e., detokenize,
+    move to cpu and convert to list."""
+
+    # Main inference.
+    tokens, scores = beam_search(model,
+                                 prompts=prompts,
+                                 tokens_to_generate=tokens_to_generate,
+                                 beam_size=beam_size,
+                                 add_BOS=add_BOS,
+                                 stop_token=stop_token,
+                                 num_return_gen=num_return_gen,
+                                 length_penalty=length_penalty,
+                                 prevent_newline_after_colon=prevent_newline_after_colon)
+    # Only post-process on first stage.
+    if mpu.is_pipeline_first_stage():
+        lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
+        tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, True)
+        scores = scores.cpu().numpy().tolist()
+        return prompts_plus_generations, prompts_plus_generations_segments, scores
+
+    return None
+
+def beam_search(model, prompts=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1, prevent_newline_after_colon=False):
+    # Make sure input params are avaialble to all ranks.
+    values = [tokens_to_generate,
+              beam_size,
+              add_BOS,
+              stop_token,
+              num_return_gen,
+              length_penalty,
+              prevent_newline_after_colon]
+    values_float_tensor = broadcast_float_list(len(values), float_list=values)
+    tokens_to_generate = int(values_float_tensor[0].item())
+    beam_size = int(values_float_tensor[1].item())
+    add_BOS = bool(values_float_tensor[2].item())
+    stop_token = int(values_float_tensor[3].item())
+    num_return_gen = int(values_float_tensor[4].item())
+    length_penalty = values_float_tensor[5].item()
+    prevent_newline_after_colon = values_float_tensor[6].item()
+
+    context_tokens_tensor, context_length_tensor = tokenize_prompts(
+        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
+    
+    return beam_search_and_return_on_first_stage(model, context_tokens_tensor, context_length_tensor, 
+            beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty,
+            prevent_newline_after_colon=prevent_newline_after_colon)

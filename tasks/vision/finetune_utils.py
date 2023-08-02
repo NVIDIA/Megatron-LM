@@ -1,27 +1,14 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Finetune utilities."""
 
 import torch
 import torch.nn.functional as F
-from functools import partial
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
-from megatron import mpu
+from megatron import utils
+from megatron.core import mpu
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.training import evaluate_and_print_results
@@ -29,8 +16,11 @@ from megatron.training import setup_model_and_optimizer
 from megatron.training import train_step
 from megatron.training import training_log
 from megatron.utils import check_adlr_autoresume_termination
-from megatron.utils import average_losses_across_data_parallel_group
-
+from megatron.utils import average_losses_across_data_parallel_group, print_params_min_max_norm
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import Float16Module
+from megatron.core.enums import ModelType
 
 def process_batch(batch):
     """Process batch and produce inputs for the model."""
@@ -39,45 +29,16 @@ def process_batch(batch):
     return images, labels
 
 
-def cross_entropy_loss_func(labels, output_tensor):
-    logits = output_tensor
-
-    # Cross-entropy loss.
-    loss = F.cross_entropy(logits.contiguous().float(), labels)
-
-    # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
-
-    return loss, {'lm loss': averaged_loss[0]}
-
-
-def _cross_entropy_forward_step(batch, model):
-    """Simple forward step with cross-entropy loss."""
-    timers = get_timers()
-
-    # Get the batch.
-    timers("batch generator").start()
-    try:
-        batch_ = next(batch)
-    except BaseException:
-        batch_ = batch
-    images, labels = process_batch(batch_)
-    timers("batch generator").stop()
-
-   # Forward model.
-    output_tensor = model(images)
-  
-    return output_tensor, partial(cross_entropy_loss_func, labels)
-
-
-def build_data_loader(dataset, micro_batch_size, num_workers, drop_last):
+def build_data_loader(dataset, micro_batch_size,
+                      num_workers, drop_last, shuffle):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
     # Sampler.
     world_size = mpu.get_data_parallel_world_size()
     rank = mpu.get_data_parallel_rank()
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank
+        dataset, num_replicas=world_size, rank=rank,
+        drop_last=drop_last, shuffle=shuffle
     )
 
     # Data loader. Note that batch size is the per GPU batch size.
@@ -112,14 +73,14 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
     print_rank_0('building train and validation dataloaders ...')
     # Training dataset.
     train_dataloader = build_data_loader(train_dataset, args.micro_batch_size,
-                                           args.num_workers, not args.keep_last)
+                                         args.num_workers, False, True)
     # Set the training iterations.
     args.train_iters_per_epoch = len(train_dataloader)
     args.train_iters = args.epochs * args.train_iters_per_epoch
     # Validation dataset. For this dataset, we do not need to set up
     # shuffling so we can just use a simple infinite loop.
     valid_dataloader_ = build_data_loader(valid_dataset, args.micro_batch_size,
-                                            args.num_workers, not args.keep_last)
+                                          args.num_workers, True,  False)
     valid_dataloader = _build_infinite_size_dataloader(valid_dataloader_)
 
     # Now that we've built the data loaders, set batch_size arguments
@@ -132,6 +93,7 @@ def _build_train_valid_dataloaders(train_dataset, valid_dataset):
 
     return train_dataloader, valid_dataloader
 
+
 def _train(
     model,
     optimizer,
@@ -140,6 +102,7 @@ def _train(
     train_dataloader,
     valid_dataloader,
     end_of_epoch_callback,
+    process_non_loss_data_func=None
 ):
     """Train the model."""
     args = get_args()
@@ -161,12 +124,13 @@ def _train(
     report_memory_flag = True
 
     # For each remaining epoch
-    timers("interval-time").start()
+    timers("interval-time", log_level=0).start(barrier=True)
     for epoch in range(start_epoch, args.epochs):
         print_rank_0("working on epoch {} ...".format(epoch + 1))
 
         # Set the data loader epoch to shuffle the index iterator.
         train_dataloader.sampler.set_epoch(args.seed + epoch)
+        train_dataloader.dataset.set_epoch(epoch)
 
         # For all the batches in the dataset.
         for iteration_, batch in enumerate(train_dataloader):
@@ -185,8 +149,6 @@ def _train(
 
             # Logging.
             params_norm = None
-            if args.log_params_norm:
-                params_norm = calc_params_l2_norm(model)
 
             report_memory_flag = training_log(
                 losses_dict,
@@ -202,20 +164,16 @@ def _train(
             )
 
             # Autoresume
-            if args.adlr_autoresume and (
-                iteration % args.adlr_autoresume_interval == 0
-            ):
-                check_adlr_autoresume_termination(
-                    iteration, model, optimizer, opt_param_scheduler
-                )
+            if args.adlr_autoresume and \
+                    iteration % args.adlr_autoresume_interval == 0:
+                check_adlr_autoresume_termination(iteration, model, optimizer,
+                                                  opt_param_scheduler)
 
             # Checkpointing
-            if (
-                args.save
-                and args.save_interval
-                and iteration % args.save_interval == 0
-            ):
-                save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
+            if args.save and args.save_interval and \
+                    iteration % args.save_interval == 0:
+                save_checkpoint(iteration, model, optimizer,
+                                opt_param_scheduler)
 
             # Evaluation
             if args.eval_interval and iteration % args.eval_interval == 0:
@@ -226,12 +184,9 @@ def _train(
                     valid_dataloader,
                     model,
                     iteration,
+                    process_non_loss_data_func,
                     False,
                 )
-
-        # Checkpointing at the end of each epoch.
-        if args.save:
-            save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
 
         # Callback at the end of each epoch.
         if end_of_epoch_callback is not None:
@@ -241,7 +196,9 @@ def _train(
 def finetune(
     train_valid_datasets_provider,
     model_provider,
-    forward_step=_cross_entropy_forward_step,
+    forward_step,
+    model_type=ModelType.encoder_or_decoder,
+    process_non_loss_data_func=None,
     end_of_epoch_callback_provider=None,
 ):
     """Main finetune function used across all tasks."""
@@ -249,7 +206,7 @@ def finetune(
     timers = get_timers()
 
     # Train and validation data loaders.
-    timers("train/valid/test dataset/dataloder").start()
+    timers("train/valid/test dataset/dataloder", log_level=0).start()
     if args.epochs > 0:
         train_dataset, valid_dataset = train_valid_datasets_provider()
         train_dataloader, valid_dataloader = _build_train_valid_dataloaders(
@@ -258,29 +215,55 @@ def finetune(
     timers("train/valid/test dataset/dataloder").stop()
 
     # Build calback function.
-    timers("callback function").start()
+    timers("callback function", log_level=0).start()
     end_of_epoch_callback = None
     if end_of_epoch_callback_provider is not None:
         end_of_epoch_callback = end_of_epoch_callback_provider()
     timers("callback function").stop()
 
     # Build model, optimizer and learning rate scheduler.
-    timers("model and optimizer").start()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(model_provider)
+    timers("model and optimizer", log_level=0).start()
+    model, optimizer, opt_param_scheduler = \
+        setup_model_and_optimizer(
+            model_provider,
+            model_type,
+            scale_lr_cond=lambda name, param: ".head." in name,
+            lr_mult=args.head_lr_mult)
     timers("model and optimizer").stop()
 
     # If pretrained checkpoint is provided and we have not trained for
     # any iteration (i.e., iteration is zero), then load the pretrained
     # checkpoint.
-    timers("pretrained checkpoint").start()
+    timers("pretrained checkpoint", log_level=0).start(barrier=True)
     if args.iteration == 0 and args.pretrained_checkpoint is not None:
-        original_load = args.load
-        args.load = args.pretrained_checkpoint
-        _ = load_checkpoint(model, None, None, strict=False)
-        args.load = original_load
+        if args.pretrained_checkpoint_type == 'default':
+            original_load = args.load
+            args.load = args.pretrained_checkpoint
+            _ = load_checkpoint(model, None, None, strict=False)
+            args.load = original_load
+        elif args.pretrained_checkpoint_type == 'external':
+            unwrap_model = utils.unwrap_model(model)
+            state_dict = torch.load(args.pretrained_checkpoint,
+                                    map_location="cpu")
+            unwrap_model[0].module.backbone.load_state_dict(state_dict,
+                                                            strict=False)
+        elif args.pretrained_checkpoint_type == 'constrastive':
+            unwrap_model = utils.unwrap_model(model)
+            state_dict = torch.load(args.pretrained_checkpoint,
+                                    map_location="cpu")
+            state_dict = state_dict["model"]
+            state_dict = {k.replace("teacher.backbone.", ""): v
+                          for k, v in state_dict.items()
+                          if k.startswith("teacher.backbone.")}
+            unwrap_model[0].module.backbone.load_state_dict(state_dict,
+                                                            strict=False)
+        else:
+            raise Exception("pretrained checkpoint type {} not supported".format(args.pretrained_checkpoint_type))
+
         # This is critical when only model is loaded. We should make sure
         # master parameters are also updated.
         optimizer.reload_model_params()
+
     timers("pretrained checkpoint").stop()
 
     # Print setup timing.
@@ -305,11 +288,13 @@ def finetune(
             train_dataloader,
             valid_dataloader,
             end_of_epoch_callback,
+            process_non_loss_data_func,
         )
     # Or just evaluate.
     else:
         if end_of_epoch_callback is not None:
             print_rank_0("evaluation only mode, setting epoch to -1")
-            end_of_epoch_callback(model, epoch=-1, output_predictions=True)
+            end_of_epoch_callback(model, epoch=-1)
 
     print_rank_0("done :-)")
+

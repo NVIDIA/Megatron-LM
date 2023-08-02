@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Vision Transformer(VIT) model."""
 
@@ -147,6 +134,7 @@ class VitBackbone(MegatronModule):
                  post_process=True,
                  class_token=True,
                  single_token_output=False,
+                 post_layer_norm=True,
                  drop_path_rate=0.0):
         super(VitBackbone, self).__init__(share_word_embeddings=False)
         args = get_args()
@@ -164,6 +152,7 @@ class VitBackbone(MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.class_token = class_token
+        self.post_layer_norm = post_layer_norm
         self.hidden_size = args.hidden_size
         self.patch_dim = args.patch_dim
         self.img_h = args.img_h
@@ -217,6 +206,7 @@ class VitBackbone(MegatronModule):
             self.scaled_init_method,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            post_layer_norm=self.post_layer_norm,
             drop_path_rate=self.drop_path_rate
         )
 
@@ -244,14 +234,20 @@ class VitBackbone(MegatronModule):
 
             token_embeddings = concatenated_tokens + \
                     self.position_embeddings(self.position_ids[:, :concatenated_tokens.shape[1]])
+            # [b, s, h] => [s, b, h]
+            token_embeddings = token_embeddings.transpose(0, 1).contiguous()
             hidden_states = self.embedding_dropout(token_embeddings)
         else:
             hidden_states = input
 
         hidden_states = self.transformer(hidden_states, None)
 
-        if self.single_token_output:
-            hidden_states = hidden_states[:,0,:]
+        if self.post_process:
+            # [s b h] => [b s h]
+            if self.single_token_output:
+                hidden_states = hidden_states[0]
+            else:
+                hidden_states = hidden_states.transpose(0, 1).contiguous()
 
         return hidden_states
 

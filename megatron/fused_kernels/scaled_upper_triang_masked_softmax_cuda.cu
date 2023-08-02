@@ -1,18 +1,4 @@
-/* coding=utf-8
- * Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+/* Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved. */
 
 #include <ATen/ATen.h>
 #include <cuda.h>
@@ -35,7 +21,7 @@ torch::Tensor fwd_cuda(
   // input is a 3d tensor with dimensions [attn_batches, seq_len, seq_len]
   const int attn_batches = input.size(0);
   const int seq_len = input.size(1);
-  TORCH_INTERNAL_ASSERT(seq_len <= 2048);
+  TORCH_INTERNAL_ASSERT(seq_len <= 16384);
 
   // Output 
   auto act_options = input.options().requires_grad(false);

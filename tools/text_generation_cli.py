@@ -1,34 +1,23 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-import json
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 import sys
-import urllib2
-class PutRequest(urllib2.Request):
-    '''class to handling putting with urllib2'''
+import json
+import requests
 
-    def get_method(self, *args, **kwargs):
-        return 'PUT'
 
 if __name__ == "__main__":
     url = sys.argv[1]
+    url = 'http://' + url + '/api'
+    headers = {'Content-Type': 'application/json'}
+
     while True:
-        sentence = raw_input("Enter prompt: ")
-        tokens_to_generate = int(input("Enter number of tokens to generate: "))
-        data = json.dumps({"prompts": [sentence], "tokens_to_generate":tokens_to_generate})
-        req = PutRequest(url, data, {'Content-Type': 'application/json'})
-        response = urllib2.urlopen(req)
-        resp_sentences = json.load(response)
-        print("Megatron Response: ")
-        print(resp_sentences["text"][0])
+        sentence = input("Enter prompt: ")
+        tokens_to_generate = int(eval(input("Enter number of tokens to generate: ")))
+
+        data = {"prompts": [sentence], "tokens_to_generate": tokens_to_generate}
+        response = requests.put(url, data=json.dumps(data), headers=headers)
+
+        if response.status_code != 200:
+            print(f"Error {response.status_code}: {response.json()['message']}")
+        else:
+            print("Megatron Response: ")
+            print(response.json()['text'][0])

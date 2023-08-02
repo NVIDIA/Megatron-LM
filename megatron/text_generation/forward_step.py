@@ -1,17 +1,4 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Forward step utilities."""
 
@@ -19,9 +6,8 @@ from collections.abc import Iterable
 
 import torch
 
-from megatron import (
-    get_args,
-    mpu)
+from megatron import get_args
+from megatron.core import mpu
 from .communication import (
     send_to_next_pipeline_rank,
     recv_from_prev_pipeline_rank_)
@@ -42,7 +28,18 @@ class InferenceParams:
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
 
-
+    def swap_key_value_dict(self, batch_idx):
+        "swap between batches"
+        if len(self.key_value_memory_dict) == 0:
+            raise ValueError("should not swap when dict in empty")
+        
+        for layer_number in self.key_value_memory_dict.keys():
+            inference_key_memory, inference_value_memory = self.key_value_memory_dict[layer_number]
+            assert len(batch_idx) == inference_key_memory.shape[1] ## make sure batch size is the same
+            new_inference_key_memory = inference_key_memory[:, batch_idx]
+            new_inference_value_memory = inference_value_memory[:, batch_idx]
+            self.key_value_memory_dict[layer_number] = (
+                    new_inference_key_memory, new_inference_value_memory)
 
 class ForwardStep:
     """Forward step function with all the communications.
