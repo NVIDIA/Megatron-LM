@@ -12,8 +12,8 @@ TENSORBOARD_DIR=/workspace/logs
 IMAGE=gitlab-master.nvidia.com/dl/dgx/pytorch:21.12-py3-devel
 
 if [[ $USE_TE -eq 1 || $USE_CORE -eq 1 ]]; then
-  echo "Using container nvcr.io/nvidia/pytorch:23.04-py3 for running with TE ..."
-  IMAGE=nvcr.io/nvidia/pytorch:23.04-py3
+  echo "Using container nvcr.io/nvidia/pytorch:23.07-py3 for running with TE ..."
+  IMAGE=nvcr.io/nvidia/pytorch:23.07-py3
 fi
 
 srun --output $BASE_DIR/results/slurm-%j.out --error $BASE_DIR/results/slurm-%j.out --container-image $IMAGE --container-mounts $BASE_DIR/logs:/workspace/logs,$BASE_DIR/checkpoints:/workspace/checkpoints,$BUILD_DIR:/workspace/megatron-lm,$DATA_DIR:/workspace/data --no-container-mount-home bash -c "
