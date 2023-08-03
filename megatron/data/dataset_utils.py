@@ -527,6 +527,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     # Indexed dataset.
     indexed_dataset = get_indexed_dataset_(data_prefix,
                                            data_impl,
+                                           dataset_type,
                                            skip_warmup)
 
     # Get start and end indices of train/valid/train into doc-idx
@@ -601,6 +602,7 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
     if indexed_dataset is None:
         indexed_dataset = get_indexed_dataset_(data_prefix,
                                                data_impl,
+                                               dataset_type,
                                                skip_warmup)
 
     kwargs = dict(
@@ -618,6 +620,7 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
         title_dataset = get_indexed_dataset_(
             args.titles_data_path,
             data_impl,
+            dataset_type,
             skip_warmup)
 
         dataset = ICTDataset(
@@ -664,14 +667,16 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
     return dataset
 
 
-def get_indexed_dataset_(data_prefix, data_impl, skip_warmup):
+def get_indexed_dataset_(data_prefix, data_impl, dataset_type, skip_warmup):
 
     print_rank_0(' > building dataset index ...')
 
     start_time = time.time()
+    multimodal = dataset_type == DSET_TYPE_MULTIMODAL
     indexed_dataset = make_indexed_dataset(data_prefix,
                                            data_impl,
-                                           skip_warmup)
+                                           skip_warmup,
+                                           multimodal)
     assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
     print_rank_0(' > finished creating indexed dataset in {:4f} '
                  'seconds'.format(time.time() - start_time))

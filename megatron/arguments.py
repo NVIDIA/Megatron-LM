@@ -377,6 +377,7 @@ def validate_args(args, defaults={}):
 
     # Normalization args
     if args.normalization == "RMSNorm":
+        assert args.transformer_impl in ["transformer_engine", "megatron_core"], "TransformerEngine is required for RMSNorm."
         import transformer_engine as te
         assert hasattr(te.pytorch, "RMSNorm"), "Transformer-Engine v0.11 required to use this feature"
 
@@ -459,7 +460,7 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-interval', type=int, default=1,
                         help='Scaling update interval for fp8', dest='fp8_interval')
     group.add_argument('--transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
+                       choices=['local', 'transformer_engine', 'megatron_core'],
                        help='Which Transformer implementation to use.',
                        dest='transformer_impl')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,

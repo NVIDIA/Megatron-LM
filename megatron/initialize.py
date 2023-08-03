@@ -211,6 +211,7 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                args.fp8_e4m3 or args.fp8_hybrid,
             )
             if args.rank == 0:
                 print(
