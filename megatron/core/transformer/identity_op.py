@@ -11,7 +11,4 @@ class IdentityOp(torch.nn.Module):
         super(IdentityOp, self).__init__()
 
     def forward(self, x, *args, **kwargs):
-        if isinstance(x, (tuple, list)):
-            return x[0]
-        else:
             return x
