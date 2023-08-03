@@ -784,10 +784,10 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
+            setattr(self.bias, 'expert_parallel', self.is_expert)
+            setattr(self.bias, 'sequence_parallel', sequence_parallel_enabled)
         else:
             self.register_parameter('bias', None)
-        setattr(self.bias, 'expert_parallel', self.is_expert)
-        setattr(self.bias, 'sequence_parallel', sequence_parallel_enabled)
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
