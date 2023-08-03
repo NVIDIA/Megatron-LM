@@ -375,6 +375,11 @@ def validate_args(args, defaults={}):
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
 
+    # Normalization args
+    if args.normalization == "RMSNorm":
+        import transformer_engine as te
+        assert hasattr(te.pytorch, "RMSNorm"), "Transformer-Engine v0.11 required to use this feature"
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'

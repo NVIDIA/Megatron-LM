@@ -8,29 +8,6 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-
-class TELayerNorm(te.pytorch.LayerNorm):
-    """
-    Wrapper for the Transformer-Engine's `LayerNorm`.
-    """
-
-    def __init__(
-        self, hidden_size: int, eps: float = 1e-5, sequence_parallel: bool = False, **kwargs
-    ):
-        super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
-
-
-class TERMSNorm(te.pytorch.RMSNorm):
-    """
-    Wrapper for the Transformer-Engine's `RMSNorm`.
-    """
-
-    def __init__(
-        self, hidden_size: int, eps: float = 1e-5, sequence_parallel: bool = False, **kwargs
-    ):
-        super().__init__(hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel)
-
-
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
