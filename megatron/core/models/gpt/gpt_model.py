@@ -144,7 +144,7 @@ class GPTModel(MegatronModule):
         rotary_pos_emb = None
         if self.rotary_pos_emb is not None:
             if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_len
+                rotary_seq_len = inference_params.max_sequence_length
             else:
                 rotary_seq_len = min(self.max_sequence_length, decoder_input.size(0))
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
