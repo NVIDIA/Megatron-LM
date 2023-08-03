@@ -43,7 +43,8 @@ def build_tokenizer(args):
     elif args.tokenizer_type == "OpenGPTX-PretrainedHFTokenizer":
         tokenizer = PretrainedHFTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
     elif args.tokenizer_type == "OpenGPTX-SPTokenizer":
-        tokenizer = SPTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
+        #tokenizer = SPTokenizer.instantiate_from_file_or_name(model_file_or_name=args.tokenizer_model)
+        tokenizer = _GPTXSentencePieceTokenizer(args.tokenizer_model)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
@@ -539,3 +540,83 @@ class _NullTokenizer:
     @property
     def additional_special_tokens_ids(self):
         return None
+
+
+class _GPTXSentencePieceTokenizer(AbstractTokenizer):
+    def __init__(self, model_file):
+        name = 'OpenGPTX-SPTokenizer'
+        super().__init__(name)
+
+        import sentencepiece
+        self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
+        self._initalize()
+
+    def _populate_vocab(self):
+        self._vocab = {}
+        self._inv_vocab = {}
+
+        for i in range(len(self.tokenizer)):
+            t = self.tokenizer.id_to_piece(i)
+            self._inv_vocab[i] = t
+            self._vocab[t] = i
+
+    def _initalize(self):
+        self._populate_vocab()
+        self._eod_id = self._vocab['<eod>']
+
+
+    @property
+    def vocab_size(self):
+        return len(self._vocab)
+
+    @property
+    def vocab(self):
+        return self._vocab
+
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
+
+    @property
+    def decoder(self):
+        return self._inv_vocab
+
+    @property
+    def encoder(self):
+        return self._vocab
+
+    def tokenize(self, text):
+
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, ids):
+
+        return self.tokenizer.decode(ids)
+
+    @property
+    def pad(self):
+        return self._pad_id
+
+    @property
+    def bos_token_id(self):
+        return self._bos_id
+
+    @property
+    def bos(self):
+        return self._bos_id
+
+    @property
+    def eod(self):
+        return self._eod_id
+
+    @property
+    def eos_token_id(self):
+        return self._eos_id
+
+    @property
+    def eos(self):
+        return self._eos_id
+
+    @property
+    def mask(self):
+        return self._mask_id

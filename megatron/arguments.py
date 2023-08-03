@@ -1111,7 +1111,9 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'OpenGPTX-SPTokenizer',
+                                'OpenGPTX-HFTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece/OpenGPT-X tokenizer model or name.')

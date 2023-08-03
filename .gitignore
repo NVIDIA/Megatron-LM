@@ -6,3 +6,5 @@ build
 *~
 slurm*
 logs
+.vscode/
+apex/

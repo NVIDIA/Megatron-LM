@@ -31,7 +31,7 @@ def detokenize_generations(tokens_gpu_tensor,
             words = []
             for token in sequence_tokens:
                 if args.tokenizer_type in ['SentencePieceTokenizer', 
-                        'GPTSentencePieceTokenizer']:
+                        'GPTSentencePieceTokenizer', 'OpenGPTX-SPTokenizer']:
                     word = tokenizer.decoder[token]
                 elif args.tokenizer_type == 'NullTokenizer':
                     word = str(token)
@@ -94,13 +94,19 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
           into a 2D tensor.
     """
 
-    # Tokenize all the prompts.
     tokenizer = get_tokenizer()
-    if add_BOS:
-        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt)
-                          for prompt in prompts]
-    else:
-        prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
+    if isinstance(prompts[0], str):
+        # Tokenize all the prompts.
+        if add_BOS:
+            prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt) for prompt in prompts]
+        else:
+            prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]
+    elif isinstance(prompts[0], list):
+        # Prompts are already tokenized
+        if add_BOS:
+            prompts_tokens = [[tokenizer.eod] + prompt for prompt in prompts]
+        else:
+            prompts_tokens = prompts
 
     # Now we have a list of list of tokens which each list has a different
     # size. We want to extend this list to:
