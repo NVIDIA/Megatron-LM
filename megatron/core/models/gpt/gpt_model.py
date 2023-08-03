@@ -157,10 +157,6 @@ class GPTModel(MegatronModule):
             rotary_pos_emb=rotary_pos_emb,
         )
 
-        # Advance inference sequence offset.
-        if inference_params is not None:
-            inference_params.sequence_len_offset += hidden_states.size(0)
-
         if not self.post_process:
             return hidden_states
 
