@@ -18,7 +18,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
-
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region_to_moe, reduce_scatter_to_sequence_parallel_region_from_moe
 try:
     from einops import rearrange
 except ImportError:
@@ -177,7 +177,7 @@ class SwitchMLP(MegatronModule):
   
         self.local_experts = torch.nn.ModuleList()
         for i in range(self.num_local_experts):
-            self.local_experts.append(ParallelMLP(init_method, output_layer_init_method, is_expert=True))
+            self.local_experts.append(ParallelMLP(config, is_expert=True))
 
     def gather_indices(self, local_indices):
         """ Gather tensors and concatinate along the first dimension."""
@@ -216,8 +216,7 @@ class SwitchMLP(MegatronModule):
         # TODO (rprenger) TODO this could be made easier to read
         # Converting [s, b, h] to [s*b, h].
         # Each vector could be routed differently
-        global_hidden_states = \
-            mpu.gather_from_sequence_parallel_region_to_moe(hidden_states)
+        global_hidden_states = gather_from_sequence_parallel_region_to_moe(hidden_states)
         global_indices = self.gather_indices(max_ind)
         output_total = torch.zeros_like(global_hidden_states)
         output_bias_total = torch.zeros_like(global_hidden_states)
@@ -226,22 +225,25 @@ class SwitchMLP(MegatronModule):
             local_indices = (global_indices == local_expert_index).nonzero()
             hidden = global_hidden_states[local_indices, :]
             output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
             output_total[local_indices, :] = output
-            output_bias_total[local_indices, :] = output_bias
-
-        output_total = \
-            mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
-        output_bias_total = \
-            mpu.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
-
-        # bias is duplicated across tensor parallelism ranks; reduce scatter reduces bias across tensor parallel_ranks
-        output_bias_total = output_bias_total/mpu.get_tensor_model_parallel_world_size()
-
+            if output_bias is not None:
+                output_bias = output_bias.expand_as(output)
+                output_bias_total[local_indices, :] = output_bias
+        
+        output_total = reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
         output_total = output_total*max_prob
-        output_bias_total = output_bias_total*max_prob
         output_total = output_total.view(s, b, h)
-        output_bias_total = output_bias_total.view(s, b, h)
+       
+        if output_bias is not None:
+            output_bias_total = reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+            
+            # bias is duplicated across tensor parallelism ranks; reduce scatter reduces bias across tensor parallel_ranks
+            output_bias_total = output_bias_total/mpu.get_tensor_model_parallel_world_size()
+            output_bias_total = output_bias_total*max_prob
+            output_bias_total = output_bias_total.view(s, b, h)
+        else:
+            output_bias_total = None
+
         return output_total, output_bias_total
 
 

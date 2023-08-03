@@ -16,6 +16,8 @@ from .mappings import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region_to_moe,
+    reduce_scatter_to_sequence_parallel_region_from_moe,
 )
 from .random import checkpoint, get_cuda_rng_tracker, model_parallel_cuda_manual_seed
 from .utils import (
@@ -53,4 +55,6 @@ __all__ = [
     "split_tensor_along_last_dim",
     "split_tensor_into_1d_equal_chunks",
     "gather_split_1d_tensor",
+    "gather_from_sequence_parallel_region_to_moe",
+    "reduce_scatter_to_sequence_parallel_region_from_moe",
 ]
