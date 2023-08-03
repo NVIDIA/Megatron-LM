@@ -268,7 +268,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Disallow training and inference with Transformer Engine
     # for non-GPT models
     args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
-    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+    assert args.allow_transformer_engine or args.transformer_impl in ['local', 'megatron_core'], \
         'Transformer Engine is only approved for GPT models'
 
     # Set tensor model parallel attributes if not set.
@@ -863,7 +863,7 @@ def evaluate(forward_step_func,
                             key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += eval_batch_size
-        
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
