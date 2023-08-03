@@ -11,4 +11,4 @@ class IdentityOp(torch.nn.Module):
         super(IdentityOp, self).__init__()
 
     def forward(self, x, *args, **kwargs):
-            return x
+        return x

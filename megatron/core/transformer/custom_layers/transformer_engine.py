@@ -8,6 +8,7 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
