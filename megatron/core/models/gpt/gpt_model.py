@@ -132,6 +132,8 @@ class GPTModel(MegatronModule):
         labels: Tensor = None,
         inference_params=None,
     ):
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
         # Decoder embedding.
         if decoder_input is not None:
