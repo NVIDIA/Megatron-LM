@@ -28,6 +28,9 @@ class TENorm:
                 hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
             )
         elif normalization == "RMSNorm":
+            assert hasattr(
+                te.pytorch, "RMSNorm"
+            ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
                 hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
             )

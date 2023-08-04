@@ -375,12 +375,6 @@ def validate_args(args, defaults={}):
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
 
-    # Normalization args
-    if args.normalization == "RMSNorm":
-        assert args.transformer_impl in ["transformer_engine", "megatron_core"], "TransformerEngine is required for RMSNorm."
-        import transformer_engine as te
-        assert hasattr(te.pytorch, "RMSNorm"), "Transformer-Engine v0.11 required to use this feature"
-
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -460,7 +454,7 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-interval', type=int, default=1,
                         help='Scaling update interval for fp8', dest='fp8_interval')
     group.add_argument('--transformer-impl', default='local',
-                       choices=['local', 'transformer_engine', 'megatron_core'],
+                       choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.',
                        dest='transformer_impl')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,
