@@ -128,12 +128,15 @@ class GPTModel(MegatronModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params=None,
     ):
 
         # Decoder embedding.
-        if self.pre_process:
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
