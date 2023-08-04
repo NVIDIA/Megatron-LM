@@ -116,7 +116,7 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size, key.dtype)
-            inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size, value.dtype)
+            inference_value_memory = self._allocate_memory(inf_max_seq_length, inf_max_batch_size, value.dtype)
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
                 inference_value_memory,
