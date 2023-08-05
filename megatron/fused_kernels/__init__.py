@@ -25,9 +25,18 @@ def load(args):
         if int(bare_metal_major) >= 11:
             cc_flag.append('-gencode')
             cc_flag.append('arch=compute_80,code=sm_80')
-            if int(bare_metal_minor) >= 7:
+            if int(bare_metal_minor) >= 1:
                 cc_flag.append('-gencode')
-                cc_flag.append('arch=compute_90,code=sm_90')
+                cc_flag.append('arch=compute_86,code=sm_86')
+            if int(bare_metal_minor) >= 4:
+                cc_flag.append('-gencode')
+                cc_flag.append('arch=compute_87,code=sm_87')
+            if int(bare_metal_minor) >= 8:
+                cc_flag.append('-gencode')
+                cc_flag.append('arch=compute_89,code=sm_89')
+        if int(bare_metal_major) >= 12:
+            cc_flag.append('-gencode')
+            cc_flag.append('arch=compute_90,code=sm_90')
 
     # Build path
     srcpath = pathlib.Path(__file__).parent.absolute()
