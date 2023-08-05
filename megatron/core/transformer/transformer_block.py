@@ -248,6 +248,7 @@ class TransformerBlock(MegatronModule):
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
+                        inference_params=inference_params,
                     )
 
         # Final layer norm.

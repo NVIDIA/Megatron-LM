@@ -148,9 +148,10 @@ class GPTModel(MegatronModule):
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.rotary_pos_emb is not None:
-            rotary_seq_len = self.max_sequence_length
             if inference_params is not None:
                 rotary_seq_len = inference_params.max_sequence_length
+            else:
+                rotary_seq_len = min(self.max_sequence_length, decoder_input.size(0))
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
