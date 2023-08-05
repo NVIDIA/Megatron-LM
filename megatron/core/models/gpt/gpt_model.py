@@ -128,12 +128,17 @@ class GPTModel(MegatronModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params=None,
     ):
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
         # Decoder embedding.
-        if self.pre_process:
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
