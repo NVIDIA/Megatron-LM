@@ -51,10 +51,10 @@ def get_linear_layer(rows, columns, init_method, gather_params_on_init=False):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
     if get_args().perform_initialization:
-        with GatheredParameters(layer.weight, modifier_rank=0, enable=gather_params_on_init):
+        with GatheredParameters(layer.weight, modifier_rank=0, enabled=gather_params_on_init):
             init_method(layer.weight)
     with torch.no_grad():
-        with GatheredParameters(layer.bias, modifier_rank=0, enable=gather_params_on_init):
+        with GatheredParameters(layer.bias, modifier_rank=0, enabled=gather_params_on_init):
             layer.bias.zero_()
     return layer
 
