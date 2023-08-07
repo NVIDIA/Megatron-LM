@@ -84,15 +84,15 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
-            inference_max_sequence_len,
+            inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
             self.hidden_size_per_attention_head,
-            dtype=self.params_dtype,
+            dtype=dtype,
             device=torch.cuda.current_device(),
         )
 
@@ -113,10 +113,14 @@ class Attention(MegatronModule, ABC):
         # =================================================
         is_first_step = False
         if self.layer_number not in inference_params.key_value_memory_dict:
-            inf_max_seq_len = inference_params.max_sequence_len
+            inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
-            inference_key_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
-            inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
+            inference_key_memory = self._allocate_memory(
+                inf_max_seq_length, inf_max_batch_size, key.dtype
+            )
+            inference_value_memory = self._allocate_memory(
+                inf_max_seq_length, inf_max_batch_size, value.dtype
+            )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
                 inference_value_memory,

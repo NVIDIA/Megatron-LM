@@ -491,7 +491,7 @@ class TransformerLanguageModel(MegatronModule):
         if self.use_rotary_position_embeddings:
             if inference_params is not None:
                 rotary_pos_emb = \
-                    self.rotary_pos_emb(inference_params.max_sequence_len)
+                    self.rotary_pos_emb(inference_params.max_sequence_length)
             else:
                 rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 

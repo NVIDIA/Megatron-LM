@@ -544,7 +544,7 @@ class ParallelAttention(MegatronModule):
         is_first_step = False
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
+                inf_max_seq_len = inference_params.max_sequence_length
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(
                     inf_max_seq_len, inf_max_batch_size,

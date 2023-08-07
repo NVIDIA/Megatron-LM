@@ -95,6 +95,7 @@ class Encoder(object):
                     sentence_lens.append(len(sentence_ids))
             if len(doc_ids) > 0 and self.args.append_eod:
                 doc_ids.append(Encoder.tokenizer.eod)
+                sentence_lens[-1] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
         return ids, lens, len(json_line)
