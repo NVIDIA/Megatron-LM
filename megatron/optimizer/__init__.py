@@ -89,7 +89,7 @@ def get_megatron_optimizer(model,
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = False
-    if args.DDP_impl == 'local':
+    if args.DDP_impl in ['local', 'overlapping-local']:
         params_have_main_grad = True
 
     # Mixed precision optimizer.

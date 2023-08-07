@@ -34,6 +34,7 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model.distributed import OverlappingDistributedDataParallel as OverlappingLocalDDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
@@ -312,6 +313,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if args.data_parallel_random_init:
                 for model_module in model:
                     model_module.broadcast_params()
+
+        elif args.DDP_impl == 'overlapping-local':
+            model = [OverlappingLocalDDP(model_module,
+                                         mpu.get_data_parallel_group(),
+                                         args.accumulate_allreduce_grads_in_fp32)
+                     for model_module in model]
+            config = get_model_config(model[0])
+            config.no_sync_func = model[0].is_not_last_microbatch
         else:
             raise NotImplementedError('Unknown DDP implementation specified: '
                                       '{}. Exiting.'.format(args.DDP_impl))
@@ -379,7 +388,7 @@ def setup_model_and_optimizer(model_provider_func,
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, Float16Module))
+                                   (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
 
     optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
@@ -417,7 +426,7 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
+    if args.DDP_impl in ['local', 'overlapping-local'] and args.use_contiguous_buffers_in_local_ddp:
         for partition in model:
             partition.zero_grad_buffer()
     optimizer.zero_grad()
@@ -456,7 +465,7 @@ def train_step(forward_step_func, data_iterator,
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
+                                       (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
@@ -471,7 +480,7 @@ def train_step(forward_step_func, data_iterator,
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
+                                       (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.

@@ -14,6 +14,7 @@ from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
 from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model.distributed import OverlappingDistributedDataParallel as OverlappingLocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
@@ -217,11 +218,11 @@ class MegatronOptimizer(ABC):
             else:  # We do not support the interleaved schedule for T5 yet.
                 unwrapped_model = self.models[0]
             unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+                unwrapped_model, (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
 
             if unwrapped_model.share_embeddings_and_output_weights:
                 weight = unwrapped_model.shared_embedding_or_output_weight()
-                if args.DDP_impl == 'local':
+                if args.DDP_impl in ['local', 'overlapping-local']:
                     grad = weight.main_grad
                 else:
                     grad = weight.grad
@@ -240,7 +241,7 @@ class MegatronOptimizer(ABC):
                 args.pipeline_model_parallel_split_rank is not None:
             unwrapped_model = self.models[0]
             unwrapped_model = unwrap_model(
-                unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+                unwrapped_model, (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
             assert args.DDP_impl == 'local', \
                 'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
@@ -263,10 +264,10 @@ class MegatronOptimizer(ABC):
             grads = []
             for model_module in self.models:
                 unwrapped_model = unwrap_model( 
-                    model_module, (torchDDP, LocalDDP, Float16Module))
+                    model_module, (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
                 for param in unwrapped_model.parameters():
                     if getattr(param, 'sequence_parallel', False):
-                        grad = param.main_grad if args.DDP_impl == 'local' else param.grad
+                        grad = param.main_grad if args.DDP_impl in ['local', 'overlapping-local'] else param.grad
                         grads.append(grad.data)
             coalesced = _flatten_dense_tensors(grads)
             torch.distributed.all_reduce(
@@ -278,20 +279,20 @@ class MegatronOptimizer(ABC):
     def reduce_model_grads(self, args, timers):
         """All-reduce all grads, and all-reduce embeddings."""
 
-        # All-reduce layer-norm grads (for sequence parallelism).
-        timers('layernorm-grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        self.allreduce_layernorm_grads(args)
-        timers('layernorm-grads-all-reduce').stop()
-
         # All-reduce if needed.
-        if args.DDP_impl == 'local':
+        if args.DDP_impl in ['local', 'overlapping-local']:
             timers('grads-all-reduce', log_level=1).start(
                 barrier=args.barrier_with_L1_time)
             for model in self.models:
                 model.allreduce_gradients()
             timers('grads-all-reduce').stop()
 
+        # All-reduce layer-norm grads (for sequence parallelism).
+        timers('layernorm-grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        self.allreduce_layernorm_grads(args)
+        timers('layernorm-grads-all-reduce').stop()
+            
         # All-reduce embedding grads.
         timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=args.barrier_with_L1_time)

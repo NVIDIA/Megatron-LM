@@ -415,7 +415,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
-            grad_weight = None
+
+            if hasattr(weight, 'grad_added_to_main_grad'):
+                grad_weight = torch.empty(
+                    weight.main_grad.shape, dtype=input.dtype,
+                    device=torch.cuda.current_device(), requires_grad=False)
+                weight.grad_added_to_main_grad = True
+            else:
+                grad_weight = None
         else:
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
