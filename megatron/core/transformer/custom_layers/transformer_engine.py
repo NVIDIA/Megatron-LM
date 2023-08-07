@@ -1,7 +1,9 @@
+from importlib.metadata import version
 from typing import Callable
 
 import torch
 import transformer_engine as te
+from pkg_resources import packaging
 
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -121,6 +123,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version >= packaging.version.Version("0.11.0"):
+            kwargs["normalization"] = self.config.normalization
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -133,7 +140,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             init_method=init_method,
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
-            normalization=self.config.normalization,
             return_bias=self.te_return_bias,
             **kwargs
         )
