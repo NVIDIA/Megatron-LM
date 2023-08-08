@@ -4,6 +4,7 @@ import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -33,7 +34,7 @@ class TransformerLayer(MegatronModule):
 
         # Layernorm on the input data.
         # TODO: add pytorch only layernorm
-        self.input_layernorm = IdentityOp(
+        self.input_layernorm = TENorm(
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -48,7 +49,7 @@ class TransformerLayer(MegatronModule):
         )
 
         # Layernorm on the attention output
-        self.post_self_attn_layernorm = IdentityOp(
+        self.post_self_attn_layernorm = TENorm(
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
