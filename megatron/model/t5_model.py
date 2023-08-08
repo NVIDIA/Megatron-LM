@@ -127,7 +127,7 @@ class T5Model(MegatronModule):
                                         enc_hidden_states=enc_hidden_states)
 
         if self.post_process and self.add_decoder:
-            decoder_output, encoder_output = lm_output
+            decoder_output, encoder_output, _, _ = lm_output
             # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
                                      self.shared_embedding_or_output_weight())
@@ -148,11 +148,9 @@ class T5Model(MegatronModule):
                 lm_loss = lm_loss.transpose(0,1).contiguous()
             return lm_loss
         elif self.add_decoder and not self.add_encoder:
-            decoder_output, encoder_output = lm_output
-            return decoder_output
-        else:
-            encoder_output = lm_output
-            return encoder_output
+            decoder_output, _, decoder_moe_losses, _= lm_output
+            return decoder_output, decoder_moe_losses
+        return lm_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,

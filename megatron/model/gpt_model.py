@@ -112,7 +112,7 @@ class GPTModel(MegatronModule):
                 # If got a None input, need to reset curriculum_seqlen on user side
                 args.curriculum_seqlen = args.seq_length
 
-        lm_output, *moe_losses = self.language_model(
+        lm_output, moe_losses = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
@@ -128,10 +128,7 @@ class GPTModel(MegatronModule):
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
 
-        if self.return_moe_loss:
-            return (lm_output, *moe_losses)
-        else:
-            return lm_output
+        return lm_output, moe_losses if self.return_moe_loss else lm_output
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
 

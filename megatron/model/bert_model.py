@@ -183,7 +183,7 @@ class BertModel(MegatronModule):
         )
 
         if self.post_process and self.add_binary_head:
-            lm_output, pooled_output = lm_output
+            lm_output, pooled_output, _ = lm_output
 
             # Return pooled output (e.g., when computing Bert embeddings).
             if self.return_embeddings:
@@ -206,12 +206,14 @@ class BertModel(MegatronModule):
             pooled_output = None
 
         if self.post_process:
+            lm_output = lm_output if self.add_binary_head else lm_output[0]
             return post_language_model_processing(lm_output, pooled_output,
                                                   self.lm_head, self.binary_head,
                                                   lm_labels,
                                                   self.shared_embedding_or_output_weight(),
                                                   self.fp16_lm_cross_entropy)
-        return lm_output
+        else:
+            return lm_output
 
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
