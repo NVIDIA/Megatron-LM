@@ -3,6 +3,15 @@ This folder includes details about the recent sync with the NVIDIA/Megatron-LM r
 
 We also created a [backup branch](https://github.com/microsoft/Megatron-DeepSpeed/tree/before_rebase) which is the version before this sync. This branch is just for comparison tests and for temporary use when debugging the main branch. We do not plan to continue supporting the version before sync.
 
+## List of rebase efforts/achievements
+* Enabling Megatron-LM's sequence parallel.
+* Enabling rotary positional embedding.
+* Enabling FlashAttention v1 and v2.
+* Fix the conflicts related to activation checkpointing when DeepSpeed is used with the newest Megatron-LM since NVIDIA introduced some new fine-grained partial checkpointing techniques which DeepSpeed is currently not compatible.
+* Major refactor to DeepSpeed pipeline parallelism implementation for GPT model in order to work with newest Megatron-LM.
+* Fix model checkpoint save/load when DeepSpeed is used with the newest Megatron-LM.
+* Fully verified the performance and correctness of GPT pretraining after rebasing.
+
 ## Test environment
 We used 128 V100 GPUs (8 DGX-2 nodes, 16 GPU per node, inter-node network is InfiniBand with around 660 Gbps measured bandwidth) for the tests. For software, we used DeepSpeed v0.9.5.
 
