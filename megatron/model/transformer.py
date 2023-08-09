@@ -282,8 +282,12 @@ class CoreAttention(MegatronModule):
                 key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
                 beta=0.0, alpha=(1.0/self.norm_factor))
         else:
-            matmul_result = alibi[
-                :output_size[0]*output_size[1], :, :output_size[3]]
+            assert output_size[1] == alibi.size(1), \
+                'number of query heads does not match ALiBi tensor.'
+            matmul_result = alibi[..., :output_size[2], :output_size[3]].expand(
+                output_size[0], -1, -1, -1)
+            matmul_result = matmul_result.reshape(
+                output_size[0] * output_size[1], -1, output_size[3])
 
             if self.apply_query_key_layer_scaling:
                 beta = 1.0 / self.layer_number
@@ -1232,7 +1236,7 @@ class ParallelTransformerLayer(MegatronModule):
         # Copied from bigscience-workshop/Megatron-DeepSpeed
         # Based on https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
         """Returns tensor shaped
-        (batch_size * num_attention_heads, 1, max_seq_len).
+        (1, num_attention_heads_per_partition, 1, max_seq_len),
         """
 
         def get_slopes(n):
@@ -1265,7 +1269,7 @@ class ParallelTransformerLayer(MegatronModule):
         tp_index = mpu.get_tensor_model_parallel_rank()
         alibi = alibi.reshape((tp_world_size, -1, *alibi.shape[1:]))[tp_index]
 
-        alibi = alibi.repeat(batch_size, 1, 1)
+        alibi = alibi.unsqueeze(0)
         return alibi
 
 
