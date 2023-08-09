@@ -16,6 +16,7 @@ from megatron.model import LayerNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
+from megatron.model.t5_glu import T5SwiGLU
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
@@ -88,15 +89,25 @@ class ParallelMLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            config.hidden_size,
-            ffn_hidden_size,
-            config=config,
-            init_method=config.init_method,
-            bias=self.add_bias,
-            gather_output=False,
-            skip_bias_add=True,
-        )
+        if args.t5_swiglu:
+            self.dense_h_to_4h = T5SwiGLU(
+                config.hidden_size,
+                ffn_hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=self.add_bias,
+                gather_output=False,
+            )
+        else:
+            self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+                config.hidden_size,
+                ffn_hidden_size,
+                config=config,
+                init_method=config.init_method,
+                bias=self.add_bias,
+                gather_output=False,
+                skip_bias_add=True,
+            )
 
         self.bias_gelu_fusion = False
         self.activation_func = None
@@ -111,6 +122,8 @@ class ParallelMLP(MegatronModule):
                 x = torch.chunk(x, 2, dim=-1)
                 return F.silu(x[0]) * x[1]
             self.activation_func = swiglu
+        elif args.t5_swiglu:
+            self.activation_func = torch.nn.Identity()
         elif args.squared_relu:
             def squared_relu(x):
                 return torch.pow(F.relu(x), 2)

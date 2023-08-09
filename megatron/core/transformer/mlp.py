@@ -8,6 +8,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
     TERowParallelLinear,
+    TET5GLU,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -40,24 +41,34 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = TEColumnParallelLinear(
-            self.config.hidden_size,
-            ffn_hidden_size,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=self.config.add_bias_linear,
-            skip_bias_add=True,
-        )
-
-        if self.config.gated_linear_unit:
-
-            def glu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
-
-            self.activation_func = glu
+        if self.config.t5_gated_linear_unit:
+            self.linear_fc1 = TET5GLU(
+                self.config.hidden_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+            )
+            self.activation_func = torch.nn.Identity()
         else:
-            self.activation_func = self.config.activation_func
+            self.linear_fc1 = TEColumnParallelLinear(
+                self.config.hidden_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+            )
+
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                self.activation_func = glu
+            else:
+                self.activation_func = self.config.activation_func
 
         self.linear_fc2 = TERowParallelLinear(
             self.config.ffn_hidden_size,

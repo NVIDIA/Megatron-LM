@@ -251,6 +251,8 @@ def validate_args(args, defaults={}):
     if args.ffn_hidden_size is None:
         args.ffn_hidden_size = 4 * args.hidden_size
 
+    assert not (args.swiglu and args.t5_swiglu), \
+        'cannot have both `--swiglu` and `--t5-swiglu` active'
     if args.swiglu:
         # reduce the dimnesion for MLP since projections happens on
         # two linear layers. this keeps the number of paramters in
@@ -431,6 +433,10 @@ def core_transformer_config_from_args(args):
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
+    if args.t5_swiglu:
+        kw_args['activation_func'] = torch.nn.Identity()
+        kw_args['t5_gated_linear_unit'] = True
+        kw_args['bias_gelu_fusion'] = False
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -606,6 +612,11 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--t5-swiglu', action='store_true',
+                       help='Use correctly implemented gated linear units and '
+                       'SiLU activation instead of the default GELU. '
+                       '`--ffn-hidden-size` will not automatically be '
+                       'adjusted to normalize the parameter count.')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with '
                        'Torch ONNX exporter')

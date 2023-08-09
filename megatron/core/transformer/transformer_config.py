@@ -41,6 +41,8 @@ class TransformerConfig(ModelParallelConfig):
                                 in MLP layer). Default is True.
 
         gated_linear_unit (bool): Use a gated linear unit for the first linear layer in the MLP. Defaults to False.
+        t5_gated_linear_unit (bool): Use a correctly implemented gated linear unit for the
+                                     first linear layer in the MLP. Defaults to False.
 
         activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
 
@@ -135,6 +137,7 @@ class TransformerConfig(ModelParallelConfig):
     layernorm_zero_centered_gamma: bool = False
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
+    t5_gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
 
     # initialization

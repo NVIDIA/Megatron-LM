@@ -6,6 +6,7 @@ import transformer_engine as te
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -141,3 +142,35 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             **kwargs
         )
+
+
+class TET5GLU(MegatronModule):
+    """
+    Correctly implemented GLU using Transformer Engine's `Linear` layer and
+    specialized similar to megatron's `ColumnParallelLinear` layer.
+    """
+
+    def __init__(
+            self, input_size: int, output_size: int, config: TransformerConfig, **kwargs
+    ):
+        super().__init__()
+
+        # TODO These do not accept the `gather_output` parameter. Does
+        #      TransformerEngine gather outputs by default?
+        self.linear = TEColumnParallelLinear(
+            input_size,
+            output_size,
+            config=config,
+            **kwargs,
+        )
+        self.nonlinear = TEColumnParallelLinear(
+            input_size,
+            output_size,
+            config=config,
+            **kwargs,
+        )
+        self.activation_fn = self.config.activation_func
+
+    def forward(self, x):
+        output = self.linear(x)[0] * self.activation_fn(self.nonlinear(x)[0])
+        return output, None
