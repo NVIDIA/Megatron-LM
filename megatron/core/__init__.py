@@ -1,6 +1,6 @@
-import megatron.core.parallel_state
-import megatron.core.tensor_parallel
-import megatron.core.utils
+from megatron.core import parallel_state
+from megatron.core import tensor_parallel
+from megatron.core import utils
 
 from .inference_params import InferenceParams
 from .model_parallel_config import ModelParallelConfig
