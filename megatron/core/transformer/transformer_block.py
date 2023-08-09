@@ -14,6 +14,18 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_viewless_tensor
 
 
+def _get_layernorm(config: TransformerConfig):
+    extra_kwargs = {}
+    if config.normalization == 'LayerNorm':
+        layernorm_cls = FusedLayerNorm
+        extra_kwargs['persist_layer_norm'] = config.persist_layer_norm
+    elif config.normalization == 'RMSNorm':
+        layernorm_cls = FusedRMSNorm
+    else:
+        raise ValueError(f'unknown normalization "{config.normalization}"')
+    return layernorm_cls, extra_kwargs
+
+
 class TransformerBlock(MegatronModule):
     """Transformer class."""
 
@@ -114,13 +126,15 @@ class TransformerBlock(MegatronModule):
         #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
 
         if self.post_process and self.post_layer_norm:
+            layernorm_cls, extra_kwargs = _get_layernorm(self.config)
+
             # Final layer norm before output.
-            self.final_layernorm = FusedLayerNorm(
+            self.final_layernorm = layernorm_cls(
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
                 sequence_parallel=self.config.sequence_parallel,
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
             )
 
     def _get_layer(self, layer_number):

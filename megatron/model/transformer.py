@@ -12,7 +12,7 @@ from megatron import get_timers, get_args, get_retro_args, core, get_num_microba
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, RMSNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -46,6 +46,20 @@ except ImportError:
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
+
+
+def _get_layernorm(config):
+    layernorm_extra_kwargs = {}
+    if config.normalization == 'LayerNorm':
+        layernorm_cls = LayerNorm
+        layernorm_extra_kwargs['no_persist_layer_norm'] = \
+            not config.persist_layer_norm
+    elif config.normalization == 'RMSNorm':
+        layernorm_cls = RMSNorm
+    else:
+        raise ValueError(f'unknown normalization "{config.normalization}"')
+    return layernorm_cls, layernorm_extra_kwargs
+
 
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample
@@ -769,13 +783,15 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = config.bf16
         self.fp32_residual_connection = config.fp32_residual_connection
 
+        layernorm_cls, layernorm_extra_kwargs = _get_layernorm(config)
+
         # Layernorm on the input data.
-        self.input_layernorm = LayerNorm(
+        self.input_layernorm = layernorm_cls(
             config.hidden_size,
             eps=config.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm,
             sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            **layernorm_extra_kwargs)
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -788,12 +804,12 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
+        self.post_attention_layernorm = layernorm_cls(
             config.hidden_size,
             eps=config.layernorm_epsilon,
-            no_persist_layer_norm=not config.persist_layer_norm,
             sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+            apply_layernorm_1p=args.apply_layernorm_1p,
+            **layernorm_extra_kwargs)
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,
@@ -805,12 +821,12 @@ class ParallelTransformerLayer(MegatronModule):
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
-            self.post_inter_attention_layernorm = LayerNorm(
+            self.post_inter_attention_layernorm = layernorm_cls(
                 config.hidden_size,
                 eps=config.layernorm_epsilon,
-                no_persist_layer_norm=not config.persist_layer_norm,
                 sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+                apply_layernorm_1p=args.apply_layernorm_1p,
+                **layernorm_extra_kwargs)
 
         # MLP
         if args.num_experts is not None:
@@ -1491,13 +1507,15 @@ class ParallelTransformer(MegatronModule):
                     layer.hidden_dropout = args.retro_encoder_hidden_dropout
 
         if self.post_process and self.post_layer_norm:
+            layernorm_cls, layernorm_extra_kwargs = _get_layernorm(config)
+
             # Final layer norm before output.
-            self.final_layernorm = LayerNorm(
+            self.final_layernorm = layernorm_cls(
                 config.hidden_size,
                 eps=config.layernorm_epsilon,
-                no_persist_layer_norm=args.no_persist_layer_norm,
                 sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
+                apply_layernorm_1p=args.apply_layernorm_1p,
+                **layernorm_extra_kwargs)
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

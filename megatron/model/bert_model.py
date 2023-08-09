@@ -9,7 +9,7 @@ from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, RMSNorm
 from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
@@ -65,9 +65,15 @@ class BertLMHead(MegatronModule):
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
-        self.layernorm = LayerNorm(hidden_size,
-                                   eps=config.layernorm_epsilon,
-                                   sequence_parallel=config.sequence_parallel)
+        if config.normalization == 'LayerNorm':
+            layernorm_cls = LayerNorm
+        elif config.normalization == 'RMSNorm':
+            layernorm_cls = RMSNorm
+        else:
+            raise ValueError(f'unknown normalization "{config.normalization}"')
+        self.layernorm = layernorm_cls(hidden_size,
+                                       eps=config.layernorm_epsilon,
+                                       sequence_parallel=config.sequence_parallel)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
