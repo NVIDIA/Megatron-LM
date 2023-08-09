@@ -4,23 +4,23 @@ import pytest
 
 import torch
 
-from megatron.core.transformer.parallel_attention import ParallelAttention
+from megatron.core.transformer.attention import SelfAttention
 
 
 @pytest.fixture
 def parallel_attention(transformer_config):
-    return ParallelAttention(transformer_config)
+    return SelfAttention(transformer_config)
 
 
 @pytest.fixture
 def checkpointed_parallel_attention(transformer_config):
     transformer_config.recompute_granularity = 'selective'
-    return ParallelAttention(transformer_config)
+    return SelfAttention(transformer_config)
 
 
 class TestParallelAttention:
     def test_constructor(self, parallel_attention):
-        assert isinstance(parallel_attention, ParallelAttention)
+        assert isinstance(parallel_attention, SelfAttention)
         assert parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in parallel_attention.parameters()])

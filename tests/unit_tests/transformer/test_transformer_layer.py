@@ -6,17 +6,17 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.parallel_transformer_layer import ParallelTransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 @pytest.fixture
 def parallel_transformer_layer(transformer_config):
-    return ParallelTransformerLayer(transformer_config)
+    return TransformerLayer(transformer_config)
 
 
 class TestParallelTransformerLayer:
     def test_constructor(self, parallel_transformer_layer):
-        assert isinstance(parallel_transformer_layer, ParallelTransformerLayer)
+        assert isinstance(parallel_transformer_layer, TransformerLayer)
         assert parallel_transformer_layer.layer_number == 1
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])

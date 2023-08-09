@@ -5,28 +5,28 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.parallel_transformer_layer import ParallelTransformerLayer
-from megatron.core.transformer.parallel_transformer_block import ParallelTransformerBlock
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_block import TransformerBlock
 
 
 @pytest.fixture
 def parallel_transformer_block(transformer_config):
-    return ParallelTransformerBlock(transformer_config)
+    return TransformerBlock(transformer_config)
 
 
 class TestParallelTransformerBlock:
-    def test_constructor(self, parallel_transformer_block: ParallelTransformerBlock):
-        assert isinstance(parallel_transformer_block, ParallelTransformerBlock)
+    def test_constructor(self, parallel_transformer_block: TransformerBlock):
+        assert isinstance(parallel_transformer_block, TransformerBlock)
         num_weights = sum([p.numel() for p in parallel_transformer_block.parameters()])
         assert num_weights == 3792
         assert parallel_transformer_block.num_layers_per_pipeline_rank == 2
         assert len(parallel_transformer_block.layers) == 2
-        layer_0: ParallelTransformerLayer = parallel_transformer_block._get_layer(0)
+        layer_0: TransformerLayer = parallel_transformer_block._get_layer(0)
         assert layer_0.layer_number == 1
-        layer_1: ParallelTransformerLayer = parallel_transformer_block._get_layer(1)
+        layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
         assert layer_1.layer_number == 2
 
-    def test_gpu_forward(self, parallel_transformer_block: ParallelTransformerBlock):
+    def test_gpu_forward(self, parallel_transformer_block: TransformerBlock):
         config: TransformerConfig = parallel_transformer_block.config
 
         sequence_length = 32
@@ -49,7 +49,7 @@ class TestParallelTransformerBlock:
         config.recompute_granularity = 'full'
         config.recompute_method = 'block'
         config.recompute_num_layers = config.num_layers
-        full_transformer_block = ParallelTransformerBlock(config)
+        full_transformer_block = TransformerBlock(config)
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
 
@@ -71,7 +71,7 @@ class TestParallelTransformerBlock:
     def test_gpu_forward_selective_checkpoint(self, transformer_config: TransformerConfig):
         config = transformer_config
         config.recompute_granularity = 'selective'
-        selective_transformer_block = ParallelTransformerBlock(config)
+        selective_transformer_block = TransformerBlock(config)
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert selective_transformer_block.checkpoint_core_attention
 

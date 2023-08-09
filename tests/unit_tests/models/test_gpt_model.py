@@ -21,7 +21,7 @@ class TestGPTModel:
         assert gpt_model.max_sequence_length == 4
 
         num_weights = sum([p.numel() for p in gpt_model.parameters()])
-        assert num_weights == 5040
+        assert num_weights == 6240
 
     def test_set_input_tensor(self, gpt_model: GPTModel):
         config: TransformerConfig = gpt_model.config
