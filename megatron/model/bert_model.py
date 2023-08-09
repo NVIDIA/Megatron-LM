@@ -125,7 +125,8 @@ class BertModel(MegatronModule):
                  add_binary_head=True,
                  parallel_output=True,
                  pre_process=True,
-                 post_process=True):
+                 post_process=True,
+                 return_moe_loss=False):
         super().__init__(config=config)
         args = get_args()
 
@@ -137,6 +138,7 @@ class BertModel(MegatronModule):
         self.parallel_output = parallel_output
         self.pre_process = pre_process
         self.post_process = post_process
+        self.return_moe_loss = return_moe_loss
 
         self.return_embeddings = args.output_bert_embeddings
         if self.return_embeddings:
@@ -183,7 +185,7 @@ class BertModel(MegatronModule):
         )
 
         if self.post_process and self.add_binary_head:
-            lm_output, pooled_output, _ = lm_output
+            lm_output, pooled_output, moe_losses = lm_output
 
             # Return pooled output (e.g., when computing Bert embeddings).
             if self.return_embeddings:
@@ -206,12 +208,14 @@ class BertModel(MegatronModule):
             pooled_output = None
 
         if self.post_process:
-            lm_output = lm_output if self.add_binary_head else lm_output[0]
-            return post_language_model_processing(lm_output, pooled_output,
-                                                  self.lm_head, self.binary_head,
-                                                  lm_labels,
-                                                  self.shared_embedding_or_output_weight(),
-                                                  self.fp16_lm_cross_entropy)
+            if not self.add_binary_head:
+                lm_output, moe_losses = lm_output
+            lm_output = post_language_model_processing(lm_output, pooled_output,
+                                                       self.lm_head, self.binary_head,
+                                                       lm_labels,
+                                                       self.shared_embedding_or_output_weight(),
+                                                       self.fp16_lm_cross_entropy)
+            return *lm_output, moe_losses if self.return_moe_loss else lm_output
         else:
             return lm_output
 
