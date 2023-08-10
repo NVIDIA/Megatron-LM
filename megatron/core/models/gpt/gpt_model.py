@@ -150,6 +150,13 @@ class GPTModel(MegatronModule):
         if self.rotary_pos_emb is not None:
             if inference_params is not None:
                 rotary_seq_len = inference_params.max_sequence_length
+            elif self.decoder.input_tensor is not None:
+                if self.config.sequence_parallel:
+                    rotary_seq_len = (
+                        self.decoder.input_tensor.size(0) * self.config.tensor_model_parallel_size
+                    )
+                else:
+                    rotary_seq_len = self.decoder.input_tensor.size(0)
             else:
                 if self.config.sequence_parallel:
                     rotary_seq_len = decoder_input.size(0) * self.config.tensor_model_parallel_size
