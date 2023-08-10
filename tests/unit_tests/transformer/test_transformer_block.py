@@ -7,15 +7,22 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
-
-
-@pytest.fixture
-def parallel_transformer_block(transformer_config):
-    return TransformerBlock(transformer_config)
-
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
 class TestParallelTransformerBlock:
-    def test_constructor(self, parallel_transformer_block: TransformerBlock):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.parallel_transformer_block = TransformerBlock(self.transformer_config)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel() 
+
+    def test_constructor(self):
+        parallel_transformer_block = self.parallel_transformer_block
         assert isinstance(parallel_transformer_block, TransformerBlock)
         num_weights = sum([p.numel() for p in parallel_transformer_block.parameters()])
         assert num_weights == 3792
@@ -26,7 +33,8 @@ class TestParallelTransformerBlock:
         layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
         assert layer_1.layer_number == 2
 
-    def test_gpu_forward(self, parallel_transformer_block: TransformerBlock):
+    def test_gpu_forward(self):
+        parallel_transformer_block = self.parallel_transformer_block
         config: TransformerConfig = parallel_transformer_block.config
 
         sequence_length = 32
@@ -44,7 +52,8 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
-    def test_gpu_forward_full_checkpoint(self, transformer_config: TransformerConfig):
+    def test_gpu_forward_full_checkpoint(self):
+        transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'full'
         config.recompute_method = 'block'
@@ -68,7 +77,8 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
-    def test_gpu_forward_selective_checkpoint(self, transformer_config: TransformerConfig):
+    def test_gpu_forward_selective_checkpoint(self):
+        transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'selective'
         selective_transformer_block = TransformerBlock(config)

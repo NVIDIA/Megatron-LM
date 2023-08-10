@@ -5,46 +5,48 @@ import pytest
 import torch
 
 from megatron.core.transformer.attention import SelfAttention
-
-
-@pytest.fixture
-def parallel_attention(transformer_config):
-    return SelfAttention(transformer_config)
-
-
-@pytest.fixture
-def checkpointed_parallel_attention(transformer_config):
-    transformer_config.recompute_granularity = 'selective'
-    return SelfAttention(transformer_config)
-
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 class TestParallelAttention:
-    def test_constructor(self, parallel_attention):
-        assert isinstance(parallel_attention, SelfAttention)
-        assert parallel_attention.layer_number == 1
 
-        num_weights = sum([p.numel() for p in parallel_attention.parameters()])
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.parallel_attention = SelfAttention(self.transformer_config)
+        
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()    
+
+    def test_constructor(self):
+        assert isinstance(self.parallel_attention, SelfAttention)
+        assert self.parallel_attention.layer_number == 1
+
+        num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 624
 
-    def test_cpu_forward(self, parallel_attention):
+    def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
         pass
 
-    def test_gpu_forward(self, parallel_attention):
+    def test_gpu_forward(self):
 
-        config = parallel_attention.config
+        config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
 
-        parallel_attention.cuda()
+        self.parallel_attention.cuda()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, parallel_attention.config.hidden_size))
+        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
         hidden_states = hidden_states.cuda()
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        output, bias = parallel_attention(hidden_states, attention_mask)
+        output, bias = self.parallel_attention(hidden_states, attention_mask)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -52,8 +54,10 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
-    def test_checkpointed_gpu_forward(self, checkpointed_parallel_attention):
-
+    def test_checkpointed_gpu_forward(self):
+        transformer_config = self.transformer_config
+        transformer_config.recompute_granularity='selective'
+        checkpointed_parallel_attention = SelfAttention(transformer_config)
         config = checkpointed_parallel_attention.config
 
         sequence_length = 32
