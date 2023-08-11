@@ -71,7 +71,8 @@ class T5Model(MegatronModule):
                  pre_process=True,
                  post_process=True,
                  add_encoder=True,
-                 add_decoder=True):
+                 add_decoder=True,
+                 return_moe_loss=False):
         super().__init__(config=config)
         args = get_args()
 
@@ -81,6 +82,7 @@ class T5Model(MegatronModule):
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
+        self.return_moe_loss = return_moe_loss
 
         self.language_model, self._language_model_key = get_language_model(
             config=config,
@@ -127,7 +129,7 @@ class T5Model(MegatronModule):
                                         enc_hidden_states=enc_hidden_states)
 
         if self.post_process and self.add_decoder:
-            decoder_output, encoder_output, _, _ = lm_output
+            decoder_output, encoder_output, dec_moe_losses, enc_moe_losses = lm_output
             # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
                                      self.shared_embedding_or_output_weight())
@@ -146,7 +148,7 @@ class T5Model(MegatronModule):
                                                                                 lm_labels)
                 # [s b] => [b s]
                 lm_loss = lm_loss.transpose(0,1).contiguous()
-            return lm_loss
+            return lm_loss, dec_moe_losses, enc_moe_losses if self.return_moe_loss else lm_loss
         elif self.add_decoder and not self.add_encoder:
             decoder_output, _, decoder_moe_losses, _= lm_output
             return decoder_output, decoder_moe_losses
