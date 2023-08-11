@@ -57,7 +57,7 @@ class TransformerLayer(MegatronModule):
 
         # MLP
         # TODO remove this if/else, just for testing
-        if self.config.num_moe_experts > 1:
+        if (self.config.num_moe_experts > 1) and ((layer_number -1) % self.config.moe_frequency == 0):
             self.mlp = SwitchMLP(config=self.config)
         else:
             self.mlp = MLP(config=self.config)
