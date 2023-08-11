@@ -110,7 +110,7 @@ formatting:
       fi
     - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
     - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
-    - if [[ $USE_CORE == "True" ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
+    - if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
     - export $RUN_NAME
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE
@@ -151,7 +151,7 @@ formatting:
         python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
       fi
     - |
-      if [[ $USE_TE -ne 1 ]]; then
+      if [[ $SKIP_GROUND_TRUTH_COMPARISION -eq 1 ]]; then
         echo "Checking against ground truth file"
         export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
         PYTEST_EXIT=0
