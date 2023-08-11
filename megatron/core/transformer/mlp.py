@@ -30,7 +30,7 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, is_expert: bool = False):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -40,13 +40,15 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = TEColumnParallelLinear(
+        # TODO: revert this to TE; need to think of configurability
+        self.linear_fc1 = tensor_parallel.ColumnParallelLinear(
             self.config.hidden_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            is_expert=is_expert
         )
 
         if self.config.gated_linear_unit:
@@ -59,13 +61,14 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = TERowParallelLinear(
+        self.linear_fc2 = tensor_parallel.RowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            is_expert=is_expert
         )
 
     def forward(self, hidden_states):
@@ -115,9 +118,7 @@ class SwitchMLP(MegatronModule):
 
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
-            expert = MLP(self.config)
-            for name, param in expert.named_parameters():
-                param.allreduce = False
+            expert = MLP(self.config, is_expert=True)
             
             self.local_experts.append(expert)
     

@@ -553,7 +553,7 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             self.weight = None
         
-        setattr(self.weight, 'expert_parallel', self.is_expert)
+        setattr(self.weight, 'allreduce', not self.is_expert)
 
         if bias:
             if config.use_cpu_initialization:
@@ -573,9 +573,9 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
+            setattr(self.bias, 'allreduce', not self.is_expert)
         else:
             self.register_parameter('bias', None)
-        setattr(self.weight, 'expert_parallel', self.is_expert)
 
         self.async_tensor_model_parallel_allreduce = (
             config.async_tensor_model_parallel_allreduce and world_size > 1
@@ -765,7 +765,7 @@ class RowParallelLinear(torch.nn.Module):
                 _initialize_affine_weight_gpu(
                     self.weight, init_method, partition_dim=1, stride=stride,
                     is_expert=self.is_expert)
-        setattr(self.weight, 'expert_parallel', self.is_expert)
+        setattr(self.weight, 'allreduce', not self.is_expert)
         
         if bias:
             if config.use_cpu_initialization:
@@ -784,7 +784,7 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'expert_parallel', self.is_expert)
+            setattr(self.bias, 'allreduce', not self.is_expert)
             setattr(self.bias, 'sequence_parallel', sequence_parallel_enabled)
         else:
             self.register_parameter('bias', None)
