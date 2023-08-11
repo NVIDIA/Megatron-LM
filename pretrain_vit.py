@@ -61,7 +61,7 @@ def get_batch(data_iterator):
         data = next(data_iterator)
     else:
         data = None
-    batch_size = args.micro_batch_size // args.data_parallel_size
+    batch_size = args.micro_batch_size# // args.data_parallel_size
     if get_tensor_model_parallel_rank() == 0:
         images = data[0].to(get_accelerator().device_name())
         labels = data[1].to(get_accelerator().device_name())
