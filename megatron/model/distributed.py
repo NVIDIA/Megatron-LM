@@ -122,7 +122,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             # First calculate total number of elements per type.
             type_num_elements = {}
             for param in self.module.parameters():
-                if param.requires_grad and not getattr(param, 'expert_parallel', False):
+                if param.requires_grad and getattr(param, 'allreduce', True):
                     dtype = _get_buffer_type(param)
                     type_num_elements[dtype] = type_num_elements.get(dtype, 0) \
                                                + param.data.nelement()
@@ -147,7 +147,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
             for param in self.module.parameters():
                 if param.requires_grad:
                     dtype = _get_buffer_type(param)
-                    if not getattr(param, 'expert_parallel', False):
+                    if getattr(param, 'allreduce', True):
                         type_num_elements[dtype] -= param.data.nelement()
                         param.main_grad = self._grad_buffers[dtype].get(
                             param.data.shape, type_num_elements[dtype])

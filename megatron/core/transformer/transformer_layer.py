@@ -6,7 +6,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.custom_layers.transformer_engine import TELayerNorm
 from megatron.core.transformer.enums import AttnMaskType, AttnType
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, SwitchMLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
@@ -56,7 +56,11 @@ class TransformerLayer(MegatronModule):
         )
 
         # MLP
-        self.mlp = MLP(config=self.config)
+        # TODO remove this if/else, just for testing
+        if self.config.num_moe_experts > 1:
+            self.mlp = SwitchMLP(config=self.config)
+        else:
+            self.mlp = MLP(config=self.config)
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.

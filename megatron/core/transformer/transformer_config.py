@@ -44,6 +44,15 @@ class TransformerConfig(ModelParallelConfig):
 
         activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
 
+        num_moe_experts (int): Number of experts to use for Mixture of Experts. 
+                               When >1, it replaces MLP with Switch MLP. Defaults to 1 (no MoE).
+
+        moe_frequency (int): Makes every Nth transformer block's MLP a SwitchMLP when num_moe_experts > 1. 
+                             If current_layer % moe_frequency == 0, SwitchMLP is used. 
+                             Defaults to 1 (every layer is MoE).
+        
+        moe_dropout (float): Dropout probability for MoE experts. Defaults to 0.
+
         # initialization
         init_method (Callable): Method to initialize weights. Note that bias is always set to
                                 zero. Should be a function that takes a single Tensor and
@@ -136,6 +145,9 @@ class TransformerConfig(ModelParallelConfig):
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
+    num_moe_experts: int = 1
+    moe_frequency: int = 1
+    moe_dropout: float = 0.0
 
     # initialization
     init_method: Callable = None
