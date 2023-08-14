@@ -1,7 +1,6 @@
 import os
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 import sys
-import json
-import shutil
 import glob
 from tensorboard.backend.event_processing import event_accumulator
 

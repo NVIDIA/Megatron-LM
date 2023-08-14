@@ -12,7 +12,7 @@ variables: &VARS
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
   TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
-  TEST_REGEX_ON_THIS_COMMIT: NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
+  TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
 unit_tests:
@@ -111,7 +111,7 @@ formatting:
       fi
     - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
     - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
-    - if [[ $USE_CORE == "True" ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
+    - if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
     - export $RUN_NAME
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
     - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE
@@ -149,10 +149,13 @@ formatting:
     - source $PYTHON_VIRTUAL_ENV
     - |
       if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
+        export OMP_NUM_THREADS=2
+        export GOTO_NUM_THREADS=2
+        export OPENBLAS_NUM_THREADS=2
         python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
       fi
     - |
-      if [[ $USE_TE -ne 1 ]]; then
+      if [[ $SKIP_GROUND_TRUTH_COMPARISION -eq 1 ]]; then
         echo "Checking against ground truth file"
         export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
         PYTEST_EXIT=0
@@ -180,6 +183,63 @@ train.te_gpt3.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "50:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp4_pp1_1node_50steps:
