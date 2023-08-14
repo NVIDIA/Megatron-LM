@@ -149,6 +149,9 @@ formatting:
     - source $PYTHON_VIRTUAL_ENV
     - |
       if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
+        export OMP_NUM_THREADS=2
+        export GOTO_NUM_THREADS=2
+        export OPENBLAS_NUM_THREADS=2
         python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
       fi
     - |
