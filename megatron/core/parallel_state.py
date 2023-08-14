@@ -180,20 +180,22 @@ def initialize_model_parallel(
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
-    # Apply SHARP to DP groups
+    # Apply SHARP to DP process groups
     if use_sharp:
         if rank == 0:
             print("The number of process groups to use SHARP with depends on the type "
-                  "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
+                  "of the network switch. Nvidia QM1 switch supports SHARP up to 8 "
                   "process groups and QM2 supports up to 256 process groups. We apply "
                   "SHARP to the communications of the data-parallel domain. If the "
-                  "number of data-parallel process groups is larger than the max "
+                  "number of data-parallel process groups is larger than the maximum "
                   "process groups that the network switch supports, the communication "
-                  "will fall back to non-SHARP operators. To enable SHARP, "
-                  "`#SBATCH_NETWORK=sharp` should be set in the sbatch script.")
+                  "will fall back to non-SHARP operators. We assume using SHARP at "
+                  "SLURM env and `#SBATCH_NETWORK=sharp` should be set in the sbatch "
+                  "script to enable SHARP usage.")
         torch.distributed.barrier(
             group=get_data_parallel_group(), device_ids=[torch.cuda.current_device()]
         )
+        # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
         os.environ["NCCL_SHARP_DISABLE"] = "1"
 
     # Build the model-parallel groups.
