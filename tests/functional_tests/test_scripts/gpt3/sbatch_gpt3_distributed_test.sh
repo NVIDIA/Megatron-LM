@@ -2,7 +2,7 @@
 
 # Parameters
 #SBATCH --account=adlr_nlp_llmnext
-#SBATCH --job-name=adlr-ci:megatron-job
+#SBATCH --job-name=adlr_nlp_llmnext-ci:megatron-job
 #SBATCH --nodes=1
 #SBATCH --partition=luna
 
