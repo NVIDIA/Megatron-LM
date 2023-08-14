@@ -81,10 +81,6 @@ def model_provider(pre_process=True, post_process=True):
                 # https://github.com/kingoflolz/mesh-transformer-jax/
                 rotary_pos_emb = RotaryEmbedding(rotary_dim)(args.seq_length).to(
                     get_accelerator().current_device_name())
-                if args.fp16:
-                    rotary_pos_emb = rotary_pos_emb.half()
-                elif args.bf16:
-                    rotary_pos_emb = rotary_pos_emb.bfloat16()
                 args.rotary_pos_emb = rotary_pos_emb
 
         else:
