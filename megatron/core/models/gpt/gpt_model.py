@@ -151,7 +151,15 @@ class GPTModel(MegatronModule):
             if inference_params is not None:
                 rotary_seq_len = inference_params.max_sequence_length
             else:
-                rotary_seq_len = min(self.max_sequence_length, decoder_input.size(0))
+                if self.decoder.input_tensor is not None:
+                    rotary_seq_len = self.decoder.input_tensor.size(0)
+                else:
+                    rotary_seq_len = self.decoder_input.size(0)
+
+                # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
+                if self.config.sequence_parallel:
+                    rotary_seq_len *= self.config.tensor_model_parallel_size
+
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
