@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Parameters
-#SBATCH --account=adlr
+#SBATCH --account=adlr_nlp_llmnext
 #SBATCH --job-name=adlr-ci:megatron-job
 #SBATCH --nodes=1
 #SBATCH --partition=luna
