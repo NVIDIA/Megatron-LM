@@ -6,6 +6,8 @@ import torch
 
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
 DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
@@ -22,14 +24,19 @@ class DummyModule(MegatronModule):
     def forward(self, x):
         return self.linear(x)
 
-
-@pytest.fixture
-def megatron_module(transformer_config):
-    return DummyModule(config=transformer_config).cuda()
-
-
 class TestMegatronModule:
-    def test_megatron_module(self, megatron_module):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.megatron_module = DummyModule(config=transformer_config).cuda()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()   
+
+    def test_megatron_module(self):
+        megatron_module = self.megatron_module
         assert megatron_module
         assert megatron_module.config.hidden_size == 12
         assert megatron_module.config.ffn_hidden_size == 48
@@ -45,7 +52,19 @@ class TestMegatronModule:
 
 
 class TestFloat16Module:
-    def test_fp16_module(self, transformer_config, megatron_module):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.megatron_module = DummyModule(config=self.transformer_config).cuda()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()   
+        
+    def test_fp16_module(self):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
         transformer_config.fp16 = True
         fp16_module = Float16Module(config=transformer_config, module=megatron_module)
 
@@ -62,7 +81,9 @@ class TestFloat16Module:
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8, reason='bfloat16 is not supported on this device'
     )
 
-    def test_bf16_module(self, transformer_config, megatron_module):
+    def test_bf16_module(self):
+        transformer_config = self.transformer_config
+        megatron_module = self.megatron_module
         transformer_config.bf16 = True
         bf16_module = Float16Module(config=transformer_config, module=megatron_module)
 

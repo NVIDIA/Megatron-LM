@@ -116,6 +116,11 @@ class TransformerConfig(ModelParallelConfig):
                                      There are 2 predefined choices: `max` chooses the largest `amax` in the history
                                      window, while `most_recent` always chooses the most recently seen value.
 
+        # Experimental
+        normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily
+                             used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+
+
     """
 
     # model architecture
@@ -167,6 +172,9 @@ class TransformerConfig(ModelParallelConfig):
     fp8_interval: int = 1
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
+
+    # experimental section (TODO: move to apt. section above once stable)
+    normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

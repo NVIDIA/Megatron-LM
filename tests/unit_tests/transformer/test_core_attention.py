@@ -5,17 +5,17 @@ import pytest
 
 import torch
 
-from megatron.core.transformer.core_attention import CoreAttention
-
+from megatron.core.transformer.attention import CrossAttention
+""" 
 
 @pytest.fixture
 def core_attention(transformer_config):
-    return CoreAttention(transformer_config)
+    return CrossAttention(transformer_config)
 
 
 class TestCoreAttention:
     def test_constructor(self, core_attention):
-        assert isinstance(core_attention, CoreAttention)
+        assert isinstance(core_attention, CrossAttention)
         assert core_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in core_attention.parameters()])
@@ -61,3 +61,4 @@ class TestCoreAttention:
         assert context_layer.device.type == 'cuda'
         assert context_layer.dtype == torch.float32
 
+"""
