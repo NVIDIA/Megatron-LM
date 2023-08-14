@@ -11,7 +11,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TERowParallelLinear,
 )
-from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
