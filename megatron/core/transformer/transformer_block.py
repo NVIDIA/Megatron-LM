@@ -159,7 +159,7 @@ class TransformerBlock(MegatronModule):
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
-            while l < self.num_layers:
+            while l < self.num_layers_per_pipeline_rank:
                 hidden_states = tensor_parallel.checkpoint(
                     custom(l, l + self.config.recompute_num_layers),
                     self.config.distribute_saved_activations,
@@ -168,7 +168,7 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb,
                 )
 
-                l += self.recompute_num_layers
+                l += self.config.recompute_num_layers
 
         elif self.config.recompute_method == 'block':
             # Checkpoint the input activation of only a set number of individual
