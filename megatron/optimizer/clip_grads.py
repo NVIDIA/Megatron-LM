@@ -88,6 +88,10 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm ** norm_type
 
+        global_rank = torch.distributed.get_rank()
+        # print(f'Testing backward gradient norm on {global_rank}!', flush=True)
+        assert not total_norm.isnan(),f'Rank {global_rank}: found NaN in local grad norm in backwards pass'
+
         # Sum across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm,
                                      op=torch.distributed.ReduceOp.SUM,

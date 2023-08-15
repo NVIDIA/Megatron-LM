@@ -68,6 +68,10 @@ def loss_func(loss_mask, output_tensor):
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
+    global_rank = torch.distributed.get_rank()
+    # print(f'Testing forward loss on {global_rank}!', flush=True)
+    assert not loss.isnan(),f'Rank {global_rank}: found NaN in local forward loss calculation'
+
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
