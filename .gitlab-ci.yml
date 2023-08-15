@@ -7,7 +7,7 @@ stages:
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTORCH_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov
+  PYTORCH_IMAGE: gitlab-master.nvidia.com:5005/adlr/megatron-lm/ngc/pytorch:22.12-py3_pytest-cov # This is the image that is run by all nodes on selene for tests
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
@@ -28,8 +28,6 @@ unit_tests:
     paths:
       - coverage
     expire_in: 30 days
-  only:
-    - merge_requests
 
 formatting:
   tags:
@@ -52,7 +50,7 @@ formatting:
     - export BUILD_DIR=`pwd`
     - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS
+    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS PYTORCH_IMAGE
     - export DATA_DIR=$DATA_DIR
     - echo "Run name is $RUN_NAME"
     - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
@@ -69,7 +67,7 @@ formatting:
     - export GOTO_NUM_THREADS=2
     - export OPENBLAS_NUM_THREADS=2
     - echo "Submitting job"
-    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES`
+    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES,PYTORCH_IMAGE`
     - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
     - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
     - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
@@ -97,6 +95,7 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
+  retry: 2
 
 .selene_test_launcher: &selene-test-launcher
   tags:
@@ -117,7 +116,7 @@ formatting:
     - if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
     - export $RUN_NAME
     - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE
+    - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE PYTORCH_IMAGE
     - export MBS GBS
     - export DATA_DIR=$DATA_DIR
     - echo "Run name is $RUN_NAME"
@@ -135,7 +134,7 @@ formatting:
     - export GOTO_NUM_THREADS=2
     - export OPENBLAS_NUM_THREADS=2
     - echo "Submitting job"
-    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,NUM_NODES,MAX_STEPS,VP_SIZE,MBS,GBS`
+    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,NUM_NODES,MAX_STEPS,VP_SIZE,MBS,GBS,PYTORCH_IMAGE`
     - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
     - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
     - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
@@ -174,6 +173,7 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
+  retry: 2
 
 train.te_gpt3.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
