@@ -529,7 +529,7 @@ def forward_backward_pipelining_with_interleaving(
         # pipeline-parallel group.
         if config.param_sync_func is not None:
             param_sync_microbatch_id = microbatch_id + pipeline_parallel_rank
-            if param_sync_microbatch_id < num_microbatches and is_first_microbatch_for_model_chunk(
+            if param_sync_microbatch_id < total_num_microbatches and is_first_microbatch_for_model_chunk(
                 param_sync_microbatch_id
             ):
                 param_sync_chunk_id = get_model_chunk_id(param_sync_microbatch_id, forward=True) + 1
