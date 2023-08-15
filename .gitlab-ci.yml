@@ -65,6 +65,9 @@ formatting:
     - export LOGS_DIR=$BASE_DIR/logs
     - export RESULTS_DIR=$BASE_DIR/results
     - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
+    - export OMP_NUM_THREADS=2
+    - export GOTO_NUM_THREADS=2
+    - export OPENBLAS_NUM_THREADS=2
     - echo "Submitting job"
     - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES`
     - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
@@ -128,6 +131,9 @@ formatting:
     - export LOGS_DIR=$BASE_DIR/logs
     - export RESULTS_DIR=$BASE_DIR/results
     - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
+    - export OMP_NUM_THREADS=2
+    - export GOTO_NUM_THREADS=2
+    - export OPENBLAS_NUM_THREADS=2
     - echo "Submitting job"
     - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,NUM_NODES,MAX_STEPS,VP_SIZE,MBS,GBS`
     - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
@@ -149,9 +155,6 @@ formatting:
     - source $PYTHON_VIRTUAL_ENV
     - |
       if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
-        export OMP_NUM_THREADS=2
-        export GOTO_NUM_THREADS=2
-        export OPENBLAS_NUM_THREADS=2
         python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
       fi
     - |
