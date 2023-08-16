@@ -198,3 +198,41 @@ class LocalNonpersitentObject:
 
     def unwrap(self):
         return self.obj
+
+
+@dataclass
+class ShardedObject:
+    """Represents a mapping between a local object and a global object.
+
+    Global object is assumed to consist of many local objects distributed
+    between different processes.
+
+    NOTE: Contrary to ShardedTensor, it's impossible to change global object
+    sharding. Conceptually, ShardedObject is a fully-sharded ShardedTensor
+    with atomic arbitrary typed elements.
+
+    Attributes:
+        key: unique identifier of a global tensor
+        data: local object data. Can be None only for consistency validation
+        global_shape: global object shape
+        global_offset: offset of a local object in a global object, specified
+            in number of shards
+        replica_id: indicates local object replication wrt. local
+            objects in different processes
+    """
+
+    key: str
+    data: object
+    global_shape: Tuple[int, ...]
+    global_offset: Tuple[int, ...]
+    replica_id: ReplicaId = 0
+
+    def without_data(self):
+        return replace(self, data=None)
+
+    @property
+    def unique_key(self):
+        return f'{self.key}/shard_{".".join(map(str, self.global_offset))}_{".".join(map(str, self.global_shape))}'
+
+    def __str__(self):
+        return f'{self.__class__.__name__}(key=\'{self.key}\')'
