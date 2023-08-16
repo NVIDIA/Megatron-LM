@@ -319,8 +319,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                                          mpu.get_data_parallel_group(),
                                          args.accumulate_allreduce_grads_in_fp32)
                      for model_module in model]
-            config = get_model_config(model[0])
-            config.no_sync_func = model[0].is_not_last_microbatch
         else:
             raise NotImplementedError('Unknown DDP implementation specified: '
                                       '{}. Exiting.'.format(args.DDP_impl))

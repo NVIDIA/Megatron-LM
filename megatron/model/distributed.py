@@ -291,7 +291,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
 
     @contextmanager
-    def is_not_last_microbatch(self):
+    def no_sync(self):
         for grad_buffer in self.grad_dtype_to_grad_buffer.values():
             grad_buffer.is_last_microbatch = False
         try:
