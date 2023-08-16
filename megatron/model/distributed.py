@@ -107,7 +107,6 @@ class GradBuffer:
     def __init__(self, params, dtype, data_parallel_group,
                  bucket_size, param_to_name):
 
-        self.data = None
         self.buckets = []
         self.param_to_bucket = {}
 
@@ -130,14 +129,14 @@ class GradBuffer:
         # This makes things easier for distributed optimizer.
         data_parallel_size = torch.distributed.get_world_size(
             group=data_parallel_group)
-        numel = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
-        self.data = torch.empty(numel, dtype=dtype,
-                                device=torch.cuda.current_device(),
-                                requires_grad=False)
+        numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
+
+        self.memory_buffer = MemoryBuffer(numel, numel_padded, dtype)
 
         # Map the grads to the buffer and bucket them.
         def set_bucket_(bucket_params, data_start_index, data_end_index):
-            bucket_data = self.data[data_start_index:data_end_index]
+            bucket_data = self.memory_buffer.get(torch.Size([data_end_index - data_start_index]),
+                                                 data_start_index)
             bucket = Bucket(bucket_params, bucket_data, data_parallel_group)
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
@@ -153,7 +152,7 @@ class GradBuffer:
                 continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
-            param.main_grad = self.data[data_start_index:data_end_index].view(param.data.shape)
+            param.main_grad = self.memory_buffer.get(param.data.shape, data_start_index)
             bucket_params.add(param)
 
             # If we have enough elements already, form a new buffer.
@@ -180,7 +179,7 @@ class GradBuffer:
 
     def reset(self):
         # Set the data to zero and reset all the buckets.
-        self.data.zero_()
+        self.memory_buffer.zero()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = False
