@@ -1,5 +1,5 @@
 from importlib.metadata import version
-from typing import Callable
+from typing import Callable, Union
 
 import torch
 import transformer_engine as te
@@ -23,18 +23,25 @@ class TENorm:
         eps: float = 1e-5,
         sequence_parallel: bool = False,
         normalization="LayerNorm",
+        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=sequence_parallel,
+                device=device,
             )
         elif normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=sequence_parallel,
+                device=device,
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
@@ -61,6 +68,7 @@ class TELinear(te.pytorch.Linear):
         *,
         bias: bool = True,
         skip_bias_add: bool = False,
+        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config
@@ -85,6 +93,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
+            device=device,
             **kwargs
         )
 
@@ -113,6 +122,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
+        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config
@@ -141,6 +151,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
+            device=device,
             **kwargs
         )
 
@@ -204,6 +215,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         config: TransformerConfig,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config

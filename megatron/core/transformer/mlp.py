@@ -35,6 +35,11 @@ class MLP(MegatronModule):
 
         self.config: TransformerConfig = config
 
+        if self.config.use_cpu_initialization:
+            device = 'cpu'
+        else:
+            device = torch.cuda.current_device()
+
         # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
@@ -47,6 +52,7 @@ class MLP(MegatronModule):
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            device=device,
         )
 
         if self.config.gated_linear_unit:
@@ -66,6 +72,7 @@ class MLP(MegatronModule):
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            device=device,
         )
 
     def forward(self, hidden_states):
