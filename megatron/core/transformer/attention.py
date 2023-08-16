@@ -36,6 +36,11 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
 
+        if self.config.use_cpu_initialization:
+            self.device = 'cpu'
+        else:
+            self.device = torch.cuda.current_device()
+
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
@@ -63,6 +68,7 @@ class Attention(MegatronModule, ABC):
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            device=self.device,
         )
 
     def _checkpointed_attention_forward(
@@ -93,7 +99,7 @@ class Attention(MegatronModule, ABC):
             self.num_query_groups_per_partition,
             self.hidden_size_per_attention_head,
             dtype=dtype,
-            device=torch.cuda.current_device(),
+            device=self.device,
         )
 
     def _adjust_key_value_for_inference(self, inference_params, key, value, rotary_pos_emb):
@@ -261,6 +267,7 @@ class SelfAttention(Attention):
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            device=self.device,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -325,6 +332,7 @@ class CrossAttention(Attention):
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            device=self.device,
         )
 
         self.linear_kv = TEColumnParallelLinear(
@@ -334,6 +342,7 @@ class CrossAttention(Attention):
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            device=self.device,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):

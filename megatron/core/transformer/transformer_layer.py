@@ -32,6 +32,11 @@ class TransformerLayer(MegatronModule):
         self.layer_number = layer_number
         self.self_attn_mask_type = self_attn_mask_type
 
+        if self.config.use_cpu_initialization:
+            device = 'cpu'
+        else:
+            device = torch.cuda.current_device()
+
         # Layernorm on the input data.
         # TODO: add pytorch only layernorm
         self.input_layernorm = TENorm(
@@ -41,11 +46,14 @@ class TransformerLayer(MegatronModule):
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             normalization=self.config.normalization,
+            device=device,
         )
 
         # Self attention.
         self.self_attention = SelfAttention(
-            config=self.config, layer_number=layer_number, attn_mask_type=self_attn_mask_type,
+            config=self.config,
+            layer_number=layer_number,
+            attn_mask_type=self_attn_mask_type,
         )
 
         # Layernorm on the attention output
@@ -56,6 +64,7 @@ class TransformerLayer(MegatronModule):
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             normalization=self.config.normalization,
+            device=device,
         )
 
         # MLP
