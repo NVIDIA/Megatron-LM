@@ -262,21 +262,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
                 self.param_to_grad_buffer[param] = self.grad_dtype_to_grad_buffer[dtype]
 
         # Register backward hook.
-        def _make_param_hook(self, param, param_to_grad_buffer):
-            """Create the all-reduce hook for backprop."""
-            # Hook used for back-prop.
-            def param_hook(*unused):
-                if param.requires_grad:
-                    # Make sure no none values are returned.
-                    assert param.grad is not None
-                    if not param.grad_added_to_main_grad:
-                        param.main_grad.add_(param.grad.data)
-                    param.grad = None
-                    param_to_grad_buffer[param].mark_grad_as_done(param)
-                        
-            return param_hook
-
-        # Accumulation function for the gradients. These need to be stored so they
+        # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
         for param in self.module.parameters():
@@ -289,6 +275,19 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
                     param, self.param_to_grad_buffer))
                 self.grad_accs.append(grad_acc)
 
+    def _make_param_hook(self, param, param_to_grad_buffer):
+        """Create the all-reduce hook for backprop."""
+
+        def param_hook(*unused):
+            if param.requires_grad:
+                # Make sure no none values are returned.
+                assert param.grad is not None
+                if not param.grad_added_to_main_grad:
+                    param.main_grad.add_(param.grad.data)
+                param.grad = None
+                param_to_grad_buffer[param].mark_grad_as_done(param)
+
+        return param_hook
 
     @contextmanager
     def no_sync(self):
