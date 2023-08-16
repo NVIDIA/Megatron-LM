@@ -222,7 +222,7 @@ class MegatronOptimizer(ABC):
 
             if unwrapped_model.share_embeddings_and_output_weights:
                 weight = unwrapped_model.shared_embedding_or_output_weight()
-                if args.DDP_impl in ['local', 'overlapping-local']:
+                if args.DDP_impl == 'local':
                     grad = weight.main_grad
                 else:
                     grad = weight.grad
@@ -267,7 +267,7 @@ class MegatronOptimizer(ABC):
                     model_module, (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
                 for param in unwrapped_model.parameters():
                     if getattr(param, 'sequence_parallel', False):
-                        grad = param.main_grad if args.DDP_impl in ['local', 'overlapping-local'] else param.grad
+                        grad = param.main_grad if args.DDP_impl == 'local' else param.grad
                         grads.append(grad.data)
             coalesced = _flatten_dense_tensors(grads)
             torch.distributed.all_reduce(
@@ -280,7 +280,7 @@ class MegatronOptimizer(ABC):
         """All-reduce all grads, and all-reduce embeddings."""
 
         # All-reduce if needed.
-        if args.DDP_impl in ['local', 'overlapping-local']:
+        if args.DDP_impl == 'local':
             timers('grads-all-reduce', log_level=1).start(
                 barrier=args.barrier_with_L1_time)
             for model in self.models:

@@ -174,10 +174,10 @@ def validate_args(args, defaults={}):
     # If we do accumulation and all-reduces in fp32, we need to have local DDP
     # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
     if args.accumulate_allreduce_grads_in_fp32:
-        assert args.DDP_impl in ['local', 'overlapping-local']
+        assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
-    if args.DDP_impl == 'overlapping-local':
-        assert args.pipeline_model_parallel_size == 1
+    if args.overlap_grad_reduce:
+        assert args.pipeline_model_parallel_size == 1, 'Overlapping grad reduce only supported without pipeline parallelism'
 
     
     # If we use the distributed optimizer, we need to have local DDP
@@ -1024,9 +1024,11 @@ def _add_distributed_args(parser):
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
                        help='Timeout minutes for torch.distributed.')
     group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch', 'overlapping-local'],
+                       choices=['local', 'torch'],
                        help='which DistributedDataParallel implementation '
                        'to use.')
+    group.add_argument('--overlap-grad-reduce', action='store_true',
+                       default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--no-contiguous-buffers-in-local-ddp',
                        action='store_false', help='If set, dont use '
                        'contiguous buffer in local DDP.',
