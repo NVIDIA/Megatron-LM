@@ -123,7 +123,9 @@ class GradBuffer:
         # Count number of elements in the parameters and allocate memory.
         numel = 0
         for param in params:
-            numel += param.data.nelement()
+            # Only count parameters that require gradients.
+            if param.requires_grad:
+                numel += param.data.nelement()
         # Pad so size is divisible by the data parallel size.
         # This makes things easier for distributed optimizer.
         data_parallel_size = torch.distributed.get_world_size(
@@ -146,6 +148,9 @@ class GradBuffer:
         bucket_params = set()
         bucket_id = 0
         for param in params:
+            # Skip parameters that don't require gradients.
+            if not param.requires_grad:
+                continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
             param.main_grad = self.data[data_start_index:data_end_index].view(param.data.shape)

@@ -28,6 +28,7 @@ from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import GPTModel
 from megatron.core.enums import ModelType
+from megatron.optimizer import ALL_MODULE_WRAPPER_CLASSNAMES
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
@@ -387,7 +388,7 @@ def setup_model_and_optimizer(model_provider_func,
 
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
+                                   ALL_MODULE_WRAPPER_CLASSNAMES)
 
     optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
@@ -464,7 +465,7 @@ def train_step(forward_step_func, data_iterator,
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
+                                       ALL_MODULE_WRAPPER_CLASSNAMES)
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
@@ -479,7 +480,7 @@ def train_step(forward_step_func, data_iterator,
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module))
+                                       ALL_MODULE_WRAPPER_CLASSNAMES)
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.

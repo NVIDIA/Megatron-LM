@@ -186,7 +186,6 @@ def validate_args(args, defaults={}):
         assert args.DDP_impl == 'local'
         assert args.use_contiguous_buffers_in_local_ddp
 
-
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
         args.use_contiguous_buffers_in_local_ddp = False

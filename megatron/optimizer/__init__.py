@@ -8,7 +8,7 @@ from megatron import get_args
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import Float16OptimizerWithFloat16Params, FP32Optimizer
-
+from .optimizer import ALL_MODULE_WRAPPER_CLASSNAMES
 
 def get_param_groups(modules,
                      no_weight_decay_cond,
