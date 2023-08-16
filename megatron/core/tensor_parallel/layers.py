@@ -418,8 +418,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
             if hasattr(weight, 'grad_added_to_main_grad'):
                 grad_weight = torch.empty(
-                    weight.main_grad.shape, dtype=input.dtype,
-                    device=torch.cuda.current_device(), requires_grad=False)
+                    weight.main_grad.shape,
+                    dtype=input.dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
