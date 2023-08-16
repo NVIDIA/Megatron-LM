@@ -10,11 +10,6 @@ DATA_PATH=/workspace/data/gpt3_data/my-gpt3_00_text_document
 CHECKPOINT_PATH=/workspace/checkpoints
 TENSORBOARD_DIR=/workspace/logs
 
-if [[ $USE_TE -eq 1 || $USE_CORE -eq 1 ]]; then
-  echo "Using container nvcr.io/nvidia/pytorch:23.07-py3 for running with TE ..."
-  PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:23.07-py3
-fi
-
 srun --output $BASE_DIR/results/slurm-%j.out --error $BASE_DIR/results/slurm-%j.out --container-image $PYTORCH_IMAGE --container-mounts $BASE_DIR/logs:/workspace/logs,$BASE_DIR/checkpoints:/workspace/checkpoints,$BUILD_DIR:/workspace/megatron-lm,$DATA_DIR:/workspace/data --no-container-mount-home bash -c "
   ls 
   cd /workspace/megatron-lm
