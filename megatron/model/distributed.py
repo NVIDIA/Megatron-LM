@@ -171,7 +171,7 @@ class GradBuffer(MemoryBuffer):
 
 
     def reset(self):
-        # Set the data to zero and reset all the buckets.
+        """Set the data to zero and reset all the buckets."""
         self.zero()
         for bucket in self.buckets:
             bucket.reset()
@@ -179,15 +179,16 @@ class GradBuffer(MemoryBuffer):
 
 
     def done(self):
-        # Wait for all buckets' all-reductions to complete.
+        """Wait for all buckets' all-reductions to complete."""
         for bucket in self.buckets:
             bucket.done()
         
 
     def mark_grad_as_done(self, param):
-        # Note that when the number of microbatches is greater than 1,
-        # we only want to register grads when processing the last microbatch.
-        # This method is called from the backward hook.
+        """
+        When the number of microbatches is greater than 1, we only want
+        to register grads when processing the last microbatch.
+        """
         if self.is_last_microbatch:
             bucket = self.param_to_bucket[param]
             bucket.set(param)
@@ -351,9 +352,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
 
     def broadcast_params(self):
-        """
-        Sync params across all DP ranks.
-        """
+        """Sync params across all DP ranks."""
         for param in self.module.parameters():
             torch.distributed.broadcast(param.data,
                                         src=mpu.get_data_parallel_src_rank(),
