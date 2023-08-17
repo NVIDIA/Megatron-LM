@@ -24,6 +24,7 @@ class MemoryBuffer:
                                 device=torch.cuda.current_device(),
                                 requires_grad=False)
 
+
     def zero(self):
         """Reset the buffer to zero."""
         self.data.zero_()
@@ -45,7 +46,7 @@ class Bucket:
     """
     Bucket to all-reduce gradients for a set of parameters asynchronously. Provides
     functionality to register when params in the bucket have grads available, and
-    automatically launches an asynchronous all_reduce when all params in the bucket
+    automatically launches an asynchronous all_reduce when _all_ params in the bucket
     have grads available.
     """
 
@@ -97,15 +98,15 @@ class Bucket:
     
     
 
-class GradBuffer:
+class GradBuffer(MemoryBuffer):
     """
-    Buffer for gradients to ensure that gradients for different parameters in the
-    model are contiguous. Interally, gradients are organized into buckets with
-    at most bucket_size parameters each.
+    Groups gradients into a contiguous buffer, and then breaks them into buckets with
+    roughly bucket_size parameters each.
     """
     
-    def __init__(self, params, dtype, data_parallel_group,
+    def __init__(self, numel, numel_padded, dtype, params, data_parallel_group,
                  bucket_size, param_to_name):
+        super(GradBuffer, self).__init__(numel, numel_padded, dtype)
 
         self.buckets = []
         self.param_to_bucket = {}
@@ -119,24 +120,10 @@ class GradBuffer:
             unique_params.add(param)
         del unique_params
 
-        # Count number of elements in the parameters and allocate memory.
-        numel = 0
-        for param in params:
-            # Only count parameters that require gradients.
-            if param.requires_grad:
-                numel += param.data.nelement()
-        # Pad so size is divisible by the data parallel size.
-        # This makes things easier for distributed optimizer.
-        data_parallel_size = torch.distributed.get_world_size(
-            group=data_parallel_group)
-        numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
-
-        self.memory_buffer = MemoryBuffer(numel, numel_padded, dtype)
-
         # Map the grads to the buffer and bucket them.
         def set_bucket_(bucket_params, data_start_index, data_end_index):
-            bucket_data = self.memory_buffer.get(torch.Size([data_end_index - data_start_index]),
-                                                 data_start_index)
+            bucket_data = self.get(torch.Size([data_end_index - data_start_index]),
+                                   data_start_index)
             bucket = Bucket(bucket_params, bucket_data, data_parallel_group)
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
@@ -145,14 +132,13 @@ class GradBuffer:
         data_start_index = 0
         bucket_data_start_index = data_start_index
         bucket_params = set()
-        bucket_id = 0
         for param in params:
             # Skip parameters that don't require gradients.
             if not param.requires_grad:
                 continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
-            param.main_grad = self.memory_buffer.get(param.data.shape, data_start_index)
+            param.main_grad = self.get(param.data.shape, data_start_index)
             bucket_params.add(param)
 
             # If we have enough elements already, form a new buffer.
@@ -177,12 +163,19 @@ class GradBuffer:
                     print('      {}'.format(param_to_name[param]))
                 print('     total number of elements: {}'.format(numel))
 
+
     def reset(self):
         # Set the data to zero and reset all the buckets.
-        self.memory_buffer.zero()
+        self.zero()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = False
+
+
+    def done(self):
+        # Wait for all buckets' all-reductions to complete.
+        for bucket in self.buckets:
+            bucket.done()
         
 
     def mark_grad_as_done(self, param):
@@ -245,22 +238,36 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
         # Group parameters by their gradient type.
         grad_dtype_to_param = {}
+        grad_dtype_to_numel = {}
         param_to_name = {}
         for name, param in self.module.named_parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
                 param_to_name[param] = name
                 dtype = torch.float if grads_in_fp32 else param.dtype
+
                 params = grad_dtype_to_param.get(dtype, [])
                 params.append(param)
                 grad_dtype_to_param[dtype] = params
 
-        # Allocate the grad buffers and map the grads. Make sure parameters are reversed
+                # Calculate number of elements per dtype.
+                if dtype not in grad_dtype_to_numel:
+                    grad_dtype_to_numel[dtype] = 0
+                grad_dtype_to_numel[dtype] += param.data.nelement()
+
+        # Allocate the grad buffers and map the grads. Make sure parameters areå reversed
         # so they are in approximately in the order of backprop.
+        data_parallel_size = torch.distributed.get_world_size(
+            group=data_parallel_group)
         for dtype, params in grad_dtype_to_param.items():
             params.reverse()
+
+            # Pad so size is divisible by the data parallel size.
+            numel = grad_dtype_to_numel[dtype]
+            numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
+
             self.grad_dtype_to_grad_buffer[dtype] = GradBuffer(
-                params, dtype, data_parallel_group,
+                numel, numel_padded, dtype, params, data_parallel_group,
                 bucket_size, param_to_name)
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_dtype_to_grad_buffer[dtype]
@@ -279,6 +286,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
                     param, self.param_to_grad_buffer))
                 self.grad_accs.append(grad_acc)
 
+
     def _make_param_hook(self, param, param_to_grad_buffer):
         """Create the all-reduce hook for backprop."""
 
@@ -292,6 +300,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
                 param_to_grad_buffer[param].mark_grad_as_done(param)
 
         return param_hook
+
 
     @contextmanager
     def no_sync(self):
@@ -314,8 +323,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
     def allreduce_gradients(self):
         for grad_buffer in self.grad_dtype_to_grad_buffer.values():
-            for bucket in grad_buffer.buckets:
-                bucket.done()
+            grad_buffer.done()
 
 
     
