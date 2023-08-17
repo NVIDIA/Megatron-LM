@@ -306,20 +306,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      for model_module in model]
 
         elif args.DDP_impl == 'local':
-            if args.overlap_grad_reduce:
-                model = [OverlappingLocalDDP(model_module,
-                                             mpu.get_data_parallel_group(),
-                                             args.accumulate_allreduce_grads_in_fp32)
-                         for model_module in model]
-            else:
-                model = [LocalDDP(model_module,
-                                args.accumulate_allreduce_grads_in_fp32,
-                                args.use_contiguous_buffers_in_local_ddp)
+            model = [OverlappingLocalDDP(model_module,
+                                            mpu.get_data_parallel_group(),
+                                            args.accumulate_allreduce_grads_in_fp32,
+                                            args.overlap_grad_reduce)
                         for model_module in model]
-                # broad cast params from data parallel src rank to other data parallel ranks
-                if args.data_parallel_random_init:
-                    for model_module in model:
-                        model_module.broadcast_params()
+            # model = [LocalDDP(model_module,
+            #                   args.accumulate_allreduce_grads_in_fp32,
+            #                   args.use_contiguous_buffers_in_local_ddp)
+            #          for model_module in model]
+
+            # Broadcast params from data parallel src rank to other data parallel ranks.
+            if args.data_parallel_random_init:
+                for model_module in model:
+                    model_module.broadcast_params()
 
         else:
             raise NotImplementedError('Unknown DDP implementation specified: '

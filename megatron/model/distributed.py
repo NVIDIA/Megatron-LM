@@ -50,7 +50,7 @@ class Bucket:
     have grads available.
     """
 
-    def __init__(self, params, data, data_parallel_group):
+    def __init__(self, params, data, data_parallel_group, overlap_grad_reduce):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
         # available.
@@ -58,6 +58,7 @@ class Bucket:
         self.params_with_grad = set()
         self.data = data
         self.data_parallel_group = data_parallel_group
+        self.overlap_grad_reduce = overlap_grad_reduce
         
         self.one_over_data_parallel_size = 1.0 / \
             torch.distributed.get_world_size(group=data_parallel_group)
@@ -77,7 +78,7 @@ class Bucket:
         self.data.mul_(self.one_over_data_parallel_size)
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
-            async_op=True)
+            async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
         self.allreduce_issued = True
         
 
@@ -85,11 +86,14 @@ class Bucket:
         assert param in self.params, 'param is not in the bucket'
         assert param not in self.params_with_grad, 'cannot set grad twice'
         self.params_with_grad.add(param)
-        if len(self.params_with_grad) == len(self.params):
+        if self.overlap_grad_reduce and len(self.params_with_grad) == len(self.params):
             self.all_reduce()
 
 
     def done(self):
+        if not self.overlap_grad_reduce:
+            self.all_reduce()
+            return
         assert self.allreduce_issued, 'allreduce is not issued for this bucket'
         if self.allreduce_handle is not None:
             self.allreduce_handle.wait()
@@ -105,7 +109,7 @@ class GradBuffer(MemoryBuffer):
     """
     
     def __init__(self, numel, numel_padded, dtype, params, data_parallel_group,
-                 bucket_size, param_to_name):
+                 bucket_size, param_to_name, overlap_grad_reduce):
         super(GradBuffer, self).__init__(numel, numel_padded, dtype)
 
         self.buckets = []
@@ -124,7 +128,7 @@ class GradBuffer(MemoryBuffer):
         def set_bucket_(bucket_params, data_start_index, data_end_index):
             bucket_data = self.get(torch.Size([data_end_index - data_start_index]),
                                    data_start_index)
-            bucket = Bucket(bucket_params, bucket_data, data_parallel_group)
+            bucket = Bucket(bucket_params, bucket_data, data_parallel_group, overlap_grad_reduce)
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
                 self.param_to_bucket[bucket_param] = bucket
@@ -142,10 +146,12 @@ class GradBuffer(MemoryBuffer):
             bucket_params.add(param)
 
             # If we have enough elements already, form a new buffer.
-            if (data_end_index - bucket_data_start_index) >= bucket_size:
-                set_bucket_(bucket_params, bucket_data_start_index, data_end_index)
-                bucket_data_start_index = data_end_index
-                bucket_params = set()
+            # If bucket_size is None, accumulate everything into a single bucket.
+            if bucket_size is not None:
+                if (data_end_index - bucket_data_start_index) >= bucket_size:
+                    set_bucket_(bucket_params, bucket_data_start_index, data_end_index)
+                    bucket_data_start_index = data_end_index
+                    bucket_params = set()
             data_start_index = data_end_index
 
         # Add remaining params to a new bucket.
@@ -227,10 +233,13 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
     each bucket asynchronously.
     """
 
-    def __init__(self, module, data_parallel_group, grads_in_fp32):
+    def __init__(self, module, data_parallel_group, grads_in_fp32, overlap_grad_reduce):
         super(OverlappingDistributedDataParallel, self).__init__(module)        
 
-        bucket_size = 40000000
+        # Set bucket_size to infinity if overlap_grad_reduce is False.
+        bucket_size = None
+        if overlap_grad_reduce:
+            bucket_size = 40000000
         
         self.module = module
         self.grad_dtype_to_grad_buffer = {}
@@ -268,7 +277,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
             self.grad_dtype_to_grad_buffer[dtype] = GradBuffer(
                 numel, numel_padded, dtype, params, data_parallel_group,
-                bucket_size, param_to_name)
+                bucket_size, param_to_name, overlap_grad_reduce)
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_dtype_to_grad_buffer[dtype]
 
@@ -319,6 +328,13 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
                 param.grad_added_to_main_grad = False
         for grad_buffer in self.grad_dtype_to_grad_buffer.values():
             grad_buffer.reset()
+
+
+    def broadcast_params(self):
+        for param in self.module.parameters():
+            torch.distributed.broadcast(param.data,
+                                        src=mpu.get_data_parallel_src_rank(),
+                                        group=mpu.get_data_parallel_group())
 
 
     def allreduce_gradients(self):
