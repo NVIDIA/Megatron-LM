@@ -10,6 +10,11 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+def _get_device(config: TransformerConfig):
+    if config.use_cpu_initialization:
+        return 'cpu'
+    else:
+        return torch.cuda.current_device()
 
 class TENorm:
     """
@@ -19,6 +24,7 @@ class TENorm:
 
     def __new__(
         cls,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
         sequence_parallel: bool = False,
@@ -31,7 +37,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
-                device=device,
+                device=_get_device(config),
             )
         elif normalization == "RMSNorm":
             assert hasattr(
@@ -41,7 +47,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
-                device=device,
+                device=_get_device(config),
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
@@ -93,7 +99,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            device=device,
+            device=_get_device(config),
             **kwargs
         )
 
@@ -151,7 +157,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
-            device=device,
+            device=_get_device(config),
             **kwargs
         )
 

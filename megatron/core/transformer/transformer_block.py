@@ -45,11 +45,6 @@ class TransformerBlock(MegatronModule):
             self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
         )
 
-        if self.config.use_cpu_initialization:
-            self.device = 'cpu'
-        else:
-            self.device = torch.cuda.current_device()
-
         self._build_layers()
 
     def _build_layers(self):
@@ -130,17 +125,16 @@ class TransformerBlock(MegatronModule):
                     persist_layer_norm=self.config.persist_layer_norm,
                     sequence_parallel=self.config.sequence_parallel,
                     zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                    device=self.device,
                 )
             elif self.config.normalization == "RMSNorm":
                 self.final_layernorm = TENorm(
+                    config=self.config,
                     hidden_size=self.config.hidden_size,
                     eps=self.config.layernorm_epsilon,
                     persist_layer_norm=self.config.persist_layer_norm,
                     sequence_parallel=self.config.sequence_parallel,
                     zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                     normalization=self.config.normalization,
-                    device=self.device,
                 )
             else:
                 raise AssertionError("Only `LayerNorm` and `RMSNorm` are currently supported.")
