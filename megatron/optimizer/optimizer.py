@@ -7,21 +7,16 @@ from abc import abstractmethod
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 import torch
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model.distributed import OverlappingDistributedDataParallel as OverlappingLocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
-
-ALL_MODULE_WRAPPER_CLASSNAMES = (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module)
 
 
 def _zero_grad_group_helper(group, set_to_none):
@@ -219,8 +214,7 @@ class MegatronOptimizer(ABC):
                 unwrapped_model = self.models[-1]
             else:  # We do not support the interleaved schedule for T5 yet.
                 unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(
-                unwrapped_model, ALL_MODULE_WRAPPER_CLASSNAMES)
+            unwrapped_model = unwrap_model(unwrapped_model)
 
             if unwrapped_model.share_embeddings_and_output_weights:
                 weight = unwrapped_model.shared_embedding_or_output_weight()
@@ -242,8 +236,7 @@ class MegatronOptimizer(ABC):
                 mpu.get_pipeline_model_parallel_world_size() > 1 and \
                 args.pipeline_model_parallel_split_rank is not None:
             unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(
-                unwrapped_model, ALL_MODULE_WRAPPER_CLASSNAMES)
+            unwrapped_model = unwrap_model(unwrapped_model)
             assert args.DDP_impl == 'local', \
                 'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
@@ -265,8 +258,7 @@ class MegatronOptimizer(ABC):
                 args.sequence_parallel:
             grads = []
             for model_module in self.models:
-                unwrapped_model = unwrap_model( 
-                    model_module, ALL_MODULE_WRAPPER_CLASSNAMES)
+                unwrapped_model = unwrap_model(model_module)
                 for param in unwrapped_model.parameters():
                     if getattr(param, 'sequence_parallel', False):
                         grad = param.main_grad if args.DDP_impl == 'local' else param.grad

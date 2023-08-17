@@ -16,10 +16,16 @@ from megatron import (
 )
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model.distributed import OverlappingDistributedDataParallel as OverlappingLocalDDP
+from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 
 
-def unwrap_model(model, module_instances=(torchDDP)):
+ALL_MODULE_WRAPPER_CLASSNAMES = (torchDDP, LocalDDP, OverlappingLocalDDP, Float16Module)
+
+
+def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return_list = True
     if not isinstance(model, list):
         model = [model]
