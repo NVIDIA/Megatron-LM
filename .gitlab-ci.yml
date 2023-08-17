@@ -7,11 +7,11 @@ stages:
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3 # This is the image that is run by all nodes on selene for tests
+  PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.04-py3 # This is the image that is run by all nodes on selene for tests
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests L0
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
@@ -187,6 +187,7 @@ train.te_gpt3.345m_tp2_pp2_1node_50steps:
     MAX_STEPS: 50
     TIME_LIMIT: "50:00"
     TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 train.gpt3_core.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher
