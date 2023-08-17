@@ -1,5 +1,5 @@
 from importlib.metadata import version
-from typing import Callable, Union
+from typing import Callable
 
 import torch
 import transformer_engine as te
