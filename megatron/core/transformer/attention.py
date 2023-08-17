@@ -1,20 +1,20 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from typing import Union
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
-    TEDotProductAttention,
-    TERowParallelLinear,
-)
+
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
+from megatron.core.transformer.spec_utils import (
+    get_module, SelfAttentionSpec, CrossAttentionSpec
+)
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -28,7 +28,12 @@ class Attention(MegatronModule, ABC):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding,
+        self,
+        config: TransformerConfig,
+        spec: Union[SelfAttentionSpec, CrossAttentionSpec],
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs,
     ):
         super().__init__(config=config)
 
@@ -49,14 +54,15 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = TEDotProductAttention(
+        self.dot_product_attention = get_module(spec.dot_product_attention)(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
+
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
-        self.linear_proj = TERowParallelLinear(
+        self.linear_proj = get_module(spec.linear_proj)(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
@@ -250,11 +256,16 @@ class SelfAttention(Attention):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+        self,
+        config: TransformerConfig,
+        spec: SelfAttentionSpec,
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs
     ):
-        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
+        super().__init__(config=config, spec=spec, layer_number=layer_number, attn_mask_type=attn_mask_type, **kwargs)
 
-        self.linear_qkv = TEColumnParallelLinear(
+        self.layernorm_linear_qkv = get_module(spec.layernorm_linear_qkv)(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -268,7 +279,7 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.linear_qkv(hidden_states)
+        mixed_qkv, _ = self.layernorm_linear_qkv(hidden_states)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -308,9 +319,14 @@ class CrossAttention(Attention):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+        self,
+        config: TransformerConfig,
+        spec: CrossAttentionSpec,
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs
     ):
-        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
+        super().__init__(config=config, spec=spec, layer_number=layer_number, attn_mask_type=attn_mask_type, **kwargs)
 
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(
@@ -318,7 +334,7 @@ class CrossAttention(Attention):
             )
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = TEColumnParallelLinear(
+        self.layernorm_linear_q = get_module(spec.layernorm_linear_q)(
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -327,7 +343,7 @@ class CrossAttention(Attention):
             skip_bias_add=False,
         )
 
-        self.linear_kv = TEColumnParallelLinear(
+        self.layernorm_linear_kv = get_module(spec.layernorm_linear_kv)(
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
@@ -342,7 +358,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.linear_kv(key_value_states)
+        mixed_kv, _ = self.layernorm_linear_kv(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -355,7 +371,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.linear_q(hidden_states)
+        query, _ = self.layernorm_linear_q(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (

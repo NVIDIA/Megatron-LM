@@ -11,6 +11,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.spec_utils import TransformerLayerSpec
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -20,6 +21,7 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
+        spec: TransformerLayerSpec,
         self_attn_mask_type=AttnMaskType.padding,
         post_layer_norm=True,
         pre_process=True,
@@ -28,6 +30,7 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.transformer_layer_spec: TransformerLayerSpec = spec
 
         self.self_attn_mask_type = self_attn_mask_type
         self.post_layer_norm = post_layer_norm
@@ -45,9 +48,9 @@ class TransformerBlock(MegatronModule):
             self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
         )
 
-        self._build_layers()
+        self._build_layers(self.transformer_layer_spec)
 
-    def _build_layers(self):
+    def _build_layers(self, transformer_layer_spec):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
@@ -57,6 +60,7 @@ class TransformerBlock(MegatronModule):
         def build_layer(layer_number):
             return TransformerLayer(
                 config=self.config,
+                spec=transformer_layer_spec,
                 layer_number=layer_number,
                 self_attn_mask_type=self.self_attn_mask_type,
             )
