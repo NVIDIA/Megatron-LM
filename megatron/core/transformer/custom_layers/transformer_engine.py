@@ -29,7 +29,6 @@ class TENorm:
         eps: float = 1e-5,
         sequence_parallel: bool = False,
         normalization="LayerNorm",
-        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         if normalization == "LayerNorm":
@@ -74,7 +73,6 @@ class TELinear(te.pytorch.Linear):
         *,
         bias: bool = True,
         skip_bias_add: bool = False,
-        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config
@@ -128,7 +126,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
-        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config
@@ -221,7 +218,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         config: TransformerConfig,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        device: Union[torch.device, str] = "cuda",
         **kwargs
     ):
         self.config = config
