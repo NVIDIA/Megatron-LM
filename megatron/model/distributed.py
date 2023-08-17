@@ -260,7 +260,8 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
             bucket_size = 40000000
         
         self.module = module
-        self.grad_dtype_to_grad_buffer = {}
+        self.grad_buffers = {}
+        self.grad_buffer_param_index_map = {}
         self.param_to_grad_buffer = {}
 
         # Group parameters by their gradient type.
@@ -293,11 +294,19 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
             numel = grad_dtype_to_numel[dtype]
             numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
 
-            self.grad_dtype_to_grad_buffer[dtype] = GradBuffer(
+            self.grad_buffers[dtype] = GradBuffer(
                 numel, numel_padded, dtype, params, data_parallel_group,
                 bucket_size, param_to_name, overlap_grad_reduce)
+            index = 0
             for param in params:
-                self.param_to_grad_buffer[param] = self.grad_dtype_to_grad_buffer[dtype]
+                self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
+                if dtype not in self.grad_buffer_param_index_map:
+                    self.grad_buffer_param_index_map[dtype] = {}
+                self.grad_buffer_param_index_map[dtype][param] = (
+                    index,
+                    index + param.data.nelement(),
+                )
+                index += param.data.nelement()
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -332,12 +341,12 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
     @contextmanager
     def no_sync(self):
         """Context manager that turns off gradient synchronization."""
-        for grad_buffer in self.grad_dtype_to_grad_buffer.values():
+        for grad_buffer in self.grad_buffers.values():
             grad_buffer.is_last_microbatch = False
         try:
             yield
         finally:
-            for grad_buffer in self.grad_dtype_to_grad_buffer.values():
+            for grad_buffer in self.grad_buffers.values():
                 grad_buffer.is_last_microbatch = True
 
 
@@ -347,7 +356,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
-        for grad_buffer in self.grad_dtype_to_grad_buffer.values():
+        for grad_buffer in self.grad_buffers.values():
             grad_buffer.reset()
 
 
@@ -367,7 +376,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
         When overlap_grad_reduce is set to False, calls synchronous
         all-reduce.
         """
-        for grad_buffer in self.grad_dtype_to_grad_buffer.values():
+        for grad_buffer in self.grad_buffers.values():
             grad_buffer.done()
 
 
