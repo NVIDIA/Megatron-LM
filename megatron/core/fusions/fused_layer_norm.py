@@ -77,7 +77,6 @@ class FusedLayerNorm(torch.nn.Module):
             hidden_size = (hidden_size,)
         self.hidden_size = torch.Size(hidden_size)
         self.eps = eps
-        # TODO: do we need to check dtype and device here?
         self.weight = Parameter(torch.Tensor(*hidden_size))
         self.bias = Parameter(torch.Tensor(*hidden_size))
         self.reset_parameters()
