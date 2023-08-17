@@ -307,10 +307,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         elif args.DDP_impl == 'local':
             model = [OverlappingLocalDDP(model_module,
-                                            mpu.get_data_parallel_group(),
-                                            args.accumulate_allreduce_grads_in_fp32,
-                                            args.overlap_grad_reduce)
-                        for model_module in model]
+                                         mpu.get_data_parallel_group(),
+                                         args.accumulate_allreduce_grads_in_fp32,
+                                         args.overlap_grad_reduce)
+                     for model_module in model]
             # model = [LocalDDP(model_module,
             #                   args.accumulate_allreduce_grads_in_fp32,
             #                   args.use_contiguous_buffers_in_local_ddp)

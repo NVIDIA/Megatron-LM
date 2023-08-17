@@ -228,12 +228,29 @@ class DistributedDataParallelBase(MegatronModule, ABC):
 
 class OverlappingDistributedDataParallel(DistributedDataParallelBase):
     """
-    DDP wrapper that overlaps all-reduce with computation by breaking up
-    full model's gradients into smaller buckets and running all-reduce on
-    each bucket asynchronously.
+    DDP wrapper which stores grads in contiguous buffers. Also has option of
+    overlapping all-reduce with computation by breaking up full model's
+    gradients into smaller buckets and running all-reduce on each bucket
+    asynchronously.
+    This class:
+        - has the potential to reduce memory fragmentation.
+        - provides the option to do the gradient accumulation
+          in a type other than the params type (e.g., fp32).
+
+    Arguments:
+        module: input model.
+        data_parallel_group: data-parallel group.
+        accumulate_allreduce_grads_in_fp32: if true do the gradient accumulation
+            and the gradient all-reduce all in in float32.
+        overlap_grad_reduce: if true, overlap all-reduce with computation by
+            breaking up grads into buckets. If false, single synchronous all-reduce
+            is used instead.
+
     """
 
-    def __init__(self, module, data_parallel_group, grads_in_fp32, overlap_grad_reduce):
+    def __init__(self, module, data_parallel_group,
+                 accumulate_allreduce_grads_in_fp32,
+                 overlap_grad_reduce):
         super(OverlappingDistributedDataParallel, self).__init__(module)        
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
@@ -253,19 +270,19 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
                 param_to_name[param] = name
-                dtype = torch.float if grads_in_fp32 else param.dtype
+                dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
 
                 params = grad_dtype_to_param.get(dtype, [])
                 params.append(param)
                 grad_dtype_to_param[dtype] = params
 
                 # Calculate number of elements per dtype.
-                if dtype not in grad_dtype_to_numel:
-                    grad_dtype_to_numel[dtype] = 0
-                grad_dtype_to_numel[dtype] += param.data.nelement()
+                grad_dtype_to_numel[dtype] = grad_dtype_to_numel.get(dtype, 0) + param.data.nelement()
 
-        # Allocate the grad buffers and map the grads. Make sure parameters areå reversed
+        # Allocate the grad buffers and map the grads. Make sure parameters are reversed
         # so they are in approximately in the order of backprop.
+        # The grad buffer under the hood creates buckets as appropriate, depending on
+        # whether overlap_grad_reduce is True or not.
         data_parallel_size = torch.distributed.get_world_size(
             group=data_parallel_group)
         for dtype, params in grad_dtype_to_param.items():
@@ -313,6 +330,7 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
     @contextmanager
     def no_sync(self):
+        """Context manager that turns off gradient synchronization."""
         for grad_buffer in self.grad_dtype_to_grad_buffer.values():
             grad_buffer.is_last_microbatch = False
         try:
@@ -323,6 +341,8 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
 
     def zero_grad_buffer(self):
+        """Set the grad buffer data to zero. Needs to be called at the
+        begining of each iteration."""
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
@@ -331,6 +351,9 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
 
     def broadcast_params(self):
+        """
+        Sync params across all DP ranks.
+        """
         for param in self.module.parameters():
             torch.distributed.broadcast(param.data,
                                         src=mpu.get_data_parallel_src_rank(),
@@ -338,6 +361,13 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
 
     def allreduce_gradients(self):
+        """
+        Reduce gradients across data parallel ranks.
+        When overlap_grad_reduce is set to True, waits for asynchronous all-reduces
+        to complete.
+        When overlap_grad_reduce is set to False, calls synchronous
+        all-reduce.
+        """
         for grad_buffer in self.grad_dtype_to_grad_buffer.values():
             grad_buffer.done()
 
