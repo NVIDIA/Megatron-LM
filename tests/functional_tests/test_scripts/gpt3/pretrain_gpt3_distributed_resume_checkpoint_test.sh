@@ -65,7 +65,7 @@ torchrun $DISTRIBUTED_ARGS \
 echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
 # Resume from 50th iteration ckpt and continue to 100 iterations
-python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --use-checkpoint-args \
        --use-checkpoint-opt_param-scheduler \
