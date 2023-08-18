@@ -184,14 +184,18 @@ class SwitchMLP(MegatronModule):
             local_indices = (max_ind == expert_num).nonzero()
             hidden = hidden_states[local_indices,:]
             output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
+            if output_bias is not None:
+                output_bias = output_bias.expand_as(output)
+                output_bias_total[local_indices,:] = output_bias
             output_total[local_indices,:] = output
-            output_bias_total[local_indices,:] = output_bias
 
         output_total = output_total*max_prob
-        output_bias_total = output_bias_total*max_prob
         output_total = output_total.view(s, b, h)
-        output_bias_total = output_bias_total.view(s, b, h)
+        if output_bias is not None:
+            output_bias_total = output_bias_total*max_prob
+            output_bias_total = output_bias_total.view(s, b, h)
+        else:
+            output_bias_total = None
 
         return output_total, output_bias_total
 
