@@ -69,17 +69,14 @@ class Bucket:
     def reset(self):
         self.params_with_grad = set()
         self.allreduce_handle = None
-        self.allreduce_issued = False
 
 
     def all_reduce(self):
         assert self.allreduce_handle is None, 'allreduce handle is not None'
-        assert not self.allreduce_issued, 'allreduce is already issued'
         self.data.mul_(self.one_over_data_parallel_size)
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
             async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
-        self.allreduce_issued = True
         
 
     def set(self, param):
@@ -94,11 +91,9 @@ class Bucket:
         if not self.overlap_grad_reduce:
             self.all_reduce()
             return
-        assert self.allreduce_issued, 'allreduce is not issued for this bucket'
-        if self.allreduce_handle is not None:
-            self.allreduce_handle.wait()
-        self.addreduce_handle = None
-        self.allreduce_issued = False
+        assert self.allreduce_handle is not None, 'allreduce is not issued for this bucket'
+        self.allreduce_handle.wait()
+        self.allreduce_handle = None
     
     
 
@@ -251,13 +246,12 @@ class OverlappingDistributedDataParallel(DistributedDataParallelBase):
 
     def __init__(self, module, data_parallel_group,
                  accumulate_allreduce_grads_in_fp32,
-                 overlap_grad_reduce):
+                 overlap_grad_reduce, bucket_size=40000000):
         super(OverlappingDistributedDataParallel, self).__init__(module)        
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        bucket_size = None
-        if overlap_grad_reduce:
-            bucket_size = 40000000
+        if not overlap_grad_reduce:
+            bucket_size = None
         
         self.module = module
         self.grad_buffers = {}
