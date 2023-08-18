@@ -21,7 +21,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
-python -m torch.distributed.launch $DISTRIBUTED_ARGS \
+torchrun $DISTRIBUTED_ARGS \
        pretrain_bert.py \
        --num-layers 24 \
        --hidden-size 1024 \
