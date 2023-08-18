@@ -60,8 +60,7 @@ class Bucket:
         self.data_parallel_group = data_parallel_group
         self.overlap_grad_reduce = overlap_grad_reduce
         
-        self.one_over_data_parallel_size = 1.0 / \
-            torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_size = torch.distributed.get_world_size(group=data_parallel_group)
 
         self.reset()
 
@@ -73,7 +72,7 @@ class Bucket:
 
     def all_reduce(self):
         assert self.allreduce_handle is None, 'allreduce handle is not None'
-        self.data.mul_(self.one_over_data_parallel_size)
+        self.data /= self.data_parallel_size
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
             async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
