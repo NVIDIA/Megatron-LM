@@ -417,8 +417,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
             if hasattr(weight, 'grad_added_to_main_grad'):
-                # When using OverlappingDDP, need to ensure that backward hooks are
-                # all run on the main backprop thread to prevent deadlocks. Setup
+                # When overlap_grad_reduce is True, need to ensure that backward hooks
+                # are all run on the main backprop thread to prevent deadlocks. Setup
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
                 grad_weight = torch.empty(

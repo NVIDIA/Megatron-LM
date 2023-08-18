@@ -50,8 +50,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             to do gradient accumulation and all-reduces in float32
             and as a result we store those gradients in the main_grad.
             Note that main grad is not necessarily in float32.
-        use_contiguous_buffers_in_local_ddp: if true, the local DDP model
-            is using a contiguous buffer to hold the model grads.
         fp16: if true, the model is running in fp16.
         bf16: if true, the model is running in bfloat16.
         grad_scaler: used for scaling gradients. Note that this can be
@@ -352,8 +350,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
-                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 params_have_main_grad, fp16, bf16, params_dtype,
+                 grad_scaler, models):
         """
         See top of class definition for argument descriptions.
 
@@ -366,12 +364,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-            fp16, bf16, params_dtype, grad_scaler, models)
+            params_have_main_grad, fp16, bf16, params_dtype,
+            grad_scaler, models)
 
-        # Verify that contiguous buffers are being used.
-        # - Note: this should already be checked in arguments.py.
-        assert use_contiguous_buffers_in_local_ddp
         assert isinstance(optimizer, Adam), \
             "Only Adam currently supported, due to checkpointing requirements."
 

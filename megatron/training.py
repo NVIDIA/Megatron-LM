@@ -34,7 +34,6 @@ from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model.distributed import OverlappingDistributedDataParallel as OverlappingLocalDDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
@@ -305,15 +304,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      for model_module in model]
 
         elif args.DDP_impl == 'local':
-            model = [OverlappingLocalDDP(model_module,
-                                         mpu.get_data_parallel_group(),
-                                         args.accumulate_allreduce_grads_in_fp32,
-                                         args.overlap_grad_reduce)
+            model = [LocalDDP(model_module,
+                              mpu.get_data_parallel_group(),
+                              args.accumulate_allreduce_grads_in_fp32,
+                              args.overlap_grad_reduce)
                      for model_module in model]
-            # model = [LocalDDP(model_module,
-            #                   args.accumulate_allreduce_grads_in_fp32,
-            #                   args.use_contiguous_buffers_in_local_ddp)
-            #          for model_module in model]
 
             # Broadcast params from data parallel src rank to other data parallel ranks.
             if args.data_parallel_random_init:
@@ -424,7 +419,7 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
+    if args.DDP_impl == 'local':
         for partition in model:
             partition.zero_grad_buffer()
     optimizer.zero_grad()
