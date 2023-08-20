@@ -46,9 +46,7 @@ class TransformerLayer(MegatronModule):
 
         # Self attention.
         self.self_attention = SelfAttention(
-            config=self.config,
-            layer_number=layer_number,
-            attn_mask_type=self_attn_mask_type,
+            config=self.config, layer_number=layer_number, attn_mask_type=self_attn_mask_type,
         )
 
         # Layernorm on the attention output
