@@ -10,11 +10,13 @@ from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+
 def _get_device(config: TransformerConfig):
     if config.use_cpu_initialization:
         return 'cpu'
     else:
         return torch.cuda.current_device()
+
 
 class TENorm:
     """
