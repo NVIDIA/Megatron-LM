@@ -3,7 +3,7 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
-    TELayernormMLP,
+    TELayerNormMLP,
     TERowParallelLinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -20,7 +20,7 @@ def get_gpt_decoder_spec() -> TransformerLayerSpec:
             linear_proj=TERowParallelLinear,
         ),
         self_attn_bda=get_bias_dropout_add,
-        ln_mlp=TELayernormMLP,
+        ln_mlp=TELayerNormMLP,
         mlp_bda=get_bias_dropout_add,
     )
     return layer_spec

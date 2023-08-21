@@ -220,7 +220,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **kwargs
         )
 
-class TELayernormMLP(te.pytorch.LayerNormMLP):
+class TELayerNormMLP(te.pytorch.LayerNormMLP):
     """
     Wrapper for the Transformer-Engine's `LayerNormMLP` layer that combines
     `LayerNorm` and the MLP (2 x feedforward layers) into a single module which

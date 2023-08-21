@@ -13,7 +13,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 from megatron.core.transformer.spec_utils import (
-    get_module, SelfAttentionSpec, CrossAttentionSpec
+    build_module, SelfAttentionSpec, CrossAttentionSpec
 )
 
 from .enums import AttnMaskType
@@ -54,15 +54,19 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = get_module(spec.dot_product_attention)(
-            config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
+        self.dot_product_attention = build_module(
+            spec.dot_product_attention,
+            config=self.config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
         )
 
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
-        self.linear_proj = get_module(spec.linear_proj)(
+        self.linear_proj = build_module(
+            spec.linear_proj,
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
@@ -265,7 +269,8 @@ class SelfAttention(Attention):
     ):
         super().__init__(config=config, spec=spec, layer_number=layer_number, attn_mask_type=attn_mask_type, **kwargs)
 
-        self.layernorm_linear_qkv = get_module(spec.layernorm_linear_qkv)(
+        self.layernorm_linear_qkv = build_module(
+            spec.layernorm_linear_qkv,
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -334,7 +339,8 @@ class CrossAttention(Attention):
             )
         assert self.query_projection_size == self.kv_projection_size
 
-        self.layernorm_linear_q = get_module(spec.layernorm_linear_q)(
+        self.layernorm_linear_q = build_module(
+            spec.layernorm_linear_q,
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -343,7 +349,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
         )
 
-        self.layernorm_linear_kv = get_module(spec.layernorm_linear_kv)(
+        self.layernorm_linear_kv = build_module(
+            spec.layernorm_linear_kv,
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
