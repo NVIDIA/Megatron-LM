@@ -78,7 +78,7 @@ def _renest_sd(sd):
     return new_sd
 
 
-def _create_rank_checkpoint(ds_checkpoint, checkpoint_path, tp_index, pp_index, for_release=False):
+def _create_rank_checkpoint(ds_checkpoint, tp_index, pp_index, for_release=False):
     meg_encoder_sd = OrderedDict()
     meg_embedding_sd = OrderedDict()
     meg_embedding_for_head_sd = OrderedDict()
