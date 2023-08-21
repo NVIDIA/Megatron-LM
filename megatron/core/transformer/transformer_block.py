@@ -6,6 +6,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -114,13 +115,28 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = FusedLayerNorm(
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel,
-                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            )
+            # TODO (sudhakars): Need to replace the usage of `FusedLayerNorm`
+            # with `TENorm` wrapper class since we'd want consistent use of
+            # normalization layers.
+            if self.config.normalization == "LayerNorm":
+                self.final_layernorm = FusedLayerNorm(
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                    persist_layer_norm=self.config.persist_layer_norm,
+                    sequence_parallel=self.config.sequence_parallel,
+                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                )
+            elif self.config.normalization == "RMSNorm":
+                self.final_layernorm = TENorm(
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                    persist_layer_norm=self.config.persist_layer_norm,
+                    sequence_parallel=self.config.sequence_parallel,
+                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                    normalization=self.config.normalization,
+                )
+            else:
+                raise AssertionError("Only `LayerNorm` and `RMSNorm` are currently supported.")
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -143,7 +159,7 @@ class TransformerBlock(MegatronModule):
             # the input activation of each divided chunk.
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
-            while l < self.num_layers:
+            while l < self.num_layers_per_pipeline_rank:
                 hidden_states = tensor_parallel.checkpoint(
                     custom(l, l + self.config.recompute_num_layers),
                     self.config.distribute_saved_activations,
@@ -152,7 +168,7 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb,
                 )
 
-                l += self.recompute_num_layers
+                l += self.config.recompute_num_layers
 
         elif self.config.recompute_method == 'block':
             # Checkpoint the input activation of only a set number of individual

@@ -375,10 +375,6 @@ def validate_args(args, defaults={}):
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
 
-    # Normalization args
-    if args.normalization == "RMSNorm":
-        assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
-
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -579,7 +575,7 @@ def _add_network_size_args(parser):
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
-                       help='Percent of rotary dimension to use, default 100%')
+                       help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',

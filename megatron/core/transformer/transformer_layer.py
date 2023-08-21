@@ -4,8 +4,9 @@ import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
-from megatron.core.transformer.custom_layers.transformer_engine import TELayerNorm
-from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -33,12 +34,13 @@ class TransformerLayer(MegatronModule):
 
         # Layernorm on the input data.
         # TODO: add pytorch only layernorm
-        self.input_layernorm = TELayerNorm(
+        self.input_layernorm = TENorm(
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+            normalization=self.config.normalization,
         )
 
         # Self attention.
@@ -47,12 +49,13 @@ class TransformerLayer(MegatronModule):
         )
 
         # Layernorm on the attention output
-        self.post_self_attn_layernorm = TELayerNorm(
+        self.post_self_attn_layernorm = TENorm(
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
             sequence_parallel=self.config.sequence_parallel,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+            normalization=self.config.normalization,
         )
 
         # MLP

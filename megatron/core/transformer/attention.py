@@ -11,7 +11,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TERowParallelLinear,
 )
-from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
@@ -295,7 +295,7 @@ class SelfAttention(Attention):
             dim=3,
         )
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
 
