@@ -71,9 +71,11 @@ class Bucket:
 
 
     def all_reduce(self):
-        assert self.allreduce_handle is None, 'allreduce handle is not None'
+        assert self.allreduce_handle is None, \
+            'Should not have multiple all-reduces in flight at once'
+        assert len(self.params_with_grad) == len(self.params), \
+            f'Number of params with grad: {len(self.params_with_grad)}/{len(self.params)}'
         self.data /= self.data_parallel_size
-        assert len(self.params_with_grad) == len(self.params)
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
             async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
