@@ -12,6 +12,7 @@ USE_CORE=$9
 VP_SIZE=${10}
 MBS=${11}
 GBS=${12}
+ADDITIONAL_PARAMS=${13}
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -82,5 +83,6 @@ torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
+       ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
        --${TRAINING_DTYPE}
