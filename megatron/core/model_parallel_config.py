@@ -28,6 +28,8 @@ class ModelParallelConfig:
         parallelizing layer norms and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer
         Models: https://arxiv.org/abs/2205.05198 for more details. Defaults to False.
 
+    expert_parallel (bool): Distributes Moe Experts across data parallel dimension. Defaults to False.
+
     Initialization
     --------------
 
@@ -115,6 +117,7 @@ class ModelParallelConfig:
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: int = None
     sequence_parallel: bool = False
+    expert_parallel: bool = False
 
     # Initialization
     perform_initialization: bool = True
@@ -165,3 +168,6 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.expert_parallel:
+            self.sequence_parallel = True

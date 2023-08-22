@@ -388,6 +388,12 @@ def validate_args(args, defaults={}):
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
+    # Expert parallelism check
+    if args.expert_parallel:
+        assert args.num_experts % args.data_parallel_size == 0, \
+            "Number of experts should be a multiple of data parallel_size."
+        args.sequence_parallel = True
+
     # Print arguments.
     _print_args("arguments", args)
     retro_args = get_retro_args()
@@ -857,6 +863,8 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--expert-parallel', action='store_true',
+                       help='Enable expert parallel optimization.')
     return parser
 
 

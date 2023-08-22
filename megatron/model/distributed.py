@@ -151,20 +151,21 @@ class DistributedDataParallel(DistributedDataParallelBase):
                         type_num_elements[dtype] -= param.data.nelement()
                         param.main_grad = self._grad_buffers[dtype].get(
                             param.data.shape, type_num_elements[dtype])
+                    
+                        if dtype not in self._grad_buffer_param_index_map:
+                            self._grad_buffer_param_index_map[dtype] = {}
+                        self._grad_buffer_param_index_map[dtype][param] = (
+                            type_num_elements[dtype],
+                            type_num_elements[dtype] + param.data.nelement(),
+                        )
                     else:
-                        param.main_grad = torch.zeros(param.data.shape,
-                                                      dtype=dtype,
-                                                      device=torch.cuda.current_device(),
-                                                      requires_grad=False)
+                        param.main_grad = \
+                            torch.zeros(param.data.shape,
+                                        dtype=dtype,
+                                        device=torch.cuda.current_device(),
+                                        requires_grad=False)
                         self._expert_grads.append(param.main_grad)
                     
-                    if dtype not in self._grad_buffer_param_index_map:
-                        self._grad_buffer_param_index_map[dtype] = {}
-                    self._grad_buffer_param_index_map[dtype][param] = (
-                        type_num_elements[dtype],
-                        type_num_elements[dtype] + param.data.nelement(),
-                    )
-
             # Backward hook.
             # Accumalation function for the gradients. We need
             # to store them so they don't go out of scope.

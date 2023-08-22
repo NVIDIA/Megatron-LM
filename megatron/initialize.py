@@ -210,8 +210,7 @@ def _initialize_distributed():
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
-                args.pipeline_model_parallel_split_rank,
-                args.fp8_e4m3 or args.fp8_hybrid,
+                args.pipeline_model_parallel_split_rank
             )
             if args.rank == 0:
                 print(

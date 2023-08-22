@@ -4,6 +4,7 @@ import torch
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
+    get_tensor_and_data_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -129,8 +130,8 @@ def _reduce_scatter_along_first_dim(input_):
 
 def _gather_along_first_dim_moe(input_):
     """Gather tensors and concatinate along the first dimension."""
-
-    world_size = torch.distributed.get_world_size()
+    group = get_tensor_and_data_parallel_group()
+    world_size = torch.distributed.get_world_size(group=group)
     # Bypass the function if we are using only 1 GPU.
     if world_size==1:
         return input_
@@ -140,13 +141,16 @@ def _gather_along_first_dim_moe(input_):
 
     output = torch.empty(dim_size, dtype=input_.dtype,
                          device=torch.cuda.current_device())
-    torch.distributed._all_gather_base(output, input_.contiguous())
+    torch.distributed._all_gather_base(
+        output, input_.contiguous(), group=group
+    )
 
     return output
 
 def _reduce_scatter_along_first_dim_moe(input_):
     """Reduce-scatter the input tensor across model parallel group."""
-    world_size = torch.distributed.get_world_size()
+    group = get_tensor_and_data_parallel_group()
+    world_size = torch.distributed.get_world_size(group=group)
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:
         return input_
@@ -157,7 +161,9 @@ def _reduce_scatter_along_first_dim_moe(input_):
    
     output = torch.empty(dim_size, dtype=input_.dtype,
                          device=torch.cuda.current_device())
-    torch.distributed._reduce_scatter_base(output, input_.contiguous())
+    torch.distributed._reduce_scatter_base(
+        output, input_.contiguous(), group=group
+    )
     return output
 
 class _CopyToModelParallelRegion(torch.autograd.Function):

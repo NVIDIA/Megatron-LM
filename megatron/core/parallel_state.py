@@ -21,8 +21,9 @@ _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP_GLOO = None
-# FP8 amax reduction group.
-_AMAX_REDUCTION_GROUP = None
+# tensor model parallel group and data parallel group combined
+# used for fp8 and moe training
+_TENSOR_AND_DATA_PARALLEL_GROUP = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
@@ -57,7 +58,6 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
-    use_fp8: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -96,11 +96,6 @@ def initialize_model_parallel(
             pipeline_model_parallel_size is 8 and
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
-
-        use_fp8 (bool, default = False):
-            Construct GPU groups needed for FP8 training, namely for
-            amax reduction across the product of the data-parallel and
-            tensor-parallel groups.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -244,19 +239,18 @@ def initialize_model_parallel(
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
-    # Build the FP8 groups.
-    global _AMAX_REDUCTION_GROUP
-    assert _AMAX_REDUCTION_GROUP is None, 'FP8 amax reduction group is already initialized'
-    if use_fp8:
-        amax_group_size: int = tensor_model_parallel_size * data_parallel_size
-        num_amax_groups: int = world_size // amax_group_size
-        for i in range(num_amax_groups):
-            start_rank = i * amax_group_size
-            end_rank = (i + 1) * amax_group_size
-            ranks = range(start_rank, end_rank)
-            group = torch.distributed.new_group(ranks)
-            if rank in ranks:
-                _AMAX_REDUCTION_GROUP = group
+    # Build the tensor + data parallel groups.
+    global _TENSOR_AND_DATA_PARALLEL_GROUP
+    assert _TENSOR_AND_DATA_PARALLEL_GROUP is None, 'Tensor + data parallel group is already initialized'
+    tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
+    num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
+    for i in range(num_tensor_and_data_groups):
+        start_rank = i * tensor_and_data_group_size
+        end_rank = (i + 1) * tensor_and_data_group_size
+        ranks = range(start_rank, end_rank)
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -330,9 +324,13 @@ def get_position_embedding_group():
 
 def get_amax_reduction_group():
     """Get the FP8 amax reduction group the caller rank belongs to."""
-    assert _AMAX_REDUCTION_GROUP is not None, 'FP8 amax reduction group is not initialized'
-    return _AMAX_REDUCTION_GROUP
+    assert _TENSOR_AND_DATA_PARALLEL_GROUP is not None, 'FP8 amax reduction group is not initialized'
+    return _TENSOR_AND_DATA_PARALLEL_GROUP
 
+def get_tensor_and_data_parallel_group():
+    """Get the tensor and data parallel group the caller rank belongs to."""
+    assert _TENSOR_AND_DATA_PARALLEL_GROUP is not None, 'tensor and data parallel group is not initialized'
+    return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 def set_tensor_model_parallel_world_size(world_size):
     """Set the tensor model parallel size"""
@@ -612,8 +610,8 @@ def destroy_model_parallel():
     _EMBEDDING_GROUP = None
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
-    global _AMAX_REDUCTION_GROUP
-    _AMAX_REDUCTION_GROUP = None
+    global _TENSOR_AND_DATA_PARALLEL_GROUP
+    _TENSOR_AND_DATA_PARALLEL_GROUP = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
