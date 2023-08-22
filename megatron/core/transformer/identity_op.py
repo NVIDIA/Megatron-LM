@@ -13,6 +13,7 @@ class IdentityOp(torch.nn.Module):
     def forward(self, x, *args, **kwargs):
         return x
 
+
 class IdentityFuncOp(IdentityOp):
     """
     This is a placeholder for IdentityFuncOp(...)(x) -> IdentityOp(x) -> x.

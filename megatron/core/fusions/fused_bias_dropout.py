@@ -26,26 +26,27 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     out = residual + out
     return out
 
+
 def bias_dropout_add_unfused(training):
     def _bias_dropout_add(x_with_bias, residual, prob):
         return _bias_dropout_add_func(x_with_bias, residual, prob, training)
+
     return _bias_dropout_add
+
 
 @torch.jit.script
 def bias_dropout_add_fused_train(
-    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]],
-    residual: torch.Tensor,
-    prob: float,
+    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float,
 ) -> torch.Tensor:
     return _bias_dropout_add_func(x_with_bias, residual, prob, True)
 
+
 @torch.jit.script
 def bias_dropout_add_fused_inference(
-    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]],
-    residual: torch.Tensor,
-    prob: float,
+    x_with_bias: Tuple[torch.Tensor, Optional[torch.Tensor]], residual: torch.Tensor, prob: float,
 ) -> torch.Tensor:
     return _bias_dropout_add_func(x_with_bias, residual, prob, False)
+
 
 def get_bias_dropout_add(training, fused):
     if fused:

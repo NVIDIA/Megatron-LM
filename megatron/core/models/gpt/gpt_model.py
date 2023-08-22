@@ -8,12 +8,13 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec
+
 
 class GPTModel(MegatronModule):
     """Transformer language model.

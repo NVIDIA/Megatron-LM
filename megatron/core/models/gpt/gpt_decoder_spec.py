@@ -1,5 +1,5 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSpec
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
@@ -7,7 +7,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.spec_utils import SelfAttentionSpec, TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 
 
 def get_gpt_decoder_spec() -> TransformerLayerSpec:

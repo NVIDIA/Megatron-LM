@@ -16,9 +16,7 @@ class LayernormLinear(MegatronModule):
     `Linear` layers
     """
 
-    def __init__(
-        self, input_size: int, output_size: int, config: TransformerConfig, **kwargs
-    ):
+    def __init__(self, input_size: int, output_size: int, config: TransformerConfig, **kwargs):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
