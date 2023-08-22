@@ -309,9 +309,9 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_untie_embeddings_and_outputs:
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L1
     METADATA: untie_embeddings_and_outputs
-    ADDITIONAL_PARAMS: "--untie-embedding-and-output-weights"
+    ADDITIONAL_PARAMS: "--untie-embeddings-and-output-weights"
 
-train.gpt3_core.345m_tp1_pp4_1node_50steps_rope_and_disable_bias_linear:
+train.gpt3_core.345m_tp1_pp4_1node_50steps_sequence_parallel:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
@@ -325,8 +325,8 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_rope_and_disable_bias_linear:
     USE_CORE: 1
     TIME_LIMIT: "20:00"
     TEST_LEVEL: L1
-    METADATA: rope_and_disable_bias_linear
-    ADDITIONAL_PARAMS: "--position-embedding-type rope --untie-embedding-and-output-weights"
+    METADATA: sequence_parallel
+    ADDITIONAL_PARAMS: "--sequence-parallel"
 
 train.gpt3.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher
