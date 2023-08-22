@@ -11,11 +11,17 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _get_device(config: TransformerConfig):
-    if config.use_cpu_initialization:
-        return 'cpu'
-    else:
-        return torch.cuda.current_device()
+def _get_extra_te_kwargs(config: TransformerConfig):
+    extra_transformer_engine_kwargs = {}
+    from importlib.metadata import version
+    from pkg_resources import packaging
+    te_version = packaging.version.Version(version("transformer-engine"))
+    if te_version >= packaging.version.Version("0.12.0"):
+        if config.use_cpu_initialization:
+            extra_transformer_engine_kwargs["device"] = 'cpu'
+        else:
+            extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
+    return extra_transformer_engine_kwargs
 
 
 class TENorm:
@@ -38,7 +44,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
-                device=_get_device(config),
+                **_get_extra_te_kwargs(config),
             )
         elif normalization == "RMSNorm":
             assert hasattr(
@@ -48,7 +54,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
-                device=_get_device(config),
+                **_get_extra_te_kwargs(config),
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
@@ -99,7 +105,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            device=_get_device(config),
+            **_get_extra_te_kwargs(config),
             **kwargs
         )
 
@@ -156,7 +162,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
-            device=_get_device(config),
+            **_get_extra_te_kwargs(config),
             **kwargs
         )
 
