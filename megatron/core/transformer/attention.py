@@ -1,23 +1,37 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Union
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
-
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
-from megatron.core.transformer.spec_utils import (
-    build_module, SelfAttentionSpec, CrossAttentionSpec
-)
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+
+@dataclass
+class SelfAttentionSpec(ModuleSpec):
+    layernorm_linear_qkv: Union[ModuleSpec, type] = None
+    dot_product_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
+
+
+@dataclass
+class CrossAttentionSpec(ModuleSpec):
+    layernorm_linear_q: Union[ModuleSpec, type] = None
+    layernorm_linear_kv: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
 
 
 class Attention(MegatronModule, ABC):
@@ -60,7 +74,6 @@ class Attention(MegatronModule, ABC):
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
         )
-
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
@@ -265,9 +278,15 @@ class SelfAttention(Attention):
         spec: SelfAttentionSpec,
         layer_number: int = 1,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs
+        **kwargs,
     ):
-        super().__init__(config=config, spec=spec, layer_number=layer_number, attn_mask_type=attn_mask_type, **kwargs)
+        super().__init__(
+            config=config,
+            spec=spec,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            **kwargs,
+        )
 
         self.layernorm_linear_qkv = build_module(
             spec.layernorm_linear_qkv,
@@ -329,9 +348,15 @@ class CrossAttention(Attention):
         spec: CrossAttentionSpec,
         layer_number: int = 1,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs
+        **kwargs,
     ):
-        super().__init__(config=config, spec=spec, layer_number=layer_number, attn_mask_type=attn_mask_type, **kwargs)
+        super().__init__(
+            config=config,
+            spec=spec,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            **kwargs,
+        )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(

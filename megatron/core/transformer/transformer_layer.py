@@ -1,15 +1,34 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import dataclass
+from typing import Union
+
 import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.transformer.attention import CrossAttentionSpec, SelfAttentionSpec
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.spec_utils import (
-    TransformerLayerSpec, build_module
-)
 from megatron.core.utils import make_viewless_tensor
+
+
+@dataclass
+class TransformerLayerSpec:
+    input_layernorm: Union[ModuleSpec, type] = IdentityOp
+    self_attention: SelfAttentionSpec = IdentityOp
+    self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+    cross_attention: CrossAttentionSpec = IdentityOp
+    cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+    post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+    ln_mlp: Union[ModuleSpec, type] = IdentityOp
+    mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 
 
 class TransformerLayer(MegatronModule):
@@ -117,7 +136,6 @@ class TransformerLayer(MegatronModule):
             self.training, self.config.bias_dropout_fusion
         )
 
-
     # TODO: decide how to do inference_params
     def forward(
         self,
@@ -147,9 +165,9 @@ class TransformerLayer(MegatronModule):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attn_bda(
-                self.training, self.config.bias_dropout_fusion
-            )(attention_output_with_bias, residual, self.config.hidden_dropout)
+            hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                attention_output_with_bias, residual, self.config.hidden_dropout
+            )
 
         # Optional Layer norm after self-attention
         post_self_attn_layernorm_output = self.post_self_attn_layernorm(hidden_states)
@@ -168,9 +186,9 @@ class TransformerLayer(MegatronModule):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(
-                self.training, self.config.bias_dropout_fusion
-            )(attention_output_with_bias, residual, self.config.hidden_dropout)
+            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                attention_output_with_bias, residual, self.config.hidden_dropout
+            )
 
         # Optional Layer norm post the cross-attention.
         post_cross_attn_layernorm_output = self.post_cross_attn_layernorm(hidden_states)
@@ -184,9 +202,9 @@ class TransformerLayer(MegatronModule):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(
-                self.training, self.config.bias_dropout_fusion
-            )(ln_mlp_output_with_bias, residual, self.config.hidden_dropout)
+            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                ln_mlp_output_with_bias, residual, self.config.hidden_dropout
+            )
 
         # Optional Layer norm post MLP
         output = self.post_mlp_layernorm(hidden_states)

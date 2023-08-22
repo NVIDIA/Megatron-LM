@@ -10,8 +10,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.spec_utils import TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
 from megatron.core.utils import make_viewless_tensor
 
 
