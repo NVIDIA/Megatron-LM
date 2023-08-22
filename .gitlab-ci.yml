@@ -11,7 +11,7 @@ variables: &VARS
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests L1
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests L0 L1
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
@@ -157,14 +157,11 @@ formatting:
       if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
         python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
       fi
-    - |
-      if [[ $SKIP_GROUND_TRUTH_COMPARISION -eq 1 ]]; then
-        echo "Checking against ground truth file"
-        export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
-        PYTEST_EXIT=0
-        pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py || PYTEST_EXIT=$?
-        if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
-      fi
+    - echo "Checking against ground truth file"
+    - export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
+    - PYTEST_EXIT=0
+    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py || PYTEST_EXIT=$?
+    - if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
