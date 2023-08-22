@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
@@ -113,7 +113,7 @@ class ModelParallelConfig:
     # Model parallelism
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
-    virtual_pipeline_model_parallel_size: int = None
+    virtual_pipeline_model_parallel_size: Optional[int] = None
     sequence_parallel: bool = False
 
     # Initialization
@@ -136,7 +136,7 @@ class ModelParallelConfig:
     enable_autocast: bool = False
     autocast_dtype: torch.dtype = None
     variable_seq_lengths: bool = False
-    num_microbatches_with_partial_activation_checkpoints: int = None
+    num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
     overlap_p2p_comm: bool = False
     batch_p2p_comm: bool = True
     batch_p2p_sync: bool = True

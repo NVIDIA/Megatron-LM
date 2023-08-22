@@ -184,14 +184,18 @@ class SwitchMLP(MegatronModule):
             local_indices = (max_ind == expert_num).nonzero()
             hidden = hidden_states[local_indices,:]
             output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
+            if output_bias is not None:
+                output_bias = output_bias.expand_as(output)
+                output_bias_total[local_indices,:] = output_bias
             output_total[local_indices,:] = output
-            output_bias_total[local_indices,:] = output_bias
 
         output_total = output_total*max_prob
-        output_bias_total = output_bias_total*max_prob
         output_total = output_total.view(s, b, h)
-        output_bias_total = output_bias_total.view(s, b, h)
+        if output_bias is not None:
+            output_bias_total = output_bias_total*max_prob
+            output_bias_total = output_bias_total.view(s, b, h)
+        else:
+            output_bias_total = None
 
         return output_total, output_bias_total
 
@@ -413,13 +417,13 @@ class ParallelAttention(MegatronModule):
 
         self.group_query_attention = args.group_query_attention
         self.num_query_groups = args.num_query_groups
-        
+
         query_projection_size = config.kv_channels * config.num_attention_heads
         if self.group_query_attention:
             kv_projection_size = args.kv_channels * args.num_query_groups
         else:
             kv_projection_size = args.kv_channels * args.num_attention_heads
-        
+
         self.use_flash_attn = args.use_flash_attn \
             and attention_type == AttnType.self_attn \
             and self.attn_mask_type == AttnMaskType.causal
@@ -442,7 +446,7 @@ class ParallelAttention(MegatronModule):
             config.num_attention_heads, world_size)
 
         if self.group_query_attention:
-            if args.num_query_groups % world_size != 0: 
+            if args.num_query_groups % world_size != 0:
                 raise NotImplementedError('Currently the num_query_groups should be '
                                           'a multiple of the tensor parallel size')
             self.num_query_groups_per_partition = core.utils.divide(
@@ -544,13 +548,13 @@ class ParallelAttention(MegatronModule):
         is_first_step = False
         if inference_params:
             if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_len
+                inf_max_seq_len = inference_params.max_sequence_length
                 inf_max_batch_size = inference_params.max_batch_size
                 inference_key_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size, 
+                    inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
                 inference_value_memory = self._allocate_memory(
-                    inf_max_seq_len, inf_max_batch_size, 
+                    inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
 
                 inference_params.key_value_memory_dict[self.layer_number] = (
@@ -592,7 +596,7 @@ class ParallelAttention(MegatronModule):
                 ],
                 dim=3)
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
-            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head) 
+            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -667,7 +671,7 @@ class ParallelAttention(MegatronModule):
         # ==================================
         # core attention computation
         # ==================================
-        
+
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
         key_layer = key_layer.repeat_interleave(
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
@@ -1317,6 +1321,8 @@ class ParallelTransformer(MegatronModule):
 
         # Transformer Engine Init.
         self.transformer_engine_v_0_10 = False
+        self.transformer_engine_v_0_11 = False
+        self.transformer_engine_v_0_8 = False
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1324,8 +1330,12 @@ class ParallelTransformer(MegatronModule):
             from pkg_resources import packaging
 
             te_version = packaging.version.Version(version("transformer-engine"))
+            if te_version >= packaging.version.Version("0.8.0"):
+                self.transformer_engine_v_0_8 = True
             if te_version >= packaging.version.Version("0.10.0"):
                 self.transformer_engine_v_0_10 = True
+            if te_version >= packaging.version.Version("0.11.0"):
+                self.transformer_engine_v_0_11 = True
 
             del version, packaging
 
@@ -1335,7 +1345,9 @@ class ParallelTransformer(MegatronModule):
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
-            self.fp8_group = mpu.get_data_parallel_group()
+            assert args.transformer_impl == 'transformer_engine', \
+                'transformer-engine required for fp8 training and inference'
+            self.fp8_group = mpu.get_amax_reduction_group()
             if args.fp8_e4m3:
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
             elif args.fp8_hybrid:
@@ -1388,9 +1400,13 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1])
             else:
                 # This argument is only available from TE v0.10 onwards.
-                activation_kwarg = {}
+                extra_transformer_engine_kwargs = {}
+                if self.transformer_engine_v_0_8:
+                    extra_transformer_engine_kwargs["bias"] = args.add_bias_linear
                 if self.transformer_engine_v_0_10:
-                    activation_kwarg["activation"] = "swiglu" if args.swiglu else "gelu"
+                    extra_transformer_engine_kwargs["activation"] = "swiglu" if args.swiglu else "gelu"
+                if self.transformer_engine_v_0_11:
+                    extra_transformer_engine_kwargs["normalization"] = args.normalization
                 return transformer_engine.pytorch.TransformerLayer(
                     config.hidden_size,
                     config.ffn_hidden_size,
@@ -1418,7 +1434,7 @@ class ParallelTransformer(MegatronModule):
                     drop_path_rate=self.drop_path_rates[layer_number - 1],
                     set_parallel_mode=True,
                     fuse_qkv_params=True,
-                    **activation_kwarg)
+                    **extra_transformer_engine_kwargs)
 
         if config.virtual_pipeline_model_parallel_size is not None:
             assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \

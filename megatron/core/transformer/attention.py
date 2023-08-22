@@ -6,13 +6,12 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
-from megatron.core.transformer.core_attention import CoreAttention
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
-    TECoreAttention,
+    TEDotProductAttention,
     TERowParallelLinear,
 )
-from megatron.core.transformer.enums import AttnMaskType, AttnType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
@@ -50,11 +49,11 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.core_attention = TECoreAttention(
+        self.dot_product_attention = TEDotProductAttention(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
         )
 
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
         self.linear_proj = TERowParallelLinear(
@@ -76,7 +75,7 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.core_attention(query, key, value, attention_mask)
+            output_ = self.dot_product_attention(query, key, value, attention_mask)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -85,15 +84,15 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_len, batch_size):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
-            inference_max_sequence_len,
+            inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
             self.hidden_size_per_attention_head,
-            dtype=self.params_dtype,
+            dtype=dtype,
             device=torch.cuda.current_device(),
         )
 
@@ -114,10 +113,14 @@ class Attention(MegatronModule, ABC):
         # =================================================
         is_first_step = False
         if self.layer_number not in inference_params.key_value_memory_dict:
-            inf_max_seq_len = inference_params.max_sequence_len
+            inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
-            inference_key_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
-            inference_value_memory = self._allocate_memory(inf_max_seq_len, inf_max_batch_size)
+            inference_key_memory = self._allocate_memory(
+                inf_max_seq_length, inf_max_batch_size, key.dtype
+            )
+            inference_value_memory = self._allocate_memory(
+                inf_max_seq_length, inf_max_batch_size, value.dtype
+            )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
                 inference_value_memory,
@@ -225,10 +228,10 @@ class Attention(MegatronModule, ABC):
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
         )
 
-        if self.checkpoint_core_attention:
+        if self.checkpoint_dot_product_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
-            core_attn_out = self.core_attention(query, key, value, attention_mask)
+            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
 
         # =================
         # Output. [sq, b, h]
@@ -292,7 +295,7 @@ class SelfAttention(Attention):
             dim=3,
         )
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.view(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
 

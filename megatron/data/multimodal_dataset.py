@@ -39,14 +39,16 @@ class MultiModalDataset(torch.utils.data.Dataset):
         return self.indexed_dataset.sizes.shape[0]
 
     def __getitem__(self, idx):
-        text_sample = self.indexed_dataset.get(self.doc_idx[idx])
-        img_sample = self.indexed_dataset.get(self.doc_idx[idx]+1)
+        text_sample, mode = self.indexed_dataset.get(self.doc_idx[idx])
+        assert mode == 0
+        img_sample, mode = self.indexed_dataset.get(self.doc_idx[idx]+1)
+        assert mode == 1
         img_pad = img_sample[0].item()
         xs = img_sample[1:].tobytes(order='C')
         xs = xs[:len(xs)-img_pad]
-        
+
         img_sample = np.array(Image.open(io.BytesIO(xs)))
         img_sample = self.visual_transform(img_sample).reshape(-1)
-        
+
         return {'text': np.array(text_sample, dtype=np.int64),
                 'img': np.array(img_sample, dtype=np.float32)}

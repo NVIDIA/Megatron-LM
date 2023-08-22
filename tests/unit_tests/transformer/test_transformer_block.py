@@ -5,28 +5,36 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.parallel_transformer_layer import ParallelTransformerLayer
-from megatron.core.transformer.parallel_transformer_block import ParallelTransformerBlock
-
-
-@pytest.fixture
-def parallel_transformer_block(transformer_config):
-    return ParallelTransformerBlock(transformer_config)
-
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_block import TransformerBlock
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
 class TestParallelTransformerBlock:
-    def test_constructor(self, parallel_transformer_block: ParallelTransformerBlock):
-        assert isinstance(parallel_transformer_block, ParallelTransformerBlock)
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.parallel_transformer_block = TransformerBlock(self.transformer_config)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel() 
+
+    def test_constructor(self):
+        parallel_transformer_block = self.parallel_transformer_block
+        assert isinstance(parallel_transformer_block, TransformerBlock)
         num_weights = sum([p.numel() for p in parallel_transformer_block.parameters()])
         assert num_weights == 3792
         assert parallel_transformer_block.num_layers_per_pipeline_rank == 2
         assert len(parallel_transformer_block.layers) == 2
-        layer_0: ParallelTransformerLayer = parallel_transformer_block._get_layer(0)
+        layer_0: TransformerLayer = parallel_transformer_block._get_layer(0)
         assert layer_0.layer_number == 1
-        layer_1: ParallelTransformerLayer = parallel_transformer_block._get_layer(1)
+        layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
         assert layer_1.layer_number == 2
 
-    def test_gpu_forward(self, parallel_transformer_block: ParallelTransformerBlock):
+    def test_gpu_forward(self):
+        parallel_transformer_block = self.parallel_transformer_block
         config: TransformerConfig = parallel_transformer_block.config
 
         sequence_length = 32
@@ -44,12 +52,13 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
-    def test_gpu_forward_full_checkpoint(self, transformer_config: TransformerConfig):
+    def test_gpu_forward_full_checkpoint(self):
+        transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'full'
         config.recompute_method = 'block'
         config.recompute_num_layers = config.num_layers
-        full_transformer_block = ParallelTransformerBlock(config)
+        full_transformer_block = TransformerBlock(config)
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
 
@@ -68,10 +77,11 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
 
-    def test_gpu_forward_selective_checkpoint(self, transformer_config: TransformerConfig):
+    def test_gpu_forward_selective_checkpoint(self):
+        transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'selective'
-        selective_transformer_block = ParallelTransformerBlock(config)
+        selective_transformer_block = TransformerBlock(config)
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert selective_transformer_block.checkpoint_core_attention
 

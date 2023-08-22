@@ -128,12 +128,17 @@ class GPTModel(MegatronModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params=None,
     ):
+        # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
+        # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
         # Decoder embedding.
-        if self.pre_process:
+        if decoder_input is not None:
+            pass
+        elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
@@ -143,9 +148,18 @@ class GPTModel(MegatronModule):
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.rotary_pos_emb is not None:
-            rotary_seq_len = self.max_sequence_length
             if inference_params is not None:
                 rotary_seq_len = inference_params.max_sequence_length
+            else:
+                if self.decoder.input_tensor is not None:
+                    rotary_seq_len = self.decoder.input_tensor.size(0)
+                else:
+                    rotary_seq_len = decoder_input.size(0)
+
+                # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
+                if self.config.sequence_parallel:
+                    rotary_seq_len *= self.config.tensor_model_parallel_size
+
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.

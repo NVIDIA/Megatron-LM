@@ -384,7 +384,10 @@ class TransformerLanguageModel(MegatronModule):
             # partial rotary embeddings, which is better than full rotary
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+            self.rotary_pos_emb = RotaryEmbedding(
+                rotary_dim,
+                seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
+            )
 
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
@@ -488,7 +491,7 @@ class TransformerLanguageModel(MegatronModule):
         if self.use_rotary_position_embeddings:
             if inference_params is not None:
                 rotary_pos_emb = \
-                    self.rotary_pos_emb(inference_params.max_sequence_len)
+                    self.rotary_pos_emb(inference_params.max_sequence_length)
             else:
                 rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 

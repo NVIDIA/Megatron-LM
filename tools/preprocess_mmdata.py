@@ -142,7 +142,7 @@ def main():
     output_bin_files = "{}_mmdata.bin".format(args.output_prefix)
     output_idx_files = "{}_mmdata.idx".format(args.output_prefix)
 
-    builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32)
+    builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32, multimodal=True)
 
     startup_end = time.time()
     proc_start = time.time()
@@ -153,7 +153,7 @@ def main():
     for i, (sentence, img_raw, bytes_processed) in enumerate(encoded_docs, start=1):
         total_bytes_processed += bytes_processed
         builders.add_item(torch.IntTensor(sentence))
-        builders.add_item(torch.from_numpy(img_raw))
+        builders.add_item(torch.from_numpy(img_raw), 1)
         builders.end_document()
         if i % args.log_interval == 0:
             current = time.time()
