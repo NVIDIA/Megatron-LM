@@ -14,6 +14,7 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 
 
 class GPTModel(MegatronModule):
@@ -44,6 +45,7 @@ class GPTModel(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
+        spec: TransformerLayerSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -89,10 +91,9 @@ class GPTModel(MegatronModule):
             self.rotary_pos_emb = None
 
         # Transformer.
-        decoder_spec = get_gpt_decoder_spec()
         self.decoder = TransformerBlock(
             config=self.config,
-            spec=decoder_spec,
+            spec=spec,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
