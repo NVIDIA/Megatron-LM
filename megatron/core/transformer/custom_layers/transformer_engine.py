@@ -14,7 +14,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {}
     from importlib.metadata import version
+
     from pkg_resources import packaging
+
     te_version = packaging.version.Version(version("transformer-engine"))
     if te_version >= packaging.version.Version("0.12.0"):
         if config.use_cpu_initialization:
@@ -106,7 +108,7 @@ class TELinear(te.pytorch.Linear):
             bias=bias,
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs
+            **kwargs,
         )
 
     def forward(self, x):
@@ -163,7 +165,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs
+            **kwargs,
         )
 
     def forward(self, x):
@@ -190,7 +192,7 @@ class TEColumnParallelLinear(TELinear):
             output_size=output_size,
             config=self.config,
             parallel_mode="column",
-            **kwargs
+            **kwargs,
         )
 
 
@@ -207,7 +209,7 @@ class TERowParallelLinear(TELinear):
             output_size=output_size,
             config=self.config,
             parallel_mode="row",
-            **kwargs
+            **kwargs,
         )
 
 
@@ -239,5 +241,5 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            **kwargs
+            **kwargs,
         )
