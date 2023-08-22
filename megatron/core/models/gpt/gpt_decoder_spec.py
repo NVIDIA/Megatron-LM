@@ -13,7 +13,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 def get_gpt_decoder_spec() -> TransformerLayerSpec:
     layer_spec = TransformerLayerSpec(
         self_attention=SelfAttentionSpec(
-            module_path_or_module=SelfAttention,
+            module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             layernorm_linear_qkv=TELayerNormColumnParallelLinear,
             dot_product_attention=TEDotProductAttention,

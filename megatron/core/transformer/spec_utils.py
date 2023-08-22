@@ -5,7 +5,22 @@ from typing import Tuple, Union
 
 @dataclass
 class ModuleSpec:
-    module_path_or_module: Union[Tuple, type]
+    """This is a Module Specification dataclass.
+
+    Specification defines the location of the module (to import dynamically)
+    or the imported module itself. It also defines the params that need to be
+    passed to initialize the module.
+
+    Args:
+        module (Union[Tuple, type]): A tuple describing the location of the
+            module class e.g. `(module.location, ModuleClass)` or the imported
+            module class itself e.g. `ModuleClass` (which is already imported
+            using `from module.location import ModuleClass`).
+        params (dict): A dictionary of params that need to be passed while init.
+
+    """
+
+    module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
 
 
@@ -30,21 +45,20 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
         return spec_or_module
 
     # If the module is provided instead of module path, then return it as is
-    if isinstance(spec_or_module.module_path_or_module, (type, types.FunctionType)):
-        return spec_or_module.module_path_or_module
+    if isinstance(spec_or_module.module, (type, types.FunctionType)):
+        return spec_or_module.module
 
     # Otherwise, return the dynamically imported module from the module path
-    return import_module(spec_or_module.module_path_or_module)
+    return import_module(spec_or_module.module)
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
-    print(spec_or_module)
     # If the module provided is a `Function` or if the module path provided is
     # a `Function`, written is as it is
     if (
         isinstance(spec_or_module, types.FunctionType)
-        or hasattr(spec_or_module, "module_path_or_module")
-        and isinstance(spec_or_module.module_path_or_module, types.FunctionType)
+        or hasattr(spec_or_module, "module")
+        and isinstance(spec_or_module.module, types.FunctionType)
     ):
         return spec_or_module
 
@@ -52,13 +66,11 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     # itself is a class
     if isinstance(spec_or_module, type):
         module = spec_or_module
-    elif hasattr(spec_or_module, "module_path_or_module") and isinstance(
-        spec_or_module.module_path_or_module, type
-    ):
-        module = spec_or_module.module_path_or_module
+    elif hasattr(spec_or_module, "module") and isinstance(spec_or_module.module, type):
+        module = spec_or_module.module
     else:
         # Otherwise, dynamically import the module from the module path
-        module = import_module(spec_or_module.module_path_or_module)
+        module = import_module(spec_or_module.module)
 
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
