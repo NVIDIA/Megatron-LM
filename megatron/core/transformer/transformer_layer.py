@@ -32,7 +32,7 @@ class TransformerLayer(MegatronModule):
         self.layer_number = layer_number
         self.self_attn_mask_type = self_attn_mask_type
 
-        ## [Module 1: Pre SelfAttention] Optional Layernorm on the input data
+        ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             spec.input_layernorm,
@@ -94,7 +94,6 @@ class TransformerLayer(MegatronModule):
         ## [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(spec.mlp_bda)
 
-
         ## [Module 10: Post MLP] Optional Layernorm after MLP
         self.post_mlp_layernorm = build_module(
             spec.post_mlp_layernorm,
@@ -118,6 +117,7 @@ class TransformerLayer(MegatronModule):
             self.training, self.config.bias_dropout_fusion
         )
 
+
     # TODO: decide how to do inference_params
     def forward(
         self,
@@ -130,7 +130,7 @@ class TransformerLayer(MegatronModule):
     ):
         # hidden_states: [s, b, h]
 
-        # Optional Layer norm before self-attention
+        # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Residual connection.
