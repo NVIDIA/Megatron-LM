@@ -77,7 +77,6 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     if isinstance(spec_or_module, types.FunctionType) or \
         hasattr(spec_or_module, "module_path_or_module") and \
          isinstance(spec_or_module.module_path_or_module, types.FunctionType):
-        print(f"returning {spec_or_module} itself")
         return spec_or_module
 
     # Check if a module class is provided as a spec or if the module path
@@ -91,7 +90,6 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
         # Otherwise, dynamically import the module from the module path
         module = import_module(spec_or_module.module_path_or_module)
 
-    print(f"returning: {module}")
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
     return module(
