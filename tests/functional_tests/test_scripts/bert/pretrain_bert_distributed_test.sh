@@ -1,5 +1,5 @@
 #! /bin/bash
-set -o xtrace
+set -x 
 
 DATA_PATH=$1
 CHECKPOINT_PATH=$2

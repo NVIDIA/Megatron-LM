@@ -62,7 +62,7 @@ class TestCIPipeline:
             step = i * expected["step_interval"]
             print(f"Checking step {step} against expected {i}")
             if test_type == TypeOfTest.APPROX:
-                assert actual_val == pytest.approx(expected=expected_val, rel=self.margin_loss), f"{self.job_name} : The loss at step {step} should be approximately {expected_val} but it is {actual_val}."
+                assert actual_val == pytest.approx(expected=expected_val, rel=self.margin_loss), f"The loss at step {step} should be approximately {expected_val} but it is {actual_val}."
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
