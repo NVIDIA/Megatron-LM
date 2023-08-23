@@ -2,6 +2,8 @@ import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union
 
+import torch
+
 
 @dataclass
 class ModuleSpec:
@@ -53,14 +55,20 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
-    # If the module provided is a `Function` or if the module path provided is
-    # a `Function`, written is as it is
-    if (
-        isinstance(spec_or_module, types.FunctionType)
-        or hasattr(spec_or_module, "module")
-        and isinstance(spec_or_module.module, types.FunctionType)
+    # If the passed `spec_or_module` is an already initialized module or if it's
+    # a `Function`, then return it as it is
+    if isinstance(spec_or_module, torch.nn.Module) or isinstance(
+        spec_or_module, types.FunctionType
     ):
         return spec_or_module
+
+    # If the passed `spec_or_module` is actually a spec (instance of
+    # `ModuleSpec`) and it specifies a `Function` using its `module`
+    # field, return the `Function` as it is
+    if isinstance(spec_or_module, ModuleSpec) and isinstance(
+        spec_or_module.module, types.FunctionType
+    ):
+        return spec_or_module.module
 
     # Check if a module class is provided as a spec or if the module path
     # itself is a class
@@ -71,6 +79,10 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     else:
         # Otherwise, dynamically import the module from the module path
         module = import_module(spec_or_module.module)
+
+    # If the imported module is actually a `Function` return it as it is
+    if isinstance(module, types.FunctionType):
+        return module
 
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
