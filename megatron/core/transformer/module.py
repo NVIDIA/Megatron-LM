@@ -108,7 +108,7 @@ class Float16Module(MegatronModule):
         return outputs
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
-        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
+        return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
