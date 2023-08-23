@@ -36,7 +36,7 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    with deepspeed.zero.Init(data_parallel_group=mpu.get_data_parallel_group(),
+    with deepspeed.zero.Init(sequence_data_parallel_group=mpu.get_sequence_data_parallel_group(),
                              remote_device=None if args.remote_device == 'none' else args.remote_device,
                              config_dict_or_path=args.deepspeed_config,
                              enabled=args.zero_stage == 3,
@@ -117,12 +117,28 @@ def get_batch(data_iterator):
     tokens = tokens_[:, :-1].contiguous()
 
     # Get the masks and postition ids.
+    skip_mask = args.use_flash_attn or args.use_flash_attn_triton
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
-        args.eod_mask_loss)
+        args.eod_mask_loss,
+        skip_mask)
+
+    # For DS's sequence parallel
+    seq_parallel_world_size = mpu.get_sequence_parallel_world_size() if mpu.sequence_parallel_is_initialized() else 1
+    seq_parallel_world_rank = mpu.get_sequence_parallel_rank() if mpu.sequence_parallel_is_initialized() else 0
+    seq_length = tokens.size(1)
+
+    assert seq_length % seq_parallel_world_size == 0
+    sub_seq_length = seq_length // seq_parallel_world_size
+    sub_seq_start = seq_parallel_world_rank * sub_seq_length
+    sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+
+    tokens = tokens[:, sub_seq_start:sub_seq_end]
+    labels = labels[:, sub_seq_start:sub_seq_end]
+    position_ids = position_ids[:, sub_seq_start:sub_seq_end]
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 

@@ -1,0 +1,24 @@
+{
+  "train_batch_size": GBSIZE,
+  "train_micro_batch_size_per_gpu": MBSIZE,
+  "steps_per_print": LOG_INTERVAL,
+
+  "zero_optimization": {
+    "stage": ZERO_STAGE,
+    "elastic_checkpoint": true
+  },
+
+  "gradient_clipping": 1.0,
+  "prescale_gradients": PRESCALE_GRAD,
+
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 500,
+    "hysteresis": 2,
+    "min_loss_scale": 1,
+    "initial_scale_power": 11
+  },
+
+  "wall_clock_breakdown" : false
+}

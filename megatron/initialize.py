@@ -225,8 +225,16 @@ def _initialize_distributed():
         if mpu.model_parallel_is_initialized():
             print('model parallel is already initialized')
         else:
+            if args.ds_sequence_parallel_size > 1 and args.sequence_parallel:
+                raise RuntimeError(
+                    f"sequence_parallel_size > 1 enables DeepSpeed's sequence parallel, "
+                    f"which is not compatible with Megatron-LM's sequence parallel. "
+                    f"Remove --sequence_parallel to use DeepSpeed's sequence parallel."
+                )
+
             mpu.initialize_model_parallel(args.tensor_model_parallel_size,
                                            args.pipeline_model_parallel_size,
+                                           args.ds_sequence_parallel_size,
                                            args.virtual_pipeline_model_parallel_size,
                                            args.pipeline_model_parallel_split_rank,
                                            use_distributed_optimizer=args.use_distributed_optimizer)
@@ -329,7 +337,7 @@ def _warmup_jit_function():
     # Warmup fused bias+gelu
     bias = torch.rand(args.ffn_hidden_size // args.tensor_model_parallel_size,
                       dtype=dtype, device='cuda')
-    input = torch.rand((args.seq_length, args.micro_batch_size,
+    input = torch.rand((args.seq_length // args.ds_sequence_parallel_size, args.micro_batch_size,
                         args.ffn_hidden_size // args.tensor_model_parallel_size),
                        dtype=dtype, device='cuda')
     # Warmup JIT fusions with the input grad_enable state of both forward
@@ -345,9 +353,9 @@ def _warmup_jit_function():
         seq_length = args.seq_length // mpu.get_tensor_model_parallel_world_size()
     else:
         seq_length = args.seq_length
-    input = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
+    input = torch.rand((seq_length // args.ds_sequence_parallel_size, args.micro_batch_size, args.hidden_size),
                        dtype=dtype, device='cuda')
-    residual = torch.rand((seq_length, args.micro_batch_size, args.hidden_size),
+    residual = torch.rand((seq_length // args.ds_sequence_parallel_size, args.micro_batch_size, args.hidden_size),
                           dtype=dtype, device='cuda')
     bias = torch.rand((args.hidden_size), dtype=dtype, device='cuda').expand_as(residual)
     dropout_rate = 0.1

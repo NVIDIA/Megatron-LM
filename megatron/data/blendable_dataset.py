@@ -84,7 +84,8 @@ class BlendableDataset(torch.utils.data.Dataset):
             torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
             if counts[0].item() != (
                 torch.distributed.get_world_size() //
-                torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group())):
+                torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()) //
+                torch.distributed.get_world_size(group=mpu.get_sequence_parallel_group())):
                 print_rank_0("Data index creation unsuccessful, exiting.")
                 exit()
 
