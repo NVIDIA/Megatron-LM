@@ -389,7 +389,7 @@ def validate_args(args, defaults={}):
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
 
     # Expert parallelism check
-    if args.expert_parallel:
+    if args.expert_parallel and args.tensor_model_parallel_size > 1:
         assert args.num_experts % args.data_parallel_size == 0, \
             "Number of experts should be a multiple of data parallel_size."
         args.sequence_parallel = True

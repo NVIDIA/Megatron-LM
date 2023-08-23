@@ -169,5 +169,5 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        if self.expert_parallel:
+        if self.expert_parallel and self.tensor_model_parallel_size > 1:
             self.sequence_parallel = True
