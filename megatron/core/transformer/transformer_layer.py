@@ -213,7 +213,7 @@ class TransformerLayer(MegatronModule):
 
             if layer_name.endswith('._extra_state'):
                 sharded_state_dict[layer_key] = ShardedObject(
-                    f'{prefix}.' + layer_name,
+                    f'{prefix}{layer_name}',
                     tensor,
                     (num_layers,),
                     (global_layer_offset,),
@@ -222,7 +222,7 @@ class TransformerLayer(MegatronModule):
 
             else:
                 sharded_state_dict[layer_key] = ShardedTensor.from_rank_offsets(
-                    f'{prefix}.' + layer_name,
+                    f'{prefix}{layer_name}',
                     tensor,
                     *sharded_offsets,
                     replica_id=replica_id,
