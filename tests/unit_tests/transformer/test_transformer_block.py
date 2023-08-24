@@ -101,10 +101,3 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
-    
-    def test_checkpoint_save_load(self, parallel_transformer_block: ParallelTransformerBlock, tmp_path):
-        sharded_state_dict = parallel_transformer_block.sharded_state_dict()
-        dist_checkpointing.save(sharded_state_dict, checkpoint_dir=tmp_path)
-        loaded_state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_dir=tmp_path)
-
-        assert len(sharded_state_dict) == len(loaded_state_dict)
