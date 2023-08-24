@@ -40,6 +40,7 @@ class TransformerLayer(MegatronModule):
         # Layernorm on the input data.
         # TODO: add pytorch only layernorm
         self.input_layernorm = TENorm(
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -55,6 +56,7 @@ class TransformerLayer(MegatronModule):
 
         # Layernorm on the attention output
         self.post_self_attn_layernorm = TENorm(
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
