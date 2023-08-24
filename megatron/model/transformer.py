@@ -1675,6 +1675,9 @@ class ParallelTransformer(MegatronModule):
                         forward_kwargs['checkpoint_core_attention'] = self.checkpoint_core_attention
                         if self.transformer_engine_v_0_10:
                             forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
+
+                        # Backward compatibility for legacy name
+                        forward_kwargs['inference_params'].max_sequence_len = inference_params.max_sequence_length
                     else:
                         forward_kwargs['rotary_pos_emb'] = rotary_pos_emb
                         forward_kwargs['retriever_input'] = retriever_input
