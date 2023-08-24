@@ -101,7 +101,6 @@ class SwitchMLP(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
-        assert self.config.num_moe_experts % parallel_state.get_data_parallel_world_size() == 0
 
         self.router = TERowParallelLinear(
             self.config.hidden_size,
@@ -111,19 +110,23 @@ class SwitchMLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
         )
-
-        self.route_algo = SwitchMLP.sinkhorn
-        self.num_local_experts = self.config.num_moe_experts // parallel_state.get_data_parallel_world_size()
-        local_expert_indices_offset = parallel_state.get_data_parallel_rank() * self.num_local_experts
-        self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
         self.add_bias = config.add_bias_linear
         self.expert_parallel = config.expert_parallel
         self.sequence_parallel = config.sequence_parallel
+        self.route_algo = SwitchMLP.sinkhorn
+
+        if self.expert_parallel:
+            assert self.config.num_moe_experts % parallel_state.get_data_parallel_world_size() == 0
+            self.num_local_experts = self.config.num_moe_experts // parallel_state.get_data_parallel_world_size()
+            local_expert_indices_offset = parallel_state.get_data_parallel_rank() * self.num_local_experts
+            self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+        else:
+            self.num_local_experts = self.config.num_moe_experts
+            self.local_expert_indices = [i for i in range(self.num_local_experts)]
 
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, is_expert=True)
-            
             self.local_experts.append(expert)
     
     def gather_indices(self, local_indices):

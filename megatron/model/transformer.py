@@ -174,13 +174,18 @@ class SwitchMLP(MegatronModule):
         super(SwitchMLP, self).__init__()
         args = get_args()
         self.router = torch.nn.Linear(args.hidden_size, args.num_experts)
-        assert args.num_experts % mpu.get_data_parallel_world_size() == 0
-        self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
-        local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
-        self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
-        self.add_bias = config.add_bias_linear
         self.expert_parallel = config.expert_parallel
         self.sequence_parallel = config.sequence_parallel
+        self.add_bias = config.add_bias_linear
+
+        if self.expert_parallel:
+            assert args.num_experts % mpu.get_data_parallel_world_size() == 0
+            self.num_local_experts = args.num_experts // mpu.get_data_parallel_world_size()
+            local_expert_indices_offset = mpu.get_data_parallel_rank() * self.num_local_experts
+            self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+        else:
+            self.num_local_experts = args.num_experts
+            self.local_expert_indices = [i for i in range(self.num_local_experts)]
 
         self.local_experts = torch.nn.ModuleList()
         for i in range(self.num_local_experts):
