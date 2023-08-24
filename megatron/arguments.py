@@ -120,7 +120,7 @@ def validate_args(args, defaults={}):
         # For default to be valid, it should not be provided in the
         # arguments that are passed to the program. We check this by
         # ensuring the arg is set to None.
-        if getattr(args, key) is not None:
+        if getattr(args, key, None) is not None:
             if args.rank == 0:
                 print('WARNING: overriding default arguments for {key}:{v} \
                        with {key}:{v2}'.format(key=key, v=defaults[key],
@@ -575,7 +575,7 @@ def _add_network_size_args(parser):
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
-                       help='Percent of rotary dimension to use, default 100%')
+                       help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',

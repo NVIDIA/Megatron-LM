@@ -13,6 +13,7 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 class GPTModel(MegatronModule):
@@ -66,6 +67,7 @@ class GPTModel(MegatronModule):
         self.position_embedding_type = position_embedding_type
 
         # megatron core pipelining currently depends on model type
+        # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
         # Embeddings.
@@ -154,7 +156,7 @@ class GPTModel(MegatronModule):
                 if self.decoder.input_tensor is not None:
                     rotary_seq_len = self.decoder.input_tensor.size(0)
                 else:
-                    rotary_seq_len = self.decoder_input.size(0)
+                    rotary_seq_len = decoder_input.size(0)
 
                 # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
                 if self.config.sequence_parallel:
@@ -246,59 +248,57 @@ class GPTModel(MegatronModule):
             )
             GPTModel.embedding_warning_printed = True
 
-    # TODO: add distributed checkpointing
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        pass
-        # """For easy load."""
+    def sharded_state_dict(self, prefix=''):
+        sharded_state_dict = {}
 
-        # state_dict_ = {}
-        # if self.pre_process:
-        #     state_dict_[self._embedding_key] = self.embedding.state_dict_for_save_checkpoint(
-        #         prefix=prefix, keep_vars=keep_vars
-        #     )
-        # state_dict_[self._encoder_key] = self.encoder.state_dict_for_save_checkpoint(
-        #     prefix=prefix, keep_vars=keep_vars
-        # )
+        if self.pre_process:
+            embedding_prefix = f'{prefix}embedding.'
+            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
+                prefix=embedding_prefix
+            )
+            sharded_state_dict.update(embedding_sharded_state_dict)
 
-        # return state_dict_
+        decoder_prefix = f'{prefix}decoder.'
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
+        sharded_state_dict.update(decoder_sharded_state_dict)
 
-    # TODO: add distributed checkpointing
-    def load_state_dict(self, state_dict, strict=True):
-        pass
-        # """Customized load."""
+        if self.post_process:
+            output_layer_prefix = f'{prefix}output_layer.'
+            output_layer_key = f'{output_layer_prefix}weight'
+            if self.share_embeddings_and_output_weights:
+                if not self.pre_process:
+                    # when sharing embeddings with last stage, we need to use the weights from the first stage
+                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
+                    tensor = self.shared_embedding_or_output_weight()
+                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
+                    dp_rank = parallel_state.get_data_parallel_rank()
+                    dp_size = parallel_state.get_data_parallel_world_size()
+                    last_stage_word_emb_replica_id = (
+                        dp_rank + dp_size
+                    )  # copy of first stage embedding
 
-        # # Embedding.
-        # if self.pre_process:
-        #     if self._embedding_key in state_dict:
-        #         state_dict_ = state_dict[self._embedding_key]
-        #     else:
-        #         # for backward compatibility.
-        #         state_dict_ = {}
-        #         for key in state_dict.keys():
-        #             if '_embeddings' in key:
-        #                 state_dict_[key] = state_dict[key]
-        #     self.embedding.load_state_dict(state_dict_, strict=strict)
+                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
+                        tensor=tensor,
+                        key=first_stage_word_emb_key,
+                        replica_id=last_stage_word_emb_replica_id,
+                        allow_shape_mismatch=True,
+                    )
 
-        # # Encoder.
-        # if self._encoder_key in state_dict:
-        #     state_dict_ = state_dict[self._encoder_key]
-        # # For backward compatibility.
-        # elif 'transformer' in state_dict:
-        #     state_dict_ = state_dict['transformer']
-        # else:
-        #     # For backward compatibility.
-        #     state_dict_ = {}
-        #     for key in state_dict.keys():
-        #         if 'transformer.' in key:
-        #             state_dict_[key.split('transformer.')[1]] = state_dict[key]
+                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
-        # # For backward compatibility.
-        # state_dict_self_attention = {}
-        # for key in state_dict_.keys():
-        #     if '.attention.' in key:
-        #         state_dict_self_attention[key.replace(".attention.", ".self_attention.")] = state_dict_[key]
-        #     else:
-        #         state_dict_self_attention[key] = state_dict_[key]
-        # state_dict_ = state_dict_self_attention
+            else:
+                output_layer_state_dict = self.output_layer.state_dict(
+                    prefix=output_layer_prefix, keep_vars=True
+                )
+                output_layer_tensor = output_layer_state_dict[output_layer_key]
+                # independent output layer
+                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
+                    tensor=output_layer_tensor,
+                    key=output_layer_key,
+                    replica_id=parallel_state.get_data_parallel_rank(),
+                    allow_shape_mismatch=True,
+                )
 
-        # self.encoder.load_state_dict(state_dict_, strict=strict)
+                sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
+
+        return sharded_state_dict

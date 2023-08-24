@@ -1,7 +1,8 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
 import logging
-from collections import defaultdict
+import os
+from collections import Counter, defaultdict
 from itertools import chain
 from pathlib import Path
 from typing import Iterable, List, Tuple, Union
@@ -10,9 +11,17 @@ import numpy as np
 import torch
 
 from .core import CheckpointingConfig, maybe_load_config, save_config
-from .dict_utils import dict_list_map_inplace, diff, map_reduce, merge, nested_values
+from .dict_utils import (
+    dict_list_map_inplace,
+    diff,
+    extract_matching_values,
+    map_reduce,
+    merge,
+    nested_values,
+)
 from .mapping import (
     CheckpointingException,
+    ShardedObject,
     ShardedStateDict,
     ShardedTensor,
     StateDict,
@@ -57,6 +66,9 @@ def load(
     if not sharded_state_dict:
         return common_state_dict
 
+    sharded_objects, sharded_state_dict = load_sharded_objects(sharded_state_dict, checkpoint_dir)
+    merge(common_state_dict, sharded_objects)
+
     saved_config = maybe_load_config(checkpoint_dir)
     if saved_config is None:
         raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
@@ -83,8 +95,23 @@ def load(
     return common_state_dict
 
 
-def load_common_state_dict(checkpoint_dir: str):
-    return torch.load(Path(checkpoint_dir) / COMMON_STATE_FNAME)
+# TODO: implement it as common torch strategy
+def load_common_state_dict(checkpoint_dir: Path):
+    return torch.load(Path(checkpoint_dir) / COMMON_STATE_FNAME, map_location='cpu')
+
+
+def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    sharded_objects, sharded_state_dict = extract_matching_values(
+        sharded_state_dict, lambda v: isinstance(v, ShardedObject)
+    )
+
+    def load_sharded_object(sh_obj: ShardedObject):
+        sh_obj.data = None
+        load_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
+        loaded_obj = torch.load(load_path)
+        return loaded_obj
+
+    return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
 
 
 def save(
@@ -132,7 +159,7 @@ def save(
     sharded_tensors = list(nested_values(sharded_state_dict))
     validate_sharding_integrity(sharded_tensors)
 
-    _save_common_dict(state_dict, checkpoint_dir)
+    _save_common_dict(state_dict, checkpoint_dir, True)
 
     sharded_strategy.save(sharded_tensors, checkpoint_dir)
     save_config(
@@ -144,14 +171,35 @@ def save(
 def _save_common_dict(
     state_dict: StateDict, checkpoint_dir: Path, validate_consistency: bool = False
 ):
+    common_state_dict = _extract_and_save_sharded_objects(
+        state_dict, checkpoint_dir, validate_consistency
+    )
     if torch.distributed.get_rank() == 0:
-        torch.save(state_dict, checkpoint_dir / COMMON_STATE_FNAME)
+        torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
     if validate_consistency:
-        torch.distributed.barrier()
-        if not torch.distributed.get_rank() == 0:
-            rank_0_state_dict = torch.load(checkpoint_dir / COMMON_STATE_FNAME)
-            # TODO: implement checking consistency with rank 0 common dict on other ranks
-            print(diff(state_dict, rank_0_state_dict))
+        # TODO: implement checking consistency with rank 0 common dict on other ranks
+        pass
+        # torch.distributed.barrier()
+        # if not torch.distributed.get_rank() == 0:
+        #     rank_0_state_dict = torch.load(checkpoint_dir / COMMON_STATE_FNAME)
+        #     print(diff(common_state_dict, rank_0_state_dict))
+
+
+def _extract_and_save_sharded_objects(
+    state_dict: StateDict, checkpoint_dir: Path, validate_consistency: bool = False
+):
+    sharded_objects, state_dict = extract_matching_values(
+        state_dict, lambda v: isinstance(v, ShardedObject)
+    )
+    sharded_objects = list(nested_values(sharded_objects))
+    if validate_consistency:
+        validate_objects_sharding_integrity(sharded_objects)
+    for sh_obj in sharded_objects:
+        if is_main_replica(sh_obj.replica_id):
+            save_path = (checkpoint_dir / sh_obj.unique_key).with_suffix('.pt')
+            os.makedirs(save_path.parent, exist_ok=True)
+            torch.save(sh_obj.data, save_path)
+    return state_dict
 
 
 def validate_sharding_integrity(sharded_tensors: Iterable[ShardedTensor]):
@@ -246,3 +294,21 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
         raise CheckpointingException(
             f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]}'
         )
+
+
+def validate_objects_sharding_integrity(sharded_objects: List[ShardedObject]):
+    """ Ensure uniqueness of saved objects. """
+    local_sh_objs = [sh_obj.without_data() for sh_obj in sharded_objects]
+    all_sh_objs = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(all_sh_objs, local_sh_objs)
+    if torch.distributed.get_rank() != 0:
+        return
+    unique_keys = [
+        sh_obj.unique_key
+        for sh_obj in chain.from_iterable(all_sh_objs)
+        if is_main_replica(sh_obj.replica_id)
+    ]
+    if len(unique_keys) != len(set(unique_keys)):
+        duplicates = {k: cnt for k, cnt in Counter(unique_keys).items() if cnt > 1}
+        logger.error(f'Duplicate ShardedObject keys and counts: {duplicates}')
+        raise CheckpointingException(f'Duplicate ShardedObject keys: {list(duplicates.keys())}')

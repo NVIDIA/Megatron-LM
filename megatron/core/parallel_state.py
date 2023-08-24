@@ -2,6 +2,7 @@
 
 """Model and data parallel groups."""
 
+import os
 from typing import Optional
 
 import torch
@@ -58,6 +59,7 @@ def initialize_model_parallel(
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
     use_fp8: bool = False,
+    use_sharp: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -101,6 +103,12 @@ def initialize_model_parallel(
             Construct GPU groups needed for FP8 training, namely for
             amax reduction across the product of the data-parallel and
             tensor-parallel groups.
+
+        use_sharp (bool, default = False):
+            Set the use of SHARP for the collective communications of
+            data-parallel process groups. When `True`, run barrier
+            within each data-parallel process group, which specifies
+            the SHARP application target groups.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -171,6 +179,25 @@ def initialize_model_parallel(
                 _DATA_PARALLEL_GROUP = group
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
+
+    # Apply SHARP to DP process groups
+    if use_sharp:
+        if rank == 0:
+            print(
+                "The number of process groups to use SHARP with depends on the type "
+                "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
+                "process groups and QM2 supports up to 256 process groups. We apply "
+                "SHARP to the communications of the data-parallel domain. If the "
+                "number of data-parallel process groups is larger than the max "
+                "process groups that the network switch supports, the communication "
+                "will fall back to non-SHARP operators. To enable SHARP, "
+                "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
+            )
+        torch.distributed.barrier(
+            group=get_data_parallel_group(), device_ids=[torch.cuda.current_device()]
+        )
+        # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
+        os.environ["NCCL_SHARP_DISABLE"] = "1"
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -571,12 +598,18 @@ def get_pipeline_model_parallel_prev_rank():
 
 def get_data_parallel_world_size():
     """Return world size for the data parallel group."""
-    return torch.distributed.get_world_size(group=get_data_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(group=get_data_parallel_group())
+    else:
+        return 0
 
 
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
-    return torch.distributed.get_rank(group=get_data_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(group=get_data_parallel_group())
+    else:
+        return 0
 
 
 def _set_global_memory_buffer():
