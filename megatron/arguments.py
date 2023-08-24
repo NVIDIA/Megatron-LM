@@ -320,9 +320,6 @@ def validate_args(args, defaults={}):
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
-    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
-        'cannot train with both fp8 e4m3 and hybrid formatting'
-
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
@@ -430,9 +427,6 @@ def core_transformer_config_from_args(args):
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
-    kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
-    kw_args['fp8_e4m3'] = args.fp8_e4m3
-    kw_args['fp8_margin'] = args.fp8_hybrid
     if args.group_query_attention:
         kw_args['num_query_groups'] = args.num_query_groups
     else:
@@ -443,27 +437,30 @@ def core_transformer_config_from_args(args):
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
-    group.add_argument('--fp8-e4m3', action='store_true',
-                        help='E4M3 TransformerLayer', dest='fp8_e4m3')
-    group.add_argument('--fp8-hybrid', action='store_true',
-                        help='Hybrid FP8 TransformerLayer', dest='fp8_hybrid')
-    group.add_argument('--no-fp8-wgrad', action='store_false',
-                        help='Execute wgrad in higher precision even for FP8 runs', dest='fp8_wgrad')
+    group.add_argument('--fp8-format', default=None,
+                       choices=['e4m3', 'hybrid'],
+                       help='Which fp8 format scheme to use for FP8 tensors in the forward and backward pass',
+                       dest='fp8')
     group.add_argument('--fp8-margin', type=int, default=0,
-                        help='Scaling margin for fp8', dest='fp8_margin')
+                       help='Scaling margin for fp8',
+                       dest='fp8_margin')
     group.add_argument('--fp8-interval', type=int, default=1,
-                        help='Scaling update interval for fp8', dest='fp8_interval')
-    group.add_argument('--transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.',
-                       dest='transformer_impl')
+                       help='Scaling update interval for fp8',
+                       dest='fp8_interval')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,
-                        help='Number of steps for which amax history is recorded per tensor',
-                        dest='fp8_amax_history_len')
+                       help='Number of steps for which amax history is recorded per tensor',
+                       dest='fp8_amax_history_len')
     group.add_argument('--fp8-amax-compute-algo', default='most_recent',
                        choices=['most_recent', 'max'],
                        help='Algorithm for computing amax from history',
                        dest='fp8_amax_compute_algo')
+    group.add_argument('--no-fp8-wgrad', action='store_false',
+                       help='Execute wgrad in higher precision even for FP8 runs',
+                       dest='fp8_wgrad')
+    group.add_argument('--transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.',
+                       dest='transformer_impl')
     group.add_argument('--normalization', default='LayerNorm',
                        choices=['LayerNorm', 'RMSNorm'],
                        help='Which normalization technique to use.',
