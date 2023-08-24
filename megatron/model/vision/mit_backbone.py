@@ -1,10 +1,5 @@
-# ---------------------------------------------------------------
-# Copyright (c) 2021, NVIDIA Corporation. All rights reserved.
-#
-# This work is licensed under the NVIDIA Source Code License
-# found in the LICENSE file in the root directory of this 
-# source tree.
-# ---------------------------------------------------------------
+# Copyright (c) 2023, NVIDIA Corporation. All rights reserved.
+
 import math
 import torch
 import torch.nn as nn
