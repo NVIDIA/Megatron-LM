@@ -23,6 +23,7 @@ class OptimizerParamScheduler(object):
         self.min_lr = min_lr
         assert self.min_lr >= 0.0
         assert self.max_lr >= self.min_lr
+        assert self.init_lr <= self.max_lr
 
         self.lr_warmup_steps = lr_warmup_steps
         self.num_steps = 0
