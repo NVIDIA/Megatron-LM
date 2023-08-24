@@ -106,29 +106,15 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            # TODO (sudhakars): Need to replace the usage of `FusedLayerNorm`
-            # with `TENorm` wrapper class since we'd want consistent use of
-            # normalization layers.
-            if self.config.normalization == "LayerNorm":
-                self.final_layernorm = FusedLayerNorm(
-                    hidden_size=self.config.hidden_size,
-                    eps=self.config.layernorm_epsilon,
-                    persist_layer_norm=self.config.persist_layer_norm,
-                    sequence_parallel=self.config.sequence_parallel,
-                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                )
-            elif self.config.normalization == "RMSNorm":
-                self.final_layernorm = TENorm(
-                    config=self.config,
-                    hidden_size=self.config.hidden_size,
-                    eps=self.config.layernorm_epsilon,
-                    persist_layer_norm=self.config.persist_layer_norm,
-                    sequence_parallel=self.config.sequence_parallel,
-                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                    normalization=self.config.normalization,
-                )
-            else:
-                raise AssertionError("Only `LayerNorm` and `RMSNorm` are currently supported.")
+            self.final_layernorm = TENorm(
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                persist_layer_norm=self.config.persist_layer_norm,
+                sequence_parallel=self.config.sequence_parallel,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                normalization=self.config.normalization,
+            )
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

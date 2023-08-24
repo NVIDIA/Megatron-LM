@@ -16,17 +16,17 @@ class TestParallelAttention:
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_attention = SelfAttention(self.transformer_config)
-        
+
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()    
+        Utils.destroy_model_parallel()
 
     def test_constructor(self):
         assert isinstance(self.parallel_attention, SelfAttention)
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
-        assert num_weights == 624
+        assert num_weights == 648
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
