@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import re
 from contextlib import nullcontext
 
 import torch
@@ -11,7 +12,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
 class TransformerBlock(MegatronModule):
@@ -39,8 +40,6 @@ class TransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        # TODO: Maybe we can create a build_transformer_block method here instead
-
         self.num_layers_per_pipeline_rank = (
             self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
         )
@@ -55,15 +54,15 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_number):
-            return TransformerLayer(
+            layer = TransformerLayer(
                 config=self.config,
                 layer_number=layer_number,
                 self_attn_mask_type=self.self_attn_mask_type,
             )
-
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+            return layer
 
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            # Interleaved pipeline parallelism:
             # Number of layers in each model chunk is the number of layers in the stage,
             # divided by the number of model chunks in a stage.
             # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
@@ -75,28 +74,20 @@ class TransformerBlock(MegatronModule):
             # Stage 0: [0, 1]  [4, 5]
             # Stage 1: [2, 3]  [6, 7]
 
-            vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
             vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-            total_num_layers = self.config.num_layers
             num_layers_per_virtual_rank = self.num_layers_per_pipeline_rank // vp_size
-            total_virtual_chunks = total_num_layers / vp_size
-            offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
 
-            self.layers = torch.nn.ModuleList(
-                [build_layer(i + 1 + offset) for i in range(num_layers_per_virtual_rank)]
-            )
+            num_layers_to_build = num_layers_per_virtual_rank
+
         else:
+            # Non-interleaved pipeline parallelism:
             # Each stage gets a contiguous set of layers.
-            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-                offset = pipeline_rank * self.num_layers_per_pipeline_rank
-            else:
-                offset = 0
 
-            # @jcasper why is layer_number using 1 index?
-            self.layers = torch.nn.ModuleList(
-                [build_layer(i + 1 + offset) for i in range(self.num_layers_per_pipeline_rank)]
-            )
+            num_layers_to_build = self.num_layers_per_pipeline_rank
+
+        # offset is implicit in TransformerLayer
+        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:
@@ -115,28 +106,15 @@ class TransformerBlock(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            # TODO (sudhakars): Need to replace the usage of `FusedLayerNorm`
-            # with `TENorm` wrapper class since we'd want consistent use of
-            # normalization layers.
-            if self.config.normalization == "LayerNorm":
-                self.final_layernorm = FusedLayerNorm(
-                    hidden_size=self.config.hidden_size,
-                    eps=self.config.layernorm_epsilon,
-                    persist_layer_norm=self.config.persist_layer_norm,
-                    sequence_parallel=self.config.sequence_parallel,
-                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                )
-            elif self.config.normalization == "RMSNorm":
-                self.final_layernorm = TENorm(
-                    hidden_size=self.config.hidden_size,
-                    eps=self.config.layernorm_epsilon,
-                    persist_layer_norm=self.config.persist_layer_norm,
-                    sequence_parallel=self.config.sequence_parallel,
-                    zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                    normalization=self.config.normalization,
-                )
-            else:
-                raise AssertionError("Only `LayerNorm` and `RMSNorm` are currently supported.")
+            self.final_layernorm = TENorm(
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+                persist_layer_norm=self.config.persist_layer_norm,
+                sequence_parallel=self.config.sequence_parallel,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                normalization=self.config.normalization,
+            )
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
@@ -272,3 +250,21 @@ class TransformerBlock(MegatronModule):
             hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states
+
+    def sharded_state_dict(self, prefix=''):
+
+        sharded_state_dict = {}
+
+        layer_prefix = f'{prefix}layers.'
+        for layer in self.layers:
+            sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
+
+        if self.post_process and self.post_layer_norm:
+            tensor = self.state_dict(keep_vars=True)['final_layernorm.weight']
+            layer_name = f'{prefix}final_layernorm.weight'
+            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+            tensor = self.state_dict(keep_vars=True)['final_layernorm.bias']
+            layer_name = f'{prefix}final_layernorm.bias'
+            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+
+        return sharded_state_dict

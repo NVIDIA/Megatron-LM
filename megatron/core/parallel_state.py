@@ -643,18 +643,24 @@ def get_pipeline_model_parallel_prev_rank():
 
 def get_data_parallel_world_size():
     """Return world size for the data parallel group."""
-    return (
-        torch.distributed.get_world_size(group=get_data_parallel_group())
-        // get_context_parallel_world_size()
-    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return (
+            torch.distributed.get_world_size(group=get_data_parallel_group())
+            // get_context_parallel_world_size()
+        )
+    else:
+        return 0
 
 
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
-    return (
-        torch.distributed.get_rank(group=get_data_parallel_group())
-        // get_context_parallel_world_size()
-    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return (
+            torch.distributed.get_rank(group=get_data_parallel_group())
+            // get_context_parallel_world_size()
+        )
+    else:
+        return 0
 
 
 def get_context_parallel_world_size():
