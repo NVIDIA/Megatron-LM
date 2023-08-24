@@ -899,6 +899,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
                        'learning rate over.')
+    group.add_argument('--lr-warmup-init', type=float, default=0.0,
+                       help='Initial value for learning rate warmup. The '
+                       'scheduler starts warmup from this value.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')
