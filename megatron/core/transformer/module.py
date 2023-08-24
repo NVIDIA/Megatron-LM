@@ -29,8 +29,17 @@ class MegatronModule(torch.nn.Module):
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Use this function to override the state dict for
-        saving checkpoints."""
+           saving checkpoints.
+        """
+
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
+
+    def sharded_state_dict(self, prefix=''):
+        """ Override sharded_state_dict when using distributed checkpointing.
+            keep_vars must always be set to True so that optimizer states
+            can be sharded.
+        """
+        return self.state_dict(prefix=prefix, keep_vars=True)
 
 
 def conversion_helper(val, conversion):
@@ -111,7 +120,14 @@ class Float16Module(MegatronModule):
         return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        """ Retrieve state_dict from the module being wrapped."""
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
+
+    def sharded_state_dict(self, prefix=''):
+        """ Retrieve state_dict from the module being wrapped.
+            When using distributed checkpointing, keep_vars must always be set to True.
+        """
+        return self.module.sharded_state_dict(prefix=prefix, keep_vars=True)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
