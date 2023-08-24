@@ -213,14 +213,20 @@ class TransformerBlock(MegatronModule):
         if self.config.fp8:
             import transformer_engine  # To keep out TE dependency when not training in fp8
 
+            if self.config.fp8 == "e4m3":
+                fp8_format = transformer_engine.common.recipe.Format.E4M3
+            elif self.config.fp8 == "hybrid":
+                fp8_format = transformer_engine.common.recipe.Format.HYBRID
+            else:
+                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
             fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
                 margin=self.config.fp8_margin,
                 interval=self.config.fp8_interval,
-                fp8_format=transformer_engine.common.recipe.Format.E4M3
-                if self.config.fp8_e4m3
-                else transformer_engine.common.recipe.Format.HYBRID,
+                fp8_format=fp8_format,
                 amax_compute_algo=self.config.fp8_amax_compute_algo,
                 amax_history_len=self.config.fp8_amax_history_len,
+                override_linear_precision=(False, False, not self.config.fp8_wgrad),
             )
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe
