@@ -117,6 +117,30 @@ def initialize_model_parallel(
             within each data-parallel process group, which specifies
             the SHARP application target groups.
 
+        context_parallel_size (int, default = 1):
+            The number of tensor parallel GPU groups to split the
+            network input sequence length across. Compute of attention
+            module requires tokens of full sequence length, so GPUs
+            in a context parallel group need to communicate with each
+            other to exchange information of other sequence chunks.
+            Each GPU and its counterparts in other tensor parallel
+            groups compose a context parallel group.
+
+            For example, assume we have 8 GPUs, if tensor model parallel
+            size is 4 and context parallel size is 2, the network input
+            will be split into two sequence chunks, which are processed
+            by 2 different groups of 4 GPUs. One chunk is processed by
+            GPU0-3, the other chunk is processed by GPU4-7. Four groups
+            are build to do context parallel communications: [GPU0, GPU4],
+            [GPU1, GPU5], [GPU2, GPU6], and [GPU3, GPU7].
+
+            Context parallelism partitions sequence length, so it has no
+            impact on weights, which means weights are duplicated among
+            GPUs in a context parallel group. Hence, weight gradients
+            all-reduce is required in backward. For simplicity, we piggyback
+            GPUs of context parallelism on data parallel group for
+            weight gradient all-reduce.
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
