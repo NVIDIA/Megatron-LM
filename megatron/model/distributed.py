@@ -3,19 +3,18 @@
 from abc import ABC
 from abc import abstractmethod
 import math
+from typing import Dict, List
 
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from contextlib import contextmanager
 
-from megatron import get_args
 from megatron.core import mpu
 from .module import MegatronModule
 
 
 class MemoryBuffer:
 
-    def __init__(self, numel, numel_padded, dtype):
+    def __init__(self, numel: int, numel_padded: int, dtype: torch.dtype):
         self.numel = numel
         self.numel_padded = numel_padded
         self.dtype = dtype
@@ -30,7 +29,7 @@ class MemoryBuffer:
         self.data.zero_()
 
 
-    def get(self, shape, start_index):
+    def get(self, shape: torch.Size, start_index: int) -> torch.Tensor:
         """Return a tensor with the input `shape` as a view into the
         1-D data starting at `start_index`."""
         end_index = start_index + shape.numel()
@@ -50,10 +49,13 @@ class Bucket:
     have grads available.
     """
 
-    def __init__(self, params, data, data_parallel_group, overlap_grad_reduce):
+    def __init__(self, params: List[torch.nn.Parameter], data: torch.Tensor,
+                 data_parallel_group: torch.distributed.ProcessGroup,
+                 overlap_grad_reduce: bool):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
         # available.
+        self.params_list = params
         self.params = set(params)
         self.params_with_grad = set()
         self.data = data
@@ -73,15 +75,13 @@ class Bucket:
     def all_reduce(self):
         assert self.allreduce_handle is None, \
             'Should not have multiple all-reduces in flight at once'
-        assert len(self.params_with_grad) == len(self.params), \
-            f'Number of params with grad: {len(self.params_with_grad)}/{len(self.params)}'
         self.data /= self.data_parallel_size
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
             async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
-        
 
-    def set(self, param):
+
+    def set(self, param: torch.nn.Parameter):
         assert param in self.params, 'param is not in the bucket'
         assert param not in self.params_with_grad, 'cannot set grad twice'
         self.params_with_grad.add(param)
@@ -105,14 +105,19 @@ class GradBuffer(MemoryBuffer):
     roughly bucket_size parameters each.
     """
     
-    def __init__(self, numel, numel_padded, dtype, params, data_parallel_group,
-                 bucket_size, param_to_name, overlap_grad_reduce):
+    def __init__(self, numel: int, numel_padded: int, dtype: torch.dtype,
+                 params: List[torch.nn.Parameter],
+                 data_parallel_group: torch.distributed.ProcessGroup,
+                 bucket_size: int,
+                 param_to_name: Dict[torch.nn.Parameter, str],
+                 overlap_grad_reduce: bool):
         super(GradBuffer, self).__init__(numel, numel_padded, dtype)
 
         self.buckets = []
         self.param_to_bucket = {}
+        self.overlap_grad_reduce = overlap_grad_reduce
 
-        self.is_last_microbatch = False
+        self.is_last_microbatch = True
         
         # Check that params are unique.
         unique_params = set()
@@ -121,15 +126,22 @@ class GradBuffer(MemoryBuffer):
             unique_params.add(param)
         del unique_params
 
-        # Map the grads to the buffer and bucket them.
-        def set_bucket_(bucket_params, data_start_index, data_end_index):
+        # Helper function to create new bucket, add it to list of buckets, and
+        # also update param->bucket mapping.
+        def set_bucket_(bucket_params: List[torch.nn.Parameter],
+                        data_start_index: int,
+                        data_end_index: int):
+
+            # Get appropriate view into global GradBuffer.
             bucket_data = self.get(torch.Size([data_end_index - data_start_index]),
                                    data_start_index)
-            bucket = Bucket(bucket_params, bucket_data, data_parallel_group, overlap_grad_reduce)
+            bucket = Bucket(bucket_params, bucket_data, data_parallel_group,
+                            overlap_grad_reduce)
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
                 self.param_to_bucket[bucket_param] = bucket
 
+        # Map the grads to the buffer and bucket them.
         data_start_index = 0
         bucket_data_start_index = data_start_index
         bucket_params = set()
@@ -168,11 +180,11 @@ class GradBuffer(MemoryBuffer):
 
 
     def reset(self):
-        """Set the data to zero and reset all the buckets."""
+        """Set the data to zero and reset all buckets."""
         self.zero()
         for bucket in self.buckets:
             bucket.reset()
-        self.is_last_microbatch = False
+        self.is_last_microbatch = True
 
 
     def done(self):
@@ -181,12 +193,13 @@ class GradBuffer(MemoryBuffer):
             bucket.done()
         
 
-    def mark_grad_as_done(self, param):
+    def mark_grad_as_done(self, param: torch.nn.Parameter):
         """
         When the number of microbatches is greater than 1, we only want
-        to register grads when processing the last microbatch.
+        to register grads when processing the last microbatch and
+        overlap_grad_reduce is True.
         """
-        if self.is_last_microbatch:
+        if self.is_last_microbatch and self.overlap_grad_reduce:
             bucket = self.param_to_bucket[param]
             bucket.set(param)
 
@@ -246,9 +259,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
     """
 
-    def __init__(self, module, data_parallel_group,
-                 accumulate_allreduce_grads_in_fp32,
-                 overlap_grad_reduce, bucket_size=40000000):
+    def __init__(self, module: torch.nn.Module,
+                 data_parallel_group: torch.distributed.ProcessGroup,
+                 accumulate_allreduce_grads_in_fp32: bool,
+                 overlap_grad_reduce: bool, bucket_size: int=40000000):
         super(DistributedDataParallel, self).__init__(module)
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
@@ -319,7 +333,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 self.grad_accs.append(grad_acc)
 
 
-    def _make_param_hook(self, param, param_to_grad_buffer):
+    def _make_param_hook(self, param: torch.nn.Parameter,
+                         param_to_grad_buffer: Dict[torch.nn.Parameter, GradBuffer]):
         """Create the all-reduce hook for backprop."""
 
         def param_hook(*unused):

@@ -387,7 +387,7 @@ def forward_backward_pipelining_with_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and all(isinstance(chunk, (torchDDP, localDDP)) for chunk in model):
+    if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
 
         def multi_no_sync():
             stack = contextlib.ExitStack()
@@ -1058,7 +1058,7 @@ def forward_backward_pipelining_without_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and isinstance(model, (torchDDP, localDDP)):
+    if no_sync_func is None and isinstance(model, torchDDP):
         no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
