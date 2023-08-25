@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from torch import Tensor
@@ -39,6 +39,9 @@ class GPTModel(MegatronModule):
 
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
+
+        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
+            The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
@@ -53,6 +56,7 @@ class GPTModel(MegatronModule):
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
+        seq_len_interpolation_factor: Optional[float] = None,
     ):
         super(GPTModel, self).__init__(config=config)
 
@@ -85,7 +89,7 @@ class GPTModel(MegatronModule):
             if rotary_percent < 1.0:
                 rotary_dim = int(rotary_dim * rotary_percent)
 
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
         else:
             self.rotary_pos_emb = None
 
