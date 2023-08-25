@@ -437,12 +437,12 @@ def forward_backward_pipelining_with_interleaving(
     if model_type == ModelType.encoder_and_decoder:
         raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
 
-    tensor_shape = (seq_length, micro_batch_size, config.hidden_size)
-    if decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
+    if decoder_seq_length is not None and decoder_seq_length != seq_length:
         raise RuntimeError(
             "Interleaving is not supported with a different decoder sequence length."
         )
 
+    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
 
@@ -759,9 +759,7 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor,
                 recv_prev=recv_prev,
                 tensor_shape=tensor_shape,
-                dtype=dtype,
-                batch_p2p_comm=batch_p2p_comm,
-                timers=timers,
+                config=config,
                 overlap_p2p_comm=True,
             )
             # assert fwd_wait_handles is not None
