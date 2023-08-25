@@ -379,12 +379,6 @@ def set_virtual_pipeline_model_parallel_world_size(world_size):
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
-def set_virtual_pipeline_model_parallel_world_size(world_size):
-    """Set the virtual pipeline model parallel size"""
-    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
-
-
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
@@ -542,12 +536,6 @@ def get_virtual_pipeline_model_parallel_world_size():
     """Return the virtual pipeline-parallel world size."""
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-
-
-def set_virtual_pipeline_model_parallel_world_size(world_size):
-    """Set the virtual pipeline-parallel world size"""
-    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
 def get_tensor_model_parallel_src_rank():
