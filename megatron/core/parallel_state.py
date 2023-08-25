@@ -59,7 +59,6 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
-    use_fp8: bool = False,
     use_sharp: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
@@ -99,11 +98,6 @@ def initialize_model_parallel(
             pipeline_model_parallel_size is 8 and
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
-
-        use_fp8 (bool, default = False):
-            Construct GPU groups needed for FP8 training, namely for
-            amax reduction across the product of the data-parallel and
-            tensor-parallel groups.
 
         use_sharp (bool, default = False):
             Set the use of SHARP for the collective communications of
