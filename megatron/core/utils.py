@@ -8,6 +8,7 @@ from functools import reduce
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 
 def ensure_divisibility(numerator, denominator):
@@ -175,3 +176,32 @@ def scaled_init_method_normal(sigma, num_layers):
         return torch.nn.init.normal_(tensor, mean=0.0, std=std)
 
     return init_
+
+
+def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, replica_id=None, **kwargs):
+    """ Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group. """
+
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        (
+            tp_axis,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_tensor_model_parallel_world_size(),
+        ),
+        replica_id=parallel_state.get_data_parallel_rank() if replica_id is None else replica_id,
+        **kwargs,
+    )
+
+
+def make_sharded_tensor_for_checkpoint(tensor, key, **kwargs):
+    """ Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group). """
+
+    return ShardedTensor.from_rank_offsets(
+        key,
+        tensor,
+        replica_id=parallel_state.get_data_parallel_rank()
+        * parallel_state.get_data_parallel_world_size()
+        + parallel_state.get_tensor_model_parallel_rank(),
+        **kwargs,
+    )

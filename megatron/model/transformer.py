@@ -184,14 +184,18 @@ class SwitchMLP(MegatronModule):
             local_indices = (max_ind == expert_num).nonzero()
             hidden = hidden_states[local_indices,:]
             output, output_bias = expert(hidden)
-            output_bias = output_bias.expand_as(output)
+            if output_bias is not None:
+                output_bias = output_bias.expand_as(output)
+                output_bias_total[local_indices,:] = output_bias
             output_total[local_indices,:] = output
-            output_bias_total[local_indices,:] = output_bias
 
         output_total = output_total*max_prob
-        output_bias_total = output_bias_total*max_prob
         output_total = output_total.view(s, b, h)
-        output_bias_total = output_bias_total.view(s, b, h)
+        if output_bias is not None:
+            output_bias_total = output_bias_total*max_prob
+            output_bias_total = output_bias_total.view(s, b, h)
+        else:
+            output_bias_total = None
 
         return output_total, output_bias_total
 
@@ -1337,17 +1341,19 @@ class ParallelTransformer(MegatronModule):
 
             assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
 
-        self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
+        self.use_fp8 = args.fp8 is not None
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
             assert args.transformer_impl == 'transformer_engine', \
                 'transformer-engine required for fp8 training and inference'
             self.fp8_group = mpu.get_amax_reduction_group()
-            if args.fp8_e4m3:
+            if args.fp8 == "e4m3":
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif args.fp8_hybrid:
+            elif args.fp8 == "hybrid":
                 fp8_format = transformer_engine.common.recipe.Format.HYBRID
+            else:
+                raise ValueError("The DelayedScaling recipe only supports E4M3 and HYBRID formats.")
             self.fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
                 margin=args.fp8_margin,
                 interval=args.fp8_interval,

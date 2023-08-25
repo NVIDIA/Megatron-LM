@@ -10,7 +10,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 class TestParallelMLP:
-    
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
@@ -18,15 +18,15 @@ class TestParallelMLP:
         self.mlp = MLP(transformer_config)
 
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()   
+        Utils.destroy_model_parallel()
 
     def test_constructor(self):
         assert isinstance(self.mlp, MLP)
 
         num_weights = sum([p.numel() for p in self.mlp.parameters()])
-        assert num_weights == 1212
+        assert num_weights == 1236
 
-    """ 
+    """
     def test_cpu_forward(self, mlp):
         # [sequence length, micro batch size, hidden size]
         hidden_states = torch.ones((32, 2, mlp.config.hidden_size))

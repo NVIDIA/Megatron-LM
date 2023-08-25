@@ -1,2 +1,1 @@
-{"lm loss": {"start_step": 0, "end_step": 48, "step_interval": 5, "values": [10.7947, 10.85294, 10.87058, 10.83388, 10.83025, 10.78754, 10.56419, 10.57339, 10.48735, 10.19553]}, "num-zeros": {"start_step": 0, "end_step": 32, "step_interval": 5, "values": [2477.0, 2813.0, 2120.0, 2681.0, 2666.0, 2637.0, 3014.0]}, "iteration_timing_avg": 0.11574343750000003}
-
+{"lm loss": {"start_step": 0, "end_step": 47, "step_interval": 5, "values": [10.81244, 10.87437, 10.90132, 10.84946, 10.84826, 10.81872, 10.61811, 10.61053, 10.52823, 10.22961]}, "num-zeros": {"start_step": 0, "end_step": 30, "step_interval": 5, "values": [2356.0, 2601.0, 2778.0, 2282.0, 2350.0, 2782.0]}, "iteration_timing_avg": 0.12793593749999999}

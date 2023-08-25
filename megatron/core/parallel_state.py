@@ -379,12 +379,6 @@ def set_virtual_pipeline_model_parallel_world_size(world_size):
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
-def set_virtual_pipeline_model_parallel_world_size(world_size):
-    """Set the virtual pipeline model parallel size"""
-    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
-
-
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
@@ -544,12 +538,6 @@ def get_virtual_pipeline_model_parallel_world_size():
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
 
 
-def set_virtual_pipeline_model_parallel_world_size(world_size):
-    """Set the virtual pipeline-parallel world size"""
-    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
-
-
 def get_tensor_model_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
     in the tensor model parallel group."""
@@ -598,12 +586,18 @@ def get_pipeline_model_parallel_prev_rank():
 
 def get_data_parallel_world_size():
     """Return world size for the data parallel group."""
-    return torch.distributed.get_world_size(group=get_data_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(group=get_data_parallel_group())
+    else:
+        return 0
 
 
 def get_data_parallel_rank():
     """Return my rank for the data parallel group."""
-    return torch.distributed.get_rank(group=get_data_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(group=get_data_parallel_group())
+    else:
+        return 0
 
 
 def _set_global_memory_buffer():

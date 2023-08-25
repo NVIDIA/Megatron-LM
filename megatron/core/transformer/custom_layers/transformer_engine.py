@@ -11,6 +11,21 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _get_extra_te_kwargs(config: TransformerConfig):
+    extra_transformer_engine_kwargs = {}
+    from importlib.metadata import version
+
+    from pkg_resources import packaging
+
+    te_version = packaging.version.Version(version("transformer-engine"))
+    if te_version >= packaging.version.Version("0.12.0"):
+        if config.use_cpu_initialization:
+            extra_transformer_engine_kwargs["device"] = 'cpu'
+        else:
+            extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
+    return extra_transformer_engine_kwargs
+
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
@@ -19,6 +34,7 @@ class TENorm:
 
     def __new__(
         cls,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
         sequence_parallel: bool = False,
@@ -27,14 +43,20 @@ class TENorm:
     ):
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=sequence_parallel,
+                **_get_extra_te_kwargs(config),
             )
         elif normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size, eps=eps, sequence_parallel=sequence_parallel
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=sequence_parallel,
+                **_get_extra_te_kwargs(config),
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')
@@ -85,7 +107,8 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            **kwargs
+            **_get_extra_te_kwargs(config),
+            **kwargs,
         )
 
     def forward(self, x):
@@ -141,7 +164,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
-            **kwargs
+            **_get_extra_te_kwargs(config),
+            **kwargs,
         )
 
     def forward(self, x):
@@ -168,7 +192,7 @@ class TEColumnParallelLinear(TELinear):
             output_size=output_size,
             config=self.config,
             parallel_mode="column",
-            **kwargs
+            **kwargs,
         )
 
 
@@ -185,7 +209,7 @@ class TERowParallelLinear(TELinear):
             output_size=output_size,
             config=self.config,
             parallel_mode="row",
-            **kwargs
+            **kwargs,
         )
 
 
@@ -217,7 +241,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            **kwargs
+            **kwargs,
         )
 
 
