@@ -443,6 +443,7 @@ def core_transformer_config_from_args(args):
     kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
     kw_args['fp8_e4m3'] = args.fp8_e4m3
     kw_args['fp8_margin'] = args.fp8_hybrid
+    kw_args['num_moe_experts'] = args.num_experts
     if args.group_query_attention:
         kw_args['num_query_groups'] = args.num_query_groups
     else:
