@@ -223,6 +223,9 @@ def get_args():
                         help='Number of file partitions')
     group.add_argument('--log-interval', type=int, default=1000,
                        help='Interval between progress updates')
+    group.add_argument('--keep-sequential-samples', action='store_true',
+                       help='Ensure ordering of samples in .jsonl files is '
+                            'preserved when using partitions>1.')
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -279,6 +282,16 @@ def main():
     else:
         in_file_names = glob.glob(args.input)
 
+        # Count total number of lines across .jsonl files
+        if args.keep_sequential_samples:
+            total_sample_count = 0
+            for filename in in_file_names:
+                with open(filename, "r") as fin:
+                    for fc, _ in enumerate(fin):
+                        pass
+                total_sample_count += (fc + 1)
+            partition_size = math.ceil(total_sample_count / args.partitions)
+
         # create .jsonl parition files
         for idx in range(args.partitions):
             in_ss_out_name = get_file_name(args, idx)
@@ -298,6 +311,7 @@ def main():
                 partitioned_input_files.append(partitioned_input_file)
 
             index = 0
+            if args.keep_sequential_samples: line_count = 0
             for in_file_name in in_file_names:
                 # support for gzip files
                 if in_file_name.endswith(".gz"):
@@ -307,7 +321,12 @@ def main():
 
                 for line in fin:
                     partitioned_input_files[index].write(line)
-                    index = (index + 1)%args.partitions
+                    if args.keep_sequential_samples:
+                        line_count += 1
+                        if line_count % partition_size == 0:
+                            index += 1
+                    else:
+                        index = (index + 1)%args.partitions
 
                 fin.close()
 
@@ -378,5 +397,6 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()
 

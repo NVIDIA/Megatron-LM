@@ -108,12 +108,11 @@ class TransformerConfig(ModelParallelConfig):
         # fp8 related (via Transformer Engine). For detailed info, refer the the Transformer Engine docs at
         # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html
 
-        fp8 (bool): Enables the use of FP8 precision through Transformer Engine.
+        fp8 (str): If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined choices: (1) 'e4m3'
+                   uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8 activation and weight tensors and
+                   e5m2 for all FP8 output activation gradient tensors. Defaults to None.
 
-        fp8_e4m3 (bool): Enables the use of FP8 tensors in e4m3 format for both forward and backward passes.
-
-        fp8_margin (int): Enables the use of FP8 tensors in e4m3 format in the forward pass and e5m2 format in the
-                          backward pass.
+        fp8_margin (int): Margin for the scaling factor computation.
 
         fp8_interval (int): Controls how often the scaling factor is recomputed.
 
@@ -122,6 +121,14 @@ class TransformerConfig(ModelParallelConfig):
         fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation.
                                      There are 2 predefined choices: `max` chooses the largest `amax` in the history
                                      window, while `most_recent` always chooses the most recently seen value.
+
+        fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision.
+                          Defaults to True.
+
+        # Experimental
+        normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily
+                             used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
+
 
     """
 
@@ -170,12 +177,15 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: bool = None
 
     # fp8 related
-    fp8: bool = False
-    fp8_e4m3: bool = False
+    fp8: str = None
     fp8_margin: int = 0
     fp8_interval: int = 1
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
+    fp8_wgrad: bool = True
+
+    # experimental section (TODO: move to apt. section above once stable)
+    normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -233,9 +243,9 @@ class TransformerConfig(ModelParallelConfig):
                     f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
                 )
 
-            if self.distribute_saved_activations and self.sequence_parallel_enabled:
+            if self.distribute_saved_activations and self.sequence_parallel:
                 raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be false when sequence parallel is enabled: {self.sequence_parallel_enabled}'
+                    f'distribute_saved_activations: {self.distribute_saved_activations} must be false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
 
             if self.virtual_pipeline_model_parallel_size is not None:

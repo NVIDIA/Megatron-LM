@@ -353,6 +353,7 @@ def get_optimizer_param_scheduler(optimizer):
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
+        init_lr=args.lr_warmup_init,
         max_lr=args.lr,
         min_lr=args.min_lr,
         lr_warmup_steps=lr_warmup_steps,
@@ -863,7 +864,7 @@ def evaluate(forward_step_func,
                             key, torch.cuda.FloatTensor([0.0])) + loss_dict[key]
 
             args.consumed_valid_samples += eval_batch_size
-        
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(

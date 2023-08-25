@@ -120,7 +120,7 @@ def validate_args(args, defaults={}):
         # For default to be valid, it should not be provided in the
         # arguments that are passed to the program. We check this by
         # ensuring the arg is set to None.
-        if getattr(args, key) is not None:
+        if getattr(args, key, None) is not None:
             if args.rank == 0:
                 print('WARNING: overriding default arguments for {key}:{v} \
                        with {key}:{v2}'.format(key=key, v=defaults[key],
@@ -320,9 +320,6 @@ def validate_args(args, defaults={}):
             'v1.10 and above (Nvidia Pytorch container >= 21.07). Current ' \
             'pytorch version is v%s.%s.' % (TORCH_MAJOR, TORCH_MINOR)
 
-    assert not (args.fp8_e4m3 and args.fp8_hybrid), \
-        'cannot train with both fp8 e4m3 and hybrid formatting'
-
     if args.recompute_granularity == 'selective':
         assert args.recompute_method is None, \
             'recompute method is not yet supported for ' \
@@ -374,10 +371,6 @@ def validate_args(args, defaults={}):
                 args.retro_num_retrieved_chunks * \
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
-
-    # Normalization args
-    if args.normalization == "RMSNorm":
-        assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -433,6 +426,7 @@ def core_transformer_config_from_args(args):
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -440,10 +434,6 @@ def core_transformer_config_from_args(args):
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
-    kw_args['fp8'] = args.fp8_e4m3 or args.fp8_hybrid
-    kw_args['fp8_e4m3'] = args.fp8_e4m3
-    kw_args['fp8_margin'] = args.fp8_hybrid
-    kw_args['num_moe_experts'] = args.num_experts
     if args.group_query_attention:
         kw_args['num_query_groups'] = args.num_query_groups
     else:
@@ -454,27 +444,30 @@ def core_transformer_config_from_args(args):
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
-    group.add_argument('--fp8-e4m3', action='store_true',
-                        help='E4M3 TransformerLayer', dest='fp8_e4m3')
-    group.add_argument('--fp8-hybrid', action='store_true',
-                        help='Hybrid FP8 TransformerLayer', dest='fp8_hybrid')
-    group.add_argument('--no-fp8-wgrad', action='store_false',
-                        help='Execute wgrad in higher precision even for FP8 runs', dest='fp8_wgrad')
+    group.add_argument('--fp8-format', default=None,
+                       choices=['e4m3', 'hybrid'],
+                       help='Which fp8 format scheme to use for FP8 tensors in the forward and backward pass',
+                       dest='fp8')
     group.add_argument('--fp8-margin', type=int, default=0,
-                        help='Scaling margin for fp8', dest='fp8_margin')
+                       help='Scaling margin for fp8',
+                       dest='fp8_margin')
     group.add_argument('--fp8-interval', type=int, default=1,
-                        help='Scaling update interval for fp8', dest='fp8_interval')
-    group.add_argument('--transformer-impl', default='local',
-                       choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.',
-                       dest='transformer_impl')
+                       help='Scaling update interval for fp8',
+                       dest='fp8_interval')
     group.add_argument('--fp8-amax-history-len', type=int, default=1,
-                        help='Number of steps for which amax history is recorded per tensor',
-                        dest='fp8_amax_history_len')
+                       help='Number of steps for which amax history is recorded per tensor',
+                       dest='fp8_amax_history_len')
     group.add_argument('--fp8-amax-compute-algo', default='most_recent',
                        choices=['most_recent', 'max'],
                        help='Algorithm for computing amax from history',
                        dest='fp8_amax_compute_algo')
+    group.add_argument('--no-fp8-wgrad', action='store_false',
+                       help='Execute wgrad in higher precision even for FP8 runs',
+                       dest='fp8_wgrad')
+    group.add_argument('--transformer-impl', default='local',
+                       choices=['local', 'transformer_engine'],
+                       help='Which Transformer implementation to use.',
+                       dest='transformer_impl')
     group.add_argument('--normalization', default='LayerNorm',
                        choices=['LayerNorm', 'RMSNorm'],
                        help='Which normalization technique to use.',
@@ -586,7 +579,7 @@ def _add_network_size_args(parser):
                        help='Use rotary positional embeddings or not. '
                        'Deprecated: use --position-embedding-type')
     group.add_argument('--rotary-percent', type=float, default=1.0,
-                       help='Percent of rotary dimension to use, default 100%')
+                       help='Percent of rotary dimension to use, default 100%%')
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--no-position-embedding',
@@ -912,6 +905,9 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-warmup-samples', type=int, default=0,
                        help='number of samples to linearly warmup '
                        'learning rate over.')
+    group.add_argument('--lr-warmup-init', type=float, default=0.0,
+                       help='Initial value for learning rate warmup. The '
+                       'scheduler starts warmup from this value.')
     group.add_argument('--warmup', type=int, default=None,
                        help='Old lr warmup argument, do not use. Use one of the'
                        '--lr-warmup-* arguments above')

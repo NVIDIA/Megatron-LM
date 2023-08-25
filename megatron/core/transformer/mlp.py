@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEColumnParallelLinear,
+    TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
 from megatron.core.transformer.module import MegatronModule

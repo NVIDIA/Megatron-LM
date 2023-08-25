@@ -1416,17 +1416,19 @@ class ParallelTransformer(MegatronModule):
 
             assert not args.squared_relu, "TransformerEngine does not support squared relu activation."
 
-        self.use_fp8 = args.fp8_e4m3 or args.fp8_hybrid
+        self.use_fp8 = args.fp8 is not None
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
             assert args.transformer_impl == 'transformer_engine', \
                 'transformer-engine required for fp8 training and inference'
             self.fp8_group = mpu.get_amax_reduction_group()
-            if args.fp8_e4m3:
+            if args.fp8 == "e4m3":
                 fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif args.fp8_hybrid:
+            elif args.fp8 == "hybrid":
                 fp8_format = transformer_engine.common.recipe.Format.HYBRID
+            else:
+                raise ValueError("The DelayedScaling recipe only supports E4M3 and HYBRID formats.")
             self.fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
                 margin=args.fp8_margin,
                 interval=args.fp8_interval,
