@@ -212,7 +212,7 @@ fi
 if [ "${no_pp}" = "false" ]; then
     jobname="${jobname}_pp${pp_size}"
 fi
-jobname="${jobname}_seed${seed}_rebase"
+jobname="${jobname}_seed${seed}_rebase_megatron_checkpointing"
 
 username=$(whoami)
 output_home="/blob/users/${username}/project/data_efficient_gpt"
@@ -275,9 +275,14 @@ megatron_options=" \
     --log-validation-ppl-to-tensorboard \
     --tensorboard-dir ${tensorboard_path}"
 
+# test megatron activation checkpointing
+# we fixed bug in the code of this activation checkpointing, i.e., --recompute-granularity full --recompute-method uniform
+# the two arguments can be found in megatron/arguments.py
 if [ "${activation_checkpoint}" = "true" ]; then
 megatron_options="${megatron_options} \
-    --checkpoint-activations"
+    --recompute-granularity full \
+    --recompute-method uniform \
+    --recompute-num-layers 1"
 fi
 
 if [ "${log_optimizer_state}" = "true" ]; then
@@ -305,10 +310,12 @@ deepspeed_options="${deepspeed_options} \
     --no-pipeline-parallel"
 fi
 
-if [ "${activation_checkpoint}" = "true" ]; then
-deepspeed_options="${deepspeed_options} \
-    --deepspeed-activation-checkpointing"
-fi
+# disable the deepspeed activation checkpointing
+
+# if [ "${activation_checkpoint}" = "true" ]; then
+# deepspeed_options="${deepspeed_options} \
+#     --deepspeed-activation-checkpointing"
+# fi
 
 ## When saving checkpoint to a storage with cache, their could be consistency
 ## issue of the pointer to latest checkpoint. Here we find the correct pointer

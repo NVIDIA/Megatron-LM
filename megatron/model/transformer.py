@@ -1742,21 +1742,20 @@ class ParallelTransformer(MegatronModule):
                               encoder_output, enc_dec_attn_mask,
                               rotary_pos_emb, is_first_microbatch):
         args = get_args()
-        if args.deepspeed:
-            # HACK: DeepSpeed still relies on the old
-            # activation checkpointing mechanism.
-            """Forward method with activation checkpointing."""
-            def custom(start, end):
-                def custom_forward(*args, **kwargs):
-                    x_, *args = args
-                    moe_losses = []
-                    for index in range(start, end):
-                        layer = self._get_layer(index)
-                        x_, moe_loss = layer(x_, *args, **kwargs)
-                        moe_losses.append(moe_loss)
-                    return (x_, *moe_losses)
-                return custom_forward
 
+        """Forward method with activation checkpointing."""
+        def custom(start, end):
+            def custom_forward(*args, **kwargs):
+                x_, *args = args
+                moe_losses = []
+                for index in range(start, end):
+                    layer = self._get_layer(index)
+                    x_, moe_loss = layer(x_, *args, **kwargs)
+                    moe_losses.append(moe_loss)
+                return (x_, *moe_losses)
+            return custom_forward
+        
+        if args.deepspeed:
             moe_losses = []
             # Make sure memory is freed.
             tensor_parallel.reset_checkpointed_activations_memory_buffer()
@@ -1771,16 +1770,7 @@ class ParallelTransformer(MegatronModule):
 
             return hidden_states, moe_losses
         else:
-            """Forward method with activation checkpointing."""
-            def custom(start, end):
-                def custom_forward(*args, **kwargs):
-                    x_, *args = args
-                    for index in range(start, end):
-                        layer = self._get_layer(index)
-                        x_ = layer(x_, *args, **kwargs)
-                    return x_
-                return custom_forward
-
+            moe_losses = []
             te_forward_kwargs = {}
             if self.transformer_impl == 'transformer_engine':
                 te_forward_kwargs['is_first_microbatch'] = is_first_microbatch
@@ -1794,7 +1784,7 @@ class ParallelTransformer(MegatronModule):
                 l = 0
                 while l < self.num_layers:
                     if self.transformer_impl == 'transformer_engine':
-                        hidden_states = transformer_engine.pytorch.distributed.checkpoint(
+                        hidden_states, *local_moe_losses = transformer_engine.pytorch.distributed.checkpoint(
                             custom(l, l + self.recompute_num_layers),
                             self.distribute_saved_activations,
                             tensor_parallel.get_cuda_rng_tracker,
@@ -1802,15 +1792,14 @@ class ParallelTransformer(MegatronModule):
                             hidden_states, attention_mask, encoder_output,
                             enc_dec_attn_mask, **te_forward_kwargs)
                     else:
-                        hidden_states = tensor_parallel.checkpoint(
+                        hidden_states, *local_moe_losses = tensor_parallel.checkpoint(
                             custom(l, l + self.recompute_num_layers),
                             self.distribute_saved_activations,
                             hidden_states, attention_mask,
                             encoder_output, enc_dec_attn_mask,
                             None, None, None, None, rotary_pos_emb)
-
+                    moe_losses.extend(local_moe_losses)
                     l += self.recompute_num_layers
-
             elif self.recompute_method == 'block':
                 # Checkpoint the input activation of only a set number of individual
                 # Transformer layers and skip the rest.
@@ -1818,7 +1807,7 @@ class ParallelTransformer(MegatronModule):
                 for l in range(self.num_layers):
                     if l < self.recompute_num_layers:
                         if self.transformer_impl == 'transformer_engine':
-                            hidden_states = transformer_engine.pytorch.distributed.checkpoint(
+                            hidden_states, *local_moe_losses = transformer_engine.pytorch.distributed.checkpoint(
                                 custom(l, l + 1),
                                 self.distribute_saved_activations,
                                 tensor_parallel.get_cuda_rng_tracker,
@@ -1826,7 +1815,7 @@ class ParallelTransformer(MegatronModule):
                                 hidden_states, attention_mask, encoder_output,
                                 enc_dec_attn_mask, **te_forward_kwargs)
                         else:
-                            hidden_states = tensor_parallel.checkpoint(
+                            hidden_states, *local_moe_losses = tensor_parallel.checkpoint(
                                 custom(l, l + 1),
                                 self.distribute_saved_activations,
                                 hidden_states, attention_mask,
@@ -1834,18 +1823,19 @@ class ParallelTransformer(MegatronModule):
                                 None, None, None, None, rotary_pos_emb)
                     else:
                         if self.transformer_impl == 'transformer_engine':
-                            hidden_states = custom(l, l + 1)(
+                            hidden_states, *local_moe_losses = custom(l, l + 1)(
                                 hidden_states, attention_mask, encoder_output,
                                 enc_dec_attn_mask, **te_forward_kwargs)
                         else:
-                            hidden_states = custom(l, l + 1)(
+                            hidden_states, *local_moe_losses = custom(l, l + 1)(
                                 hidden_states, attention_mask,
                                 encoder_output, enc_dec_attn_mask,
                                 None, None, None, None, rotary_pos_emb)
+                            
+                    moe_losses.extend(local_moe_losses)
             else:
                 raise ValueError("Invalid activation recompute method.")
-
-            return hidden_states
+            return hidden_states, moe_losses
 
     def set_input_tensor(self, input_tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -1945,7 +1935,7 @@ class ParallelTransformer(MegatronModule):
                                                                rotary_pos_emb,
                                                                is_first_microbatch)
                 elif self.recompute_granularity == 'full':
-                    hidden_states = self._checkpointed_forward(hidden_states,
+                    hidden_states, moe_losses = self._checkpointed_forward(hidden_states,
                                                                attention_mask,
                                                                encoder_output,
                                                                enc_dec_attn_mask,

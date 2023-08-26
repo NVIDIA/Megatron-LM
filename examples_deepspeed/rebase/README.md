@@ -44,3 +44,4 @@ We also tested and verified that the Rotary Positional Embedding (RoPE) introduc
 
 ## Notes/TODOs
 * After the sync, DeepSpeed still relies on the older activation checkpointing mechanism (see function ```_checkpointed_forward``` in ```Megatron-DeepSpeed/megatron/model/transformer.py```) since we didn't have time to integrate with the new version yet. Contribution is very welcomed.
+* (Aug 2023 update) With the contribution from 3P users (https://github.com/microsoft/Megatron-DeepSpeed/pull/225), now it's also possible to use Megatron-LM's newer activation checkpointing mechanism. We DeepSpeed team compared the [older mechanism](ds_pretrain_gpt_1.3B.sh) and [newer mechanism](ds_pretrain_gpt_1.3B_megatron_checkpointing.sh), and found that the convergence (in terms of training loss) is the same, and the performance (in terms of TFLOPs) is also quite similar. However, this is just one comparison so users may still want to test both options for their training.
