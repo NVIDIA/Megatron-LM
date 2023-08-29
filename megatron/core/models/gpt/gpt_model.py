@@ -13,7 +13,8 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint, \
+    make_sharded_tensor_for_checkpoint
 
 
 class GPTModel(MegatronModule):
@@ -265,6 +266,13 @@ class GPTModel(MegatronModule):
         decoder_prefix = f'{prefix}decoder.'
         decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
         sharded_state_dict.update(decoder_sharded_state_dict)
+
+        if self.rotary_pos_emb is not None:
+            # TODO: is this really needed? If so, move to RotaryEmbedding.sharded_state_dict
+            sharded_state_dict[f'{prefix}rotary_pos_emb.inv_freq'] = make_sharded_tensor_for_checkpoint(
+                self.rotary_pos_emb.inv_freq, f'{prefix}rotary_pos_emb.inv_freq',
+                replica_id=torch.distributed.get_rank()  # all ranks have the same data
+            )
 
         if self.post_process:
             output_layer_prefix = f'{prefix}output_layer.'
