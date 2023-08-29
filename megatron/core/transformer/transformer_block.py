@@ -266,11 +266,16 @@ class TransformerBlock(MegatronModule):
             sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
 
         if self.post_process and self.post_layer_norm:
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.weight']
-            layer_name = f'{prefix}final_layernorm.weight'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.bias']
-            layer_name = f'{prefix}final_layernorm.bias'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+            state_dict = self.state_dict(keep_vars=True)
+
+            if 'final_layernorm.weight' in state_dict.keys():
+                tensor = state_dict['final_layernorm.weight']
+                layer_name = f'{prefix}final_layernorm.weight'
+                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+
+            if 'final_layernorm.bias' in state_dict.keys():
+                tensor = state_dict['final_layernorm.bias']
+                layer_name = f'{prefix}final_layernorm.bias'
+                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
 
         return sharded_state_dict
