@@ -1,4 +1,13 @@
 #!/bin/bash
+###############################################################################
+###############################################################################
+###############################################################################
+## WARNING: This script is only for evaluating Megatron-LM's activation
+## checkpointing. We do not recommend using it for actual training because
+## you are not able to use any DeepSpeed technologies.
+###############################################################################
+###############################################################################
+###############################################################################
 dir=`pwd`
 ###############################################################################
 ### Main configs
@@ -136,11 +145,11 @@ mp_size=2
 ## Pipeline parallelism. To disable PP, set pp_size to 1 and no_pp to true.
 ## Note that currently both curriculum learning and random-LTD are NOT
 ## compatible with pipeline parallelism.
-pp_size=2
-no_pp="false"
+pp_size=1
+no_pp="true"
 
 ## ZeRO-based data parallelism, stage=0 will disable ZeRO
-zero_stage=1
+zero_stage=0
 
 ## Total number of GPUs. ds_ssh is from DeepSpeed library.
 num_gpus=$(($(ds_ssh nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)-2))
@@ -300,9 +309,6 @@ sed "s/GBSIZE/${global_batch_size}/" ${template_json} \
       > ${config_json}
 
 deepspeed_options=" \
-    --deepspeed \
-    --deepspeed_config ${config_json} \
-    --zero-stage ${zero_stage} \
     --pipeline-model-parallel-size ${pp_size}"
 
 if [[ "${no_pp}" = "true" ]]; then
