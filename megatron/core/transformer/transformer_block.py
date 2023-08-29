@@ -268,11 +268,11 @@ class TransformerBlock(MegatronModule):
         if self.post_process and self.post_layer_norm:
             state_dict = self.state_dict(keep_vars=True)
 
-            if 'final_layernorm.weight' in state_dict.keys():
-                tensor = state_dict['final_layernorm.weight']
-                layer_name = f'{prefix}final_layernorm.weight'
-                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+            tensor = state_dict['final_layernorm.weight']
+            layer_name = f'{prefix}final_layernorm.weight'
+            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
 
+            # RMSNorm doesn't have bias.
             if 'final_layernorm.bias' in state_dict.keys():
                 tensor = state_dict['final_layernorm.bias']
                 layer_name = f'{prefix}final_layernorm.bias'
