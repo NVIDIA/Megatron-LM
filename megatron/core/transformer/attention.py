@@ -18,6 +18,7 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+from .utils import make_sharded_tensors_for_checkpoint
 
 
 class Attention(MegatronModule, ABC):
@@ -298,6 +299,22 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        if sharded_key_prefix is None:
+            sharded_key_prefix = prefix
+
+        tensor_parallel_layers_axis_map = {
+            'linear_qkv.weight': 0,
+            'linear_qkv.bias': 0,
+            'linear_proj.weight': 1,
+        }
+
+        state_dict = self.state_dict(prefix='')
+
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_key_prefix,
+                                                                 tensor_parallel_layers_axis_map, sharded_offsets)
+        return sharded_state_dict
 
 
 class CrossAttention(Attention):

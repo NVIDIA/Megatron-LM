@@ -11,6 +11,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 class MLP(MegatronModule):
@@ -85,3 +86,20 @@ class MLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
         return output, output_bias
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=(), replica_id=None):
+        if sharded_key_prefix is None:
+            sharded_key_prefix = prefix
+
+        tensor_parallel_layers_axis_map = {
+            'linear_fc1.weight': 0,
+            'linear_fc1.bias': 0,
+            'linear_fc2.weight': 1,
+        }
+
+        state_dict = self.state_dict(prefix='')
+
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_key_prefix,
+                                                                 tensor_parallel_layers_axis_map, sharded_offsets,
+                                                                 replica_id=replica_id)
+        return sharded_state_dict
