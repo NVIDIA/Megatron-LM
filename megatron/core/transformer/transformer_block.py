@@ -276,6 +276,8 @@ class TransformerBlock(MegatronModule):
             if 'final_layernorm.bias' in state_dict.keys():
                 tensor = state_dict['final_layernorm.bias']
                 layer_name = f'{prefix}final_layernorm.bias'
-                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(
+                    tensor, layer_name
+                )
 
         return sharded_state_dict
