@@ -275,7 +275,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.param_to_grad_buffer = {}
 
         # Group parameters by their gradient type.
-        grad_dtype_to_param = {}
+        grad_dtype_to_params = {}
         grad_dtype_to_numel = {}
         param_to_name = {}
         for name, param in self.module.named_parameters():
@@ -284,9 +284,9 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 param_to_name[param] = name
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
 
-                params = grad_dtype_to_param.get(dtype, [])
+                params = grad_dtype_to_params.get(dtype, [])
                 params.append(param)
-                grad_dtype_to_param[dtype] = params
+                grad_dtype_to_params[dtype] = params
 
                 # Calculate number of elements per dtype.
                 grad_dtype_to_numel[dtype] = grad_dtype_to_numel.get(dtype, 0) + param.data.nelement()
@@ -297,7 +297,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # whether overlap_grad_reduce is True or not.
         data_parallel_size = torch.distributed.get_world_size(
             group=data_parallel_group)
-        for dtype, params in grad_dtype_to_param.items():
+        for dtype, params in grad_dtype_to_params.items():
             params.reverse()
 
             # Pad so size is divisible by the data parallel size.
@@ -307,16 +307,22 @@ class DistributedDataParallel(DistributedDataParallelBase):
             self.grad_buffers[dtype] = GradBuffer(
                 numel, numel_padded, dtype, params, data_parallel_group,
                 bucket_size, param_to_name, overlap_grad_reduce)
-            index = 0
-            for param in params:
+
+            # Iterate through parameters in non-reversed order to maintain exactly same
+            # losses with the old DistributedDataParallel wrapper when using distributed
+            # optimizer.
+            index = grad_dtype_to_numel[dtype]
+            for i in range(len(params)):
+                param = params[len(params)-i-1]
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
                 if dtype not in self.grad_buffer_param_index_map:
                     self.grad_buffer_param_index_map[dtype] = {}
+
+                index -= param.data.nelement()
                 self.grad_buffer_param_index_map[dtype][param] = (
                     index,
                     index + param.data.nelement(),
                 )
-                index += param.data.nelement()
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
