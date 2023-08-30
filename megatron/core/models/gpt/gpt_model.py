@@ -13,8 +13,7 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint, \
-    make_sharded_tensor_for_checkpoint
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 class GPTModel(MegatronModule):
