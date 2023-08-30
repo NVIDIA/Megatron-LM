@@ -707,6 +707,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
+    # TODO: Remove this once we move LocalDDP to Core.
+    if len(model) == 1 and isinstance(model[0], LocalDDP):
+        config.no_sync_func = model[0].no_sync
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')

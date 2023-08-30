@@ -12,7 +12,6 @@ from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
-from megatron.model.distributed import DistributedDataParallel as localDDP
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -316,7 +315,7 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
 
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and isinstance(model, (torchDDP, localDDP)):
+    if no_sync_func is None and isinstance(model, torchDDP):
         no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
