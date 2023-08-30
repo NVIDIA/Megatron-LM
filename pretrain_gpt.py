@@ -2,6 +2,7 @@
 
 """Pretrain GPT"""
 
+import os
 import torch
 from functools import partial
 from megatron import get_args
@@ -19,6 +20,7 @@ from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
+    args = get_args()
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
@@ -29,6 +31,23 @@ def model_provider(pre_process=True, post_process=True):
         pre_process=pre_process,
         post_process=post_process
     )
+
+    # Validate successful load of model checkpoint
+    # or model initialization by checking all model
+    # params for infs and nans
+    if args.validate_model_load:
+        for name, param in model.named_parameters():
+            if torch.isinf(param).any():
+                raise ValueError(
+                    f'error: inf in {name} on device {torch.cuda.current_device()} '
+                    f'on host {os.uname()[1]}'
+                )
+            if torch.isnan(param).any():
+                raise ValueError(
+                    f'error: nan in {name} on device {torch.cuda.current_device()} '
+                    f'on host {os.uname()[1]}'
+                )
+
     return model
 
 
@@ -67,6 +86,13 @@ def loss_func(loss_mask, output_tensor):
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+
+    # Check individual rank losses are not nan prior to DP allreduce
+    global_rank = torch.distributed.get_rank()
+    assert not loss.isnan(), (
+        f'Rank {global_rank}: found NaN in local forward loss calculation. '
+        f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+    )
 
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])

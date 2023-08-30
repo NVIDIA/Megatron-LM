@@ -2,6 +2,8 @@
 
 """Gradient clipping."""
 
+import os
+
 import torch
 from torch import inf
 
@@ -87,6 +89,15 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
             for grad in grads_for_norm:
                 grad_norm = torch.norm(grad, norm_type)
                 total_norm += grad_norm ** norm_type
+
+        # Check individual rank grad norms are not nan
+        # prior to model-parllel allreduce
+        global_rank = torch.distributed.get_rank()
+        assert not total_norm.isnan(), (
+            f'Rank {global_rank}: found NaN in local grad norm in '
+            f'backwards pass. Device: {torch.cuda.current_device()}, '
+            f'node: {os.uname()[1]}'
+        )
 
         # Sum across all model-parallel GPUs.
         torch.distributed.all_reduce(total_norm,

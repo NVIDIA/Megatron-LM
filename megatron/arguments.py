@@ -178,7 +178,7 @@ def validate_args(args, defaults={}):
     # Overlapping grad reduce only supported without pipeline parallelism right now.
     if args.overlap_grad_reduce:
         assert args.pipeline_model_parallel_size == 1
-    
+
     # If we use the distributed optimizer, we need to use local DDP.
     if args.use_distributed_optimizer:
         assert args.DDP_impl == 'local'
@@ -949,6 +949,9 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
+    group.add_argument('--validate-model-load', action='store_true',
+                       help='After loading checkpoint, checks all model '
+                       'params for nans and infs')
 
     return parser
 
