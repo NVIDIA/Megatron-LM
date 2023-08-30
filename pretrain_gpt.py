@@ -32,22 +32,6 @@ def model_provider(pre_process=True, post_process=True):
         post_process=post_process
     )
 
-    # Validate successful load of model checkpoint
-    # or model initialization by checking all model
-    # params for infs and nans
-    if args.validate_model_load:
-        for name, param in model.named_parameters():
-            if torch.isinf(param).any():
-                raise ValueError(
-                    f'error: inf in {name} on device {torch.cuda.current_device()} '
-                    f'on host {os.uname()[1]}'
-                )
-            if torch.isnan(param).any():
-                raise ValueError(
-                    f'error: nan in {name} on device {torch.cuda.current_device()} '
-                    f'on host {os.uname()[1]}'
-                )
-
     return model
 
 
