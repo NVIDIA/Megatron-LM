@@ -87,7 +87,7 @@ class MLP(MegatronModule):
         output, output_bias = self.linear_fc2(intermediate_parallel)
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=(), replica_id=None):
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
         if sharded_key_prefix is None:
             sharded_key_prefix = prefix
 
@@ -100,6 +100,5 @@ class MLP(MegatronModule):
         state_dict = self.state_dict(prefix='')
 
         sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_key_prefix,
-                                                                 tensor_parallel_layers_axis_map, sharded_offsets,
-                                                                 replica_id=replica_id)
+                                                                 tensor_parallel_layers_axis_map, sharded_offsets)
         return sharded_state_dict
