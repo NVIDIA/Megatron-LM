@@ -310,7 +310,7 @@ class SelfAttention(Attention):
             'linear_proj.weight': 1,
         }
 
-        state_dict = self.state_dict(prefix='')
+        state_dict = self.state_dict(prefix='', keep_vars=True)
 
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             state_dict, prefix, sharded_key_prefix, tensor_parallel_layers_axis_map, sharded_offsets
