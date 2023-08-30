@@ -173,8 +173,12 @@ class TransformerLayer(MegatronModule):
         num_layers = self.config.num_layers
 
         global_layer_offset = self.layer_number - 1  # self.layer_number starts at 1
-        state_dict_prefix = f'{prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
-        sharded_pp_offset = [(0, global_layer_offset, num_layers)]  # PP sharding offset for ShardedTensors
+        state_dict_prefix = (
+            f'{prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock
+        )
+        sharded_pp_offset = [
+            (0, global_layer_offset, num_layers)
+        ]  # PP sharding offset for ShardedTensors
 
         attn_state_dict = self.self_attention.sharded_state_dict(
             prefix=f'{state_dict_prefix}self_attention.',

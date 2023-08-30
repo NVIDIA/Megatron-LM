@@ -178,7 +178,9 @@ def scaled_init_method_normal(sigma, num_layers):
     return init_
 
 
-def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs):
+def make_tp_sharded_tensor_for_checkpoint(
+    tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
+):
     """ Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
@@ -213,7 +215,11 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     prepend_axis_num = len(prepend_offsets)
 
     if replica_id is None:
-        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), parallel_state.get_data_parallel_rank())
+        replica_id = (
+            0,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_data_parallel_rank(),
+        )
 
     return ShardedTensor.from_rank_offsets(
         key,

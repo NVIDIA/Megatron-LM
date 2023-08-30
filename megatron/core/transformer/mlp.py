@@ -99,6 +99,7 @@ class MLP(MegatronModule):
 
         state_dict = self.state_dict(prefix='')
 
-        sharded_state_dict = make_sharded_tensors_for_checkpoint(state_dict, prefix, sharded_key_prefix,
-                                                                 tensor_parallel_layers_axis_map, sharded_offsets)
+        sharded_state_dict = make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, tensor_parallel_layers_axis_map, sharded_offsets
+        )
         return sharded_state_dict

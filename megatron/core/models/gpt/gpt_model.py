@@ -275,7 +275,11 @@ class GPTModel(MegatronModule):
                     # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
                     tensor = self.shared_embedding_or_output_weight()
                     first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    last_stage_word_emb_replica_id = (1, 0, parallel_state.get_data_parallel_rank())  # "1" indicates a copy of first stage embedding
+                    last_stage_word_emb_replica_id = (
+                        1,  # copy of first stage embedding
+                        0,
+                        parallel_state.get_data_parallel_rank(),
+                    )
 
                     sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
                         tensor=tensor,
