@@ -708,7 +708,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
     # TODO: Remove this once we move LocalDDP to Core.
-    if len(model) == 1 and isinstance(model[0], LocalDDP):
+    if len(model) == 1 and isinstance(model[0], LocalDDP) and \
+        args.pipeline_model_parallel_size == 1:
         config.no_sync_func = model[0].no_sync
 
     timers('interval-time', log_level=0).start(barrier=True)

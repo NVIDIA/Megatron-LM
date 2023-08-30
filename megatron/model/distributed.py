@@ -93,7 +93,9 @@ class Bucket:
         if not self.overlap_grad_reduce:
             self.all_reduce()
             return
-        assert self.allreduce_handle is not None, 'allreduce is not issued for this bucket'
+        assert self.allreduce_handle is not None, \
+            (f'allreduce is not issued for this bucket, '
+             f'{len(self.params_with_grad)}/{len(self.params)} grads available')
         self.allreduce_handle.wait()
         self.allreduce_handle = None
     
