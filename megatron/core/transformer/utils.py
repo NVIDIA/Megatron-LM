@@ -56,11 +56,7 @@ def make_sharded_tensors_for_checkpoint(state_dict, state_dict_prefix, sharded_k
             assert len(sharded_offsets) == 1, 'TODO'
             _, pp_offset, pp_num_layers = sharded_offsets[0]
             if replica_id is None:
-                replica_id = (
-                        parallel_state.get_data_parallel_rank()
-                        * parallel_state.get_data_parallel_world_size()
-                        + parallel_state.get_tensor_model_parallel_rank()
-                )
+                replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), parallel_state.get_data_parallel_rank())
 
             sharded_state_dict[layer_key] = ShardedObject(
                 sharded_key, tensor,

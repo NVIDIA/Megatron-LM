@@ -186,6 +186,9 @@ def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, replica_id=Non
 
     prepend_axis_num = len(prepend_offsets)
 
+    if replica_id is None:
+        replica_id = (0, 0, parallel_state.get_data_parallel_rank())
+
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -195,7 +198,7 @@ def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, replica_id=Non
             parallel_state.get_tensor_model_parallel_rank(),
             parallel_state.get_tensor_model_parallel_world_size(),
         ),
-        replica_id=parallel_state.get_data_parallel_rank() if replica_id is None else replica_id,
+        replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
@@ -210,7 +213,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     prepend_axis_num = len(prepend_offsets)
 
     if replica_id is None:
-        replica_id = parallel_state.get_data_parallel_rank() * parallel_state.get_data_parallel_world_size() + parallel_state.get_tensor_model_parallel_rank()
+        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), parallel_state.get_data_parallel_rank())
 
     return ShardedTensor.from_rank_offsets(
         key,
