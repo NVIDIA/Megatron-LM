@@ -5,10 +5,7 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -40,7 +37,7 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = TELayerNormColumnParallelLinear(
+        self.linear_fc1 = ColumnParallelLinear(
             self.config.hidden_size,
             ffn_hidden_size,
             config=self.config,
@@ -59,7 +56,7 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = TERowParallelLinear(
+        self.linear_fc2 = RowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
