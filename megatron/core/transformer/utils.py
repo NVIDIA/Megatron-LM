@@ -54,7 +54,7 @@ def make_sharded_tensors_for_checkpoint(
     sharded_key_prefix,
     tensor_parallel_layers_axis_map,
     sharded_offsets,
-    extra_state_suffix='._extra_state',
+    extra_state_suffix='_extra_state',
 ):
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
@@ -95,7 +95,7 @@ def make_sharded_tensors_for_checkpoint(
 
         if layer_name.endswith(extra_state_suffix):
             # Get replica_id from the base tensor. Extra state adds the TP replication
-            base_layer_name = f'{layer_key[:-len(extra_state_suffix)]}.weight'
+            base_layer_name = f'{layer_key[:-len(extra_state_suffix)]}weight'
             base_sharded_tensor = sharded_state_dict[base_layer_name]
             assert isinstance(
                 base_sharded_tensor, ShardedTensor
