@@ -212,10 +212,7 @@ class MegatronOptimizer(ABC):
 
             if unwrapped_model.share_embeddings_and_output_weights:
                 weight = unwrapped_model.shared_embedding_or_output_weight()
-                if args.DDP_impl == 'local':
-                    grad = weight.main_grad
-                else:
-                    grad = weight.grad
+                grad = weight.main_grad
                 torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
 
 
@@ -231,8 +228,6 @@ class MegatronOptimizer(ABC):
                 args.pipeline_model_parallel_split_rank is not None:
             unwrapped_model = self.models[0]
             unwrapped_model = unwrap_model(unwrapped_model)
-            assert args.DDP_impl == 'local', \
-                'T5 model is only supported with local DDP mode'
             grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
             torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
 
@@ -255,7 +250,7 @@ class MegatronOptimizer(ABC):
                 unwrapped_model = unwrap_model(model_module)
                 for param in unwrapped_model.parameters():
                     if getattr(param, 'sequence_parallel', False):
-                        grad = param.main_grad if args.DDP_impl == 'local' else param.grad
+                        grad = param.main_grad
                         grads.append(grad.data)
             coalesced = _flatten_dense_tensors(grads)
             torch.distributed.all_reduce(
@@ -267,13 +262,12 @@ class MegatronOptimizer(ABC):
     def reduce_model_grads(self, args, timers):
         """All-reduce all grads, and all-reduce embeddings."""
 
-        # All-reduce if needed.
-        if args.DDP_impl == 'local':
-            timers('grads-all-reduce', log_level=1).start(
-                barrier=args.barrier_with_L1_time)
-            for model in self.models:
-                model.allreduce_gradients()
-            timers('grads-all-reduce').stop()
+        # All-reduce.
+        timers('grads-all-reduce', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        for model in self.models:
+            model.allreduce_gradients()
+        timers('grads-all-reduce').stop()
 
         # All-reduce layer-norm grads (for sequence parallelism).
         timers('layernorm-grads-all-reduce', log_level=1).start(

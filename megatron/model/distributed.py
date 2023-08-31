@@ -254,7 +254,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         module: input model.
         data_parallel_group: data-parallel group.
         accumulate_allreduce_grads_in_fp32: if true do the gradient accumulation
-            and the gradient all-reduce all in in float32.
+            and the gradient all-reduce in float32.
         overlap_grad_reduce: if true, overlap all-reduce with computation by
             breaking up grads into buckets. If false, single synchronous all-reduce
             is used instead.

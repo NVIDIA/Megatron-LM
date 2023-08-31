@@ -5,7 +5,6 @@
 import sys
 
 import torch
-from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
@@ -21,7 +20,7 @@ from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 
 
-ALL_MODULE_WRAPPER_CLASSNAMES = (torchDDP, LocalDDP, Float16Module)
+ALL_MODULE_WRAPPER_CLASSNAMES = (LocalDDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):

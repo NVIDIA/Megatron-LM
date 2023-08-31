@@ -9,7 +9,6 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -297,27 +296,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(model_module, args) for model_module in model]
 
     if wrap_with_ddp:
-        if args.DDP_impl == 'torch':
-            i = torch.cuda.current_device()
-            model = [torchDDP(model_module, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
-                     for model_module in model]
+        model = [LocalDDP(model_module,
+                          mpu.get_data_parallel_group(),
+                          args.accumulate_allreduce_grads_in_fp32,
+                          args.overlap_grad_reduce)
+                 for model_module in model]
 
-        elif args.DDP_impl == 'local':
-            model = [LocalDDP(model_module,
-                              mpu.get_data_parallel_group(),
-                              args.accumulate_allreduce_grads_in_fp32,
-                              args.overlap_grad_reduce)
-                     for model_module in model]
-
-            # Broadcast params from data parallel src rank to other data parallel ranks.
-            if args.data_parallel_random_init:
-                for model_module in model:
-                    model_module.broadcast_params()
-
-        else:
-            raise NotImplementedError('Unknown DDP implementation specified: '
-                                      '{}. Exiting.'.format(args.DDP_impl))
+        # Broadcast params from data parallel src rank to other data parallel ranks.
+        if args.data_parallel_random_init:
+            for model_module in model:
+                model_module.broadcast_params()
 
     return model
 
@@ -396,11 +384,7 @@ def setup_model_and_optimizer(model_provider_func,
     else:
         args.iteration = 0
 
-    # We only support local DDP with multiple micro-batches.
-    if len(model) > 1 or mpu.get_pipeline_model_parallel_world_size() > 1:
-        assert args.DDP_impl == 'local'
-
-    # get model without FP16 and/or TorchDDP wrappers
+    # get model without FP16 and/or DDP wrappers
     if args.iteration == 0 and len(unwrapped_model) == 1 \
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert'):
         print_rank_0("Initializing ICT from pretrained BERT model")
@@ -419,9 +403,8 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local':
-        for partition in model:
-            partition.zero_grad_buffer()
+    for partition in model:
+        partition.zero_grad_buffer()
     optimizer.zero_grad()
 
     # Forward pass.

@@ -87,9 +87,7 @@ def get_megatron_optimizer(model,
             args.optimizer))
 
     # Determine whether the params have main-grad field.
-    params_have_main_grad = False
-    if args.DDP_impl == 'local':
-        params_have_main_grad = True
+    params_have_main_grad = True
 
     # Mixed precision optimizer.
     # - Note: both the Float16Optimizer and the DistributedOptimizer inherit

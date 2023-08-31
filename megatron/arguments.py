@@ -171,17 +171,9 @@ def validate_args(args, defaults={}):
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # If we do accumulation and all-reduces in fp32, we need to have local DDP.
-    if args.accumulate_allreduce_grads_in_fp32:
-        assert args.DDP_impl == 'local'
-
     # Overlapping grad reduce only supported without pipeline parallelism right now.
     if args.overlap_grad_reduce:
         assert args.pipeline_model_parallel_size == 1
-
-    # If we use the distributed optimizer, we need to use local DDP.
-    if args.use_distributed_optimizer:
-        assert args.DDP_impl == 'local'
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -1015,10 +1007,6 @@ def _add_distributed_args(parser):
                        help='Which backend to use for distributed training.')
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
                        help='Timeout minutes for torch.distributed.')
-    group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
-                       help='which DistributedDataParallel implementation '
-                       'to use.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
