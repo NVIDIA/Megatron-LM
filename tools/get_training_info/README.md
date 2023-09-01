@@ -1,7 +1,7 @@
 <!-- MegatronLM GPTModel Training Analysis Tool -->
 
 # Introduction
-Offline analysis of memory requirements, communication, and computation information of MegatronLM under hybrid parallel strategies on multiple nodes.
+Offline analysis of memory requirements and communication information of MegatronLM GPTMode training under hybrid parallel strategies.
 # Features
 Given the GPT model configuration and parallel training configuration, this tool will output the following:
 
@@ -12,6 +12,7 @@ Given the GPT model configuration and parallel training configuration, this tool
 
 We randomly selected some parallel configurations and used the "Memory Requirement" output in this tool as the predicted value, and the output of "torch.cuda.max_memory_allocated()" in Megatron's [report_memory](../../megatron/utils.py#L81) after training several iterations as the actual value. The parallel configurations in the x-axis of the following figure correspond to the four model parallel configurations in the table below in order.
 
+This can give users insight into whether their planned parallel configuration is trainable, and if it potentially could trigger OOM errors.
 
 <div align="center">
 <img src="Mem_Est_vs_Actual.png" alt="图片描述" style="width: 250px; object-fit: cover;">
@@ -23,17 +24,18 @@ margin: auto;
 }
 </style>
 
-<!-- |micro_batch_size | global_batch_size| |  data_parallel_size  | pipeline_parallel_size | tensor_parallel_size|  
-| 2  | 2048 | 2  | 8 | 1  | -->
 <div  style="zoom:70%" >
 
-Model |precision | mbs   | gbs       | dp   | pp  | tp  | Peak_Memory_Actual |  Peak_Memory_Estimated | Error (%) 
+Model |Precision | MBS   | GBS       | DP   | PP  | TP  | Peak_Memory_Actual |  Peak_Memory_Estimated | Error (%) 
 :-: |:-: |:-: | :-: | :-:|:-: | :-: | :-: | :-: | :-:
 Llama2 7B | bf16 | 2     |   2048    | 8    | 1   | 1   |  69.1|  68.8 |0.4 
 Llama2 7B | bf16 | 4     |   512     | 4    | 1   | 2   | 55.7 |  55.5 |0.4
 Llama2 7B | bf16 | 2     |   2048    | 4    | 2   | 1   | 49.8|  49.5|0.6
 Llama2 7B | bf16 | 4     |   128     | 1    | 1   | 8   | 28.8 |  28.6 |0.7
+In this table, MBS refers to micro batch size, GBS refers to global batch size, DP denotes data parallelism size, PP denotes pipeline parallelism size, and TP denotes tensor parallelism size.
+
 </div>
+
 
 
 # Calculation Method Explanation
