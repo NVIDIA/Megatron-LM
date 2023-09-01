@@ -584,10 +584,6 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     output = get_datasets_weights_and_num_samples(data_prefix,
                                                   train_valid_test_num_samples)
     prefixes, weights, datasets_train_valid_test_num_samples = output
-    train_num_samples, valid_num_samples, test_num_samples = map(
-        sum,
-        zip(*datasets_train_valid_test_num_samples)
-    )
 
     # Build individual datasets.
     train_datasets = []
@@ -605,6 +601,10 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             valid_datasets.append(valid_ds)
         if test_ds:
             test_datasets.append(test_ds)
+
+    train_num_samples = sum(map(len, train_datasets))
+    valid_num_samples = sum(map(len, valid_datasets))
+    test_num_samples = sum(map(len, test_datasets))
 
     # Blend.
     blending_train_dataset = None
