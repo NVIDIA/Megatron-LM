@@ -70,34 +70,38 @@ class Bucket:
     def reset(self):
         self.params_with_grad = set()
         self.allreduce_handle = None
+        self.allreduce_issued = False
 
 
     def all_reduce(self):
-        assert self.allreduce_handle is None, \
+        assert self.allreduce_handle is None and not self.allreduce_issued, \
             'Should not have multiple all-reduces in flight at once'
         self.data /= self.data_parallel_size
         self.allreduce_handle = torch.distributed.all_reduce(
             self.data, group=self.data_parallel_group,
             async_op=self.overlap_grad_reduce)  # Use async_op only when overlap_grad_reduce is True.
+        self.allreduce_issued = True
 
 
     def set(self, param: torch.nn.Parameter):
-        assert param in self.params, 'param is not in the bucket'
-        assert param not in self.params_with_grad, 'cannot set grad twice'
+        assert param in self.params, 'Param is not in the bucket'
+        assert param not in self.params_with_grad, 'Cannot set grad twice'
+        assert self.overlap_grad_reduce, 'set() should be called only when overlapping grad reduce'
         self.params_with_grad.add(param)
-        if self.overlap_grad_reduce and len(self.params_with_grad) == len(self.params):
+        # If all params in bucket have grads available, issue all-reduce.
+        if len(self.params_with_grad) == len(self.params):
             self.all_reduce()
 
 
     def done(self):
+        # If not overlapping grad reduce, issue synchronous all-reduce here.
         if not self.overlap_grad_reduce:
             self.all_reduce()
             return
-        assert self.allreduce_handle is not None, \
-            (f'allreduce is not issued for this bucket, '
-             f'{len(self.params_with_grad)}/{len(self.params)} grads available')
+        assert self.allreduce_handle is not None and self.allreduce_issued, \
+            (f'All-reduce is not issued for this bucket, '
+             f'only {len(self.params_with_grad)}/{len(self.params)} params with grad')
         self.allreduce_handle.wait()
-        self.allreduce_handle = None
     
     
 
