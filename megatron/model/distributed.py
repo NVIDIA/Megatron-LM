@@ -151,7 +151,9 @@ class GradBuffer(MemoryBuffer):
         data_start_index = 0
         bucket_data_start_index = data_start_index
         bucket_params = set()
-        for param in params:
+
+        # Iterate through parameters in reverse order to roughly follow backprop order.
+        for param in params[::-1]:
             # Skip parameters that don't require gradients.
             if not param.requires_grad:
                 continue
@@ -172,6 +174,10 @@ class GradBuffer(MemoryBuffer):
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             set_bucket_(bucket_params, bucket_data_start_index, data_end_index)
+
+        if not overlap_grad_reduce:
+            assert len(bucket_params) == len(params), \
+                "All params should be in one bucket when overlap_grad_reduce is False"
 
         # Print buckets.
         if torch.distributed.get_rank() == 0:
@@ -297,15 +303,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 # Calculate number of elements per dtype.
                 grad_dtype_to_numel[dtype] = grad_dtype_to_numel.get(dtype, 0) + param.data.nelement()
 
-        # Allocate the grad buffers and map the grads. Make sure parameters are reversed
-        # so they are in approximately in the order of backprop.
+        # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate, depending on
         # whether overlap_grad_reduce is True or not.
         data_parallel_size = torch.distributed.get_world_size(
             group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
-            params.reverse()
-
             # Pad so size is divisible by the data parallel size.
             numel = grad_dtype_to_numel[dtype]
             numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
@@ -314,12 +317,10 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 numel, numel_padded, dtype, params, data_parallel_group,
                 bucket_size, param_to_name, overlap_grad_reduce)
 
-            # Iterate through parameters in non-reversed order to maintain exactly same
-            # losses with the old DistributedDataParallel wrapper when using distributed
-            # optimizer.
+            # Parameters are laid out in the corresponding grad_buffer in reverse
+            # order, so count indices from the back.
             index = grad_dtype_to_numel[dtype]
-            for i in range(len(params)):
-                param = params[len(params)-i-1]
+            for param in params:
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
                 if dtype not in self.grad_buffer_param_index_map:
                     self.grad_buffer_param_index_map[dtype] = {}
