@@ -81,7 +81,8 @@ class TransformerConfig(ModelParallelConfig):
                                      are also less compute intensive which makes activation checkpointing more efficient
                                      for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer
                                      Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint
-                                     the entire transformer layer.  Must be 'selective' or 'full'. Defaults to None.
+                                     the entire transformer layer.  Must be 'selective' or 'full'. 'selective' always uses all layers.
+                                     Defaults to None.
 
         recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer
                                 block and recompute the input activation of each divided chunk at the specified
@@ -93,7 +94,7 @@ class TransformerConfig(ModelParallelConfig):
         recompute_num_layers (int): When recompute_method is uniform, recompute_num_layers is the number of transformer
                                     layers in each uniformly divided recompute unit.  When recompute_method is block,
                                     recompute_num_layers is the number of transformer layers to recompute within each
-                                    pipeline stage.  Defaults to None.
+                                    pipeline stage.  Must be None for 'selective' activation checkpointing. Defaults to None.
 
         distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
                                              group. Defaults to None.
@@ -228,10 +229,16 @@ class TransformerConfig(ModelParallelConfig):
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_num_layers is None:
+            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} so recompute_num_layers must be between '
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be between '
                     f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
+                )
+            elif (
+                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
+            ):
+                raise ValueError(
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be None.'
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:
