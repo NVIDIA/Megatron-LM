@@ -1,7 +1,7 @@
 <!-- MegatronLM GPTModel Training Analysis Tool -->
 
 # Introduction
-Offline analysis of memory requirements and communication information of MegatronLM GPTMode training under hybrid parallel strategies.
+Offline analysis of memory requirements and communication information of MegatronLM GPTModel training under hybrid parallel strategies.
 # Features
 Given the GPT model configuration and parallel training configuration, this tool will output the following:
 
