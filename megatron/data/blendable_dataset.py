@@ -33,8 +33,8 @@ class BlendableDataset(torch.utils.data.Dataset):
         # Build indicies.
         def _build_indices():
             start_time = time.time()
-            assert num_datasets < 255
-            dataset_index = np.zeros(self.size, dtype=np.uint8)
+            assert num_datasets < 65535
+            dataset_index = np.zeros(self.size, dtype=np.uint16)
             dataset_sample_index = np.zeros(self.size, dtype=np.int64)
 
             from megatron.data import helpers
