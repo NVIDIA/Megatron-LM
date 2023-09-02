@@ -15,7 +15,7 @@ We randomly selected some parallel configurations and used the "Memory Requireme
 This can give users insight into whether their planned parallel configuration is trainable, and if it potentially could trigger OOM errors.
 
 <div align="center">
-<img src="Mem_Est_vs_Actual.png" alt="图片描述" style="width: 250px; object-fit: cover;">
+<img src="https://raw.githubusercontent.com/NVIDIA/Megatron-LM/2ffa75a9bcf6afad563e9be06f6197d8bdb4a814/tools/get_training_info/Mem_Est_vs_Actual.png" alt="图片描述" style="width: 250px; object-fit: cover;">
 </div>
 
 <style>
