@@ -106,9 +106,12 @@ def initialize_model_parallel(
 
         use_sharp (bool, default = False):
             Set the use of SHARP for the collective communications of
-            data-parallel process groups. When `True`, run barrier
-            within each data-parallel process group, which specifies
-            the SHARP application target groups.
+            data-parallel and FP8 AMAX reduction process groups. When
+            `True`, run barrier within each process group, which specifies
+            the SHARP application target groups. SHARP can be selectively
+            applied to data-parallel or FP8 AMAX reduction process group
+            by setting the environment variables of `MEGATRON_CORE_USE_SHARP_DP`
+            and `MEGATRON_CORE_USE_SHARP_AMAX`.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -178,20 +181,48 @@ def initialize_model_parallel(
                 _DATA_PARALLEL_GROUP_GLOO = group_gloo
                 _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
-    # Apply SHARP to DP groups
+    # Build the FP8 groups.
+    global _AMAX_REDUCTION_GROUP
+    assert _AMAX_REDUCTION_GROUP is None, \
+        'FP8 amax reduction group is already initialized'
+    if use_fp8:
+        amax_group_size: int = tensor_model_parallel_size * data_parallel_size
+        num_amax_groups: int = world_size // amax_group_size
+        for i in range(num_amax_groups):
+            start_rank = i * amax_group_size
+            end_rank = (i + 1) * amax_group_size
+            ranks = range(start_rank, end_rank)
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _AMAX_REDUCTION_GROUP = group
+
     if use_sharp:
         if rank == 0:
-            print("The number of process groups to use SHARP with depends on the type "
-                  "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
-                  "process groups and QM2 supports up to 256 process groups. We apply "
-                  "SHARP to the communications of the data-parallel domain. If the "
-                  "number of data-parallel process groups is larger than the max "
-                  "process groups that the network switch supports, the communication "
-                  "will fall back to non-SHARP operators. To enable SHARP, "
-                  "`#SBATCH_NETWORK=sharp` should be set in the sbatch script.")
-        torch.distributed.barrier(
-            group=get_data_parallel_group(), device_ids=[torch.cuda.current_device()]
-        )
+            print(
+                "The number of process groups to use SHARP with depends on the type "
+                "of the network switch. Nvidia QM1 switch supports SAHRP up to 8 "
+                "process groups and QM2 supports up to 256 process groups. We apply "
+                "SHARP to the communications of the data-parallel domain. If the "
+                "number of process groups to apply SHARP is larger than the max "
+                "process groups that the network switch supports, the communication "
+                "will fall back to non-SHARP operators. To enable SHARP, "
+                "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
+            )
+        use_sharp_dp = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_DP", 1)))
+        use_sharp_amax = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_AMAX", 0)))
+        # TODO: Use SHARP at multiple communication jobs.
+        assert not (use_sharp_dp and use_sharp_amax)
+        # Apply SHARP to DP process groups
+        if use_sharp_dp:
+            torch.distributed.barrier(
+                group=get_data_parallel_group(), device_ids=[torch.cuda.current_device()]
+            )
+        # Apply SHARP to AMAX reduction process groups
+        if use_fp8 and use_sharp_amax:
+            torch.distributed.barrier(
+                group=get_amax_reduction_group(), device_ids=[torch.cuda.current_device()]
+            )
+        # Set `NCCL_SHARP_DISABLE=1` to avoid applying SHARP to the rest of process groups
         os.environ["NCCL_SHARP_DISABLE"] = "1"
 
     # Build the model-parallel groups.
@@ -262,21 +293,6 @@ def initialize_model_parallel(
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
-
-    # Build the FP8 groups.
-    global _AMAX_REDUCTION_GROUP
-    assert _AMAX_REDUCTION_GROUP is None, \
-        'FP8 amax reduction group is already initialized'
-    if use_fp8:
-        amax_group_size: int = tensor_model_parallel_size * data_parallel_size
-        num_amax_groups: int = world_size // amax_group_size
-        for i in range(num_amax_groups):
-            start_rank = i * amax_group_size
-            end_rank = (i + 1) * amax_group_size
-            ranks = range(start_rank, end_rank)
-            group = torch.distributed.new_group(ranks)
-            if rank in ranks:
-                _AMAX_REDUCTION_GROUP = group
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
