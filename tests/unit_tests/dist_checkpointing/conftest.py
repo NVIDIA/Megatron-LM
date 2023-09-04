@@ -32,7 +32,7 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
     tmp_dir = tmp_dir.parent.parent / 'tmp_dist_ckpt'
 
     if Utils.rank == 0:
-        with TempNamedDir(tmp_dir):
+        with TempNamedDir(tmp_dir, sync=False):
             yield tmp_dir
 
     else:

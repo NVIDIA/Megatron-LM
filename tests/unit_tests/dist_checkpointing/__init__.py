@@ -21,7 +21,7 @@ def empty_dir(path: Path):
 
 class TempNamedDir(TemporaryDirectory):
     """ TemporaryDirectory with a fully named directory. Empties the dir if not empty. """
-    def __init__(self, name: Union[str, Path]) -> None:
+    def __init__(self, name: Union[str, Path], sync=True) -> None:
         self.name = str(name)
         if Utils.rank == 0:
             os.makedirs(name, exist_ok=True)
@@ -31,7 +31,13 @@ class TempNamedDir(TemporaryDirectory):
             self, self._cleanup, self.name,
             warn_message="Implicitly cleaning up {!r}".format(self))
 
+        self.sync = sync
+
     def cleanup(self) -> None:
+        if self.sync:
+            import torch
+            torch.distributed.barrier()
+
         if Utils.rank == 0:
             super().cleanup()
 
