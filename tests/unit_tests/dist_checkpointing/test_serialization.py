@@ -1,11 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import numpy as np
+import pytest
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
-
+from megatron.core.dist_checkpointing.core import CheckpointingException
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -142,6 +143,4 @@ class TestSerialization:
 
             assert isinstance(ten_b, torch.Tensor)
             assert ten_b.shape == (5, 10 * 8)
-            match = torch.all(ten_b == torch.arange(80).unsqueeze(0).expand(5, 80) + Utils.rank // 2 * 100)
-            print(match, 'rank', Utils.rank)
-            assert match
+            assert torch.all(ten_b == torch.arange(80).unsqueeze(0).expand(5, 80) + Utils.rank // 2 * 100)
