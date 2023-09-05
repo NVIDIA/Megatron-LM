@@ -23,4 +23,12 @@ def get_gpt_decoder_spec() -> TransformerLayerSpec:
         ln_mlp=TELayerNormMLP,
         mlp_bda=get_bias_dropout_add,
     )
+    # >>>
+    # from lutil import pax
+    # pax("layer_spec", {
+    #     # "layer_spec / self_attn_bda" : self_attn_bda,
+    #     # "get_bias_dropout_add" : get_bias_dropout_add,
+    #     # "tls" : TransformerLayerSpec(),
+    # })
+    # <<<
     return layer_spec

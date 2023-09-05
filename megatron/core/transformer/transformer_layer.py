@@ -32,6 +32,9 @@ class TransformerLayerSpec:
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 
+    # >>>
+    # add_retriever: bool = False
+    # <<<
 
 class TransformerLayer(MegatronModule):
     """A single transformer layer.
