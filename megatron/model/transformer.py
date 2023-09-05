@@ -12,7 +12,7 @@ from megatron import get_timers, get_args, get_retro_args, core, get_num_microba
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.model import LayerNorm
+from megatron.model import MixedFusedNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -774,7 +774,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.fp32_residual_connection = config.fp32_residual_connection
 
         # Layernorm on the input data.
-        self.input_layernorm = LayerNorm(
+        self.input_layernorm = MixedFusedNorm(
+            args.normalization,
             config.hidden_size,
             eps=config.layernorm_epsilon,
             no_persist_layer_norm=args.no_persist_layer_norm,
@@ -792,7 +793,8 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
+        self.post_attention_layernorm = MixedFusedNorm(
+            args.normalization,
             config.hidden_size,
             eps=config.layernorm_epsilon,
             no_persist_layer_norm=not config.persist_layer_norm,
@@ -809,7 +811,8 @@ class ParallelTransformerLayer(MegatronModule):
                 layer_number,
                 attention_type=AttnType.cross_attn)
             # Layernorm on the attention output.
-            self.post_inter_attention_layernorm = LayerNorm(
+            self.post_inter_attention_layernorm = MixedFusedNorm(
+                args.normalization,
                 config.hidden_size,
                 eps=config.layernorm_epsilon,
                 no_persist_layer_norm=not config.persist_layer_norm,
@@ -1498,7 +1501,8 @@ class ParallelTransformer(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_layernorm = LayerNorm(
+            self.final_layernorm = MixedFusedNorm(
+                args.normalization,
                 config.hidden_size,
                 eps=config.layernorm_epsilon,
                 no_persist_layer_norm=args.no_persist_layer_norm,

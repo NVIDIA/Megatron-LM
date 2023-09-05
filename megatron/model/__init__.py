@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from .fused_layer_norm import MixedFusedNorm
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
 
 from .distributed import DistributedDataParallel
