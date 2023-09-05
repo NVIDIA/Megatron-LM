@@ -183,12 +183,12 @@ class GradBuffer(MemoryBuffer):
         if torch.distributed.get_rank() == 0:
             print('> buckets for gradient all-reduce:')
             for index, bucket in enumerate(self.buckets):
-                print('    params for bucket {}'.format(index + 1))
+                print(f'    params for bucket {index+1}')
                 numel = 0
                 for param in bucket.params:
                     numel += param.data.nelement()
-                    print('      {}'.format(param_to_name[param]))
-                print('     total number of elements: {}'.format(numel))
+                    print(f'      {param_to_name[param]}')
+                print(f'     total number of elements: {numel}')
 
 
     def reset(self):
