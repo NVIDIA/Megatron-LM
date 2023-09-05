@@ -765,7 +765,7 @@ def _add_training_args(parser):
                        'individual Transformer layers per pipeline stage and do the '
                        'rest without any recomputing at specified granularity'
                        'default) do not apply activations recompute to any layers')
-    group.add_argument('--recompute-num-layers', type=int, default=1,
+    group.add_argument('--recompute-num-layers', type=int, default=None,
                        help='1) uniform: the number of Transformer layers in each '
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
