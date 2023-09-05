@@ -121,7 +121,7 @@ class T5Model(MegatronModule):
                                         decoder_input_ids,
                                         decoder_position_ids,
                                         decoder_attn_mask,
-                                        encoder_decoder_attn_mask,
+                                        enc_dec_attn_mask=encoder_decoder_attn_mask,
                                         tokentype_ids=tokentype_ids,
                                         enc_hidden_states=enc_hidden_states)
 
