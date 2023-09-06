@@ -29,23 +29,9 @@ def model_provider(pre_process=True, post_process=True):
 
     return model
 
-def add_text_generate_args(parser):
-    group = parser.add_argument_group(title='text generation')
-
-    group.add_argument("--temperature", type=float, default=1.0,
-                       help='Sampling temperature.')
-    group.add_argument("--top_p", type=float, default=0.0,
-                       help='Top p sampling.')
-    group.add_argument("--top_k", type=int, default=0,
-                       help='Top k sampling.')
-    group.add_argument("--out-seq-length", type=int, default=1024,
-                       help='Size of the output generated text.')
-    return parser
-
 
 if __name__ == "__main__":
-    initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+    initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                                        'no_load_rng': True,
                                        'no_load_optim': True})
 
