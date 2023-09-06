@@ -1,24 +1,32 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import abc
 # import logging
-# from typing import Literal, Optional
+from typing import Literal, Optional
 
 # import torch
-# from torch import Tensor
+from torch import Tensor
 
-# from megatron.core import parallel_state, tensor_parallel
-# from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
+from megatron.core import parallel_state # , tensor_parallel
+from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 # from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec
-# from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
-# from megatron.core.transformer.enums import AttnMaskType, ModelType
-# from megatron.core.transformer.module import MegatronModule
+from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
+from megatron.core.transformer.enums import AttnMaskType # , ModelType
+from megatron.core.transformer.module import MegatronModule
 # from megatron.core.transformer.transformer_block import TransformerBlock
-# from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 # from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 # from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
+from .block import NewTransformerBlock
+from .spec import RetroModelSpec
 
-class RetroModel(MegatronModule):
+# >>>
+from lutil import pax
+# <<<
+
+
+class RetroModel(MegatronModule, abc.ABC):
     """Transformer language model.
 
     Arguments:
@@ -53,6 +61,7 @@ class RetroModel(MegatronModule):
         # spec: TransformerLayerSpec,
         # spec: TransformerSpec,
         spec: RetroModelSpec,
+        # block_spec: NewTransformerBlockSpec,
         # <<<
         vocab_size: int,
         max_sequence_length: int,
@@ -65,9 +74,15 @@ class RetroModel(MegatronModule):
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
     ):
-        super(GPTModel, self).__init__(config=config)
+        super().__init__(config=config)
+        # super().__init__(config=config, spec=spec)
 
-        self.config: TransformerConfig = config
+        # pax("config", "spec")
+
+        # >>>
+        # self.config: TransformerConfig = config
+        # <<<
+        self.spec = spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -79,7 +94,9 @@ class RetroModel(MegatronModule):
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
-        self.model_type = ModelType.encoder_or_decoder
+        # >>>
+        # self.model_type = ModelType.encoder_or_decoder
+        # <<<
 
         # Embeddings.
         if self.pre_process:
@@ -102,13 +119,20 @@ class RetroModel(MegatronModule):
 
         # Transformer.
         # self.decoder = TransformerBlock(
-        self.decoder = RetroTransformerBlock(
+        # self.decoder = RetroTransformerBlock(
+        self.decoder = NewTransformerBlock(
             config=self.config,
-            spec=spec,
+            # >>>
+            # spec=spec,
+            # spec=self.get_block_spec(),
+            layer_specs=self.get_layer_specs(), # config, spec),
+            # <<<
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
+
+        pax({"decoder": self.decoder})
 
         # Output
         if post_process:
@@ -126,6 +150,15 @@ class RetroModel(MegatronModule):
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
+
+    @abc.abstractmethod
+    # def get_block_spec(self):
+    def get_layer_specs(self):
+        pass
+
+    @abc.abstractmethod
+    def get_retro_layer_numbers(self):
+        pass
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
@@ -315,3 +348,125 @@ class RetroModel(MegatronModule):
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
+
+
+class RetroDecoderModel(RetroModel):
+
+    def get_num_layers(self):
+
+        num_layers_per_pipeline_rank = self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+
+        # pax("num_layers_per_pipeline_rank")
+
+        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            # Interleaved pipeline parallelism:
+            # Number of layers in each model chunk is the number of layers in the stage,
+            # divided by the number of model chunks in a stage.
+            # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0]  [2]  [4]  [6]
+            # Stage 1: [1]  [3]  [5]  [7]
+            # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0, 1]  [4, 5]
+            # Stage 1: [2, 3]  [6, 7]
+
+            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+            num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+
+            return num_layers_per_virtual_rank
+
+        else:
+            # Non-interleaved pipeline parallelism:
+            # Each stage gets a contiguous set of layers.
+
+            return num_layers_per_pipeline_rank
+
+    def get_retro_layer_numbers(self):
+        retro_layer_start = 6 if self.config.num_layers <= 15 else 9
+        return list(range(retro_layer_start, self.config.num_layers + 1, 3))
+
+    # def get_layer_specs(config: TransformerConfig, spec: RetroModelSpec):
+    # def get_layer_specs(self):
+    # def get_block_spec(self):
+    def get_layer_specs(self):
+
+        num_layers = self.get_num_layers()
+        retro_layer_numbers = self.get_retro_layer_numbers()
+
+        # specs = [ get_layer_spec(i + 1 + offset) for i in range(num_layers) ]
+        layer_specs = []
+        for layer_number in range(1, num_layers + 1):
+            if layer_number == retro_layer_numbers[0]:
+                layer_specs.append(self.spec.retro_decoder_with_retriever_layer_spec)
+            elif layer_number in retro_layer_numbers:
+                layer_specs.append(self.spec.retro_decoder_layer_spec)
+            else:
+                layer_specs.append(self.spec.gpt_layer_spec)
+
+        # pax({
+        #     "config" : self.config,
+        #     "spec" : self.spec,
+        #     "num_layers" : num_layers,
+        #     "retro_layer_numbers" : retro_layer_numbers,
+        #     # "layer_specs" : layer_specs,
+        #     "attn specs" : [ s.cross_attention for s in layer_specs ],
+        # })
+
+        return layer_specs
+
+    # def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
+    #                     layer_number):
+    #     args = get_args()
+    #     if args.retro_add_retriever and layer_number in retro_layer_numbers:
+    #         if model_type == ModelType.retro_decoder:
+    #             return LayerType.retro_decoder_with_retriever \
+    #                 if layer_number == retro_layer_numbers[0] \
+    #                    else LayerType.retro_decoder
+    #         elif model_type == ModelType.retro_encoder:
+    #             return LayerType.retro_encoder
+    #         else:
+    #             raise Exception("Unsupported model type, '%s'." % model_type)
+    #     else:
+    #         return default_layer_type
+    #             ? ? ?
+
+    # def __init__(
+    #     self,
+    #     config: TransformerConfig,
+    #     # >>>
+    #     # spec: TransformerLayerSpec,
+    #     # spec: TransformerSpec,
+    #     spec: RetroModelSpec,
+    #     # <<<
+    #     vocab_size: int,
+    #     max_sequence_length: int,
+    #     pre_process: bool = True,
+    #     post_process: bool = True,
+    #     fp16_lm_cross_entropy: bool = False,
+    #     parallel_output: bool = True,
+    #     share_embeddings_and_output_weights: bool = False,
+    #     position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+    #     rotary_percent: float = 1.0,
+    #     seq_len_interpolation_factor: Optional[float] = None,
+    # ):
+    #     super().__init__(
+    #         config=config,
+    #         spec=spec,
+    #         # block_spec=get_block_spec(config, spec),
+    #         vocab_size=vocab_size,
+    #         max_sequence_length=max_sequence_length,
+    #         pre_process=pre_process,
+    #         post_process=post_process,
+    #         fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+    #         parallel_output=parallel_output,
+    #         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+    #         position_embedding_type=position_embedding_type,
+    #         rotary_percent=rotary_percent,
+    #         seq_len_interpolation_factor=seq_len_interpolation,
+    #     )
+
+# >>>
+# eof
+# <<<

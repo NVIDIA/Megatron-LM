@@ -8,12 +8,12 @@
 from megatron import get_args
 # from megatron import get_timers
 # from megatron import get_tokenizer
-# from megatron import print_rank_0
+from megatron import print_rank_0
 from megatron.arguments import core_transformer_config_from_args
 # from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 # from megatron.core.models.gpt import GPTModel
-from megatron.core.models.retro import get_model_spec
+from megatron.core.models.retro import get_model_spec, RetroDecoderModel
 # from megatron.core.transformer.spec_utils import import_module
 # from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.training import pretrain
@@ -46,12 +46,12 @@ def model_provider(pre_process=True, post_process=True):
         # retro_model_spec = get_retro_decoder_spec()
         model_spec = get_model_spec()
 
-    pax("retro_model_spec")
+    # pax("model_spec")
 
     print_rank_0('building Retro model ...')
-    model = GPTModel(
+    model = RetroDecoderModel(
         config=config,
-        spec=retro_model_spec,
+        spec=model_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,

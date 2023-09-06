@@ -15,10 +15,18 @@ from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec as ge
 from megatron.core.transformer.spec_utils import ModuleSpec #, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 
+# from .attn import (
+#     RetroDecoderWithRetrieverCrossAttention,
+#     RetroDecoderWithRetrieverBiasDropoutAdd,
+#     RetroDecoderWithRetrieverLayernorm,
+# )
 from .attn import (
-    RetroDecoderWithRetrieverCrossAttention,
-    RetroDecoderWithRetrieverBiasDropoutAdd,
-    RetroDecoderWithRetrieverLayernorm,
+    RetroDecoderCrossAttention,
+    RetroDecoderBiasDropoutAdd,
+    RetroDecoderLayerNorm,
+    RetroEncoderCrossAttention,
+    RetroEncoderBiasDropoutAdd,
+    RetroEncoderLayerNorm,
 )
 
 # >>>
@@ -50,7 +58,8 @@ from lutil import pax
 #         linear_proj=TERowParallelLinear,
 #     )
 
-def get_decoder_layer_spec(add_retriever=False) -> TransformerLayerSpec:
+# def get_decoder_layer_spec(add_retriever=False) -> TransformerLayerSpec:
+def get_decoder_layer_spec(add_retriever) -> TransformerLayerSpec:
     spec = get_gpt_layer_spec()
     # spec.add_retriever = True
     # self_attention=SelfAttentionSpec(
@@ -61,7 +70,7 @@ def get_decoder_layer_spec(add_retriever=False) -> TransformerLayerSpec:
     #     linear_proj=TERowParallelLinear,
     # ),
     spec.cross_attention=CrossAttentionSpec(
-        module=RetroDecoderWithRetrieverCrossAttention,
+        module=RetroDecoderCrossAttention,
         params={
             "attn_mask_type" : AttnMaskType.causal,
             "add_retriever" : add_retriever,
@@ -73,19 +82,44 @@ def get_decoder_layer_spec(add_retriever=False) -> TransformerLayerSpec:
     )
     # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(
-        module=RetroDecoderWithRetrieverBiasDropoutAdd,
+        module=RetroDecoderBiasDropoutAdd,
         params=None,
     )
     spec.post_cross_attn_layernorm=ModuleSpec(
-        module=RetroDecoderWithRetrieverLayernorm,
+        module=RetroDecoderLayerNorm,
         params=None,
     )
     # pax("spec")
     return spec
 
 
-def get_decoder_with_retriever_layer_spec() -> TransformerLayerSpec:
-    return get_decoder_layer_spec(add_retriever=True)
+# def get_decoder_with_retriever_layer_spec() -> TransformerLayerSpec:
+#     return get_decoder_layer_spec(add_retriever=True)
+
+
+def get_encoder_layer_spec() -> TransformerLayerSpec:
+    spec = get_gpt_layer_spec()
+    spec.cross_attention=CrossAttentionSpec(
+        module=RetroEncoderCrossAttention,
+        params={
+            "attn_mask_type" : AttnMaskType.padding,
+        },
+        layernorm_linear_q=TELayerNormColumnParallelLinear,
+        layernorm_linear_kv=TELayerNormColumnParallelLinear,
+        core_attention=TEDotProductAttention,
+        linear_proj=TERowParallelLinear,
+    )
+    # spec.cross_attn_bda=get_bias_dropout_add
+    spec.cross_attn_bda=ModuleSpec(
+        module=RetroEncoderBiasDropoutAdd,
+        params=None,
+    )
+    spec.post_cross_attn_layernorm=ModuleSpec(
+        module=RetroEncoderLayerNorm,
+        params=None,
+    )
+    # pax("spec")
+    return spec
 
 
 @dataclass
@@ -95,15 +129,21 @@ class RetroModelSpec:
     retro_decoder_layer_spec: TransformerLayerSpec = None
     retro_encoder_layer_spec: TransformerLayerSpec = None
 
+
 # def class RetroModelSpec(ModuleSpec):
 #     decoder_with_retriever: RetroDeocderWithRetrieverSpec = 
 # def get_retro_model_spec() -> RetroModelSpec:
 def get_model_spec() -> RetroModelSpec:
     spec = RetroModelSpec(
         gpt_layer_spec = get_gpt_layer_spec(),
-        retro_decoder_with_retriever_layer_spec = get_decoder_with_retriever_layer_spec(),
-        retro_decoder_layer_spec = get_decoder_layer_spec(),
+        retro_decoder_with_retriever_layer_spec = get_decoder_layer_spec(True),
+        retro_decoder_layer_spec = get_decoder_layer_spec(False),
         retro_encoder_layer_spec = get_encoder_layer_spec(),
     )
-    pax("spec")
+    # pax("spec")
     return spec
+
+
+# >>>
+# eof
+# <<<

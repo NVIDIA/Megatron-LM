@@ -17,8 +17,28 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
 
+# @dataclass
+# class TransformerLayerSpec:
+#     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     self_attention: SelfAttentionSpec = IdentityOp
+#     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+#     post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     cross_attention: CrossAttentionSpec = IdentityOp
+#     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+#     post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     ln_mlp: Union[ModuleSpec, type] = IdentityOp
+#     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+#     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 @dataclass
-class TransformerLayerSpec:
+class TransformerLayerSpec(ModuleSpec):
+
+    # >>>
+    module: MegatronModule = None
+    params: dict = None
+    # <<<
+
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: SelfAttentionSpec = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
