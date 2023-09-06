@@ -17,28 +17,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
 
-# @dataclass
-# class TransformerLayerSpec:
-#     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     self_attention: SelfAttentionSpec = IdentityOp
-#     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-
-#     post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     cross_attention: CrossAttentionSpec = IdentityOp
-#     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-
-#     post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     ln_mlp: Union[ModuleSpec, type] = IdentityOp
-#     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
-#     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 @dataclass
-class TransformerLayerSpec(ModuleSpec):
-
-    # >>>
-    module: MegatronModule = None
-    params: dict = None
-    # <<<
-
+class TransformerLayerSpec:
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
     self_attention: SelfAttentionSpec = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
@@ -51,10 +31,31 @@ class TransformerLayerSpec(ModuleSpec):
     ln_mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+# @dataclass
+# class TransformerLayerSpec:
+# # class TransformerLayerSpec(ModuleSpec):
 
-    # >>>
-    # add_retriever: bool = False
-    # <<<
+#     # >>>
+#     # module: MegatronModule = None
+#     # params: dict = None
+#     # <<<
+
+#     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     self_attention: SelfAttentionSpec = IdentityOp
+#     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+#     post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     cross_attention: CrossAttentionSpec = IdentityOp
+#     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+
+#     post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+#     ln_mlp: Union[ModuleSpec, type] = IdentityOp
+#     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+#     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+
+#     # >>>
+#     # add_retriever: bool = False
+#     # <<<
 
 class TransformerLayer(MegatronModule):
     """A single transformer layer.
@@ -120,11 +121,22 @@ class TransformerLayer(MegatronModule):
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(spec.cross_attn_bda)
+        # >>>
+        # self.cross_attn_bda = build_module(spec.cross_attn_bda)
+        self.cross_attn_bda = build_module(
+            spec.cross_attn_bda,
+            config=self.config,
+            spec=spec.cross_attention,
+        )
+        # <<<
 
         ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
         self.post_cross_attn_layernorm = build_module(
             spec.post_cross_attn_layernorm,
+            # >>>
+            config=self.config,
+            spec=spec.cross_attention,
+            # <<<
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,

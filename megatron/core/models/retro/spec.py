@@ -83,11 +83,11 @@ def get_decoder_layer_spec(add_retriever) -> TransformerLayerSpec:
     # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(
         module=RetroDecoderBiasDropoutAdd,
-        params=None,
+        # params={}, # None,
     )
     spec.post_cross_attn_layernorm=ModuleSpec(
         module=RetroDecoderLayerNorm,
-        params=None,
+        # params={}, # None,
     )
     # pax("spec")
     return spec
@@ -112,11 +112,11 @@ def get_encoder_layer_spec() -> TransformerLayerSpec:
     # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(
         module=RetroEncoderBiasDropoutAdd,
-        params=None,
+        # params={}, # None,
     )
     spec.post_cross_attn_layernorm=ModuleSpec(
         module=RetroEncoderLayerNorm,
-        params=None,
+        # params={}, # None,
     )
     # pax("spec")
     return spec

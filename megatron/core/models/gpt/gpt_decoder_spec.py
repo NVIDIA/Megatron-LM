@@ -16,7 +16,10 @@ def get_gpt_decoder_spec() -> TransformerLayerSpec:
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             layernorm_linear_qkv=TELayerNormColumnParallelLinear,
-            dot_product_attention=TEDotProductAttention,
+            # >>>
+            # dot_product_attention=TEDotProductAttention,
+            core_attention=TEDotProductAttention,
+            # <<<
             linear_proj=TERowParallelLinear,
         ),
         self_attn_bda=get_bias_dropout_add,

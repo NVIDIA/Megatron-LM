@@ -54,8 +54,8 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         # **kwargs,
     ):
         super().__init__(config=config)
-
-        pax("spec")
+        self.spec = spec
+        # pax("config", "spec")
 
 
 # class RetroDecoderWithRetrieverLayernorm(MegatronModule):
@@ -67,8 +67,8 @@ class RetroDecoderLayerNorm(MegatronModule):
         spec: ModuleSpec,
     ):
         super().__init__(config=config)
-
-        pax("spec")
+        self.spec = spec
+        pax("config", "spec")
 
 
 ###########################################################################
@@ -107,13 +107,13 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
+        # spec: ModuleSpec,
         # layer_number: int = 1,
         # attn_mask_type=AttnMaskType.padding,
         # **kwargs,
     ):
         super().__init__(config=config)
-
+        self.spec = spec
         pax("spec")
 
 
@@ -122,10 +122,10 @@ class RetroEncoderLayerNorm(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
+        # spec: ModuleSpec,
     ):
         super().__init__(config=config)
-
+        self.spec = spec
         pax("spec")
 
 

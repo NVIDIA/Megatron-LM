@@ -118,15 +118,9 @@ class RetroModel(MegatronModule, abc.ABC):
             self.rotary_pos_emb = None
 
         # Transformer.
-        # self.decoder = TransformerBlock(
-        # self.decoder = RetroTransformerBlock(
         self.decoder = NewTransformerBlock(
             config=self.config,
-            # >>>
-            # spec=spec,
-            # spec=self.get_block_spec(),
-            layer_specs=self.get_layer_specs(), # config, spec),
-            # <<<
+            layer_specs=self.get_layer_specs(),
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
@@ -356,8 +350,6 @@ class RetroDecoderModel(RetroModel):
 
         num_layers_per_pipeline_rank = self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
 
-        # pax("num_layers_per_pipeline_rank")
-
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             # Interleaved pipeline parallelism:
             # Number of layers in each model chunk is the number of layers in the stage,
@@ -387,15 +379,11 @@ class RetroDecoderModel(RetroModel):
         retro_layer_start = 6 if self.config.num_layers <= 15 else 9
         return list(range(retro_layer_start, self.config.num_layers + 1, 3))
 
-    # def get_layer_specs(config: TransformerConfig, spec: RetroModelSpec):
-    # def get_layer_specs(self):
-    # def get_block_spec(self):
     def get_layer_specs(self):
 
         num_layers = self.get_num_layers()
         retro_layer_numbers = self.get_retro_layer_numbers()
 
-        # specs = [ get_layer_spec(i + 1 + offset) for i in range(num_layers) ]
         layer_specs = []
         for layer_number in range(1, num_layers + 1):
             if layer_number == retro_layer_numbers[0]:
@@ -415,58 +403,3 @@ class RetroDecoderModel(RetroModel):
         # })
 
         return layer_specs
-
-    # def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
-    #                     layer_number):
-    #     args = get_args()
-    #     if args.retro_add_retriever and layer_number in retro_layer_numbers:
-    #         if model_type == ModelType.retro_decoder:
-    #             return LayerType.retro_decoder_with_retriever \
-    #                 if layer_number == retro_layer_numbers[0] \
-    #                    else LayerType.retro_decoder
-    #         elif model_type == ModelType.retro_encoder:
-    #             return LayerType.retro_encoder
-    #         else:
-    #             raise Exception("Unsupported model type, '%s'." % model_type)
-    #     else:
-    #         return default_layer_type
-    #             ? ? ?
-
-    # def __init__(
-    #     self,
-    #     config: TransformerConfig,
-    #     # >>>
-    #     # spec: TransformerLayerSpec,
-    #     # spec: TransformerSpec,
-    #     spec: RetroModelSpec,
-    #     # <<<
-    #     vocab_size: int,
-    #     max_sequence_length: int,
-    #     pre_process: bool = True,
-    #     post_process: bool = True,
-    #     fp16_lm_cross_entropy: bool = False,
-    #     parallel_output: bool = True,
-    #     share_embeddings_and_output_weights: bool = False,
-    #     position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
-    #     rotary_percent: float = 1.0,
-    #     seq_len_interpolation_factor: Optional[float] = None,
-    # ):
-    #     super().__init__(
-    #         config=config,
-    #         spec=spec,
-    #         # block_spec=get_block_spec(config, spec),
-    #         vocab_size=vocab_size,
-    #         max_sequence_length=max_sequence_length,
-    #         pre_process=pre_process,
-    #         post_process=post_process,
-    #         fp16_lm_cross_entropy=fp16_lm_cross_entropy,
-    #         parallel_output=parallel_output,
-    #         share_embeddings_and_output_weights=share_embeddings_and_output_weights,
-    #         position_embedding_type=position_embedding_type,
-    #         rotary_percent=rotary_percent,
-    #         seq_len_interpolation_factor=seq_len_interpolation,
-    #     )
-
-# >>>
-# eof
-# <<<

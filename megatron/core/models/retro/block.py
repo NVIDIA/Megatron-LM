@@ -11,8 +11,7 @@ from megatron.core import parallel_state # , tensor_parallel
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-# from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
 # from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
 
 from .spec import RetroModelSpec
@@ -51,14 +50,6 @@ class NewTransformerBlock(MegatronModule):
         post_process=True,
     ):
         super().__init__(config=config)
-        # super().__init__(config=config, spec=spec)
-
-        pax("layer_specs")
-
-        # >>>
-        # self.config: TransformerConfig = config
-        # self.transformer_layer_spec: TransformerLayerSpec = spec
-        # <<<
 
         self.layer_specs = layer_specs
         self.self_attn_mask_type = self_attn_mask_type
@@ -71,15 +62,11 @@ class NewTransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        # >>>
-        # self._build_layers(self.transformer_layer_spec)
         self._build_layers()
-        # <<<
 
-    # >>>
-    # def _build_layers(self, transformer_layer_spec):
+        pax({"layers": self.layers})
+
     def _build_layers(self):
-    # <<<
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
@@ -91,7 +78,8 @@ class NewTransformerBlock(MegatronModule):
                 config=self.config,
                 # >>>
                 # spec=transformer_layer_spec,
-                spec=self.spec.layers[layer_number-1],
+                # spec=self.spec.layers[layer_number-1],
+                spec=self.layer_specs[layer_number-1],
                 # <<<
                 layer_number=layer_number,
                 self_attn_mask_type=self.self_attn_mask_type,
@@ -99,7 +87,10 @@ class NewTransformerBlock(MegatronModule):
             return layer
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
+        self.layers = torch.nn.ModuleList(
+            [build_layer(i + 1) for i in range(len(self.layer_specs))])
+
+        pax({"layers": layers})
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:

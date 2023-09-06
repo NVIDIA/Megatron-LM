@@ -22,7 +22,10 @@ from .transformer_config import TransformerConfig
 @dataclass
 class SelfAttentionSpec(ModuleSpec):
     layernorm_linear_qkv: Union[ModuleSpec, type] = None
-    dot_product_attention: Union[ModuleSpec, type] = None
+    # >>>
+    # dot_product_attention: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    # <<<
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -68,14 +71,25 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = build_module(
-            spec.dot_product_attention,
+        # >>>
+        # self.dot_product_attention = build_module(
+        #     spec.dot_product_attention,
+        #     config=self.config,
+        #     layer_number=self.layer_number,
+        #     attn_mask_type=self.attn_mask_type,
+        # )
+        self.core_attention = build_module(
+            spec.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
         )
+        # <<<
 
-        self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
+        # >>>
+        # self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        # <<<
 
         # Output.
         self.linear_proj = build_module(
@@ -98,7 +112,10 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.dot_product_attention(query, key, value, attention_mask)
+            # >>>
+            # output_ = self.dot_product_attention(query, key, value, attention_mask)
+            output_ = self.core_attention(query, key, value, attention_mask)
+            # <<<
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -251,10 +268,16 @@ class Attention(MegatronModule, ABC):
             self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
         )
 
-        if self.checkpoint_dot_product_attention:
+        # >>>
+        # if self.checkpoint_dot_product_attention:
+        #     core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
+        # else:
+        #     core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+        if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
-            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+            core_attn_out = self.core_attention(query, key, value, attention_mask)
+        # <<<
 
         # =================
         # Output. [sq, b, h]

@@ -86,6 +86,11 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
 
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
-    return module(
-        *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
-    )
+    # >>>
+    try:
+        return module(
+            *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
+        )
+    except Exception as e:
+        raise Exception(f"error instantiating {module.__name__}, with error: {e}")
+    # <<<
