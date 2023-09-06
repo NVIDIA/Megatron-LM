@@ -265,6 +265,7 @@ class IndexedDatasetBuilder(object):
     element_sizes = {
         np.uint8: 1,
         np.int8: 1,
+        np.uint16: 2,
         np.int16: 2,
         np.int32: 4,
         np.int64: 8,
