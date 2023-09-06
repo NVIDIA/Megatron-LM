@@ -5,6 +5,7 @@ from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
+from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import core
 from megatron.core import parallel_state
@@ -314,6 +315,8 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
 
     no_sync_func = config.no_sync_func
+    if no_sync_func is None and isinstance(model, torchDDP):
+        no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
@@ -383,6 +386,15 @@ def forward_backward_pipelining_with_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
+    if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for chunk in model:
+                stack.enter_context(chunk.no_sync())
+            return stack
+
+        no_sync_func = multi_no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
@@ -1045,6 +1057,8 @@ def forward_backward_pipelining_without_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
+    if no_sync_func is None and isinstance(model, torchDDP):
+        no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
