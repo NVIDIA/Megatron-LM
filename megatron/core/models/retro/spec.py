@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 # from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec as get_gpt_layer_spec
 from megatron.core.transformer.attention import CrossAttention, CrossAttentionSpec
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
@@ -11,7 +12,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec as get_gpt_layer_spec
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 
@@ -44,6 +45,7 @@ def get_encoder_layer_spec() -> TransformerLayerSpec:
     # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(module=RetroEncoderBiasDropoutAdd)
     spec.post_cross_attn_layernorm=ModuleSpec(module=RetroEncoderLayerNorm)
+    spec.ln_mlp=ModuleSpec(module=MLP)
     # pax("spec")
     return spec
 
@@ -66,6 +68,8 @@ def get_decoder_layer_spec(encoder) -> TransformerLayerSpec:
     # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
     spec.post_cross_attn_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
+    spec.ln_mlp=ModuleSpec(module=MLP)
+    # pax("spec")
     return spec
 
 

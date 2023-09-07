@@ -91,7 +91,7 @@ def model_provider(pre_process=True, post_process=True):
     encoder = get_encoder(config)
     decoder = get_decoder(config, pre_process, post_process, encoder)
 
-    pax("encoder", "decoder")
+    # pax("encoder", "decoder")
 
     return decoder
 

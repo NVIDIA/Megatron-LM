@@ -76,38 +76,8 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             **kwargs,
         )
 
-        pax("encoder")
-
-        if not add_retriever:
-            pax("kwargs", "add_retriever")
-
-        # Retriever (bi-directional transformer with cross attention)
-        # if layer_type == LayerType.retro_decoder_with_retriever:
-        if add_retriever:
-            from megatron.core.models.retro.model import RetroEncoderModel
-            self.retriever = RetroEncoderModel(
-                config=config,
-                model_type=ModelType.retro_encoder,
-                self_attn_mask_type=AttnMaskType.padding,
-                pre_process=True,
-                post_process=False,
-            )
-            # self.retriever = RetroEncoderModel(
-            #     config=config,
-            #     spec=spec,
-            #     vocab_size=args.padded_vocab_size,
-            #     max_sequence_length=args.max_position_embeddings,
-            #     pre_process=True,
-            #     post_process=False,
-            #     fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            #     parallel_output=True,
-            #     share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            #     position_embedding_type=args.position_embedding_type,
-            #     rotary_percent=args.rotary_percent
-            # )
-            self._retriever_key = 'retriever' # necessary?
-        else:
-            self.retriever = None
+        self.encoder = encoder
+        # self._encoder_key = 'encoder' # necessary?
 
     def forward(
         self,
