@@ -10,9 +10,9 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/t5-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH=/workspace/checkpoints
+VOCAB_FILE=vocab/bert-large-uncased-vocab.txt
+DATA_PATH=output_prefix/my-t5-uncased_text_sentence
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \

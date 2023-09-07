@@ -2,9 +2,9 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/t5-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH=/workspace/checkpoints
+VOCAB_FILE=vocab/bert-large-uncased-vocab.txt
+DATA_PATH=output_prefix/my-t5-uncased_text_sentence
 
 T5_ARGS="
     --num-layers 12 \

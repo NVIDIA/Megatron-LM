@@ -4,10 +4,10 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=<Specify path to file>/gpt2-merges.txt
-DATA_PATH=<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=/workspace/checkpoints
+VOCAB_FILE=/workspace/megatron/vocab/gpt2-vocab.json
+MERGE_FILE=/workspace/megatron/vocab/gpt2-merges.txt
+DATA_PATH=/workspace/megatron/output_prefix/my-gpt2-cased_text_document
 
 GPT_ARGS="
     --num-layers 24 \

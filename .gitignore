@@ -8,3 +8,5 @@ slurm*
 logs
 *.bin
 *.idx
+dataset
+*.npy
