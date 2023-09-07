@@ -5,7 +5,6 @@
 import sys
 
 import torch
-from torch.nn.parallel import DistributedDataParallel as torchDDP
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
@@ -16,10 +15,15 @@ from megatron import (
 )
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.model import DistributedDataParallel as DDP
+from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 
 
-def unwrap_model(model, module_instances=(torchDDP)):
+ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+
+
+def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return_list = True
     if not isinstance(model, list):
         model = [model]

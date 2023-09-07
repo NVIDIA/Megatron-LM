@@ -20,10 +20,6 @@ from tasks.finetune_utils import build_data_loader
 
 from .datasets import build_dataset
 
-# These are needed to unwrap the model, would be nice to put these in megatron.utils if possible?
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import Float16Module
 
 def get_model_provider(eval_metric):
     """Based on evaluation metric set the parallel-output flag and
@@ -87,8 +83,7 @@ def forward_step(batch, model, eval_metric, config):
     input_tensor = recv_forward(tensor_shape, config)
 
     # Forward pass through the model.
-    unwrapped_model = unwrap_model(
-        model, (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model = unwrap_model(model)
     unwrapped_model.set_input_tensor(input_tensor)
     output = model(tokens, position_ids, attention_mask)
 
