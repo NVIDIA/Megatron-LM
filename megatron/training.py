@@ -41,7 +41,7 @@ from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
-
+import wandb
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -106,6 +106,15 @@ def pretrain(train_valid_test_dataset_provider,
 
     args = get_args()
     timers = get_timers()
+    
+    wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_name,
+        tags=args.wandb_tags,
+        save_code=args.wandb_save_code,
+        reinit=True,
+        config=args,
+    )
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -578,39 +587,58 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if args.log_learning_rate_to_tensorboard:
+            wandb.log({"learning-rate": learning_rate})
+            wandb.log({"learning-rate vs samples": learning_rate}, step=args.consumed_train_samples)
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate,
                               args.consumed_train_samples)
         if args.log_batch_size_to_tensorboard:
+            wandb.log({"batch-size": batch_size}, step=iteration)
+            wandb.log({"batch-size vs samples": batch_size}, step=args.consumed_train_samples)
             writer.add_scalar('batch-size', batch_size, iteration)
             writer.add_scalar('batch-size vs samples', batch_size,
                               args.consumed_train_samples)
         for key in loss_dict:
+            wandb.log({key: loss_dict[key]}, step=iteration)
+            wandb.log({key + ' vs samples': loss_dict[key]}, step=args.consumed_train_samples)
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
         if args.log_loss_scale_to_tensorboard:
+            wandb.log({"loss-scale": loss_scale}, step=iteration)
+            wandb.log({"loss-scale vs samples": loss_scale}, step=args.consumed_train_samples)
             writer.add_scalar('loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
         if args.log_world_size_to_tensorboard:
+            wandb.log({"world-size": args.world_size}, step=iteration)
+            wandb.log({"world-size vs samples": args.world_size}, step=args.consumed_train_samples)
             writer.add_scalar('world-size', args.world_size, iteration)
             writer.add_scalar('world-size vs samples', args.world_size,
                               args.consumed_train_samples)
         if grad_norm is not None:
+            wandb.log({"grad-norm": grad_norm}, step=iteration)
+            wandb.log({"grad-norm vs samples": grad_norm}, step=args.consumed_train_samples)
             writer.add_scalar('grad-norm', grad_norm, iteration)
             writer.add_scalar('grad-norm vs samples', grad_norm,
                               args.consumed_train_samples)
         if num_zeros_in_grad is not None:
+            wandb.log({"num-zeros": num_zeros_in_grad}, step=iteration)
+            wandb.log({"num-zeros vs samples": num_zeros_in_grad}, step=args.consumed_train_samples)
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
         if params_norm is not None:
+            wandb.log({"params-norm": params_norm}, step=iteration)
+            wandb.log({"params-norm vs samples": params_norm}, step=args.consumed_train_samples)
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
                               args.consumed_train_samples)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
+            wandb.log({"mem-allocated": mem_stats["allocated_bytes.all.peak"]}, step=iteration)
+            wandb.log({"mem-reserved": mem_stats["reserved_bytes.all.peak"]}, step=iteration)
+            wandb.log({"mem-allocated-bytes": mem_stats["allocated_bytes.all.peak"]}, step=iteration)
             writer.add_scalar(
                 "mem-reserved-bytes",
                 mem_stats["reserved_bytes.all.current"],
@@ -632,10 +660,16 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         elapsed_time_per_iteration = elapsed_time / total_iterations
         if writer:
             if args.log_timers_to_tensorboard:
+                wandb.log({"iteration-time": elapsed_time_per_iteration}, step=iteration)
                 writer.add_scalar('iteration-time',
                                   elapsed_time_per_iteration, iteration)
         log_string = ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        wandb.log({"iteration": iteration}, step=iteration)
+        wandb.log({"elapsed time per iteration (ms)": elapsed_time_per_iteration * 1000.0}, step=iteration)
+        wandb.log({"learning rate": learning_rate}, step=iteration)
+        wandb.log({"global batch size": batch_size}, step=iteration)
+        
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -650,13 +684,20 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = torch.cuda.FloatTensor([0.0])
+                wandb.log({key: avg}, step=iteration)
+        wandb.log({"loss-scale": loss_scale}, step=iteration)
         log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
+            wandb.log({"grad-norm": grad_norm}, step=iteration)
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
         if num_zeros_in_grad is not None:
+            wandb.log({"num-zeros": num_zeros_in_grad}, step=iteration)
             log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
+            wandb.log({"params-norm": params_norm}, step=iteration)
             log_string += ' params norm: {:.3f} |'.format(params_norm)
+        wandb.log({"number of skipped iterations": total_loss_dict[skipped_iters_key]}, step=iteration)
+        wandb.log({"number of nan iterations": total_loss_dict[nan_iters_key]}, step=iteration)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
@@ -907,6 +948,8 @@ def evaluate_and_print_results(prefix, forward_step_func,
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
         if writer:
+            wandb.log({key: total_loss_dict[key].item()}, step=iteration)
+            wandb.log({key + ' vs samples': total_loss_dict[key].item()}, step=args.consumed_train_samples)
             writer.add_scalar('{} validation'.format(key),
                               total_loss_dict[key].item(),
                               iteration)
@@ -914,6 +957,8 @@ def evaluate_and_print_results(prefix, forward_step_func,
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
             if args.log_validation_ppl_to_tensorboard:
+                wandb.log({"{} validation ppl".format(key): ppl}, step=iteration)
+                wandb.log({"{} validation ppl vs samples".format(key): ppl}, step=args.consumed_train_samples)
                 writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),

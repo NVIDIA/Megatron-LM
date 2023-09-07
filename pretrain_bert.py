@@ -17,6 +17,8 @@ from megatron.model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
+import wandb
+
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -130,8 +132,29 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
-if __name__ == "__main__":
+# Kwangryeol Park custom
+def extra_args_provider(parser):
+    group = parser.add_argument_group(title='Wandb-Logger')
+    group.add_argument('--wandb-project',
+                       help='wandb project name.')
+    group.add_argument('--wandb-name',
+                       help='wandb name.')
+    group.add_argument('--wandb-save_code',
+                       help='wandb save_code.')
+    group.add_argument('--wandb-tags',
+                       help='wandb tags.', nargs='+')
+    group.add_argument('--wandb-model',
+                       help='wandb model.')
+    group.add_argument('--wandb-optimizer',
+                       help='wandb optimizer.')
+    group.add_argument('--wandb-optimizer-version',
+                       help='wandb optimizer-version.')
+    
+    
+    return parser
 
+if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider, model_provider,
              ModelType.encoder_or_decoder,
-             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
+             forward_step, args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'}
+             , extra_args_provider=extra_args_provider)

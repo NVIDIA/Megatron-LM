@@ -37,15 +37,25 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 100 \
+    --log-interval 10 \
     --save-interval 10000 \
     --eval-interval 1000 \
     --eval-iters 10
 "
 
+WANDB="
+    --wandb-project Megatron-LM \
+    --wandb-name gpt \
+    --wandb-save_code True \
+    --wandb-tags baseline \
+    --wandb-model gpt \
+    --wandb-optimizer adam \
+    --wandb-optimizer-version original
+"
 torchrun pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
+    $WANDB \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH

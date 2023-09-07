@@ -113,6 +113,23 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     return train_ds, valid_ds, test_ds
 
+# Kwangryeol Park custom
+def extra_args_provider(parser):
+    group = parser.add_argument_group(title='Wandb-Logger')
+    group.add_argument('--wandb-project',
+                       help='wandb project name.')
+    group.add_argument('--wandb-name',
+                       help='wandb name.')
+    group.add_argument('--wandb-save_code',
+                       help='wandb save_code.')
+    group.add_argument('--wandb-tags',
+                       help='wandb tags.', nargs='+')
+    group.add_argument('--wandb-model',
+                       help='wandb model.')
+    group.add_argument('--wandb-optimizer',
+                       help='wandb optimizer.')
+    group.add_argument('--wandb-optimizer-version',
+                       help='wandb optimizer-version.')
 
 if __name__ == "__main__":
 
@@ -120,4 +137,5 @@ if __name__ == "__main__":
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
+             , extra_args_provider=extra_args_provider)

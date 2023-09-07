@@ -40,13 +40,11 @@ def initialize_megatron(
         # Make sure cuda is available.
         assert torch.cuda.is_available(), "Megatron requires CUDA."
 
-    # Parse arguments
+    # Parse arguments    
     args = parse_args(extra_args_provider, ignore_unknown_args)
-
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
         assert args.load is not None, "--use-checkpoints-args requires --load argument"
         load_args_from_checkpoint(args)
-
     validate_args(args, args_defaults)
 
     # set global args, build tokenizer, and set adlr-autoresume,

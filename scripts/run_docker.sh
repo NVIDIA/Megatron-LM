@@ -19,6 +19,8 @@ sudo docker exec $NAME apt install -yqq net-tools vim openssh-server screen lm-s
 sudo docker exec $NAME /bin/bash -c "echo PermitRootLogin yes >> /etc/ssh/sshd_config"
 sudo docker exec $NAME service ssh start
 sudo docker exec $NAME pip3 install nltk
+sudo docker exec $NAME pip3 install wandb
+sudo docker exec $NAME pip3 install protobuf==3.20.*
 sudo docker exec $NAME /bin/bash -c "echo cd /workspace/megatron >> /root/.bashrc"
 
 

@@ -37,15 +37,25 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 100 \
+    --log-interval 10 \
     --save-interval 10000 \
     --eval-interval 1000 \
     --eval-iters 10
 "
 
+WANDB="
+    --wandb-project Megatron-LM \
+    --wandb-name t5 \
+    --wandb-save_code True \
+    --wandb-tags baseline \
+    --wandb-model t5 \
+    --wandb-optimizer adam \
+    --wandb-optimizer-version original
+"
 torchrun pretrain_t5.py \
     $T5_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
+    $WANDB \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH
