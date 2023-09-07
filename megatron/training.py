@@ -32,7 +32,7 @@ from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import DistributedDataParallel as DDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
@@ -296,10 +296,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(model_module, args) for model_module in model]
 
     if wrap_with_ddp:
-        model = [LocalDDP(model_module,
-                          mpu.get_data_parallel_group(),
-                          args.accumulate_allreduce_grads_in_fp32,
-                          args.overlap_grad_reduce)
+        model = [DDP(model_module,
+                     mpu.get_data_parallel_group(),
+                     args.accumulate_allreduce_grads_in_fp32,
+                     args.overlap_grad_reduce)
                  for model_module in model]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -690,8 +690,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
-    # TODO: Remove this once we move LocalDDP to Core.
-    if len(model) == 1 and isinstance(model[0], LocalDDP) and \
+    # TODO: Remove this once we move DDP to Core.
+    if len(model) == 1 and isinstance(model[0], DDP) and \
         args.pipeline_model_parallel_size == 1:
         config.no_sync_func = model[0].no_sync
 
