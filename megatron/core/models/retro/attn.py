@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-from megatron.core.transformer.attention import CrossAttention
+from megatron.core.transformer.attention import CrossAttention, CrossAttentionSpec
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -10,13 +12,88 @@ from lutil import pax
 # <<<
 
 
+class BaseRetroCrossAttention(MegatronModule):
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: CrossAttentionSpec,
+        layer_number: int = 1,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        # add_retriever: bool = False,
+        **kwargs,
+    ):
+        super().__init__(config=config)
+
+        self.attn = CrossAttention(
+            config=config,
+            spec=spec,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            **kwargs,
+        )
+
+        self.retro_num_neighbors = config.retro_num_neighbors
+        self.retro_chunk_length = config.retro_args.retro_gpt_chunk_length
+        self.retro_retrieved_length = config.retro_args.retro_gpt_retrieved_length
+
+        pax("self")
+
+
 ###########################################################################
 # decoder
 ###########################################################################
 
 
 # class RetroDecoderWithRetrieverCrossAttention(CrossAttention):
-class RetroDecoderCrossAttention(CrossAttention):
+# class RetroDecoderCrossAttention(CrossAttention):
+# class RetroDecoderCrossAttention(MegatronModule):
+class RetroDecoderCrossAttention(BaseRetroCrossAttention):
+
+    # def __init__(
+    #         self,
+    #         config: TransformerConfig,
+    #         spec: CrossAttentionSpec,
+    #         layer_number: int,
+    #         attn_mask_type: AttnMaskType,
+    #         add_retriever: bool,
+    #         **kwargs,
+    # ):
+    #     pax("spec")
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: CrossAttentionSpec,
+        layer_number: int = 1,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        add_retriever: bool = False,
+        **kwargs,
+    ):
+        super().__init__(
+            config=config,
+            spec=spec,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            # **kwargs,
+        )
+
+        pax("kwargs", "add_retriever")
+
+        # Retriever (bi-directional transformer with cross attention)
+        # if layer_type == LayerType.retro_decoder_with_retriever:
+        if add_retriever:
+            raise Exception("hi.")
+            self.retriever = ParallelTransformer(
+                config=config,
+                model_type=ModelType.retro_encoder,
+                self_attn_mask_type=AttnMaskType.padding,
+                pre_process=True,
+                post_process=False,
+            )
+            self._retriever_key = 'retriever' # necessary?
+        else:
+            self.retriever = None
 
     def forward(
         self,
@@ -65,10 +142,35 @@ class RetroDecoderLayerNorm(MegatronModule):
         self,
         config: TransformerConfig,
         spec: ModuleSpec,
+
+        # hidden_size=self.config.hidden_size,
+        # eps=self.config.layernorm_epsilon,
+        # persist_layer_norm=self.config.persist_layer_norm,
+        # sequence_parallel=self.config.sequence_parallel,
+        # zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+        # normalization=self.config.normalization,
+
+        # hidden_size: int,
+        # eps: float = 1e-5,
+        # sequence_parallel: bool = False,
+        # normalization: str = "LayerNorm",
+        **kwargs,
     ):
         super().__init__(config=config)
         self.spec = spec
-        pax("config", "spec")
+
+        self.norm = TENorm(
+            config=config,
+            # hidden_size=hidden_size,
+            # eps=eps,
+            # persist_layer_norm=config.persist_layer_norm,
+            # sequence_parallel=sequence_parallel,
+            # zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            # normalization=normalization,
+            **kwargs,
+        )
+
+        # pax("config", "spec")
 
 
 ###########################################################################
@@ -76,7 +178,8 @@ class RetroDecoderLayerNorm(MegatronModule):
 ###########################################################################
 
 
-class RetroEncoderCrossAttention(CrossAttention):
+# class RetroEncoderCrossAttention(CrossAttention):
+class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
     def forward(
         self,
@@ -123,10 +226,35 @@ class RetroEncoderLayerNorm(MegatronModule):
         self,
         config: TransformerConfig,
         # spec: ModuleSpec,
+
+        # hidden_size=self.config.hidden_size,
+        # eps=self.config.layernorm_epsilon,
+        # persist_layer_norm=self.config.persist_layer_norm,
+        # sequence_parallel=self.config.sequence_parallel,
+        # zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+        # normalization=self.config.normalization,
+
+        # hidden_size: int,
+        # eps: float = 1e-5,
+        # sequence_parallel: bool = False,
+        # normalization: str = "LayerNorm",
+        **kwargs,
     ):
         super().__init__(config=config)
         self.spec = spec
-        pax("spec")
+
+        self.norm = TENorm(
+            config=config,
+            # hidden_size=hidden_size,
+            # eps=eps,
+            # persist_layer_norm=config.persist_layer_norm,
+            # sequence_parallel=sequence_parallel,
+            # zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            # normalization=normalization,
+            **kwargs,
+        )
+
+        pax("config", "spec")
 
 
 # >>>

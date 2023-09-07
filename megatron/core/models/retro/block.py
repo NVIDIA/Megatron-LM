@@ -7,7 +7,7 @@ from typing import List
 
 from megatron.core import parallel_state # , tensor_parallel
 # from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-# from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -64,7 +64,7 @@ class NewTransformerBlock(MegatronModule):
 
         self._build_layers()
 
-        pax({"layers": self.layers})
+        # pax({"layers": [ L.cross_attention for L in self.layers ]})
 
     def _build_layers(self):
         # Transformer layers.
@@ -75,6 +75,7 @@ class NewTransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_number):
             layer = TransformerLayer(
+            # layer = RetroTransformerLayer(
                 config=self.config,
                 # >>>
                 # spec=transformer_layer_spec,
@@ -90,7 +91,10 @@ class NewTransformerBlock(MegatronModule):
         self.layers = torch.nn.ModuleList(
             [build_layer(i + 1) for i in range(len(self.layer_specs))])
 
-        pax({"layers": layers})
+        # pax({
+        #     "layers" : list(self.layers), # list(self.layers.modules())})
+        #     "cross attns" : [ L.cross_attention for L in self.layers ],
+        # })
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:
@@ -181,7 +185,16 @@ class NewTransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
+    def forward(
+            self,
+            hidden_states,
+            attention_mask,
+            inference_params=None,
+            rotary_pos_emb=None,
+            retriever_input=None,
+            retriever_output=None,
+            retriever_attn_mask=None,
+    ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -252,7 +265,18 @@ class NewTransformerBlock(MegatronModule):
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
+                        retriever_input=retriever_input,
+                        retriever_output=retriever_output,
+                        retriever_attn_mask=retriever_attn_mask,
                     )
+
+                    # First Retro decoder layer returns both hidden_states
+                    # and retriever_output. Make retriever_output available
+                    # to subsequence Retro layers.
+                    if isinstance(hidden_states, tuple):
+                        raise Exception("hi.")
+                        assert len(hidden_states) == 2
+                        hidden_states, retriever_output = hidden_states
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

@@ -89,6 +89,7 @@ def get_decoder_layer_spec(add_retriever) -> TransformerLayerSpec:
         module=RetroDecoderLayerNorm,
         # params={}, # None,
     )
+    # spec.add_retriever = True
     # pax("spec")
     return spec
 

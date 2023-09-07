@@ -36,6 +36,8 @@ def model_provider(pre_process=True, post_process=True):
     args = get_args()
     config = core_transformer_config_from_args(args)
 
+    pax("config")
+
     # NOTE: Experimental customization feature
     if args.model_spec is not None:
         # >>>
@@ -64,7 +66,7 @@ def model_provider(pre_process=True, post_process=True):
     )
 
     # >>>
-    pax("model")
+    # pax("model")
     # <<<
 
     return model
