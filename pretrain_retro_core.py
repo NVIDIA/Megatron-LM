@@ -13,7 +13,12 @@ from megatron.arguments import core_transformer_config_from_args
 # from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 # from megatron.core.models.gpt import GPTModel
-from megatron.core.models.retro import get_model_spec, RetroDecoderModel
+from megatron.core.models.retro import (
+    get_decoder_model_spec,
+    get_encoder_model_spec,
+    RetroDecoderModel,
+    RetroEncoderModel,
+)
 # from megatron.core.transformer.spec_utils import import_module
 # from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.training import pretrain
@@ -30,30 +35,39 @@ from lutil import pax
 # <<<
 
 
-def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
+# def get_spec(encoder=None):
+#     # NOTE: Experimental customization feature
+#     args = get_args()
+#     if args.model_spec is not None:
+#         return import_module(args.model_spec)()
+#     else:
+#         return get_model_spec(encoder=encoder)
 
+
+def get_encoder(config):
     args = get_args()
-    config = core_transformer_config_from_args(args)
-
-    pax("config")
-
-    # NOTE: Experimental customization feature
-    if args.model_spec is not None:
-        # >>>
-        raise Exception("hi.")
-        # <<<
-        model_spec = import_module(args.model_spec)()
-    else:
-        # retro_model_spec = get_retro_decoder_spec()
-        model_spec = get_model_spec()
-
-    # pax("model_spec")
-
-    print_rank_0('building Retro model ...')
-    model = RetroDecoderModel(
+    return RetroEncoderModel(
         config=config,
-        spec=model_spec,
+        # spec=get_spec(None),
+        spec=get_encoder_model_spec(),
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=True,
+        post_process=False,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent
+    )
+
+
+def get_decoder(config, pre_process, post_process, encoder):
+    args = get_args()
+    return RetroDecoderModel(
+        config=config,
+        # spec=get_spec(encoder),
+        spec=get_decoder_model_spec(encoder),
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
@@ -62,14 +76,24 @@ def model_provider(pre_process=True, post_process=True):
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent
+        rotary_percent=args.rotary_percent,
+        # retriever=retriever,
     )
 
-    # >>>
-    # pax("model")
-    # <<<
 
-    return model
+def model_provider(pre_process=True, post_process=True):
+    """Build the model."""
+
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+
+    print_rank_0('building Retro model ...')
+    encoder = get_encoder(config)
+    decoder = get_decoder(config, pre_process, post_process, encoder)
+
+    pax("encoder", "decoder")
+
+    return decoder
 
 
 # def get_batch(data_iterator):

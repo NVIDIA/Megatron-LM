@@ -179,6 +179,7 @@ class TransformerConfig(ModelParallelConfig):
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
+    # >>>
     # retro
     retro_workdir: str = None
     # retro_add_retriever: bool = False
@@ -190,6 +191,7 @@ class TransformerConfig(ModelParallelConfig):
     retro_num_retrieved_chunks: int = 2
     # retro_return_doc_ids: bool = False
     retro_preprocess: types.SimpleNamespace = None
+    # <<<
 
 
     def __post_init__(self):

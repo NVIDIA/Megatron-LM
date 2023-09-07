@@ -20,7 +20,6 @@ class BaseRetroCrossAttention(MegatronModule):
         spec: CrossAttentionSpec,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        # add_retriever: bool = False,
         **kwargs,
     ):
         super().__init__(config=config)
@@ -34,10 +33,8 @@ class BaseRetroCrossAttention(MegatronModule):
         )
 
         self.retro_num_neighbors = config.retro_num_neighbors
-        self.retro_chunk_length = config.retro_args.retro_gpt_chunk_length
-        self.retro_retrieved_length = config.retro_args.retro_gpt_retrieved_length
-
-        pax("self")
+        self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
+        self.retro_retrieved_length = config.retro_preprocess.retro_gpt_retrieved_length
 
 
 ###########################################################################
@@ -67,7 +64,8 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         spec: CrossAttentionSpec,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        add_retriever: bool = False,
+        # add_retriever: bool = False,
+        encoder: MegatronModule = None,
         **kwargs,
     ):
         super().__init__(
@@ -75,22 +73,38 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             spec=spec,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            # **kwargs,
+            **kwargs,
         )
 
-        pax("kwargs", "add_retriever")
+        pax("encoder")
+
+        if not add_retriever:
+            pax("kwargs", "add_retriever")
 
         # Retriever (bi-directional transformer with cross attention)
         # if layer_type == LayerType.retro_decoder_with_retriever:
         if add_retriever:
-            raise Exception("hi.")
-            self.retriever = ParallelTransformer(
+            from megatron.core.models.retro.model import RetroEncoderModel
+            self.retriever = RetroEncoderModel(
                 config=config,
                 model_type=ModelType.retro_encoder,
                 self_attn_mask_type=AttnMaskType.padding,
                 pre_process=True,
                 post_process=False,
             )
+            # self.retriever = RetroEncoderModel(
+            #     config=config,
+            #     spec=spec,
+            #     vocab_size=args.padded_vocab_size,
+            #     max_sequence_length=args.max_position_embeddings,
+            #     pre_process=True,
+            #     post_process=False,
+            #     fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            #     parallel_output=True,
+            #     share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            #     position_embedding_type=args.position_embedding_type,
+            #     rotary_percent=args.rotary_percent
+            # )
             self._retriever_key = 'retriever' # necessary?
         else:
             self.retriever = None
@@ -210,14 +224,14 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        # spec: ModuleSpec,
+        spec: ModuleSpec,
         # layer_number: int = 1,
         # attn_mask_type=AttnMaskType.padding,
         # **kwargs,
     ):
         super().__init__(config=config)
         self.spec = spec
-        pax("spec")
+        # pax("spec")
 
 
 class RetroEncoderLayerNorm(MegatronModule):
@@ -225,7 +239,7 @@ class RetroEncoderLayerNorm(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        # spec: ModuleSpec,
+        spec: ModuleSpec,
 
         # hidden_size=self.config.hidden_size,
         # eps=self.config.layernorm_epsilon,
@@ -254,7 +268,7 @@ class RetroEncoderLayerNorm(MegatronModule):
             **kwargs,
         )
 
-        pax("config", "spec")
+        # pax("config", "spec")
 
 
 # >>>

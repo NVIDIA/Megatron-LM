@@ -2,7 +2,7 @@
 
 import abc
 # import logging
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 # import torch
 from torch import Tensor
@@ -19,7 +19,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 # from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 from .block import NewTransformerBlock
-from .spec import RetroModelSpec
+from .spec import RetroDecoderModelSpec, RetroEncoderModelSpec
 
 # >>>
 from lutil import pax
@@ -57,12 +57,7 @@ class RetroModel(MegatronModule, abc.ABC):
     def __init__(
         self,
         config: TransformerConfig,
-        # >>>
-        # spec: TransformerLayerSpec,
-        # spec: TransformerSpec,
-        spec: RetroModelSpec,
-        # block_spec: NewTransformerBlockSpec,
-        # <<<
+        spec: Union[RetroEncoderModelSpec, RetroDecoderModelSpec],
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -359,6 +354,27 @@ class RetroModel(MegatronModule, abc.ABC):
 
 class RetroDecoderModel(RetroModel):
 
+    # def __init__(
+    #     self,
+    #     # retriever: RetroModel,
+    #     **kwargs,
+    #     # config: TransformerConfig,
+    #     # spec: RetroModelSpec,
+    #     # vocab_size: int,
+    #     # max_sequence_length: int,
+    #     # pre_process: bool = True,
+    #     # post_process: bool = True,
+    #     # fp16_lm_cross_entropy: bool = False,
+    #     # parallel_output: bool = True,
+    #     # share_embeddings_and_output_weights: bool = False,
+    #     # position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+    #     # rotary_percent: float = 1.0,
+    #     # seq_len_interpolation_factor: Optional[float] = None,
+    # ):
+    #     super().__init__(**kwargs)
+
+    #     pax("retriever")
+
     def get_num_layers(self):
 
         num_layers_per_pipeline_rank = self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
@@ -403,6 +419,40 @@ class RetroDecoderModel(RetroModel):
                 layer_specs.append(self.spec.retro_decoder_with_retriever_layer_spec)
             elif layer_number in retro_layer_numbers:
                 layer_specs.append(self.spec.retro_decoder_layer_spec)
+            else:
+                layer_specs.append(self.spec.gpt_layer_spec)
+
+        # pax({
+        #     "config" : self.config,
+        #     "spec" : self.spec,
+        #     "num_layers" : num_layers,
+        #     "retro_layer_numbers" : retro_layer_numbers,
+        #     # "layer_specs" : layer_specs,
+        #     "attn specs" : [ s.cross_attention for s in layer_specs ],
+        # })
+
+        return layer_specs
+
+
+class RetroEncoderModel(RetroModel):
+
+    def get_num_layers(self):
+        return self.config.retro_encoder_num_layers
+
+    def get_retro_layer_numbers(self):
+        return [1]
+
+    def get_layer_specs(self):
+
+        num_layers = self.get_num_layers()
+        retro_layer_numbers = self.get_retro_layer_numbers()
+
+        # pax("num_layers", "retro_layer_numbers")
+
+        layer_specs = []
+        for layer_number in range(1, num_layers + 1):
+            if layer_number in retro_layer_numbers:
+                layer_specs.append(self.spec.retro_encoder_layer_spec)
             else:
                 layer_specs.append(self.spec.gpt_layer_spec)
 

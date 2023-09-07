@@ -14,7 +14,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
 # from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
 
-from .spec import RetroModelSpec
+# from .spec import RetroModelSpec
 
 # >>>
 from lutil import pax
