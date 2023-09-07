@@ -15,10 +15,11 @@ sudo docker run --gpus all -td --rm \
 
 sudo docker exec $NAME /bin/bash -c "echo root:$PASSWORD | chpasswd"
 sudo docker exec $NAME apt update
-sudo docker exec $NAME apt install -yqq net-tools vim openssh-server screen
+sudo docker exec $NAME apt install -yqq net-tools vim openssh-server screen lm-sensors
 sudo docker exec $NAME /bin/bash -c "echo PermitRootLogin yes >> /etc/ssh/sshd_config"
 sudo docker exec $NAME service ssh start
 sudo docker exec $NAME pip3 install nltk
+sudo docker exec $NAME /bin/bash -c "echo cd /workspace/megatron >> /root/.bashrc"
 
 
 echo "Setting done"
