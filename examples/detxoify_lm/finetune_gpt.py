@@ -103,7 +103,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for GPT ...')
     train_ds, valid_ds1, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
-        data_impl=args.data_impl,
         splits_string=args.split,
         train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.seq_length,
@@ -113,7 +112,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     _, valid_ds, _ = build_train_valid_test_datasets(
         data_prefix=args.data_path2,
-        data_impl="mmap",
         splits_string="98,2,0",
         train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=2048,

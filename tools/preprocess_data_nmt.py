@@ -49,8 +49,6 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-    group.add_argument('--dataset-impl', type=str, default='mmap',
-                       choices=['lazy', 'cached', 'mmap'])
 
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, default=1,
@@ -84,9 +82,9 @@ def main():
     print(f"Output prefix: {args.output_prefix}")
     output_bin_file = "{}.bin".format(args.output_prefix)
     output_idx_file = "{}.idx".format(args.output_prefix)
-    builder = indexed_dataset.make_builder(output_bin_file,
-                                           impl=args.dataset_impl,
-                                           vocab_size=tokenizer.vocab_size)
+    builder = indexed_dataset.MMapIndexedDatasetBuilder(
+        output_bin_file, dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size)
+    )
 
     startup_end = time.time()
     proc_start = time.time()

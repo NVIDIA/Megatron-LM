@@ -89,7 +89,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for GPT ...')
     train_ds, valid_ds, test_ds = build_gpt_train_valid_test_datasets(
         data_prefix=args.retro_gpt_data_path,
-        data_impl=args.retro_gpt_data_impl,
         splits_string=args.retro_gpt_split,
         train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.retro_gpt_seq_length,
