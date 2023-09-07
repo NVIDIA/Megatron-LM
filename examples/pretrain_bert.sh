@@ -2,7 +2,11 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=<Specify path>
+# CHECKPOINT_PATH=<Specify path>
+# VOCAB_FILE=<Specify path to file>/bert-vocab.txt
+# DATA_PATH=<Specify path and file prefix>_text_sentence
+
+CHECKPOINT_PATH=/workspace/checkpoints
 VOCAB_FILE=<Specify path to file>/bert-vocab.txt
 DATA_PATH=<Specify path and file prefix>_text_sentence
 
