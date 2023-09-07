@@ -809,11 +809,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         The DDP's grad buffer is used for the reduce-scatter, and thus no
         tensors are dynamically allocated.
-
-        Note: this is a different order of reduction, versus the non-
-        distributed optimizer, which reduces: 1) layernorm grads, 2) all
-        grads, 3) embedding grads.
         """
+
+        # Reduce-scatter setup.
+        timers('grads-reduce-scatter', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        for model in self.models:
+            model.allreduce_gradients()
+        timers('grads-reduce-scatter').stop()
 
         # All-reduce layer-norm grads (for sequence parallelism).
         timers('layernorm-grads-all-reduce', log_level=1).start(
@@ -826,31 +829,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             barrier=args.barrier_with_L1_time)
         self.allreduce_embedding_grads(args)
         timers('embedding-grads-all-reduce').stop()
-
-        # Reduce-scatter setup.
-        timers('grads-reduce-scatter', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        data_parallel_rank = mpu.get_data_parallel_rank()
-        data_parallel_world_size = mpu.get_data_parallel_world_size()
-        data_parallel_group = mpu.get_data_parallel_group()
-
-        # Scale grad buffers by '1 / data_parallel_world_size'.
-        for model in self.models:
-            for dtype, gbuf in model.grad_buffers.items():
-                gbuf.data /= data_parallel_world_size
-
-        # Reduce-scatter all grads.
-        gbuf_view_items = self.get_model_grad_buffer_dp_views()
-        for index, (model_index, dtype, gbuf, gbuf_views) \
-            in enumerate(gbuf_view_items):
-
-            torch.distributed._reduce_scatter_base(
-                gbuf_views[data_parallel_rank],
-                gbuf,
-                group = data_parallel_group,
-            )
-
-        timers('grads-reduce-scatter').stop()
 
 
 

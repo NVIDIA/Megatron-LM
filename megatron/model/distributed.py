@@ -52,6 +52,7 @@ class Bucket:
         data: torch.Tensor,
         data_parallel_group: torch.distributed.ProcessGroup,
         overlap_grad_reduce: bool,
+        reduce_scatter: bool,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -62,8 +63,10 @@ class Bucket:
         self.data = data
         self.data_parallel_group = data_parallel_group
         self.overlap_grad_reduce = overlap_grad_reduce
+        self.reduce_scatter = reduce_scatter
 
         self.data_parallel_size = torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
 
         self.reset()
 
@@ -72,14 +75,32 @@ class Bucket:
         self.allreduce_handle = None
         self.allreduce_issued = False
 
+    def _get_local_view(self, buf):
+        assert buf.numel() % self.data_parallel_size == 0
+        shard_size = buf.numel() // self.data_parallel_size
+        return buf[
+            (self.data_parallel_rank * shard_size) : ((self.data_parallel_rank + 1) * shard_size)
+        ]
+
     def all_reduce(self):
         assert (
             self.allreduce_handle is None and not self.allreduce_issued
         ), 'Should not have multiple all-reduces in flight at once'
+
         self.data /= self.data_parallel_size
-        self.allreduce_handle = torch.distributed.all_reduce(
-            self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
-        )  # Use async_op only when overlap_grad_reduce is True.
+        # Use async_op only when overlap_grad_reduce is True.
+        if self.reduce_scatter:
+            local_data_view = self._get_local_view(self.data)
+            self.allreduce_handle = torch.distributed._reduce_scatter_base(
+                local_data_view,
+                self.data,
+                group=self.data_parallel_group,
+                async_op=self.overlap_grad_reduce,
+            )
+        else:
+            self.allreduce_handle = torch.distributed.all_reduce(
+                self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
+            )
         self.allreduce_issued = True
 
     def set(self, param: torch.nn.Parameter):
@@ -119,6 +140,7 @@ class GradBuffer(MemoryBuffer):
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
+        reduce_scatter: bool,
     ):
         super(GradBuffer, self).__init__(numel, numel_padded, dtype)
 
@@ -145,7 +167,9 @@ class GradBuffer(MemoryBuffer):
             bucket_data = self.get(
                 torch.Size([data_end_index - data_start_index]), data_start_index
             )
-            bucket = Bucket(bucket_params, bucket_data, data_parallel_group, overlap_grad_reduce)
+            bucket = Bucket(
+                bucket_params, bucket_data, data_parallel_group, overlap_grad_reduce, reduce_scatter
+            )
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
                 self.param_to_bucket[bucket_param] = bucket
@@ -273,6 +297,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         data_parallel_group: torch.distributed.ProcessGroup,
         accumulate_allreduce_grads_in_fp32: bool,
         overlap_grad_reduce: bool,
+        reduce_scatter: bool,
         bucket_size: int = 40000000,
     ):
         super(DistributedDataParallel, self).__init__(module)
@@ -324,6 +349,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 bucket_size,
                 param_to_name,
                 self.overlap_grad_reduce,
+                reduce_scatter,
             )
 
             # Parameters are laid out in the corresponding grad_buffer in reverse
