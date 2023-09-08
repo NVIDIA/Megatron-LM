@@ -12,7 +12,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
-from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
+from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
 class TransformerBlock(MegatronModule):
