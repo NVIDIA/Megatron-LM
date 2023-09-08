@@ -129,9 +129,7 @@ class TransformerLayer(MegatronModule):
         else:
             residual = hidden_states
 
-        bias_dropout_add_func = get_bias_dropout_add(
-            self.training, self.config.bias_dropout_fusion
-        )
+        bias_dropout_add_func = get_bias_dropout_add(self.training, self.config.bias_dropout_fusion)
 
         # bias_dropout_add fusion returning fp32 instead of bf16
         with self.bias_dropout_add_exec_handler():
