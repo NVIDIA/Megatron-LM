@@ -17,7 +17,7 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec
+from megatron.core.models.gpt.gpt_decoder_spec import gpt_model_with_transformer_engine_default_spec
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -27,10 +27,9 @@ def model_provider(pre_process=True, post_process=True):
 
     # NOTE: Experimental customization feature
     if args.model_spec is not None:
-        gpt_model_spec_func = import_module(args.model_spec)
-        gpt_model_spec = gpt_model_spec_func()
+        gpt_model_spec = import_module(args.model_spec)
     else:
-        gpt_model_spec = get_gpt_decoder_spec()
+        gpt_model_spec = gpt_model_with_transformer_engine_default_spec
 
     print_rank_0('building GPT model ...')
     model = GPTModel(
