@@ -123,10 +123,6 @@ class TransformerLayer(MegatronModule):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-        self.bias_dropout_add_func = get_bias_dropout_add(
-            self.training, self.config.bias_dropout_fusion
-        )
-
     def _get_layer_offset(self):
 
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -199,10 +195,18 @@ class TransformerLayer(MegatronModule):
             inference_params=inference_params,
         )
 
+<<<<<<< HEAD
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+=======
+        bias_dropout_add_func = get_bias_dropout_add(self.training, self.config.bias_dropout_fusion)
+
+        # bias_dropout_add fusion returning fp32 instead of bf16
+        with self.bias_dropout_add_exec_handler():
+            layernorm_input = bias_dropout_add_func(
+>>>>>>> main
                 attention_output_with_bias, residual, self.config.hidden_dropout
             )
 
