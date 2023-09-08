@@ -54,6 +54,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [BERT Task Evaluation](#bert-task-evaluation)
          * [RACE Evaluation](#race-evaluation)
          * [MNLI Evaluation](#mnli-evaluation)
+      * [Llama-2 Inference and Finetuning](#llama-2-inference-and-finetuning)
    * [Datasets](#datasets)
       * [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
@@ -331,7 +332,7 @@ We provide several command line arguments, detailed in the scripts listed below,
 Because evaluation requires substantially less memory than training, it may be advantageous to merge a model trained in parallel for use on fewer GPUs in downstream tasks. The following script accomplishes this. This example reads in a GPT model with 4-way tensor and 4-way pipeline model parallelism and writes out a model with 2-way tensor and 2-way pipeline model parallelism.
 
 <pre>
-python tools/checkpoint_util.py \
+python tools/checkpoint/util.py \
         --model-type GPT \
         --load-dir checkpoints/gpt3_tp4_pp4 \
         --save-dir checkpoints/gpt3_tp2_pp2 \
@@ -497,6 +498,12 @@ python tasks/main.py \
        --lr 5.0e-5 \
        --lr-warmup-fraction 0.065
 </pre>
+
+## Llama-2 Inference and Finetuning
+
+The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At the time of release, Llama-2 models achieved among the best results for open-source models, and were competitive with the closed-source GPT-3.5 model (see https://arxiv.org/pdf/2307.09288.pdf).
+
+The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning. See documentation [here](docs/llama2.md).
 
 # Datasets
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.

@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 import json
 import os
 import sys
@@ -222,6 +224,9 @@ def _load_checkpoint(queue, args):
 
     queue_put("embeddings", message)
 
+    # Layernorm has bias; RMSNorm does not.
+    norm_has_bias = md.checkpoint_args.normalization == "LayerNorm"
+
     total_layer_num = 0
     for vp_rank in range(vp_size):
         mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
@@ -236,10 +241,12 @@ def _load_checkpoint(queue, args):
 
                 # Get non-parallel tensors from tp_rank 0
                 layer = models[0].language_model.encoder.layers[layer_num]
-                message["input layernorm weight"] = layer.input_layernorm.weight.data
-                message["input layernorm bias"] = layer.input_layernorm.bias.data
-                message["post layernorm weight"] = layer.post_attention_layernorm.weight.data
-                message["post layernorm bias"] = layer.post_attention_layernorm.bias.data
+                message["input norm weight"] = layer.input_norm.weight.data
+                if norm_has_bias:
+                    message["input norm bias"] = layer.input_norm.bias.data
+                message["post norm weight"] = layer.post_attention_norm.weight.data
+                if norm_has_bias:
+                    message["post norm bias"] = layer.post_attention_norm.bias.data
                 if md.linear_bias:
                     message["dense bias"] = layer.self_attention.dense.bias.data
                     message["mlp l1 bias"] = layer.mlp.dense_4h_to_h.bias.data
@@ -289,12 +296,13 @@ def _load_checkpoint(queue, args):
 
                 total_layer_num = total_layer_num + 1
 
-    # Send final layernorm from tp_rank 0
+    # Send final norm from tp_rank 0
     message = {
-        "weight": models[0].language_model.encoder.final_layernorm.weight.data,
-        "bias": models[0].language_model.encoder.final_layernorm.bias.data
+        "weight": models[0].language_model.encoder.final_norm.weight.data,
     }
-    queue_put("final layernorm", message)
+    if norm_has_bias:
+        message["bias"] = models[0].language_model.encoder.final_norm.bias.data
+    queue_put("final norm", message)
 
     if md.output_layer:
         message = {
@@ -316,9 +324,10 @@ def _load_checkpoint(queue, args):
         message = {
             "dense weight": models[0].lm_head.dense.weight.data,
             "dense bias": models[0].lm_head.dense.bias.data,
-            "layernorm weight": models[0].lm_head.layernorm.weight.data,
-            "layernorm bias": models[0].lm_head.layernorm.bias.data
+            "norm weight": models[0].lm_head.norm.weight.data,
         }
+        if norm_has_bias:
+            message["norm bias"] = models[0].lm_head.norm.bias.data
         queue_put("lm head", message)
 
         if md.bert_binary_head:
