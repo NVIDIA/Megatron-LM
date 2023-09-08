@@ -62,7 +62,8 @@ class TestParallelTransformerBlock:
         config.recompute_granularity = 'full'
         config.recompute_method = 'block'
         config.recompute_num_layers = config.num_layers
-        full_transformer_block = TransformerBlock(config)
+        full_transformer_block = TransformerBlock(config,
+                                                  gpt_model_with_transformer_engine_default_spec)
         assert full_transformer_block.config.recompute_granularity == 'full'
         assert full_transformer_block.config.recompute_method == 'block'
 
@@ -85,7 +86,8 @@ class TestParallelTransformerBlock:
         transformer_config = self.transformer_config
         config = transformer_config
         config.recompute_granularity = 'selective'
-        selective_transformer_block = TransformerBlock(config)
+        selective_transformer_block = TransformerBlock(config,
+                                                       gpt_model_with_transformer_engine_default_spec)
         assert selective_transformer_block.config.recompute_granularity == 'selective'
         assert selective_transformer_block.checkpoint_core_attention
 

@@ -38,7 +38,7 @@ class TestSpecCustomization:
         self.attention_spec = SelfAttentionSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
-            layernorm_linear_qkv=TELayerNormColumnParallelLinear,
+            linear_qkv=TELayerNormColumnParallelLinear,
             dot_product_attention=TEDotProductAttention,
             linear_proj=TERowParallelLinear,
         )
