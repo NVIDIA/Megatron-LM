@@ -15,6 +15,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
 from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
 
+# >>>
+from lutil import pax
+# <<<
+
 
 def get_num_layers_to_build(config) -> int:
 
@@ -65,8 +69,9 @@ class TransformerBlock(MegatronModule):
         spec: TransformerBlockSpec,
         # <<<
         # >>>
+        # [ ... never used ... ]
         # self_attn_mask_type=AttnMaskType.padding,
-        attn_mask_type=AttnMaskType.padding,
+        # attn_mask_type=AttnMaskType.padding,
         # <<<
         post_layer_norm=True,
         pre_process=True,
@@ -80,9 +85,11 @@ class TransformerBlock(MegatronModule):
         self.spec = spec
         # <<<
 
+        # pax("spec")
+
         # >>>
         # self.self_attn_mask_type = self_attn_mask_type
-        self.attn_mask_type = attn_mask_type
+        # self.attn_mask_type = attn_mask_type
         # <<<
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
@@ -174,24 +181,27 @@ class TransformerBlock(MegatronModule):
     #             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
     #             normalization=self.config.normalization,
     #         )
-    def _build_layers(self, transformer_layer_spec):
+    def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(layer_number):
-            layer = TransformerLayer(
+        def build_layer(spec, layer_number):
+            return TransformerLayer(
                 config=self.config,
-                spec=transformer_layer_spec,
+                spec=spec,
                 layer_number=layer_number,
-                self_attn_mask_type=self.self_attn_mask_type,
+                # >>>
+                # self_attn_mask_type=self.self_attn_mask_type,
+                # attn_mask_type=self.attn_mask_type,
+                # <<<
             )
-            return layer
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
+        # self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
+        self.layers = torch.nn.ModuleList([build_layer(spec, i + 1) for i, spec in enumerate(self.spec.layers)])
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:

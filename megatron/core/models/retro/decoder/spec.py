@@ -17,32 +17,34 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
-from megatron.core.models.retro.attn import (
+from megatron.core.models.retro.attn import BaseRetroCrossAttention
+from megatron.core.models.retro.encoder import get_retro_encoder_block_spec
+from megatron.core.transformer import (
+    get_num_layers_to_build,
+    ModuleSpec,
+    TransformerBlockSpec,
+    TransformerConfig,
+    TransformerLayerSpec,
+)
+
+from .attn import (
     RetroDecoderBiasDropoutAdd,
     RetroDecoderCrossAttention,
     RetroDecoderLayerNorm,
 )
-from megatron.core.models.retro.encoder import get_retro_encoder_block_spec
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import (
-    get_num_layers_to_build,
-    TransformerBlockSpec,
-)
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
-
 
 # >>>
 from lutil import pax
 # <<<
 
 
-def get_retro_decoder_layer_spec(encoder=None) -> TransformerLayerSpec:
+def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpec:
     spec = get_gpt_layer_spec()
     spec.cross_attention=CrossAttentionSpec(
         module=RetroDecoderCrossAttention,
         params={
             "attn_mask_type" : AttnMaskType.causal,
-            "encoder" : encoder,
+            "encoder_block_spec" : encoder_block_spec,
         },
         layernorm_linear_q=TELayerNormColumnParallelLinear,
         layernorm_linear_kv=TELayerNormColumnParallelLinear,
@@ -57,38 +59,7 @@ def get_retro_decoder_layer_spec(encoder=None) -> TransformerLayerSpec:
     return spec
 
 
-# def get_decoder_layer_specs(config, pre_process, post_process, encoder_block):
-
-#     # Num layers.
-#     assert parallel_state.get_pipeline_model_parallel_world_size() == 1
-#     assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
-#     num_layers = config.num_layers
-
-#     # Retro layer numbers.
-#     retro_layer_start = 6 if self.config.num_layers <= 15 else 9
-#     retro_layer_numbers = list(range(retro_layer_start, self.config.num_layers + 1, 3))
-
-#     # Layer specs.
-#     layer_specs = []
-#     for layer_number in range(1, num_layers + 1):
-#         if layer_number == retro_layer_numbers[0]:
-#             layer_specs.append(self.spec.retro_decoder_with_retriever_layer_spec)
-#         elif layer_number in retro_layer_numbers:
-#             layer_specs.append(self.spec.retro_decoder_layer_spec)
-#         else:
-#             layer_specs.append(self.spec.gpt_layer_spec)
-
-#     pax({
-#         "config" : self.config,
-#         "spec" : self.spec,
-#         "num_layers" : num_layers,
-#         "retro_layer_numbers" : retro_layer_numbers,
-#         # "layer_specs" : layer_specs,
-#         "attn specs" : [ s.cross_attention for s in layer_specs ],
-#     })
-
-#     return layer_specs
-def get_retro_decoder_block_spec(config) -> TransformerBlockSpec:
+def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSpec:
 
     # Num layers.
     assert parallel_state.get_pipeline_model_parallel_world_size() == 1
@@ -100,12 +71,18 @@ def get_retro_decoder_block_spec(config) -> TransformerBlockSpec:
     retro_layer_start = 6 if num_layers <= 15 else 9
     retro_layer_numbers = list(range(retro_layer_start, num_layers + 1, 3))
 
+    # Layer specs.
     gpt_layer_spec = get_gpt_layer_spec()
     retro_layer_spec = get_retro_decoder_layer_spec()
     retro_layer_spec_with_retriever = \
-        get_retro_decoder_layer_spec(get_encoder_block_spec())
+        get_retro_decoder_layer_spec(get_retro_encoder_block_spec(config))
 
-    # Layer specs.
+    # pax(
+    #     "gpt_layer_spec",
+    #     "retro_layer_spec",
+    #     "retro_layer_spec_with_retriever",
+    # )
+
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
         if layer_number == retro_layer_numbers[0]:
@@ -118,17 +95,14 @@ def get_retro_decoder_block_spec(config) -> TransformerBlockSpec:
     # Block spec.
     block_spec = TransformerBlockSpec(layers=layer_specs)
 
-    pax({
-        "num_layers" : num_layers,
-        "retro_layer_numbers" : retro_layer_numbers,
-        "config" : config,
-        "spec" : spec,
-        "num_layers" : num_layers,
-        "retro_layer_numbers" : retro_layer_numbers,
-        "layer_specs" : layer_specs,
-        "attn specs" : [ s.cross_attention for s in layer_specs ],
-        "block_spec" : block_spec,
-    })
+    # pax({
+    #     "config" : config,
+    #     "num_layers" : num_layers,
+    #     "retro_layer_numbers" : retro_layer_numbers,
+    #     "layer_specs" : layer_specs,
+    #     "attn specs" : [ s.cross_attention for s in layer_specs ],
+    #     "block_spec" : [ L.cross_attention for L in block_spec.layers ],
+    # })
 
     return block_spec
 

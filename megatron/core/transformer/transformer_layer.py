@@ -69,14 +69,21 @@ class TransformerLayer(MegatronModule):
         config: TransformerConfig,
         spec: TransformerLayerSpec,
         layer_number: int = 1,
-        self_attn_mask_type=AttnMaskType.padding,
+        # >>>
+        # [ ... never used ... ]
+        # self_attn_mask_type=AttnMaskType.padding,
+        # attn_mask_type=AttnMaskType.padding,
+        # <<<
     ):
         super().__init__(config=config)
         self.config: TransformerConfig = config
 
         self.layer_number = layer_number + self._get_layer_offset()
 
-        self.self_attn_mask_type = self_attn_mask_type
+        # >>>
+        # self.self_attn_mask_type = self_attn_mask_type
+        # self.attn_mask_type = attn_mask_type
+        # <<<
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm

@@ -92,5 +92,5 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
             *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
         )
     except Exception as e:
-        raise Exception(f"error instantiating {module.__name__}, with error: {e}")
+        raise Exception(f"error instantiating {module.__name__}, with error: {type(e).__name__}: '{e}'")
     # <<<

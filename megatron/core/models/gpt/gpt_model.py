@@ -99,7 +99,11 @@ class GPTModel(MegatronModule):
         self.decoder = TransformerBlock(
             config=self.config,
             spec=spec,
-            self_attn_mask_type=AttnMaskType.causal,
+            # >>>
+            # [ ... never used ... ]
+            # self_attn_mask_type=AttnMaskType.causal,
+            # attn_mask_type=AttnMaskType.causal,
+            # <<<
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
