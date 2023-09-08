@@ -21,15 +21,15 @@ from .transformer_config import TransformerConfig
 
 @dataclass
 class SelfAttentionSpec(ModuleSpec):
-    layernorm_linear_qkv: Union[ModuleSpec, type] = None
+    linear_qkv: Union[ModuleSpec, type] = None
     dot_product_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
 @dataclass
 class CrossAttentionSpec(ModuleSpec):
-    layernorm_linear_q: Union[ModuleSpec, type] = None
-    layernorm_linear_kv: Union[ModuleSpec, type] = None
+    linear_q: Union[ModuleSpec, type] = None
+    linear_kv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
@@ -288,8 +288,8 @@ class SelfAttention(Attention):
             **kwargs,
         )
 
-        self.layernorm_linear_qkv = build_module(
-            spec.layernorm_linear_qkv,
+        self.linear_qkv = build_module(
+            spec.linear_qkv,
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -303,7 +303,7 @@ class SelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        mixed_qkv, _ = self.layernorm_linear_qkv(hidden_states)
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -364,8 +364,8 @@ class CrossAttention(Attention):
             )
         assert self.query_projection_size == self.kv_projection_size
 
-        self.layernorm_linear_q = build_module(
-            spec.layernorm_linear_q,
+        self.linear_q = build_module(
+            spec.linear_q,
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -374,8 +374,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
         )
 
-        self.layernorm_linear_kv = build_module(
-            spec.layernorm_linear_kv,
+        self.linear_kv = build_module(
+            spec.linear_kv,
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
@@ -390,7 +390,7 @@ class CrossAttention(Attention):
         from `key_value_states`.
         """
         # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
-        mixed_kv, _ = self.layernorm_linear_kv(key_value_states)
+        mixed_kv, _ = self.linear_kv(key_value_states)
 
         # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
         new_tensor_shape = mixed_kv.size()[:-1] + (
@@ -403,7 +403,7 @@ class CrossAttention(Attention):
         (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
-        query, _ = self.layernorm_linear_q(hidden_states)
+        query, _ = self.linear_q(hidden_states)
 
         # [sq, b, hp] --> [sq, b, np, hn]
         new_tensor_shape = query.size()[:-1] + (

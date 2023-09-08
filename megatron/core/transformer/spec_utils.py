@@ -55,11 +55,11 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
-    # If the passed `spec_or_module` is an already initialized module or if it's
+    # If the passed `spec_or_module` is
     # a `Function`, then return it as it is
-    if isinstance(spec_or_module, torch.nn.Module) or isinstance(
-        spec_or_module, types.FunctionType
-    ):
+    # NOTE: to support an already initialized module add the following condition
+    # `or isinstance(spec_or_module, torch.nn.Module)` to the following if check
+    if isinstance(spec_or_module, types.FunctionType):
         return spec_or_module
 
     # If the passed `spec_or_module` is actually a spec (instance of

@@ -23,14 +23,13 @@ class TransformerLayerSpec:
     self_attention: SelfAttentionSpec = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
-    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+    pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
     cross_attention: CrossAttentionSpec = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
-    post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-    ln_mlp: Union[ModuleSpec, type] = IdentityOp
+    pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+    mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
-    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
 
 
 class TransformerLayer(MegatronModule):
@@ -78,8 +77,8 @@ class TransformerLayer(MegatronModule):
         self.self_attn_bda = build_module(spec.self_attn_bda)
 
         ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
-        self.post_self_attn_layernorm = build_module(
-            spec.post_self_attn_layernorm,
+        self.pre_cross_attn_layernorm = build_module(
+            spec.pre_cross_attn_layernorm,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -100,8 +99,8 @@ class TransformerLayer(MegatronModule):
         self.cross_attn_bda = build_module(spec.cross_attn_bda)
 
         ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
-        self.post_cross_attn_layernorm = build_module(
-            spec.post_cross_attn_layernorm,
+        self.pre_mlp_layernorm = build_module(
+            spec.pre_mlp_layernorm,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -111,21 +110,10 @@ class TransformerLayer(MegatronModule):
         )
 
         ## [Module 8: MLP block]
-        self.ln_mlp = build_module(spec.ln_mlp, config=self.config)
+        self.mlp = build_module(spec.mlp, config=self.config)
 
         ## [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(spec.mlp_bda)
-
-        ## [Module 10: Post MLP] Optional Layernorm after MLP
-        self.post_mlp_layernorm = build_module(
-            spec.post_mlp_layernorm,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
-            persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization,
-        )
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -198,14 +186,14 @@ class TransformerLayer(MegatronModule):
             )
 
         # Optional Layer norm after self-attention
-        post_self_attn_layernorm_output = self.post_self_attn_layernorm(hidden_states)
+        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
         # Residual connection.
-        residual = post_self_attn_layernorm_output
+        residual = pre_cross_attn_layernorm_output
 
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
-            post_self_attn_layernorm_output,
+            pre_cross_attn_layernorm_output,
             attention_mask=attention_mask,
             context=context,
             inference_params=inference_params,
@@ -219,23 +207,20 @@ class TransformerLayer(MegatronModule):
             )
 
         # Optional Layer norm post the cross-attention.
-        post_cross_attn_layernorm_output = self.post_cross_attn_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         # Residual connection.
-        residual = post_cross_attn_layernorm_output
+        residual = pre_mlp_layernorm_output
 
         # MLP.
-        ln_mlp_output_with_bias = self.ln_mlp(post_cross_attn_layernorm_output)
+        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                ln_mlp_output_with_bias, residual, self.config.hidden_dropout
+                mlp_output_with_bias, residual, self.config.hidden_dropout
             )
-
-        # Optional Layer norm post MLP
-        output = self.post_mlp_layernorm(hidden_states)
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
@@ -244,7 +229,7 @@ class TransformerLayer(MegatronModule):
         # p2p_communication), it serves to document the origin of this
         # 'view' tensor.
         output = make_viewless_tensor(
-            inp=output, requires_grad=output.requires_grad, keep_graph=True
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
         return output
