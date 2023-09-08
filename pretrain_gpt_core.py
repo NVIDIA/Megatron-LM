@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain GPT"""
 
@@ -17,25 +17,30 @@ from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_decoder_spec
+from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_block_spec
 
-def model_provider(pre_process=True, post_process=True):
+# >>>
+# def model_provider(pre_process=True, post_process=True):
+def model_provider(pre_process=True, post_process=True, block_spec=None):
+# <<<
     """Build the model."""
 
     args = get_args()
     config = core_transformer_config_from_args(args)
 
     # NOTE: Experimental customization feature
-    if args.model_spec is not None:
-        gpt_model_spec_func = import_module(args.model_spec)
-        gpt_model_spec = gpt_model_spec_func()
+    if block_spec is not None:
+        pass
+    elif args.block_spec is not None:
+        block_spec_func = import_module(args.block_spec)
+        block_spec = block_spec_func()
     else:
-        gpt_model_spec = get_gpt_decoder_spec()
+        block_spec = get_gpt_block_spec()
 
     print_rank_0('building GPT model ...')
     model = GPTModel(
         config=config,
-        spec=gpt_model_spec,
+        spec=block_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
@@ -46,6 +51,7 @@ def model_provider(pre_process=True, post_process=True):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent
     )
+    pax("model")
     return model
 
 

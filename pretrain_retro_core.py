@@ -8,23 +8,19 @@
 from megatron import get_args
 # from megatron import get_timers
 # from megatron import get_tokenizer
-from megatron import print_rank_0
+# from megatron import print_rank_0
 from megatron.arguments import core_transformer_config_from_args
 # from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 # from megatron.core.models.gpt import GPTModel
-from megatron.core.models.retro import (
-    get_decoder_model_spec,
-    get_encoder_model_spec,
-    RetroDecoderModel,
-    RetroEncoderModel,
-)
+from megatron.core.models.retro import get_retro_decoder_block_spec
 # from megatron.core.transformer.spec_utils import import_module
 # from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.training import pretrain
 # from megatron.utils import average_losses_across_data_parallel_group
 # from megatron.utils import get_ltor_masks_and_position_ids
 
+from pretrain_gpt_core import model_provider as gpt_model_provider
 from pretrain_retro import (
     forward_step,
     train_valid_test_datasets_provider,
@@ -44,56 +40,94 @@ from lutil import pax
 #         return get_model_spec(encoder=encoder)
 
 
-def get_encoder(config):
-    args = get_args()
-    return RetroEncoderModel(
-        config=config,
-        # spec=get_spec(None),
-        spec=get_encoder_model_spec(),
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        pre_process=True,
-        post_process=False,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent
-    )
+# def get_encoder(config):
+#     args = get_args()
+#     return RetroEncoderModel(
+#         config=config,
+#         # spec=get_spec(None),
+#         spec=get_encoder_model_spec(),
+#         vocab_size=args.padded_vocab_size,
+#         max_sequence_length=args.max_position_embeddings,
+#         pre_process=True,
+#         post_process=False,
+#         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+#         parallel_output=True,
+#         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+#         position_embedding_type=args.position_embedding_type,
+#         rotary_percent=args.rotary_percent
+#     )
+# def get_encoder_block(config):
+#     args = get_args()
+#     # return RetroEncoderModel(
+#     return RetroEncoderBlock(
+#         config=config,
+#         # spec=get_spec(None),
+#         spec=get_encoder_model_spec(),
+#         vocab_size=args.padded_vocab_size,
+#         max_sequence_length=args.max_position_embeddings,
+#         pre_process=True,
+#         post_process=False,
+#         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+#         parallel_output=True,
+#         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+#         position_embedding_type=args.position_embedding_type,
+#         rotary_percent=args.rotary_percent
+#     )
 
 
-def get_decoder(config, pre_process, post_process, encoder):
-    args = get_args()
-    return RetroDecoderModel(
-        config=config,
-        # spec=get_spec(encoder),
-        spec=get_decoder_model_spec(encoder),
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        pre_process=pre_process,
-        post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        # retriever=retriever,
-    )
+# def get_decoder_model(config, pre_process, post_process, encoder):
+#     args = get_args()
+#     return RetroDecoderModel(
+#         config=config,
+#         # spec=get_spec(encoder),
+#         spec=get_decoder_model_spec(encoder),
+#         vocab_size=args.padded_vocab_size,
+#         max_sequence_length=args.max_position_embeddings,
+#         pre_process=pre_process,
+#         post_process=post_process,
+#         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+#         parallel_output=True,
+#         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+#         position_embedding_type=args.position_embedding_type,
+#         rotary_percent=args.rotary_percent,
+#         # retriever=retriever,
+#     )
 
 
+# def model_provider(pre_process=True, post_process=True):
+#     """Build the model."""
+
+#     args = get_args()
+#     config = core_transformer_config_from_args(args)
+
+#     print_rank_0('building Retro model ...')
+#     encoder = get_encoder(config)
+#     decoder = get_decoder(config, pre_process, post_process, encoder)
+
+#     # pax("encoder", "decoder")
+
+#     return decoder
+# def model_provider(pre_process=True, post_process=True):
+#     """Build the model."""
+
+#     args = get_args()
+#     config = core_transformer_config_from_args(args)
+
+#     print_rank_0('building Retro model ...')
+#     # encoder_layer_specs = get_encoder_layer_specs(config, )
+#     # decoder_layer_specs = get_decoder_layer_specs(config, pre_process, post_process, encoder_layer_specs)
+#     encoder_block = get_encoder_block(config)
+#     decoder_model = get_decoder_model(config, pre_process, post_process, encoder_block)
+    
+
+#     # pax("encoder", "decoder")
+
+#     return decoder
 def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
-
     args = get_args()
     config = core_transformer_config_from_args(args)
-
-    print_rank_0('building Retro model ...')
-    encoder = get_encoder(config)
-    decoder = get_decoder(config, pre_process, post_process, encoder)
-
-    # pax("encoder", "decoder")
-
-    return decoder
+    return gpt_model_provider(pre_process, post_process,
+                              block_spec=get_retro_decoder_block_spec(config))
 
 
 # def get_batch(data_iterator):

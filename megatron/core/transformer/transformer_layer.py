@@ -204,13 +204,17 @@ class TransformerLayer(MegatronModule):
         self,
         hidden_states,
         attention_mask,
+        # >>>
         context=None,
         context_mask=None,
+        # <<<
         inference_params=None,
         rotary_pos_emb=None,
-        retriever_input=None,
+        # >>>
+        # retriever_input=None,
         retriever_output=None,
-        retriever_attn_mask=None,
+        # retriever_attn_mask=None,
+        # <<<
     ):
         # hidden_states: [s, b, h]
 
@@ -242,15 +246,37 @@ class TransformerLayer(MegatronModule):
         residual = post_self_attn_layernorm_output
 
         # Cross attention.
+        # >>>
+        # attention_output_with_bias = self.cross_attention(
+        #     post_self_attn_layernorm_output,
+        #     attention_mask=attention_mask,
+        #     context=context,
+        #     inference_params=inference_params,
+        # )
+        # attention_output_with_bias = self.cross_attention(
+
+        #     context=context,
+        #     context_mask=context_mask,
+
+        #     layernorm_input=hidden_states,
+        #     layernorm_output=post_self_attn_layernorm_output,
+
+        #     inference_params=inference_params,
+
+        #     retriever_input=retriever_input,
+        #     retriever_output=retriever_output,
+        #     retriever_attn_mask=retriever_attn_mask,
+
+        # )
         attention_output_with_bias = self.cross_attention(
-            post_self_attn_layernorm_output,
-            attention_mask=attention_mask,
-            context=context,
+            hidden_states=post_self_attn_layernorm_output,
+            attention_mask=context_mask,
+            key_value_states=context,
+            # residual = post_self_attn_layernorm_output if apply_post else ...
             inference_params=inference_params,
-            retriever_input=retriever_input,
             retriever_output=retriever_output,
-            retriever_attn_mask=retriever_attn_mask,
         )
+        # <<<
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

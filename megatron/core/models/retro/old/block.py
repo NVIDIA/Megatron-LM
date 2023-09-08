@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+? ? ? [ use transformer/transformer_block.py ]
+
 # import re
 from contextlib import nullcontext
 import torch
@@ -35,16 +37,9 @@ class NewTransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        # >>>
-        # spec: TransformerLayerSpec,
-        # spec: RetroTransformerBlockSpec,
-        # spec: NewTransformerBlockSpec,
         layer_specs: List[TransformerLayerSpec],
-        # <<<
-        # >>>
         # self_attn_mask_type=AttnMaskType.padding,
         self_attn_mask_type: AttnMaskType,
-        # <<<
         post_layer_norm=True,
         pre_process=True,
         post_process=True,

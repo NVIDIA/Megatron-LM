@@ -79,29 +79,79 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         self.encoder = encoder
         # self._encoder_key = 'encoder' # necessary?
 
+    # def forward(
+    #     self,
+    #     hidden_states,
+    #     attention_mask,
+    #     key_value_states=None,
+    #     inference_params=None,
+    #     rotary_pos_emb=None,
+    #     # add_retriever=None,
+    #     retriever_input=None,
+    #     retriever_output=None,
+    #     retriever_attn_mask=None,
+    # ):
+    #     # hidden_states: [sq, b, h]
+
+    #     pax(
+    #         "hidden_states",
+    #         "attention_mask",
+    #         "key_value_states",
+    #         "inference_params",
+    #         "rotary_pos_emb",
+    #         "retriever_input",
+    #         "retriever_output",
+    #         "retriever_attn_mask",
+    #     )
+
+    #     attention_output_with_bias = self.attn( # super()(
+    #         hidden_states=hidden_states,
+    #         attention_mask=attention_mask,
+    #         key_value_states=key_value_states,
+    #         # key_value_states=retriever_input,
+    #         inference_params=inference_params,
+    #         rotary_pos_emb=rotary_pos_emb,
+    #     )
+
+    #     pax("attention_output_with_bias")
+
+    #     assert isinstance(add_retriever, bool), "'add_retriever' must be defined."
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
+        context=None,
+        context_mask=None,
+        layernorm_input=None,
+        layernorm_output=None,
         inference_params=None,
-        rotary_pos_emb=None,
-        add_retriever=None,
+        # rotary_pos_emb=None, # unsupported for retro.
+        retriever_input=None,
+        retriever_output=None,
+        retriever_attn_mask=None,
     ):
         # hidden_states: [sq, b, h]
 
-        attention_output_with_bias = super()(
+        # >>>
+        # context=context,
+        # context_mask=context_mask,
+
+        # layernorm_input=hidden_states,
+        # layernorm_output=post_self_attn_layernorm_output,
+
+        # inference_params=inference_params,
+
+        # retriever_input=retriever_input,
+        # retriever_output=retriever_output,
+        # retriever_attn_mask=retriever_attn_mask,
+        # <<<
+
+        attention_output_with_bias = self.attn( # super()(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             key_value_states=key_value_states,
+            # key_value_states=retriever_input,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
         )
-
-        pax("attention_output_with_bias")
-
-        assert isinstance(add_retriever, bool), "'add_retriever' must be defined."
-
 
 # class RetroDecoderWithRetrieverBiasDropoutAdd(MegatronModule):
 class RetroDecoderBiasDropoutAdd(MegatronModule):
@@ -172,11 +222,13 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         key_value_states=None,
         inference_params=None,
         rotary_pos_emb=None,
-        add_retriever=None,
+        retriever_input=None,
+        retriever_output=None,
+        retriever_attn_mask=None,
     ):
         # hidden_states: [sq, b, h]
 
-        attention_output_with_bias = super()(
+        attention_output_with_bias = self.attn( # super()(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             key_value_states=key_value_states,

@@ -2,8 +2,9 @@
 
 import re
 from contextlib import nullcontext
-
+from dataclasses import dataclass
 import torch
+from typing import List
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -15,24 +16,74 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
 
 
+def get_num_layers_to_build(config) -> int:
+
+    num_layers_per_pipeline_rank = \
+        config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        # Interleaved pipeline parallelism:
+        # Number of layers in each model chunk is the number of layers in the stage,
+        # divided by the number of model chunks in a stage.
+        # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
+        # layers to stages like (each list is a model chunk):
+        # Stage 0: [0]  [2]  [4]  [6]
+        # Stage 1: [1]  [3]  [5]  [7]
+        # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
+        # layers to stages like (each list is a model chunk):
+        # Stage 0: [0, 1]  [4, 5]
+        # Stage 1: [2, 3]  [6, 7]
+
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+
+        num_layers_to_build = num_layers_per_virtual_rank
+
+    else:
+        # Non-interleaved pipeline parallelism:
+        # Each stage gets a contiguous set of layers.
+
+        num_layers_to_build = num_layers_per_pipeline_rank
+
+    return num_layers_to_build
+
+
+@dataclass
+class TransformerBlockSpec:
+    layers: List[TransformerLayerSpec] = None
+
+
 class TransformerBlock(MegatronModule):
     """Transformer class."""
 
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerLayerSpec,
-        self_attn_mask_type=AttnMaskType.padding,
+        # >>>
+        # spec: TransformerLayerSpec,
+        spec: TransformerBlockSpec,
+        # <<<
+        # >>>
+        # self_attn_mask_type=AttnMaskType.padding,
+        attn_mask_type=AttnMaskType.padding,
+        # <<<
         post_layer_norm=True,
         pre_process=True,
         post_process=True,
     ):
         super().__init__(config=config)
 
-        self.config: TransformerConfig = config
-        self.transformer_layer_spec: TransformerLayerSpec = spec
+        # >>>
+        # self.config: TransformerConfig = config
+        # self.transformer_layer_spec: TransformerLayerSpec = spec
+        self.spec = spec
+        # <<<
 
-        self.self_attn_mask_type = self_attn_mask_type
+        # >>>
+        # self.self_attn_mask_type = self_attn_mask_type
+        self.attn_mask_type = attn_mask_type
+        # <<<
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -42,12 +93,87 @@ class TransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        self.num_layers_per_pipeline_rank = (
-            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-        )
+        # >>>
+        # self.num_layers_per_pipeline_rank = (
+        #     self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+        # )
+        # <<<
 
-        self._build_layers(self.transformer_layer_spec)
+        # >>>
+        # self._build_layers(self.transformer_layer_spec)
+        self._build_layers()
 
+    # >>>
+    # def _build_layers(self, transformer_layer_spec):
+    #     # Transformer layers.
+    #     # @jcasper can we improve how we deal with layer_number?
+    #     # currently it's only used in CoreAttention?
+    #     # if self.apply_query_key_layer_scaling:
+    #     #     coeff = self.layer_number
+    #     #     self.norm_factor *= coeff
+    #     def build_layer(layer_number):
+    #         layer = TransformerLayer(
+    #             config=self.config,
+    #             spec=transformer_layer_spec,
+    #             layer_number=layer_number,
+    #             self_attn_mask_type=self.self_attn_mask_type,
+    #         )
+    #         return layer
+
+    #     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+    #         # Interleaved pipeline parallelism:
+    #         # Number of layers in each model chunk is the number of layers in the stage,
+    #         # divided by the number of model chunks in a stage.
+    #         # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
+    #         # layers to stages like (each list is a model chunk):
+    #         # Stage 0: [0]  [2]  [4]  [6]
+    #         # Stage 1: [1]  [3]  [5]  [7]
+    #         # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
+    #         # layers to stages like (each list is a model chunk):
+    #         # Stage 0: [0, 1]  [4, 5]
+    #         # Stage 1: [2, 3]  [6, 7]
+
+    #         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    #         num_layers_per_virtual_rank = self.num_layers_per_pipeline_rank // vp_size
+
+    #         num_layers_to_build = num_layers_per_virtual_rank
+
+    #     else:
+    #         # Non-interleaved pipeline parallelism:
+    #         # Each stage gets a contiguous set of layers.
+
+    #         num_layers_to_build = self.num_layers_per_pipeline_rank
+
+    #     # offset is implicit in TransformerLayer
+    #     self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
+
+    #     # # TODO: add back standalone_embedding_stage
+    #     # if self.num_layers == 0:
+    #     #     # When a standalone embedding stage is used (e.g.,
+    #     #     # args.standalone_embedding_stage == True), virtual pipeline ranks
+    #     #     # on pipeline rank 0 will have zero transformer layers assigned to
+    #     #     # them. This results in the model's input and output tensors to be
+    #     #     # the same, which will cause failure for certain output tensor
+    #     #     # optimizations (e.g., pipeline output deallocation). To remedy
+    #     #     # this, we assign a 'no-op' layer on these ranks, which will
+    #     #     # disconnect the input tensor from the output tensor.
+    #     #     self.num_layers = 1
+    #     #     self.layers = torch.nn.ModuleList([NoopTransformerLayer(1)])
+    #     # else:
+    #     #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
+
+    #     if self.post_process and self.post_layer_norm:
+    #         # Final layer norm before output.
+    #         self.final_layernorm = TENorm(
+    #             config=self.config,
+    #             hidden_size=self.config.hidden_size,
+    #             eps=self.config.layernorm_epsilon,
+    #             persist_layer_norm=self.config.persist_layer_norm,
+    #             sequence_parallel=self.config.sequence_parallel,
+    #             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+    #             normalization=self.config.normalization,
+    #         )
     def _build_layers(self, transformer_layer_spec):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -63,31 +189,6 @@ class TransformerBlock(MegatronModule):
                 self_attn_mask_type=self.self_attn_mask_type,
             )
             return layer
-
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-            # Interleaved pipeline parallelism:
-            # Number of layers in each model chunk is the number of layers in the stage,
-            # divided by the number of model chunks in a stage.
-            # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
-            # layers to stages like (each list is a model chunk):
-            # Stage 0: [0]  [2]  [4]  [6]
-            # Stage 1: [1]  [3]  [5]  [7]
-            # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
-            # layers to stages like (each list is a model chunk):
-            # Stage 0: [0, 1]  [4, 5]
-            # Stage 1: [2, 3]  [6, 7]
-
-            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-
-            num_layers_per_virtual_rank = self.num_layers_per_pipeline_rank // vp_size
-
-            num_layers_to_build = num_layers_per_virtual_rank
-
-        else:
-            # Non-interleaved pipeline parallelism:
-            # Each stage gets a contiguous set of layers.
-
-            num_layers_to_build = self.num_layers_per_pipeline_rank
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
@@ -118,6 +219,7 @@ class TransformerBlock(MegatronModule):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 normalization=self.config.normalization,
             )
+    # <<<
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

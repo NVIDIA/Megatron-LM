@@ -120,6 +120,7 @@ class RetroModel(MegatronModule, abc.ABC):
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
+        # self.decoder = RetroDecoderBlock()
 
         # pax({"decoder": self.decoder})
 
