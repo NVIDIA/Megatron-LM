@@ -24,7 +24,7 @@ class TestParallelMLP:
         assert isinstance(self.mlp, MLP)
 
         num_weights = sum([p.numel() for p in self.mlp.parameters()])
-        assert num_weights == 1236
+        assert num_weights == 1212
 
     """
     def test_cpu_forward(self, mlp):

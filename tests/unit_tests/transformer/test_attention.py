@@ -59,7 +59,8 @@ class TestParallelAttention:
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity='selective'
-        checkpointed_parallel_attention = SelfAttention(transformer_config)
+        checkpointed_parallel_attention = SelfAttention(transformer_config,
+                                                        gpt_model_with_transformer_engine_default_spec.self_attention)
         config = checkpointed_parallel_attention.config
 
         sequence_length = 32
