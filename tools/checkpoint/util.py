@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 import argparse
 import importlib
 import torch.multiprocessing as mp
@@ -87,7 +89,7 @@ import sys
 # - "done"
 
 def load_plugin(plugin_type, name):
-    module_name = f"checkpoint_{plugin_type}_{name}"
+    module_name = f"{plugin_type}_{name}"
     try:
         plugin = importlib.import_module(module_name)
     except ModuleNotFoundError:
