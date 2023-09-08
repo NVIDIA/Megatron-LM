@@ -24,6 +24,8 @@ class GPTModel(MegatronModule):
     Arguments:
         config (TransformerConfig): transformer config
 
+        spec (TransformerLayerSpec): transformer layer customization spec
+
         vocab_size (int): vocabulary size
 
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -64,6 +66,7 @@ class GPTModel(MegatronModule):
         super(GPTModel, self).__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.spec: TransformerLayerSpec = spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -99,7 +102,7 @@ class GPTModel(MegatronModule):
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            spec=spec,
+            spec=self.spec,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
