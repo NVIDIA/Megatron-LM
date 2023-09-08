@@ -8,6 +8,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.models.gpt.gpt_decoder_spec import gpt_model_with_transformer_engine_default_spec
 
 class TestGPTModel:
 
@@ -15,10 +16,10 @@ class TestGPTModel:
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        self.gpt_model = GPTModel(config=transformer_config, vocab_size=100, max_sequence_length=4)
-        
+        self.gpt_model = GPTModel(config=transformer_config, spec=gpt_model_with_transformer_engine_default_spec, vocab_size=100, max_sequence_length=4)
+
     def teardown_method(self, method):
-        Utils.destroy_model_parallel()    
+        Utils.destroy_model_parallel()
 
     def test_constructor(self):
         assert isinstance(self.gpt_model, GPTModel)
