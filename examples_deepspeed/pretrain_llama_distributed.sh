@@ -36,6 +36,10 @@ LR_WARMUP_STEPS=2000
 WEIGHT_DECAY=0.1
 GRAD_CLIP=1
 
+## Activation checkpointing saves GPU memory, but reduces training speed
+# activation_checkpoint="true"
+activation_checkpoint="false"
+
 # Below configuration required for llama model as per llama paper
 # --no-query-key-layer-scaling \
 # --attention-dropout 0 \
@@ -67,8 +71,18 @@ ds_args=""
 ds_args=" --deepspeed ${ds_args}"
 ds_args=" --deepspeed_config=$DS_CONFIG ${ds_args}"
 ds_args=" --zero-stage=$ZERO_STAGE ${ds_args}"
-ds_args=" --deepspeed-activation-checkpointing ${ds_args}"
 
+if [ "${activation_checkpoint}" = "true" ]; then
+  ds_args="--deepspeed-activation-checkpointing ${ds_args}"
+
+  ## old argument for recomputing the transformer layer
+  # ds_args="--checkpoint-activations ${ds_args}"
+
+  ## new argument for recomputing the transformer layer
+  ds_args="--recompute-granularity full --recompute-method uniform ${ds_args}"
+  ## new argument for recomputing only the attention layer
+  # ds_args="--recompute-granularity selective ${ds_args}"
+fi
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 

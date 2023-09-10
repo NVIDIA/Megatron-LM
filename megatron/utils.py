@@ -271,7 +271,7 @@ def throughput_calculator(model, args, iteration_time, total_iterations):
     checkpoint_activations_factor = 3
     if hasattr(args, 'checkpoint_activations') and args.checkpoint_activations:
         checkpoint_activations_factor = 4
-    if hasattr(args, 'recompute_granularity') and args.recompute_granularity == 'selective':
+    if hasattr(args, 'recompute_granularity') and (args.recompute_granularity == 'selective' or args.recompute_granularity == 'full'):
         checkpoint_activations_factor = 4
     seq_len = args.seq_length
     if hasattr(args, 'actual_seq_length'):

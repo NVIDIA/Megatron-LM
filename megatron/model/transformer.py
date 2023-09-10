@@ -608,10 +608,6 @@ class ParallelAttention(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True)
 
-        if deepspeed.checkpointing.is_configured():
-            global get_cuda_rng_tracker, checkpoint
-            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
-            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -1730,10 +1726,6 @@ class ParallelTransformer(MegatronModule):
                         eps=config.layernorm_epsilon)
             else:
                 self.final_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
-        if deepspeed.checkpointing.is_configured():
-            global get_cuda_rng_tracker, checkpoint
-            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
-            checkpoint = deepspeed.checkpointing.checkpoint
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]

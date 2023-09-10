@@ -26,6 +26,8 @@ from .utils import (
 
 from megatron.core.utils import safely_set_viewless_tensor_data
 
+import deepspeed
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
@@ -168,9 +170,11 @@ class CudaRNGStatesTracker:
 # RNG tracker object.
 _CUDA_RNG_STATE_TRACKER = CudaRNGStatesTracker()
 
-
 def get_cuda_rng_tracker():
     """Get cuda rng tracker."""
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.get_cuda_rng_tracker()
+    
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -191,6 +195,9 @@ def model_parallel_cuda_manual_seed(seed):
                               groups. This is used for example for dropout in
                               model parallel regions.
     """
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.model_parallel_cuda_manual_seed(seed)
+    
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
     tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
@@ -307,5 +314,8 @@ class CheckpointFunction(torch.autograd.Function):
 def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.checkpoint(function, *args)
+    
     return CheckpointFunction.apply(function,
                                     distribute_saved_activations, *args)
