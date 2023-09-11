@@ -57,7 +57,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         key_value_states=None,
         inference_params=None,
         # rotary_pos_emb=None, # ... unsupported for retro.
-        retriever_output=None,
+        # retriever_output=None,
     ):
         # hidden_states: [sq, b, h]
 

@@ -47,8 +47,8 @@ class TransformerLayer(MegatronModule):
         layer_number: int = 1,
     ):
         super().__init__(config=config)
-        self.config: TransformerConfig = config
 
+        self.spec = spec
         self.layer_number = layer_number + self._get_layer_offset()
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -176,9 +176,6 @@ class TransformerLayer(MegatronModule):
         context_mask=None,
         inference_params=None,
         rotary_pos_emb=None,
-        # >>>
-        # retriever_output=None,
-        # <<<
     ):
         # hidden_states: [s, b, h]
 
@@ -215,9 +212,6 @@ class TransformerLayer(MegatronModule):
             attention_mask=context_mask,
             key_value_states=context,
             inference_params=inference_params,
-            # >>>
-            # retriever_output=retriever_output,
-            # <<<
         )
 
         if isinstance(attention_output_with_bias, dict) \
@@ -260,13 +254,7 @@ class TransformerLayer(MegatronModule):
             inp=output, requires_grad=output.requires_grad, keep_graph=True
         )
 
-        # >>>
-        # if retriever_output is None:
-        #     return output
-        # else:
-        #     return output, retriever_output
         return output, context
-        # <<<
 
     def sharded_state_dict(self, prefix=''):
 
