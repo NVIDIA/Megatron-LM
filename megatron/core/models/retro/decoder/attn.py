@@ -61,10 +61,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
     ):
         # hidden_states: [sq, b, h]
 
-        layernorm_output = hidden_states
-        retriever_input = key_value_states
-        retriever_attn_mask = attention_mask
-
         """Cross attention for Retro decoder.
 
         Notation:
@@ -77,7 +73,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
-        ns, bs, d = layernorm_output.shape
+        ns, bs, d = hidden_states.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
 
         # Retrieve neighbors.
@@ -86,7 +82,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             if first_ns > 0:
                 raise Exception("test this case.")
                 first_chunk, rest_chunk = \
-                    layernorm_output[:first_ns], layernorm_output[first_ns:]
+                    hidden_states[:first_ns], hidden_states[first_ns:]
                 first_chunk = torch.nn.functional.pad(
                     first_chunk,
                     (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
@@ -95,7 +91,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 chunked_output = \
                     torch.cat((first_chunk, rest_chunk), dim=0) # [l * m, bs, d]
             else:
-                chunked_output = layernorm_output # [l * m, bs, d]
+                chunked_output = hidden_states # [l * m, bs, d]
             chunked_output = chunked_output \
                 .reshape(l, self.retro_chunk_length, bs, d) \
                 .permute(1, 2, 0, 3) \
@@ -103,18 +99,18 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 .contiguous()
 
             # Get Encoder Output
-            retriever_output = self.encoder(
-                hidden_states=retriever_input,
-                attention_mask=retriever_attn_mask,
+            key_value_states = self.encoder(
+                hidden_states=key_value_states,
+                attention_mask=attention_mask,
                 context=chunked_output,
                 context_mask=None,
                 inference_params=inference_params) # [r, k * bs * l , d]
-            retriever_output = retriever_output.reshape(
+            key_value_states = key_value_states.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
 
         # Chunks.
         pad = (ns - 1) % self.retro_chunk_length
-        attending_chunks = layernorm_output[pad:]
+        attending_chunks = hidden_states[pad:]
         padded_chunks = torch.nn.functional.pad(
             attending_chunks,
             (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
@@ -129,7 +125,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         attention_output, attention_bias = \
             self.attn(padded_chunked_output,
                       None,
-                      key_value_states=retriever_output)
+                      key_value_states=key_value_states)
 
         # Return dimensions for bias-dropout step.
         return {
@@ -140,8 +136,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             "pad" : pad,
             "attention_output" : attention_output,
             "attention_bias" : attention_bias,
-            # "retriever_output" : retriever_output,
-            "context" : retriever_output,
+            "context" : key_value_states,
         }
 
 

@@ -28,9 +28,6 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
     ):
         # hidden_states: [sq, b, h]
 
-        layernorm_output = hidden_states
-        retriever_output = key_value_states
-
         """Cross attention for Retro encoder.
 
         Notation:
@@ -42,13 +39,13 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
-        ns, bs, d = layernorm_output.shape # [r, bs * l * k, d]
+        ns, bs, d = hidden_states.shape # [r, bs * l * k, d]
 
         # Divide sequence dimension into chunks.
-        chunked_outputs = layernorm_output.reshape(self.retro_retrieved_length,
-                                                   -1,
-                                                   self.retro_num_neighbors,
-                                                   d)
+        chunked_outputs = hidden_states.reshape(self.retro_retrieved_length,
+                                                -1,
+                                                self.retro_num_neighbors,
+                                                d)
 
         # Per-chunk attention.
         attention_output_tuples = []
@@ -59,7 +56,7 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             attention_output, attention_bias = self.attn(
                 hidden_states=chunked_output, # Q (neighbor embedding)
                 attention_mask=None,
-                key_value_states=retriever_output) # K, V (hidden act)
+                key_value_states=key_value_states) # K, V (hidden act)
 
             # Residual connection.
             residual = chunked_output
