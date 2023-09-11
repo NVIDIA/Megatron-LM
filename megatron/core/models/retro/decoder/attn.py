@@ -131,6 +131,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                       None,
                       key_value_states=retriever_output)
 
+        # Return dimensions for bias-dropout step.
         return {
             "ns" : ns,
             "bs" : bs,
@@ -139,7 +140,8 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             "pad" : pad,
             "attention_output" : attention_output,
             "attention_bias" : attention_bias,
-            "retriever_output" : retriever_output,
+            # "retriever_output" : retriever_output,
+            "context" : retriever_output,
         }
 
 

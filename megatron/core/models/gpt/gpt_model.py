@@ -136,16 +136,12 @@ class GPTModel(MegatronModule):
         input_ids: Tensor,
         position_ids: Tensor,
         attention_mask: Tensor,
+        context_input_ids: Tensor = None,
+        context_position_ids: Tensor = None,
+        context_mask: Tensor = None,
         decoder_input: Tensor = None,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
-        # >>>
-        # context,
-        # context_mask,
-        retriever_input_ids: Tensor = None,
-        retriever_position_ids: Tensor = None,
-        retriever_attn_mask: Tensor = None,
-        # <<<
     ):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -160,13 +156,11 @@ class GPTModel(MegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # >>>
-        if retriever_input_ids is not None:
-            retriever_input = self.embedding(retriever_input_ids,
-                                             retriever_position_ids)
+        # Context embedding (e.g., for Retro neighbor tokens).
+        if context_input_ids is not None:
+            context = self.embedding(context_input_ids, context_position_ids)
         else:
-            retriever_input = None
-        # <<<
+            context = None
 
         # Rotary positional embeddings
         rotary_pos_emb = None
@@ -189,12 +183,10 @@ class GPTModel(MegatronModule):
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
-            # >>>
-            context=retriever_input,
-            context_mask=retriever_attn_mask,
-            # <<<
         )
 
         if not self.post_process:

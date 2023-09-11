@@ -176,7 +176,9 @@ class TransformerLayer(MegatronModule):
         context_mask=None,
         inference_params=None,
         rotary_pos_emb=None,
-        retriever_output=None,
+        # >>>
+        # retriever_output=None,
+        # <<<
     ):
         # hidden_states: [s, b, h]
 
@@ -213,12 +215,14 @@ class TransformerLayer(MegatronModule):
             attention_mask=context_mask,
             key_value_states=context,
             inference_params=inference_params,
-            retriever_output=retriever_output,
+            # >>>
+            # retriever_output=retriever_output,
+            # <<<
         )
 
         if isinstance(attention_output_with_bias, dict) \
-           and "retriever_output" in attention_output_with_bias:
-            retriever_output = attention_output_with_bias["retriever_output"]
+           and "context" in attention_output_with_bias:
+            context = attention_output_with_bias["context"]
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -256,10 +260,13 @@ class TransformerLayer(MegatronModule):
             inp=output, requires_grad=output.requires_grad, keep_graph=True
         )
 
-        if retriever_output is None:
-            return output
-        else:
-            return output, retriever_output
+        # >>>
+        # if retriever_output is None:
+        #     return output
+        # else:
+        #     return output, retriever_output
+        return output, context
+        # <<<
 
     def sharded_state_dict(self, prefix=''):
 

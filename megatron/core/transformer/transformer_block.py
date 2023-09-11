@@ -258,24 +258,15 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                 )
             else:
-                retriever_output = None
                 for layer in self.layers:
-                    hidden_states = layer(
+                    hidden_states, context = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
-                        retriever_output=retriever_output,
                     )
-
-                    # First Retro decoder layer returns both hidden_states
-                    # and retriever_output. Make retriever_output available
-                    # to subsequence Retro layers.
-                    if isinstance(hidden_states, tuple):
-                        assert len(hidden_states) == 2
-                        hidden_states, retriever_output = hidden_states
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -284,7 +275,7 @@ class TransformerBlock(MegatronModule):
         # >>>
         # from lutil import tp
         # print("HIDDEN_STATES : %s." % tp(hidden_states))
-        # print("RETRIEVER_OUTPUT : %s." % tp(retriever_output))
+        # print("CONTEXT : %s." % tp(context))
         # <<<
 
         return hidden_states

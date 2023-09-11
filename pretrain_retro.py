@@ -77,7 +77,15 @@ def get_batch(data_iterator):
         return tokens, labels, loss_mask, attention_mask, position_ids
 
 
-def forward_step(data_iterator, model):
+def get_forward_kwargs(input_ids, position_ids, attn_mask):
+    return {
+        "retriever_input_ids" : input_ids,
+        "retriever_position_ids" : position_ids,
+        "retriever_attn_mask" : attn_mask,
+    }
+
+
+def forward_step(data_iterator, model, get_forward_kwargs):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -95,10 +103,11 @@ def forward_step(data_iterator, model):
             None, None, None
     timers('batch-generator').stop()
 
+    # Model call.
     output_tensor = model(tokens, position_ids, attention_mask,
-                          retriever_input_ids=neighbor_tokens,
-                          retriever_position_ids=neighbor_position_ids,
-                          retriever_attn_mask=neighbor_attention_mask,
+                          **get_forward_kwargs(neighbor_tokens,
+                                               neighbor_position_ids,
+                                               neighbor_attention_mask),
                           labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
@@ -118,6 +127,6 @@ if __name__ == "__main__":
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.retro_decoder,
-             forward_step,
+             partial(forward_step, get_forward_kwargs=get_forward_kwargs),
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                             'retro_add_retriever': True})
