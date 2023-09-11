@@ -393,12 +393,15 @@ class TransformerBlock(MegatronModule):
                     if isinstance(hidden_states, tuple):
                         assert len(hidden_states) == 2
                         hidden_states, retriever_output = hidden_states
-                        # raise Exception("hi.")
                     # <<<
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
+
+        # >>>
+        print("HIDDEN_STATES : %s." % tp(hidden_states))
+        # <<<
 
         return hidden_states
 
