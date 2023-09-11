@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+import numpy as np
+
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.transformer import (
     ModuleSpec,
@@ -7,9 +9,10 @@ from megatron.core.transformer import (
     TransformerConfig,
 )
 from megatron.core.transformer.attention import CrossAttentionSpec
-# from megatron.core.transformer.custom_layers.transformer_engine import TENorm
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_block import TransformerBlock
 # from megatron.core.transformer.transformer_config import TransformerConfig
 
 # >>>
@@ -49,7 +52,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             **kwargs,
         )
 
-        pax("spec", "encoder_block_spec")
+        # pax("spec", "encoder_block_spec")
 
         if encoder_block_spec:
             self.encoder = TransformerBlock(
@@ -58,10 +61,13 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 pre_process=True,
                 post_process=False,
             )
-            pax({"encoder": self.encoder})
+            # self._encoder_key = 'encoder' # necessary?
+            # pax({
+            #     "encoder" : self.encoder,
+            #     "encoder / layers" : list(self.encoder.layers),
+            # })
         else:
             self.encoder = None
-        # self._encoder_key = 'encoder' # necessary?
 
     # def forward(
     #     self,
@@ -100,42 +106,164 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
     #     pax("attention_output_with_bias")
 
     #     assert isinstance(add_retriever, bool), "'add_retriever' must be defined."
+    # def forward(
+    #     self,
+    #     context=None,
+    #     context_mask=None,
+    #     layernorm_input=None,
+    #     layernorm_output=None,
+    #     inference_params=None,
+    #     # rotary_pos_emb=None, # unsupported for retro.
+    #     retriever_input=None,
+    #     retriever_output=None,
+    #     retriever_attn_mask=None,
+    # ):
+    #     # hidden_states: [sq, b, h]
+
+    #     attention_output_with_bias = self.attn( # super()(
+    #         hidden_states=hidden_states,
+    #         attention_mask=attention_mask,
+    #         key_value_states=key_value_states,
+    #         # key_value_states=retriever_input,
+    #         inference_params=inference_params,
+    #         rotary_pos_emb=rotary_pos_emb,
+    #     )
+    # def forward(
+    #     self,
+    #     hidden_states,
+    #     context=None,
+    #     context_mask=None,
+    #     inference_params=None,
+    #     # rotary_pos_emb=None, # unsupported for retro.
+    #     retriever_output=None,
+    # ):
+    #     # hidden_states: [sq, b, h]
     def forward(
         self,
-        context=None,
-        context_mask=None,
-        layernorm_input=None,
-        layernorm_output=None,
+        hidden_states,
+        attention_mask,
+        key_value_states=None,
         inference_params=None,
         # rotary_pos_emb=None, # unsupported for retro.
-        retriever_input=None,
         retriever_output=None,
-        retriever_attn_mask=None,
     ):
         # hidden_states: [sq, b, h]
 
-        # >>>
-        # context=context,
-        # context_mask=context_mask,
+        # attention_output_with_bias = self.attn(
+        #     hidden_states=hidden_states,
+        #     attention_mask=attention_mask,
+        #     key_value_states=key_value_states,
+        #     # key_value_states=retriever_input,
+        #     inference_params=inference_params,
+        #     rotary_pos_emb=rotary_pos_emb,
+        # )
 
-        # layernorm_input=hidden_states,
-        # layernorm_output=post_self_attn_layernorm_output,
+        layernorm_output = hidden_states
+        retriever_input = key_value_states
+        retriever_attn_mask = attention_mask
 
-        # inference_params=inference_params,
+        """Cross attention for Retro decoder.
 
-        # retriever_input=retriever_input,
-        # retriever_output=retriever_output,
-        # retriever_attn_mask=retriever_attn_mask,
-        # <<<
+        Notation:
+            ns : Sequence length.
+            bs : Batch size.
+            d  : Hidden size.
+            l  : Number of chunks per sample (i.e., seq_length/chunk_length).
+            m  : Number of tokens per chunk.
+            k  : Number of neighbors.
+            r  : Number of retrieved tokens (neighbors + continuation).
+        """
 
-        attention_output_with_bias = self.attn( # super()(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            key_value_states=key_value_states,
-            # key_value_states=retriever_input,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-        )
+        ns, bs, d = layernorm_output.shape
+        l = int(np.ceil(ns / self.retro_chunk_length))
+
+        # Retrieve neighbors.
+        if self.encoder:
+            first_ns = ns % self.retro_chunk_length
+            if first_ns > 0:
+                raise Exception("test this case.")
+                first_chunk, rest_chunk = \
+                    layernorm_output[:first_ns], layernorm_output[first_ns:]
+                first_chunk = torch.nn.functional.pad(
+                    first_chunk,
+                    (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
+                    'constant',
+                    0)
+                chunked_output = \
+                    torch.cat((first_chunk, rest_chunk), dim=0) # [l * m, bs, d]
+            else:
+                chunked_output = layernorm_output # [l * m, bs, d]
+            chunked_output = chunked_output \
+                .reshape(l, self.retro_chunk_length, bs, d) \
+                .permute(1, 2, 0, 3) \
+                .reshape(self.retro_chunk_length, bs * l, d) \
+                .contiguous()
+
+            # Get Encoder Output
+            # retriever_output = self.encoder(
+            #     hidden_states=retriever_input,
+            #     attention_mask=retriever_attn_mask,
+            #     retriever_output=chunked_output,
+            #     retriever_attn_mask=retriever_attn_mask,
+            #     inference_params=inference_params) # [r, k * bs * l , d]
+            retriever_output = self.encoder(
+                hidden_states=retriever_input,
+                attention_mask=retriever_attn_mask,
+                context=chunked_output,
+                context_mask=None,
+                inference_params=inference_params) # [r, k * bs * l , d]
+            retriever_output = retriever_output.reshape(
+                self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
+
+            pax("retriever_output")
+
+        # Chunks.
+        pad = (ns - 1) % self.retro_chunk_length
+        attending_chunks = layernorm_output[pad:]
+        padded_chunks = torch.nn.functional.pad(
+            attending_chunks,
+            (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
+            'constant', 0)
+        padded_chunked_output = padded_chunks \
+            .reshape(l, self.retro_chunk_length, bs, d) \
+            .permute(1, 2, 0, 3)
+        padded_chunked_output = padded_chunked_output.reshape(
+            self.retro_chunk_length, bs * l, d).contiguous()
+
+        # Encoder output.
+        attention_output, attention_bias = \
+            self.inter_attention(padded_chunked_output,
+                                 None,
+                                 encoder_output=retriever_output)
+
+        # Residual connection.
+        if self.apply_residual_connection_post_layernorm:
+            residual = layernorm_output
+        else:
+            residual = layernorm_input
+
+        # Re-enable torch grad to enable fused optimization.
+        with torch.enable_grad():
+            layernorm_input = bias_dropout_add_func(
+                attention_output,
+                None if attention_bias is None else attention_bias.expand_as(attention_output),
+                torch.zeros_like(attention_output),
+                self.hidden_dropout)
+            layernorm_input = layernorm_input \
+                .reshape(self.retro_chunk_length, bs, l, d) \
+                .permute(2, 0, 1, 3) # [l, m, bs, d]
+            layernorm_input = layernorm_input.reshape(self.retro_chunk_length * l, bs, d)
+            layernorm_input = torch.nn.functional.pad(
+                layernorm_input,
+                (0, 0, 0, 0, pad, 0),
+                'constant', 0)[:ns] # [ns, b, d]
+            layernorm_input = layernorm_input + residual
+
+        # Layer norm post the decoder attention
+        layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
+
+        return retriever_output, layernorm_input, layernorm_output
+
 
 # class RetroDecoderWithRetrieverBiasDropoutAdd(MegatronModule):
 class RetroDecoderBiasDropoutAdd(MegatronModule):
@@ -151,6 +279,9 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         super().__init__(config=config)
         self.spec = spec
         # pax("config", "spec")
+
+    def forward(self):
+        raise Exception("hi.")
 
 
 # class RetroDecoderWithRetrieverLayernorm(MegatronModule):
@@ -189,3 +320,6 @@ class RetroDecoderLayerNorm(MegatronModule):
         )
 
         # pax("config", "spec")
+
+    def forward(self):
+        raise Exception("hi.")

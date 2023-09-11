@@ -293,7 +293,17 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        # >>>
+        context=None,
+        context_mask=None,
+        # <<<
+        inference_params=None,
+        rotary_pos_emb=None,
+    ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -358,13 +368,30 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                 )
             else:
+                # >>>
+                retriever_output = None
+                # <<<
                 for layer in self.layers:
                     hidden_states = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
+                        # >>>
+                        context=context,
+                        context_mask=context_mask,
+                        # <<<
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
+                        # >>>
+                        retriever_output=retriever_output,
+                        # <<<
                     )
+
+                    # First Retro decoder layer returns both hidden_states
+                    # and retriever_output. Make retriever_output available
+                    # to subsequence Retro layers.
+                    if isinstance(hidden_states, tuple):
+                        assert len(hidden_states) == 2
+                        hidden_states, retriever_output = hidden_states
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

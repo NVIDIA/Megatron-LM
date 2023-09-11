@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel, InferenceParams
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -143,7 +143,14 @@ class GPTModel(MegatronModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params=None,
+        inference_params: InferenceParams = None,
+        # >>>
+        # context,
+        # context_mask,
+        retriever_input_ids: Tensor = None,
+        retriever_position_ids: Tensor = None,
+        retriever_attn_mask: Tensor = None,
+        # <<<
     ):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -157,6 +164,14 @@ class GPTModel(MegatronModule):
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
+
+        # >>>
+        if retriever_input_ids is not None:
+            retriever_input = self.embedding(retriever_input_ids,
+                                             retriever_position_ids)
+        else:
+            retriever_input = None
+        # <<<
 
         # Rotary positional embeddings
         rotary_pos_emb = None
@@ -181,6 +196,10 @@ class GPTModel(MegatronModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            # >>>
+            context=retriever_input,
+            context_mask=retriever_attn_mask,
+            # <<<
         )
 
         if not self.post_process:

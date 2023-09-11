@@ -276,7 +276,7 @@ class TransformerLayer(MegatronModule):
 
         # )
         attention_output_with_bias = self.cross_attention(
-            hidden_states=post_self_attn_layernorm_output,
+            post_self_attn_layernorm_output, # i.e., 'x'
             attention_mask=context_mask,
             key_value_states=context,
             # residual = post_self_attn_layernorm_output if apply_post else ...

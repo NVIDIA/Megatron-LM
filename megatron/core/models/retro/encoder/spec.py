@@ -63,11 +63,11 @@ def get_retro_encoder_block_spec(config: TransformerConfig) -> TransformerBlockS
     gpt_layer_spec.self_attention.params["attn_mask_type"] = AttnMaskType.padding
     retro_layer_spec.self_attention.params["attn_mask_type"] = AttnMaskType.padding
 
-    pax({
-        "gpt_layer_spec / s / params" : gpt_layer_spec.self_attention.params,
-        "retro_layer_spec / s / params" : retro_layer_spec.self_attention.params,
-        "retro_layer_spec / c / params" : retro_layer_spec.cross_attention.params,
-    })
+    # pax({
+    #     "gpt_layer_spec / s / params" : gpt_layer_spec.self_attention.params,
+    #     "retro_layer_spec / s / params" : retro_layer_spec.self_attention.params,
+    #     "retro_layer_spec / c / params" : retro_layer_spec.cross_attention.params,
+    # })
 
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
