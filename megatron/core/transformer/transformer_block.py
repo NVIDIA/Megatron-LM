@@ -386,12 +386,15 @@ class TransformerBlock(MegatronModule):
                         # <<<
                     )
 
+                    # >>>
                     # First Retro decoder layer returns both hidden_states
                     # and retriever_output. Make retriever_output available
                     # to subsequence Retro layers.
                     if isinstance(hidden_states, tuple):
                         assert len(hidden_states) == 2
                         hidden_states, retriever_output = hidden_states
+                        # raise Exception("hi.")
+                    # <<<
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

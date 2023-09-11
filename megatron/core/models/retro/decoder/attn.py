@@ -1,7 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+from functools import partial
 import numpy as np
+import torch
+from torch import Tensor
+from typing import Callable, Optional, Tuple
 
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.transformer import (
     ModuleSpec,
@@ -177,6 +182,8 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         ns, bs, d = layernorm_output.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
 
+        # pax("ns", "bs", "d", "l")
+
         # Retrieve neighbors.
         if self.encoder:
             first_ns = ns % self.retro_chunk_length
@@ -215,7 +222,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             retriever_output = retriever_output.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
 
-            pax("retriever_output")
+            # pax("retriever_output")
 
         # Chunks.
         pad = (ns - 1) % self.retro_chunk_length
@@ -232,37 +239,29 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Encoder output.
         attention_output, attention_bias = \
-            self.inter_attention(padded_chunked_output,
-                                 None,
-                                 encoder_output=retriever_output)
+            self.attn(padded_chunked_output,
+                      None,
+                      key_value_states=retriever_output)
 
-        # Residual connection.
-        if self.apply_residual_connection_post_layernorm:
-            residual = layernorm_output
-        else:
-            residual = layernorm_input
+        # # Residual connection.
+        # if self.apply_residual_connection_post_layernorm:
+        #     residual = layernorm_output
+        # else:
+        #     residual = layernorm_input
 
-        # Re-enable torch grad to enable fused optimization.
-        with torch.enable_grad():
-            layernorm_input = bias_dropout_add_func(
-                attention_output,
-                None if attention_bias is None else attention_bias.expand_as(attention_output),
-                torch.zeros_like(attention_output),
-                self.hidden_dropout)
-            layernorm_input = layernorm_input \
-                .reshape(self.retro_chunk_length, bs, l, d) \
-                .permute(2, 0, 1, 3) # [l, m, bs, d]
-            layernorm_input = layernorm_input.reshape(self.retro_chunk_length * l, bs, d)
-            layernorm_input = torch.nn.functional.pad(
-                layernorm_input,
-                (0, 0, 0, 0, pad, 0),
-                'constant', 0)[:ns] # [ns, b, d]
-            layernorm_input = layernorm_input + residual
+        # pax("attention_output", "attention_bias", "retriever_output")
 
-        # Layer norm post the decoder attention
-        layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
-
-        return retriever_output, layernorm_input, layernorm_output
+        # return attention_output, attention_bias, retriever_output
+        return {
+            "ns" : ns,
+            "bs" : bs,
+            "d" : d,
+            "l" : l,
+            "pad" : pad,
+            "attention_output" : attention_output,
+            "attention_bias" : attention_bias,
+            "retriever_output" : retriever_output,
+        }
 
 
 # class RetroDecoderWithRetrieverBiasDropoutAdd(MegatronModule):
@@ -278,10 +277,62 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     ):
         super().__init__(config=config)
         self.spec = spec
+        self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
         # pax("config", "spec")
 
-    def forward(self):
-        raise Exception("hi.")
+    @classmethod
+    def _forward(
+        cls,
+        # x_with_bias: Tuple[Tensor, Optional[Tensor]],
+        x_with_bias: dict,
+        residual: Tensor,
+        prob: float,
+        retro_chunk_length: int,
+        bias_dropout_add: Callable,
+    ) -> Tensor:
+
+        # pax("x_with_bias")
+
+        # attention_output, attention_bias = x_with_bias
+
+        ns = x_with_bias["ns"]
+        bs = x_with_bias["bs"]
+        d = x_with_bias["d"]
+        l = x_with_bias["l"]
+        pad = x_with_bias["pad"]
+        attention_output = x_with_bias["attention_output"]
+        attention_bias = x_with_bias["attention_bias"]
+
+        # pax("attention_output", "attention_bias")
+
+        # Re-enable torch grad to enable fused optimization.
+        with torch.enable_grad():
+            x = bias_dropout_add(
+                (attention_output,
+                 None if attention_bias is None else attention_bias.expand_as(attention_output)),
+                torch.zeros_like(attention_output),
+                prob)
+            # pax("retro_chunk_length", "x")
+            x = x \
+                .reshape(retro_chunk_length, bs, l, d) \
+                .permute(2, 0, 1, 3) # [l, m, bs, d]
+            x = x.reshape(retro_chunk_length * l, bs, d)
+            x = torch.nn.functional.pad(
+                x,
+                (0, 0, 0, 0, pad, 0),
+                'constant', 0)[:ns] # [ns, b, d]
+            x = x + residual
+
+        # pax("x")
+
+        return x
+
+    def forward(self, training, fused):
+        return partial(
+            self._forward,
+            retro_chunk_length=self.retro_chunk_length,
+            bias_dropout_add=get_bias_dropout_add(training, fused),
+        )
 
 
 # class RetroDecoderWithRetrieverLayernorm(MegatronModule):
@@ -321,5 +372,5 @@ class RetroDecoderLayerNorm(MegatronModule):
 
         # pax("config", "spec")
 
-    def forward(self):
-        raise Exception("hi.")
+    def forward(self, x):
+        return self.norm(x)

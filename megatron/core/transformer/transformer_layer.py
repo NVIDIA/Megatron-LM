@@ -16,6 +16,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
+# >>>
+from lutil import pax
+# <<<
+
 
 @dataclass
 class TransformerLayerSpec:
@@ -283,6 +287,15 @@ class TransformerLayer(MegatronModule):
             inference_params=inference_params,
             retriever_output=retriever_output,
         )
+
+        # if len(attention_output_with_bias) == 3:
+        #     retriever_output = attention_output_with_bias[2]
+        #     attention_output_with_bias = attention_output_with_bias[:2]
+        #     # pax("attention_output_with_bias", "retriever_output")
+        if isinstance(attention_output_with_bias, dict) \
+           and "retriever_output" in attention_output_with_bias:
+            retriever_output = attention_output_with_bias["retriever_output"]
+            # pax("attention_output_with_bias", "retriever_output")
         # <<<
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -321,7 +334,13 @@ class TransformerLayer(MegatronModule):
             inp=output, requires_grad=output.requires_grad, keep_graph=True
         )
 
-        return output
+        # >>>
+        if retriever_output is None:
+            return output
+        else:
+            # raise Exception("hi.")
+            return output, retriever_output
+        # <<<
 
     def sharded_state_dict(self, prefix=''):
 
