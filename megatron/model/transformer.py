@@ -1371,6 +1371,7 @@ class ParallelTransformer(MegatronModule):
         self.num_layers = _get_num_layers(args, model_type,
                                           layer_type==LayerType.decoder)
 
+
         self.drop_path_rates = [
             rate.item() for rate in
             torch.linspace(0, self.drop_path_rate, config.num_layers)]
@@ -1468,7 +1469,9 @@ class ParallelTransformer(MegatronModule):
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
-                offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                print("\n\n\n\n\n\n############################################")
+                print(self.num_layers)
+                offset = mpu.get_pipeline_model_parallel_rank() * int(self.num_layers)
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,

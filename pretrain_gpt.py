@@ -131,6 +131,8 @@ def extra_args_provider(parser):
     group.add_argument('--wandb-optimizer-version',
                        help='wandb optimizer-version.')
 
+    return parser
+
 if __name__ == "__main__":
 
     pretrain(train_valid_test_datasets_provider,

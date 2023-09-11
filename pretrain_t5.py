@@ -171,6 +171,8 @@ def extra_args_provider(parser):
                        help='wandb optimizer.')
     group.add_argument('--wandb-optimizer-version',
                        help='wandb optimizer-version.')
+    
+    return parser
 
 if __name__ == "__main__":
 

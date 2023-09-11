@@ -2,7 +2,7 @@
 
 PORT=50088
 SSH_PORT=22
-NAME="Megatron-LM"
+NAME="Megatron-LM2"
 PASSWORD="1234"
 
 sudo docker run --gpus all -td --rm \
