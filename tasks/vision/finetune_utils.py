@@ -17,9 +17,6 @@ from megatron.training import train_step
 from megatron.training import training_log
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import average_losses_across_data_parallel_group, print_params_min_max_norm
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import Float16Module
 from megatron.core.enums import ModelType
 
 def process_batch(batch):

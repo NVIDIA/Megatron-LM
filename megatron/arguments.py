@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -14,6 +14,7 @@ from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
 from megatron.core.transformer import TransformerConfig
+
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     """Parse all arguments."""
@@ -171,21 +172,9 @@ def validate_args(args, defaults={}):
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # If we do accumulation and all-reduces in fp32, we need to have local DDP
-    # and we should make sure use-contiguous-buffers-in-local-ddp is not off.
-    if args.accumulate_allreduce_grads_in_fp32:
-        assert args.DDP_impl == 'local'
-        assert args.use_contiguous_buffers_in_local_ddp
-
-    # If we use the distributed optimizer, we need to have local DDP
-    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
-    if args.use_distributed_optimizer:
-        assert args.DDP_impl == 'local'
-        assert args.use_contiguous_buffers_in_local_ddp
-
-    # For torch DDP, we do not use contiguous buffer
-    if args.DDP_impl == 'torch':
-        args.use_contiguous_buffers_in_local_ddp = False
+    # Overlapping grad reduce only supported without pipeline parallelism right now.
+    if args.overlap_grad_reduce:
+        assert args.pipeline_model_parallel_size == 1
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -249,15 +238,15 @@ def validate_args(args, defaults={}):
 
     # Checks.
     if args.ffn_hidden_size is None:
-        args.ffn_hidden_size = 4 * args.hidden_size
-
-    if args.swiglu:
-        # reduce the dimnesion for MLP since projections happens on
-        # two linear layers. this keeps the number of paramters in
-        # the same ballpark as the counterpart with 4*h size
-        # we keep it a multiple of 64, which means the actual tensor size
-        # will be a multiple of 64 / tp_size
-        args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+        if args.swiglu:
+            # reduce the dimnesion for MLP since projections happens on
+            # two linear layers. this keeps the number of paramters in
+            # the same ballpark as the counterpart with 4*h size
+            # we keep it a multiple of 64, which means the actual tensor size
+            # will be a multiple of 64 / tp_size
+            args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+        else:
+            args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
         assert args.hidden_size % args.num_attention_heads == 0
@@ -417,6 +406,7 @@ def core_transformer_config_from_args(args):
             kw_args[f.name] = getattr(args, f.name)
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['layernorm_zero_centered_gamma'] = args.apply_layernorm_1p
+    kw_args['layernorm_epsilon'] = args.norm_epsilon
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
@@ -459,12 +449,7 @@ def _add_transformer_engine_args(parser):
                        dest='fp8_wgrad')
     group.add_argument('--transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
-                       help='Which Transformer implementation to use.',
-                       dest='transformer_impl')
-    group.add_argument('--normalization', default='LayerNorm',
-                       choices=['LayerNorm', 'RMSNorm'],
-                       help='Which normalization technique to use.',
-                       dest='normalization')
+                       help='Which Transformer implementation to use.')
 
     return parser
 
@@ -582,8 +567,11 @@ def _add_network_size_args(parser):
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')
-    group.add_argument('--layernorm-epsilon', type=float, default=1e-5,
-                       help='Layer norm epsilon.')
+    group.add_argument('--normalization', default='LayerNorm',
+                       choices=['LayerNorm', 'RMSNorm'],
+                       help='Which normalization technique to use.')
+    group.add_argument('--norm-epsilon', type=float, default=1e-5,
+                       help='Epsilon for layer norm and RMS norm.')
     group.add_argument('--apply-layernorm-1p', action='store_true',
                        help='Adjust LayerNorm weights such that they are centered '
                        'around zero. This improves numerical stability.')
@@ -752,6 +740,9 @@ def _add_training_args(parser):
                        'whole transformer layer is recomputed, '
                        '2) selective: core attention part of the transformer '
                        'layer is recomputed.')
+    group.add_argument('--no-check-for-nan-in-loss-and-grad', action='store_false',
+                       help='Check for NaNs in loss and grad',
+                       dest='check_for_nan_in_loss_and_grad')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -765,7 +756,7 @@ def _add_training_args(parser):
                        'individual Transformer layers per pipeline stage and do the '
                        'rest without any recomputing at specified granularity'
                        'default) do not apply activations recompute to any layers')
-    group.add_argument('--recompute-num-layers', type=int, default=1,
+    group.add_argument('--recompute-num-layers', type=int, default=None,
                        help='1) uniform: the number of Transformer layers in each '
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
@@ -1019,14 +1010,8 @@ def _add_distributed_args(parser):
                        help='Which backend to use for distributed training.')
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
                        help='Timeout minutes for torch.distributed.')
-    group.add_argument('--DDP-impl', default='local',
-                       choices=['local', 'torch'],
-                       help='which DistributedDataParallel implementation '
-                       'to use.')
-    group.add_argument('--no-contiguous-buffers-in-local-ddp',
-                       action='store_false', help='If set, dont use '
-                       'contiguous buffer in local DDP.',
-                       dest='use_contiguous_buffers_in_local_ddp')
+    group.add_argument('--overlap-grad-reduce', action='store_true',
+                       default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='Use scatter/gather to optimize communication of tensors in pipeline',
                        dest='scatter_gather_tensors_in_pipeline')
@@ -1148,13 +1133,11 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'Llama2Tokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
-    group.add_argument('--data-impl', type=str, default='infer',
-                       choices=['mmap', 'infer'],
-                       help='Implementation of indexed datasets.')
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
