@@ -50,6 +50,7 @@ class Bucket:
         self,
         params: List[torch.nn.Parameter],
         data: torch.Tensor,
+        offset: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         overlap_grad_reduce: bool,
         reduce_scatter: bool,
@@ -61,6 +62,7 @@ class Bucket:
         self.params = set(params)
         self.params_with_grad = set()
         self.data = data
+        self.offset = offset
         self.data_parallel_group = data_parallel_group
         self.overlap_grad_reduce = overlap_grad_reduce
         self.reduce_scatter = reduce_scatter
@@ -146,6 +148,7 @@ class GradBuffer(MemoryBuffer):
 
         self.buckets = []
         self.param_to_bucket = {}
+        self.param_to_bucket_index = {}
         self.overlap_grad_reduce = overlap_grad_reduce
 
         self.is_last_microbatch = True
@@ -168,11 +171,12 @@ class GradBuffer(MemoryBuffer):
                 torch.Size([data_end_index - data_start_index]), data_start_index
             )
             bucket = Bucket(
-                bucket_params, bucket_data, data_parallel_group, overlap_grad_reduce, reduce_scatter
+                bucket_params, bucket_data, data_start_index, data_parallel_group, overlap_grad_reduce, reduce_scatter
             )
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
                 self.param_to_bucket[bucket_param] = bucket
+                self.param_to_bucket_index[bucket_param] = len(self.buckets) - 1
 
         # Map the grads to the buffer and bucket them.
         data_start_index = 0
@@ -361,9 +365,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     self.grad_buffer_param_index_map[dtype] = {}
 
                 index -= param.data.nelement()
+                # Store the bucket of each param.
                 self.grad_buffer_param_index_map[dtype][param] = (
                     index,
                     index + param.data.nelement(),
+                    self.grad_buffers[dtype].param_to_bucket_index[param]
                 )
 
         # Register backward hook.
