@@ -7,9 +7,6 @@ from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
-# >>>
-from megatron.core.transformer.spec_utils import ModuleSpec
-# <<<
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
@@ -25,16 +22,10 @@ class MegatronModule(torch.nn.Module):
     """Megatron specific extensions of torch Module with support
     for pipelining."""
 
-    # >>>
     # def __init__(self, config: TransformerConfig, share_word_embeddings=True):
     def __init__(self, config: TransformerConfig):
-    # def __init__(self, config: TransformerConfig, spec: ModuleSpec=None):
-    # <<<
         super().__init__()
         self.config = config
-        # >>>
-        # self.spec = spec
-        # <<<
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """Use this function to override the state dict for

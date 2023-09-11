@@ -435,19 +435,13 @@ def core_transformer_config_from_args(args):
 
     retro_args = get_retro_args()
     if retro_args:
-
-        # >>>
         kw_args['retro_workdir'] = args.retro_workdir
-        # kw_args['retro_add_retriever'] = args.retro_add_retriever
-        # kw_args['retro_cyclic_train_iters'] = args.retro_cyclic_train_iters
         kw_args['retro_encoder_num_layers'] = args.retro_encoder_layers
         kw_args['retro_encoder_hidden_dropout'] = args.retro_encoder_hidden_dropout
         kw_args['retro_encoder_attention_dropout'] = args.retro_encoder_attention_dropout
         kw_args['retro_num_neighbors'] = args.retro_num_neighbors
         kw_args['retro_num_retrieved_chunks'] = args.retro_num_retrieved_chunks
-        # kw_args['retro_return_doc_ids'] = args.retro_return_doc_ids
         kw_args['retro_preprocess'] = retro_args
-        # <<<
 
     return TransformerConfig(**kw_args)
 
@@ -1323,11 +1317,12 @@ def _add_vision_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--model-spec',
+    group.add_argument('--block-spec',
                        type=str, default=None, nargs=2,
                        help='Specify the <module_location function_name> pair '
                             'that returns a spec to customize the transformer '
-                            'layer implementation. For more details, check the'
-                            '`transformer_layer.py` file that details the use '
+                            'block implementation. For more details, check the'
+                            '`transformer_block.py` file that details the use '
                             'of spec based customization.')
+
     return parser

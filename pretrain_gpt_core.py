@@ -19,10 +19,8 @@ from megatron.utils import average_losses_across_data_parallel_group
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_block_spec
 
-# >>>
-# def model_provider(pre_process=True, post_process=True):
+
 def model_provider(pre_process=True, post_process=True, block_spec=None):
-# <<<
     """Build the model."""
 
     args = get_args()

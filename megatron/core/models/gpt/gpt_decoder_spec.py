@@ -22,10 +22,7 @@ def get_gpt_layer_spec() -> TransformerLayerSpec:
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
             layernorm_linear_qkv=TELayerNormColumnParallelLinear,
-            # >>>
-            # dot_product_attention=TEDotProductAttention,
             core_attention=TEDotProductAttention,
-            # <<<
             linear_proj=TERowParallelLinear,
         ),
         self_attn_bda=get_bias_dropout_add,
@@ -38,5 +35,4 @@ def get_gpt_block_spec() -> TransformerBlockSpec:
     num_layers = get_num_layers_to_build()
     layer_spec = get_gpt_layer_spec()
     block_spec = TransformerBlockSpec([layer_spec] * num_layers)
-    pax("num_layers", "layer_spec", "block_spec")
     return block_spec

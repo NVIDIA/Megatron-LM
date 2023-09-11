@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 
-# from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_layer_spec
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.transformer import (
@@ -15,7 +14,6 @@ from megatron.core.transformer.attention import CrossAttentionSpec
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
-    # TELayerNormMLP,
     TERowParallelLinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -26,10 +24,6 @@ from .attn import (
     RetroEncoderBiasDropoutAdd,
     RetroEncoderLayerNorm,
 )
-
-# >>>
-from lutil import pax
-# <<<
 
 
 def get_retro_encoder_layer_spec() -> TransformerLayerSpec:
@@ -44,11 +38,9 @@ def get_retro_encoder_layer_spec() -> TransformerLayerSpec:
         core_attention=TEDotProductAttention,
         linear_proj=TERowParallelLinear,
     )
-    # spec.cross_attn_bda=get_bias_dropout_add
     spec.cross_attn_bda=ModuleSpec(module=RetroEncoderBiasDropoutAdd)
     spec.post_cross_attn_layernorm=ModuleSpec(module=RetroEncoderLayerNorm)
     spec.ln_mlp=ModuleSpec(module=MLP)
-    # pax("spec")
     return spec
 
 def get_retro_encoder_block_spec(config: TransformerConfig) -> TransformerBlockSpec:
@@ -63,12 +55,6 @@ def get_retro_encoder_block_spec(config: TransformerConfig) -> TransformerBlockS
     gpt_layer_spec.self_attention.params["attn_mask_type"] = AttnMaskType.padding
     retro_layer_spec.self_attention.params["attn_mask_type"] = AttnMaskType.padding
 
-    # pax({
-    #     "gpt_layer_spec / s / params" : gpt_layer_spec.self_attention.params,
-    #     "retro_layer_spec / s / params" : retro_layer_spec.self_attention.params,
-    #     "retro_layer_spec / c / params" : retro_layer_spec.cross_attention.params,
-    # })
-
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
         if layer_number in retro_layer_numbers:
@@ -78,15 +64,5 @@ def get_retro_encoder_block_spec(config: TransformerConfig) -> TransformerBlockS
 
     # Block spec.
     block_spec = TransformerBlockSpec(layers=layer_specs)
-
-    # pax({
-    #     "config" : config,
-    #     "num_layers" : num_layers,
-    #     "retro_layer_numbers" : retro_layer_numbers,
-    #     "layer_specs" : layer_specs,
-    #     "attn specs" : [ s.cross_attention for s in layer_specs ],
-    #     "block_spec" : block_spec,
-    #     "block_spec / layers" : [ L.cross_attention for L in block_spec.layers ],
-    # })
 
     return block_spec

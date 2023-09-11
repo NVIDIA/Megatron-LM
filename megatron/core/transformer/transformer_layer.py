@@ -16,10 +16,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
-# >>>
-from lutil import pax
-# <<<
-
 
 @dataclass
 class TransformerLayerSpec:
@@ -35,31 +31,7 @@ class TransformerLayerSpec:
     ln_mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
-# @dataclass
-# class TransformerLayerSpec:
-# # class TransformerLayerSpec(ModuleSpec):
 
-#     # >>>
-#     # module: MegatronModule = None
-#     # params: dict = None
-#     # <<<
-
-#     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     self_attention: SelfAttentionSpec = IdentityOp
-#     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-
-#     post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     cross_attention: CrossAttentionSpec = IdentityOp
-#     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-
-#     post_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-#     ln_mlp: Union[ModuleSpec, type] = IdentityOp
-#     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
-#     post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
-
-#     # >>>
-#     # add_retriever: bool = False
-#     # <<<
 
 class TransformerLayer(MegatronModule):
     """A single transformer layer.
@@ -73,21 +45,11 @@ class TransformerLayer(MegatronModule):
         config: TransformerConfig,
         spec: TransformerLayerSpec,
         layer_number: int = 1,
-        # >>>
-        # [ ... never used ... ]
-        # self_attn_mask_type=AttnMaskType.padding,
-        # attn_mask_type=AttnMaskType.padding,
-        # <<<
     ):
         super().__init__(config=config)
         self.config: TransformerConfig = config
 
         self.layer_number = layer_number + self._get_layer_offset()
-
-        # >>>
-        # self.self_attn_mask_type = self_attn_mask_type
-        # self.attn_mask_type = attn_mask_type
-        # <<<
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -132,22 +94,17 @@ class TransformerLayer(MegatronModule):
         )
 
         ## [Module 6: BiasDropoutFusion]
-        # >>>
-        # self.cross_attn_bda = build_module(spec.cross_attn_bda)
         self.cross_attn_bda = build_module(
             spec.cross_attn_bda,
             config=self.config,
             spec=spec.cross_attention,
         )
-        # <<<
 
         ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
         self.post_cross_attn_layernorm = build_module(
             spec.post_cross_attn_layernorm,
-            # >>>
             config=self.config,
             spec=spec.cross_attention,
-            # <<<
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -215,17 +172,11 @@ class TransformerLayer(MegatronModule):
         self,
         hidden_states,
         attention_mask,
-        # >>>
         context=None,
         context_mask=None,
-        # <<<
         inference_params=None,
         rotary_pos_emb=None,
-        # >>>
-        # retriever_input=None,
         retriever_output=None,
-        # retriever_attn_mask=None,
-        # <<<
     ):
         # hidden_states: [s, b, h]
 
@@ -257,46 +208,17 @@ class TransformerLayer(MegatronModule):
         residual = post_self_attn_layernorm_output
 
         # Cross attention.
-        # >>>
-        # attention_output_with_bias = self.cross_attention(
-        #     post_self_attn_layernorm_output,
-        #     attention_mask=attention_mask,
-        #     context=context,
-        #     inference_params=inference_params,
-        # )
-        # attention_output_with_bias = self.cross_attention(
-
-        #     context=context,
-        #     context_mask=context_mask,
-
-        #     layernorm_input=hidden_states,
-        #     layernorm_output=post_self_attn_layernorm_output,
-
-        #     inference_params=inference_params,
-
-        #     retriever_input=retriever_input,
-        #     retriever_output=retriever_output,
-        #     retriever_attn_mask=retriever_attn_mask,
-
-        # )
         attention_output_with_bias = self.cross_attention(
             post_self_attn_layernorm_output, # i.e., 'x'
             attention_mask=context_mask,
             key_value_states=context,
-            # residual = post_self_attn_layernorm_output if apply_post else ...
             inference_params=inference_params,
             retriever_output=retriever_output,
         )
 
-        # if len(attention_output_with_bias) == 3:
-        #     retriever_output = attention_output_with_bias[2]
-        #     attention_output_with_bias = attention_output_with_bias[:2]
-        #     # pax("attention_output_with_bias", "retriever_output")
         if isinstance(attention_output_with_bias, dict) \
            and "retriever_output" in attention_output_with_bias:
             retriever_output = attention_output_with_bias["retriever_output"]
-            # pax("attention_output_with_bias", "retriever_output")
-        # <<<
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -334,13 +256,10 @@ class TransformerLayer(MegatronModule):
             inp=output, requires_grad=output.requires_grad, keep_graph=True
         )
 
-        # >>>
         if retriever_output is None:
             return output
         else:
-            # raise Exception("hi.")
             return output, retriever_output
-        # <<<
 
     def sharded_state_dict(self, prefix=''):
 
