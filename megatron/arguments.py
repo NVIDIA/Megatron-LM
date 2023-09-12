@@ -145,6 +145,10 @@ def validate_args(args, defaults={}):
         assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
             'number of layers is not divisible by number of layers per virtual ' \
             'pipeline stage'
+        assert args.num_layers % \
+        (args.transformer_pipeline_model_parallel_size * args.num_layers_per_virtual_pipeline_stage) == 0, \
+            'number of layers is not divisible by number of layers per virtual pipeline stage ' \
+            'x number of pipeline stages'
         args.virtual_pipeline_model_parallel_size = \
             (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
             args.num_layers_per_virtual_pipeline_stage
