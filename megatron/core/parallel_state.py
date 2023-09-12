@@ -218,7 +218,7 @@ def initialize_model_parallel(
             )
         use_sharp_dp = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_DP", 1)))
         use_sharp_amax = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_AMAX", 0)))
-        # TODO: Use SHARP at multiple communication jobs.
+        # SHARP does not supprt multiple communicators that have a topological overlap
         assert not (use_sharp_dp and use_sharp_amax)
         # Apply SHARP to DP process groups
         if use_sharp_dp:
