@@ -81,7 +81,8 @@ class TransformerConfig(ModelParallelConfig):
                                      are also less compute intensive which makes activation checkpointing more efficient
                                      for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer
                                      Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint
-                                     the entire transformer layer.  Must be 'selective' or 'full'. Defaults to None.
+                                     the entire transformer layer.  Must be 'selective' or 'full'. 'selective' always uses all layers.
+                                     Defaults to None.
 
         recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer
                                 block and recompute the input activation of each divided chunk at the specified
@@ -93,7 +94,7 @@ class TransformerConfig(ModelParallelConfig):
         recompute_num_layers (int): When recompute_method is uniform, recompute_num_layers is the number of transformer
                                     layers in each uniformly divided recompute unit.  When recompute_method is block,
                                     recompute_num_layers is the number of transformer layers to recompute within each
-                                    pipeline stage.  Defaults to None.
+                                    pipeline stage.  Must be None for 'selective' activation checkpointing. Defaults to None.
 
         distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
                                              group. Defaults to None.
@@ -101,12 +102,11 @@ class TransformerConfig(ModelParallelConfig):
         # fp8 related (via Transformer Engine). For detailed info, refer the the Transformer Engine docs at
         # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/common.html
 
-        fp8 (bool): Enables the use of FP8 precision through Transformer Engine.
+        fp8 (str): If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined choices: (1) 'e4m3'
+                   uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8 activation and weight tensors and
+                   e5m2 for all FP8 output activation gradient tensors. Defaults to None.
 
-        fp8_e4m3 (bool): Enables the use of FP8 tensors in e4m3 format for both forward and backward passes.
-
-        fp8_margin (int): Enables the use of FP8 tensors in e4m3 format in the forward pass and e5m2 format in the
-                          backward pass.
+        fp8_margin (int): Margin for the scaling factor computation.
 
         fp8_interval (int): Controls how often the scaling factor is recomputed.
 
@@ -115,6 +115,9 @@ class TransformerConfig(ModelParallelConfig):
         fp8_amax_compute_algo (str): Algorithm used for choosing the `amax` value for the scaling factor computation.
                                      There are 2 predefined choices: `max` chooses the largest `amax` in the history
                                      window, while `most_recent` always chooses the most recently seen value.
+
+        fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision.
+                          Defaults to True.
 
         # Experimental
         normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily
@@ -166,12 +169,12 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: bool = None
 
     # fp8 related
-    fp8: bool = False
-    fp8_e4m3: bool = False
+    fp8: str = None
     fp8_margin: int = 0
     fp8_interval: int = 1
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
+    fp8_wgrad: bool = True
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
@@ -226,10 +229,16 @@ class TransformerConfig(ModelParallelConfig):
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_num_layers is None:
+            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} so recompute_num_layers must be between '
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be between '
                     f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
+                )
+            elif (
+                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
+            ):
+                raise ValueError(
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be None.'
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:

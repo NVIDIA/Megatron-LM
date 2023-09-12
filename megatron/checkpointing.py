@@ -470,6 +470,8 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
+    _set_arg('num_query_groups', force=True)
+    _set_arg('group_query_attention', force=True)
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
     _set_arg('position_embedding_type', force=True)

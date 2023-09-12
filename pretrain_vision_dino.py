@@ -13,9 +13,6 @@ from megatron.model.vision.dino import DINOPretrainModel
 from megatron.model.vision.knn_monitor import knn_predict, get_feature_bank
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group, unwrap_model
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
-from megatron.model import DistributedDataParallel as LocalDDP
-from megatron.model import Float16Module
 from megatron.arguments import core_transformer_config_from_args
 
 def model_provider(pre_process=True, post_process=True):
@@ -39,11 +36,8 @@ def get_batch(data_iterator):
 
 def loss_func(model, labels, output_tensor, collect_data=False):
     args = get_args()
-    
-    model = unwrap_model(
-        model,
-        (torchDDP, LocalDDP, Float16Module)
-    )
+
+    model = unwrap_model(model)
     if model.training:
         student_output, teacher_output = output_tensor
         loss = model.dino_loss(student_output, teacher_output, args.curr_iteration)
@@ -100,6 +94,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,

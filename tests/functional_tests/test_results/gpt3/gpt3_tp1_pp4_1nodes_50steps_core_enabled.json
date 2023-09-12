@@ -1,1 +1,29 @@
-{"lm loss": {"start_step": 0, "end_step": 41, "step_interval": 5, "values": [10.79471, 10.86601, 10.89077, 10.78484, 10.65869, 10.58127, 10.08135, 10.19421, 10.13438]}, "num-zeros": {"start_step": 0, "end_step": 41, "step_interval": 5, "values": [1650.0, 1867.0, 1912.0, 1869.0, 1768.0, 1684.0, 1543.0, 1983.0, 2379.0]}, "iteration_timing_avg": 0.126312962962963}
+{
+    "lm loss": {
+        "start_step": 0,
+        "end_step": 27,
+        "step_interval": 5,
+        "values": [
+            10.79373,
+            10.86736,
+            10.89174,
+            10.78285,
+            10.66227,
+            10.58291
+        ]
+    },
+    "num-zeros": {
+        "start_step": 0,
+        "end_step": 27,
+        "step_interval": 5,
+        "values": [
+            1670.0,
+            1914.0,
+            1868.0,
+            1951.0,
+            1846.0,
+            1709.0
+        ]
+    },
+    "iteration_timing_avg": 0.12781055555555554
+}

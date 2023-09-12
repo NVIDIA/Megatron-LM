@@ -41,6 +41,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         clip_grad: clip gradeints with this global L2 norm. Note
             that clipping is ignored if clip_grad == 0
         log_num_zeros_in_grad: return number of zeros in the gradients.
+        check_for_nan_in_grad: check if gradients have a NaN.
         params_have_main_grad: flag indicating if parameters have
             a `main_grad` field. If this is set, we are assuming
             that the model parameters are store in the `main_grad`
@@ -50,8 +51,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             to do gradient accumulation and all-reduces in float32
             and as a result we store those gradients in the main_grad.
             Note that main grad is not necessarily in float32.
-        use_contiguous_buffers_in_local_ddp: if true, the local DDP model
-            is using a contiguous buffer to hold the model grads.
         fp16: if true, the model is running in fp16.
         bf16: if true, the model is running in bfloat16.
         grad_scaler: used for scaling gradients. Note that this can be
@@ -91,7 +90,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Param range map.
-        param_world_index_map = model._grad_buffer_param_index_map[dtype]
+        param_world_index_map = model.grad_buffer_param_index_map[dtype]
         param_range_map = {}
         for param, param_world_indexes in param_world_index_map.items():
 
@@ -136,7 +135,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_world_size = mpu.get_data_parallel_world_size()
 
         # Grad buffer range.
-        grad_buffer = model._grad_buffers[dtype]
+        grad_buffer = model.grad_buffers[dtype]
         gbuf_size = grad_buffer.numel
         max_gbuf_range_size = int(math.ceil(gbuf_size / data_parallel_world_size))
 
@@ -177,7 +176,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         return {
             dtype : cls.build_model_gbuf_range(model, dtype)
-            for dtype in model._grad_buffers
+            for dtype in model.grad_buffers
         }
 
 
@@ -352,8 +351,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     def __init__(self, optimizer, clip_grad, log_num_zeros_in_grad,
-                 params_have_main_grad, use_contiguous_buffers_in_local_ddp,
-                 fp16, bf16, params_dtype, grad_scaler, models):
+                 check_for_nan_in_grad, params_have_main_grad, fp16,
+                 bf16, params_dtype, grad_scaler, models):
         """
         See top of class definition for argument descriptions.
 
@@ -366,12 +365,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         super().__init__(
             optimizer, clip_grad, log_num_zeros_in_grad,
-            params_have_main_grad, use_contiguous_buffers_in_local_ddp,
+            check_for_nan_in_grad, params_have_main_grad,
             fp16, bf16, params_dtype, grad_scaler, models)
 
-        # Verify that contiguous buffers are being used.
-        # - Note: this should already be checked in arguments.py.
-        assert use_contiguous_buffers_in_local_ddp
         assert isinstance(optimizer, Adam), \
             "Only Adam currently supported, due to checkpointing requirements."
 
@@ -405,7 +401,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.param_buffers = []
         for model_index, model in enumerate(self.models):
             current_param_buffers = {}
-            for dtype, grad_buffer in model._grad_buffers.items():
+            for dtype, grad_buffer in model.grad_buffers.items():
 
                 # Handle older/newer method for getting untyped storage.
                 try:
@@ -597,7 +593,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # Compute local DP contiguous shard's size.
                 model = self.models[model_idx]
-                gbuf_world_numel = model._grad_buffers[dtype].numel_padded
+                gbuf_world_numel = model.grad_buffers[dtype].numel_padded
                 gbuf_local_numel = int(gbuf_world_numel/data_parallel_world_size)
                 local_shards = {key:torch.empty((gbuf_local_numel,),
                                              dtype=torch.float32,
@@ -689,7 +685,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # Compute local DP contiguous shard's size.
                 model = self.models[model_idx]
-                gbuf_world_numel = model._grad_buffers[dtype].numel_padded
+                gbuf_world_numel = model.grad_buffers[dtype].numel_padded
                 gbuf_local_numel = int(gbuf_world_numel/data_parallel_world_size)
 
                 # Contiguous local shards (received from DP rank 0).
@@ -800,7 +796,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return self.get_model_buffer_dp_views([
             {dtype : mem_buffer.data}
             for model in self.models
-            for dtype, mem_buffer in model._grad_buffers.items()])
+            for dtype, mem_buffer in model.grad_buffers.items()])
 
 
     def get_model_param_buffer_dp_views(self):
@@ -840,7 +836,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Scale grad buffers by '1 / data_parallel_world_size'.
         for model in self.models:
-            for dtype, gbuf in model._grad_buffers.items():
+            for dtype, gbuf in model.grad_buffers.items():
                 gbuf.data /= data_parallel_world_size
 
         # Reduce-scatter all grads.
@@ -891,7 +887,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Copy from param buffer to each param.
         for model_id, model in enumerate(self.models):
-            for dtype, param_map in model._grad_buffer_param_index_map.items():
+            for dtype, param_map in model.grad_buffer_param_index_map.items():
                 for param, (buf_start, buf_end) in param_map.items():
                     param_buf = self.param_buffers[model_id][dtype]
                     param_buf_shard = param_buf[buf_start:buf_end]

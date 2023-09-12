@@ -32,7 +32,7 @@ from megatron import (
 )
 from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
-from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.data.indexed_dataset import MMapIndexedDataset
 
 DSET_TYPE_BERT = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
@@ -420,8 +420,7 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
     return tokens_np, tokentypes_np, labels_np, padding_mask_np, loss_mask_np
 
 
-def build_train_valid_test_datasets_with_prefixes(data_impl,
-                                                  train_valid_test_num_samples,
+def build_train_valid_test_datasets_with_prefixes(train_valid_test_num_samples,
                                                   max_seq_length,
                                                   seed,
                                                   skip_warmup,
@@ -436,21 +435,21 @@ def build_train_valid_test_datasets_with_prefixes(data_impl,
     train_dataset, valid_dataset, test_dataset = None, None, None
     # Single dataset.
     if train_data_prefix is not None:
-        train_dataset = build_dataset("train", train_data_prefix, data_impl,
+        train_dataset = build_dataset("train", train_data_prefix,
                                       train_valid_test_num_samples[0],
                                       max_seq_length, seed, skip_warmup,
                                       binary_head, max_seq_length_dec,
                                       dataset_type=dataset_type)
 
     if valid_data_prefix is not None:
-        valid_dataset = build_dataset("valid", valid_data_prefix, data_impl,
+        valid_dataset = build_dataset("valid", valid_data_prefix,
                                       train_valid_test_num_samples[1],
                                       max_seq_length, seed, False,
                                       binary_head, max_seq_length_dec,
                                       dataset_type=dataset_type)
 
     if test_data_prefix is not None:
-        test_dataset = build_dataset("test", test_data_prefix, data_impl,
+        test_dataset = build_dataset("test", test_data_prefix,
                                      train_valid_test_num_samples[2],
                                      max_seq_length, seed, False,
                                      binary_head, max_seq_length_dec,
@@ -459,7 +458,7 @@ def build_train_valid_test_datasets_with_prefixes(data_impl,
     return (train_dataset, valid_dataset, test_dataset)
 
 
-def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+def build_train_valid_test_datasets(data_prefix, splits_string,
                                     train_valid_test_num_samples,
                                     max_seq_length, seed,
                                     skip_warmup, binary_head=False,
@@ -468,7 +467,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     if len(data_prefix) == 1:
         return _build_train_valid_test_datasets(data_prefix[0],
-                                                data_impl, splits_string,
+                                                splits_string,
                                                 train_valid_test_num_samples,
                                                 max_seq_length, seed,
                                                 skip_warmup,
@@ -491,7 +490,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     test_datasets = []
     for i in range(len(prefixes)):
         train_ds, valid_ds, test_ds = _build_train_valid_test_datasets(
-            prefixes[i], data_impl, splits_string,
+            prefixes[i], splits_string,
             datasets_train_valid_test_num_samples[i],
             max_seq_length, seed, skip_warmup, binary_head,
             max_seq_length_dec, dataset_type=dataset_type)
@@ -517,7 +516,7 @@ def build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             blending_test_dataset)
 
 
-def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
+def _build_train_valid_test_datasets(data_prefix, splits_string,
                                      train_valid_test_num_samples,
                                      max_seq_length, seed,
                                      skip_warmup, binary_head,
@@ -526,7 +525,6 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
 
     # Indexed dataset.
     indexed_dataset = get_indexed_dataset_(data_prefix,
-                                           data_impl,
                                            dataset_type,
                                            skip_warmup)
 
@@ -566,7 +564,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
             indexed_dataset.set_doc_idx(doc_idx_ptr[start_index:end_index])
 
             dataset = build_dataset(
-                name, data_prefix, data_impl,
+                name, data_prefix,
                 train_valid_test_num_samples[index], max_seq_length,
                 seed, skip_warmup, binary_head, max_seq_length_dec,
                 dataset_type, indexed_dataset)
@@ -586,7 +584,7 @@ def _build_train_valid_test_datasets(data_prefix, data_impl, splits_string,
     return (train_dataset, valid_dataset, test_dataset)
 
 
-def build_dataset(name, data_prefix, data_impl, max_num_samples,
+def build_dataset(name, data_prefix, max_num_samples,
                   max_seq_length, seed, skip_warmup, binary_head,
                   max_seq_length_dec, dataset_type='standard_bert',
                   indexed_dataset=None):
@@ -601,7 +599,6 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
 
     if indexed_dataset is None:
         indexed_dataset = get_indexed_dataset_(data_prefix,
-                                               data_impl,
                                                dataset_type,
                                                skip_warmup)
 
@@ -619,7 +616,6 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
 
         title_dataset = get_indexed_dataset_(
             args.titles_data_path,
-            data_impl,
             dataset_type,
             skip_warmup)
 
@@ -667,16 +663,13 @@ def build_dataset(name, data_prefix, data_impl, max_num_samples,
     return dataset
 
 
-def get_indexed_dataset_(data_prefix, data_impl, dataset_type, skip_warmup):
+def get_indexed_dataset_(data_prefix, dataset_type, skip_warmup):
 
     print_rank_0(' > building dataset index ...')
 
     start_time = time.time()
     multimodal = dataset_type == DSET_TYPE_MULTIMODAL
-    indexed_dataset = make_indexed_dataset(data_prefix,
-                                           data_impl,
-                                           skip_warmup,
-                                           multimodal)
+    indexed_dataset = MMapIndexedDataset(data_prefix, skip_warmup, multimodal)
     assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
     print_rank_0(' > finished creating indexed dataset in {:4f} '
                  'seconds'.format(time.time() - start_time))

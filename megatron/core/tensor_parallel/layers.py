@@ -229,6 +229,83 @@ class VocabParallelEmbedding(torch.nn.Module):
         return output
 
 
+class LinearWithFrozenWeight(torch.autograd.Function):
+    """Linear operator that does not calculate gradient for weight.
+    This op and LinearWithGradAccumulationAndAsyncCommunication performs 
+    mathematically-identical forward and DGRAD. 
+    
+    Conceptually this op is the same as torch.nn.functional.linear with
+    weight.requires_grad==False, but in experiments they are not identical 
+    mathematically. """
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx, input, weight, bias,
+    ):
+        ctx.save_for_backward(weight)
+        output = torch.matmul(input, weight.t())
+        if bias is not None:
+            output = output + bias
+        return output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        (weight,) = ctx.saved_tensors
+        grad_input = grad_output.matmul(weight)
+        return grad_input, None, None
+
+
+def linear_with_frozen_weight(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    gradient_accumulation_fusion: bool,
+    async_grad_allreduce: bool,
+    sequence_parallel: bool,
+) -> torch.Tensor:
+    """Linear layer execution with weight.requires_grad == False.
+
+    This function handles linear layers with weight frozen (untrainable). 
+    In the forward, it only saves weight and does not save input activations.
+    In the backward, it does not perform weight gradient calculation, or 
+    weight gradient allreduce. 
+
+    Arguments:
+
+    input (torch.Tensor required): input like torch.nn.functional.linear
+
+    weight (torch.Tensor required): weight like torch.nn.functional.linear
+
+    bias (torch.Tensor optional): bias like torch.nn.functional.linear
+
+    gradient_accumulation_fusion (bool required): dummy argument, used to 
+    keep the API unified between all forward implementation functions.
+
+    async_grad_allreduce (bool required): dummy argument, used to 
+    keep the API unified between all forward implementation functions.
+
+    sequence_parallel (bool required): Indicates that sequence
+        parallelism is used and thus in the forward pass the input is
+        all gathered, and the backward pass the input gradients are
+        reduce scattered.
+    """
+
+    if sequence_parallel:
+        input = gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
+    else:
+        input = input
+
+    args = [
+        input,
+        weight,
+        bias,
+    ]
+
+    return LinearWithFrozenWeight.apply(*args)
+
+
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
 
@@ -338,7 +415,21 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
-            grad_weight = None
+
+            if hasattr(weight, 'grad_added_to_main_grad'):
+                # When overlap_grad_reduce is True, need to ensure that backward hooks
+                # are all run on the main backprop thread to prevent deadlocks. Setup
+                # dummy grad_weight tensor to prevent backward hooks from being run
+                # in a background thread.
+                grad_weight = torch.empty(
+                    weight.main_grad.shape,
+                    dtype=input.dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+                weight.grad_added_to_main_grad = True
+            else:
+                grad_weight = None
         else:
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
@@ -635,6 +726,10 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
+        if not weight.requires_grad:
+            self._forward_impl = linear_with_frozen_weight
+        else:
+            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
         output_parallel = self._forward_impl(
             input=input_parallel,
             weight=weight,
@@ -791,6 +886,10 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
+        if not self.weight.requires_grad:
+            self._forward_impl = linear_with_frozen_weight
+        else:
+            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
         output_parallel = self._forward_impl(
             input=input_parallel,
             weight=self.weight,
