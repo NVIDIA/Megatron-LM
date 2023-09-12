@@ -17,6 +17,7 @@ class VitClassificationModel(MegatronModule):
                  pre_process=True, post_process=True):
         super(VitClassificationModel, self).__init__()
         args = get_args()
+        self.config = config
 
         self.hidden_size = args.hidden_size
         self.num_classes = num_classes
@@ -29,10 +30,10 @@ class VitClassificationModel(MegatronModule):
             post_process=self.post_process,
             single_token_output=True
         )
-        
+
         if self.post_process:
             if not self.finetune:
-                self.head = VitMlpHead(self.hidden_size, self.num_classes)
+                self.head = VitMlpHead(config, self.hidden_size, self.num_classes)
             else:
                 self.head = get_linear_layer(
                     self.hidden_size,

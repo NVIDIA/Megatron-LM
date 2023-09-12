@@ -36,7 +36,7 @@ def get_batch(data_iterator):
 
 def loss_func(model, labels, output_tensor, collect_data=False):
     args = get_args()
-    
+
     model = unwrap_model(model)
     if model.training:
         student_output, teacher_output = output_tensor
@@ -94,6 +94,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
