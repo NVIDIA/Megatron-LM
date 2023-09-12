@@ -482,6 +482,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
+    _set_arg('normalization', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
     if checkpoint_version < 3.0:
