@@ -96,8 +96,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param, param_world_indexes in param_world_index_map.items():
 
             # Param range.
-            # TODO: This might need to be fixed when reduce_grad_overlap is set to True.
-            # TODO: Right now, param_world_indexes is the global indexes (not the relevant bucket).
             param_world_start, param_world_end, _ = param_world_indexes
             param_local_start = max(
                 0,
@@ -431,7 +429,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         storage,
                         dtype = params_dtype,
                         device = bucket.data.device)
-                    param_buffer = param_buffer[:bucket.data.numel()]
+                    param_buffer = param_buffer[bucket.offset:bucket.offset+bucket.data.numel()]
                     current_param_buffers[dtype].append(param_buffer)
             self.param_buffers.append(current_param_buffers)
 
@@ -802,13 +800,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         view_items = []
         for model_index, buffers in enumerate(model_buffers):
             for dtype, buf_for_all_buckets in buffers.items():
-                for _, buf in enumerate(buf_for_all_buckets):
-
+                for bucket_index, buf in enumerate(buf_for_all_buckets):
                     assert buf.numel() % data_parallel_world_size == 0
-                    shard_size = int(buf.numel() / data_parallel_world_size)
+                    shard_size = buf.numel() // data_parallel_world_size
                     buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
                                 for r in range(data_parallel_world_size)]
-                    view_items.append((model_index, dtype, buf, buf_views))
+                    view_items.append((model_index, dtype, bucket_index, buf, buf_views))
 
         return view_items
 
@@ -868,10 +865,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   all sub-views will have consistent start/end indexes across data
         #   parallel ranks.
         pbuf_view_items = self.get_model_param_buffer_dp_views()
-        for index, (model_index, dtype, pbuf, pbuf_views) \
+        for index, (model_index, dtype, bucket_index, pbuf, pbuf_views) \
             in enumerate(pbuf_view_items):
-
-            # TODO: Update to this in an interleaved fashion.
             torch.distributed._all_gather_base(
                 pbuf,
                 pbuf_views[data_parallel_rank],
@@ -885,6 +880,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_offset = model.grad_buffers[dtype].buckets[bucket_index].offset
                     param_buf = self.param_buffers[model_id][dtype][bucket_index]
                     param_buf_shard = param_buf[buf_start-bucket_offset:buf_end-bucket_offset]
+                    assert param.data.nelement() == param_buf_shard.nelement()
                     param.view(-1).detach().copy_(param_buf_shard)
 
         timers('params-all-gather').stop()

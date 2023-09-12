@@ -175,6 +175,8 @@ class GradBuffer(MemoryBuffer):
             )
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
+                assert bucket_param not in self.param_to_bucket
+                assert bucket_param not in self.param_to_bucket_index
                 self.param_to_bucket[bucket_param] = bucket
                 self.param_to_bucket_index[bucket_param] = len(self.buckets) - 1
 
