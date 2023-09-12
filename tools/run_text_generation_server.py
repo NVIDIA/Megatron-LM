@@ -30,8 +30,16 @@ def model_provider(pre_process=True, post_process=True):
     return model
 
 
+def add_text_generate_args(parser):
+    group = parser.add_argument_group(title='text generation')
+    group.add_argument("--port", type=int, default=5000,
+                       help='port for text generation server to run on')
+    return parser
+
+
 if __name__ == "__main__":
-    initialize_megatron(args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+    initialize_megatron(extra_args_provider=add_text_generate_args,
+                        args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
                                        'no_load_rng': True,
                                        'no_load_optim': True})
 
