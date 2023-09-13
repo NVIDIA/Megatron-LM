@@ -486,6 +486,11 @@ class TransformerLanguageModel(MegatronModule):
         else:
             retriever_input = None
 
+        # >>>
+        # from lutil import pax
+        # pax("encoder_input", "retriever_input")
+        # <<<
+
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.use_rotary_position_embeddings:

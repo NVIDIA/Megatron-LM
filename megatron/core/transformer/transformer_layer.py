@@ -16,6 +16,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
+# >>>
+from lutil import pax
+# <<<
+
 
 @dataclass
 class TransformerLayerSpec:
@@ -179,6 +183,15 @@ class TransformerLayer(MegatronModule):
     ):
         # hidden_states: [s, b, h]
 
+        # >>>
+        # pax(
+        #     {"layer_number": self.layer_number},
+        #     "hidden_states",
+        #     "attention_mask",
+        #     "context",
+        # )
+        # <<<
+
         # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
 
@@ -192,6 +205,18 @@ class TransformerLayer(MegatronModule):
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
         )
+
+        # >>>
+        # if True or self.layer_number == 2:
+        #     pax(
+        #         {
+        #             "layer" : dict(self.named_children()),
+        #             "self_attention" : dict(self.self_attention.named_children()),
+        #         },
+        #         "attention_output_with_bias",
+        #         "residual",
+        #     )
+        # <<<
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -253,6 +278,10 @@ class TransformerLayer(MegatronModule):
         output = make_viewless_tensor(
             inp=output, requires_grad=output.requires_grad, keep_graph=True
         )
+
+        # >>>
+        # pax("output") # , "context")
+        # <<<
 
         return output, context
 

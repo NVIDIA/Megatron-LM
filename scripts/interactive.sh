@@ -5,7 +5,7 @@ set -u
 ######## Arguments. ########
 
 ADD_RETRIEVER=1
-NPROCS=1 # 8
+NPROCS=1
 NWORKERS=32
 
 . /lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh \
@@ -14,7 +14,13 @@ NWORKERS=32
   ${NWORKERS}
 
 REPO_DIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore"
-SCRIPT="pretrain_retro_core.py"
+
+if [ "$1" = "0" ]; then
+    SCRIPT="pretrain_retro.py"
+else
+    SCRIPT="pretrain_retro_core.py"
+fi
+
 ARGS="${ARGS/'          --split-constraint 98,2,0         --split-constraint 99,1,0'/''}"
 
 # echo "ARGS     : ${ARGS}"

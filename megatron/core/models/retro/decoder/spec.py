@@ -23,14 +23,39 @@ from megatron.core.transformer import (
 from .attn import (
     RetroDecoderBiasDropoutAdd,
     RetroDecoderCrossAttention,
+    RetroDecoderCrossAttention_naive,
     RetroDecoderLayerNorm,
 )
 
 
+# >>>
+# def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpec:
+#     spec = get_gpt_layer_spec()
+#     # >>>
+#     # <<<
+#     spec.cross_attention=CrossAttentionSpec(
+#         module=RetroDecoderCrossAttention,
+#         params={
+#             "attn_mask_type" : AttnMaskType.causal,
+#             "encoder_block_spec" : encoder_block_spec,
+#         },
+#         layernorm_linear_q=TELayerNormColumnParallelLinear,
+#         layernorm_linear_kv=TELayerNormColumnParallelLinear,
+#         core_attention=TEDotProductAttention,
+#         linear_proj=TERowParallelLinear,
+#     )
+#     spec.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+#     spec.post_cross_attn_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
+#     spec.ln_mlp=ModuleSpec(module=MLP)
+#     # >>>
+#     # from lutil import pax
+#     # pax("spec")
+#     # <<<
+#     return spec
 def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpec:
     spec = get_gpt_layer_spec()
     spec.cross_attention=CrossAttentionSpec(
-        module=RetroDecoderCrossAttention,
+        module=RetroDecoderCrossAttention_naive,
         params={
             "attn_mask_type" : AttnMaskType.causal,
             "encoder_block_spec" : encoder_block_spec,
@@ -40,10 +65,20 @@ def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpe
         core_attention=TEDotProductAttention,
         linear_proj=TERowParallelLinear,
     )
-    spec.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
-    spec.post_cross_attn_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
+    # spec.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    # spec.post_cross_attn_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
+
+    # >>>
     spec.ln_mlp=ModuleSpec(module=MLP)
+    # spec.ln_mlp=ModuleSpec(module=ParallelMLP)
+    # <<<
+
+    # >>>
+    # from lutil import pax
+    # pax("spec")
+    # <<<
     return spec
+# <<<
 
 
 def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSpec:

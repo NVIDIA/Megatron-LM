@@ -19,6 +19,10 @@ from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
 
+# >>>
+from lutil import pax, tp
+# <<<
+
 try:
     from einops import rearrange
 except ImportError:
@@ -803,10 +807,42 @@ class ParallelTransformerLayer(MegatronModule):
                                LayerType.retro_decoder,
                                LayerType.retro_decoder_with_retriever,
                                LayerType.retro_encoder):
-            self.inter_attention = ParallelAttention(
-                config,
-                layer_number,
-                attention_type=AttnType.cross_attn)
+            # >>>
+            # self.inter_attention = ParallelAttention(
+            #     config,
+            #     layer_number,
+            #     attention_type=AttnType.cross_attn)
+            # +++
+            from megatron.core.transformer.attention import CrossAttention, CrossAttentionSpec
+            from megatron.core.transformer.custom_layers.transformer_engine import (
+                # TEColumnParallelLinear,
+                TELayerNormColumnParallelLinear as TEColumnParallelLinear,
+                TEDotProductAttention,
+                TERowParallelLinear,
+            )
+
+            class MyCrossAttention(CrossAttention):
+                def forward(self, hidden_states, attention_mask,
+                            encoder_output=None):
+                    return super().forward(hidden_states,
+                                           attention_mask,
+                                           key_value_states=encoder_output)
+            self.inter_attention = MyCrossAttention(
+                config=config,
+                spec=CrossAttentionSpec(
+                    module=None, # CrossAttention
+                    params={
+                        "attn_mask_type" : self_attn_mask_type, # AttnMaskType.causal,
+                        # "encoder_block_spec" : encoder_block_spec,
+                    },
+                    layernorm_linear_q=TEColumnParallelLinear,
+                    layernorm_linear_kv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                ),
+                layer_number=layer_number,
+            )
+            # <<<
             # Layernorm on the attention output.
             self.post_inter_attention_layernorm = LayerNorm(
                 config.hidden_size,
@@ -973,6 +1009,18 @@ class ParallelTransformerLayer(MegatronModule):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
+        # >>>
+        # if self.layer_type == LayerType.retro_decoder:
+        #     pax(
+        #         "retriever_input",
+        #         "retriever_output",
+        #         "layernorm_input",
+        #         "layernorm_output",
+        #         {"post ln" : self.apply_residual_connection_post_layernorm},
+        #         # {"retriever": self.retriever},
+        #     )
+        # <<<
+
         ns, bs, d = layernorm_output.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
 
@@ -999,6 +1047,11 @@ class ParallelTransformerLayer(MegatronModule):
                 .contiguous()
 
             # Get Encoder Output
+            # >>>
+            # pax("layernorm_output")
+            # pax("retriever_input", "retriever_attn_mask", "chunked_output")
+            # <<<
+
             retriever_output = self.retriever(
                 hidden_states=retriever_input,
                 attention_mask=retriever_attn_mask,
@@ -1007,6 +1060,10 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=inference_params) # [r, k * bs * l , d]
             retriever_output = retriever_output.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
+
+            # >>>
+            # pax("retriever_output")
+            # <<<
 
         # Chunks.
         pad = (ns - 1) % self.retro_chunk_length
@@ -1026,6 +1083,10 @@ class ParallelTransformerLayer(MegatronModule):
             self.inter_attention(padded_chunked_output,
                                  None,
                                  encoder_output=retriever_output)
+
+        # >>>
+        # pax("attention_output", "attention_bias", "retriever_output")
+        # <<<
 
         # Residual connection.
         if self.apply_residual_connection_post_layernorm:
@@ -1053,6 +1114,12 @@ class ParallelTransformerLayer(MegatronModule):
         # Layer norm post the decoder attention
         layernorm_output = self.post_inter_attention_layernorm(layernorm_input)
 
+        # >>>
+        # if self.layer_type == LayerType.retro_decoder:
+        #     pax("layernorm_output")
+        # pax("retriever_output", "layernorm_output")
+        # <<<
+
         return retriever_output, layernorm_input, layernorm_output
 
     def forward(self, hidden_states, attention_mask,
@@ -1063,6 +1130,15 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
+
+        # >>>
+        # pax(
+        #     {"layer_number": self.layer_number},
+        #     "hidden_states",
+        #     "attention_mask",
+        #     "retriever_input",
+        # )
+        # <<<
 
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
@@ -1080,6 +1156,19 @@ class ParallelTransformerLayer(MegatronModule):
             residual = layernorm_output
         else:
             residual = hidden_states
+
+        # >>>
+        # if True or self.layer_number == 2:
+        #     pax(
+        #         {
+        #             "layer" : dict(self.named_children()),
+        #             "self_attention" : dict(self.self_attention.named_children()),
+        #         },
+        #         "attention_output",
+        #         "attention_bias",
+        #         "residual",
+        #     )
+        # <<<
 
         if self.drop_path is None:
             # jit scripting for a nn.module (with dropout) is not
@@ -1180,6 +1269,10 @@ class ParallelTransformerLayer(MegatronModule):
                                               p=self.hidden_dropout,
                                               training=self.training)
             output = residual + self.drop_path(out)
+
+        # >>>
+        # pax("output")
+        # <<<
 
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output

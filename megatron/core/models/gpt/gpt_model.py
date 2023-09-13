@@ -162,6 +162,23 @@ class GPTModel(MegatronModule):
         else:
             context = None
 
+        # >>>
+        # from lutil import pax
+        # pax("decoder_input", "context")
+        # <<<
+
+        # >>>
+        # from lutil import tp
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # # print("EMBEDDING : %s." % tp(self.embedding.word_embeddings.weight))
+        # print("INPUT_IDS : %s." % tp(input_ids))
+        # print("POSITION_IDS : %s." % tp(position_ids))
+        # print("DECODER_INPUT : %s." % tp(decoder_input))
+        # # print("CONTEXT_INPUT_IDS : %s." % tp(context_input_ids))
+        # # print("CONTEXT_POSITION_IDS : %s." % tp(context_position_ids))
+        # # print("CONTEXT : %s." % tp(context))
+        # <<<
+
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.rotary_pos_emb is not None:
@@ -208,6 +225,12 @@ class GPTModel(MegatronModule):
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
+
+        # >>>
+        # from lutil import tp
+        # print("LOSS : %s." % tp(loss))
+        # <<<
+
         return loss
 
     def shared_embedding_or_output_weight(self):

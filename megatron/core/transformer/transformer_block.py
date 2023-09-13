@@ -15,6 +15,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
 from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
 
+# >>>
+from lutil import pax
+# <<<
+
 
 def get_num_layers_to_build(config) -> int:
 
@@ -79,6 +83,19 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
 
+        # >>>
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # print(self.layers[0].self_attention)
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # print(self.layers[5].self_attention)
+        # print(self.layers[5].inter_attention)
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # print(self.layers[8].self_attention)
+        # print(self.layers[8].cross_attention)
+        # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        # exit()
+        # <<<
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -87,6 +104,56 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(spec, layer_number):
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            from megatron.model.enums import LayerType
+            from megatron.model.transformer import ParallelTransformerLayer
+
+            class OldDecoderLayerWrapper(ParallelTransformerLayer):
+                def forward(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    context=None,
+                    context_mask=None,
+                    inference_params=None,
+                    rotary_pos_emb=None,
+                ):
+                    # assert self.retriever is not None
+                    return super().forward(
+                        hidden_states,
+                        attention_mask,
+                        retriever_input=context,
+                        retriever_output=context,
+                        retriever_attn_mask=context_mask)
+
+            class OldEncoderLayerWrapper(ParallelTransformerLayer):
+                def forward(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    context=None,
+                    context_mask=None,
+                    inference_params=None,
+                    rotary_pos_emb=None,
+                ):
+                    raise Exception("hi.")
+
+            # if layer_number == 6:
+            if type(spec.cross_attention).__name__ == "CrossAttentionSpec":
+                xspec = spec.cross_attention
+                if xspec.module.__name__ == "RetroDecoderCrossAttention_naive":
+                    if xspec.params["encoder_block_spec"] is not None:
+                        return OldDecoderLayerWrapper(
+                            self.config,
+                            layer_number,
+                            layer_type=LayerType.retro_decoder if xspec.params["encoder_block_spec"] is None else LayerType.retro_decoder_with_retriever,
+                            self_attn_mask_type=AttnMaskType.causal,
+                            # drop_path_rate=self.drop_path_rates[layer_number - 1])
+                            drop_path_rate=0.)
+                else:
+                    raise Exception("specialize for <%s>."%xspec.module.__name__)
+                # pax("layer_number", "spec", {"xattn": spec.cross_attention})
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             return TransformerLayer(
                 config=self.config,
                 spec=spec,
@@ -259,7 +326,17 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for layer in self.layers:
-                    hidden_states, context = layer(
+                    # >>>
+                    # hidden_states, context = layer(
+                    #     hidden_states=hidden_states,
+                    #     attention_mask=attention_mask,
+                    #     context=context,
+                    #     context_mask=context_mask,
+                    #     rotary_pos_emb=rotary_pos_emb,
+                    #     inference_params=inference_params,
+                    # )
+                    # +++
+                    result = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         context=context,
@@ -267,6 +344,16 @@ class TransformerBlock(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
                     )
+                    if isinstance(result, tuple):
+                        hidden_states, context = result
+                    elif isinstance(result, torch.Tensor):
+                        hidden_states = result
+                    else:
+                        raise Exception("hi.")
+
+                    # if layer.layer_number == 6:
+                    #     pax("hidden_states", "context")
+                    # <<<
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
