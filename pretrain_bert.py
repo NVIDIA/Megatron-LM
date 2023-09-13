@@ -149,6 +149,8 @@ def extra_args_provider(parser):
                        help='wandb optimizer.')
     group.add_argument('--wandb-optimizer-version',
                        help='wandb optimizer-version.')
+    group.add_argument('--wandb-id',
+                       help='wandb id.')
     
     
     return parser

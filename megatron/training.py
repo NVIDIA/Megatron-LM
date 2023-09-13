@@ -114,6 +114,8 @@ def pretrain(train_valid_test_dataset_provider,
         save_code=args.wandb_save_code,
         reinit=True,
         config=args,
+        resume="allow",
+        id=args.wandb_id
     )
 
     # Model, optimizer, and learning rate.
@@ -698,6 +700,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             log_string += ' params norm: {:.3f} |'.format(params_norm)
         wandb.log({"number of skipped iterations": total_loss_dict[skipped_iters_key]}, step=iteration)
         wandb.log({"number of nan iterations": total_loss_dict[nan_iters_key]}, step=iteration)
+        
+        mem_stats = torch.cuda.memory_stats()
+        wandb.log({"mem-allocated": mem_stats["allocated_bytes.all.peak"]}, step=iteration)
+        wandb.log({"mem-reserved": mem_stats["reserved_bytes.all.peak"]}, step=iteration)
+        wandb.log({"mem-allocated-bytes": mem_stats["allocated_bytes.all.peak"]}, step=iteration)
         log_string += ' number of skipped iterations: {:3d} |'.format(
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(

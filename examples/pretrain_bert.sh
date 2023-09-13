@@ -6,7 +6,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # VOCAB_FILE=<Specify path to file>/bert-vocab.txt
 # DATA_PATH=<Specify path and file prefix>_text_sentence
 
-CHECKPOINT_PATH=/workspace/checkpoints
+CHECKPOINT_PATH=/workspace/checkpoints/bert-large-uncased/
 VOCAB_FILE=vocab/bert-large-uncased-vocab.txt
 DATA_PATH=output_prefix/my-bert-uncased_text_sentence
 
@@ -50,7 +50,8 @@ WANDB="
     --wandb-tags baseline \
     --wandb-model bert \
     --wandb-optimizer adam \
-    --wandb-optimizer-version original
+    --wandb-optimizer-version original \
+    --wandb-id bert-large-uncased1 \
 "
 
 torchrun pretrain_bert.py \

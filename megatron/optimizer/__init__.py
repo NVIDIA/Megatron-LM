@@ -83,6 +83,17 @@ def get_megatron_optimizer(model,
                         lr=args.lr,
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)
+    # elif args.optimizer == 'adam_november':
+    #     from .adam_november import Adam
+    #     optimizer = Adam(param_groups,
+    #                      lr=args.lr,
+    #                      weight_decay=args.weight_decay,
+    #                      betas=(args.adam_beta1, args.adam_beta2),
+    #                      eps=args.adam_eps,
+    #                      decay_rate=args.adam_decay_rate,
+    #                      vector_reshape=True,
+    #                      lambda_factor=args.adam_lambda,)
+                        
     else:
         raise Exception('{} optimizer is not supported.'.format(
             args.optimizer))
