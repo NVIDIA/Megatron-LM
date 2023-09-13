@@ -13,3 +13,4 @@ dataset
 wandb/*
 .hypothesis/*
 .vscode/*
+checkpoints/*
