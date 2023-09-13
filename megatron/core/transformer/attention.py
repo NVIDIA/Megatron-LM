@@ -298,15 +298,6 @@ class SelfAttention(Attention):
             skip_bias_add=False,
         )
 
-        # >>> [ temporary ]
-        # core_attention = self.core_attention
-        # linear_proj = self.linear_proj
-        # delattr(self, "core_attention")
-        # delattr(self, "linear_proj")
-        # self.core_attention = core_attention
-        # self.linear_proj = linear_proj
-        # <<<
-
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.

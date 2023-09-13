@@ -116,11 +116,6 @@ def pretrain(train_valid_test_dataset_provider,
                    'scheduler are built')
     config = get_model_config(model[0])
 
-    # >>>
-    # from lutil import pax
-    # pax("model")
-    # <<<
-
     # Data stuff.
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)

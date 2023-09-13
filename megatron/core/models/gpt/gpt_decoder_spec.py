@@ -16,7 +16,6 @@ from megatron.core.transformer.transformer_block import (
 from megatron.core.transformer.transformer_layer import TransformerLayerSpec
 
 
-# >>>
 def get_gpt_layer_spec() -> TransformerLayerSpec:
     return TransformerLayerSpec(
         self_attention=SelfAttentionSpec(
@@ -30,20 +29,7 @@ def get_gpt_layer_spec() -> TransformerLayerSpec:
         ln_mlp=TELayerNormMLP,
         mlp_bda=get_bias_dropout_add,
     )
-# def get_gpt_layer_spec() -> TransformerLayerSpec:
-#     return TransformerLayerSpec(
-#         input_layernorm=ModuleSpec(
-#             module=MixedFusedLayerNorm,
-#         ),
-#         self_attention=SelfAttentionSpec(
-#             module=ParallelAttention(,
-#             params={"attention_type": AttnType.self_attn, "attn_mask_type": AttnMaskType.causal},
-#         ),
-#         self_attn_bda=get_bias_dropout_add,
-#         ln_mlp=TELayerNormMLP,
-#         mlp_bda=get_bias_dropout_add,
-#     )
-# <<<
+
 
 def get_gpt_block_spec() -> TransformerBlockSpec:
     num_layers = get_num_layers_to_build()
