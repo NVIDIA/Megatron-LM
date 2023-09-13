@@ -50,7 +50,8 @@ WANDB="
     --wandb-tags baseline \
     --wandb-model gpt \
     --wandb-optimizer adam \
-    --wandb-optimizer-version original
+    --wandb-optimizer-version original \
+    --wandb-id gpt_baseline
 "
 torchrun pretrain_gpt.py \
     $GPT_ARGS \
