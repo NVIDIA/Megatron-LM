@@ -68,6 +68,8 @@ def get_norm(config):
             sequence_parallel=config.sequence_parallel,
             apply_layernorm_1p=args.apply_layernorm_1p)
     elif args.normalization == "RMSNorm":
-        return RMSNorm(args.hidden_size, args.norm_epsilon)
+        return RMSNorm(dim=config.hidden_size,
+                       eps=config.layernorm_epsilon,
+                       sequence_parallel=config.sequence_parallel)
     else:
         raise Exception(f"unsupported norm type '{args.normalization}'.")
