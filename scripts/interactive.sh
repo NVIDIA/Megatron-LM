@@ -1,26 +1,37 @@
 #!/bin/bash
 
 set -u
+unset NCCL_DEBUG
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 ######## Arguments. ########
 
+USE_CORE=0
 ADD_RETRIEVER=1
 NPROCS=1
 NWORKERS=32
 
-. /lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh \
+# ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh"
+# . ${ARGS_PATH} \
+#   ${USE_CORE} \
+#   ${ADD_RETRIEVER} \
+#   ${NPROCS} \
+#   ${NWORKERS}
+ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore/scripts/args_wiki.sh"
+. ${ARGS_PATH} \
+  ${USE_CORE} \
   ${ADD_RETRIEVER} \
-  ${NPROCS} \
   ${NWORKERS}
 
 REPO_DIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore"
 
-if [ "$1" = "0" ]; then
-    SCRIPT="pretrain_retro.py"
-else
-    SCRIPT="pretrain_retro_core.py"
-fi
+# if [ "$1" = "0" ]; then
+#     SCRIPT="pretrain_retro.py"
+# else
+#     SCRIPT="pretrain_retro_core.py"
+# fi
 
+# Remove 'split-constraint' args.
 ARGS="${ARGS/'          --split-constraint 98,2,0         --split-constraint 99,1,0'/''}"
 
 # echo "ARGS     : ${ARGS}"
