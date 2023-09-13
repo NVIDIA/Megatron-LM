@@ -86,7 +86,6 @@ If loading for either inference or finetuning, use the following arguments:
 --no-load-optim \
 --no-load-rng \
 --fp16 \
---DDP-impl local \
 --untie-embeddings-and-output-weights \
 --use-rotary-position-embeddings \
 --normalization RMSNorm \
