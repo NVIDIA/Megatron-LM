@@ -20,20 +20,18 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_block_spec
 
 
-def model_provider(pre_process=True, post_process=True, block_spec=None):
+def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
     args = get_args()
     config = core_transformer_config_from_args(args)
 
     # NOTE: Experimental customization feature
-    if block_spec is not None:
-        pass
-    elif args.block_spec is not None:
+    if args.block_spec is not None:
         block_spec_func = import_module(args.block_spec)
         block_spec = block_spec_func()
     else:
-        block_spec = get_gpt_block_spec()
+        block_spec = get_gpt_block_spec(config)
 
     print_rank_0('building GPT model ...')
     model = GPTModel(

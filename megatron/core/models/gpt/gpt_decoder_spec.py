@@ -31,8 +31,8 @@ def get_gpt_layer_spec() -> TransformerLayerSpec:
     )
 
 
-def get_gpt_block_spec() -> TransformerBlockSpec:
-    num_layers = get_num_layers_to_build()
+def get_gpt_block_spec(config) -> TransformerBlockSpec:
+    num_layers = get_num_layers_to_build(config)
     layer_spec = get_gpt_layer_spec()
     block_spec = TransformerBlockSpec([layer_spec] * num_layers)
     return block_spec
