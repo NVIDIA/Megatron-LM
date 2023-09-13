@@ -2,7 +2,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=./checkpoints
+CHECKPOINT_PATH=./checkpoints/t5
 VOCAB_FILE=./vocab/bert-large-uncased-vocab.txt
 DATA_PATH=./output_prefix/my-t5-uncased_text_sentence
 
@@ -47,11 +47,13 @@ WANDB="
     --wandb-project Megatron-LM \
     --wandb-name t5 \
     --wandb-save_code True \
-    --wandb-tags baseline \
+    --wandb-tags test \
     --wandb-model t5 \
     --wandb-optimizer adam \
-    --wandb-optimizer-version original
+    --wandb-optimizer-version original \
+    --wandb-id t5_test
 "
+
 torchrun pretrain_t5.py \
     $T5_ARGS \
     $DATA_ARGS \
