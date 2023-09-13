@@ -12,10 +12,10 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=/workspace/checkpoints
-VOCAB_FILE=/workspace/megatron/vocab/gpt2-vocab.json
-MERGE_FILE=/workspace/megatron/vocab/gpt2-merges.txt
-DATA_PATH=/workspace/megatron/output_prefix/my-gpt2-cased_text_document
+CHECKPOINT_PATH=./checkpoints
+VOCAB_FILE=./vocab/gpt2-vocab.json
+MERGE_FILE=./vocab/gpt2-merges.txt
+DATA_PATH=./output_prefix/my-gpt2-cased_text_document
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \

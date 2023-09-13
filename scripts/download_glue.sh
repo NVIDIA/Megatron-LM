@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DATA_DIR=/root/workspace/dataset/glue
+DATA_DIR=./dataset/glue
 
 (
     python scripts/utils/download_glue.py \

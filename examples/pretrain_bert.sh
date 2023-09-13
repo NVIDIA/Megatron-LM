@@ -6,9 +6,9 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # VOCAB_FILE=<Specify path to file>/bert-vocab.txt
 # DATA_PATH=<Specify path and file prefix>_text_sentence
 
-CHECKPOINT_PATH=/workspace/checkpoints/bert-large-uncased/
-VOCAB_FILE=vocab/bert-large-uncased-vocab.txt
-DATA_PATH=output_prefix/my-bert-uncased_text_sentence
+CHECKPOINT_PATH=./checkpoints/bert-large-uncased/
+VOCAB_FILE=./vocab/bert-large-uncased-vocab.txt
+DATA_PATH=./output_prefix/my-bert-uncased_text_sentence
 
 BERT_ARGS="
     --num-layers 24 \
