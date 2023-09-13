@@ -8,7 +8,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.transformer.enums import AttnMaskType
+# from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.models.retro.encoder import get_retro_encoder_block_spec
@@ -23,7 +23,6 @@ from megatron.core.transformer import (
 from .attn import (
     RetroDecoderBiasDropoutAdd,
     RetroDecoderCrossAttention,
-    RetroDecoderCrossAttention_naive,
     RetroDecoderLayerNorm,
 )
 
@@ -33,7 +32,7 @@ def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpe
     spec.cross_attention=CrossAttentionSpec(
         module=RetroDecoderCrossAttention,
         params={
-            "attn_mask_type" : AttnMaskType.causal,
+            # "attn_mask_type" : AttnMaskType.causal,
             "encoder_block_spec" : encoder_block_spec,
         },
         layernorm_linear_q=TELayerNormColumnParallelLinear,
