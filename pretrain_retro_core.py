@@ -9,20 +9,12 @@ from megatron.arguments import core_transformer_config_from_args
 from megatron.core.enums import ModelType
 from megatron.core.models.retro import get_retro_decoder_block_spec, RetroModel
 from megatron.training import pretrain
-
-# from pretrain_gpt_core import model_provider as gpt_model_provider
 from pretrain_retro import (
     forward_step,
     train_valid_test_datasets_provider,
 )
 
 
-# def model_provider(pre_process=True, post_process=True):
-#     args = get_args()
-#     config = core_transformer_config_from_args(args)
-#     model = gpt_model_provider(pre_process, post_process,
-#                                block_spec=get_retro_decoder_block_spec(config))
-#     return model
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
