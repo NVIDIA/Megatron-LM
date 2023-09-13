@@ -215,21 +215,21 @@ def initialize_model_parallel(
         end_rank = (i + 1) * num_pipeline_model_parallel_groups
         for j in range(context_parallel_size * tensor_model_parallel_size):
             ranks = range(start_rank + j, end_rank, context_parallel_size * tensor_model_parallel_size)
+            group = torch.distributed.new_group(ranks)
+            group_gloo = torch.distributed.new_group(ranks, backend="gloo")
+            if rank in ranks:
+                _DATA_PARALLEL_GROUP = group
+                _DATA_PARALLEL_GROUP_GLOO = group_gloo
+                _DATA_PARALLEL_GLOBAL_RANKS = ranks
         for j in range(tensor_model_parallel_size):
             ranks_with_cp = range(start_rank + j, end_rank, tensor_model_parallel_size)
-        all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
-        group = torch.distributed.new_group(ranks)
-        group_gloo = torch.distributed.new_group(ranks, backend="gloo")
-        group_with_cp = torch.distributed.new_group(ranks_with_cp)
-        group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
-        if rank in ranks:
-            _DATA_PARALLEL_GROUP = group
-            _DATA_PARALLEL_GROUP_GLOO = group_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS = ranks
-        if rank in ranks_with_cp:
-            _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
+            all_data_parallel_group_ranks_with_cp.append(list(ranks_with_cp))
+            group_with_cp = torch.distributed.new_group(ranks_with_cp)
+            group_with_cp_gloo = torch.distributed.new_group(ranks_with_cp, backend="gloo")
+            if rank in ranks_with_cp:
+                _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
+                _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
+                _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
     # Apply SHARP to DP process groups
     if use_sharp:
