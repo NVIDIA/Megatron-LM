@@ -212,7 +212,10 @@ class GradBuffer(MemoryBuffer):
         to register grads when processing the last microbatch and
         overlap_grad_reduce is True.
         """
-        if self.is_last_microbatch and self.overlap_grad_reduce:
+        assert (
+            self.overlap_grad_reduce
+        ), 'mark_grad_as_done() should only be called when overlap_grad_reduce is True'
+        if self.is_last_microbatch:
             bucket = self.param_to_bucket[param]
             bucket.set(param)
 
@@ -275,7 +278,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
         super(DistributedDataParallel, self).__init__(module)
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not overlap_grad_reduce:
+        self.overlap_grad_reduce = overlap_grad_reduce
+        if not self.overlap_grad_reduce:
             bucket_size = None
 
         self.module = module
@@ -319,7 +323,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 data_parallel_group,
                 bucket_size,
                 param_to_name,
-                overlap_grad_reduce,
+                self.overlap_grad_reduce,
             )
 
             # Parameters are laid out in the corresponding grad_buffer in reverse
@@ -356,12 +360,15 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
         def param_hook(*unused):
             if param.requires_grad:
-                # Make sure no none values are returned.
-                assert param.grad is not None
-                if not param.grad_added_to_main_grad:
+                if self.overlap_grad_reduce:
+                    assert (
+                        param.grad is not None
+                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                if param.grad is not None and not param.grad_added_to_main_grad:
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
-                param_to_grad_buffer[param].mark_grad_as_done(param)
+                if self.overlap_grad_reduce:
+                    param_to_grad_buffer[param].mark_grad_as_done(param)
 
         return param_hook
 

@@ -6,8 +6,15 @@ import sys
 
 import torch
 
-from apex.multi_tensor_apply import multi_tensor_applier
-import amp_C
+try:
+    from apex.multi_tensor_apply import multi_tensor_applier
+except ImportError:
+    multi_tensor_applier = None
+
+try:
+    import amp_C
+except ImportError:
+    amp_C = None
 
 from megatron import (
     get_args,
@@ -54,6 +61,10 @@ def calc_params_l2_norm(model):
                     params_data.append(param.data.float())
                 else:
                     params_data.append(param.data)
+    # Check the availability of apex
+    assert multi_tensor_applier is not None and amp_C is not None, \
+        "apex is not available, please install it from https://github.com/NVIDIA/apex"
+
     # Calculate norm
     dummy_overflow_buf = torch.cuda.IntTensor([0])
     norm, _ = multi_tensor_applier(

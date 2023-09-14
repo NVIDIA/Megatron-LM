@@ -6,3 +6,4 @@ build
 *~
 slurm*
 logs
+.vscode

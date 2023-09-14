@@ -81,6 +81,17 @@ class BertLMHead(MegatronModule):
                                     bias=self.bias)
         return output
 
+    def load_state_dict(self, state_dict, strict=True):
+        """Customize load."""
+
+        # Handle renaming layernorm -> norm in component names
+        state_dict_ = {}
+        for key in state_dict.keys():
+            newkey = key.replace("layernorm", "norm")
+            state_dict_[newkey] = state_dict[key]
+
+        super().load_state_dict(state_dict_, strict)
+
 
 def post_language_model_processing(lm_output, pooled_output,
                                    lm_head, binary_head,
