@@ -6,8 +6,11 @@ CHECKPOINT_PATH=./checkpoints/t5
 VOCAB_FILE=./vocab/bert-large-uncased-vocab.txt
 DATA_PATH=./output_prefix/my-t5-uncased_text_sentence
 
+NUM_LAYERS=12
+
 T5_ARGS="
-    --num-layers 12 \
+    --num-layers $NUM_LAYERS \
+    --decoder-num-layers $NUM_LAYERS \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -32,7 +35,6 @@ T5_ARGS="
 DATA_ARGS="
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_FILE \
-    --data-impl mmap \
     --split 949,50,1
 "
 
@@ -47,17 +49,18 @@ WANDB="
     --wandb-project Megatron-LM \
     --wandb-name t5 \
     --wandb-save_code True \
-    --wandb-tags test \
+    --wandb-tags baseline \
     --wandb-model t5 \
     --wandb-optimizer adam \
     --wandb-optimizer-version original \
-    --wandb-id t5_test
+    --wandb-id t5_baseline
 "
 
-torchrun pretrain_t5.py \
+torchrun --master-port 29600 \
+    pretrain_t5.py \
     $T5_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
     $WANDB \
     --save $CHECKPOINT_PATH \
-    --load $CHECKPOINT_PATH
+    --load $CHECKPOINT_PATH 
