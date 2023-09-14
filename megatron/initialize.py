@@ -213,10 +213,11 @@ def _initialize_distributed():
     if args.deepspeed or args.ds_inference:
         deepspeed.init_distributed()
     else:
-        torch.distributed.init_process_group(
-            backend=args.distributed_backend,
-            world_size=args.world_size, rank=args.rank,
-            timeout=timedelta(minutes=args.distributed_timeout_minutes))
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend=args.distributed_backend,
+                world_size=args.world_size, rank=args.rank,
+                timeout=timedelta(minutes=args.distributed_timeout_minutes))
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
