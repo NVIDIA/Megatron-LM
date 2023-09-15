@@ -606,16 +606,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dtype_state = {}
             assert len(gbuf_range_maps) == 1, "single dtype supported, for now."
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
+                world_tensors = {}
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
 
                     # Compute local DP contiguous shard's size.
                     model = self.models[model_idx]
-                    gbuf_world_numel = model.grad_buffers[dtype].buckets[bucket_idx].data.numel_padded
-                    gbuf_local_numel = int(gbuf_world_numel/data_parallel_world_size)
-                    local_shards = {key:torch.empty((gbuf_local_numel,),
-                                                dtype=torch.float32,
-                                                device="cpu")
-                                for key in ("param", "exp_avg", "exp_avg_sq")}
+                    gbuf_world_numel = model.grad_buffers[dtype].buckets[bucket_idx].data.numel()
+                    assert gbuf_world_numel % data_parallel_world_size == 0
+                    gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
+                    local_shards = {key: torch.empty((gbuf_local_numel,),
+                                                     dtype=torch.float32,
+                                                     device="cpu")
+                                    for key in ("param", "exp_avg", "exp_avg_sq")}
 
                     # Build contiguous DP rank shards (for param + optim states).
                     for model_param, param_range_map in \
@@ -641,7 +643,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 .data.copy_(tensors[key].detach().cpu())
 
                     # Gather contiguous shards on DP rank 0.
-                    world_tensors = {}
                     for key, send_tensor in local_shards.items():
 
                         # Gather tensor list.
@@ -663,7 +664,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Concatenate.
                         if data_parallel_rank == 0:
-                            world_tensors[key] = torch.cat(recv_tensors)
+                            if key not in world_tensors:
+                                world_tensors[key] = []
+                            world_tensors[key].append(torch.cat(recv_tensors))
 
                 # Collect world state.
                 dtype_state[dtype] = world_tensors
@@ -703,13 +706,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     # Compute local DP contiguous shard's size.
                     model = self.models[model_idx]
-                    gbuf_world_numel = model.grad_buffers[dtype].buckets[bucket_idx].data.numel_padded
-                    gbuf_local_numel = int(gbuf_world_numel/data_parallel_world_size)
+                    gbuf_world_numel = model.grad_buffers[dtype].buckets[bucket_idx].data.numel()
+                    assert gbuf_world_numel % data_parallel_world_size == 0
+                    gbuf_local_numel = gbuf_world_numel // data_parallel_world_size
 
                     # Contiguous local shards (received from DP rank 0).
-                    local_shards = {key:torch.empty((gbuf_local_numel,),
-                                                    dtype=torch.float32,
-                                                    device="cpu")
+                    local_shards = {key: torch.empty((gbuf_local_numel,),
+                                                     dtype=torch.float32,
+                                                     device="cpu")
                                     for key in ("param", "exp_avg", "exp_avg_sq")}
 
                     # Scatter local shards from DP rank 0.
@@ -717,7 +721,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Scatter tensor list.
                         if data_parallel_rank == 0:
-                            world_tensor = loaded_state[model_idx][dtype][key]
+                            world_tensor = loaded_state[model_idx][dtype][key][bucket_idx]
                             gbuf_start_idxs = \
                                 list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
