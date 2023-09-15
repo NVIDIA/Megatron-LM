@@ -51,7 +51,7 @@ WANDB="
     --wandb-model gpt \
     --wandb-optimizer adam \
     --wandb-optimizer-version original \
-    --wandb-id GPT_BASELINE_ADAM2
+    --wandb-id GPT_BASELINE_ADAM3
 "
 torchrun --master-port 24500 pretrain_gpt.py \
     $GPT_ARGS \
