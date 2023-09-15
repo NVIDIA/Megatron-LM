@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -29,7 +29,8 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
         async_grad_allreduce = args.async_tensor_model_parallel_allreduce and \
             model_parallel and not args.sequence_parallel
     else:
-        input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(input_)
+        input_parallel = tensor_parallel.copy_to_tensor_model_parallel_region(
+            input_)
         async_grad_allreduce = False
 
     # Matrix multiply.
@@ -98,7 +99,6 @@ class Pooler(MegatronModule):
         args = get_args()
         self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
         self.sequence_parallel = args.sequence_parallel
-
 
     def forward(self, hidden_states, sequence_index=0):
         # hidden_states: [s, b, h]
@@ -244,7 +244,8 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
@@ -262,7 +263,7 @@ class Embedding(MegatronModule):
         if self.add_position_embedding:
             state_dict_[self._position_embeddings_key] \
                 = self.position_embeddings.state_dict(prefix=prefix,
-                                                  keep_vars=keep_vars)
+                                                      keep_vars=keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
                 = self.tokentype_embeddings.state_dict(prefix=prefix,
@@ -296,7 +297,8 @@ class Embedding(MegatronModule):
                     if 'position_embeddings' in key:
                         state_dict_[key.split('position_embeddings.')[1]] \
                             = state_dict[key]
-            self.position_embeddings.load_state_dict(state_dict_, strict=strict)
+            self.position_embeddings.load_state_dict(
+                state_dict_, strict=strict)
 
         # Tokentype embedding.
         if self.num_tokentypes > 0:
@@ -342,8 +344,10 @@ class TransformerLanguageModel(MegatronModule):
                  post_process=True):
         args = get_args()
         # TODO: passing share_embeddings_and_output_weights=False will not work correctly for T5 and embeddings will not be synced. Fix later for T5.
-        if args.untie_embeddings_and_output_weights: assert not add_decoder
-        super(TransformerLanguageModel, self).__init__(share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
+        if args.untie_embeddings_and_output_weights:
+            assert not add_decoder
+        super(TransformerLanguageModel, self).__init__(
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights)
 
         self.pre_process = pre_process
         self.post_process = post_process
@@ -394,8 +398,8 @@ class TransformerLanguageModel(MegatronModule):
         if self.add_encoder:
             self.encoder = ParallelTransformer(
                 config,
-                model_type=args.model_type if not args.retro_add_retriever \
-                    else ModelType.retro_decoder,
+                model_type=args.model_type if not args.retro_add_retriever
+                else ModelType.retro_decoder,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
@@ -430,7 +434,7 @@ class TransformerLanguageModel(MegatronModule):
                     args.padded_vocab_size,
                     config=config,
                     init_method=self.init_method,
-                    bias=False) # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
+                    bias=False)  # Setting bias to False always to keep it consistent with embedding tying that also does not have a bias.
                 self._output_layer_key = 'output_layer'
 
     def set_input_tensor(self, input_tensor):
@@ -459,7 +463,8 @@ class TransformerLanguageModel(MegatronModule):
             else:
                 raise Exception('input_tensor must have either length 1 or 2')
         else:
-            raise Exception('Stage must have at least either encoder or decoder')
+            raise Exception(
+                'Stage must have at least either encoder or decoder')
 
     def forward(self, enc_input_ids, enc_position_ids, enc_attn_mask,
                 dec_input_ids=None, dec_position_ids=None, dec_attn_mask=None,
@@ -600,14 +605,15 @@ class TransformerLanguageModel(MegatronModule):
                 state_dict_ = {}
                 for key in state_dict.keys():
                     if 'transformer.' in key:
-                        state_dict_[key.split('transformer.')[1]] = state_dict[key]
+                        state_dict_[key.split('transformer.')[
+                            1]] = state_dict[key]
 
             # For backward compatibility.
             state_dict_self_attention = {}
             for key in state_dict_.keys():
                 if '.attention.' in key:
                     state_dict_self_attention[key.replace(".attention.",
-                        ".self_attention.")] = state_dict_[key]
+                                                          ".self_attention.")] = state_dict_[key]
                 else:
                     state_dict_self_attention[key] = state_dict_[key]
             state_dict_ = state_dict_self_attention
