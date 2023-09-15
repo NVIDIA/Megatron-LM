@@ -7,8 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
+from megatron.core.models.common.embeddings.base_embedding import BaseEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -54,7 +53,8 @@ class GPTModel(MegatronModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute',
+                                         'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
     ):
@@ -76,22 +76,14 @@ class GPTModel(MegatronModule):
 
         # Embeddings.
         if self.pre_process:
-            self.embedding = GPTEmbedding(
+            self.embedding = BaseEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
-                add_position_embedding=(self.position_embedding_type == 'learned_absolute'),
+                position_embedding_type=position_embedding_type,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor
             )
-
-        # Rotary Position Embeddings
-        if self.position_embedding_type == 'rope':
-            rotary_dim = self.config.kv_channels
-            if rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * rotary_percent)
-
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
-        else:
-            self.rotary_pos_emb = None
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -116,18 +108,7 @@ class GPTModel(MegatronModule):
             )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
-
-    def set_input_tensor(self, input_tensor):
-        """ See megatron.model.transformer.set_input_tensor()"""
-
-        # This is usually handled in schedules.py but some inference code still
-        # gives us non-lists or None
-        if not isinstance(input_tensor, list):
-            input_tensor = [input_tensor]
-
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
-        self.decoder.set_input_tensor(input_tensor[0])
+            self.initialize_last_stage_with_word_embeddings(GPTModel)
 
     def forward(
         self,
@@ -145,7 +126,8 @@ class GPTModel(MegatronModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            decoder_input = self.embedding(
+                input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -153,20 +135,9 @@ class GPTModel(MegatronModule):
 
         # Rotary positional embeddings
         rotary_pos_emb = None
-        if self.rotary_pos_emb is not None:
-            if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_length
-            else:
-                if self.decoder.input_tensor is not None:
-                    rotary_seq_len = self.decoder.input_tensor.size(0)
-                else:
-                    rotary_seq_len = decoder_input.size(0)
-
-                # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
-                if self.config.sequence_parallel:
-                    rotary_seq_len *= self.config.tensor_model_parallel_size
-
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+        if self.position_embedding_type == 'rope':
+            rotary_pos_emb = self.rotary_pos_emb(
+                inference_params, self.decoder, decoder_input, self.config)
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -189,12 +160,8 @@ class GPTModel(MegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        # [b s] => [s b]
-        labels = labels.transpose(0, 1).contiguous()
-        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
+        loss = self.compute_loss(loss, logits)
 
-        # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
         return loss
 
     def shared_embedding_or_output_weight(self):
@@ -203,54 +170,6 @@ class GPTModel(MegatronModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
-
-    def initialize_last_stage_with_word_embeddings(self):
-
-        # This function just initializes the word embeddings in the final stage
-        # when we are using pipeline parallelism and sharing word
-        # embeddings. Nothing to do if we aren't sharing weights or aren't using
-        # pipeline parallelism.
-        if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
-            return
-
-        if self.post_process and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage()
-            # set word_embeddings weights to 0 here, then copy first
-            # stage's weights using all_reduce below.
-            self.output_layer.weight.data.fill_(0)
-            self.output_layer.weight.shared = True
-
-        # Parameters are shared between the word embeddings layers, and the
-        # heads at the end of the model. In a pipelined setup with more than
-        # one stage, the initial embedding layer and the head are on different
-        # workers, so we do the following:
-        # 1. Create a second copy of word_embeddings on the last stage, with
-        #    initial parameters of 0.0.
-        # 2. Do an all-reduce between the first and last stage to ensure that
-        #    the two copies of word_embeddings start off with the same
-        #    parameter values.
-        # 3. In the training loop, before an all-reduce between the grads of
-        #    the two word_embeddings layers to ensure that every applied weight
-        #    update is the same on both stages.
-
-        # Ensure that first and last stages have the same initial parameter
-        # values.
-        if torch.distributed.is_initialized():
-            if parallel_state.is_rank_in_embedding_group():
-                weight = self.shared_embedding_or_output_weight()
-                torch.distributed.all_reduce(
-                    weight.data, group=parallel_state.get_embedding_group()
-                )
-
-        elif not getattr(GPTModel, "embedding_warning_printed", False):
-            logging.getLogger(__name__).warning(
-                "Distributed processes aren't initialized, so the output layer "
-                "is not initialized with weights from the word embeddings. "
-                "If you are just manipulating a model this is fine, but "
-                "this needs to be handled manually. If you are training "
-                "something is definitely wrong."
-            )
-            GPTModel.embedding_warning_printed = True
 
     def sharded_state_dict(self, prefix=''):
         sharded_state_dict = {}
@@ -263,7 +182,8 @@ class GPTModel(MegatronModule):
             sharded_state_dict.update(embedding_sharded_state_dict)
 
         decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
+            prefix=decoder_prefix)
         sharded_state_dict.update(decoder_sharded_state_dict)
 
         if self.post_process:
