@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
@@ -38,7 +38,8 @@ class Attention(MegatronModule, ABC):
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
-        self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
+        self.query_projection_size = self.config.kv_channels * \
+            self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         # Per attention head and per partition values.
@@ -46,8 +47,10 @@ class Attention(MegatronModule, ABC):
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
-        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
-        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
+        self.num_attention_heads_per_partition = divide(
+            self.config.num_attention_heads, world_size)
+        self.num_query_groups_per_partition = divide(
+            self.config.num_query_groups, world_size)
 
         self.dot_product_attention = TEDotProductAttention(
             config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
@@ -75,7 +78,8 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.dot_product_attention(query, key, value, attention_mask)
+            output_ = self.dot_product_attention(
+                query, key, value, attention_mask)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -139,10 +143,13 @@ class Attention(MegatronModule, ABC):
         sequence_end = sequence_start + key.size(0)
         assert sequence_end <= inference_key_memory.size(0)
         # Copy key and values.
-        inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
-        inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
+        inference_key_memory[sequence_start:sequence_end,
+                             batch_start:batch_end, ...] = key
+        inference_value_memory[sequence_start:sequence_end,
+                               batch_start:batch_end, ...] = value
         key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
-        value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+        value = inference_value_memory[:sequence_end,
+                                       batch_start:batch_end, ...]
 
         # adjust the key rotary positional embedding
         if rotary_pos_emb is not None:
@@ -153,7 +160,7 @@ class Attention(MegatronModule, ABC):
                 # In inference, we compute one token at a time.
                 # Select the correct positional embedding
                 # (only the last token in the sequence)
-                q_pos_emb = q_pos_emb[sequence_end - 1 : sequence_end]
+                q_pos_emb = q_pos_emb[sequence_end - 1: sequence_end]
             else:
                 # In the first forward pass of inference,
                 # we use the entire provided prefix.
@@ -192,7 +199,8 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        query, key, value = self.get_query_key_value_tensors(
+            hidden_states, key_value_states)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -229,9 +237,11 @@ class Attention(MegatronModule, ABC):
         )
 
         if self.checkpoint_dot_product_attention:
-            core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
+            core_attn_out = self._checkpointed_attention_forward(
+                query, key, value, attention_mask)
         else:
-            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+            core_attn_out = self.dot_product_attention(
+                query, key, value, attention_mask)
 
         # =================
         # Output. [sq, b, h]
@@ -274,7 +284,8 @@ class SelfAttention(Attention):
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
             (
-                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                (self.num_attention_heads_per_partition //
+                 self.num_query_groups_per_partition + 2)
                 * self.hidden_size_per_attention_head
             ),
         )
@@ -295,7 +306,8 @@ class SelfAttention(Attention):
             dim=3,
         )
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        query = query.reshape(query.size(0), query.size(
+            1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value
 
