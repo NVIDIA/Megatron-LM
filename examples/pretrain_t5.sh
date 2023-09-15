@@ -2,7 +2,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=./checkpoints/t5
+CHECKPOINT_PATH=./checkpoints/t5-adam
 VOCAB_FILE=./vocab/bert-large-uncased-vocab.txt
 DATA_PATH=./output_prefix/my-t5-uncased_text_sentence
 
@@ -41,7 +41,7 @@ DATA_ARGS="
 OUTPUT_ARGS="
     --log-interval 10 \
     --save-interval 10000 \
-    --eval-interval 1000 \
+    --eval-interval 100 \
     --eval-iters 10
 "
 
@@ -53,7 +53,7 @@ WANDB="
     --wandb-model t5 \
     --wandb-optimizer adam \
     --wandb-optimizer-version original \
-    --wandb-id t5_baseline
+    --wandb-id T5_BASELINE_ADAM
 "
 
 torchrun --master-port 29600 \

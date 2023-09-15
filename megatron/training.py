@@ -954,9 +954,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
         ppl = math.exp(min(20, total_loss_dict[key].item()))
         string += '{} PPL: {:.6E} | '.format(key, ppl)
+        wandb.log({key: total_loss_dict[key].item()}, step=iteration)
+        wandb.log({key + ' vs samples': total_loss_dict[key].item()}, step=args.consumed_train_samples)
+        wandb.log({"{} validation ppl".format(key): ppl}, step=iteration)
+        wandb.log({"{} validation ppl vs samples".format(key): ppl}, step=args.consumed_train_samples)
         if writer:
-            wandb.log({key: total_loss_dict[key].item()}, step=iteration)
-            wandb.log({key + ' vs samples': total_loss_dict[key].item()}, step=args.consumed_train_samples)
             writer.add_scalar('{} validation'.format(key),
                               total_loss_dict[key].item(),
                               iteration)
@@ -964,8 +966,6 @@ def evaluate_and_print_results(prefix, forward_step_func,
                               total_loss_dict[key].item(),
                               args.consumed_train_samples)
             if args.log_validation_ppl_to_tensorboard:
-                wandb.log({"{} validation ppl".format(key): ppl}, step=iteration)
-                wandb.log({"{} validation ppl vs samples".format(key): ppl}, step=args.consumed_train_samples)
                 writer.add_scalar('{} validation ppl'.format(key), ppl,
                                   iteration)
                 writer.add_scalar('{} validation ppl vs samples'.format(key),
