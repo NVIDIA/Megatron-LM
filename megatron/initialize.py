@@ -113,6 +113,9 @@ def _compile_dependencies():
     if not get_accelerator().device_name() == 'cuda':
         print(">fused kernel is only supported in cuda, skip loading fused kernel")
         return 
+
+    if args.use_dataset_only:
+        return
     # ==================
     # Load fused kernels
     # ==================

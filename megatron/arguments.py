@@ -262,31 +262,34 @@ def validate_args(args, defaults={}):
             'cannot have both num-layers and encoder-num-layers specified'
         args.encoder_num_layers = args.num_layers
     else:
-        assert args.encoder_num_layers is not None, \
-            'either num-layers or encoder-num-layers should be specified'
-        args.num_layers = args.encoder_num_layers
+        if not args.use_dataset_only:
+            assert args.encoder_num_layers is not None, \
+                'either num-layers or encoder-num-layers should be specified'
+            args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
-    required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
-    for req_arg in required_args:
-        _check_arg_is_not_none(args, req_arg)
+    if not args.use_dataset_only:
+        required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
+                         'max_position_embeddings']
+        for req_arg in required_args:
+            _check_arg_is_not_none(args, req_arg)
 
-    # Checks.    
-    if args.ffn_hidden_size is None:
-        if args.swiglu:
-            # reduce the dimnesion for MLP since projections happens on
-            # two linear layers. this keeps the number of paramters in
-            # the same ballpark as the counterpart with 4*h size
-            # we keep it a multiple of 64, which means the actual tensor size
-            # will be a multiple of 64 / tp_size
-            args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
-        else:
-            args.ffn_hidden_size = 4 * args.hidden_size
+    # Checks.
+    if not args.use_dataset_only:
+        if args.ffn_hidden_size is None:
+            if args.swiglu:
+                # reduce the dimnesion for MLP since projections happens on
+                # two linear layers. this keeps the number of paramters in
+                # the same ballpark as the counterpart with 4*h size
+                # we keep it a multiple of 64, which means the actual tensor size
+                # will be a multiple of 64 / tp_size
+                args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
+            else:
+                args.ffn_hidden_size = 4 * args.hidden_size
 
-    if args.kv_channels is None:
-        assert args.hidden_size % args.num_attention_heads == 0
-        args.kv_channels = args.hidden_size // args.num_attention_heads
+        if args.kv_channels is None:
+            assert args.hidden_size % args.num_attention_heads == 0
+            args.kv_channels = args.hidden_size // args.num_attention_heads
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -295,10 +298,11 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    if not args.use_dataset_only:
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
     # When rotary position embeddings is used, set add_position_embedding
     # to false to turn off absolute position embedding.
     if args.use_rotary_position_embeddings:
@@ -314,14 +318,15 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.weight_decay_incr_style == 'constant':
-        assert args.start_weight_decay is None
-        assert args.end_weight_decay is None
-        args.start_weight_decay = args.weight_decay
-        args.end_weight_decay = args.weight_decay
-    else:
-        assert args.start_weight_decay is not None
-        assert args.end_weight_decay is not None
+    if not args.use_dataset_only:
+        if args.weight_decay_incr_style == 'constant':
+            assert args.start_weight_decay is None
+            assert args.end_weight_decay is None
+            args.start_weight_decay = args.weight_decay
+            args.end_weight_decay = args.weight_decay
+        else:
+            assert args.start_weight_decay is not None
+            assert args.end_weight_decay is not None
 
     TORCH_MAJOR = int(torch.__version__.split('.')[0])
     TORCH_MINOR = int(torch.__version__.split('.')[1])
@@ -385,15 +390,16 @@ def validate_args(args, defaults={}):
     if args.deepspeed:
         args.async_tensor_model_parallel_allreduce = False
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
-        if args.sequence_parallel:
-            raise RuntimeError(
-                "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    if not args.use_dataset_only:
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+            if args.sequence_parallel:
+                raise RuntimeError(
+                    "Using sequence parallelism requires setting the environment variable "
+                    "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+            if args.async_tensor_model_parallel_allreduce:
+                raise RuntimeError(
+                    "Using async gradient all reduce requires setting the environment "
+                    "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -422,15 +428,16 @@ def validate_args(args, defaults={}):
         args.data_path = data_paths
 
     # GQA
-    if args.num_key_value_heads is None:
-        args.num_key_value_heads = args.num_attention_heads
-    assert args.num_attention_heads % args.num_key_value_heads == 0, \
-        f"num_attention_heads must be divisible by num_key_value_heads (got `num_attention_heads`: {args.num_attention_heads} " \
-        f"and `num_key_value_heads`: {args.num_key_value_heads})."
-    if args.num_key_value_heads != args.num_attention_heads:
-        # if GQA
-        assert not args.mos, 'GQA currently does not support args.mos'
-        assert not args.kd, 'GQA currently does not support args.kd'
+    if not args.use_dataset_only:
+        if args.num_key_value_heads is None:
+            args.num_key_value_heads = args.num_attention_heads
+        assert args.num_attention_heads % args.num_key_value_heads == 0, \
+            f"num_attention_heads must be divisible by num_key_value_heads (got `num_attention_heads`: {args.num_attention_heads} " \
+            f"and `num_key_value_heads`: {args.num_key_value_heads})."
+        if args.num_key_value_heads != args.num_attention_heads:
+            # if GQA
+            assert not args.mos, 'GQA currently does not support args.mos'
+            assert not args.kd, 'GQA currently does not support args.kd'
 
     # Print arguments.
     _print_args("arguments", args)
@@ -932,6 +939,8 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--use-dataset-only', type=bool, required=False, default=False,
+                       help='If set to True, only use the megatron dataset for external trainer ')
     return parser
 
 
