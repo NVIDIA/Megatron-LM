@@ -219,11 +219,14 @@ class Embedding(MegatronModule):
         # Embeddings.
         if self.embedding_weights_in_fp32:
             self.word_embeddings = self.word_embeddings.to(torch.float32)
+        # Data format change to avoid explicit tranposes : [b s] --> [s b].
+        input_ids = input_ids.transpose(0, 1).contiguous()
         words_embeddings = self.word_embeddings(input_ids)
         if self.embedding_weights_in_fp32:
             words_embeddings = words_embeddings.to(self.params_dtype)
             self.word_embeddings = self.word_embeddings.to(self.params_dtype)
         if self.add_position_embedding:
+            position_ids = position_ids.transpose(0, 1).contiguous()
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
         else:
@@ -231,12 +234,10 @@ class Embedding(MegatronModule):
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
+            tokentype_ids = tokentype_ids.transpose(0, 1).contiguous()
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
         else:
             assert self.tokentype_embeddings is None
-
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-        embeddings = embeddings.transpose(0, 1).contiguous()
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.fp32_residual_connection:

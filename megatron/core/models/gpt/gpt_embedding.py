@@ -66,16 +66,16 @@ class GPTEmbedding(MegatronModule):
         self.position_embeddings.weight.shared = True
 
     def forward(self, input_ids, position_ids):
+        # Data format change to avoid explicit tranposes : [b s] --> [s b].
+        input_ids = input_ids.transpose(0, 1).contiguous()
         # Embeddings.
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
+            position_ids = position_ids.transpose(0, 1).contiguous()
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:
             embeddings = word_embeddings
-
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-        embeddings = embeddings.transpose(0, 1).contiguous()
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
