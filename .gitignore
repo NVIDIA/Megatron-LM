@@ -14,3 +14,4 @@ wandb/*
 .hypothesis/*
 .vscode/*
 checkpoints/*
+output_prefix/*
