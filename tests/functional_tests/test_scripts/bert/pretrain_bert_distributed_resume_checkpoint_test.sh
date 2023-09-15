@@ -43,7 +43,6 @@ torchrun $DISTRIBUTED_ARGS \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
        --vocab-file /workspace/data/bert_data/vocab.txt \
-       --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \
@@ -84,7 +83,6 @@ torchrun $DISTRIBUTED_ARGS \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
        --vocab-file /workspace/data/bert_data/vocab.txt \
-       --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.0001 \

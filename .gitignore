@@ -15,3 +15,5 @@ wandb/*
 .vscode/*
 checkpoints/*
 output_prefix/*
+=======
+.vscode

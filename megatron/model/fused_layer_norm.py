@@ -18,8 +18,10 @@ try:
 except:
     HAVE_PERSIST_LAYER_NORM = False
 
-from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
-
+try:
+    from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
+except:
+    FusedLayerNormAffineFunction = None
 
 global fused_layer_norm_cuda
 fused_layer_norm_cuda = None
@@ -77,6 +79,8 @@ class MixedFusedLayerNorm(torch.nn.Module):
     weight = self.weight + 1 if self.apply_layernorm_1p else self.weight
 
     if self.no_persist_layer_norm:
+        assert FusedLayerNormAffineFunction is not None, \
+            "FusedLayerNormAffineFunction is not available, please install apex from https://github.com/NVIDIA/apex"
         return FusedLayerNormAffineFunction.apply(input, weight, self.bias, self.normalized_shape, self.eps)
     else:
         output = FastLayerNormFN.apply(input, weight, self.bias, self.eps)

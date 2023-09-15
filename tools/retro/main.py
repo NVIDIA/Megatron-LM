@@ -58,9 +58,6 @@ def add_retro_args(parser):
     group.add_argument('--retro-gpt-seed', type=int, default=1234,
                        help='Random seed used for python, numpy, '
                        'pytorch, and cuda.')
-    group.add_argument('--retro-gpt-data-impl', type=str, default='infer',
-                       choices=['lazy', 'cached', 'mmap', 'infer'],
-                       help='Implementation of indexed datasets.')
     group.add_argument('--retro-gpt-data-path', nargs='*', required=True,
                        help='Path to the training dataset. Accepted format:'
                        '1) a single data path, 2) multiple datasets in the'
