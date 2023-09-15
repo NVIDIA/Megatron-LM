@@ -160,7 +160,7 @@ class GPTModel(MegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_loss(loss, logits)
+        loss = self.compute_loss(labels, logits)
 
         return loss
 

@@ -54,7 +54,7 @@ class MegatronModule(torch.nn.Module):
             input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def compute_loss(self, loss, logits):
+    def compute_loss(self, labels, logits):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         loss = tensor_parallel.vocab_parallel_cross_entropy(
