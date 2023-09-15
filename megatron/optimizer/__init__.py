@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 from apex.optimizers import FusedAdam as Adam
 from apex.optimizers import FusedSGD as SGD
 
@@ -73,13 +74,14 @@ def get_megatron_optimizer(model,
                                     lr_mult)
 
     if args.optimizer == 'adam':
-        optimizer = Adam(param_groups,
+        optimizer = torch.optim.Adam(param_groups,
                          lr=args.lr,
                          weight_decay=args.weight_decay,
                          betas=(args.adam_beta1, args.adam_beta2),
                          eps=args.adam_eps)
+        print("Using Adam optimizer", type(optimizer))
     elif args.optimizer == 'sgd':
-        optimizer = SGD(param_groups,
+        optimizer = torch.optim.SGD(param_groups,
                         lr=args.lr,
                         weight_decay=args.weight_decay,
                         momentum=args.sgd_momentum)

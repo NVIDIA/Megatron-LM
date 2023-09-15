@@ -4,7 +4,7 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CHECKPOINT_PATH=./checkpoints/gpt
+CHECKPOINT_PATH=./checkpoints/gpt-test-adam
 VOCAB_FILE=./vocab/gpt2-vocab.json
 MERGE_FILE=./vocab/gpt2-merges.txt
 DATA_PATH=./output_prefix/my-gpt2-cased_text_document
@@ -50,10 +50,10 @@ WANDB="
     --wandb-tags baseline \
     --wandb-model gpt \
     --wandb-optimizer adam \
-    --wandb-optimizer-version original \
-    --wandb-id gpt_baseline
+    --wandb-optimizer-version test \
+    --wandb-id gpt_baseline_test_adam
 "
-torchrun pretrain_gpt.py \
+torchrun --master-port 24500 pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
