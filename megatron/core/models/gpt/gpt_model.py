@@ -136,7 +136,7 @@ class GPTModel(MegatronModule):
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
-            rotary_pos_emb = self.embedding.rotary_pos_emb(
+            rotary_pos_emb = self.embedding.get_rotary_pos_emb(
                 inference_params, self.decoder, decoder_input, self.config)
 
         # Run decoder.
