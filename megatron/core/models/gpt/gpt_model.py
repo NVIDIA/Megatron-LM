@@ -74,7 +74,7 @@ class GPTModel(MegatronModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        # Embeddings.
+        self.embedding = None
         if self.pre_process:
             self.embedding = BaseEmbedding(
                 config=self.config,
@@ -133,9 +133,9 @@ class GPTModel(MegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # Rotary positional embeddings
+        # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
+        if self.embedding is not None and self.position_embedding_type == 'rope':
             rotary_pos_emb = self.embedding.get_rotary_pos_emb(
                 inference_params, self.decoder, decoder_input, self.config)
 
