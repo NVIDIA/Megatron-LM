@@ -308,7 +308,6 @@ class IndexedDatasetBuilder(object):
         begin = self.dim_offsets[-1]
         for dim_offset in index.dim_offsets[1:]:
             self.dim_offsets.append(begin + dim_offset)
-        self.doc_idx.extend( (doc_offset + index.doc_idx)[1:] )
 
         self.doc_idx.extend((doc_offset + index.doc_idx)[1:])
 
