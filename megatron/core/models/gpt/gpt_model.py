@@ -74,16 +74,14 @@ class GPTModel(MegatronModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        self.embedding = None
-        if self.pre_process:
-            self.embedding = BaseEmbedding(
-                config=self.config,
-                vocab_size=self.vocab_size,
-                max_sequence_length=self.max_sequence_length,
-                position_embedding_type=position_embedding_type,
-                rotary_percent=rotary_percent,
-                seq_len_interpolation_factor=seq_len_interpolation_factor
-            )
+        self.embedding = BaseEmbedding(
+            config=self.config,
+            vocab_size=self.vocab_size,
+            max_sequence_length=self.max_sequence_length,
+            position_embedding_type=position_embedding_type,
+            rotary_percent=rotary_percent,
+            seq_len_interpolation_factor=seq_len_interpolation_factor
+        )
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -135,7 +133,7 @@ class GPTModel(MegatronModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.embedding is not None and self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope':
             rotary_pos_emb = self.embedding.get_rotary_pos_emb(
                 inference_params, self.decoder, decoder_input, self.config)
 
