@@ -11,7 +11,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.parallel_state import get_tensor_and_data_parallel_group
+from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_data_parallel_group
 
 
 class MLP(MegatronModule):
@@ -131,7 +131,10 @@ class SwitchMLP(MegatronModule):
     
     def gather_indices(self, local_indices):
         """ Gather tensors and concatinate along the first dimension."""
-        group = get_tensor_and_data_parallel_group()
+        if self.expert_parallel:
+            group = get_tensor_and_data_parallel_group()
+        else:
+            group = get_tensor_model_parallel_group()
         world_size = torch.distributed.get_world_size(group=group)
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -185,7 +188,10 @@ class SwitchMLP(MegatronModule):
 
         if self.sequence_parallel or self.expert_parallel:
             global_hidden_states = \
-                tensor_parallel.gather_from_sequence_parallel_region_to_moe(hidden_states)
+                tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                    hidden_states,
+                    expert_parallel=self.expert_parallel
+                )
             global_indices = self.gather_indices(max_ind)
         else:
             global_hidden_states = hidden_states
@@ -208,10 +214,16 @@ class SwitchMLP(MegatronModule):
 
         if self.sequence_parallel or self.expert_parallel:
             output_total = \
-                tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+                tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                    output_total,
+                    expert_parallel=self.expert_parallel
+                )
             if self.add_bias:
                 output_bias_total = \
-                    tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+                    tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                        output_bias_total,
+                        expert_parallel=self.expert_parallel
+                    )
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks
                 output_bias_total = \
