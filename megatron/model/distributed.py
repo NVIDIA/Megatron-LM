@@ -312,6 +312,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         self.overlap_grad_reduce = overlap_grad_reduce
         if not self.overlap_grad_reduce:
             bucket_size = None
+        self.bucket_size = bucket_size
 
         self.module = module
         self.grad_buffers = {}

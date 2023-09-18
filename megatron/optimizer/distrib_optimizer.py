@@ -386,7 +386,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Model grad buffer ranges.
         self.model_gbuf_ranges = []
+        self.bucket_sizes = []
         for model_index, model in enumerate(self.models):
+            self.bucket_sizes.append(model.bucket_size)
             self.model_gbuf_ranges.append(self.build_model_gbuf_range_map(model))
         self.model_param_gbuf_map = \
             self.build_model_param_gbuf_map(self.model_gbuf_ranges)
@@ -599,7 +601,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS)
 
         # Collect param states.
-        state = {}
+        state = {"bucket_sizes": self.bucket_sizes}
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -698,6 +700,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Load on DP rank 0.
         if data_parallel_rank == 0:
             loaded_state = torch.load(filename)
+            if "bucket_sizes" in loaded_state:
+                bucket_sizes_in_checkpoint = loaded_state["bucket_sizes"]
+                assert self.bucket_sizes == bucket_sizes_in_checkpoint, \
+                    f"Bucket sizes need to be the same in current run ({self.bucket_sizes}) and checkpoint ({bucket_sizes_in_checkpoint})"
 
         # Scatter tensors to all DP ranks.
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
