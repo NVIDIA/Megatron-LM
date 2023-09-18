@@ -239,6 +239,11 @@ class GradBuffer(MemoryBuffer):
         for bucket in self.buckets:
             bucket.done()
 
+    def grad_sync(self):
+        """Synchronize grads."""
+        for bucket in self.buckets:
+            bucket.communicate()
+
     def mark_grad_as_done(self, param: torch.nn.Parameter):
         """
         When the number of microbatches is greater than 1, we only want
@@ -427,6 +432,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
         finally:
             for grad_buffer in self.grad_buffers.values():
                 grad_buffer.is_last_microbatch = True
+
+    def grad_sync(self, *unused):
+        """Method to dispatch grad sync operations."""
+        for grad_buffer in self.grad_buffers.values():
+            grad_buffer.grad_sync()
 
     def zero_grad_buffer(self):
         """Set the grad buffer data to zero. Needs to be called at the

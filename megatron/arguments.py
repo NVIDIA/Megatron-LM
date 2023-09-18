@@ -174,9 +174,9 @@ def validate_args(args, defaults={}):
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # Overlapping grad reduce only supported without pipeline parallelism right now.
+    # Overlapping grad reduce not supported with interleaved PP right now.
     if args.overlap_grad_reduce:
-        assert args.pipeline_model_parallel_size == 1
+        assert args.virtual_pipeline_model_parallel_size is None
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -1014,8 +1014,11 @@ def _add_distributed_args(parser):
                        help='Timeout minutes for torch.distributed.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
+    group.add_argument('--no-delay-grad-reduce', action='store_false',
+                       help='If not set, delay grad reduction in all but first PP stage.',
+                       dest='delay_grad_reduce')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
-                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--use-ring-exchange-p2p', action='store_true',
                        default=False, help='If set, use custom-built ring exchange '
