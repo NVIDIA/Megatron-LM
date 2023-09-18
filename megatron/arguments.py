@@ -696,7 +696,6 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
-
     return parser
 
 
@@ -841,6 +840,9 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--use-mcore-models', action='store_false',
+                       help='Use the implementation from megatron core',
+                       dest='use_mcore')                       
     return parser
 
 
