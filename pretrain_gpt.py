@@ -28,6 +28,7 @@ import subprocess
 from torch import nn
 import torch.nn.functional as F
 
+
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
@@ -127,8 +128,13 @@ def get_batch(data_iterator):
         skip_mask)
 
     # For DS's sequence parallel
-    seq_parallel_world_size = mpu.get_sequence_parallel_world_size() if mpu.sequence_parallel_is_initialized() else 1
-    seq_parallel_world_rank = mpu.get_sequence_parallel_rank() if mpu.sequence_parallel_is_initialized() else 0
+    seq_parallel_world_size = mpu.get_sequence_parallel_world_size()
+    seq_parallel_world_rank = mpu.get_sequence_parallel_rank()
+
+    # For Megatron's sequence parallel
+    if args.sequence_parallel:
+        seq_parallel_world_size = mpu.get_tensor_model_parallel_world_size()
+        seq_parallel_world_rank = mpu.get_tensor_model_parallel_rank()
     seq_length = tokens.size(1)
 
     assert seq_length % seq_parallel_world_size == 0
@@ -137,8 +143,10 @@ def get_batch(data_iterator):
     sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
 
     tokens = tokens[:, sub_seq_start:sub_seq_end]
-    labels = labels[:, sub_seq_start:sub_seq_end]
     position_ids = position_ids[:, sub_seq_start:sub_seq_end]
+    # For DS's sequence parallel
+    if mpu.get_sequence_parallel_world_size() > 1:
+        labels = labels[:, sub_seq_start:sub_seq_end]
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 

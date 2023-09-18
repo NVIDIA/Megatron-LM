@@ -161,15 +161,21 @@ class Embedding(MegatronModule):
         # Position embedding (serial).
         self.add_position_embedding = args.add_position_embedding
         if self.add_position_embedding:
-            self.position_embeddings = torch.nn.Embedding(
-                max_sequence_length, self.hidden_size)
             self._position_embeddings_key = 'position_embeddings'
-            # Initialize the position embeddings.
-            if args.perform_initialization:
-                if args.zero_stage == 3:
-                    gather_and_init(self.position_embeddings.weight, self.init_method)
-                else:
-                    self.init_method(self.position_embeddings.weight)
+            if args.sequence_parallel:
+                self.position_embeddings = tensor_parallel.layers.SequenceParallelPositionEmbedding(
+                    max_sequence_length, self.hidden_size)
+                # Initialize the position embeddings.
+                self.init_method(self.position_embeddings.local_embeddings.weight)
+            else:
+                self.position_embeddings = torch.nn.Embedding(
+                    max_sequence_length, self.hidden_size)
+                # Initialize the position embeddings.
+                if args.perform_initialization:
+                    if args.zero_stage == 3:
+                        gather_and_init(self.position_embeddings.weight, self.init_method)
+                    else:
+                        self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -250,7 +256,8 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # already partition sequence, do not need scatter_to_sequence_parallel_region
+            # embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:
