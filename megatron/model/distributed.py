@@ -57,12 +57,13 @@ class Bucket:
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
-        # available.
+        # available. When overlap_grad_reduce is True, communication (all-reduce
+        # or reduce-scatter) is issued when params_with_grad equals params.
         self.params_list = params
         self.params = set(params)
         self.params_with_grad = set()
         self.data = data
-        self.offset = offset
+        self.offset = offset  # Needed by distributed optimizer to keep track of this bucket's offset within the full grad_buffer.
         self.data_parallel_group = data_parallel_group
         self.overlap_grad_reduce = overlap_grad_reduce
         self.reduce_scatter = reduce_scatter
@@ -74,36 +75,39 @@ class Bucket:
 
     def reset(self):
         self.params_with_grad = set()
-        self.allreduce_handle = None
-        self.allreduce_issued = False
+        self.communication_handle = None
+        self.communication_issued = False
 
     def _get_local_view(self, buf):
+        """
+        Compute view in buf that this rank is responsible for (when using distributed optimizer / reduce-scatter).
+        """
         assert buf.numel() % self.data_parallel_size == 0
         shard_size = buf.numel() // self.data_parallel_size
         return buf[
             (self.data_parallel_rank * shard_size) : ((self.data_parallel_rank + 1) * shard_size)
         ]
 
-    def all_reduce(self):
+    def communicate(self):
         assert (
-            self.allreduce_handle is None and not self.allreduce_issued
+            self.communication_handle is None and not self.communication_issued
         ), 'Should not have multiple all-reduces in flight at once'
 
         self.data /= self.data_parallel_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.reduce_scatter:
             local_data_view = self._get_local_view(self.data)
-            self.allreduce_handle = torch.distributed._reduce_scatter_base(
+            self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.data,
                 group=self.data_parallel_group,
                 async_op=self.overlap_grad_reduce,
             )
         else:
-            self.allreduce_handle = torch.distributed.all_reduce(
+            self.communication_handle = torch.distributed.all_reduce(
                 self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
             )
-        self.allreduce_issued = True
+        self.communication_issued = True
 
     def set(self, param: torch.nn.Parameter):
         assert param in self.params, 'Param is not in the bucket'
@@ -112,18 +116,18 @@ class Bucket:
         self.params_with_grad.add(param)
         # If all params in bucket have grads available, issue all-reduce.
         if len(self.params_with_grad) == len(self.params):
-            self.all_reduce()
+            self.communicate()
 
     def done(self):
         # If not overlapping grad reduce, issue synchronous all-reduce here.
         if not self.overlap_grad_reduce:
-            self.all_reduce()
+            self.communicate()
             return
-        assert self.allreduce_handle is not None and self.allreduce_issued, (
+        assert self.communication_handle is not None and self.communication_issued, (
             f'All-reduce is not issued for this bucket, '
-            f'only {len(self.params_with_grad)}/{len(self.params)} params with grad'
+            f'only {len(self.params_with_grad)}/{len(self.params)} params have grad available'
         )
-        self.allreduce_handle.wait()
+        self.communication_handle.wait()
 
 
 class GradBuffer(MemoryBuffer):
@@ -171,7 +175,12 @@ class GradBuffer(MemoryBuffer):
                 torch.Size([data_end_index - data_start_index]), data_start_index
             )
             bucket = Bucket(
-                bucket_params, bucket_data, data_start_index, data_parallel_group, overlap_grad_reduce, reduce_scatter
+                bucket_params,
+                bucket_data,
+                data_start_index,
+                data_parallel_group,
+                overlap_grad_reduce,
+                reduce_scatter,
             )
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
@@ -368,11 +377,11 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     self.grad_buffer_param_index_map[dtype] = {}
 
                 index -= param.data.nelement()
-                # Store the bucket of each param.
+                # Store the indices / bucket of each param.
                 self.grad_buffer_param_index_map[dtype][param] = (
                     index,
                     index + param.data.nelement(),
-                    self.grad_buffers[dtype].param_to_bucket_index[param]
+                    self.grad_buffers[dtype].param_to_bucket_index[param],
                 )
 
         # Register backward hook.

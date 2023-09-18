@@ -124,7 +124,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
 
     @classmethod
-    def build_model_gbuf_range(cls, model, dtype):
+    def build_model_gbuf_range(cls, model, dtype, bucket_index):
         """
         Build mapping between params and their grad buffers.
 
@@ -138,43 +138,39 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = mpu.get_data_parallel_rank()
         data_parallel_world_size = mpu.get_data_parallel_world_size()
 
-        # Grad buffer range.
-        data_for_all_buckets = []
-        for bucket in model.grad_buffers[dtype].buckets:
-            grad_buffer = bucket.data
+        bucket = model.grad_buffers[dtype].buckets[bucket_index]
+        bucket_buffer = bucket.data
+        gbuf_size = bucket_buffer.numel()
+        assert gbuf_size % data_parallel_world_size == 0, \
+            f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
+        max_gbuf_range_size = gbuf_size // data_parallel_world_size
 
-            gbuf_size = grad_buffer.numel()
-            assert gbuf_size % data_parallel_world_size == 0, \
-                f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
-            max_gbuf_range_size = gbuf_size // data_parallel_world_size
+        # All world ranges (i.e., across all data parallel ranks).
+        gbuf_world_all_ranges = []
+        for r in range(data_parallel_world_size):
+            # Compute start of chunk in this bucket.
+            gbuf_world_start = r * max_gbuf_range_size
+            gbuf_world_end = min(gbuf_size, gbuf_world_start+max_gbuf_range_size)
+            # Add bucket's offset in grad buffer.
+            gbuf_world_range = Range(gbuf_world_start + bucket.offset,
+                                     gbuf_world_end + bucket.offset)
+            gbuf_world_all_ranges.append(gbuf_world_range)
 
-            # All world ranges (i.e., across all data parallel ranks).
-            gbuf_world_all_ranges = []
-            for r in range(data_parallel_world_size):
-                # Compute start of chunk in this bucket.
-                gbuf_world_start = (r * max_gbuf_range_size)
-                gbuf_world_end = min(gbuf_size, gbuf_world_start+max_gbuf_range_size)
-                # Add bucket's offset in grad buffer.
-                gbuf_world_range = Range(gbuf_world_start + bucket.offset,
-                                         gbuf_world_end + bucket.offset)
-                gbuf_world_all_ranges.append(gbuf_world_range)
+        # Local DP's ranges.
+        gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
 
-            # Local DP's ranges.
-            gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
+        # Get each param's ranges.
+        param_range_map = cls.build_model_gbuf_param_range_map(model,
+                                                               dtype,
+                                                               gbuf_world_range,
+                                                               bucket.offset)
 
-            # Get each param's ranges.
-            param_range_map = cls.build_model_gbuf_param_range_map(model,
-                                                                   dtype,
-                                                                   gbuf_world_range,
-                                                                   bucket.offset)
+        # Group into dict.
+        data = {
+            "param_map" : param_range_map,
+        }
 
-            # Group into dict.
-            data_for_this_bucket = {
-                "param_map" : param_range_map,
-            }
-            data_for_all_buckets.append(data_for_this_bucket)
-
-        return data_for_all_buckets
+        return data
 
 
     @classmethod
@@ -183,8 +179,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Create param-to-grad-buffer mappings, for grad buffer data types
         within a specific virtual model.
         """
+        # Iterate through all buckets to construct param ranges that this rank "owns"
+        # (the dp_rank'th shard of each bucket, where each shard is 1/dp_world_size
+        # of the bucket).
         return {
-            dtype : cls.build_model_gbuf_range(model, dtype)
+            dtype : [cls.build_model_gbuf_range(model, dtype, bucket_index)
+                     for bucket_index in range(len(model.grad_buffers[dtype].buckets))]
             for dtype in model.grad_buffers
         }
 
@@ -431,6 +431,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         storage,
                         dtype = params_dtype,
                         device = bucket.data.device)
+                    # .storage() ignores views / slices, so param_buffer now points to the start
+                    # of the grad_buffer instead of to the start of each bucket. As a result,
+                    # add bucket.offset to make sure param_buffers don't point to the same region
+                    # of memory.
                     param_buffer = param_buffer[bucket.offset:bucket.offset+bucket.data.numel()]
                     current_param_buffers[dtype].append(param_buffer)
             self.param_buffers.append(current_param_buffers)
@@ -875,8 +879,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   all sub-views will have consistent start/end indexes across data
         #   parallel ranks.
         pbuf_view_items = self.get_model_param_buffer_dp_views()
-        for index, (model_index, dtype, bucket_index, pbuf, pbuf_views) \
-            in enumerate(pbuf_view_items):
+        for (_, _, _, pbuf, pbuf_views) in pbuf_view_items:
             torch.distributed._all_gather_base(
                 pbuf,
                 pbuf_views[data_parallel_rank],
@@ -889,6 +892,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for param, (buf_start, buf_end, bucket_index) in param_map.items():
                     bucket_offset = model.grad_buffers[dtype].buckets[bucket_index].offset
                     param_buf = self.param_buffers[model_id][dtype][bucket_index]
+                    # buf_start and buf_end store position of this parameter in the full grad_buffer,
+                    # so need to adjust these indices (by subtracting out bucket_offset) since we
+                    # have independent param_bufs for each bucket.
                     param_buf_shard = param_buf[buf_start-bucket_offset:buf_end-bucket_offset]
                     assert param.data.nelement() == param_buf_shard.nelement()
                     param.view(-1).detach().copy_(param_buf_shard)
