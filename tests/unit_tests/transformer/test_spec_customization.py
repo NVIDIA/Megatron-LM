@@ -8,7 +8,7 @@ import transformer_engine as te
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSpec
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
@@ -19,7 +19,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -32,15 +32,17 @@ class TestSpecCustomization:
         )
 
         # specify Transformer Layer spec with all identity ops
-        self.transformer_layer_spec = TransformerLayerSpec()
+        self.transformer_layer_spec = TransformerLayerSubmodules()
 
         # specify attention spec using already imported class
-        self.attention_spec = SelfAttentionSpec(
+        self.attention_spec = ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
-            linear_qkv=TELayerNormColumnParallelLinear,
-            dot_product_attention=TEDotProductAttention,
-            linear_proj=TERowParallelLinear,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                dot_product_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear
+            ),
         )
 
         # specify layernorm spec with module path to test dynamic importing
