@@ -10,8 +10,9 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
@@ -21,7 +22,7 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerLayerSpec,
+        spec: ModuleSpec,
         self_attn_mask_type=AttnMaskType.padding,
         post_layer_norm=True,
         pre_process=True,
@@ -30,7 +31,7 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
-        self.transformer_layer_spec: TransformerLayerSpec = spec
+        self.transformer_layer_spec: ModuleSpec = spec
 
         self.self_attn_mask_type = self_attn_mask_type
         self.post_layer_norm = post_layer_norm
@@ -58,7 +59,7 @@ class TransformerBlock(MegatronModule):
         def build_layer(layer_number):
             layer = TransformerLayer(
                 config=self.config,
-                spec=transformer_layer_spec,
+                submodules=transformer_layer_spec.submodules,
                 layer_number=layer_number,
                 self_attn_mask_type=self.self_attn_mask_type,
             )

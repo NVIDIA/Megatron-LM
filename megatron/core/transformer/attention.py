@@ -20,14 +20,14 @@ from .transformer_config import TransformerConfig
 
 
 @dataclass
-class SelfAttentionSpec(ModuleSpec):
+class SelfAttentionSubmodules:
     linear_qkv: Union[ModuleSpec, type] = None
     dot_product_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
 @dataclass
-class CrossAttentionSpec(ModuleSpec):
+class CrossAttentionSubmodules:
     linear_q: Union[ModuleSpec, type] = None
     linear_kv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
@@ -44,7 +44,7 @@ class Attention(MegatronModule, ABC):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: Union[SelfAttentionSpec, CrossAttentionSpec],
+        submodules: Union[SelfAttentionSubmodules, CrossAttentionSubmodules],
         layer_number: int = 1,
         attn_mask_type=AttnMaskType.padding,
         **kwargs,
@@ -69,7 +69,7 @@ class Attention(MegatronModule, ABC):
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         self.dot_product_attention = build_module(
-            spec.dot_product_attention,
+            submodules.dot_product_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -79,7 +79,7 @@ class Attention(MegatronModule, ABC):
 
         # Output.
         self.linear_proj = build_module(
-            spec.linear_proj,
+            submodules.linear_proj,
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
@@ -275,21 +275,21 @@ class SelfAttention(Attention):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: SelfAttentionSpec,
+        submodules: SelfAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type=AttnMaskType.padding,
         **kwargs,
     ):
         super().__init__(
             config=config,
-            spec=spec,
+            submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             **kwargs,
         )
 
         self.linear_qkv = build_module(
-            spec.linear_qkv,
+            submodules.linear_qkv,
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -345,14 +345,14 @@ class CrossAttention(Attention):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: CrossAttentionSpec,
+        submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type=AttnMaskType.padding,
         **kwargs,
     ):
         super().__init__(
             config=config,
-            spec=spec,
+            submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             **kwargs,
@@ -365,7 +365,7 @@ class CrossAttention(Attention):
         assert self.query_projection_size == self.kv_projection_size
 
         self.linear_q = build_module(
-            spec.linear_q,
+            submodules.linear_q,
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -375,7 +375,7 @@ class CrossAttention(Attention):
         )
 
         self.linear_kv = build_module(
-            spec.linear_kv,
+            submodules.linear_kv,
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,

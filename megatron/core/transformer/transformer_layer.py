@@ -8,7 +8,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.transformer.attention import CrossAttentionSpec, SelfAttentionSpec
+from megatron.core.transformer.attention import CrossAttentionSubmodules, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -18,13 +18,13 @@ from megatron.core.utils import make_viewless_tensor
 
 
 @dataclass
-class TransformerLayerSpec:
+class TransformerLayerSubmodules:
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-    self_attention: SelfAttentionSpec = IdentityOp
+    self_attention: SelfAttentionSubmodules = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-    cross_attention: CrossAttentionSpec = IdentityOp
+    cross_attention: CrossAttentionSubmodules = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
@@ -42,7 +42,7 @@ class TransformerLayer(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerLayerSpec,
+        submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
         self_attn_mask_type=AttnMaskType.padding,
     ):
@@ -56,7 +56,7 @@ class TransformerLayer(MegatronModule):
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
-            spec.input_layernorm,
+            submodules.input_layernorm,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -67,18 +67,15 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 2: SelfAttention]
         self.self_attention = build_module(
-            spec.self_attention,
-            config=self.config,
-            spec=spec.self_attention,
-            layer_number=layer_number,
+            submodules.self_attention, config=self.config, layer_number=layer_number,
         )
 
         ## [Module 3: BiasDropoutFusion]
-        self.self_attn_bda = build_module(spec.self_attn_bda)
+        self.self_attn_bda = build_module(submodules.self_attn_bda)
 
         ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = build_module(
-            spec.pre_cross_attn_layernorm,
+            submodules.pre_cross_attn_layernorm,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -89,18 +86,15 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            spec.cross_attention,
-            config=self.config,
-            spec=spec.cross_attention,
-            layer_number=layer_number,
+            submodules.cross_attention, config=self.config, layer_number=layer_number,
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(spec.cross_attn_bda)
+        self.cross_attn_bda = build_module(submodules.cross_attn_bda)
 
         ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
         self.pre_mlp_layernorm = build_module(
-            spec.pre_mlp_layernorm,
+            submodules.pre_mlp_layernorm,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -110,10 +104,10 @@ class TransformerLayer(MegatronModule):
         )
 
         ## [Module 8: MLP block]
-        self.mlp = build_module(spec.mlp, config=self.config)
+        self.mlp = build_module(submodules.mlp, config=self.config)
 
         ## [Module 9: BiasDropoutFusion]
-        self.mlp_bda = build_module(spec.mlp_bda)
+        self.mlp_bda = build_module(submodules.mlp_bda)
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.

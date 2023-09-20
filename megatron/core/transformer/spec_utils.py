@@ -24,6 +24,7 @@ class ModuleSpec:
 
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
+    submodules: type = None
 
 
 def import_module(module_path: Tuple[str]):
@@ -86,6 +87,12 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
 
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
+
+    # Add the `submodules` argument to the module init call if it exists in the
+    # spec.
+    if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
+        kwargs["submodules"] = spec_or_module.submodules
+
     return module(
         *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
     )

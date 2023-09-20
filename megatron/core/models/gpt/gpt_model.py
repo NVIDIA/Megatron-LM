@@ -13,7 +13,7 @@ from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import ModuleSpec
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
@@ -50,7 +50,7 @@ class GPTModel(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerLayerSpec,
+        spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -65,7 +65,7 @@ class GPTModel(MegatronModule):
         super(GPTModel, self).__init__(config=config)
 
         self.config: TransformerConfig = config
-        self.spec: TransformerLayerSpec = spec
+        self.spec: ModuleSpec = spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
