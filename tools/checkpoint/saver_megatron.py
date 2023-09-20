@@ -19,8 +19,10 @@ def add_arguments(parser):
                        help='Target tensor model parallel size, defaults to the tensor parallel size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
     group.add_argument('--target-pipeline-parallel-size', type=int,
-                       help='Target tensor model parallel size, default to the pipeline parall size '
+                       help='Target pipeline model parallel size, default to the pipeline parall size '
                        'in the input checkpoint if provided by the loader, otherwise to 1')
+    group.add_argument('--target-virtual-pipeline-parallel-size', type=int,
+                       help='Target virtual pipeline model parallel size, default to 1')
 
 def save_checkpoint(queue, args):
 
@@ -86,6 +88,16 @@ def save_checkpoint(queue, args):
             print("loader did not provide a pipeline parallel size and --target-pipeline-parallel-size not provided on command line. "
                   "Default to 1.")
             args.target_pipeline_parallel_size = 1
+    
+    if args.target_virtual_pipeline_parallel_size is None:
+        print("--target-virtual-pipeline-parallel-size not provided on command line. "
+                "Default to 1.")
+        args.target_virtual_pipeline_parallel_size = 1
+
+    assert md.num_layers % args.target_pipeline_parallel_size == 0
+    num_layers_per_pipeline_stage = md.num_layers // args.target_pipeline_parallel_size
+    assert num_layers_per_pipeline_stage % args.target_virtual_pipeline_parallel_size == 0
+    args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage // args.target_virtual_pipeline_parallel_size
 
 
     # Arguments do sanity checks on the world size, but we don't care,
@@ -118,6 +130,9 @@ def save_checkpoint(queue, args):
                 '--save-interval', '1',
                 '--save', args.save_dir
                 ]
+    
+    if args.target_virtual_pipeline_parallel_size > 1:
+        sys.argv.extend(['--num-layers-per-virtual-pipeline-stage', str(args.num_layers_per_virtual_pipeline_stage)])
 
     if md.make_vocab_size_divisible_by is not None:
         sys.argv.extend(['--make-vocab-size-divisible-by', str(md.make_vocab_size_divisible_by)])
@@ -190,15 +205,27 @@ def save_checkpoint(queue, args):
     else:
         raise Exception(f'unrecognized model type: {args.model_type}')
 
-    def get_models(count, dtype, pre_process, post_process):
-        models = [model_provider(pre_process, post_process).to(dtype) for _ in range(count)]
+    # return a two-dimensional list of models, first dimension is vp_rank, second is tp_rank.
+    def get_models(tp_size, vp_size, dtype):
+        models = []
+        for vp_rank in range(vp_size):
+            mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
+            pre_process = mpu.is_pipeline_first_stage()
+            post_process = mpu.is_pipeline_last_stage()
+            model_ = []
+            for tp_rank in range(tp_size):
+                mpu.set_tensor_model_parallel_rank(tp_rank)
+                model_.append(model_provider(pre_process, post_process).to(dtype))
+            models.append(model_)
         return models
 
     # fake initializing distributed
     mpu.set_tensor_model_parallel_world_size(args.target_tensor_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(args.target_pipeline_parallel_size)
+    mpu.set_virtual_pipeline_model_parallel_world_size(args.target_virtual_pipeline_parallel_size)
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
+    mpu.set_virtual_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
 
     # Embeddings
@@ -241,10 +268,17 @@ def save_checkpoint(queue, args):
     # Split into new tensor model parallel sizes
     out_word_embed = torch.chunk(full_word_embed, args.target_tensor_parallel_size, dim=0)
 
+    # Make models for all pipeline stages, all_models[pp_rank][vp_rank][tp_rank] is a model
+    all_models = []
+    for pp_rank in range(args.target_pipeline_parallel_size):
+        mpu.set_pipeline_model_parallel_rank(pp_rank)
+        all_models.append(get_models(args.target_tensor_parallel_size,
+                                     args.target_virtual_pipeline_parallel_size, md.params_dtype))
+
     # Make models for first pipeline stage and fill in embeddings
     mpu.set_pipeline_model_parallel_rank(0)
-    post_process = args.target_pipeline_parallel_size == 1
-    models = get_models(args.target_tensor_parallel_size, md.params_dtype, True, post_process)
+    mpu.set_virtual_pipeline_model_parallel_rank(0)
+    models = all_models[0][0]
     for tp_rank, model in enumerate(models):
         model.language_model.embedding.word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
         if pos_embed is not None:
@@ -255,14 +289,16 @@ def save_checkpoint(queue, args):
     # Transformer layers
     #-------------------
     total_layer_num = 0
-    for pp_rank in range(args.target_pipeline_parallel_size):
-        # For later pipeline parallel ranks, make the new models
-        if pp_rank > 0:
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
-            post_process = pp_rank == args.target_pipeline_parallel_size - 1
-            models = get_models(args.target_tensor_parallel_size, md.params_dtype, False, post_process)
 
+    def get_layers(pp_rank, vp_rank):
+        # Get the models for this pipeline stage
+        mpu.set_pipeline_model_parallel_rank(pp_rank)
+        mpu.set_virtual_pipeline_model_parallel_rank(vp_rank)
+        models = all_models[pp_rank][vp_rank]
+        post_process = mpu.is_pipeline_last_stage()
+        
         for layer in range(len(models[0].language_model.encoder.layers)):
+            nonlocal total_layer_num
             msg = queue_get(f"transformer layer {total_layer_num}")
 
             # duplicated tensors
@@ -400,7 +436,16 @@ def save_checkpoint(queue, args):
             if msg != "done":
                 print("ERROR: got some more data but was expecting to be done")
 
+    for vp_rank in range(args.target_virtual_pipeline_parallel_size):
+        for pp_rank in range(args.target_pipeline_parallel_size):
+            get_layers(pp_rank, vp_rank)    
+
+    # Save all models
+    for pp_rank in range(args.target_pipeline_parallel_size):
+        mpu.set_pipeline_model_parallel_rank(pp_rank)
         for tp_rank in range(args.target_tensor_parallel_size):
             mpu.set_tensor_model_parallel_rank(tp_rank)
-            save_checkpoint(md.iteration, [models[tp_rank]], None, None)
+            models = [all_models[pp_rank][vp_rank][tp_rank] \
+                for vp_rank in range(args.target_virtual_pipeline_parallel_size)]
+            save_checkpoint(md.iteration, models, None, None)
     print("Done!")
