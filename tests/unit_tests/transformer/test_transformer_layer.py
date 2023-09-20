@@ -21,7 +21,7 @@ class TestParallelTransformerLayer:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                           gpt_model_with_transformer_engine_default_spec)
+                                                           gpt_model_with_transformer_engine_default_spec.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

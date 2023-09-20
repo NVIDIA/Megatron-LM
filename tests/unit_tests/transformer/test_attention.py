@@ -17,7 +17,7 @@ class TestParallelAttention:
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_attention = SelfAttention(self.transformer_config,
-                                                gpt_model_with_transformer_engine_default_spec.self_attention)
+                                                gpt_model_with_transformer_engine_default_spec.submodules.self_attention.submodules)
 
 
     def teardown_method(self, method):
@@ -60,7 +60,7 @@ class TestParallelAttention:
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity='selective'
         checkpointed_parallel_attention = SelfAttention(transformer_config,
-                                                        gpt_model_with_transformer_engine_default_spec.self_attention)
+                                                        gpt_model_with_transformer_engine_default_spec.submodules.self_attention.submodules)
         config = checkpointed_parallel_attention.config
 
         sequence_length = 32
