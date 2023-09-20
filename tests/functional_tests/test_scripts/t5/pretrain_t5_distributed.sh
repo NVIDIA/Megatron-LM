@@ -10,9 +10,9 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/t5-vocab.txt
-DATA_PATH=<Specify path and file prefix>_text_sentence
+CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/megatron-lm-test/trained_models"
+VOCAB_FILE="/lustre/fsw/adlr/adlr-nlp/data/t5/vocab/vocab.txt"
+DATA_PATH="/lustre/fsw/adlr/adlr-nlp/data/roberta_mmap/bc_rn_owt_sto_wiki_dedup_shuf_cleaned_0.7_mmap"
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -59,6 +59,7 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
+# cd /lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm
 torchrun $DISTRIBUTED_ARGS pretrain_t5_core.py \
     $T5_ARGS \
     $DATA_ARGS \
