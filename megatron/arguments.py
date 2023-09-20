@@ -143,12 +143,11 @@ def validate_args(args, defaults={}):
             'pipeline-model-parallel size should be greater than 2 with ' \
             'interleaved schedule'
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-        'number of layers should be divisble by the pipeline parallel size'
+            'number of layers should be divisible by the pipeline parallel size'
         num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
         assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-        'number of layers per pipeline stage must be divisble number of layers per virtual pipeline stage'
-        args.virtual_pipeline_model_parallel_size = \
-            (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
+            'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+        args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.virtual_pipeline_model_parallel_size = None
