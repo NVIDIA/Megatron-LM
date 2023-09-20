@@ -4,7 +4,6 @@ from typing import Literal, Optional
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -32,8 +31,6 @@ class BaseEmbedding(MegatronModule):
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute',
                                          'rope'] = 'learned_absolute',
-        rotary_percent: float = 1.0,
-        seq_len_interpolation_factor: Optional[float] = None,
     ):
         super().__init__(config=config)
 
@@ -49,17 +46,6 @@ class BaseEmbedding(MegatronModule):
             init_method=self.config.init_method,
             config=self.config,
         )
-
-       # Rotary Position Embeddings
-        if position_embedding_type == 'rope':
-            rotary_dim = self.config.kv_channels
-            if rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * rotary_percent)
-
-            self.rotary_pos_emb = RotaryEmbedding(
-                rotary_dim, seq_len_interpolation_factor)
-        else:
-            self.rotary_pos_emb = None
 
         # Position embedding (serial).
         if self.add_position_embedding:
@@ -107,24 +93,6 @@ class BaseEmbedding(MegatronModule):
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
-
-    def get_rotary_pos_emb(self, inference_params, transformer, transformer_input, transformer_config):
-        if inference_params is not None:
-            rotary_seq_len = inference_params.max_sequence_length
-        else:
-            if transformer.input_tensor is not None:
-                rotary_seq_len = transformer.input_tensor.size(0)
-            else:
-                rotary_seq_len = transformer_input.size(0)
-
-            if transformer_config.sequence_parallel:
-                rotary_seq_len *= transformer_config.tensor_model_parallel_size
-
-        rotary_pos_emb = None
-        if self.rotary_pos_emb is not None:
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
-
-        return rotary_pos_emb
 
     def sharded_state_dict(self, prefix=''):
 

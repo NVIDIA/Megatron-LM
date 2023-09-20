@@ -6,6 +6,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.base_embedding import BaseEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -74,16 +75,17 @@ class GPTModel(MegatronModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        self.embedding = None
         if self.pre_process:
             self.embedding = BaseEmbedding(
-                config=self.config,
-                vocab_size=self.vocab_size,
-                max_sequence_length=self.max_sequence_length,
-                position_embedding_type=position_embedding_type,
-                rotary_percent=rotary_percent,
-                seq_len_interpolation_factor=seq_len_interpolation_factor
+                    config=self.config,
+                    vocab_size=self.vocab_size,
+                    max_sequence_length=self.max_sequence_length,
+                    position_embedding_type=position_embedding_type
             )
+
+        if self.position_embedding_type == 'rope':
+            self.rotary_pos_emb = RotaryEmbedding(
+                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor)
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -92,6 +94,8 @@ class GPTModel(MegatronModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
+
+
 
         # Output
         if post_process:
@@ -135,9 +139,9 @@ class GPTModel(MegatronModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.embedding is not None and self.position_embedding_type == 'rope':
-            rotary_pos_emb = self.embedding.get_rotary_pos_emb(
-                inference_params, self.decoder, decoder_input, self.config)
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(inference_params, self.decoder, decoder_input, self.config)
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
         hidden_states = self.decoder(
