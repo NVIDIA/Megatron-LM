@@ -192,7 +192,7 @@ def get_student_backbone_and_num_features(config, pre_process=True, post_process
     else:
         raise Exception('{} vision backbone is not supported.'.format(
                               args.vision_backbone_type))
- 
+
     return student, num_features
 
 def get_teacher_backbone_and_num_features(config, pre_process=True, post_process=True):
@@ -220,6 +220,7 @@ class DINOPretrainModel(MegatronModule):
     def __init__(self, config, pre_process=True, post_process=True):
         super(DINOPretrainModel, self).__init__()
         args = get_args()
+        self.config = config
         self.out_dim = 65536
 
         self.dino_loss = DINOLoss(

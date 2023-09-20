@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """BERT model."""
 
@@ -9,7 +9,7 @@ from megatron.core import tensor_parallel
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits
 from megatron.model.language_model import get_language_model
-from megatron.model import LayerNorm
+from megatron.model.utils import get_norm
 from megatron.model.utils import openai_gelu, erf_gelu
 from megatron.model.utils import get_linear_layer
 from megatron.model.utils import init_method_normal
@@ -49,11 +49,10 @@ class BertLMHead(MegatronModule):
     Arguments:
         config: TransformerConfig object
         mpu_vocab_size: model parallel size of vocabulary.
-        hidden_size: hidden size
         parallel_output: whether output logits being distributed or not.
     """
 
-    def __init__(self, mpu_vocab_size, hidden_size, config, parallel_output):
+    def __init__(self, mpu_vocab_size, config, parallel_output):
         super().__init__(config=config)
 
         args = get_args()
@@ -61,13 +60,11 @@ class BertLMHead(MegatronModule):
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
-        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method)
+        self.dense = get_linear_layer(config.hidden_size, config.hidden_size, config.init_method)
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)
 
-        self.layernorm = LayerNorm(hidden_size,
-                                   eps=config.layernorm_epsilon,
-                                   sequence_parallel=config.sequence_parallel)
+        self.norm = get_norm(config)
         self.gelu = torch.nn.functional.gelu
         if args.openai_gelu:
             self.gelu = openai_gelu
@@ -77,12 +74,23 @@ class BertLMHead(MegatronModule):
     def forward(self, hidden_states, word_embeddings_weight):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.gelu(hidden_states)
-        hidden_states = self.layernorm(hidden_states)
+        hidden_states = self.norm(hidden_states)
         output = parallel_lm_logits(hidden_states,
                                     word_embeddings_weight,
                                     self.parallel_output,
                                     bias=self.bias)
         return output
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Customize load."""
+
+        # Handle renaming layernorm -> norm in component names
+        state_dict_ = {}
+        for key in state_dict.keys():
+            newkey = key.replace("layernorm", "norm")
+            state_dict_[newkey] = state_dict[key]
+
+        super().load_state_dict(state_dict_, strict)
 
 
 def post_language_model_processing(lm_output, pooled_output,
@@ -152,8 +160,7 @@ class BertModel(MegatronModule):
 
         self.initialize_word_embeddings()
         if self.post_process:
-            self.lm_head = BertLMHead(self.shared_embedding_or_output_weight().size(0), config.hidden_size,
-                                      config, parallel_output)
+            self.lm_head = BertLMHead(self.shared_embedding_or_output_weight().size(0), config, parallel_output)
             self._lm_head_key = 'lm_head'
             self.binary_head = None
             if self.add_binary_head:
