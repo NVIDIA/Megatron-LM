@@ -840,7 +840,7 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
-    group.add_argument('--use-mcore-models', action='store_false',
+    group.add_argument('--use-mcore-models', action='store_true',
                        help='Use the implementation from megatron core',
                        dest='use_mcore')                       
     return parser
