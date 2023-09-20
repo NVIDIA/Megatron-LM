@@ -229,7 +229,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     checkpoint_name = get_checkpoint_name(args.save, iteration)
 
     # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer:
+    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None:
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
