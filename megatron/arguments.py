@@ -404,6 +404,9 @@ def validate_args(args):
     args.curriculum_learning_legacy = False
     args.compression_training = False
 
+    # FlashAttention
+    args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
+
     # AML
     if args.aml_data_download_path is not None:
         data_paths = []
