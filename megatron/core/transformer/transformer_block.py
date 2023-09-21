@@ -10,8 +10,9 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
@@ -21,6 +22,7 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
+        transformer_layer_spec: ModuleSpec,
         self_attn_mask_type=AttnMaskType.padding,
         post_layer_norm=True,
         pre_process=True,
@@ -29,6 +31,7 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
 
         self.self_attn_mask_type = self_attn_mask_type
         self.post_layer_norm = post_layer_norm
@@ -44,9 +47,9 @@ class TransformerBlock(MegatronModule):
             self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
         )
 
-        self._build_layers()
+        self._build_layers(self.transformer_layer_spec)
 
-    def _build_layers(self):
+    def _build_layers(self, transformer_layer_spec):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
@@ -56,6 +59,7 @@ class TransformerBlock(MegatronModule):
         def build_layer(layer_number):
             layer = TransformerLayer(
                 config=self.config,
+                submodules=transformer_layer_spec.submodules,
                 layer_number=layer_number,
                 self_attn_mask_type=self.self_attn_mask_type,
             )
