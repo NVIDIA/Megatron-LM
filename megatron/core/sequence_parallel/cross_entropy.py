@@ -1,4 +1,5 @@
 import torch
+from packaging import version
 
 from megatron.core.parallel_state import (
     get_sequence_parallel_group,
@@ -23,7 +24,10 @@ class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
         batch_size = vocab_seq_parallel_logits.size(1)
 
         loss_all = torch.empty(ctx.seqlen, batch_size, dtype=vocab_seq_parallel_logits.dtype, device=vocab_seq_parallel_logits.device)
-        torch.distributed.all_gather_into_tensor(loss_all, loss, group=get_sequence_parallel_group())
+        if version.parse(torch.__version__) >= version.parse('1.13'):
+            torch.distributed.all_gather_into_tensor(loss_all, loss, group=get_sequence_parallel_group())
+        else:
+            torch.distributed._all_gather_base(loss_all, loss, group=get_sequence_parallel_group())
 
         ctx.save_for_backward(softmax, target)
 

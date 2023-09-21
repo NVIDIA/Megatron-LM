@@ -8,6 +8,7 @@ import time
 
 import torch
 from deepspeed.accelerator import get_accelerator
+from packaging import version
 
 
 class TimerBase(ABC):
@@ -197,8 +198,12 @@ class Timers:
                     reset=reset)
 
         # See the note above for why we are not using gather.
-        torch.distributed._all_gather_base(rank_name_to_time.view(-1),
+        if version.parse(torch.__version__) >= version.parse('1.13'):
+            torch.distributed.all_gather_into_tensor(rank_name_to_time.view(-1),
                                            rank_name_to_time[rank, :].view(-1))
+        else:
+            torch.distributed._all_gather_base(rank_name_to_time.view(-1),
+                                         rank_name_to_time[rank, :].view(-1))
 
         return rank_name_to_time
 
