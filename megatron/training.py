@@ -51,6 +51,12 @@ from megatron.model.transformer import ParallelTransformerLayer
 
 from deepspeed import comm as dist
 
+try:
+    import wandb
+except (ImportError, ModuleNotFoundError):
+    wandb = None
+
+
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
     torch.distributed.barrier()
@@ -228,6 +234,7 @@ def pretrain(train_valid_test_dataset_provider,
                                    test_data_iterator, model,
                                    iteration, process_non_loss_data_func, config,
                                    verbose=True, write_to_tensorboard=not args.skip_train, test=True)
+    return model
 
 
 def update_train_iters(args):
@@ -999,7 +1006,27 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         seq_len = args.seq_length
         if hasattr(args, 'actual_seq_length'):
             seq_len = args.actual_seq_length
-        samples_per_sec, tflops, approx_parameters_in_billions = throughput_calculator(model, args, elapsed_time, total_iterations)
+        samples_per_sec, tflops, approx_parameters_in_billions = throughput_calculator(
+            model,
+            args,
+            elapsed_time,
+            total_iterations
+        )
+        samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
+        tokens_per_sec = samples_per_sec * seq_len
+        tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            tput = {
+                'throughput/iteration-time': elapsed_time_per_iteration,  # 1000 ms / s
+                'throughput/samples_per_sec': samples_per_sec,
+                'throughput/samples_per_sec_per_replica': samples_per_sec_per_replica,
+                'throughput/tokens_per_sec': tokens_per_sec,
+                'throughput/tokens_per_sec_per_replica': tokens_per_sec_per_replica,
+                'throughput/tflops': tflops,
+                'throughput/approx_params_in_billions': approx_parameters_in_billions,
+                'throughput/elapsed_ms_per_iteration': elapsed_time_per_iteration,
+            }
+            wandb.run.log(tput)
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time/iteration-time',
