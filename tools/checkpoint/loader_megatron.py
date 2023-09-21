@@ -175,6 +175,13 @@ def _load_checkpoint(queue, args):
     if vp_size is None:
         vp_size = 1
 
+    # Layernorm has bias; RMSNorm does not.
+    if hasattr(checkpoint_args, 'normalization'):
+        norm_has_bias = checkpoint_args.normalization == "LayerNorm"
+    else:
+        # older models only supported LayerNorm
+        norm_has_bias = True
+
     # metadata
     md = types.SimpleNamespace()
     md.model_type = args.model_type
@@ -190,6 +197,7 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.norm_has_bias = norm_has_bias
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
@@ -223,9 +231,6 @@ def _load_checkpoint(queue, args):
         assert not hasattr(models[0].language_model.embedding, 'position_embeddings')
 
     queue_put("embeddings", message)
-
-    # Layernorm has bias; RMSNorm does not.
-    norm_has_bias = md.checkpoint_args.normalization == "LayerNorm"
 
     total_layer_num = 0
     for vp_rank in range(vp_size):
