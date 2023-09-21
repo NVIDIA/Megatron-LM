@@ -55,6 +55,7 @@ class TransformerLayer(MegatronModule):
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             spec.input_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -77,6 +78,7 @@ class TransformerLayer(MegatronModule):
         ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.post_self_attn_layernorm = build_module(
             spec.post_self_attn_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -122,6 +124,7 @@ class TransformerLayer(MegatronModule):
         ## [Module 10: Post MLP] Optional Layernorm after MLP
         self.post_mlp_layernorm = build_module(
             spec.post_mlp_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,

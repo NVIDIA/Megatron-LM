@@ -205,7 +205,7 @@ class T5Model(MegatronModule):
     ):
 
         encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = t5_extended_attention_mask(
-            encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask
+            [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
         )
         encoder_position_ids = t5_position_ids(encoder_input_ids)
         decoder_position_ids = t5_position_ids(decoder_input_ids)
@@ -277,7 +277,7 @@ class T5Model(MegatronModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits = self.lm_head(decoder_hidden_states, weight=output_weight)
+        logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
 
         if labels is None:
             # [s b h] => [b s h]
@@ -346,11 +346,6 @@ class T5Model(MegatronModule):
             )
             T5Model.embedding_warning_printed = True
 
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        pass
-
-    def load_state_dict(self, state_dict, strict=True):
-        pass
 
     def sharded_state_dict(self, prefix=''):
         sharded_state_dict = {}
@@ -412,6 +407,46 @@ class T5Model(MegatronModule):
         return sharded_state_dict
 
 
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        pass
+
+
+    def load_state_dict(self, state_dict, strict=True):
+        pass
+
+
+    # def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+    #     """For easy load when model is combined with other heads,
+    #     add an extra key."""
+
+    #     state_dict_ = {}
+    #     state_dict_[self._language_model_key] \
+    #         = self.language_model.state_dict_for_save_checkpoint(prefix=prefix,
+    #                                                              keep_vars=keep_vars)
+    #     if self.post_process and self.add_decoder:
+    #         state_dict_[self._lm_head_key] \
+    #             = self.lm_head.state_dict_for_save_checkpoint(prefix=prefix,
+    #                                                           keep_vars=keep_vars)
+    #      # Save word_embeddings.
+    #     if self.post_process and not self.pre_process and self.add_decoder:
+    #         state_dict_[self._word_embeddings_for_head_key] \
+    #             = self.word_embeddings.state_dict(prefix=prefix,
+    #                                               keep_vars=keep_vars)
+    #     return state_dict_
+
+
+    # def load_state_dict(self, state_dict, strict=True):
+    #     """Customized load."""
+
+    #     self.language_model.load_state_dict(
+    #         state_dict[self._language_model_key], strict=strict)
+    #     if self.post_process and self.add_decoder:
+    #         self.lm_head.load_state_dict(state_dict[self._lm_head_key],
+    #                                      strict=strict)
+    #     # Load word embeddings.
+    #     if self.post_process and not self.pre_process and self.add_decoder:
+    #         self.word_embeddings.load_state_dict(
+    #             state_dict[self._word_embeddings_for_head_key], strict=strict)
 
 
 

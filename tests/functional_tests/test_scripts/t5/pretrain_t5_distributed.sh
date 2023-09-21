@@ -1,4 +1,6 @@
 #!/bin/bash
+cd /lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm
+pip install -e .
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
@@ -10,9 +12,10 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/trained_models"
+CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/trained_models/test7"
 VOCAB_FILE="/lustre/fsw/joc/huvu/data/t5/vocab/vocab.txt"
 DATA_PATH="/lustre/fsw/joc/huvu/data/t5/training_data/bc_rn_owt_sto_wiki_dedup_shuf_cleaned_0.7_mmap"
+TENSORBOARD_DIR=$CHECKPOINT_PATH
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -22,6 +25,30 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+# T5_ARGS="
+#     --num-layers 12 \
+#     --hidden-size 768 \
+#     --num-attention-heads 12 \
+#     --kv-channels 64 \
+#     --ffn-hidden-size 3072 \
+#     --encoder-seq-length 512 \
+#     --decoder-seq-length 128 \
+#     --max-position-embeddings 512 \
+#     --micro-batch-size 16 \
+#     --global-batch-size 128 \
+#     --lr 0.0001 \
+#     --train-iters 1000000 \
+#     --lr-decay-iters 1000000 \
+#     --lr-decay-style linear \
+#     --min-lr 0.00001 \
+#     --weight-decay 1e-2 \
+#     --lr-warmup-fraction .01 \
+#     --clip-grad 1.0 \
+#     --fp16 \
+#     --vocab-extra-ids 100
+# "
+
+## different batch-size
 T5_ARGS="
     --num-layers 12 \
     --hidden-size 768 \
@@ -31,8 +58,8 @@ T5_ARGS="
     --encoder-seq-length 512 \
     --decoder-seq-length 128 \
     --max-position-embeddings 512 \
-    --micro-batch-size 16 \
-    --global-batch-size 128 \
+    --micro-batch-size 128 \
+    --global-batch-size 1024 \
     --lr 0.0001 \
     --train-iters 1000000 \
     --lr-decay-iters 1000000 \
@@ -45,6 +72,58 @@ T5_ARGS="
     --vocab-extra-ids 100
 "
 
+
+## TP-DP-PP
+T5_ARGS="
+    --num-layers 12 \
+    --hidden-size 768 \
+    --num-attention-heads 12 \
+    --kv-channels 64 \
+    --ffn-hidden-size 3072 \
+    --encoder-seq-length 512 \
+    --decoder-seq-length 128 \
+    --max-position-embeddings 512 \
+    --micro-batch-size 16 \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 4 \
+    --pipeline-model-parallel-split-rank 3 \
+    --lr 0.0001 \
+    --train-iters 1000000 \
+    --lr-decay-iters 1000000 \
+    --lr-decay-style linear \
+    --min-lr 0.00001 \
+    --weight-decay 1e-2 \
+    --lr-warmup-fraction .01 \
+    --clip-grad 1.0 \
+    --fp16 \
+    --vocab-extra-ids 100
+"
+
+
+# ## fp8 (check core/transformer/transformer_config.py) - only work on H100
+# T5_ARGS="
+#     --num-layers 12 \
+#     --hidden-size 768 \
+#     --num-attention-heads 12 \
+#     --kv-channels 64 \
+#     --ffn-hidden-size 3072 \
+#     --encoder-seq-length 512 \
+#     --decoder-seq-length 128 \
+#     --max-position-embeddings 512 \
+#     --micro-batch-size 16 \
+#     --global-batch-size 128 \
+#     --lr 0.0001 \
+#     --train-iters 1000000 \
+#     --lr-decay-iters 1000000 \
+#     --lr-decay-style linear \
+#     --min-lr 0.00001 \
+#     --weight-decay 1e-2 \
+#     --lr-warmup-fraction .01 \
+#     --clip-grad 1.0 \
+#     --fp8-format hybrid \
+#     --vocab-extra-ids 100
+# "
+
 DATA_ARGS="
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_FILE \
@@ -54,12 +133,13 @@ DATA_ARGS="
 
 OUTPUT_ARGS="
     --log-interval 100 \
-    --save-interval 10000 \
+    --tensorboard-dir ${TENSORBOARD_DIR} \
+    --save-interval 5000 \
     --eval-interval 1000 \
     --eval-iters 10
 "
 
-# cd /lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm
+mkdir $CHECKPOINT_PATH
 torchrun $DISTRIBUTED_ARGS pretrain_t5_core.py \
     $T5_ARGS \
     $DATA_ARGS \

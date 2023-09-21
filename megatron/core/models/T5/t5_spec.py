@@ -5,6 +5,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TELayerNormMLP,
     TERowParallelLinear,
+    TENorm
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_layer import TransformerLayerSpec
@@ -50,7 +51,7 @@ def decoder_model_with_transformer_engine_default_spec() -> TransformerLayerSpec
     # post_cross_attn_layernorm = TELayerNormColumnParallelLinear,
     ln_mlp=TELayerNormMLP,
     mlp_bda=get_bias_dropout_add,
-    # post_mlp_layernorm = TELayerNormColumnParallelLinear,
+    post_mlp_layernorm = TENorm,
 )
 
 def get_t5_encoder_block_spec(config) -> TransformerBlockSpec:

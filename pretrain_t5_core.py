@@ -140,8 +140,7 @@ def forward_step(data_iterator, model):
                           enc_mask,
                           dec_mask,
                           enc_dec_mask,
-                          tokentype_ids=None,
-                          lm_labels=lm_labels)
+                          labels=lm_labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
