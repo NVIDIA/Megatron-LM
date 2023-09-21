@@ -11,7 +11,7 @@ from megatron.arguments import core_transformer_config_from_args
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_decoder_spec import gpt_model_with_transformer_engine_default_spec
+from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.spec_utils import import_module
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.training import pretrain
@@ -29,14 +29,14 @@ def model_provider(pre_process=True, post_process=True):
 
     # NOTE: Experimental customization feature
     if args.model_spec is not None:
-        gpt_model_spec = import_module(args.model_spec)
+        transformer_layer_spec = import_module(args.model_spec)
     else:
-        gpt_model_spec = gpt_model_with_transformer_engine_default_spec
+        transformer_layer_spec = gpt_layer_with_transformer_engine_spec
 
     print_rank_0('building GPT model ...')
     model = GPTModel(
         config=config,
-        spec=gpt_model_spec,
+        transformer_layer_spec=transformer_layer_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,

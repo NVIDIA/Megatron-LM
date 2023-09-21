@@ -22,7 +22,7 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
+        transformer_layer_spec: ModuleSpec,
         self_attn_mask_type=AttnMaskType.padding,
         post_layer_norm=True,
         pre_process=True,
@@ -31,7 +31,7 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
-        self.transformer_layer_spec: ModuleSpec = spec
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
 
         self.self_attn_mask_type = self_attn_mask_type
         self.post_layer_norm = post_layer_norm

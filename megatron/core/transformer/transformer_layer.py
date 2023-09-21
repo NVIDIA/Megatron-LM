@@ -20,11 +20,11 @@ from megatron.core.utils import make_viewless_tensor
 @dataclass
 class TransformerLayerSubmodules:
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-    self_attention: SelfAttentionSubmodules = IdentityOp
+    self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
-    cross_attention: CrossAttentionSubmodules = IdentityOp
+    cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
