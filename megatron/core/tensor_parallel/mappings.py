@@ -8,6 +8,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from .utils import split_tensor_along_last_dim
+from deepspeed.accelerator import get_accelerator
 
 
 def _reduce(input_):
@@ -98,7 +99,7 @@ def _gather_along_first_dim(input_):
     dim_size[0] = dim_size[0] * world_size
 
     output = torch.empty(dim_size, dtype=input_.dtype,
-                         device=torch.cuda.current_device())
+                         device=get_accelerator().current_device_name())
     torch.distributed._all_gather_base(output, input_.contiguous(),
                                        group=get_tensor_model_parallel_group())
 
@@ -118,7 +119,7 @@ def _reduce_scatter_along_first_dim(input_):
     dim_size[0] = dim_size[0] // world_size
    
     output = torch.empty(dim_size, dtype=input_.dtype,
-                         device=torch.cuda.current_device())
+                         device=get_accelerator().current_device_name())
     torch.distributed._reduce_scatter_base(output, input_.contiguous(), 
                                            group=get_tensor_model_parallel_group())
     return output
