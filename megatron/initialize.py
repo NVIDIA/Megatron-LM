@@ -44,12 +44,23 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
 
     # Parse arguments
     args = parse_args(extra_args_provider, ignore_unknown_args)
+    # Set input args.
+    for key in args_defaults:
+        # The args_defaults is for those who want to set default value or pass parameters when
+        # calling Python functions. Instead of using arguments passed in from outside the program.
+        if args.rank == 0:
+            print('INFO: overriding default arguments for {key}:{v} \
+                   with {key}:{v2}'.format(key=key, v=getattr(args, key),
+                                           v2=args_defaults[key]),
+                                           flush=True)
+        setattr(args, key, args_defaults[key])
+
 
     if args.use_checkpoint_args or args_defaults.get('use_checkpoint_args', False):
         assert args.load is not None, '--use-checkpoints-args requires --load argument'
         load_args_from_checkpoint(args)
 
-    validate_args(args, args_defaults)
+    validate_args(args)
         
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.

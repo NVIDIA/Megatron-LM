@@ -57,16 +57,13 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     else:
         args = parser.parse_args()
 
-    # helper argument to set deepspeed pipeline parallel or not
-    args.ds_pipeline_enabled = not args.no_pipeline_parallel
-
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
     return args
 
-def validate_args(args, defaults={}):
+def validate_args(args):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -138,20 +135,7 @@ def validate_args(args, defaults={}):
         args.recompute_granularity = 'selective'
     del args.recompute_activations
 
-    # Set input defaults.
-    for key in defaults:
-        # For default to be valid, it should not be provided in the
-        # arguments that are passed to the program. We check this by
-        # ensuring the arg is set to None.
-        if getattr(args, key) is not None:
-            if args.rank == 0:
-                print('WARNING: overriding default arguments for {key}:{v} \
-                       with {key}:{v2}'.format(key=key, v=defaults[key],
-                                               v2=getattr(args, key)),
-                                               flush=True)
-        else:
-            setattr(args, key, defaults[key])
-
+    args.ds_pipeline_enabled = not args.no_pipeline_parallel
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
