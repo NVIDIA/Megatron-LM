@@ -710,12 +710,18 @@ def get_data_parallel_rank():
 
 def get_context_parallel_world_size():
     """Return world size for the context parallel group."""
-    return torch.distributed.get_world_size(group=get_context_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(group=get_context_parallel_group())
+    else:
+        return 0
 
 
 def get_context_parallel_rank():
     """Return my rank for the context parallel group."""
-    return torch.distributed.get_rank(group=get_context_parallel_group())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank(group=get_context_parallel_group())
+    else:
+        return 0
 
 
 def _set_global_memory_buffer():
