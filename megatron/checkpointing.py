@@ -81,6 +81,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
                         pipeline_parallel=None,
                         tensor_rank=None, pipeline_rank=None):
     """Determine the directory name for this rank's checkpoint."""
+    args=get_args()
     if release:
         directory = 'release'
     else:
@@ -101,10 +102,13 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     # data parallel rank.
     if not pipeline_parallel:
         common_path = os.path.join(checkpoints_path, directory,
-                            f'mp_rank_{tensor_rank:02d}_{data_rank:03d}')
+                            f'mp_rank_{tensor_rank:02d}')
     else:
         common_path = os.path.join(checkpoints_path, directory,
-                f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}_{data_rank:03d}')
+                f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
+
+    if args.expert_parallel:
+        common_path = common_path + f'_{data_rank:03d}'
 
     return os.path.join(common_path, "model_optim_rng.pt")
 
@@ -238,9 +242,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
         optimizer.save_parameter_state(optim_checkpoint_name)
 
     # Collect args, model, RNG.
-#    if not torch.distributed.is_initialized() \
-#       or mpu.get_data_parallel_rank() == 0:
-    if True:
+    if not torch.distributed.is_initialized() \
+       or mpu.get_data_parallel_rank() == 0 \
+       or args.expert_parallel:
 
         # Arguments, iteration, and model.
         state_dict = {}
