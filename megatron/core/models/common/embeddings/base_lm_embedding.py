@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from typing import Literal, Optional
+
 import torch
 
 from megatron.core import tensor_parallel
@@ -12,7 +13,7 @@ from megatron.core.utils import (
 )
 
 
-class BaseEmbedding(MegatronModule):
+class BaseLanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
     Arguments:
@@ -29,8 +30,7 @@ class BaseEmbedding(MegatronModule):
         config: TransformerConfig,
         vocab_size: int,
         max_sequence_length: int,
-        position_embedding_type: Literal['learned_absolute',
-                                         'rope'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
     ):
         super().__init__(config=config)
 
@@ -85,8 +85,7 @@ class BaseEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                embeddings)
+            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:

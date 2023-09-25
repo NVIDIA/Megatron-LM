@@ -6,17 +6,19 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.base_embedding import BaseEmbedding
+from megatron.core.models.common.embeddings.base_lm_embedding import BaseLanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model.base_language_model import (
+    BaseLanguageModel,
+)
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
-from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
-class GPTModel(MegatronModule):
+class GPTModel(BaseLanguageModel):
     """Transformer language model.
 
     Arguments:
@@ -54,8 +56,7 @@ class GPTModel(MegatronModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute',
-                                         'rope'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
     ):
@@ -76,16 +77,17 @@ class GPTModel(MegatronModule):
         self.model_type = ModelType.encoder_or_decoder
 
         if self.pre_process:
-            self.embedding = BaseEmbedding(
-                    config=self.config,
-                    vocab_size=self.vocab_size,
-                    max_sequence_length=self.max_sequence_length,
-                    position_embedding_type=position_embedding_type
+            self.embedding = BaseLanguageModelEmbedding(
+                config=self.config,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.max_sequence_length,
+                position_embedding_type=position_embedding_type,
             )
 
         if self.position_embedding_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
-                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor)
+                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+            )
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -94,8 +96,6 @@ class GPTModel(MegatronModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
-
-
 
         # Output
         if post_process:
@@ -130,8 +130,7 @@ class GPTModel(MegatronModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(
-                input_ids=input_ids, position_ids=position_ids)
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -140,7 +139,9 @@ class GPTModel(MegatronModule):
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(inference_params, self.decoder, decoder_input, self.config)
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_params, self.decoder, decoder_input, self.config
+            )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
@@ -164,7 +165,7 @@ class GPTModel(MegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_loss(labels, logits)
+        loss = self.compute_language_model_loss(labels, logits)
 
         return loss
 
@@ -186,8 +187,7 @@ class GPTModel(MegatronModule):
             sharded_state_dict.update(embedding_sharded_state_dict)
 
         decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(
-            prefix=decoder_prefix)
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
         sharded_state_dict.update(decoder_sharded_state_dict)
 
         if self.post_process:
@@ -230,4 +230,3 @@ class GPTModel(MegatronModule):
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
-
