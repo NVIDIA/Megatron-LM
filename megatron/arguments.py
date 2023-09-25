@@ -39,6 +39,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
+    parser = _add_experimental_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -143,11 +144,12 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 2, \
             'pipeline-model-parallel size should be greater than 2 with ' \
             'interleaved schedule'
-        assert args.num_layers % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'number of layers is not divisible by number of layers per virtual ' \
-            'pipeline stage'
-        args.virtual_pipeline_model_parallel_size = \
-            (args.num_layers // args.transformer_pipeline_model_parallel_size) // \
+        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+            'number of layers should be divisible by the pipeline parallel size'
+        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
+        assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
+            'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+        args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.virtual_pipeline_model_parallel_size = None
@@ -1284,4 +1286,16 @@ def _add_vision_args(parser):
     group.add_argument('--dino-warmup-teacher-temp-epochs', type=int, default=30,
                        help='warmup teacher temperaure epochs')
 
+    return parser
+
+def _add_experimental_args(parser):
+    group = parser.add_argument_group(title='experimental')
+
+    group.add_argument('--model-spec',
+                       type=str, default=None, nargs=2,
+                       help='Specify the <module_location function_name> pair '
+                            'that returns a spec to customize the transformer '
+                            'layer implementation. For more details, check the'
+                            '`transformer_layer.py` file that details the use '
+                            'of spec based customization.')
     return parser

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 
+import nltk
 import requests
 
 from megatron.data.indexed_dataset import MMapIndexedDataset
@@ -61,6 +62,10 @@ def merge_datasets(idir):
 
 
 def do_test_preprocess_data(temp_dir, extra_args=[]):
+    # set the default nltk data path
+    os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
+    nltk.data.path.append(os.environ["NLTK_DATA"])
+
     path_to_raws = os.path.join(temp_dir, "sample_raws")
     path_to_data = os.path.join(temp_dir, "sample_data")
     os.mkdir(path_to_raws)
