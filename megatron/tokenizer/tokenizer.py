@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron tokenizers."""
 
@@ -7,7 +7,6 @@ from abc import abstractmethod
 
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
-
 
 def build_tokenizer(args):
     """Initialize tokenizer."""
@@ -36,16 +35,20 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'Llama2Tokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = _Llama2Tokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
     else:
         raise NotImplementedError('{} tokenizer is not '
                                   'implemented.'.format(args.tokenizer_type))
-    
-    # Add vocab size.
-    args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
-                                                      args)
+
+    # Add vocab size (if not already set from a checkpoint).
+    if getattr(args, "padded_vocab_size", None) is None:
+        args.padded_vocab_size = _vocab_size_with_padding(tokenizer.vocab_size,
+                                                          args)
 
     return tokenizer
 
@@ -497,6 +500,55 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     @property
     def eod(self):
         return self._eos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+class _Llama2Tokenizer(_SentencePieceTokenizer):
+    """SentencePieceTokenizer-Megatron wrapper"""
+
+    def __init__(self, model_file,):
+        super().__init__(model_file, vocab_extra_ids=0)
+
+    def _initalize(self, vocab_extra_ids):
+        self._populate_vocab()
+
+        # BOS / EOS token IDs
+        self.n_words: int = self.tokenizer.vocab_size()
+        self.bos_id: int = self.tokenizer.bos_id()
+        self.eos_id: int = self.tokenizer.eos_id()
+        self.pad_id: int = self.tokenizer.pad_id()
+        assert self.tokenizer.vocab_size() == self.tokenizer.get_piece_size()
+
+    def tokenize(self, s: str, bos=True, eos=False):
+        '''Default args for text completion, not chat/dialog.'''
+        assert type(s) is str
+        t = self.tokenizer.encode(s)
+        if bos:
+            t = [self.bos_id] + t
+        if eos:
+            t = t + [self.eos_id]
+        return t
+
+    def detokenize(self, ids):
+        return self.tokenizer.decode_ids(ids)
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self.eos_id
 
     @property
     def additional_special_tokens_ids(self):

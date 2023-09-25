@@ -33,8 +33,11 @@ class BlendableDataset(torch.utils.data.Dataset):
         # Build indicies.
         def _build_indices():
             start_time = time.time()
-            assert num_datasets < 255
-            dataset_index = np.zeros(self.size, dtype=np.uint8)
+            assert num_datasets < 32767
+            # Dataset index is a 16-bit integer to alow at least 2^15 datasets.
+            # PyTorch isn't happy casting numpy uint16 to a Torch Tensor,
+            # so we use int16 although a dataset_index can never be negative.
+            dataset_index = np.zeros(self.size, dtype=np.int16)
             dataset_sample_index = np.zeros(self.size, dtype=np.int64)
 
             from megatron.data import helpers
