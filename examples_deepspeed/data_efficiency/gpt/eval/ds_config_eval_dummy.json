@@ -4,8 +4,7 @@
 "steps_per_print": 10,
 
 "zero_optimization": {
-    "stage": 0,
-    "elastic_checkpoint": true
+    "stage": 0
 },
 
 "gradient_clipping": 1.0,

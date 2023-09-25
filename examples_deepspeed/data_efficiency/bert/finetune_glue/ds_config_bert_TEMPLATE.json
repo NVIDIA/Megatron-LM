@@ -4,8 +4,7 @@
   "steps_per_print": LOG_INTERVAL,
 
   "zero_optimization": {
-    "stage": ZERO_STAGE,
-    "elastic_checkpoint": true
+    "stage": ZERO_STAGE
   },
 
   "gradient_clipping": 1.0,
