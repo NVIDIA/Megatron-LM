@@ -1383,5 +1383,4 @@ def _add_ul2_args(parser):
     # in `validate_args` but still evaluate to `False`.
     group.add_argument('--_is_ul2', help=argparse.SUPPRESS)
 
-
     return parser
