@@ -174,10 +174,6 @@ def validate_args(args, defaults={}):
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # Overlapping grad reduce not supported with interleaved PP right now.
-    if args.overlap_grad_reduce:
-        assert args.virtual_pipeline_model_parallel_size is None
-
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
