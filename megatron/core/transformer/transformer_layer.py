@@ -217,7 +217,35 @@ class TransformerLayer(MegatronModule):
                     (global_layer_offset,),
                     replica_id,
                 )
-
+            elif is_glu_weight:
+                # We must split the tensor into 2 parts, each sharded separately.
+                # This requires special handling:
+                #  - in `load_state_dict` (see `_load_from_state_dict` below)
+                #  - in the optimizer `sharded_state_dict` (the mapping between
+                #      model params tracked by the optimizer params and tensors
+                #      wrapped with ShardedTensor is broken)
+                # TODO: implement optimizer state handling
+                assert tp_axis == 0, f'TP axis for GLU weight should be 0, got: {tp_axis}'
+                tensor_w, tensor_v = torch.chunk(tensor, 2, dim=tp_axis)
+                tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+                offset_w = (tp_axis + 1, tp_rank, tp_size * 2)
+                offset_v = (tp_axis + 1, tp_size + tp_rank, tp_size * 2)
+                sh_ten_w = ShardedTensor.from_rank_offsets(
+                    f'{prefix}{layer_name}',
+                    tensor_w,
+                    *(sharded_offsets + [offset_w]),
+                    replica_id=replica_id,
+                    prepend_axis_num=1,  # for PP sharding
+                )
+                sh_ten_v = ShardedTensor.from_rank_offsets(
+                    f'{prefix}{layer_name}',
+                    tensor_v,
+                    *(sharded_offsets + [offset_v]),
+                    replica_id=replica_id,
+                    prepend_axis_num=1,  # for PP sharding
+                )
+                sharded_state_dict[layer_key] = [sh_ten_w, sh_ten_v]
             else:
                 sharded_state_dict[layer_key] = ShardedTensor.from_rank_offsets(
                     f'{prefix}{layer_name}',
@@ -228,3 +256,11 @@ class TransformerLayer(MegatronModule):
                 )
 
         return sharded_state_dict
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if self.mlp.config.gated_linear_unit:
+            for layer_name in state_dict.keys():
+                if layer_name.endswith('mlp.linear_fc1.weight'):
+                    assert prefix + 'mlp.linear_fc1.weight' == layer_name, (prefix, layer_name)
+                    state_dict[layer_name] = torch.cat(state_dict[layer_name])
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
