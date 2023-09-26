@@ -51,7 +51,7 @@ class MegatronModule(torch.nn.Module):
             input_tensor = [input_tensor]
 
         assert len(
-            input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
+            input_tensor) == 1, 'input_tensor should only be length 1 for this model'
         self.decoder.set_input_tensor(input_tensor[0])
 
     def compute_loss(self, labels, logits):

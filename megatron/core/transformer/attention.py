@@ -18,6 +18,7 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+from megatron.core.tensor_parallel import ColumnParallelLinear
 
 
 class Attention(MegatronModule, ABC):
