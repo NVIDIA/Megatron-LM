@@ -12,7 +12,8 @@ from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel
+import megatron.model
+from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -24,13 +25,28 @@ def model_provider(pre_process=True, post_process=True):
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
-    model = GPTModel(
-        config,
-        num_tokentypes=0,
-        parallel_output=True,
-        pre_process=pre_process,
-        post_process=post_process
-    )
+
+    if args.use_mcore:
+        model = GPTModel(
+            config=config,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent
+        )
+    else:
+        model = megatron.model.GPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process
+        )
 
     return model
 

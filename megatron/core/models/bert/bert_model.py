@@ -1,7 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from typing import Literal, Optional
 from megatron.core.models.bert.bert_lm_head import BertLMHead
-from megatron.core.models.common.embeddings.base_embedding import BaseEmbedding
+from megatron.core.models.common.embeddings.base_lm_embedding import BaseLanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model.base_language_model import (
+    BaseLanguageModel,
+)
 from megatron.core.transformer.utils import get_linear_layer
 from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
 from megatron.model.language_model import Pooler
@@ -9,13 +12,14 @@ from megatron.model.language_model import Pooler
 import torch
 from torch import Tensor
 
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class BertModel(MegatronModule):
+class BertModel(BaseLanguageModel):
     """Transformer language model.
 
     Arguments:
@@ -79,17 +83,20 @@ class BertModel(MegatronModule):
 
         # Embeddings.
         if self.pre_process:
-            self.embedding = BaseEmbedding(
+            self.embedding = BaseLanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
-                position_embedding_type=position_embedding_type,
-                rotary_percent=rotary_percent,
-                seq_len_interpolation_factor=seq_len_interpolation_factor
+                position_embedding_type=position_embedding_type
+            )
+
+        if self.position_embedding_type == 'rope':
+            self.rotary_pos_emb = RotaryEmbedding(
+                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
             )
 
         # Transformer.
-        self.encoder = TransformerBlock(
+        self.transformer = TransformerBlock(
             config=self.config,
             self_attn_mask_type=AttnMaskType.padding,
             pre_process=self.pre_process,
@@ -109,9 +116,11 @@ class BertModel(MegatronModule):
 
             self.binary_head = None
             if self.add_binary_head:
+                 #TODO: Shoudl switch this to TELinear ? 
                 self.binary_head = get_linear_layer(
                     config.hidden_size, 2, config.init_method)
 
+                #TODO : Should we add our pooler layer in megatron core as well ?
                 self.pooler = Pooler(config.hidden_size, config.init_method)
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
@@ -131,7 +140,7 @@ class BertModel(MegatronModule):
 
         # Encoder embedding.
         if self.pre_process:
-            # tokentype_ids should be used to be consistant with non core bert model
+            # TODO : tokentype_ids should be used to be consistant with non core bert model
             encoder_input = self.embedding(
                 input_ids=input_ids, position_ids=position_ids)
         else:
@@ -141,23 +150,24 @@ class BertModel(MegatronModule):
 
         # Rotary positional embeddings (Why not move this into BERT/GPTEmberdding ?)
         rotary_pos_emb = None
-        if self.embedding is not None and self.position_embedding_type == 'rope':
-            rotary_pos_emb = self.embedding.get_rotary_pos_emb(
-                inference_params, self.encoder, encoder_input, self.config)
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_params, self.transformer, encoder_input, self.config
+                )
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
-        hidden_states = self.encoder(
+        hidden_states = self.transformer(
             hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
         )
-
         if not self.post_process:
             return hidden_states
 
         if self.add_binary_head:
-            hidden_states = self.pooler(hidden_states, 0)
+            pooled_output = self.pooler(hidden_states, 0)
 
         if self.return_embeddings:
             embeddings = torch.transpose(hidden_states, 0, 1)
@@ -181,13 +191,13 @@ class BertModel(MegatronModule):
 
         binary_logits = None
         if self.binary_head is not None:
-            binary_logits = self.binary_head(hidden_states)
+            binary_logits = self.binary_head(pooled_output)
 
         if lm_labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous(), binary_logits
 
-        loss = self.compute_loss(lm_labels, logits)
+        loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss, binary_logits
 

@@ -34,8 +34,8 @@ def model_provider(pre_process=True, post_process=True):
             config=config,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
-            # num_tokentypes=0, #num_tokentypes This is sent in original bert and gpt model
-            add_binary_head=False,  # args.bert_binary_head, # Where should we get this from ?
+            # num_tokentypes=0, #TODO : num_tokentypes This is sent in original bert and gpt model
+            add_binary_head=args.bert_binary_head,
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process)

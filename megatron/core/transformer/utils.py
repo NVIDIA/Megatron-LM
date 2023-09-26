@@ -15,7 +15,7 @@ def attention_mask_func(attention_scores, attention_mask):
 def get_linear_layer(rows, columns, init_method):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
-    if get_args().perform_initialization:
+    if init_method is not None:
         init_method(layer.weight)
     with torch.no_grad():
         layer.bias.zero_()

@@ -5,7 +5,6 @@ from megatron.core.transformer.utils import openai_gelu, erf_gelu
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.utils import get_linear_layer
 
-
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
@@ -25,6 +24,7 @@ class BertLMHead(MegatronModule):
             self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
+        #TODO: Shoudl switch this to TELinear ? Or club this sand the LayerNorm to TELayerNormColumnParallelLinear ?
         self.dense = get_linear_layer(
             hidden_size, hidden_size, config.init_method)
 
@@ -37,6 +37,7 @@ class BertLMHead(MegatronModule):
                                    sequence_parallel=config.sequence_parallel)
 
         self.gelu = torch.nn.functional.gelu
+        #TODO Use activation_func in config to etermine what to use
         # if config.openai_gelu: # Dont have these configs in transfomer config yet
         #    self.gelu = openai_gelu
         # elif config.onnx_safe: # Dont have these configs in transfomer config yet
