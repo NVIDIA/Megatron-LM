@@ -249,8 +249,7 @@ class TransformerLayer(MegatronModule):
                     replica_id=replica_id,
                     prepend_axis_num=1,  # for PP sharding
                 )
-                # TODO: creating a tuple (instead of a dict) should be possible here, check why it's not
-                sharded_state_dict[layer_key] = {'w': sh_ten_w, 'v': sh_ten_v}
+                sharded_state_dict[layer_key] = [sh_ten_w, sh_ten_v]
             else:
                 sharded_state_dict[layer_key] = ShardedTensor.from_rank_offsets(
                     f'{prefix}{layer_name}',
@@ -267,5 +266,5 @@ class TransformerLayer(MegatronModule):
             for layer_name in state_dict.keys():
                 if layer_name.endswith('mlp.linear_fc1.weight'):
                     assert prefix + 'mlp.linear_fc1.weight' == layer_name, (prefix, layer_name)
-                    state_dict[layer_name] = torch.cat((state_dict[layer_name]['w'], state_dict[layer_name]['v']))
+                    state_dict[layer_name] = torch.cat(state_dict[layer_name])
         return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
