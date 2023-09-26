@@ -32,7 +32,6 @@ DATA_ARGS="
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_FILE \
     --merge-file $MERGE_FILE \
-    --data-impl mmap \
     --split 949,50,1
 "
 

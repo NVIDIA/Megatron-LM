@@ -3,621 +3,406 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Essentially re-written in entirety
 
-# copied from fairseq/fairseq/data/indexed_dataset.py
-# Removed IndexedRawTextDataset since it relied on Fairseq dictionary
-# other slight modifications to remove fairseq dependencies
-# Added document index to index file and made it accessible.
-#    An empty sentence no longer separates documents.
-
-from functools import lru_cache
 import os
 import shutil
 import struct
+from enum import Enum
+from functools import lru_cache
 from itertools import accumulate
+from types import TracebackType
+from typing import List, Optional, Tuple, Type, Union
 
 import numpy as np
 import torch
+
 from megatron import print_rank_0
 
-
-def __best_fitting_dtype(vocab_size=None):
-    if vocab_size is not None and vocab_size < 65500:
-        return np.uint16
-    else:
-        return np.int32
+_INDEX_HEADER = b"MMIDIDX\x00\x00"
 
 
-def get_available_dataset_impl():
-    return ['lazy', 'cached', 'mmap']
+class DType(Enum):
+    uint8 = 1
+    int8 = 2
+    int16 = 3
+    int32 = 4
+    int64 = 5
+    float64 = 6
+    float32 = 7
+    uint16 = 8
 
+    @classmethod
+    def code_from_dtype(cls, value: Type[np.number]) -> int:
+        return cls[value.__name__].value
 
-def infer_dataset_impl(path):
-    if IndexedDataset.exists(path):
-        with open(index_file_path(path), 'rb') as f:
-            magic = f.read(8)
-            if magic == IndexedDataset._HDR_MAGIC:
-                return 'cached'
-            elif magic == MMapIndexedDataset.Index._HDR_MAGIC[:8]:
-                return 'mmap'
-            else:
-                return None
-    else:
-        print(f"Dataset does not exist: {path}")
-        print("Path should be a basename that both .idx and .bin can be appended to get full filenames.")
-        return None
-
-
-def make_builder(out_file, impl, vocab_size=None):
-    if impl == 'mmap':
-        return MMapIndexedDatasetBuilder(out_file, dtype=__best_fitting_dtype(vocab_size))
-    else:
-        return IndexedDatasetBuilder(out_file)
-
-
-def make_dataset(path, impl, skip_warmup=False, multimodal=False):
-    if not IndexedDataset.exists(path):
-        print(f"Dataset does not exist: {path}")
-        print("Path should be a basename that both .idx and .bin can be appended to get full filenames.")
-        return None
-    if impl == 'infer':
-        impl = infer_dataset_impl(path)
-    if impl == 'lazy' and IndexedDataset.exists(path):
-        return IndexedDataset(path)
-    elif impl == 'cached' and IndexedDataset.exists(path):
-        return IndexedCachedDataset(path)
-    elif impl == 'mmap' and MMapIndexedDataset.exists(path):
-        return MMapIndexedDataset(path, skip_warmup, multimodal)
-    print(f"Unknown dataset implementation: {impl}")
-    return None
-
-
-def dataset_exists(path, impl):
-    if impl == 'mmap':
-        return MMapIndexedDataset.exists(path)
-    else:
-        return IndexedDataset.exists(path)
-
-
-def read_longs(f, n):
-    a = np.empty(n, dtype=np.int64)
-    f.readinto(a)
-    return a
-
-
-def write_longs(f, a):
-    f.write(np.array(a, dtype=np.int64))
-
-
-dtypes = {
-    1: np.uint8,
-    2: np.int8,
-    3: np.int16,
-    4: np.int32,
-    5: np.int64,
-    6: np.float64,
-    7: np.float32,
-    8: np.uint16,
-}
-
-
-def code(dtype):
-    for k in dtypes.keys():
-        if dtypes[k] == dtype:
-            return k
-    raise ValueError(dtype)
-
-
-def index_file_path(prefix_path):
-    return prefix_path + '.idx'
-
-
-def data_file_path(prefix_path):
-    return prefix_path + '.bin'
-
-
-def create_doc_idx(sizes):
-    doc_idx = [0]
-    for i, s in enumerate(sizes):
-        if s == 0:
-            doc_idx.append(i + 1)
-    return doc_idx
-
-
-class IndexedDataset(torch.utils.data.Dataset):
-    """Loader for IndexedDataset"""
-    _HDR_MAGIC = b'TNTIDX\x00\x00'
-
-    def __init__(self, path):
-        super().__init__()
-        self.path = path
-        self.data_file = None
-        self.read_index(path)
-
-    def read_index(self, path):
-        with open(index_file_path(path), 'rb') as f:
-            magic = f.read(8)
-            assert magic == self._HDR_MAGIC, (
-                'Index file doesn\'t match expected format. '
-                'Make sure that --dataset-impl is configured properly.'
-            )
-            version = f.read(8)
-            assert struct.unpack('<Q', version) == (1,)
-            code, self.element_size = struct.unpack('<QQ', f.read(16))
-            self.dtype = dtypes[code]
-            self._len, self.s = struct.unpack('<QQ', f.read(16))
-            self.doc_count = struct.unpack('<Q', f.read(8))
-            self.dim_offsets = read_longs(f, self._len + 1)
-            self.data_offsets = read_longs(f, self._len + 1)
-            self.sizes = read_longs(f, self.s)
-            self.doc_idx = read_longs(f, self.doc_count)
-
-    def read_data(self, path):
-        self.data_file = open(data_file_path(path), 'rb', buffering=0)
-
-    def check_index(self, i):
-        if i < 0 or i >= self._len:
-            raise IndexError('index out of range')
-
-    def __del__(self):
-        if self.data_file:
-            self.data_file.close()
-
-    # @lru_cache(maxsize=8)
-    def __getitem__(self, idx):
-        if not self.data_file:
-            self.read_data(self.path)
-        if isinstance(idx, int):
-            i = idx
-            self.check_index(i)
-            tensor_size = self.sizes[self.dim_offsets[i]:self.dim_offsets[i + 1]]
-            a = np.empty(tensor_size, dtype=self.dtype)
-            self.data_file.seek(self.data_offsets[i] * self.element_size)
-            self.data_file.readinto(a)
-            return a
-        elif isinstance(idx, slice):
-            start, stop, step = idx.indices(len(self))
-            if step != 1:
-                raise ValueError("Slices into indexed_dataset must be contiguous")
-            sizes = self.sizes[self.dim_offsets[start]:self.dim_offsets[stop]]
-            size = sum(sizes)
-            a = np.empty(size, dtype=self.dtype)
-            self.data_file.seek(self.data_offsets[start] * self.element_size)
-            self.data_file.readinto(a)
-            offsets = list(accumulate(sizes))
-            sents = np.split(a, offsets[:-1])
-            return sents
-
-    def __len__(self):
-        return self._len
-
-    def num_tokens(self, index):
-        return self.sizes[index]
-
-    def size(self, index):
-        return self.sizes[index]
+    @classmethod
+    def dtype_from_code(cls, value: int) -> Type[np.number]:
+        return getattr(np, cls(value).name)
 
     @staticmethod
-    def exists(path):
+    def size(key: Union[int, Type[np.number]]) -> int:
+        if isinstance(key, int):
+            return DType.dtype_from_code(key)().itemsize
+        elif np.number in key.__mro__:
+            return key().itemsize
+        else:
+            raise ValueError
+
+    @staticmethod
+    def optimal_dtype(cardinality: int) -> Type[np.number]:
+        if cardinality is not None and cardinality < 65500:
+            return np.uint16
+        else:
+            return np.int32
+
+
+class _IndexWriter(object):
+    """
+    Object class to write the index file i.e. <data-path>.idx
+    """
+
+    def __init__(self, path: str, dtype: Type[np.number]) -> None:
+        self.path = path
+        self.dtype = dtype
+
+    def __enter__(self) -> "_IndexWriter":
+        self.idx_path = open(self.path, "wb")
+        # fixed, vestigial practice
+        self.idx_path.write(_INDEX_HEADER)
+        # fixed, vestigial practice
+        self.idx_path.write(struct.pack("<Q", 1))
+        # the numeric code for the dtype
+        self.idx_path.write(struct.pack("<B", DType.code_from_dtype(self.dtype)))
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        self.idx_path.close()
+
+    def write(
+        self,
+        sequence_lengths: List[int],
+        sequence_modes: Optional[List[int]],
+        document_indices: List[int],
+    ) -> None:
+        sequence_pointers = self._sequence_pointers(sequence_lengths)
+
+        # the number of sequences in the dataset
+        sequence_count = len(sequence_lengths)
+        self.idx_path.write(struct.pack("<Q", sequence_count))
+
+        # the number of documents in the dataset
+        document_count = len(document_indices)
+        self.idx_path.write(struct.pack("<Q", document_count))
+
+        # the number of tokens per sequence
+        sequence_lengths = np.array(sequence_lengths, dtype=np.int32)
+        self.idx_path.write(sequence_lengths.tobytes(order="C"))
+        del sequence_lengths
+
+        # the byte offsets for all sequences
+        sequence_pointers = np.array(sequence_pointers, dtype=np.int64)
+        self.idx_path.write(sequence_pointers.tobytes(order="C"))
+        del sequence_pointers
+
+        # the sequence indices marking the end of each document
+        document_indices = np.array(document_indices, dtype=np.int64)
+        self.idx_path.write(document_indices.tobytes(order="C"))
+
+        # the mode per sequence
+        if sequence_modes is not None:
+            sequence_modes = np.array(sequence_modes, dtype=np.int32)
+            self._file.write(sequence_modes.tobytes(order='C'))
+            del sequence_modes
+
+    def _sequence_pointers(self, sequence_lengths: List[int]) -> List[int]:
+        itemsize = DType.size(self.dtype)
+        curr_ptr = 0
+        list_ptr = []
+        for length in sequence_lengths:
+            list_ptr.append(curr_ptr)
+            curr_ptr += length * itemsize
+        return list_ptr
+
+
+class _IndexReader(object):
+    """
+    Object class to read the index file i.e. <data-path>.idx
+    """
+
+    def __init__(self, path: str, multimodal: bool) -> None:
+        with open(path, "rb") as stream:
+            header = stream.read(9)
+            assert header == _INDEX_HEADER, f"bad header, cannot read: {path}"
+
+            version = struct.unpack("<Q", stream.read(8))[0]
+            assert version == 1, f"bad version, cannot read: {path}"
+
+            code = struct.unpack("<B", stream.read(1))[0]
+            self._dtype = DType.dtype_from_code(code)
+            self._dtype_size = DType.size(self._dtype)
+
+            self._sequence_count = struct.unpack("<Q", stream.read(8))[0]
+            self._document_count = struct.unpack("<Q", stream.read(8))[0]
+
+            offset = stream.tell()
+
+        self._multimodal = multimodal
+
+        self._bin_buffer_mmap = np.memmap(path, mode="r", order="C")
+        self._bin_buffer = memoryview(self._bin_buffer_mmap)
+
+        print_rank_0("    reading sequence lengths...")
+        self._sequence_lengths = np.frombuffer(
+            self._bin_buffer, dtype=np.int32, count=self._sequence_count, offset=offset
+        )
+
+        print_rank_0("    reading sequence pointers...")
+        self._sequence_pointers = np.frombuffer(
+            self._bin_buffer,
+            dtype=np.int64,
+            count=self._sequence_count,
+            offset=offset + self._sequence_lengths.nbytes,
+        )
+
+        print_rank_0("    reading document indices...")
+        self._document_indices = np.frombuffer(
+            self._bin_buffer,
+            dtype=np.int64,
+            count=self._document_count,
+            offset=offset + self._sequence_lengths.nbytes + self._sequence_pointers.nbytes,
+        )
+
+        self._sequence_modes = None
+        if self._multimodal:
+            print_rank_0("    reading sequence modes...")
+            self._sequence_modes = np.frombuffer(
+                self._bin_buffer,
+                dtype=np.int8,
+                count=self._len,
+                offset=offset
+                + self._sequence_lengths.nbytes
+                + self._sequence_pointers.nbytes
+                + self._document_indices.nbytes,
+            )
+
+    def __del__(self) -> None:
+        self._bin_buffer_mmap._mmap.close()
+        del self._bin_buffer_mmap
+
+    def __len__(self) -> int:
+        return self._sequence_count
+
+    @lru_cache(maxsize=8)
+    def __getitem__(self, i: int) -> Tuple[np.int32, np.int64, Optional[np.int8]]:
         return (
-            os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
+            self._sequence_pointers[i],
+            self._sequence_lengths[i],
+            self._sequence_modes[i] if self._multimodal else None,
         )
 
     @property
-    def supports_prefetch(self):
-        return False  # avoid prefetching to save memory
-
-
-class IndexedCachedDataset(IndexedDataset):
-
-    def __init__(self, path):
-        super().__init__(path)
-        self.cache = None
-        self.cache_index = {}
+    def dtype(self) -> Type[np.number]:
+        return self._dtype
 
     @property
-    def supports_prefetch(self):
-        return True
+    def sizes(self) -> np.ndarray:
+        return self._sequence_lengths
 
-    def prefetch(self, indices):
-        if all(i in self.cache_index for i in indices):
-            return
-        if not self.data_file:
-            self.read_data(self.path)
-        indices = sorted(set(indices))
-        total_size = 0
-        for i in indices:
-            total_size += self.data_offsets[i + 1] - self.data_offsets[i]
-        self.cache = np.empty(total_size, dtype=self.dtype)
-        ptx = 0
-        self.cache_index.clear()
-        for i in indices:
-            self.cache_index[i] = ptx
-            size = self.data_offsets[i + 1] - self.data_offsets[i]
-            a = self.cache[ptx: ptx + size]
-            self.data_file.seek(self.data_offsets[i] * self.element_size)
-            self.data_file.readinto(a)
-            ptx += size
-        if self.data_file:
-            # close and delete data file after prefetch so we can pickle
-            self.data_file.close()
-            self.data_file = None
+    @property
+    def doc_idx(self) -> np.ndarray:
+        return self._document_indices
 
-    # @lru_cache(maxsize=8)
-    def __getitem__(self, idx):
-        if isinstance(idx, int):
-            i = idx
-            self.check_index(i)
-            tensor_size = self.sizes[self.dim_offsets[i]:self.dim_offsets[i + 1]]
-            a = np.empty(tensor_size, dtype=self.dtype)
-            ptx = self.cache_index[i]
-            np.copyto(a, self.cache[ptx: ptx + a.size])
-            return a
-        elif isinstance(idx, slice):
-            # Hack just to make this work, can optimizer later if necessary
-            sents = []
-            for i in range(*idx.indices(len(self))):
-                sents.append(self[i])
-            return sents
-
-
-class IndexedDatasetBuilder(object):
-    element_sizes = {
-        np.uint8: 1,
-        np.int8: 1,
-        np.int16: 2,
-        np.int32: 4,
-        np.int64: 8,
-        np.float32: 4,
-        np.float64: 8,
-    }
-
-    def __init__(self, out_file, dtype=np.int32):
-        self.out_file = open(out_file, 'wb')
-        self.dtype = dtype
-        self.data_offsets = [0]
-        self.dim_offsets = [0]
-        self.sizes = []
-        self.element_size = self.element_sizes[self.dtype]
-        self.doc_idx = [0]
-
-    def add_item(self, tensor):
-        bytes = self.out_file.write(np.array(tensor.numpy(), dtype=self.dtype))
-        self.data_offsets.append(self.data_offsets[-1] + bytes / self.element_size)
-        for s in tensor.size():
-            self.sizes.append(s)
-        self.dim_offsets.append(self.dim_offsets[-1] + len(tensor.size()))
-
-    def end_document(self):
-        self.doc_idx.append(len(self.sizes))
-
-    def merge_file_(self, another_file):
-        index = IndexedDataset(another_file)
-        assert index.dtype == self.dtype
-
-        doc_offset = len(self.sizes)
-
-        begin = self.data_offsets[-1]
-        for data_offset in index.data_offsets[1:]:
-            self.data_offsets.append(begin + data_offset)
-        self.sizes.extend(index.sizes)
-
-        begin = self.dim_offsets[-1]
-        for dim_offset in index.dim_offsets[1:]:
-            self.dim_offsets.append(begin + dim_offset)
-
-        self.doc_idx.extend((doc_offset + index.doc_idx)[1:])
-
-        with open(data_file_path(another_file), 'rb') as f:
-            while True:
-                data = f.read(1024)
-                if data:
-                    self.out_file.write(data)
-                else:
-                    break
-
-    def finalize(self, index_file):
-        self.out_file.close()
-        index = open(index_file, 'wb')
-        index.write(b'TNTIDX\x00\x00')
-        index.write(struct.pack('<Q', 1))
-        index.write(struct.pack('<QQ', code(self.dtype), self.element_size))
-        index.write(struct.pack('<QQ', len(self.data_offsets) - 1, len(self.sizes)))
-        index.write(struct.pack('<Q', len(self.doc_idx)))
-        write_longs(index, self.dim_offsets)
-        write_longs(index, self.data_offsets)
-        write_longs(index, self.sizes)
-        write_longs(index, self.doc_idx)
-        index.close()
-
-
-def _warmup_mmap_file(path):
-    with open(path, 'rb') as stream:
-        while stream.read(100 * 1024 * 1024):
-            pass
+    @property
+    def modes(self) -> np.ndarray:
+        return self._sequence_modes
 
 
 class MMapIndexedDataset(torch.utils.data.Dataset):
-    class Index(object):
-        _HDR_MAGIC = b'MMIDIDX\x00\x00'
-
-        @classmethod
-        def writer(cls, path, dtype):
-            class _Writer(object):
-                def __enter__(self):
-                    self._file = open(path, 'wb')
-
-                    self._file.write(cls._HDR_MAGIC)
-                    self._file.write(struct.pack('<Q', 1))
-                    self._file.write(struct.pack('<B', code(dtype)))
-
-                    return self
-
-                @staticmethod
-                def _get_pointers(sizes):
-                    dtype_size = dtype().itemsize
-                    address = 0
-                    pointers = []
-
-                    for size in sizes:
-                        pointers.append(address)
-                        address += size * dtype_size
-
-                    return pointers
-
-                def write(self, sizes, modes, doc_idx):
-                    pointers = self._get_pointers(sizes)
-
-                    self._file.write(struct.pack('<Q', len(sizes)))
-                    self._file.write(struct.pack('<Q', len(doc_idx)))
-
-                    sizes = np.array(sizes, dtype=np.int32)
-                    self._file.write(sizes.tobytes(order='C'))
-                    del sizes
-
-                    if modes is not None:
-                        modes = np.array(modes, dtype=np.int32)
-                        self._file.write(modes.tobytes(order='C'))
-                        del modes
-
-                    pointers = np.array(pointers, dtype=np.int64)
-                    self._file.write(pointers.tobytes(order='C'))
-                    del pointers
-
-                    doc_idx = np.array(doc_idx, dtype=np.int64)
-                    self._file.write(doc_idx.tobytes(order='C'))
-
-                def __exit__(self, exc_type, exc_val, exc_tb):
-                    self._file.close()
-
-            return _Writer()
-
-        def __init__(self, path, skip_warmup=False, multimodal=False):
-            with open(path, 'rb') as stream:
-                magic_test = stream.read(9)
-                assert self._HDR_MAGIC == magic_test, (
-                    'Index file doesn\'t match expected format. '
-                    'Make sure that --dataset-impl is configured properly.'
-                )
-                version = struct.unpack('<Q', stream.read(8))
-                assert (1,) == version
-
-                dtype_code, = struct.unpack('<B', stream.read(1))
-                self._dtype = dtypes[dtype_code]
-                self._dtype_size = self._dtype().itemsize
-                self.multimodal = multimodal
-
-                self._len = struct.unpack('<Q', stream.read(8))[0]
-                self._doc_count = struct.unpack('<Q', stream.read(8))[0]
-                offset = stream.tell()
-
-            if not skip_warmup:
-                print_rank_0("    warming up index mmap file...")
-                _warmup_mmap_file(path)
-
-            self._bin_buffer_mmap = np.memmap(path, mode='r', order='C')
-            self._bin_buffer = memoryview(self._bin_buffer_mmap)
-            print_rank_0("    reading sizes...")
-            self._sizes = np.frombuffer(
-                self._bin_buffer,
-                dtype=np.int32,
-                count=self._len,
-                offset=offset)
-
-            print_rank_0("    reading pointers...")
-            self._pointers = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._len,
-                                           offset=offset + self._sizes.nbytes)
-            print_rank_0("    reading document index...")
-            self._doc_idx = np.frombuffer(self._bin_buffer, dtype=np.int64, count=self._doc_count,
-                                          offset=offset + self._sizes.nbytes + self._pointers.nbytes)
-            self._modes = None
-            if multimodal:
-                print_rank_0("    reading modes...")
-                self._modes = np.frombuffer(
-                    self._bin_buffer,
-                    dtype=np.int8,
-                    count=self._len,
-                    offset=offset + self._sizes.nbytes + self._pointers.nbytes + self._doc_idx.nbytes)
-
-        def __del__(self):
-            self._bin_buffer_mmap._mmap.close()
-            del self._bin_buffer_mmap
-
-        @property
-        def dtype(self):
-            return self._dtype
-
-        @property
-        def sizes(self):
-            return self._sizes
-
-        @property
-        def modes(self):
-            return self._modes
-
-        @property
-        def doc_idx(self):
-            return self._doc_idx
-
-        @lru_cache(maxsize=8)
-        def __getitem__(self, i):
-            return self._pointers[i], self._sizes[i], (self._modes[i] if self.multimodal else None)
-
-        def __len__(self):
-            return self._len
-
-    def __init__(self, path, skip_warmup=False, multimodal=False):
+    def __init__(self, path: str, skip_warmup: bool = False, multimodal: bool = False) -> None:
         super().__init__()
 
         self._path = None
         self._index = None
         self._bin_buffer = None
-        self.multimodal = multimodal
+        self._multimodal = multimodal
 
         self._do_init(path, skip_warmup, multimodal)
 
-    def __getstate__(self):
+    def __getstate__(self) -> str:
         return self._path
 
-    def __setstate__(self, state):
-        self._do_init(state, skip_warmup=True, multimodal=False)
+    def __setstate__(self, path: str) -> None:
+        self._do_init(path, skip_warmup=True, multimodal=False)
 
-    def _do_init(self, path, skip_warmup, multimodal):
-        self._path = path
-        self._index = self.Index(index_file_path(self._path), skip_warmup, multimodal)
-
-        if not skip_warmup:
-            print_rank_0("    warming up data mmap file...")
-            _warmup_mmap_file(data_file_path(self._path))
-        print_rank_0("    creating numpy buffer of mmap...")
-        self._bin_buffer_mmap = np.memmap(data_file_path(self._path), mode='r', order='C')
-        print_rank_0("    creating memory view of numpy buffer...")
-        self._bin_buffer = memoryview(self._bin_buffer_mmap)
-
-    def __del__(self):
+    def __del__(self) -> None:
         self._bin_buffer_mmap._mmap.close()
         del self._bin_buffer_mmap
         del self._index
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._index)
 
-    # @lru_cache(maxsize=8)
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: Union[int, np.integer, slice]) -> np.ndarray:
         if isinstance(idx, (int, np.integer)):
-            ptr, size, mode = self._index[idx]
-            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
-                                     count=size, offset=ptr)
-            return (np_array, mode) if mode is not None else np_array
+            sequence_pointer, sequence_length, sequence_mode = self._index[idx]
+            sequence = np.frombuffer(
+                self._bin_buffer,
+                dtype=self._index.dtype,
+                count=sequence_length,
+                offset=sequence_pointer,
+            )
+            return (sequence, sequence_mode) if sequence_mode is not None else sequence
         elif isinstance(idx, slice):
             start, stop, step = idx.indices(len(self))
             if step != 1:
                 raise ValueError("Slices into indexed_dataset must be contiguous")
-            ptr = self._index._pointers[start]
-            sizes = self._index._sizes[idx]
-            modes = self._index._modes[idx] if self.multimodal else None
-            offsets = list(accumulate(sizes))
-            total_size = sum(sizes)
-            np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
-                                     count=total_size, offset=ptr)
-            sents = np.split(np_array, offsets[:-1])
-            return (sents, modes) if modes is not None else sents
+            sequence_lengths = self._index._sequence_lengths[idx]
+            sequence_modes = self._index._sequence_modes[idx] if self._multimodal else None
+            sequence_offsets = list(accumulate(sequence_lengths))
+            sequences = np.split(
+                np.frombuffer(
+                    self._bin_buffer,
+                    dtype=self._index.dtype,
+                    count=sum(sequence_lengths),
+                    offset=self._index._sequence_pointers[start],
+                ),
+                sequence_offsets[:-1],
+            )
+            return (sequences, sequence_modes) if sequence_modes is not None else sequences
         else:
             raise TypeError("Unexpected type received for idx: {}".format(type(idx)))
 
-    def get(self, idx, offset=0, length=None):
-        """ Retrieves a single item from the dataset with the option to only
+    def _do_init(self, path: str, skip_warmup: bool, multimodal: bool) -> None:
+        self._path = path
+
+        if not skip_warmup:
+            print_rank_0("    warming up index mmap file...")
+            self.warmup_mmap_file(get_idx_path(self._path))
+
+        self._index = _IndexReader(get_idx_path(self._path), multimodal)
+
+        if not skip_warmup:
+            print_rank_0("    warming up data mmap file...")
+            self.warmup_mmap_file(get_bin_path(self._path))
+
+        print_rank_0("    creating np buffer of mmap...")
+        self._bin_buffer_mmap = np.memmap(get_bin_path(self._path), mode="r", order="C")
+
+        print_rank_0("    creating memory view of np buffer...")
+        self._bin_buffer = memoryview(self._bin_buffer_mmap)
+
+    def get(self, idx: int, offset: int = 0, length: Optional[int] = None) -> np.ndarray:
+        """Retrieves a single item from the dataset with the option to only
         return a portion of the item.
 
         get(idx) is the same as [idx] but get() does not support slicing.
         """
-        ptr, size, mode = self._index[idx]
+        sequence_pointer, sequence_length, sequence_mode = self._index[idx]
         if length is None:
-            length = size - offset
-        ptr += offset * np.dtype(self._index.dtype).itemsize
-        np_array = np.frombuffer(self._bin_buffer, dtype=self._index.dtype,
-                                 count=length, offset=ptr)
-        return (np_array, mode) if mode is not None else np_array
-            
+            length = sequence_length - offset
+        sequence_pointer += offset * DType.size(self._index.dtype)
+        sequence = np.frombuffer(
+            self._bin_buffer, dtype=self._index.dtype, count=length, offset=sequence_pointer
+        )
+        return (sequence, sequence_mode) if sequence_mode is not None else sequence
 
     @property
-    def sizes(self):
+    def sizes(self) -> np.ndarray:
         return self._index.sizes
 
     @property
-    def modes(self):
+    def doc_idx(self) -> np.ndarray:
+        return self._index._document_indices
+
+    def get_doc_idx(self) -> np.ndarray:
+        return self._index._document_indices
+
+    def set_doc_idx(self, doc_idx: np.ndarray) -> None:
+        self._index._document_indices = doc_idx
+
+    def modes(self) -> np.ndarray:
         return self._index.modes
 
     @property
-    def doc_idx(self):
-        return self._index.doc_idx
-
-    def get_doc_idx(self):
-        return self._index._doc_idx
-
-    def set_doc_idx(self, doc_idx_):
-        self._index._doc_idx = doc_idx_
-
-    @property
-    def supports_prefetch(self):
+    def supports_prefetch(self) -> bool:
         return False
 
     @staticmethod
-    def exists(path):
-        return (
-            os.path.exists(index_file_path(path)) and os.path.exists(data_file_path(path))
+    def exists(path_prefix: str) -> bool:
+        return os.path.exists(get_idx_path(path_prefix)) and os.path.exists(
+            get_bin_path(path_prefix)
         )
+
+    @staticmethod
+    def warmup_mmap_file(path: str) -> None:
+        with open(path, "rb") as stream:
+            while stream.read(100 * 1024 * 1024):
+                pass
 
 
 class MMapIndexedDatasetBuilder(object):
-    def __init__(self, out_file, dtype=np.int64, multimodal=False):
-        self._data_file = open(out_file, 'wb')
+    def __init__(
+        self, bin_path: str, dtype: Type[np.number] = np.int32, multimodal: bool = False
+    ) -> None:
+        self._data_file = open(bin_path, "wb")
         self._dtype = dtype
         self._multimodal = multimodal
-        self._sizes = []
-        self._doc_idx = [0]
-        self._modes = [] if self._multimodal else None
 
-    def add_item(self, tensor, mode=0):
+        self._sequence_lengths = []
+        self._document_indices = [0]
+        self._sequence_modes = [] if self._multimodal else None
+
+    def add_item(self, tensor: torch.Tensor, mode: int = 0) -> None:
         np_array = np.array(tensor.numpy(), dtype=self._dtype)
-        self._data_file.write(np_array.tobytes(order='C'))
-        self._sizes.append(np_array.size)
-        
+        self._data_file.write(np_array.tobytes(order="C"))
+        self._sequence_lengths.append(np_array.size)
         if self._multimodal:
-            self._modes.append(mode)
+            self._sequence_modes.append(mode)
 
-    def add_doc(self, tensor, sizes, modes=None):
+    def add_doc(
+        self, tensor: torch.Tensor, lengths: List[int], modes: Optional[List[int]] = None
+    ) -> None:
         np_array = np.array(tensor, dtype=self._dtype)
-        self._data_file.write(np_array.tobytes(order='C'))
-        self._sizes.extend(sizes)
-        self._doc_idx.append(len(self._sizes))
-        
+        self._data_file.write(np_array.tobytes(order="C"))
+        self._sequence_lengths.extend(lengths)
+        self._document_indices.append(len(self._sequence_lengths))
         if self._multimodal:
-            self._modes.extend(modes if modes is not None else [0]*sizes)
+            self._sequence_modes.extend(modes if modes is not None else [0] * lengths)
 
-    def end_document(self):
-        self._doc_idx.append(len(self._sizes))
+    def end_document(self) -> None:
+        self._document_indices.append(len(self._sequence_lengths))
 
-    def merge_file_(self, another_file):
+    def merge_file_(self, path_prefix: str) -> None:
         # Concatenate index
-        index = MMapIndexedDataset.Index(
-                index_file_path(another_file),
-                multimodal=self._multimodal)
+        index = _IndexReader(get_idx_path(path_prefix), multimodal=self._multimodal)
         assert index.dtype == self._dtype
 
-        offset = len(self._sizes)
-        self._sizes.extend(index.sizes)
-        self._doc_idx.extend((offset + index.doc_idx)[1:])
-        
+        offset = len(self._sequence_lengths)
+        self._sequence_lengths.extend(index.sizes)
+        self._document_indices.extend((offset + index.doc_idx)[1:])
+
         if self._multimodal:
-            self._modes.extend(index.modes)
+            self._sequence_modes.extend(index._sequence_modes)
 
         # Concatenate data
-        with open(data_file_path(another_file), 'rb') as f:
+        with open(get_bin_path(path_prefix), "rb") as f:
             shutil.copyfileobj(f, self._data_file)
 
-    def finalize(self, index_file):
+    def finalize(self, idx_path: str) -> None:
         self._data_file.close()
+        with _IndexWriter(idx_path, self._dtype) as writer:
+            writer.write(self._sequence_lengths, self._sequence_modes, self._document_indices)
 
-        with MMapIndexedDataset.Index.writer(index_file, self._dtype) as index:
-            index.write(self._sizes, self._modes, self._doc_idx)
+
+def get_idx_path(path_prefix: str) -> str:
+    return path_prefix + ".idx"
+
+
+def get_bin_path(path_prefix: str) -> str:
+    return path_prefix + ".bin"
