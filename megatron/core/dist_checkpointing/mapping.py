@@ -4,12 +4,13 @@
 
 from dataclasses import dataclass, replace
 from itertools import chain
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, Callable
 
 import numpy as np
 import torch
 
 from .core import CheckpointingException
+from .dict_utils import dict_list_map_inplace, dict_list_map_outplace
 
 # These type definitions are just hints to differentiate a plain model state
 #  dict (StateDict) from a state dict with tensors replaced with ShardedTensors
@@ -236,3 +237,66 @@ class ShardedObject:
 
     def __str__(self):
         return f'{self.__class__.__name__}(key=\'{self.key}\')'
+
+
+@dataclass
+class ShardedTensorFactory:
+    """ Allows to apply transformations to tensors before/after serialization.
+
+    The essence of those transformations is that they can be applied to
+    optimizer states the same way they are applied to the model params.
+
+    Builder creates a sub-state-dict out of a tensor before saving, and merger
+    merges the corresponding state dict after loading.
+    """
+    data: torch.Tensor
+    builder_fn: Callable[[torch.Tensor], ShardedStateDict]
+    merge_fn: Callable[[StateDict], torch.Tensor]
+
+    def build(self, tensor: torch.Tensor):
+        return self.builder_fn(tensor)
+
+    def build_self(self):
+        return self.builder_fn(self.data)
+
+    def clone(self, new_data):
+        return replace(self, data=new_data)
+
+
+def apply_factories(sharded_state_dict: ShardedStateDict):
+    def apply(x):
+        if isinstance(x, ShardedTensorFactory):
+            x = x.build_self()
+        return x
+
+    dict_list_map_inplace(apply, sharded_state_dict)
+
+
+def apply_factories_outplace(sharded_state_dict: ShardedStateDict):
+    def apply(x):
+        if isinstance(x, ShardedTensorFactory):
+            x = x.build_self()
+        return x
+
+    dict_list_map_outplace(apply, sharded_state_dict)
+
+
+def apply_factory_merges(x1: StateDict, x2: ShardedStateDict):
+    if isinstance(x2, ShardedTensorFactory):
+        return x2.merge_fn(x1)
+
+    # There rest is almost the same as the `merge` function from `dict_utils`
+    if isinstance(x1, dict) and isinstance(x2, dict):
+        for k, v2 in x2.items():
+            if k not in x1:
+                raise ValueError('Different dict keys encountered in `apply_factory_merges`')
+            else:
+                x1[k] = apply_factory_merges(x1[k], v2)
+    elif isinstance(x1, list) and isinstance(x2, list):
+        if len(x1) != len(x2):
+            raise ValueError('Cannot merge two lists with different lengths')
+        for i, v2 in enumerate(x2):
+            x1[i] = apply_factory_merges(x1[i], v2)
+    else:
+        raise ValueError(f'Duplicate non-dict and non-list values encountered: `{x1}` and `{x2}`')
+    return x1
