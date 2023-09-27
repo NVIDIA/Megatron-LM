@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 import argparse
 from collections.abc import Mapping
 import concurrent.futures
@@ -5,6 +7,7 @@ import os
 import sys
 
 import torch
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
@@ -24,6 +27,7 @@ def save_checkpoint(queue, args):
     # Search in directory above this
     sys.path.append(os.path.abspath(
         os.path.join(os.path.dirname(__file__),
+                     os.path.pardir,
                      os.path.pardir)))
     if args.megatron_path is not None:
         sys.path.insert(0, args.megatron_path)
@@ -144,6 +148,7 @@ def save_checkpoint(queue, args):
                         'vocab_file', 'tokenizer_model',
                         'save_interval', 'save',
                         'perform_initialization', 'use_cpu_initialization',
+                        'recompute_granularity', 'recompute_num_layers', 'recompute_method',
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
@@ -261,10 +266,12 @@ def save_checkpoint(queue, args):
             msg = queue_get(f"transformer layer {total_layer_num}")
 
             # duplicated tensors
-            input_layernorm_weight = msg.pop("input layernorm weight")
-            input_layernorm_bias = msg.pop("input layernorm bias")
-            post_layernorm_weight = msg.pop("post layernorm weight")
-            post_layernorm_bias = msg.pop("post layernorm bias")
+            input_norm_weight = msg.pop("input norm weight")
+            if md.norm_has_bias:
+                input_norm_bias = msg.pop("input norm bias")
+            post_norm_weight = msg.pop("post norm weight")
+            if md.norm_has_bias:
+                post_norm_bias = msg.pop("post norm bias")
             if md.linear_bias:
                 dense_bias = msg.pop("dense bias")
                 mlp_l1_bias = msg.pop("mlp l1 bias")
@@ -294,12 +301,14 @@ def save_checkpoint(queue, args):
             # Save them to the model
             for tp_rank in range(args.target_tensor_parallel_size):
                 l = models[tp_rank].language_model.encoder.layers[layer]
-                l.input_layernorm.weight.data.copy_(input_layernorm_weight)
-                l.input_layernorm.bias.data.copy_(input_layernorm_bias)
+                l.input_norm.weight.data.copy_(input_norm_weight)
+                if md.norm_has_bias:
+                    l.input_norm.bias.data.copy_(input_norm_bias)
                 l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
                 l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
-                l.post_attention_layernorm.weight.data.copy_(post_layernorm_weight)
-                l.post_attention_layernorm.bias.data.copy_(post_layernorm_bias)
+                l.post_attention_norm.weight.data.copy_(post_norm_weight)
+                if md.norm_has_bias:
+                    l.post_attention_norm.bias.data.copy_(post_norm_bias)
                 l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
                 l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
                 if md.linear_bias:
@@ -313,17 +322,20 @@ def save_checkpoint(queue, args):
 
 
         if post_process:
-            msg = queue_get("final layernorm")
-            final_layernorm_weight = msg.pop("weight")
-            final_layernorm_bias = msg.pop("bias")
+            msg = queue_get("final norm")
+            final_norm_weight = msg.pop("weight")
+            if md.norm_has_bias:
+                final_norm_bias = msg.pop("bias")
             for tp_rank in range(args.target_tensor_parallel_size):
-                models[tp_rank].language_model.encoder.final_layernorm.weight.data.copy_(final_layernorm_weight)
-                models[tp_rank].language_model.encoder.final_layernorm.bias.data.copy_(final_layernorm_bias)
+                models[tp_rank].language_model.encoder.final_norm.weight.data.copy_(final_norm_weight)
+                if md.norm_has_bias:
+                    models[tp_rank].language_model.encoder.final_norm.bias.data.copy_(final_norm_bias)
                 if pp_rank != 0 and not md.output_layer:
                     # Copy word embeddings to final pipeline rank
                     models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
-            del final_layernorm_weight
-            del final_layernorm_bias
+            del final_norm_weight
+            if md.norm_has_bias:
+                del final_norm_bias
             check_message(msg)
 
             if md.output_layer:
@@ -360,13 +372,15 @@ def save_checkpoint(queue, args):
                 print("received lm head")
                 lm_head_dense_weight = msg.pop("dense weight")
                 lm_head_dense_bias = msg.pop("dense bias")
-                lm_head_layernorm_weight = msg.pop("layernorm weight")
-                lm_head_layernorm_bias = msg.pop("layernorm bias")
+                lm_head_norm_weight = msg.pop("norm weight")
+                if md.norm_has_bias:
+                    lm_head_norm_bias = msg.pop("norm bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
                     models[tp_rank].lm_head.dense.weight.data.copy_(lm_head_dense_weight)
                     models[tp_rank].lm_head.dense.bias.data.copy_(lm_head_dense_bias)
-                    models[tp_rank].lm_head.layernorm.weight.data.copy_(lm_head_layernorm_weight)
-                    models[tp_rank].lm_head.layernorm.bias.data.copy_(lm_head_layernorm_bias)
+                    models[tp_rank].lm_head.norm.weight.data.copy_(lm_head_norm_weight)
+                    if md.norm_has_bias:
+                        models[tp_rank].lm_head.norm.bias.data.copy_(lm_head_norm_bias)
                 check_message(msg)
                 msg = queue_get()
 

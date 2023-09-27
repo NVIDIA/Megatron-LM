@@ -11,9 +11,10 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
-from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
 def get_num_layers_to_build(config) -> int:
@@ -54,20 +55,39 @@ class TransformerBlockSpec:
     layers: List[TransformerLayerSpec] = None
 
 
+def get_block_spec(config, spec) -> TransformerBlockSpec:
+    if isinstance(spec, TransformerBlockSpec):
+        # >>>
+        from lutil import pax
+        pax("spec")
+        # <<<
+        return spec
+    elif isinsance(spec, TransformerLayerSpec):
+        num_layers = get_num_layers_to_build(config)
+        block_spec = TransformerBlockSpec([spec] * num_layers)
+        # >>>
+        from lutil import pax
+        pax("block_spec")
+        # <<<
+        return block_spec
+    else:
+        raise Exception(f"specialize for {type(spec).__name__}."
+
+
 class TransformerBlock(MegatronModule):
     """Transformer class."""
 
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerBlockSpec,
+        spec: Union[TransformerBlockSpec, TransformerLayerSpec],
         post_layer_norm=True,
         pre_process=True,
         post_process=True,
     ):
         super().__init__(config=config)
 
-        self.spec = spec
+        self.spec = get_block_spec(config, spec)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -89,7 +109,7 @@ class TransformerBlock(MegatronModule):
         def build_layer(spec, layer_number):
             return TransformerLayer(
                 config=self.config,
-                spec=spec,
+                submodules=spec.submodules,
                 layer_number=layer_number,
             )
 
@@ -243,8 +263,11 @@ class TransformerBlock(MegatronModule):
                 amax_history_len=self.config.fp8_amax_history_len,
                 override_linear_precision=(False, False, not self.config.fp8_wgrad),
             )
+            fp8_group = None
+            if parallel_state.model_parallel_is_initialized():
+                fp8_group = parallel_state.get_amax_reduction_group()
             fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe
+                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )
         else:
             fp8_context = nullcontext()
@@ -283,11 +306,18 @@ class TransformerBlock(MegatronModule):
             sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
 
         if self.post_process and self.post_layer_norm:
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.weight']
+            state_dict = self.state_dict(keep_vars=True)
+
+            tensor = state_dict['final_layernorm.weight']
             layer_name = f'{prefix}final_layernorm.weight'
             sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.bias']
-            layer_name = f'{prefix}final_layernorm.bias'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+
+            # RMSNorm doesn't have bias.
+            if 'final_layernorm.bias' in state_dict.keys():
+                tensor = state_dict['final_layernorm.bias']
+                layer_name = f'{prefix}final_layernorm.bias'
+                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(
+                    tensor, layer_name
+                )
 
         return sharded_state_dict

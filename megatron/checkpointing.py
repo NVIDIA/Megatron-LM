@@ -229,7 +229,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
     checkpoint_name = get_checkpoint_name(args.save, iteration)
 
     # Save distributed optimizer's custom parameter state.
-    if args.use_distributed_optimizer:
+    if args.use_distributed_optimizer and not args.no_save_optim and optimizer is not None:
         optim_checkpoint_name = \
             get_distributed_optimizer_checkpoint_name(checkpoint_name)
         ensure_directory_exists(optim_checkpoint_name)
@@ -470,6 +470,8 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('ffn_hidden_size')
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
+    _set_arg('num_query_groups', force=True)
+    _set_arg('group_query_attention', force=True)
     _set_arg('kv_channels')
     _set_arg('max_position_embeddings')
     _set_arg('position_embedding_type', force=True)
@@ -480,6 +482,7 @@ def load_args_from_checkpoint(args, load_arg='load'):
     _set_arg('swiglu', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
+    _set_arg('normalization', force=True)
     _set_arg('tokenizer_type')
     _set_arg('padded_vocab_size')
     if checkpoint_version < 3.0:

@@ -30,8 +30,9 @@ class VitMlpHead(MegatronModule):
             bias is set to zero.
     """
 
-    def __init__(self, hidden_size, num_classes):
+    def __init__(self, config, hidden_size, num_classes):
         super(VitMlpHead, self).__init__()
+        self.config = config
         self.dense_in = torch.nn.Linear(hidden_size, hidden_size)
         self.relu = torch.nn.ReLU()
         self.dense_out = torch.nn.Linear(hidden_size, num_classes)
@@ -139,6 +140,7 @@ class VitBackbone(MegatronModule):
                  drop_path_rate=0.0):
         super(VitBackbone, self).__init__(share_embeddings_and_output_weights=False)
         args = get_args()
+        self.config = config
 
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
 
@@ -172,7 +174,7 @@ class VitBackbone(MegatronModule):
                 )
                 torch.nn.init.zeros_(self.cls_token)
             self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
-            
+
             # Linear encoder
             self.linear_encoder = torch.nn.Linear(
                 self.flatten_dim, self.hidden_size
@@ -196,6 +198,7 @@ class VitBackbone(MegatronModule):
         # Transformer
         self.transformer = ParallelTransformer(
             config,
+            model_type=args.model_type,
             pre_process=self.pre_process,
             post_process=self.post_process,
             post_layer_norm=self.post_layer_norm,
