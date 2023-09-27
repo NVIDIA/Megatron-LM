@@ -603,6 +603,10 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
+    group.add_argument('--moe-frequency', type=int, default=1,
+                       help='Makes every Nth transformer block\'s MLP a SwitchMLP '
+                            'when num_moe_experts > 1. If current_layer % moe_frequency == 0, '
+                            'SwitchMLP is used. Defaults to 1 (every layer is MoE).')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
     group.add_argument('--embedding-weights-in-fp32', action='store_true',
