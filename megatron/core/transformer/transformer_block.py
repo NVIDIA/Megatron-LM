@@ -4,7 +4,7 @@ import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 import torch
-from typing import List
+from typing import List, Union
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -51,27 +51,34 @@ def get_num_layers_to_build(config) -> int:
 
 
 @dataclass
-class TransformerBlockSpec:
-    layers: List[TransformerLayerSpec] = None
+class TransformerBlockSubmodules:
+    # >>>
+    # layers: List[TransformerLayerSubmodules] = None
+    layers: List[ModuleSpec] = None
+    # <<<
 
 
-def get_block_spec(config, spec) -> TransformerBlockSpec:
-    if isinstance(spec, TransformerBlockSpec):
+def get_block_submodules(config, submodules) -> TransformerBlockSubmodules:
+
+    # Transformer block submodules.
+    if isinstance(submodules, TransformerBlockSubmodules):
         # >>>
         from lutil import pax
-        pax("spec")
+        pax("submodules")
         # <<<
-        return spec
-    elif isinsance(spec, TransformerLayerSpec):
+        return submodules
+
+    # ModuleSpec here is generally assumed to be for a transformer layer.
+    elif isinstance(submodules, ModuleSpec):
         num_layers = get_num_layers_to_build(config)
-        block_spec = TransformerBlockSpec([spec] * num_layers)
+        submodules = TransformerBlockSubmodules([submodules] * num_layers)
         # >>>
         from lutil import pax
-        pax("block_spec")
+        pax("submodules")
         # <<<
-        return block_spec
+        return submodules
     else:
-        raise Exception(f"specialize for {type(spec).__name__}."
+        raise Exception(f"specialize for {type(spec).__name__}.")
 
 
 class TransformerBlock(MegatronModule):
@@ -80,14 +87,14 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: Union[TransformerBlockSpec, TransformerLayerSpec],
+        submodules: Union[TransformerBlockSubmodules, ModuleSpec],
         post_layer_norm=True,
         pre_process=True,
         post_process=True,
     ):
         super().__init__(config=config)
 
-        self.spec = get_block_spec(config, spec)
+        self.submodules = get_block_submodules(config, submodules)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process

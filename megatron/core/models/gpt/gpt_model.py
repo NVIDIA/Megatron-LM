@@ -98,15 +98,9 @@ class GPTModel(MegatronModule):
             self.rotary_pos_emb = None
 
         # Transformer.
-        transformer_block_spec = get_transformer_block_spec(transformer_layer_spec)
-        # >>>
-        from lutil import pax
-        pax("transformer_block_spec")
-        # <<<
         self.decoder = TransformerBlock(
             config=self.config,
-            block_spec=block_spec,
-            transformer_block_spec=self.transformer_layer_spec,
+            submodules=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )

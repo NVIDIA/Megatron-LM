@@ -23,6 +23,7 @@ TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
 mkdir -p ${TENSORBOARD_DIR}
 
 # --loss-scale 1024 \
+# --DDP-impl local \
 NUM_LAYERS=12 # 4, [*12]
 HIDDEN_SIZE=768 # 256, [512], *768
 NUM_HEADS=12 # [4], 8, *12
@@ -66,7 +67,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --fp16 \
-    --DDP-impl local \
     --dataloader-type cyclic \
     --no-data-sharding \
 "
