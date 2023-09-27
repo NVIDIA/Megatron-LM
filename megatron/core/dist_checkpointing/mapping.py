@@ -250,14 +250,11 @@ class ShardedTensorFactory:
     merges the corresponding state dict after loading.
     """
     data: torch.Tensor
-    builder_fn: Callable[[torch.Tensor], ShardedStateDict]
+    build_fn: Callable[[torch.Tensor], ShardedStateDict]
     merge_fn: Callable[[StateDict], torch.Tensor]
 
-    def build(self, tensor: torch.Tensor):
-        return self.builder_fn(tensor)
-
-    def build_self(self):
-        return self.builder_fn(self.data)
+    def build(self):
+        return self.build_fn(self.data)
 
     def clone(self, new_data):
         return replace(self, data=new_data)
@@ -266,19 +263,10 @@ class ShardedTensorFactory:
 def apply_factories(sharded_state_dict: ShardedStateDict):
     def apply(x):
         if isinstance(x, ShardedTensorFactory):
-            x = x.build_self()
+            x = x.build()
         return x
 
     dict_list_map_inplace(apply, sharded_state_dict)
-
-
-def apply_factories_outplace(sharded_state_dict: ShardedStateDict):
-    def apply(x):
-        if isinstance(x, ShardedTensorFactory):
-            x = x.build_self()
-        return x
-
-    dict_list_map_outplace(apply, sharded_state_dict)
 
 
 def apply_factory_merges(x1: StateDict, x2: ShardedStateDict):
