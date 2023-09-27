@@ -145,7 +145,7 @@ class UL2Dataset(torch.utils.data.Dataset):
                 (
                     vocab[token]
                     if isinstance(token, str)
-                    else inv_vocab[token]
+                    else token
                 )
                 if token
                 else None
