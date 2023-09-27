@@ -1,8 +1,8 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 #
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
-i
+
 import math
 import apex
 import einops
@@ -13,7 +13,7 @@ from megatron.model.utils import get_linear_layer
 from megatron.model.vision.vit_backbone import VitBackbone
 from megatron.model.module import MegatronModule
 from megatron.model.vision.mit_backbone import mit_b3
-from megatron.model.vision.utils import resize_
+from megatron.model.vision.utils import resize
 
 
 class VitInpaintingModel(MegatronModule):
@@ -22,6 +22,7 @@ class VitInpaintingModel(MegatronModule):
         super(VitInpaintingModel, self).__init__()
         args = get_args()
 
+        self.config = config
         self.pre_process = pre_process
         self.post_process = post_process
         self.hidden_size = config.hidden_size
@@ -108,9 +109,9 @@ class MitInpaintingModel(MegatronModule):
         self.conv_fuse = torch.nn.Conv2d(self.embedding_dim*4, self.embedding_dim, 1, 1, bias=False)
         self.norm = apex.parallel.SyncBatchNorm(self.embedding_dim)
         self.dropout = torch.nn.Dropout2d(0.1)
-        
+
         self.linear_pred = torch.nn.Conv2d(self.embedding_dim, self.flatten_dim, kernel_size=1)
-    
+
     def set_input_tensor(self, input_tensor):
         """See megatron.model.transformer.set_input_tensor()"""
         pass
@@ -121,7 +122,7 @@ class MitInpaintingModel(MegatronModule):
         n, _, h, w = c4.shape
         _c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(n, -1, c4.shape[2], c4.shape[3])
         _c4 = resize(_c4, size=c1.size()[2:], mode='bilinear', align_corners=False)
-    
+
         _c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(n, -1, c3.shape[2], c3.shape[3])
         _c3 = resize(_c3, size=c1.size()[2:], mode='bilinear', align_corners=False)
 
@@ -132,7 +133,7 @@ class MitInpaintingModel(MegatronModule):
 
         _c = torch.cat([_c4, _c3, _c2, _c1], dim=1)
         _c = self.conv_fuse(_c)
- 
+
         x = self.norm(_c)
         x = F.relu(x, inplace=True)
         x = self.dropout(x)

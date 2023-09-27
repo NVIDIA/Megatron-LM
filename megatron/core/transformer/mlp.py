@@ -1,17 +1,23 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import dataclass
+from typing import Union
+
 import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_data_parallel_group
+
+
+@dataclass
+class MLPSubmodules:
+    linear_fc1: Union[ModuleSpec, type] = None
+    linear_fc2: Union[ModuleSpec, type] = None
 
 
 class MLP(MegatronModule):
@@ -31,7 +37,7 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
-    def __init__(self, config: TransformerConfig, is_expert: bool = False):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules, is_expert: bool = False):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -42,7 +48,8 @@ class MLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # TODO: revert this to TE; need to think of configurability
-        self.linear_fc1 = tensor_parallel.ColumnParallelLinear(
+        self.linear_fc1 = build_module(
+            submodules.linear_fc1,
             self.config.hidden_size,
             ffn_hidden_size,
             config=self.config,
@@ -62,7 +69,8 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = tensor_parallel.RowParallelLinear(
+        self.linear_fc2 = build_module(
+            submodules.linear_fc2,
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
@@ -88,6 +96,7 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
+
         return output, output_bias
 
 
@@ -97,19 +106,12 @@ class SwitchMLP(MegatronModule):
     Curently supports Sinkhorn based expert routing.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
 
-        self.router = TERowParallelLinear(
-            self.config.hidden_size,
-            self.config.num_moe_experts,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=self.config.add_bias_linear,
-            skip_bias_add=False,
-        )
+        self.router = torch.nn.Linear(self.config.hidden_size, self.config.num_moe_experts)
         self.add_bias = config.add_bias_linear
         self.expert_parallel = config.expert_parallel
         self.sequence_parallel = config.sequence_parallel
@@ -126,7 +128,7 @@ class SwitchMLP(MegatronModule):
 
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
-            expert = MLP(self.config, is_expert=True)
+            expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
     
     def gather_indices(self, local_indices):
@@ -168,7 +170,7 @@ class SwitchMLP(MegatronModule):
 
     def forward(self, hidden_states):
         hidden_shape = hidden_states.shape
-        route, _ = self.router(hidden_states)
+        route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)
 
         if self.training:

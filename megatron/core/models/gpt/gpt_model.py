@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from torch import Tensor
@@ -11,6 +11,7 @@ from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
@@ -21,6 +22,8 @@ class GPTModel(MegatronModule):
 
     Arguments:
         config (TransformerConfig): transformer config
+
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
 
         vocab_size (int): vocabulary size
 
@@ -39,11 +42,15 @@ class GPTModel(MegatronModule):
 
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
+
+        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
+            The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
         self,
         config: TransformerConfig,
+        transformer_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -53,10 +60,12 @@ class GPTModel(MegatronModule):
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
+        seq_len_interpolation_factor: Optional[float] = None,
     ):
         super(GPTModel, self).__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -85,13 +94,14 @@ class GPTModel(MegatronModule):
             if rotary_percent < 1.0:
                 rotary_dim = int(rotary_dim * rotary_percent)
 
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
         else:
             self.rotary_pos_emb = None
 
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
+            transformer_layer_spec=self.transformer_layer_spec,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,

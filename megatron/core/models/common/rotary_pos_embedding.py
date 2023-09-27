@@ -13,7 +13,7 @@ class RotaryEmbedding(nn.Module):
         super().__init__()
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
 
     def forward(self, max_seq_len, offset=0):
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
@@ -26,6 +26,10 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         return emb[:, None, None, :]
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        state_dict.pop(f'{prefix}inv_freq', None)
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
 
 def _rotate_half(x):
@@ -43,6 +47,7 @@ def apply_rotary_pos_emb(t, freqs):
     check https://kexue.fm/archives/8265 for detailed formulas
     """
     rot_dim = freqs.shape[-1]
+
     # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
     t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
 

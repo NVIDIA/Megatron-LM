@@ -421,7 +421,21 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
-            grad_weight = None
+
+            if hasattr(weight, 'grad_added_to_main_grad'):
+                # When overlap_grad_reduce is True, need to ensure that backward hooks
+                # are all run on the main backprop thread to prevent deadlocks. Setup
+                # dummy grad_weight tensor to prevent backward hooks from being run
+                # in a background thread.
+                grad_weight = torch.empty(
+                    weight.main_grad.shape,
+                    dtype=input.dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+                weight.grad_added_to_main_grad = True
+            else:
+                grad_weight = None
         else:
             grad_weight = grad_output.t().matmul(total_input)
         grad_bias = grad_output.sum(dim=0) if use_bias else None
@@ -811,7 +825,10 @@ class RowParallelLinear(torch.nn.Module):
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and not self.input_is_parallel:
-            raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
+            # raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
+            print('WARNING: To enable `sequence_parallel`',
+                  '`input_is_parallel` must be `True ', flush=True)
+            self.input_is_parallel = True
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result

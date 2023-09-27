@@ -144,7 +144,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
-        data_impl=args.data_impl,
         splits_string=args.split,
         train_valid_test_num_samples=train_val_test_num_samples,
         max_seq_length=args.seq_length,
