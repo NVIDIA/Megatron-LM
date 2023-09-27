@@ -159,7 +159,7 @@ def save(
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, 'zarr', 1)
 
-    sharded_state_dict = apply_factories(sharded_state_dict)
+    apply_factories(sharded_state_dict)
     sharded_state_dict, state_dict = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)
     sharded_state_dict, _ = extract_sharded_tensors(sharded_state_dict)
     sharded_tensors = list(nested_values(sharded_state_dict))
@@ -224,17 +224,19 @@ def validate_sharding_integrity(sharded_tensors: Iterable[ShardedTensor]):
 
 
 def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
-    global_shape = rank_sharding[0][1].global_shape
-    local_shape = rank_sharding[0][1].local_shape
-    dtype = rank_sharding[0][1].dtype
-    has_flattened_range = rank_sharding[0][1].flattened_range is not None
+    some_rank_shard = rank_sharding[0][1]
+    global_shape = some_rank_shard.global_shape
+    local_shape = some_rank_shard.local_shape
+    dtype = some_rank_shard.dtype
+    has_flattened_range = some_rank_shard.flattened_range is not None
     for rank, sharding in rank_sharding:
-        assert sharding.dtype == dtype, (sharding.dtype, dtype)
-        assert sharding.global_shape == global_shape, (sharding.global_shape, global_shape)
-        assert sharding.local_shape == local_shape, (sharding.local_shape, local_shape)
+        assert sharding.dtype == dtype, (sharding.dtype, dtype, some_rank_shard)
+        assert sharding.global_shape == global_shape, (sharding.global_shape, global_shape, some_rank_shard)
+        assert sharding.local_shape == local_shape, (sharding.local_shape, local_shape, some_rank_shard)
         assert (sharding.flattened_range is not None) == has_flattened_range, (
             (sharding.flattened_range is not None),
             has_flattened_range,
+            some_rank_shard
         )
 
     shard_access_cnt = _compute_shards_access(rank_sharding)

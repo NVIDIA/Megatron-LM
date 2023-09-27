@@ -249,15 +249,13 @@ class ShardedTensorFactory:
     Builder creates a sub-state-dict out of a tensor before saving, and merger
     merges the corresponding state dict after loading.
     """
+    key: str
     data: torch.Tensor
-    build_fn: Callable[[torch.Tensor], ShardedStateDict]
+    build_fn: Callable[[str, torch.Tensor], ShardedStateDict]
     merge_fn: Callable[[StateDict], torch.Tensor]
 
     def build(self):
-        return self.build_fn(self.data)
-
-    def clone(self, new_data):
-        return replace(self, data=new_data)
+        return self.build_fn(self.key, self.data)
 
 
 def apply_factories(sharded_state_dict: ShardedStateDict):
