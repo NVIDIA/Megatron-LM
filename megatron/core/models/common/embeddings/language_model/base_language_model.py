@@ -8,7 +8,7 @@ from megatron.core.transformer.module import MegatronModule
 
 class BaseLanguageModel(MegatronModule):
     def __init__(self, config):
-        super(BaseLanguageModel, self).__init__(config=config)
+        super().__init__(config=config)
 
     def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
