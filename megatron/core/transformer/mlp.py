@@ -48,7 +48,6 @@ class MLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # TODO: revert this to TE; need to think of configurability
-        # self.linear_fc1 = tensor_parallel.ColumnParallelLinear(
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.config.hidden_size,
@@ -70,7 +69,6 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        # self.linear_fc2 = tensor_parallel.RowParallelLinear(
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
@@ -108,19 +106,12 @@ class SwitchMLP(MegatronModule):
     Curently supports Sinkhorn based expert routing.
     """
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
 
-        self.router = TERowParallelLinear(
-            self.config.hidden_size,
-            self.config.num_moe_experts,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=self.config.add_bias_linear,
-            skip_bias_add=False,
-        )
+        self.router = torch.nn.Linear(self.config.hidden_size, self.config.num_moe_experts)
         self.add_bias = config.add_bias_linear
         self.expert_parallel = config.expert_parallel
         self.sequence_parallel = config.sequence_parallel
@@ -137,7 +128,7 @@ class SwitchMLP(MegatronModule):
 
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):
-            expert = MLP(self.config, is_expert=True)
+            expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
     
     def gather_indices(self, local_indices):
@@ -179,7 +170,7 @@ class SwitchMLP(MegatronModule):
 
     def forward(self, hidden_states):
         hidden_shape = hidden_states.shape
-        route, _ = self.router(hidden_states)
+        route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)
 
         if self.training:
