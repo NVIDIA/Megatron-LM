@@ -343,14 +343,14 @@ def build_training_sample(sample, target_seq_length,
         truncated = len(tokens) > safe_max_seq_len
         tokens = tokens[:safe_max_seq_len]
     else:
-        # If we are S-denoising, we know three tokens are going to be
-        # added: `bos`, `sep`, and `eos`. Same when not adding mask
+        # If we are S-denoising, we know exactly two tokens are
+        # going to be added: `bos` and `eos`. Same when not adding mask
         # tokens.
         if (
                 is_decoder_only(model_type) and denoiser == 'S'
                 or not add_mask_tokens
         ):
-            max_num_tokens -= 3
+            max_num_tokens -= 2
 
         # If we have a decoder-only model and do not add mask tokens, we
         # basically duplicate the sequence. So cut the maximum length in
