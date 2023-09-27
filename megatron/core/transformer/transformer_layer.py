@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import re
+from functools import partial
 
 import torch
 
@@ -229,29 +230,24 @@ class TransformerLayer(MegatronModule):
                 assert tp_axis == 0, f'TP axis for GLU weight should be 0, got: {tp_axis}'
                 tp_rank = parallel_state.get_tensor_model_parallel_rank()
                 tp_size = parallel_state.get_tensor_model_parallel_world_size()
-                offset_w = (tp_axis + 1, tp_rank, tp_size * 2)
-                offset_v = (tp_axis + 1, tp_size + tp_rank, tp_size * 2)
 
-                def sh_ten_build_fn(t: torch.Tensor):
-                    tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_axis)
-                    sh_ten_w = ShardedTensor.from_rank_offsets(
-                        f'{prefix}{layer_name}',
-                        tensor_w,
-                        *(sharded_offsets + [offset_w]),
-                        replica_id=replica_id,
-                        prepend_axis_num=1,  # for PP sharding
-                    )
-                    sh_ten_v = ShardedTensor.from_rank_offsets(
-                        f'{prefix}{layer_name}',
-                        tensor_v,
-                        *(sharded_offsets + [offset_v]),
-                        replica_id=replica_id,
-                        prepend_axis_num=1,  # for PP sharding
-                    )
-                    return [sh_ten_w, sh_ten_v]
+                sh_ten_builder = partial(ShardedTensor.from_rank_offsets,
+                                         f'{prefix}{layer_name}',
+                                         replica_id=replica_id,
+                                         prepend_axis_num=1)  # for PP sharding
+
+                # NOTE: passing `tp_axis` as argument due to late binding in closures
+                def sh_ten_build_fn(t: torch.Tensor, tp_axis=tp_axis):
+                    offset_w = (tp_axis + 1, tp_rank, tp_size * 2)
+                    offset_v = (tp_axis + 1, tp_size + tp_rank, tp_size * 2)
+                    with torch.no_grad():
+                        tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_axis)
+                    return [sh_ten_builder(tensor_w, *sharded_offsets, offset_w),
+                            sh_ten_builder(tensor_v, *sharded_offsets, offset_v)]
 
                 def sh_ten_merge_fn(sub_state_dict):
-                    return torch.cat(sub_state_dict)
+                    with torch.no_grad():
+                        return torch.cat(sub_state_dict)
 
                 sharded_state_dict[layer_key] = ShardedTensorFactory(tensor, sh_ten_build_fn, sh_ten_merge_fn)
             else:
