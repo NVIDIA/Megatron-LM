@@ -688,21 +688,21 @@ def get_pipeline_model_parallel_prev_rank():
     return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
-def get_data_parallel_world_size():
+def get_data_parallel_world_size(with_context_parallel=False):
     """Return world size for the data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_world_size(
-            group=get_data_parallel_group(with_context_parallel=False)
+            group=get_data_parallel_group(with_context_parallel=with_context_parallel)
         )
     else:
         return 0
 
 
-def get_data_parallel_rank():
+def get_data_parallel_rank(with_context_parallel=False):
     """Return my rank for the data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(
-            group=get_data_parallel_group(with_context_parallel=False)
+            group=get_data_parallel_group(with_context_parallel=with_context_parallel)
         )
     else:
         return 0
