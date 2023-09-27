@@ -321,6 +321,10 @@ def build_training_sample(sample, target_seq_length,
     # flatten sentences into one list
     tokens = [token for sentence in sample for token in sentence]
 
+    # Remove EOS tokens at end of sequence.
+    while len(tokens) > 1 and tokens[-1] == eos_id:
+        del tokens[-1]
+
     # Prepend objective token.
     cls_id = cls_ids.get(denoiser, False)
     if cls_id is False:
