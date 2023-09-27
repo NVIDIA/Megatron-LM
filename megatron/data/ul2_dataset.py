@@ -147,7 +147,7 @@ class UL2Dataset(torch.utils.data.Dataset):
                     if isinstance(token, str)
                     else token
                 )
-                if token
+                if token != ''
                 else None
             )
             for (denoiser, token) in denoiser_tokens.items()
