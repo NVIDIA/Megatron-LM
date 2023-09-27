@@ -15,9 +15,11 @@ from megatron.data.gpt_dataset import build_train_valid_test_datasets
 import megatron.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
+from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
+from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -27,8 +29,14 @@ def model_provider(pre_process=True, post_process=True):
     config = core_transformer_config_from_args(get_args())
 
     if args.use_mcore:
+        if args.model_spec is not None:
+            transformer_layer_spec = import_module(args.model_spec)
+        else:
+            transformer_layer_spec = gpt_layer_with_transformer_engine_spec
+
         model = GPTModel(
             config=config,
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,

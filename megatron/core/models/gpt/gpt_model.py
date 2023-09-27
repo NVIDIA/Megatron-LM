@@ -13,6 +13,7 @@ from megatron.core.models.common.embeddings.language_model.language_model import
 )
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
@@ -23,6 +24,8 @@ class GPTModel(LanguageModel):
 
     Arguments:
         config (TransformerConfig): transformer config
+
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
 
         vocab_size (int): vocabulary size
 
@@ -49,6 +52,7 @@ class GPTModel(LanguageModel):
     def __init__(
         self,
         config: TransformerConfig,
+        transformer_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -63,6 +67,7 @@ class GPTModel(LanguageModel):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -92,6 +97,7 @@ class GPTModel(LanguageModel):
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
+            transformer_layer_spec=self.transformer_layer_spec,
             self_attn_mask_type=AttnMaskType.causal,
             pre_process=self.pre_process,
             post_process=self.post_process,
