@@ -26,7 +26,7 @@ from .mapping import (
     ShardedTensor,
     StateDict,
     is_main_replica, apply_factories, ShardedTensorFactory,
-    apply_factories_outplace, apply_factory_merges,
+    apply_factory_merges,
 )
 from .strategies.base import (
     LoadCommonStrategy,
@@ -74,9 +74,8 @@ def load(
     if saved_config is None:
         raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
-    sh_ten_factories, sharded_state_dict = extract_matching_values(sharded_state_dict, lambda x: isinstance(x, ShardedTensorFactory))
-    sh_ten_built = apply_factories_outplace(sh_ten_factories)
-    sharded_state_dict = merge(sharded_state_dict, sh_ten_built)
+    sh_ten_factories, _ = extract_matching_values(sharded_state_dict, lambda x: isinstance(x, ShardedTensorFactory))
+    apply_factories(sharded_state_dict)
     sharded_state_dict, _ = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)
     sharded_state_dict, nonpersistent_state_dict = extract_sharded_tensors(sharded_state_dict)
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
