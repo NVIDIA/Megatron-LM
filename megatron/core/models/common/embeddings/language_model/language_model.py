@@ -6,7 +6,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 
 
-class BaseLanguageModel(MegatronModule):
+class LanguageModel(MegatronModule):
     def __init__(self, config):
         super().__init__(config=config)
 
@@ -30,7 +30,7 @@ class BaseLanguageModel(MegatronModule):
         loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    def initialize_last_stage_with_word_embeddings(self, llm_model):
+    def initialize_last_stage_with_word_embeddings(self):
 
         # This function just initializes the word embeddings in the final stage
         # when we are using pipeline parallelism and sharing word
@@ -68,7 +68,7 @@ class BaseLanguageModel(MegatronModule):
                     weight.data, group=parallel_state.get_embedding_group()
                 )
 
-        elif not getattr(llm_model, "embedding_warning_printed", False):
+        elif not getattr(LanguageModel, "embedding_warning_printed", False):
             logging.getLogger(__name__).warning(
                 "Distributed processes aren't initialized, so the output layer "
                 "is not initialized with weights from the word embeddings. "
@@ -76,4 +76,4 @@ class BaseLanguageModel(MegatronModule):
                 "this needs to be handled manually. If you are training "
                 "something is definitely wrong."
             )
-            llm_model.embedding_warning_printed = True
+            LanguageModel.embedding_warning_printed = True

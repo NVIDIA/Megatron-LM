@@ -7,9 +7,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.base_lm_embedding import BaseLanguageModelEmbedding
-from megatron.core.models.common.embeddings.language_model.base_language_model import (
-    BaseLanguageModel,
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model.language_model import (
+    LanguageModel,
 )
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -18,7 +18,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
-class GPTModel(BaseLanguageModel):
+class GPTModel(LanguageModel):
     """Transformer language model.
 
     Arguments:
@@ -60,7 +60,7 @@ class GPTModel(BaseLanguageModel):
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
     ):
-        super(GPTModel, self).__init__(config=config)
+        super().__init__(config=config)
 
         self.config: TransformerConfig = config
         self.vocab_size = vocab_size
@@ -77,7 +77,7 @@ class GPTModel(BaseLanguageModel):
         self.model_type = ModelType.encoder_or_decoder
 
         if self.pre_process:
-            self.embedding = BaseLanguageModelEmbedding(
+            self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,

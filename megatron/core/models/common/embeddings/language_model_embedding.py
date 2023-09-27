@@ -13,7 +13,7 @@ from megatron.core.utils import (
 )
 
 
-class BaseLanguageModelEmbedding(MegatronModule):
+class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
     Arguments:
