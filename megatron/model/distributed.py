@@ -40,9 +40,9 @@ class MemoryBuffer:
 
 class Bucket:
     """
-    Bucket to all-reduce gradients for a set of parameters asynchronously. Provides
-    functionality to register when params in the bucket have grads available, and
-    automatically launches an asynchronous all_reduce when _all_ params in the bucket
+    Bucket to all-reduce / reduce-scatter gradients for a set of parameters asynchronously.
+    Provides functionality to register when params in the bucket have grads available, and
+    automatically launches an asynchronous communication call when _all_ params in the bucket
     have grads available.
     """
 
@@ -53,7 +53,7 @@ class Bucket:
         offset: int,
         data_parallel_group: torch.distributed.ProcessGroup,
         overlap_grad_reduce: bool,
-        reduce_scatter: bool,
+        use_distributed_optimizer: bool,
     ):
         # State for bookkeeping: params is the set of parameters this bucket is
         # responsible for, params_with_grad is the set of parameters with grads
@@ -66,7 +66,7 @@ class Bucket:
         self.offset = offset  # Needed by distributed optimizer to keep track of this bucket's offset within the full grad_buffer.
         self.data_parallel_group = data_parallel_group
         self.overlap_grad_reduce = overlap_grad_reduce
-        self.reduce_scatter = reduce_scatter
+        self.use_distributed_optimizer = use_distributed_optimizer
 
         self.data_parallel_size = torch.distributed.get_world_size(group=data_parallel_group)
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
@@ -91,11 +91,11 @@ class Bucket:
     def communicate(self):
         assert (
             self.communication_handle is None and not self.communication_issued
-        ), 'Should not have multiple all-reduces in flight at once'
+        ), 'Should not have multiple communication calls in flight at once'
 
         self.data /= self.data_parallel_size
         # Use async_op only when overlap_grad_reduce is True.
-        if self.reduce_scatter:
+        if self.use_distributed_optimizer:
             local_data_view = self._get_local_view(self.data)
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
@@ -114,18 +114,18 @@ class Bucket:
         assert param not in self.params_with_grad, 'Cannot set grad twice'
         assert self.overlap_grad_reduce, 'set() should be called only when overlapping grad reduce'
         self.params_with_grad.add(param)
-        # If all params in bucket have grads available, issue all-reduce.
+        # If all params in bucket have grads available, issue communication call.
         if len(self.params_with_grad) == len(self.params):
             self.communicate()
 
     def done(self):
-        # If not overlapping grad reduce, issue synchronous all-reduce here.
+        # If not overlapping grad reduce, issue synchronous communication call here.
         if not self.overlap_grad_reduce:
             self.communicate()
             return
         assert self.communication_handle is not None and self.communication_issued, (
-            f'All-reduce is not issued for this bucket, '
-            f'only {len(self.params_with_grad)}/{len(self.params)} params have grad available'
+            f'Communication call has not been issued for this bucket '
+            f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
         )
         self.communication_handle.wait()
 
@@ -146,7 +146,7 @@ class GradBuffer(MemoryBuffer):
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
         overlap_grad_reduce: bool,
-        reduce_scatter: bool,
+        use_distributed_optimizer: bool,
     ):
         super(GradBuffer, self).__init__(numel, numel_padded, dtype)
 
@@ -154,6 +154,7 @@ class GradBuffer(MemoryBuffer):
         self.param_to_bucket = {}
         self.param_to_bucket_index = {}
         self.overlap_grad_reduce = overlap_grad_reduce
+        self.use_distributed_optimizer = use_distributed_optimizer
 
         self.is_last_microbatch = True
 
@@ -179,8 +180,8 @@ class GradBuffer(MemoryBuffer):
                 bucket_data,
                 data_start_index,
                 data_parallel_group,
-                overlap_grad_reduce,
-                reduce_scatter,
+                self.overlap_grad_reduce,
+                self.use_distributed_optimizer,
             )
             self.buckets.append(bucket)
             for bucket_param in bucket_params:
@@ -224,7 +225,7 @@ class GradBuffer(MemoryBuffer):
 
         # Print buckets.
         if torch.distributed.get_rank() == 0:
-            print('> buckets for gradient all-reduce:')
+            print('> buckets for gradient all-reduce / reduce-scatter:')
             for index, bucket in enumerate(self.buckets):
                 print(f'    params for bucket {index+1}')
                 numel = 0
@@ -241,7 +242,7 @@ class GradBuffer(MemoryBuffer):
         self.is_last_microbatch = True
 
     def done(self):
-        """Wait for all buckets' all-reductions to complete."""
+        """Wait for all buckets' communication calls to complete."""
         for bucket in self.buckets:
             bucket.done()
 
@@ -268,7 +269,7 @@ class DistributedDataParallelBase(MegatronModule, ABC):
         self.module = module
 
     @abstractmethod
-    def allreduce_gradients(self):
+    def sync_gradients(self):
         pass
 
     def forward(self, *inputs, **kwargs):
@@ -287,9 +288,9 @@ class DistributedDataParallelBase(MegatronModule, ABC):
 class DistributedDataParallel(DistributedDataParallelBase):
     """
     DDP wrapper which stores grads in contiguous buffers. Also has option of
-    overlapping all-reduce with computation by breaking up full model's
-    gradients into smaller buckets and running all-reduce on each bucket
-    asynchronously.
+    overlapping communication with backprop computation by breaking up full model's
+    gradients into smaller buckets and running all-reduce / reduce-scatter
+    on each bucket asynchronously.
     This class:
         - has the potential to reduce memory fragmentation.
         - provides the option to do the gradient accumulation
@@ -299,10 +300,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
         module: input model.
         data_parallel_group: data-parallel group.
         accumulate_allreduce_grads_in_fp32: if true do the gradient accumulation
-            and the gradient all-reduce in float32.
-        overlap_grad_reduce: if true, overlap all-reduce with computation by
-            breaking up grads into buckets. If false, single synchronous all-reduce
-            is used instead.
+            and communication in float32.
+        overlap_grad_reduce: if true, overlap communication with backprop
+            computation by breaking up grads into buckets. If false, single
+            synchronous communication call is used instead.
+        use_distributed_optimizer: if true, issue reduce-scatter communication
+            calls as part of distributed optimizer. If false, issue all-reducde
+            communication calls.
 
     """
 
@@ -312,13 +316,15 @@ class DistributedDataParallel(DistributedDataParallelBase):
         data_parallel_group: torch.distributed.ProcessGroup,
         accumulate_allreduce_grads_in_fp32: bool,
         overlap_grad_reduce: bool,
-        reduce_scatter: bool,
+        use_distributed_optimizer: bool,
         bucket_size: int = 40000000,
     ):
         super(DistributedDataParallel, self).__init__(module)
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         self.overlap_grad_reduce = overlap_grad_reduce
+        self.use_distributed_optimizer = use_distributed_optimizer
+
         if not self.overlap_grad_reduce:
             bucket_size = None
         self.bucket_size = bucket_size
@@ -365,7 +371,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 bucket_size,
                 param_to_name,
                 self.overlap_grad_reduce,
-                reduce_scatter,
+                self.use_distributed_optimizer,
             )
 
             # Parameters are laid out in the corresponding grad_buffer in reverse
@@ -400,7 +406,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
     def _make_param_hook(
         self, param: torch.nn.Parameter, param_to_grad_buffer: Dict[torch.nn.Parameter, GradBuffer]
     ):
-        """Create the all-reduce hook for backprop."""
+        """Create the all-reduce / reduce-scatter hook for backprop."""
 
         def param_hook(*unused):
             if param.requires_grad:
@@ -445,13 +451,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 group=mpu.get_data_parallel_group(),
             )
 
-    def allreduce_gradients(self):
+    def sync_gradients(self):
         """
-        Reduce gradients across data parallel ranks.
-        When overlap_grad_reduce is set to True, waits for asynchronous all-reduces
-        to complete.
+        Reduce gradients across data-parallel ranks.
+        When overlap_grad_reduce is set to True, waits for asynchronous
+        communication calls to complete.
         When overlap_grad_reduce is set to False, calls synchronous
-        all-reduce.
+        communication ops.
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.done()

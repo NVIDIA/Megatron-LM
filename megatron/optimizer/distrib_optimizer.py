@@ -840,7 +840,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         timers('grads-reduce-scatter', log_level=1).start(
             barrier=args.barrier_with_L1_time)
         for model in self.models:
-            model.allreduce_gradients()
+            model.sync_gradients()
         timers('grads-reduce-scatter').stop()
 
         # All-reduce layer-norm grads (for sequence parallelism).
