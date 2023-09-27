@@ -43,6 +43,7 @@ def get_retro_encoder_layer_spec() -> TransformerLayerSpec:
     spec.ln_mlp=ModuleSpec(module=MLP)
     return spec
 
+
 def get_retro_encoder_block_spec(config: TransformerConfig) -> TransformerBlockSpec:
 
     # Num layers.

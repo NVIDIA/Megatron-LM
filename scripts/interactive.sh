@@ -11,17 +11,17 @@ ADD_RETRIEVER=1
 NPROCS=1
 NWORKERS=32
 
-# ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh"
-# . ${ARGS_PATH} \
-#   ${USE_CORE} \
-#   ${ADD_RETRIEVER} \
-#   ${NPROCS} \
-#   ${NWORKERS}
-ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore/scripts/args_wiki.sh"
+ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh"
 . ${ARGS_PATH} \
   ${USE_CORE} \
   ${ADD_RETRIEVER} \
+  ${NPROCS} \
   ${NWORKERS}
+# ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore/scripts/args_wiki.sh"
+# . ${ARGS_PATH} \
+#   ${USE_CORE} \
+#   ${ADD_RETRIEVER} \
+#   ${NWORKERS}
 
 REPO_DIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore"
 
