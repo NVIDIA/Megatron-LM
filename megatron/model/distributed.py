@@ -68,7 +68,7 @@ class Bucket:
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
 
-        self.data_parallel_size = torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
 
         self.reset()
@@ -78,25 +78,18 @@ class Bucket:
         self.communication_handle = None
         self.communication_issued = False
 
-    def _get_local_view(self, buf):
-        """
-        Compute view in buf that this rank is responsible for (when using distributed optimizer / reduce-scatter).
-        """
-        assert buf.numel() % self.data_parallel_size == 0
-        shard_size = buf.numel() // self.data_parallel_size
-        return buf[
-            (self.data_parallel_rank * shard_size) : ((self.data_parallel_rank + 1) * shard_size)
-        ]
-
     def communicate(self):
         assert (
             self.communication_handle is None and not self.communication_issued
         ), 'Should not have multiple communication calls in flight at once'
 
-        self.data /= self.data_parallel_size
+        self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = self._get_local_view(self.data)
+            # TODO: Move this import to top of file.
+            # Import is here for now because of circular import errors.
+            from megatron.optimizer.utils import shard_buffer
+            local_data_view = shard_buffer(self.data)[self.data_parallel_rank]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.data,
@@ -356,11 +349,13 @@ class DistributedDataParallel(DistributedDataParallelBase):
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate, depending on
         # whether overlap_grad_reduce is True or not.
-        data_parallel_size = torch.distributed.get_world_size(group=data_parallel_group)
+        data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
             # Pad so size is divisible by the data parallel size.
             numel = grad_dtype_to_numel[dtype]
-            numel_padded = int(math.ceil(numel / data_parallel_size)) * data_parallel_size
+            numel_padded = (
+                int(math.ceil(numel / data_parallel_world_size)) * data_parallel_world_size
+            )
 
             self.grad_buffers[dtype] = GradBuffer(
                 numel,

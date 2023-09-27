@@ -14,6 +14,8 @@ from megatron.core import mpu, tensor_parallel
 from megatron.model.module import param_is_not_shared
 
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
+from .utils import shard_buffer
+
 
 
 class Range:
@@ -808,17 +810,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         in _reduce_scatter_base and _all_gather_base.
         """
 
-        data_parallel_world_size = mpu.get_data_parallel_world_size()
-
         # Buffer views.
         view_items = []
         for model_index, buffers in enumerate(model_buffers):
             for dtype, buf_for_all_buckets in buffers.items():
                 for bucket_index, buf in enumerate(buf_for_all_buckets):
-                    assert buf.numel() % data_parallel_world_size == 0
-                    shard_size = buf.numel() // data_parallel_world_size
-                    buf_views = [buf[(r*shard_size):((r+1)*shard_size)]
-                                for r in range(data_parallel_world_size)]
+                    buf_views = shard_buffer(buf)
                     view_items.append((model_index, dtype, bucket_index, buf, buf_views))
 
         return view_items
