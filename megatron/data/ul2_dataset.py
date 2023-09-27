@@ -423,7 +423,7 @@ def build_training_sample(sample, target_seq_length,
             tokens_dec_in.append(eos_id)
             labels.append(eos_id)
 
-        # Move BOS token to start of sequence.
+        # Remove BOS token.
         tokens_dec_in = tokens_dec_in[1:]
         if not add_mask_tokens:
             # Do not reproduce objective token when not using masking
@@ -436,8 +436,7 @@ def build_training_sample(sample, target_seq_length,
         # Do not add separator token if S- or C-denoising.
         separator = [sep_id] if denoiser != 'S' and denoiser != 'C' else []
         tokens = (
-            [bos_id]
-            + tokens_enc
+            tokens_enc
             + separator
             + tokens_dec_in
         )
