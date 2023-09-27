@@ -206,35 +206,6 @@ class T5Model(MegatronModule):
         inference_params = None,
     ):
 
-        # # DEBUGGING
-        # from megatron import print_rank_0
-        # print_rank_0("encoder_input_ids.shape: " + str(encoder_input_ids.shape))
-        # print_rank_0("decoder_input_ids.shape: " + str(decoder_input_ids.shape))
-        # print_rank_0("labels.shape: " + str(labels.shape))
-        # print_rank_0("encoder_attn_mask.shape: " + str(encoder_attn_mask.shape))
-        # print_rank_0("decoder_attn_mask.shape: " + str(decoder_attn_mask.shape))
-        # print_rank_0("encoder_decoder_attn_mask.shape: " + str(encoder_decoder_attn_mask.shape))
-        # # print_rank_0("Sample encoder_input_ids: " + str(encoder_input_ids[0]))
-        # # print_rank_0("Sample decoder_input_ids: " + str(decoder_input_ids[0]))
-        # # print_rank_0("Sample labels: " + str(labels[0]))
-        # from transformers import BertTokenizer
-        # t = BertTokenizer.from_pretrained('bert-base-uncased')
-        # # t = BertTokenizer.from_pretrained('bert-base-cased')
-        # print_rank_0("Text encoder: " + str(t.decode(token_ids=encoder_input_ids[0])) + "\n")
-        # print_rank_0("Text decoder: " + str(t.decode(token_ids=decoder_input_ids[0])) + "\n")
-        # print_rank_0("Text labels: " + str(t.decode(token_ids=labels[0])) + "\n")
-        # # from megatron import get_tokenizer
-        # # tokenizer = get_tokenizer()
-        # # print_rank_0("Text encoder: " + str(tokenizer.detokenize(token_ids=encoder_input_ids[0])))
-        # # print_rank_0("Text decoder: " + str(tokenizer.detokenize(token_ids=decoder_input_ids[0])))
-        # # print_rank_0("Text labels: " + str(tokenizer.detokenize(token_ids=labels[0])))
-        # # print_rank_0("Sample encoder_attn_mask: " + str(encoder_attn_mask[0][0]))
-        # # print_rank_0("Sample decoder_attn_mask: " + str(decoder_attn_mask[0][0]))
-        # # print_rank_0("Sample encoder_decoder_attn_mask: " + str(encoder_decoder_attn_mask[0][0]))
-        # print_rank_0("\n")
-
-
-
         encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = t5_extended_attention_mask(
             [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
         )
@@ -316,12 +287,6 @@ class T5Model(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
-
-        # # DEBUGGING
-        # from megatron import print_rank_0
-        # cse_loss_computer = torch.nn.CrossEntropyLoss(ignore_index=-1)
-        # cse_loss = cse_loss_computer(logits.float(), labels)
-        # print_rank_0("CSE loss: " + str(round(cse_loss,2)))
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
