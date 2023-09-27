@@ -1339,9 +1339,11 @@ def _add_ul2_args(parser):
                        'selected. Uniform distribution by default.')
     group.add_argument('--ul2-denoisers', nargs='+', type=str,
                        default=['R', 'R', 'S', 'X', 'X', 'X', 'X'],
-                       choices=['R', 'S', 'X'],
+                       choices=['R', 'S', 'X', 'C'],
                        help='What type of UL2 denoising objective the other '
-                       'UL2 configurations refer to.')
+                       'UL2 configurations refer to. "C" is a fully causal '
+                       'objective with BOS as its denoiser token. Its '
+                       'settings need to be provided but will be ignored.')
     group.add_argument('--ul2-mean-span-lengths', nargs='+', type=float,
                        default=[3, 8, 0.25, 3, 8, 64, 64],
                        help='Mean length for sampling span lengths. '

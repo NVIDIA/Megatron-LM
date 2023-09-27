@@ -334,6 +334,7 @@ def build_training_sample(sample, target_seq_length,
     if (
             is_decoder_only(model_type)
             and denoiser != 'S'
+            and denoiser != 'C'
             and add_mask_tokens
     ):
         # Keep space for repeated `extra_id` tokens; not the most data
@@ -343,11 +344,12 @@ def build_training_sample(sample, target_seq_length,
         truncated = len(tokens) > safe_max_seq_len
         tokens = tokens[:safe_max_seq_len]
     else:
-        # If we are S-denoising, we know exactly two tokens are
+        # If we are S- or C-denoising, we know exactly two tokens are
         # going to be added: `bos` and `eos`. Same when not adding mask
         # tokens.
         if (
-                is_decoder_only(model_type) and denoiser == 'S'
+                is_decoder_only(model_type)
+                and (denoiser == 'S' or denoiser == 'C')
                 or not add_mask_tokens
         ):
             max_num_tokens -= 2
@@ -358,6 +360,7 @@ def build_training_sample(sample, target_seq_length,
         if (
                 is_decoder_only(model_type)
                 and denoiser != 'S'
+                and denoiser != 'C'
                 and not add_mask_tokens
         ):
             max_num_tokens = max_num_tokens // 2
@@ -382,7 +385,9 @@ def build_training_sample(sample, target_seq_length,
             sampling_style = SamplingStyle.UNSCALED_NORMAL
         prefix_lm = False
         max_predictions_per_seq = len(tokens) - 1
-    elif denoiser == 'S':
+    elif denoiser == 'S' or denoiser == 'C':
+        if denoiser == 'C':
+            masked_lm_prob = 0.0
         sampling_style = SamplingStyle.UNIFORM
         prefix_lm = True
         max_predictions_per_seq = min(
@@ -424,8 +429,8 @@ def build_training_sample(sample, target_seq_length,
 
         num_labels = len(labels)
 
-        # Do not add separator token if S-denoising.
-        separator = [sep_id] if denoiser != 'S' else []
+        # Do not add separator token if S- or C-denoising.
+        separator = [sep_id] if denoiser != 'S' and denoiser != 'C' else []
         tokens = (
             [bos_id]
             + tokens_enc

@@ -30,6 +30,7 @@ import torch
 
 from megatron import (
     get_args,
+    get_tokenizer,
     print_rank_0
 )
 from megatron.core import mpu
@@ -751,6 +752,7 @@ def build_dataset(name, data_prefix, data_impl, splits_string, max_num_samples,
         )
     elif dataset_type == DSET_TYPE_UL2:
         args = get_args()
+        tokenizer = get_tokenizer()
         dataset = UL2Dataset(
             indexed_dataset=indexed_dataset,
             splits_string=splits_string,
@@ -765,6 +767,7 @@ def build_dataset(name, data_prefix, data_impl, splits_string, max_num_samples,
                 'R': args.ul2_r_denoiser_token,
                 'S': args.ul2_s_denoiser_token,
                 'X': args.ul2_x_denoiser_token,
+                'C': tokenizer.bos_id,
             },
             scale_normal_std=args.ul2_scale_normal_std,
             like_ul2r=args.ul2_like_ul2r,
