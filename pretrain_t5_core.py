@@ -67,7 +67,7 @@ def model_provider(pre_process=True, post_process=True,
     # NOTE: Experimental customization feature
     en_block_spec = get_t5_encoder_block_spec(config)
     de_block_spec = get_t5_decoder_block_spec(config)
-    print_rank_0('building GPT model ...')
+    print_rank_0('building T5 model ...')
     model = T5Model(
         config=config,
         spec=[en_block_spec, de_block_spec],

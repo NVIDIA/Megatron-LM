@@ -37,22 +37,20 @@ def decoder_model_with_transformer_engine_default_spec() -> TransformerLayerSpec
         layernorm_linear_qkv=TELayerNormColumnParallelLinear,
         core_attention=TEDotProductAttention,
         linear_proj=TERowParallelLinear,
-    ),
-    self_attn_bda=get_bias_dropout_add,
-    # post_self_attn_layernorm = TELayerNormColumnParallelLinear,
-    cross_attention=CrossAttentionSpec(
-        module=CrossAttention,
-        layernorm_linear_q=TELayerNormColumnParallelLinear,
-        layernorm_linear_kv=TELayerNormColumnParallelLinear,
-        core_attention=TEDotProductAttention,
-        linear_proj=TERowParallelLinear,
-    ),
-    cross_attn_bda=get_bias_dropout_add,
-    # post_cross_attn_layernorm = TELayerNormColumnParallelLinear,
-    ln_mlp=TELayerNormMLP,
-    mlp_bda=get_bias_dropout_add,
-    post_mlp_layernorm = TENorm,
-)
+        ),
+        self_attn_bda=get_bias_dropout_add,
+        cross_attention=CrossAttentionSpec(
+            module=CrossAttention,
+            layernorm_linear_q=TELayerNormColumnParallelLinear,
+            layernorm_linear_kv=TELayerNormColumnParallelLinear,
+            core_attention=TEDotProductAttention,
+            linear_proj=TERowParallelLinear,
+        ),
+        cross_attn_bda=get_bias_dropout_add,
+        ln_mlp=TELayerNormMLP,
+        mlp_bda=get_bias_dropout_add,
+        # post_mlp_layernorm = TENorm,
+    )
 
 def get_t5_encoder_block_spec(config) -> TransformerBlockSpec:
     num_layers = get_num_layers_to_build(config)
