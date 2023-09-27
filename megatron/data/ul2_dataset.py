@@ -141,7 +141,15 @@ class UL2Dataset(torch.utils.data.Dataset):
         # Replace empty string tokens with `None` – we want to ignore
         # those.
         self.cls_ids = {
-            denoiser: vocab[token] if token else None
+            denoiser: (
+                (
+                    vocab[token]
+                    if isinstance(token, str)
+                    else inv_vocab[token]
+                )
+                if token
+                else None
+            )
             for (denoiser, token) in denoiser_tokens.items()
         }
         # cls_token = self.vocab_id_to_token_dict[tokenizer.cls]
