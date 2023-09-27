@@ -232,24 +232,23 @@ class TransformerLayer(MegatronModule):
                 tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
                 sh_ten_builder = partial(ShardedTensor.from_rank_offsets,
-                                         f'{prefix}{layer_name}',
                                          replica_id=replica_id,
                                          prepend_axis_num=1)  # for PP sharding
 
                 # NOTE: passing `tp_axis` as argument due to late binding in closures
-                def sh_ten_build_fn(t: torch.Tensor, tp_axis=tp_axis):
+                def sh_ten_build_fn(key: str, t: torch.Tensor, tp_axis=tp_axis):
                     offset_w = (tp_axis + 1, tp_rank, tp_size * 2)
                     offset_v = (tp_axis + 1, tp_size + tp_rank, tp_size * 2)
                     with torch.no_grad():
                         tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_axis)
-                    return [sh_ten_builder(tensor_w, *sharded_offsets, offset_w),
-                            sh_ten_builder(tensor_v, *sharded_offsets, offset_v)]
+                    return [sh_ten_builder(key, tensor_w, *sharded_offsets, offset_w),
+                            sh_ten_builder(key, tensor_v, *sharded_offsets, offset_v)]
 
                 def sh_ten_merge_fn(sub_state_dict):
                     with torch.no_grad():
                         return torch.cat(sub_state_dict)
 
-                sharded_state_dict[layer_key] = ShardedTensorFactory(tensor, sh_ten_build_fn, sh_ten_merge_fn)
+                sharded_state_dict[layer_key] = ShardedTensorFactory(f'{prefix}{layer_name}', tensor, sh_ten_build_fn, sh_ten_merge_fn)
             else:
                 sharded_state_dict[layer_key] = ShardedTensor.from_rank_offsets(
                     f'{prefix}{layer_name}',

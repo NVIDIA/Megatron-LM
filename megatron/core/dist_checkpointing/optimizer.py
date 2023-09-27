@@ -52,7 +52,9 @@ def make_sharded_optimizer_tensor(
     model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
 ) -> Union[ShardedTensor, ShardedTensorFactory]:
     if isinstance(model_param, ShardedTensorFactory):
-        return model_param.clone(optim_param)
+        return replace(
+            model_param, key=f'{prefix}.{model_param.key}', data=optim_param
+        )
 
     assert (
         tuple(optim_param.shape) == model_param.local_shape
