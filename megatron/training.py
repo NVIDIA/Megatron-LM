@@ -297,9 +297,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         model = [DDP(model_module,
-                     mpu.get_data_parallel_group(),
-                     args.accumulate_allreduce_grads_in_fp32,
-                     args.overlap_grad_reduce)
+                     data_parallel_group=mpu.get_data_parallel_group(),
+                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+                     overlap_grad_reduce=args.overlap_grad_reduce,
+                     use_distributed_optimizer=args.use_distributed_optimizer)
                  for model_module in model]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
