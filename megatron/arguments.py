@@ -418,10 +418,10 @@ def core_transformer_config_from_args(args):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
-    if args.num_experts > 1:
+    if args.num_experts is not None and args.num_experts > 1:
         assert args.model_spec is not None and \
-            args.model_spec[1] == 'gpt_layer_local_spec_moe', 'Please set `--model-spec '\
-            '\'megatron.core.models.gpt.gpt_layer_specs\' \'gpt_layer_local_spec_moe\' '\
+            args.model_spec[1].endswith('moe'), 'Please set `--model-spec '\
+            '\'megatron.core.models.gpt.gpt_layer_specs\' \'gpt_layer_with_transformer_engine_spec_moe\' '\
             ' for Mixture of Experts model configs.'
     if args.swiglu:
         kw_args['activation_func'] = F.silu

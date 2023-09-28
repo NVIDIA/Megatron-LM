@@ -63,7 +63,32 @@ gpt_layer_local_spec = ModuleSpec(
     ),
 )
 
-# Use this spec for an implementation using only modules in megatron core for MoE
+# Use this spec to use lower level Transformer Engine modules and SwitchMLP based MoE
+gpt_layer_with_transformer_engine_spec_moe = ModuleSpec(
+    module=TransformerLayer,
+    submodules=TransformerLayerSubmodules(
+        self_attention=ModuleSpec(
+            module=SelfAttention,
+            params={"attn_mask_type": AttnMaskType.causal},
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                dot_product_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+            ),
+        ),
+        self_attn_bda=get_bias_dropout_add,
+        pre_mlp_layernorm=FusedLayerNorm,
+        mlp=ModuleSpec(
+            module=SwitchMLP, # MOE
+            submodules=MLPSubmodules(
+                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,
+            ),
+        ),
+        mlp_bda=get_bias_dropout_add,
+    ),
+)
+
+# Use this spec for an implementation using only modules in megatron core for MoE models
 gpt_layer_local_spec_moe = ModuleSpec(
     module=TransformerLayer,
     submodules=TransformerLayerSubmodules(
