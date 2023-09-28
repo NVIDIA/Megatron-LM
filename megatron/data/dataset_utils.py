@@ -278,10 +278,11 @@ def create_masked_lm_predictions(tokens,
 
     masked_lm_positions = []
     masked_lm_labels = []
+    masked_spans = []
 
     if masked_lm_prob == 0:
         return (output_tokens, masked_lm_positions,
-                masked_lm_labels, token_boundary)
+                masked_lm_labels, token_boundary, masked_spans)
 
     if (
             sampling_style is SamplingStyle.NORMAL
@@ -335,7 +336,7 @@ def create_masked_lm_predictions(tokens,
         )
     ngram_indexes = map(get_ngram_indices_, ngram_index_indexes)
 
-    (masked_lms, masked_spans) = ([], [])
+    masked_lms = []
     covered_indexes = set()
     for cand_index_set in ngram_indexes:
         if len(masked_lms) >= num_to_predict:
