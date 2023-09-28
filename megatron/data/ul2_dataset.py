@@ -399,7 +399,7 @@ def build_training_sample(sample, target_seq_length,
         max_predictions_per_seq = len(tokens) - 1
     elif denoiser == 'S' or denoiser == 'C':
         if denoiser == 'C':
-            masked_lm_prob = 0.0
+            masked_lm_prob = 1.0
         sampling_style = SamplingStyle.UNIFORM
         prefix_lm = True
         max_predictions_per_seq = min(
