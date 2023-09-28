@@ -9,26 +9,32 @@ set -u
 REPO_DIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore"
 
 # >>>
-RETRO_WORKDIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/workdirs/wiki-mt-lower-mcore"
-DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/Wikipedia-shuf/Wikipedia_en_ftfy_id_shuf_text_document"
+# RETRO_WORKDIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/workdirs/wiki-mt-lower-mcore"
+# DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/Wikipedia-shuf/Wikipedia_en_ftfy_id_shuf_text_document"
+# RETRO_INDEX_STR="IVF262144_HNSW32,Flat"
+# RETRO_INDEX_NTRAIN=66625331
+# RETRO_QUERY_EF_SEARCH=16
+# RETRO_QUERY_NPROBE=4096
 # +++
-# RETRO_WORKDIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/workdirs/wiki-tiny"
-# DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/wiki-tiny/wiki-200k_text_document"
+RETRO_WORKDIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/workdirs/wiki-tiny"
+DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/wiki-tiny/wiki-200k_text_document"
+RETRO_INDEX_STR="IVF4096_HNSW4,Flat"
+RETRO_INDEX_NTRAIN=31250
+RETRO_QUERY_EF_SEARCH=4
+RETRO_QUERY_NPROBE=64
 # <<<
 
 ######## Task (e.g., db, index, query). ########
 
 # RETRO_TASKS="db-build"
-# RETRO_TASKS="index-train"
+RETRO_TASKS="index-train"
 # RETRO_TASKS="index-add"
-RETRO_TASKS="query-pretraining-neighbors"
+# RETRO_TASKS="query-pretraining-neighbors"
 
 ######## Data. ########
 
 ######## Index. ########
 
-RETRO_INDEX_STR="IVF262144_HNSW32,Flat"
-RETRO_INDEX_NTRAIN=66625331
 RETRO_INDEX_TRAIN_LOAD_FRACTION=1.0
 RETRO_INDEX_ADD_LOAD_FRACTION=1.0
 
@@ -37,7 +43,7 @@ RETRO_INDEX_ADD_LOAD_FRACTION=1.0
 RETRO_GPT_SEED=1234
 RETRO_GPT_SPLIT="98,2,0"
 RETRO_GPT_DATA_PATH=${DATA_BLEND}
-RETRO_GPT_DATA_IMPL=mmap
+# RETRO_GPT_DATA_IMPL=mmap
 RETRO_GPT_DATALOADER_TYPE=cyclic # single
 RETRO_GPT_EVAL_INTERVAL=2000
 RETRO_GPT_EVAL_ITERS=100
@@ -51,13 +57,14 @@ RETRO_GPT_CHUNK_LENGTH=64
 ######## Query. ########
 
 RETRO_QUERY_NUM_NEIGHBORS_QUERY=200 RETRO_QUERY_NUM_NEIGHBORS_SAVE=20
-RETRO_QUERY_EF_SEARCH=16
-RETRO_QUERY_NPROBE=4096
 
 ######## Args. ########
 
 # --retro-gpt-tokenizer-type GPTSentencePieceTokenizer \
 # --retro-gpt-tokenizer-model /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/next-llm-tokenizer/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
+# --DDP-impl local \
+# --data-impl ${RETRO_GPT_DATA_IMPL} \
+# --retro-gpt-data-impl ${RETRO_GPT_DATA_IMPL} \
 ARGS=" \
     --distributed-timeout-minutes 600 \
     --tensor-model-parallel-size 1 \
@@ -75,7 +82,6 @@ ARGS=" \
     --data-path ${RETRO_GPT_DATA_PATH} \
     --tokenizer-type BertWordPieceLowerCase \
     --vocab-file /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/vocab/bert-large-uncased-vocab.txt \
-    --data-impl ${RETRO_GPT_DATA_IMPL} \
     --split ${RETRO_GPT_SPLIT} \
     --distributed-backend nccl \
     --lr 0.0001 \
@@ -89,7 +95,6 @@ ARGS=" \
     --eval-interval ${RETRO_GPT_EVAL_INTERVAL} \
     --eval-iters ${RETRO_GPT_EVAL_ITERS} \
     --fp16 \
-    --DDP-impl local \
     --dataloader-type ${RETRO_GPT_DATALOADER_TYPE} \
     --no-data-sharding \
     --no-gradient-accumulation-fusion \
@@ -112,7 +117,6 @@ ARGS=" \
     --retro-gpt-eval-interval ${RETRO_GPT_EVAL_INTERVAL} \
     --retro-gpt-eval-iters ${RETRO_GPT_EVAL_ITERS} \
     --retro-gpt-split ${RETRO_GPT_SPLIT} \
-    --retro-gpt-data-impl ${RETRO_GPT_DATA_IMPL} \
     --retro-gpt-data-path ${RETRO_GPT_DATA_PATH} \
     --retro-index-str ${RETRO_INDEX_STR} \
     --retro-index-ntrain ${RETRO_INDEX_NTRAIN} \

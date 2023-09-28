@@ -189,5 +189,11 @@ class BlockPathMap:
     def __getitem__(self, idx):
         '''Get block path from index.'''
         block_start_idx = self.block_size * (idx // self.block_size)
-        block_path = self.block_path_map[block_start_idx]
+        # >>>
+        try:
+            block_path = self.block_path_map[block_start_idx]
+        except Exception as e:
+            from lutil import pax
+            pax({"block_path_map": self.block_path_map}, "block_start_idx", "e")
+        # <<<
         return block_path

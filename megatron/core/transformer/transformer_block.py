@@ -11,10 +11,14 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+
+# >>>
+from lutil import pax
+# <<<
 
 
 def get_num_layers_to_build(config) -> int:
@@ -52,31 +56,24 @@ def get_num_layers_to_build(config) -> int:
 
 @dataclass
 class TransformerBlockSubmodules:
-    # >>>
-    # layers: List[TransformerLayerSubmodules] = None
-    layers: List[ModuleSpec] = None
-    # <<<
+    layer_specs: List[ModuleSpec] = None
 
 
-def get_block_submodules(config, submodules) -> TransformerBlockSubmodules:
+def get_block_submodules(config, spec) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
-    if isinstance(submodules, TransformerBlockSubmodules):
-        # >>>
-        from lutil import pax
-        pax("submodules")
-        # <<<
-        return submodules
+    if isinstance(spec, TransformerBlockSubmodules):
+        return spec
 
     # ModuleSpec here is generally assumed to be for a transformer layer.
-    elif isinstance(submodules, ModuleSpec):
-        num_layers = get_num_layers_to_build(config)
-        submodules = TransformerBlockSubmodules([submodules] * num_layers)
-        # >>>
-        from lutil import pax
-        pax("submodules")
-        # <<<
-        return submodules
+    elif isinstance(spec, ModuleSpec):
+        if issubclass(spec.module, TransformerBlock):
+            return spec.submodules
+        elif issubclass(spec.module, TransformerLayer):
+            num_layers = get_num_layers_to_build(config)
+            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
+        else:
+            raise Exception(f"specialize for {spec.module.__name__}.")
     else:
         raise Exception(f"specialize for {type(spec).__name__}.")
 
@@ -95,6 +92,9 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.submodules = get_block_submodules(config, submodules)
+        # >>>
+        # pax({"layer_specs": [ s.submodules.cross_attention for s in self.submodules.layer_specs ]})
+        # <<<
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -113,15 +113,22 @@ class TransformerBlock(MegatronModule):
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(spec, layer_number):
-            return TransformerLayer(
+        def build_layer(layer_spec, layer_number):
+            return build_module(
+                layer_spec,
                 config=self.config,
-                submodules=spec.submodules,
                 layer_number=layer_number,
             )
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([build_layer(spec, i + 1) for i, spec in enumerate(self.spec.layers)])
+        self.layers = torch.nn.ModuleList([
+            build_layer(layer_spec, i + 1)
+            for i, layer_spec in enumerate(self.submodules.layer_specs)
+        ])
+
+        # >>>
+        # pax({"layers": list(self.layers)})
+        # <<<
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:

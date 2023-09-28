@@ -11,32 +11,52 @@ USE_CORE=$1
 ADD_RETRIEVER=$2
 NUM_WORKERS=$3
 
-ROOT_DIR=/lustre/fs3/portfolios/adlr/users/lmcafee
-DATA_PATH=${ROOT_DIR}/corpus-530b/Wikipedia-shuf
+ROOT_DIR=/lustre/fsw/portfolios/adlr/users/lmcafee
 
-VOCAB_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-vocab.json
-MERGE_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-merges.txt
+# >>>
+# DATA_PATH=${ROOT_DIR}/corpus-530b/Wikipedia-shuf/Wikipedia_en_ftfy_id_shuf_text_document
+# RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/wiki-mt-lower-mcore
+# VOCAB_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-vocab.json
+# MERGE_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-merges.txt
+# TOKENIZER_ARGS=" \
+#     --tokenizer-type GPT2BPETokenizer \
+#     --vocab-file ${VOCAB_FILE} \
+#     --merge-file ${MERGE_FILE} \
+# "
+# GLOBAL_BATCH_SIZE=256
+# +++
+DATA_PATH=${ROOT_DIR}/retro/data/MTNLG/NIHExporter_shuf_text_document
+RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/nih
+TOKENIZER_ARGS=" \
+    --tokenizer-type GPTSentencePieceTokenizer \
+    --tokenizer-model /lustre/fsw/portfolios/adlr/projects/adlr_nlp_arch/adlr_nlp_sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
+"
+# GLOBAL_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=256
+# <<<
 
-RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/wiki-mt-lower-mcore
-CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c${USE_CORE}-r${ADD_RETRIEVER}
-TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
-mkdir -p ${TENSORBOARD_DIR}
+# CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c${USE_CORE}-r${ADD_RETRIEVER}
+# TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
+# mkdir -p ${TENSORBOARD_DIR}
 
 # --loss-scale 1024 \
 # --DDP-impl local \
+# --fp16 \
 NUM_LAYERS=12 # 4, [*12]
 HIDDEN_SIZE=768 # 256, [512], *768
 NUM_HEADS=12 # [4], 8, *12
 MICRO_BATCH_SIZE=4 # [4], *8
-SAVE_INTERVAL=2000 # [2000], *10000
 LOG_INTERVAL=1 # 100
+# SAVE_INTERVAL=2000 # [2000], *10000
+# ARGS=" \
+#     --tensorboard-dir ${TENSORBOARD_DIR} \
+#     --log-validation-ppl-to-tensorboard \
+#     --save-interval ${SAVE_INTERVAL} \
+#     --save ${CHECKPOINT_DIR} \
+#     --load ${CHECKPOINT_DIR} \
+#     \
 ARGS=" \
-    --tensorboard-dir ${TENSORBOARD_DIR} \
-    --log-validation-ppl-to-tensorboard \
-    --save-interval ${SAVE_INTERVAL} \
-    --save ${CHECKPOINT_DIR} \
-    --load ${CHECKPOINT_DIR} \
-    \
+    ${TOKENIZER_ARGS} \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --num-layers ${NUM_LAYERS} \
@@ -45,7 +65,7 @@ ARGS=" \
     --seq-length 2048 \
     --max-position-embeddings 2048 \
     --micro-batch-size ${MICRO_BATCH_SIZE} \
-    --global-batch-size 256 \
+    --global-batch-size ${GLOBAL_BATCH_SIZE} \
     --train-samples  2037248  \
     --lr-decay-samples 166400000 \
     --lr-warmup-samples 162761 \
@@ -56,8 +76,6 @@ ARGS=" \
     --eval-iters 100 \
     --eval-interval 2000 \
     --data-path ${DATA_PATH} \
-    --vocab-file ${VOCAB_FILE} \
-    --merge-file ${MERGE_FILE} \
     --split 98,2,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
@@ -66,7 +84,7 @@ ARGS=" \
     --init-method-std 0.023 \
     --log-params-norm \
     --log-num-zeros-in-grad \
-    --fp16 \
+    --bf16 \
     --dataloader-type cyclic \
     --no-data-sharding \
 "
@@ -78,6 +96,7 @@ if [ "$ADD_RETRIEVER" = "0" ]; then
 	SCRIPT=pretrain_gpt_core.py
     fi
 else
+    # --retro-no-verify-neighbor-count \
     ARGS="${ARGS} \
     --retro-workdir ${RETRO_WORKDIR} \
     --retro-add-retriever \

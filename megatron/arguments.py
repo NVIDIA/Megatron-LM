@@ -523,6 +523,10 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
+    group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
+                       dest="retro_verify_neighbor_count",
+                       help="Skip verifying that len(GPT dataset) == len(saved "
+                       "neighbors).")
 
     # Enforce argument naming convention.
     for action in group._group_actions:

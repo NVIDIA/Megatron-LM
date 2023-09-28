@@ -31,7 +31,7 @@ def model_provider(pre_process=True, post_process=True):
     print_rank_0('building GPT model ...')
     model = RetroModel(
         config=config,
-        spec=block_spec,
+        transformer_layer_spec=block_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,

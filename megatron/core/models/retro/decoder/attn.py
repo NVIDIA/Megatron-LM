@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from functools import partial
 import numpy as np
@@ -10,10 +10,10 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.transformer import (
     ModuleSpec,
-    TransformerBlockSpec,
+    TransformerBlockSubmodules,
     TransformerConfig,
 )
-from megatron.core.transformer.attention import CrossAttentionSpec
+from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
@@ -25,27 +25,38 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: CrossAttentionSpec,
+        submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        encoder_block_spec: TransformerBlockSpec = None,
+        encoder_block_spec: ModuleSpec = None,
         **kwargs,
     ):
         super().__init__(
             config=config,
-            spec=spec,
+            submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             **kwargs,
         )
 
         if encoder_block_spec:
-            self.encoder = TransformerBlock(
-                config=config,
+            # >>>
+            # self.encoder = TransformerBlock(
+            #     config=config,
+            #     spec=encoder_block_spec,
+            #     pre_process=True,
+            #     post_process=False,
+            # )
+            self.encoder = build_module(
                 spec=encoder_block_spec,
+                config=config,
                 pre_process=True,
                 post_process=False,
             )
+            # <<<
+            # >>>
+            pax({"encoder": self.encoder})
+            # <<<
             # self._encoder_key = 'encoder' # ... necessary?
         else:
             self.encoder = None
@@ -144,11 +155,15 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
+        # >>>
+        # spec: ModuleSpec,
+        # <<<
         **kwargs,
     ):
         super().__init__(config=config)
-        self.spec = spec
+        # >>>
+        # self.spec = spec
+        # <<<
         self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
 
     @classmethod
@@ -201,11 +216,15 @@ class RetroDecoderLayerNorm(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
+        # >>>
+        # spec: ModuleSpec,
+        # <<<
         **kwargs,
     ):
         super().__init__(config=config)
-        self.spec = spec
+        # >>>
+        # self.spec = spec
+        # <<<
         self.norm = TENorm(config=config, **kwargs)
 
     def forward(self, x):

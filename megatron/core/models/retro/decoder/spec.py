@@ -1,22 +1,23 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_decoder_spec import get_gpt_layer_spec
-from megatron.core.transformer.attention import CrossAttentionSpec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
-from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.models.retro.encoder import get_retro_encoder_block_spec
 from megatron.core.transformer import (
     get_num_layers_to_build,
     ModuleSpec,
-    TransformerBlockSpec,
+    TransformerBlock,
+    TransformerBlockSubmodules,
     TransformerConfig,
-    TransformerLayerSpec,
 )
 
 from .attn import (
@@ -25,26 +26,46 @@ from .attn import (
     RetroDecoderLayerNorm,
 )
 
+# >>>
+from lutil import pax
+# <<<
 
-def get_retro_decoder_layer_spec(encoder_block_spec=None) -> TransformerLayerSpec:
-    spec = get_gpt_layer_spec()
-    spec.cross_attention=CrossAttentionSpec(
+
+def get_retro_decoder_layer_spec(encoder_block_submodules=None) -> ModuleSpec:
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={
-            "encoder_block_spec" : encoder_block_spec,
+            "encoder_block_submodules" : encoder_block_submodules,
         },
-        layernorm_linear_q=TELayerNormColumnParallelLinear,
-        layernorm_linear_kv=TELayerNormColumnParallelLinear,
-        core_attention=TEDotProductAttention,
-        linear_proj=TERowParallelLinear,
+        submodules=CrossAttentionSubmodules(
+            linear_q=TELayerNormColumnParallelLinear,
+            linear_kv=TELayerNormColumnParallelLinear,
+            core_attention=TEDotProductAttention,
+            linear_proj=TERowParallelLinear,
+        ),
     )
-    spec.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
-    spec.post_cross_attn_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
-    spec.ln_mlp=ModuleSpec(module=MLP)
+    spec.submodules.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    spec.submodules.pre_mlp_layernorm=ModuleSpec(module=RetroDecoderLayerNorm)
+    spec.submodules.mlp=ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear,
+            linear_fc2=TERowParallelLinear,
+        ),
+    )
+    # >>>
+    # pax({
+    #     "spec" : spec,
+    #     "spec / submodules" : spec.submodules,
+    #     "ca subs" : spec.submodules.cross_attention.submodules,
+    #     "mlp subs" : spec.submodules.mlp.submodules,
+    # })
+    # <<<
     return spec
 
 
-def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSpec:
+def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
 
     # Num layers.
     assert parallel_state.get_pipeline_model_parallel_world_size() == 1, \
@@ -58,10 +79,18 @@ def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockS
     retro_layer_numbers = list(range(retro_layer_start, num_layers + 1, 3))
 
     # Layer specs.
-    gpt_layer_spec = get_gpt_layer_spec()
+    gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
     retro_layer_spec = get_retro_decoder_layer_spec()
     retro_layer_spec_with_retriever = \
         get_retro_decoder_layer_spec(get_retro_encoder_block_spec(config))
+
+    # >>>
+    # pax(
+    #     "gpt_layer_spec",
+    #     "retro_layer_spec",
+    #     "retro_layer_spec_with_retriever",
+    # )
+    # <<<
 
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
@@ -73,6 +102,17 @@ def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockS
             layer_specs.append(gpt_layer_spec)
 
     # Block spec.
-    block_spec = TransformerBlockSpec(layers=layer_specs)
+    block_spec = ModuleSpec(
+        module=TransformerBlock,
+        submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
+    )
+
+    # >>>
+    # pax({
+    #     "block_spec" : block_spec,
+    #     "cross attns" : [ s.submodules.cross_attention
+    #                       for s in block_spec.submodules.layer_specs ],
+    # })
+    # <<<
 
     return block_spec
