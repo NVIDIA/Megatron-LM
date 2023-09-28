@@ -116,7 +116,7 @@ class GPTModel(LanguageModel):
             )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings(GPTModel)
+            self.initialize_last_stage_with_word_embeddings()
 
     def forward(
         self,
