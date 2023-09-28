@@ -457,7 +457,7 @@ def build_training_sample(sample, target_seq_length,
 
         tokens = np.array(tokens + filler, dtype=np.int64)
         labels = np.array((
-            tokens_enc
+            tokens_enc[1:]
             + separator
             + labels
             + filler
