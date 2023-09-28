@@ -24,9 +24,11 @@ from .mapping import (
     ShardedObject,
     ShardedStateDict,
     ShardedTensor,
+    ShardedTensorFactory,
     StateDict,
-    is_main_replica, apply_factories, ShardedTensorFactory,
+    apply_factories,
     apply_factory_merges,
+    is_main_replica,
 )
 from .strategies.base import (
     LoadCommonStrategy,
@@ -74,7 +76,9 @@ def load(
     if saved_config is None:
         raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
-    sh_ten_factories, _ = extract_matching_values(sharded_state_dict, lambda x: isinstance(x, ShardedTensorFactory))
+    sh_ten_factories, _ = extract_matching_values(
+        sharded_state_dict, lambda x: isinstance(x, ShardedTensorFactory)
+    )
     apply_factories(sharded_state_dict)
     sharded_state_dict, _ = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)
     sharded_state_dict, nonpersistent_state_dict = extract_sharded_tensors(sharded_state_dict)
@@ -231,12 +235,20 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
     has_flattened_range = some_rank_shard.flattened_range is not None
     for rank, sharding in rank_sharding:
         assert sharding.dtype == dtype, (sharding.dtype, dtype, some_rank_shard)
-        assert sharding.global_shape == global_shape, (sharding.global_shape, global_shape, some_rank_shard)
-        assert sharding.local_shape == local_shape, (sharding.local_shape, local_shape, some_rank_shard)
+        assert sharding.global_shape == global_shape, (
+            sharding.global_shape,
+            global_shape,
+            some_rank_shard,
+        )
+        assert sharding.local_shape == local_shape, (
+            sharding.local_shape,
+            local_shape,
+            some_rank_shard,
+        )
         assert (sharding.flattened_range is not None) == has_flattened_range, (
             (sharding.flattened_range is not None),
             has_flattened_range,
-            some_rank_shard
+            some_rank_shard,
         )
 
     shard_access_cnt = _compute_shards_access(rank_sharding)

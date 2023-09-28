@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass, replace
 from itertools import chain
-from typing import Any, Dict, Optional, Tuple, Union, Callable
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -249,6 +249,7 @@ class ShardedTensorFactory:
     Builder creates a sub-state-dict out of a tensor before saving, and merger
     merges the corresponding state dict after loading.
     """
+
     key: str
     data: torch.Tensor
     build_fn: Callable[[str, torch.Tensor], ShardedStateDict]

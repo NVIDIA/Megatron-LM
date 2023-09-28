@@ -13,10 +13,14 @@ logger = logging.getLogger(__name__)
 import torch
 
 from .dict_utils import nested_values
-from .mapping import LocalNonpersitentObject, ShardedStateDict, ShardedTensor, \
-    StateDict, ShardedTensorFactory
-from .utils import extract_sharded_tensors, \
-    extract_sharded_tensors_and_factories
+from .mapping import (
+    LocalNonpersitentObject,
+    ShardedStateDict,
+    ShardedTensor,
+    ShardedTensorFactory,
+    StateDict,
+)
+from .utils import extract_sharded_tensors, extract_sharded_tensors_and_factories
 
 
 def get_optim_param_to_id_map(optim_params_iter: Iterable[torch.nn.Parameter]) -> Dict[int, int]:
@@ -52,9 +56,7 @@ def make_sharded_optimizer_tensor(
     model_param: Union[ShardedTensor, ShardedTensorFactory], optim_param: torch.Tensor, prefix: str
 ) -> Union[ShardedTensor, ShardedTensorFactory]:
     if isinstance(model_param, ShardedTensorFactory):
-        return replace(
-            model_param, key=f'{prefix}.{model_param.key}', data=optim_param
-        )
+        return replace(model_param, key=f'{prefix}.{model_param.key}', data=optim_param)
 
     assert (
         tuple(optim_param.shape) == model_param.local_shape
