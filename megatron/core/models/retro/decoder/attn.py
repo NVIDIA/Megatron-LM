@@ -40,23 +40,12 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         )
 
         if encoder_block_spec:
-            # >>>
-            # self.encoder = TransformerBlock(
-            #     config=config,
-            #     spec=encoder_block_spec,
-            #     pre_process=True,
-            #     post_process=False,
-            # )
             self.encoder = build_module(
                 spec=encoder_block_spec,
                 config=config,
                 pre_process=True,
                 post_process=False,
             )
-            # <<<
-            # >>>
-            pax({"encoder": self.encoder})
-            # <<<
             # self._encoder_key = 'encoder' # ... necessary?
         else:
             self.encoder = None
@@ -155,15 +144,9 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        # >>>
-        # spec: ModuleSpec,
-        # <<<
         **kwargs,
     ):
         super().__init__(config=config)
-        # >>>
-        # self.spec = spec
-        # <<<
         self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
 
     @classmethod
@@ -216,15 +199,9 @@ class RetroDecoderLayerNorm(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        # >>>
-        # spec: ModuleSpec,
-        # <<<
         **kwargs,
     ):
         super().__init__(config=config)
-        # >>>
-        # self.spec = spec
-        # <<<
         self.norm = TENorm(config=config, **kwargs)
 
     def forward(self, x):

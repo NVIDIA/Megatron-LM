@@ -16,10 +16,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
-# >>>
-from lutil import pax
-# <<<
-
 
 def get_num_layers_to_build(config) -> int:
 
@@ -92,9 +88,6 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.submodules = get_block_submodules(config, submodules)
-        # >>>
-        # pax({"layer_specs": [ s.submodules.cross_attention for s in self.submodules.layer_specs ]})
-        # <<<
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -125,10 +118,6 @@ class TransformerBlock(MegatronModule):
             build_layer(layer_spec, i + 1)
             for i, layer_spec in enumerate(self.submodules.layer_specs)
         ])
-
-        # >>>
-        # pax({"layers": list(self.layers)})
-        # <<<
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:

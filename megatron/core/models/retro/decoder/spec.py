@@ -26,10 +26,6 @@ from .attn import (
     RetroDecoderLayerNorm,
 )
 
-# >>>
-from lutil import pax
-# <<<
-
 
 def get_retro_decoder_layer_spec(encoder_block_submodules=None) -> ModuleSpec:
     spec = get_gpt_layer_with_transformer_engine_spec()
@@ -54,14 +50,6 @@ def get_retro_decoder_layer_spec(encoder_block_submodules=None) -> ModuleSpec:
             linear_fc2=TERowParallelLinear,
         ),
     )
-    # >>>
-    # pax({
-    #     "spec" : spec,
-    #     "spec / submodules" : spec.submodules,
-    #     "ca subs" : spec.submodules.cross_attention.submodules,
-    #     "mlp subs" : spec.submodules.mlp.submodules,
-    # })
-    # <<<
     return spec
 
 
@@ -84,14 +72,6 @@ def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockS
     retro_layer_spec_with_retriever = \
         get_retro_decoder_layer_spec(get_retro_encoder_block_spec(config))
 
-    # >>>
-    # pax(
-    #     "gpt_layer_spec",
-    #     "retro_layer_spec",
-    #     "retro_layer_spec_with_retriever",
-    # )
-    # <<<
-
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
         if layer_number == retro_layer_numbers[0]:
@@ -106,13 +86,5 @@ def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockS
         module=TransformerBlock,
         submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
     )
-
-    # >>>
-    # pax({
-    #     "block_spec" : block_spec,
-    #     "cross attns" : [ s.submodules.cross_attention
-    #                       for s in block_spec.submodules.layer_specs ],
-    # })
-    # <<<
 
     return block_spec

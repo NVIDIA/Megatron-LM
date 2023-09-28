@@ -26,10 +26,6 @@ from .attn import (
     RetroEncoderLayerNorm,
 )
 
-# >>>
-from lutil import pax
-# <<<
-
 
 def get_retro_encoder_layer_spec() -> ModuleSpec:
     spec = get_gpt_layer_with_transformer_engine_spec()
@@ -54,14 +50,6 @@ def get_retro_encoder_layer_spec() -> ModuleSpec:
             linear_fc2=TERowParallelLinear,
         ),
     )
-    # >>>
-    # pax({
-    #     "spec" : spec,
-    #     "spec / submodules" : spec.submodules,
-    #     "ca subs" : spec.submodules.cross_attention.submodules,
-    #     "mlp subs" : spec.submodules.mlp.submodules,
-    # })
-    # <<<
     return spec
 
 
@@ -89,13 +77,5 @@ def get_retro_encoder_block_spec(config: TransformerConfig) -> ModuleSpec:
         module=TransformerBlock,
         submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
     )
-
-    # >>>
-    # pax({
-    #     "block_spec" : block_spec,
-    #     "cross attns" : [ s.submodules.cross_attention
-    #                       for s in block_spec.submodules.layer_specs ],
-    # })
-    # <<<
 
     return block_spec

@@ -91,18 +91,12 @@ class TransformerLayer(MegatronModule):
         self.cross_attn_bda = build_module(
             submodules.cross_attn_bda,
             config=self.config,
-            # >>>
-            # submodules=submodules.cross_attention,
-            # <<<
         )
 
         ## [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
-            # >>>
-            # submodules=submodules.cross_attention,
-            # <<<
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
