@@ -129,7 +129,7 @@ def _reduce_scatter_along_first_dim(input_):
     return output
 
 def _gather_along_first_dim_moe(input_, expert_parallel):
-    """Gather tensors and concatinate along the first dimension."""
+    """Gather tensors and concatenate along the first dimension."""
     if expert_parallel:
         group = get_tensor_and_data_parallel_group()
     else:
