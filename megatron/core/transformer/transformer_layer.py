@@ -193,6 +193,11 @@ class TransformerLayer(MegatronModule):
             layer_key = f'{prefix}{global_layer_offset - offset}.{layer_name}'  # module list index in TransformerBlock
             sharded_offsets = [(0, global_layer_offset, num_layers)]  # PP sharding
 
+            # TODO: move it to MLP after merging the "sharded_state_dict modularization" MR
+            is_glu_weight = (
+                layer_name == 'mlp.linear_fc1.weight' and self.mlp.config.gated_linear_unit
+            )
+
             if layer_name in tensor_parallel_layers_axis_map:
                 tp_axis = tensor_parallel_layers_axis_map[layer_name]
                 # TP sharding
