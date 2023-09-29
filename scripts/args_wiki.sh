@@ -61,7 +61,7 @@ LOG_INTERVAL=10 # *1, 100
 #     --load ${CHECKPOINT_DIR} \
 #     \
 ARGS=" \
-    --exit-interval 300 \
+    --exit-interval 1000 \
     \
     ${TOKENIZER_ARGS} \
     --tensor-model-parallel-size 1 \
