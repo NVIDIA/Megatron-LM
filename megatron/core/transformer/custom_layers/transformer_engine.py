@@ -165,7 +165,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs,
         )
 
     def forward(self, x):
