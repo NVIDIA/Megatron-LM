@@ -156,11 +156,21 @@ class TransformerLayer(MegatronModule):
     ):
         # hidden_states: [s, b, h]
 
+        # >>>
         # Residual connection.
         residual = hidden_states
+        # <<<
 
         # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
+
+        # >>>
+        # # Residual connection.
+        # if self.apply_residual_connection_post_layernorm:
+        #     residual = input_layernorm_output
+        # else:
+        #     residual = hidden_states
+        # <<<
 
         # Self attention.
         attention_output_with_bias = self.self_attention(
@@ -177,11 +187,21 @@ class TransformerLayer(MegatronModule):
                 attention_output_with_bias, residual, self.config.hidden_dropout
             )
 
+        # >>>
         # Residual connection.
         residual = hidden_states
+        # <<<
 
         # Optional Layer norm after self-attention
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+
+        # >>>
+        # # Residual connection.
+        # if self.apply_residual_connection_post_layernorm:
+        #     residual = pre_cross_attn_layernorm_output
+        # else:
+        #     residual = hidden_states
+        # <<<
 
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
@@ -202,11 +222,21 @@ class TransformerLayer(MegatronModule):
                 attention_output_with_bias, residual, self.config.hidden_dropout
             )
 
+        # >>>
         # Residual connection.
         residual = hidden_states
+        # <<<
 
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+
+        # >>>
+        # # Residual connection.
+        # if self.apply_residual_connection_post_layernorm:
+        #     residual = pre_mlp_layernorm_output
+        # else:
+        #     residual = hidden_states
+        # <<<
 
         # MLP.
         mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)

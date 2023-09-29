@@ -39,11 +39,6 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
-        # >>>
-        # from lutil import pax
-        # pax("hidden_states", "attention_mask", "key_value_states")
-        # <<<
-
         ns, bs, d = hidden_states.shape # [r, bs * l * k, d]
 
         # Divide sequence dimension into chunks.
@@ -105,12 +100,11 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
                 for attention_output, attention_bias, residual in x_with_bias
             ]
 
-        # >>>
-        from lutil import pax
-        pax("outputs")
-        # <<<
+        # Concatenate outputs (to shape [r, k*bs*l, d]; see notation above).
+        ns, _, d = outputs[0].shape
+        output = torch.stack(outputs, dim=1).reshape(ns, -1, d)
 
-        return outputs
+        return output
 
     def forward(self, training, fused):
         return partial(
@@ -129,19 +123,20 @@ class RetroEncoderLayerNorm(MegatronModule):
     ):
         super().__init__(config=config)
         self.norm = TENorm(config=config, **kwargs)
+        self.retro_num_neighbors = config.retro_num_neighbors
 
-    def forward(self, layernorm_inputs):
+    def forward(self, input):
 
-        layernorm_outputs = [ self.norm(inp) for inp in layernorm_inputs ]
+        # Split input into 'num_neighbors' tensors.
+        chunk_size = input.shape[1] // self.retro_num_neighbors
+        inputs = torch.split(input, chunk_size, dim=1)
+
+        # Norm.
+        outputs = [ self.norm(inp.contiguous()) for inp in inputs ]
 
         # Concatenate layer norms (to shape [r, k*bs*l, d]; see notation above).
-        ns, _, d = layernorm_inputs[0].shape
-        layernorm_output = torch.stack(layernorm_outputs, dim=1).reshape(ns,-1,d)
+        ns, _, d = inputs[0].shape
+        output = torch.stack(outputs, dim=1).reshape(ns,-1,d)
 
-        # >>>
-        # from lutil import pax
-        # pax("layernorm_output")
-        # <<<
-
-        return layernorm_output
+        return output
 

@@ -61,11 +61,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
     ):
         # hidden_states: [sq, b, h]
 
-        # >>>
-        # from lutil import pax
-        # pax("hidden_states", "attention_mask", "key_value_states") # , {"encoder": self.encoder, "layer_number": self.attn.layer_number})
-        # <<<
-
         """Cross attention for Retro decoder.
 
         Notation:
@@ -127,17 +122,10 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             self.retro_chunk_length, bs * l, d).contiguous()
 
         # Encoder output.
-        # >>>
-        try:
-            attention_output, attention_bias = \
-                self.attn(padded_chunked_output,
-                          None,
-                          key_value_states=key_value_states)
-        except Exception as e:
-            from lutil import pax
-            pax("padded_chunked_output", "key_value_states")
-        raise Exception("hi.")
-        # <<<
+        attention_output, attention_bias = \
+            self.attn(padded_chunked_output,
+                      None,
+                      key_value_states=key_value_states)
 
         # Return dimensions for bias-dropout step.
         return {
