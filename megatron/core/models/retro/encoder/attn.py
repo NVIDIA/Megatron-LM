@@ -39,6 +39,11 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
+        # >>>
+        # from lutil import pax
+        # pax("hidden_states", "attention_mask", "key_value_states")
+        # <<<
+
         ns, bs, d = hidden_states.shape # [r, bs * l * k, d]
 
         # Divide sequence dimension into chunks.
@@ -73,11 +78,9 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
         **kwargs,
     ):
         super().__init__(config=config)
-        self.spec = spec
         self.retro_num_neighbors = config.retro_num_neighbors
 
     @classmethod
@@ -102,6 +105,11 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
                 for attention_output, attention_bias, residual in x_with_bias
             ]
 
+        # >>>
+        from lutil import pax
+        pax("outputs")
+        # <<<
+
         return outputs
 
     def forward(self, training, fused):
@@ -117,11 +125,9 @@ class RetroEncoderLayerNorm(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: ModuleSpec,
         **kwargs,
     ):
         super().__init__(config=config)
-        self.spec = spec
         self.norm = TENorm(config=config, **kwargs)
 
     def forward(self, layernorm_inputs):
@@ -131,6 +137,11 @@ class RetroEncoderLayerNorm(MegatronModule):
         # Concatenate layer norms (to shape [r, k*bs*l, d]; see notation above).
         ns, _, d = layernorm_inputs[0].shape
         layernorm_output = torch.stack(layernorm_outputs, dim=1).reshape(ns,-1,d)
+
+        # >>>
+        # from lutil import pax
+        # pax("layernorm_output")
+        # <<<
 
         return layernorm_output
 

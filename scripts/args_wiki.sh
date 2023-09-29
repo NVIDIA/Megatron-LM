@@ -16,23 +16,25 @@ ROOT_DIR=/lustre/fsw/portfolios/adlr/users/lmcafee
 # >>>
 # DATA_PATH=${ROOT_DIR}/corpus-530b/Wikipedia-shuf/Wikipedia_en_ftfy_id_shuf_text_document
 # RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/wiki-mt-lower-mcore
-# VOCAB_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-vocab.json
-# MERGE_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-merges.txt
-# TOKENIZER_ARGS=" \
-#     --tokenizer-type GPT2BPETokenizer \
-#     --vocab-file ${VOCAB_FILE} \
-#     --merge-file ${MERGE_FILE} \
-# "
-# GLOBAL_BATCH_SIZE=256
-# +++
-DATA_PATH=${ROOT_DIR}/retro/data/MTNLG/NIHExporter_shuf_text_document
-RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/nih
+DATA_PATH=${ROOT_DIR}/corpus-530b/wiki-tiny/wiki-200k_text_document
+RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/wiki-tiny
+VOCAB_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-vocab.json
+MERGE_FILE=${ROOT_DIR}/retro/misc/vocab/gpt2-merges.txt
 TOKENIZER_ARGS=" \
-    --tokenizer-type GPTSentencePieceTokenizer \
-    --tokenizer-model /lustre/fsw/portfolios/adlr/projects/adlr_nlp_arch/adlr_nlp_sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
+    --tokenizer-type GPT2BPETokenizer \
+    --vocab-file ${VOCAB_FILE} \
+    --merge-file ${MERGE_FILE} \
 "
-# GLOBAL_BATCH_SIZE=16
 GLOBAL_BATCH_SIZE=256
+# +++
+# DATA_PATH=${ROOT_DIR}/retro/data/MTNLG/NIHExporter_shuf_text_document
+# RETRO_WORKDIR=${ROOT_DIR}/retro/workdirs/nih
+# TOKENIZER_ARGS=" \
+#     --tokenizer-type GPTSentencePieceTokenizer \
+#     --tokenizer-model /lustre/fsw/portfolios/adlr/projects/adlr_nlp_arch/adlr_nlp_sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
+# "
+# # GLOBAL_BATCH_SIZE=16
+# GLOBAL_BATCH_SIZE=256
 # <<<
 
 # CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c${USE_CORE}-r${ADD_RETRIEVER}
@@ -42,11 +44,14 @@ GLOBAL_BATCH_SIZE=256
 # --loss-scale 1024 \
 # --DDP-impl local \
 # --fp16 \
+    # --train-samples  2037248  \
+    # --lr-decay-samples 166400000 \
+    # --lr-warmup-samples 162761 \
 NUM_LAYERS=12 # 4, [*12]
 HIDDEN_SIZE=768 # 256, [512], *768
 NUM_HEADS=12 # [4], 8, *12
 MICRO_BATCH_SIZE=4 # [4], *8
-LOG_INTERVAL=1 # 100
+LOG_INTERVAL=10 # *1, 100
 # SAVE_INTERVAL=2000 # [2000], *10000
 # ARGS=" \
 #     --tensorboard-dir ${TENSORBOARD_DIR} \
@@ -56,6 +61,8 @@ LOG_INTERVAL=1 # 100
 #     --load ${CHECKPOINT_DIR} \
 #     \
 ARGS=" \
+    --exit-interval 300 \
+    \
     ${TOKENIZER_ARGS} \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
@@ -66,9 +73,9 @@ ARGS=" \
     --max-position-embeddings 2048 \
     --micro-batch-size ${MICRO_BATCH_SIZE} \
     --global-batch-size ${GLOBAL_BATCH_SIZE} \
-    --train-samples  2037248  \
-    --lr-decay-samples 166400000 \
-    --lr-warmup-samples 162761 \
+    --train-samples 100000  \
+    --lr-decay-samples 99000 \
+    --lr-warmup-samples 1000 \
     --lr 6.0e-4 \
     --min-lr 6.0e-5 \
     --lr-decay-style cosine \

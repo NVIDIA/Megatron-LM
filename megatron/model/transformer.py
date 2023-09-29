@@ -886,6 +886,11 @@ class ParallelTransformerLayer(MegatronModule):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
+        # >>>
+        # from lutil import pax
+        # pax("norm_output", "retriever_output")
+        # <<<
+
         ns, bs, d = norm_output.shape # [r, bs * l * k, d]
 
         # Divide sequence dimension into chunks.
@@ -935,6 +940,11 @@ class ParallelTransformerLayer(MegatronModule):
         norm_input = torch.stack(norm_inputs, dim=1).reshape(ns, bs, d)
         norm_output = torch.stack(norm_outputs, dim=1).reshape(ns, bs, d)
 
+        # >>>
+        # from lutil import pax
+        # pax("norm_output")
+        # <<<
+
         return norm_input, norm_output
 
     def retro_decoder_cross_attention(self,
@@ -956,6 +966,11 @@ class ParallelTransformerLayer(MegatronModule):
             k  : Number of neighbors.
             r  : Number of retrieved tokens (neighbors + continuation).
         """
+
+        # >>>
+        # from lutil import pax
+        # pax("norm_output", "retriever_attn_mask", "retriever_input")
+        # <<<
 
         ns, bs, d = norm_output.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
@@ -1006,6 +1021,10 @@ class ParallelTransformerLayer(MegatronModule):
             self.retro_chunk_length, bs * l, d).contiguous()
 
         # Encoder output.
+        # >>>
+        from lutil import pax
+        pax("padded_chunked_output", "retriever_output")
+        # <<<
         attention_output, attention_bias = \
             self.inter_attention(padded_chunked_output,
                                  None,

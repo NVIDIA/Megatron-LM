@@ -9,6 +9,7 @@ from typing import Callable, Optional, Tuple
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.attn import BaseRetroCrossAttention
 from megatron.core.transformer import (
+    build_module,
     ModuleSpec,
     TransformerBlockSubmodules,
     TransformerConfig,
@@ -28,7 +29,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        encoder_block_spec: ModuleSpec = None,
+        encoder_block_spec: TransformerBlockSubmodules = None,
         **kwargs,
     ):
         super().__init__(
@@ -41,7 +42,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         if encoder_block_spec:
             self.encoder = build_module(
-                spec=encoder_block_spec,
+                encoder_block_spec,
                 config=config,
                 pre_process=True,
                 post_process=False,
@@ -59,6 +60,11 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         # rotary_pos_emb=None, # ... unsupported for retro.
     ):
         # hidden_states: [sq, b, h]
+
+        # >>>
+        # from lutil import pax
+        # pax("hidden_states", "attention_mask", "key_value_states") # , {"encoder": self.encoder, "layer_number": self.attn.layer_number})
+        # <<<
 
         """Cross attention for Retro decoder.
 
@@ -121,10 +127,17 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             self.retro_chunk_length, bs * l, d).contiguous()
 
         # Encoder output.
-        attention_output, attention_bias = \
-            self.attn(padded_chunked_output,
-                      None,
-                      key_value_states=key_value_states)
+        # >>>
+        try:
+            attention_output, attention_bias = \
+                self.attn(padded_chunked_output,
+                          None,
+                          key_value_states=key_value_states)
+        except Exception as e:
+            from lutil import pax
+            pax("padded_chunked_output", "key_value_states")
+        raise Exception("hi.")
+        # <<<
 
         # Return dimensions for bias-dropout step.
         return {

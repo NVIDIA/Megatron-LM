@@ -214,9 +214,15 @@ class TransformerLayer(MegatronModule):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.config.hidden_dropout
-            )
+            # >>>
+            try:
+                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                    mlp_output_with_bias, residual, self.config.hidden_dropout
+                )
+            except Exception as e:
+                from lutil import pax
+                pax("residual", "pre_mlp_layernorm_output", "mlp_output_with_bias")
+            # <<<
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

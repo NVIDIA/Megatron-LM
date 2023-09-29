@@ -13,13 +13,20 @@ REPO_DIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/megatrons/retro-mcore"
 # DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/Wikipedia-shuf/Wikipedia_en_ftfy_id_shuf_text_document"
 # RETRO_INDEX_STR="IVF262144_HNSW32,Flat"
 # RETRO_INDEX_NTRAIN=66625331
+# RETRO_GPT_TRAIN_SAMPLES=2037248
+# RETRO_GPT_LR_DECAY_SAMPLES=2000000
+# RETRO_GPT_LR_WARMUP_SAMPLES=20000
 # RETRO_QUERY_EF_SEARCH=16
 # RETRO_QUERY_NPROBE=4096
 # +++
 RETRO_WORKDIR="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/workdirs/wiki-tiny"
 DATA_BLEND="1.0 /lustre/fsw/portfolios/adlr/users/lmcafee/corpus-530b/wiki-tiny/wiki-200k_text_document"
-RETRO_INDEX_STR="IVF4096_HNSW4,Flat"
+# RETRO_INDEX_STR="IVF4096_HNSW4,Flat"
+RETRO_INDEX_STR="OPQ8_32,IVF4096_HNSW4,PQ8"
 RETRO_INDEX_NTRAIN=31250
+RETRO_GPT_TRAIN_SAMPLES=100000
+RETRO_GPT_LR_DECAY_SAMPLES=99000
+RETRO_GPT_LR_WARMUP_SAMPLES=1000
 RETRO_QUERY_EF_SEARCH=4
 RETRO_QUERY_NPROBE=64
 # <<<
@@ -27,9 +34,9 @@ RETRO_QUERY_NPROBE=64
 ######## Task (e.g., db, index, query). ########
 
 # RETRO_TASKS="db-build"
-RETRO_TASKS="index-train"
+# RETRO_TASKS="index-train"
 # RETRO_TASKS="index-add"
-# RETRO_TASKS="query-pretraining-neighbors"
+RETRO_TASKS="query-pretraining-neighbors"
 
 ######## Data. ########
 
@@ -47,9 +54,6 @@ RETRO_GPT_DATA_PATH=${DATA_BLEND}
 RETRO_GPT_DATALOADER_TYPE=cyclic # single
 RETRO_GPT_EVAL_INTERVAL=2000
 RETRO_GPT_EVAL_ITERS=100
-RETRO_GPT_TRAIN_SAMPLES=2037248
-RETRO_GPT_LR_DECAY_SAMPLES=2000000
-RETRO_GPT_LR_WARMUP_SAMPLES=20000
 RETRO_GPT_SEQ_LENGTH=2048
 RETRO_GPT_GLOBAL_BATCH_SIZE=256
 RETRO_GPT_CHUNK_LENGTH=64

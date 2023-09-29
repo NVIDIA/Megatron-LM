@@ -27,12 +27,12 @@ from .attn import (
 )
 
 
-def get_retro_decoder_layer_spec(encoder_block_submodules=None) -> ModuleSpec:
+def get_retro_decoder_layer_spec(encoder_block_spec=None) -> ModuleSpec:
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={
-            "encoder_block_submodules" : encoder_block_submodules,
+            "encoder_block_spec" : encoder_block_spec,
         },
         submodules=CrossAttentionSubmodules(
             linear_q=TELayerNormColumnParallelLinear,
@@ -50,6 +50,11 @@ def get_retro_decoder_layer_spec(encoder_block_submodules=None) -> ModuleSpec:
             linear_fc2=TERowParallelLinear,
         ),
     )
+    # >>>
+    # from lutil import pax
+    # if encoder_block_spec:
+    #     pax("encoder_block_spec")
+    # <<<
     return spec
 
 
@@ -86,5 +91,11 @@ def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockS
         module=TransformerBlock,
         submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
     )
+
+    # >>>
+    # from lutil import pax
+    # pax({"layers": [ s.submodules.cross_attention
+    #                  for s in block_spec.submodules.layer_specs ]})
+    # <<<
 
     return block_spec
