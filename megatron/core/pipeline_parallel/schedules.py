@@ -5,7 +5,6 @@ from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import core
 from megatron.core import parallel_state
@@ -315,8 +314,6 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
 
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and isinstance(model, torchDDP):
-        no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
@@ -386,15 +383,6 @@ def forward_backward_pipelining_with_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and all(isinstance(chunk, torchDDP) for chunk in model):
-
-        def multi_no_sync():
-            stack = contextlib.ExitStack()
-            for chunk in model:
-                stack.enter_context(chunk.no_sync())
-            return stack
-
-        no_sync_func = multi_no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
@@ -1057,8 +1045,6 @@ def forward_backward_pipelining_without_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
-    if no_sync_func is None and isinstance(model, torchDDP):
-        no_sync_func = model.no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
@@ -1208,6 +1194,12 @@ def forward_backward_pipelining_without_interleaving(
             # the backward pass.
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
+
+            # Enable grad sync for the last microbatch in the batch if the full
+            # backward pass completes in the 1F1B stage.
+            if num_warmup_microbatches == 0 and last_iteration:
+                if config.grad_sync_func is None or rank == 0:
+                    enable_grad_sync()
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
