@@ -295,7 +295,7 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
 
 
 class _GatherFromSequenceParallelRegionToMOE(torch.autograd.Function):
-    """Gather the input from model parallel region and concatinate.""" #TODO
+    """Gather the input from model parallel region and concatenate.""" #TODO
 
     @staticmethod
     def symbolic(graph, input_, expert_parallel):
