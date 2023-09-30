@@ -156,13 +156,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        # Set the detauls for compatibility.
-        self.padding_idx = None
-        self.max_norm = None
-        self.norm_type = 2.0
-        self.scale_grad_by_freq = False
-        self.sparse = False
-        self._weight = None
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         # Divide the weight matrix along the vocaburaly dimension.
         (
@@ -211,16 +204,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input[input_mask] = 0
         else:
             masked_input = input_
-            # Get the embeddings.
-        output_parallel = F.embedding(
-            masked_input,
-            self.weight,
-            self.padding_idx,
-            self.max_norm,
-            self.norm_type,
-            self.scale_grad_by_freq,
-            self.sparse,
-        )
+        # Get the embeddings.
+        output_parallel = self.weight[masked_input]
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
