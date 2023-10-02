@@ -23,6 +23,13 @@ from megatron.core.transformer import (
 
 
 def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
+    """
+    A Retro decoder layer uses custom attention and bias-dropout-add operators
+    to perform chunked-cross attention. Additionally, the first Retro decoder
+    layer instantiates an entire encoder transformer block. As such, the decoder
+    cross attention module takes an optional encoder block spec, which is only
+    provided for the first Retro decoder layer.
+    """
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
@@ -41,6 +48,16 @@ def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> Modul
 
 
 def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
+
+    """
+    Retro decoder block implementation details:
+    - The retro decoder block consists of interleaved GPT layers and customized
+      Retro decoder layers.
+    - The Retro decoder layers are spaced three layers apart, and start on layer
+      6 or 9 (depending on the total number of layers).
+    - The first decoder layer instantiates an encoder block, and it therefore
+      passes in an encoder_block_spec.
+    """
 
     # Num layers.
     assert parallel_state.get_pipeline_model_parallel_world_size() == 1, \

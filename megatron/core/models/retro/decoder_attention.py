@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+"""Retro's cross attention modules for the decoder block."""
+
 from functools import partial
 import numpy as np
 import torch
@@ -21,6 +23,14 @@ from megatron.core.transformer.module import MegatronModule
 
 class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
+    """Retro decoder's chunked cross attention operator.
+
+    See this paper for more details: https://arxiv.org/abs/2112.04426.
+
+    Neighboring chunks retrieved from the chunk database are used here for
+    chunked-cross attention.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -29,6 +39,23 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         encoder_block_spec: TransformerBlockSubmodules = None,
     ):
+        """
+        ** Note about 'encoder_block_spec' **
+
+        Retro is an encoder-decoder model that uses its encoder for encoding
+        neighboring chunks that are retrieved from a chunk database. These
+        encoded neighbors are then used in the decoder stack for performing
+        chunked-cross attention (see paper link above).
+
+        In contrast to the T5 model, the encoder and decoder are computationally
+        intertwined, since the input to the encoder is the output of the self-
+        attention of the first decoder layer. As such, the encoder block itself
+        is instantiated within the first Retro decoder layer, in order to receive
+        the self-attention's output. (Note, that only the first decoder layer
+        instantiates an encoder block, and the remaining decoder layers use the
+        encoder output from the first decoder layer.)
+        """
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -137,6 +164,12 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
 
 class RetroDecoderBiasDropoutAdd(MegatronModule):
+
+    """Retro decoder's bias-dropout-add operator.
+
+    This operator takes care of reshaping and permuting the output from the
+    chunk dimension to the sequence dimension.
+    """
 
     def __init__(
         self,

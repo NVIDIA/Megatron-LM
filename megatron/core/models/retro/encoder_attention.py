@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+"""Retro's cross attention modules for the encoder block."""
+
 from functools import partial
 import torch
 from torch import Tensor
@@ -14,6 +16,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class RetroEncoderCrossAttention(BaseRetroCrossAttention):
+
+    """Retro encoder's cross attention operator.
+
+    See this paper for more details: https://arxiv.org/abs/2112.04426.
+
+    Neighboring chunks are retrieved from the chunk database, encoded, and
+    used by the decoder layers for chunked cross attention.
+    """
 
     def forward(
         self,
@@ -67,6 +77,12 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
 class RetroEncoderBiasDropoutAdd(MegatronModule):
 
+    """Retro encoder's bias-dropout-add operator.
+
+    This operator applies bias-dropout-add individually on each neighboring
+    chunk that is retrieved from the chunk database.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -111,6 +127,13 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
 
 class RetroEncoderLayerNorm(MegatronModule):
+
+    """Retro encoder's layernorm operator.
+
+    This operator applies layernorm individually on each neighboring chunk that
+    is retrieved from the chunk database, and then concatenates the chunks into
+    a single tensor.
+    """
 
     def __init__(
         self,

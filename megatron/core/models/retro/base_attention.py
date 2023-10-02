@@ -8,6 +8,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class BaseRetroCrossAttention(MegatronModule):
 
+    """Base class for Retro cross attention, for both encoder & decoder layers.
+
+    This class collects the retro arguments below (i.e., num neighbors, chunk
+    length, and retrieve length) for use in Retro's custom cross attention
+    operators.
+    """
+
     def __init__(
         self,
         config: TransformerConfig,

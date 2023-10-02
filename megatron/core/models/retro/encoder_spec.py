@@ -24,6 +24,12 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 
 
 def get_retro_encoder_layer_spec() -> ModuleSpec:
+    """
+    A Retro encoder layer uses custom attention, bias-dropout-add, and layernorm
+    operators to encode neighboring chunks that are retrieved from the chunk
+    database. Each operator is responsible for iterating the retrieved chunks
+    and processing them individually.
+    """
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroEncoderCrossAttention,
@@ -50,6 +56,11 @@ def get_retro_encoder_layer_spec() -> ModuleSpec:
 
 
 def get_retro_encoder_block_spec(config: TransformerConfig) -> ModuleSpec:
+
+    """
+    The retro encoder block consists of one customized Retro encoder layer
+    (layer 1), and all of the following layers are standard GPT layers.
+    """
 
     # Num layers.
     num_layers = config.retro_encoder_num_layers

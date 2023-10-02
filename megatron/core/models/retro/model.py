@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+"""Retro Model."""
+
 from torch import Tensor
 
 from megatron.core import InferenceParams
@@ -7,6 +9,14 @@ from megatron.core.models.gpt import GPTModel
 
 
 class RetroModel(GPTModel):
+
+    """Retro Model.
+
+    A Retro model mostly re-uses the GPTModel interface, with the only difference
+    being the embedding of the 'context' this is used by Retro for processing
+    neighbor tokens. This embedded context is then forwarded to the Transformer
+    Block.
+    """
 
     def forward(
         self,
@@ -27,6 +37,7 @@ class RetroModel(GPTModel):
         else:
             context = None
 
+        # Call GPTModel.forward, and pass in embedded context.
         return super().forward(
             input_ids=input_ids,
             position_ids=position_ids,
