@@ -4,14 +4,16 @@
 
 import os
 import torch
+from torch import Tensor
 from functools import partial
+from typing import Union
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.data.gpt_dataset import GPTDataset, build_train_valid_test_datasets
 import megatron.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
@@ -21,14 +23,25 @@ from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
 
-def model_provider(pre_process=True, post_process=True):
-    """Build the model."""
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+    """Builds the model
+
+    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model. 
+
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+
+
+    Returns:
+        Union[GPTModel, megatron.model.GPTModel]: The returned model
+    """
     args = get_args()
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(get_args())
 
-    if args.use_mcore:
+    if args.use_mcore_models:
         if args.model_spec is not None:
             transformer_layer_spec = import_module(args.model_spec)
         else:
@@ -90,7 +103,18 @@ def get_batch(data_iterator):
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask: Tensor, output_tensor: Tensor) -> tuple(Tensor, dict):
+    """Loss function
+
+    _extended_summary_
+
+    Args:
+        loss_mask (Tensor): Used to mask out some portions of the loss 
+        output_tensor (Tensor): The tensor with the losses 
+
+    Returns:
+        tuple(Tensor, dict): Returns a tuple of the total loss, and the averaged loss across data parallel group as a dictionary
+    """    
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
@@ -110,8 +134,14 @@ def loss_func(loss_mask, output_tensor):
     return loss, {'lm loss': averaged_loss[0]}
 
 
-def forward_step(data_iterator, model):
-    """Forward step."""
+def forward_step(data_iterator, model: GPTModel):
+    """Forward training step
+
+    Args:
+        data_iterator (_type_): Input data iterator
+        model (GPTModel): The GPT Model 
+
+    """
     args = get_args()
     timers = get_timers()
 
@@ -127,8 +157,15 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Build train, valid, and test datasets."""
+def train_valid_test_datasets_provider(train_val_test_num_samples) -> tuple(GPTDataset, GPTDataset, GPTDataset):
+    """Build the train test and validation datasets
+
+    Args:
+        train_val_test_num_samples (_type_): A list containing the number of samples in train test and validation. 
+
+    Returns:
+        tuple(GPTDataset, GPTDataset, GPTDataset): The train, valid and test datasets
+    """
     args = get_args()
 
     print_rank_0('> building train, validation, and test datasets '

@@ -19,32 +19,61 @@ def param_is_not_shared(param):
 
 
 class MegatronModule(torch.nn.Module):
-    """Megatron specific extensions of torch Module with support
-    for pipelining."""
+    """Base Megatron module inhertied by all Models
+
+    Megatron specific extensions of torch Module with support
+    for pipelining
+
+    Attributes:
+        config (TransformerConfig): Transformer config
+    """
 
     # def __init__(self, config: TransformerConfig, share_word_embeddings=True):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
 
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """Use this function to override the state dict for
-           saving checkpoints.
+    def state_dict_for_save_checkpoint(self, prefix:str='', keep_vars:bool=False):
+        """Override state dict for saving checkpoints
+            Use this function to override the state dict for saving checkpoints
+
+        Args:
+            prefix (str, optional): _description_. Defaults to ''.
+            keep_vars (bool, optional): _description_. Defaults to False.
+
+        Returns:
+            _type_: _description_
         """
 
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
-    def sharded_state_dict(self, prefix=''):
-        """ Override sharded_state_dict when using distributed checkpointing.
-            keep_vars must always be set to True so that optimizer states
-            can be sharded.
-        """
+    def sharded_state_dict(self, prefix:str=''):
+        """Override sharded state dict with Dist Checkpointing
+
+        Override sharded_state_dict when using distributed checkpointing. keep_vars must always be set to True so that optimizer states can be sharded.
+
+        Args:
+            prefix (str, optional): _description_. Defaults to ''.
+
+        Returns:
+            _type_: _description_
+        """        
         return self.state_dict(prefix=prefix, keep_vars=True)
 
 
 def conversion_helper(val, conversion):
-    """Apply conversion to val. Recursively apply conversion if `val`
-    #is a nested tuple/list structure."""
+    """Aplpy conversion to val
+
+    Apply conversion to val. Recursively apply conversion if `val` is a nested tuple/list structure.
+
+    Args:
+        val (_type_): _description_
+        conversion (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """    
+    """"""
     if not isinstance(val, (tuple, list)):
         return conversion(val)
     rtn = [conversion_helper(v, conversion) for v in val]
@@ -54,8 +83,15 @@ def conversion_helper(val, conversion):
 
 
 def fp32_to_float16(val, float16_convertor):
-    """Convert fp32 `val` to fp16/bf16"""
+    """Convert fp32 `val` to fp16/bf1
 
+    Args:
+        val (_type_): _description_
+        float16_convertor (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """  
     def half_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
@@ -68,8 +104,15 @@ def fp32_to_float16(val, float16_convertor):
 
 
 def float16_to_fp32(val):
-    """Convert fp16/bf16 `val` to fp32"""
+    """Convert fp16/bf16 `val` to fp32
 
+    Args:
+        val (_type_): _description_
+        float16_convertor (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """  
     def float_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
@@ -82,7 +125,24 @@ def float16_to_fp32(val):
 
 
 class Float16Module(MegatronModule):
+    """Float 16 Module.
+
+    Attributes:
+        config (TransformerConfig): Transformer config
+        fp16 (bool) : Specifies if the model runs in fp16 mode 
+        bf16 (bool) : Specifies if the model runs in bf16 mode 
+    """    
     def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+        """Constructor for the float 16 module
+
+        Args:
+            config (TransformerConfig): The transformer config used to initalize the model
+            module (torch.nn.Module): _description_
+
+        Raises:
+            Exception: If both fp16 and bf16 are not enabled it raises an exception
+
+        """        
         super(Float16Module, self).__init__(config)
         self.config = config
         self.fp16 = config.fp16

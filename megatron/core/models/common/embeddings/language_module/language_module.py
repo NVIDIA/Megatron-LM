@@ -1,18 +1,27 @@
 import logging
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 import torch
+from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 
 
-class LanguageModel(MegatronModule):
-    def __init__(self, config):
+class LanguageModule(MegatronModule):
+    """Base language module that has common helper functions used across GPT, BERT etc.
+    """
+    def __init__(self, config: TransformerConfig) -> None :
         super().__init__(config=config)
 
-    def set_input_tensor(self, input_tensor):
-        """ See megatron.model.transformer.set_input_tensor()"""
+    def set_input_tensor(self, input_tensor: Tensor) -> None :
+        """Sets input tensor to the model
 
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model. 
+        """        
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
         if not isinstance(input_tensor, list):
@@ -21,7 +30,16 @@ class LanguageModel(MegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def compute_language_model_loss(self, labels, logits):
+    def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+        """ Computes the language model loss (Cross entropy across vocabulary)
+
+        Args:
+            labels (Tensor): The labels of dimension [batch size, seq length]
+            logits (Tensor): The final logits returned by the output layer of the transformer model
+
+        Returns:
+            Tensor: Loss tensor of dimensions [batch size, sequence_length]
+        """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
@@ -30,12 +48,11 @@ class LanguageModel(MegatronModule):
         loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    def initialize_last_stage_with_word_embeddings(self):
+    def initialize_last_stage_with_word_embeddings(self) -> None :
+        """Intializes the word embeddings in the final stage
 
-        # This function just initializes the word embeddings in the final stage
-        # when we are using pipeline parallelism and sharing word
-        # embeddings. Nothing to do if we aren't sharing weights or aren't using
-        # pipeline parallelism.
+        This function just initalizes word embeddings in the final stage, when we are using pipeline parallelism and sharind word embeddings. Nothing to do if we arn't sharing weights or aren't using Pipeline parallelism
+        """
         if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
             return
 
@@ -68,7 +85,7 @@ class LanguageModel(MegatronModule):
                     weight.data, group=parallel_state.get_embedding_group()
                 )
 
-        elif not getattr(LanguageModel, "embedding_warning_printed", False):
+        elif not getattr(LanguageModule, "embedding_warning_printed", False):
             logging.getLogger(__name__).warning(
                 "Distributed processes aren't initialized, so the output layer "
                 "is not initialized with weights from the word embeddings. "
@@ -76,4 +93,4 @@ class LanguageModel(MegatronModule):
                 "this needs to be handled manually. If you are training "
                 "something is definitely wrong."
             )
-            LanguageModel.embedding_warning_printed = True
+            LanguageModule.embedding_warning_printed = True

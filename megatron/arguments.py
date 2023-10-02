@@ -844,7 +844,7 @@ def _add_training_args(parser):
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
                        help='Use the implementation from megatron core',
-                       dest='use_mcore')                       
+                       dest='use_mcore_models')                       
     return parser
 
 
