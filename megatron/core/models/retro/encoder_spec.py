@@ -1,9 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-from dataclasses import dataclass
-
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.encoder_attention import (
     RetroEncoderCrossAttention,
     RetroEncoderBiasDropoutAdd,

@@ -4,21 +4,18 @@ from functools import partial
 import numpy as np
 import torch
 from torch import Tensor
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.transformer import (
     build_module,
-    ModuleSpec,
     TransformerBlockSubmodules,
     TransformerConfig,
 )
 from megatron.core.transformer.attention import CrossAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_block import TransformerBlock
 
 
 class RetroDecoderCrossAttention(BaseRetroCrossAttention):
@@ -193,17 +190,3 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             retro_chunk_length=self.retro_chunk_length,
             bias_dropout_add=get_bias_dropout_add(training, fused),
         )
-
-
-class RetroDecoderLayerNorm(MegatronModule):
-
-    def __init__(
-        self,
-        config: TransformerConfig,
-        **kwargs,
-    ):
-        super().__init__(config=config)
-        self.norm = TENorm(config=config, **kwargs)
-
-    def forward(self, x):
-        return self.norm(x)

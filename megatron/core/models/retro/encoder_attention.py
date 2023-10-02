@@ -10,7 +10,6 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -18,12 +17,11 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_params=None,
-        # rotary_pos_emb=None, # unsupported for retro.
-        # retriever_output=None, # set as key_value_states
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Tensor=None,
+        inference_params: InferenceParams=None,
+        # rotary_pos_emb: Tensor=None, # unsupported for retro.
         **kwargs,
     ):
         # hidden_states: [sq, b, h]
