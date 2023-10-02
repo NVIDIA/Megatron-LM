@@ -568,12 +568,11 @@ class ColumnParallelLinear(torch.nn.Module):
                        return it to be added by the caller. This
                        enables performance optimations where bias can
                        be fused with other elementwise operations.
-
         skip_weight_param_allocation: If True, weight parameter is not allocated and must be passed
                                       as a keyword argument `weight` during the forward pass. Note
                                       that this does not affect bias, which will be allocated if
                                       bias is True. Defaults to False.
-
+        is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
 
     """
@@ -792,6 +791,7 @@ class RowParallelLinear(torch.nn.Module):
                        return it to be added by the caller. This
                        enables performance optimations where bias can
                        be fused with other elementwise operations.
+        is_expert: If True, the layer is treated as an MoE expert layer
         config: ModelParallelConfig object
 
     """

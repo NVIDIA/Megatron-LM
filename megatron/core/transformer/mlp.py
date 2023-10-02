@@ -132,7 +132,7 @@ class SwitchMLP(MegatronModule):
             self.local_experts.append(expert)
     
     def gather_indices(self, local_indices):
-        """ Gather tensors and concatinate along the first dimension."""
+        """ Gather tensors and concatenate along the first dimension."""
         if self.expert_parallel:
             group = get_tensor_and_data_parallel_group()
         else:
