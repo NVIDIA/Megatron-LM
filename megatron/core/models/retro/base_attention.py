@@ -14,7 +14,6 @@ class BaseRetroCrossAttention(MegatronModule):
         submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        **kwargs,
     ):
         super().__init__(config=config)
 
@@ -23,7 +22,6 @@ class BaseRetroCrossAttention(MegatronModule):
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
         )
 
         self.retro_num_neighbors = config.retro_num_neighbors

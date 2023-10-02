@@ -28,14 +28,12 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         encoder_block_spec: TransformerBlockSubmodules = None,
-        **kwargs,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
         )
 
         if encoder_block_spec:
@@ -143,7 +141,6 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        **kwargs,
     ):
         super().__init__(config=config)
         self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length

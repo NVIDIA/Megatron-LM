@@ -22,7 +22,6 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         key_value_states: Tensor = None,
         inference_params: InferenceParams = None,
         # rotary_pos_emb: Tensor = None, # unsupported for retro.
-        **kwargs,
     ) -> Tensor:
         # hidden_states: [sq, b, h]
 
@@ -71,7 +70,6 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        **kwargs,
     ):
         super().__init__(config=config)
         self.retro_num_neighbors = config.retro_num_neighbors
