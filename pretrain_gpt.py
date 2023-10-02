@@ -125,8 +125,31 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     return train_ds, valid_ds, test_ds
 
 
-if __name__ == "__main__":
+def set_device_and_init_torch_dist():
+    from mpi4py import MPI
+    world_rank = MPI.COMM_WORLD.Get_rank()
+    world_size = MPI.COMM_WORLD.Get_size()
 
+    # assign a unique GPU to each MPI process on a node    
+    local_rank = world_rank % torch.cuda.device_count()
+    torch.cuda.set_device(local_rank)
+
+    init_method = "tcp://"
+    master_ip = os.getenv("MASTER_ADDR", "localhost")
+    master_port = os.getenv("MASTER_PORT", "6000")
+    init_method += master_ip + ":" + master_port
+   
+    # create a process group across all processes 
+    torch.distributed.init_process_group(
+                init_method=init_method,
+                backend="nccl",
+                world_size=world_size,
+                rank=world_rank
+    )
+
+
+if __name__ == "__main__":
+    set_device_and_init_torch_dist()
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
