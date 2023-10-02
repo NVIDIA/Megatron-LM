@@ -110,10 +110,14 @@ else
     --retro-cyclic-train-iters 750000 \
     --num-workers ${NUM_WORKERS} \
     "
-    if [ "$USE_CORE" = "0" ]; then
-	SCRIPT=pretrain_retro.py
-    else
-	SCRIPT=pretrain_retro_core.py
+    # if [ "$USE_CORE" = "0" ]; then
+    # 	SCRIPT=pretrain_retro.py
+    # else
+    # 	SCRIPT=pretrain_retro_core.py
+    # fi
+    SCRIPT=pretrain_retro.py
+    if [ "$USE_CORE" = "1" ]; then
+	ARGS="${ARGS} --retro-use-core"
     fi
 fi
 
