@@ -7,7 +7,7 @@ from typing import Callable, Optional, Tuple
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.retro.attn import BaseRetroCrossAttention
+from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec

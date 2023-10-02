@@ -2,6 +2,13 @@
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
+from megatron.core.models.retro.decoder_attention import (
+    RetroDecoderBiasDropoutAdd,
+    RetroDecoderCrossAttention,
+    RetroDecoderLayerNorm,
+)
+from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
@@ -10,20 +17,12 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.models.retro.attn import BaseRetroCrossAttention
-from megatron.core.models.retro.encoder import get_retro_encoder_block_spec
 from megatron.core.transformer import (
     get_num_layers_to_build,
     ModuleSpec,
     TransformerBlock,
     TransformerBlockSubmodules,
     TransformerConfig,
-)
-
-from .attn import (
-    RetroDecoderBiasDropoutAdd,
-    RetroDecoderCrossAttention,
-    RetroDecoderLayerNorm,
 )
 
 

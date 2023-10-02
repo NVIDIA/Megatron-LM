@@ -3,7 +3,12 @@
 from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.models.retro.attn import BaseRetroCrossAttention
+from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
+from megatron.core.models.retro.encoder_attention import (
+    RetroEncoderCrossAttention,
+    RetroEncoderBiasDropoutAdd,
+    RetroEncoderLayerNorm,
+)
 from megatron.core.transformer import (
     ModuleSpec,
     TransformerBlock,
@@ -19,12 +24,6 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 )
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-
-from .attn import (
-    RetroEncoderCrossAttention,
-    RetroEncoderBiasDropoutAdd,
-    RetroEncoderLayerNorm,
-)
 
 
 def get_retro_encoder_layer_spec() -> ModuleSpec:

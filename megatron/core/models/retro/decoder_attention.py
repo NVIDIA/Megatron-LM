@@ -7,7 +7,7 @@ from torch import Tensor
 from typing import Callable, Optional, Tuple
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.retro.attn import BaseRetroCrossAttention
+from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.transformer import (
     build_module,
     ModuleSpec,
