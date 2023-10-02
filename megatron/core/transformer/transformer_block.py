@@ -55,7 +55,7 @@ class TransformerBlockSubmodules:
     layer_specs: List[ModuleSpec] = None
 
 
-def get_block_submodules(config, spec) -> TransformerBlockSubmodules:
+def _get_block_submodules(config, spec) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
     if isinstance(spec, TransformerBlockSubmodules):
@@ -87,7 +87,7 @@ class TransformerBlock(MegatronModule):
     ):
         super().__init__(config=config)
 
-        self.submodules = get_block_submodules(config, submodules)
+        self.submodules = _get_block_submodules(config, submodules)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
