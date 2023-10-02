@@ -2,13 +2,14 @@
 
 """Utilities for transformer layers."""
 from operator import itemgetter
+from typing import Dict, Tuple, Iterable
 
 import torch
 
 from megatron import get_args
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject, StateDict
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
@@ -49,13 +50,31 @@ def erf_gelu(x):
 
 
 def make_sharded_tensors_for_checkpoint(
-    state_dict,
-    state_dict_prefix,
-    sharded_key_prefix,
-    tensor_parallel_layers_axis_map,
-    sharded_offsets,
-    extra_state_suffix='_extra_state',
+    state_dict: StateDict,
+    state_dict_prefix: str,
+    sharded_key_prefix: str,
+    tensor_parallel_layers_axis_map: Dict[str, int],
+    sharded_offsets: Iterable[Tuple[int, int, int]],
+    extra_state_suffix: str = '_extra_state',
 ):
+    """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
+
+    For a given `state_dict`, wraps all regular tensors with ShardedTensor
+    sharded according to `tensor_parallel_layers_axis_map`
+
+    Args:
+        state_dict: state_dict to convert
+        state_dict_prefix: prefix appended to keys in final state dict
+        sharded_key_prefix: prefix appended to ShardedTensor keys
+        tensor_parallel_layers_axis_map: dict mapping layer names to the axis
+            for TP sharding
+        sharded_offsets: sharding already applied (e.g. PP related),
+            passed along to ShardedTensor
+        extra_state_suffix: layers with this suffix will be wrapped with ShardedObject
+            instead of ShardedTensor. The mapping for ShardedObjects is based on the
+            mapping of the corresponding ShardedTensor.
+
+    """
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
         tensor = state_dict[layer_name]
