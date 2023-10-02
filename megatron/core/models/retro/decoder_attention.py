@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 from typing import Callable
 
+from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.transformer import (
@@ -50,12 +51,12 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_params=None,
-        # rotary_pos_emb=None, # ... unsupported for retro.
-    ):
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Tensor = None,
+        inference_params: InferenceParams = None,
+        # rotary_pos_emb: Tensor = None, # ... unsupported for retro.
+    ) -> Tensor:
         # hidden_states: [sq, b, h]
 
         """Cross attention for Retro decoder.
@@ -184,7 +185,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
 
         return x
 
-    def forward(self, training, fused):
+    def forward(self, training: bool, fused: bool) -> Tensor:
         return partial(
             self._forward,
             retro_chunk_length=self.retro_chunk_length,

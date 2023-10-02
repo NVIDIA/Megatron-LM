@@ -19,11 +19,11 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        key_value_states: Tensor=None,
-        inference_params: InferenceParams=None,
-        # rotary_pos_emb: Tensor=None, # unsupported for retro.
+        key_value_states: Tensor = None,
+        inference_params: InferenceParams = None,
+        # rotary_pos_emb: Tensor = None, # unsupported for retro.
         **kwargs,
-    ):
+    ) -> Tensor:
         # hidden_states: [sq, b, h]
 
         """Cross attention for Retro encoder.
@@ -104,7 +104,7 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
         return output
 
-    def forward(self, training, fused):
+    def forward(self, training: bool, fused: bool) -> Tensor:
         return partial(
             self._forward,
             retro_num_neighbors=self.retro_num_neighbors,
@@ -123,7 +123,7 @@ class RetroEncoderLayerNorm(MegatronModule):
         self.norm = TENorm(config=config, **kwargs)
         self.retro_num_neighbors = config.retro_num_neighbors
 
-    def forward(self, input):
+    def forward(self, input: Tensor) -> Tensor:
 
         # Split input into 'num_neighbors' tensors.
         chunk_size = input.shape[1] // self.retro_num_neighbors

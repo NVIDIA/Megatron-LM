@@ -22,7 +22,7 @@ from megatron.core.transformer import (
 )
 
 
-def get_retro_decoder_layer_spec(encoder_block_spec=None) -> ModuleSpec:
+def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
