@@ -170,4 +170,7 @@ class ModelParallelConfig:
             self.autocast_dtype = self.params_dtype
 
         if self.expert_parallel and self.tensor_model_parallel_size > 1:
-            self.sequence_parallel = True
+            if self.sequence_parallel is False:
+                raise ValueError(
+                    "When using expert parallelism and tensor parallelism, sequence parallelism must be used"
+                )
