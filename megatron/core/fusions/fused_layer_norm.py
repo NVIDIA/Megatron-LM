@@ -38,8 +38,9 @@ class FusedLayerNorm(torch.nn.Module):
 
         self.zero_centered_gamma = zero_centered_gamma
         self.normalization = normalization
-        assert normalization == "LayerNorm", '({}) is not supported in '\
-            'FusedLayerNorm'.format(normalization)
+        assert normalization == "LayerNorm", '({}) is not supported in ' 'FusedLayerNorm'.format(
+            normalization
+        )
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent

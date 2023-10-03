@@ -13,11 +13,11 @@ from .layers import (
 from .mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
+    gather_from_sequence_parallel_region_to_moe,
     gather_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region_from_moe,
     scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
-    gather_from_sequence_parallel_region_to_moe,
-    reduce_scatter_to_sequence_parallel_region_from_moe,
 )
 from .random import checkpoint, get_cuda_rng_tracker, model_parallel_cuda_manual_seed
 from .utils import (

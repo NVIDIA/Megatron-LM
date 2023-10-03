@@ -80,9 +80,9 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
         maybe_copy(attribute)
 
 
-def _initialize_affine_weight_gpu(weight, init_method,
-                                  partition_dim, stride=1,
-                                  expert_parallel=False):
+def _initialize_affine_weight_gpu(
+    weight, init_method, partition_dim, stride=1, expert_parallel=False
+):
     """Initialize affine weight for model parallel on GPU."""
 
     set_tensor_model_parallel_attributes(
@@ -638,13 +638,17 @@ class ColumnParallelLinear(torch.nn.Module):
                 )
                 if config.perform_initialization:
                     _initialize_affine_weight_gpu(
-                        self.weight, init_method, partition_dim=0, stride=stride, 
-                        expert_parallel=(self.is_expert and config.expert_parallel))
+                        self.weight,
+                        init_method,
+                        partition_dim=0,
+                        stride=stride,
+                        expert_parallel=(self.is_expert and config.expert_parallel),
+                    )
 
             setattr(self.weight, 'allreduce', not (self.is_expert and config.expert_parallel))
         else:
             self.weight = None
-        
+
         if bias:
             if config.use_cpu_initialization:
                 self.bias = Parameter(
@@ -698,7 +702,9 @@ class ColumnParallelLinear(torch.nn.Module):
             )
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-        self.explicit_expert_comm = self.is_expert and (self.sequence_parallel or config.expert_parallel)
+        self.explicit_expert_comm = self.is_expert and (
+            self.sequence_parallel or config.expert_parallel
+        )
 
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
         """Forward of ColumnParallelLinear
@@ -732,7 +738,11 @@ class ColumnParallelLinear(torch.nn.Module):
 
         bias = self.bias if not self.skip_bias_add else None
 
-        if self.async_tensor_model_parallel_allreduce or self.sequence_parallel or self.explicit_expert_comm:
+        if (
+            self.async_tensor_model_parallel_allreduce
+            or self.sequence_parallel
+            or self.explicit_expert_comm
+        ):
             input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
@@ -747,7 +757,9 @@ class ColumnParallelLinear(torch.nn.Module):
             weight=weight,
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            async_grad_allreduce=False if self.explicit_expert_comm else self.async_tensor_model_parallel_allreduce,
+            async_grad_allreduce=False
+            if self.explicit_expert_comm
+            else self.async_tensor_model_parallel_allreduce,
             sequence_parallel=False if self.explicit_expert_comm else self.sequence_parallel,
         )
         if self.gather_output:
@@ -826,8 +838,11 @@ class RowParallelLinear(torch.nn.Module):
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and not self.input_is_parallel:
             # raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
-            print('WARNING: To enable `sequence_parallel`',
-                  '`input_is_parallel` must be `True ', flush=True)
+            print(
+                'WARNING: To enable `sequence_parallel`',
+                '`input_is_parallel` must be `True ',
+                flush=True,
+            )
             self.input_is_parallel = True
 
         # Parameters.
@@ -863,10 +878,14 @@ class RowParallelLinear(torch.nn.Module):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(
-                    self.weight, init_method, partition_dim=1, stride=stride,
-                    expert_parallel=(self.is_expert and config.expert_parallel))
+                    self.weight,
+                    init_method,
+                    partition_dim=1,
+                    stride=stride,
+                    expert_parallel=(self.is_expert and config.expert_parallel),
+                )
         setattr(self.weight, 'allreduce', not (self.is_expert and config.expert_parallel))
-        
+
         if bias:
             if config.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(self.output_size, dtype=config.params_dtype))
@@ -889,7 +908,9 @@ class RowParallelLinear(torch.nn.Module):
             self.register_parameter('bias', None)
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-        self.explicit_expert_comm = self.is_expert and (self.sequence_parallel or config.expert_parallel)
+        self.explicit_expert_comm = self.is_expert and (
+            self.sequence_parallel or config.expert_parallel
+        )
 
     def forward(self, input_):
         """Forward of RowParallelLinear
@@ -924,7 +945,7 @@ class RowParallelLinear(torch.nn.Module):
         # All-reduce across all the partitions.
         if self.explicit_expert_comm:
             assert self.skip_bias_add
-            output_ =  output_parallel
+            output_ = output_parallel
         elif self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:

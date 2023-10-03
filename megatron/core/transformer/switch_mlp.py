@@ -3,11 +3,14 @@
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.parallel_state import (
+    get_tensor_and_data_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_data_parallel_group
 
-from .mlp import MLPSubmodules, MLP
+from .mlp import MLP, MLPSubmodules
 
 
 def sinkhorn(cost, tol=0.0001):
@@ -47,9 +50,15 @@ class SwitchMLP(MegatronModule):
 
         if self.expert_parallel:
             assert self.config.num_moe_experts % parallel_state.get_data_parallel_world_size() == 0
-            self.num_local_experts = self.config.num_moe_experts // parallel_state.get_data_parallel_world_size()
-            local_expert_indices_offset = parallel_state.get_data_parallel_rank() * self.num_local_experts
-            self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+            self.num_local_experts = (
+                self.config.num_moe_experts // parallel_state.get_data_parallel_world_size()
+            )
+            local_expert_indices_offset = (
+                parallel_state.get_data_parallel_rank() * self.num_local_experts
+            )
+            self.local_expert_indices = [
+                local_expert_indices_offset + i for i in range(self.num_local_experts)
+            ]
         else:
             self.num_local_experts = self.config.num_moe_experts
             self.local_expert_indices = [i for i in range(self.num_local_experts)]
@@ -58,7 +67,7 @@ class SwitchMLP(MegatronModule):
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
-    
+
     def gather_indices(self, local_indices):
         """ Gather tensors and concatenate along the first dimension."""
         if self.expert_parallel:
@@ -74,10 +83,10 @@ class SwitchMLP(MegatronModule):
         dim_size[0] = dim_size[0] * world_size
 
         # TODO pre allocate memory
-        output = torch.empty(dim_size, dtype=local_indices.dtype,
-                             device=torch.cuda.current_device())
-        torch.distributed._all_gather_base(
-            output, local_indices.contiguous(), group=group)
+        output = torch.empty(
+            dim_size, dtype=local_indices.dtype, device=torch.cuda.current_device()
+        )
+        torch.distributed._all_gather_base(output, local_indices.contiguous(), group=group)
         return output
 
     def forward(self, hidden_states):
@@ -96,21 +105,19 @@ class SwitchMLP(MegatronModule):
         else:
             route = self.router_activation(route)
             max_prob, max_ind = torch.max(route, dim=1)
-        
+
         max_prob = torch.unsqueeze(max_prob, 1)
         hidden_states = hidden_states.view(-1, hidden_shape[-1])
 
         if self.sequence_parallel or self.expert_parallel:
-            global_hidden_states = \
-                tensor_parallel.gather_from_sequence_parallel_region_to_moe(
-                    hidden_states,
-                    expert_parallel=self.expert_parallel
-                )
+            global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                hidden_states, expert_parallel=self.expert_parallel
+            )
             global_indices = self.gather_indices(max_ind)
         else:
             global_hidden_states = hidden_states
             global_indices = max_ind
-        
+
         output_total = torch.zeros_like(global_hidden_states)
         if self.add_bias:
             output_bias_total = torch.zeros_like(global_hidden_states)
@@ -127,26 +134,23 @@ class SwitchMLP(MegatronModule):
                 output_bias_total[local_indices, :] = output_bias
 
         if self.sequence_parallel or self.expert_parallel:
-            output_total = \
-                tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                    output_total,
-                    expert_parallel=self.expert_parallel
-                )
+            output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                output_total, expert_parallel=self.expert_parallel
+            )
             if self.add_bias:
-                output_bias_total = \
-                    tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                        output_bias_total,
-                        expert_parallel=self.expert_parallel
-                    )
+                output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                    output_bias_total, expert_parallel=self.expert_parallel
+                )
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks
-                output_bias_total = \
-                    output_bias_total/parallel_state.get_tensor_model_parallel_world_size()
+                output_bias_total = (
+                    output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
+                )
 
-        output_total = output_total*max_prob
+        output_total = output_total * max_prob
         output_total = output_total.view(hidden_shape)
         if self.add_bias:
-            output_bias_total = output_bias_total*max_prob
+            output_bias_total = output_bias_total * max_prob
             output_bias_total = output_bias_total.view(hidden_shape)
         else:
             output_bias_total = None

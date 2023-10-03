@@ -268,7 +268,9 @@ def initialize_model_parallel(
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
-    assert _TENSOR_AND_DATA_PARALLEL_GROUP is None, 'Tensor + data parallel group is already initialized'
+    assert (
+        _TENSOR_AND_DATA_PARALLEL_GROUP is None
+    ), 'Tensor + data parallel group is already initialized'
     tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
     num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
     for i in range(num_tensor_and_data_groups):
@@ -351,13 +353,19 @@ def get_position_embedding_group():
 
 def get_amax_reduction_group():
     """Get the FP8 amax reduction group the caller rank belongs to."""
-    assert _TENSOR_AND_DATA_PARALLEL_GROUP is not None, 'FP8 amax reduction group is not initialized'
+    assert (
+        _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+    ), 'FP8 amax reduction group is not initialized'
     return _TENSOR_AND_DATA_PARALLEL_GROUP
+
 
 def get_tensor_and_data_parallel_group():
     """Get the tensor and data parallel group the caller rank belongs to."""
-    assert _TENSOR_AND_DATA_PARALLEL_GROUP is not None, 'tensor and data parallel group is not initialized'
+    assert (
+        _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+    ), 'tensor and data parallel group is not initialized'
     return _TENSOR_AND_DATA_PARALLEL_GROUP
+
 
 def set_tensor_model_parallel_world_size(world_size):
     """Set the tensor model parallel size"""

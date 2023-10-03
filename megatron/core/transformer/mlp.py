@@ -35,7 +35,9 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules, is_expert: bool = False):
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules, is_expert: bool = False
+    ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -53,7 +55,7 @@ class MLP(MegatronModule):
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
-            is_expert=is_expert
+            is_expert=is_expert,
         )
 
         if self.config.gated_linear_unit:
@@ -74,7 +76,7 @@ class MLP(MegatronModule):
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
-            is_expert=is_expert
+            is_expert=is_expert,
         )
 
     def forward(self, hidden_states):
