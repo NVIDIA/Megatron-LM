@@ -106,8 +106,6 @@ def get_batch(data_iterator):
 def loss_func(loss_mask: Tensor, output_tensor: Tensor) -> tuple(Tensor, dict):
     """Loss function
 
-    _extended_summary_
-
     Args:
         loss_mask (Tensor): Used to mask out some portions of the loss 
         output_tensor (Tensor): The tensor with the losses 
@@ -138,7 +136,7 @@ def forward_step(data_iterator, model: GPTModel):
     """Forward training step
 
     Args:
-        data_iterator (_type_): Input data iterator
+        data_iterator : Input data iterator
         model (GPTModel): The GPT Model 
 
     """
@@ -161,7 +159,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples) -> tuple(GPTD
     """Build the train test and validation datasets
 
     Args:
-        train_val_test_num_samples (_type_): A list containing the number of samples in train test and validation. 
+        train_val_test_num_samples : A list containing the number of samples in train test and validation. 
 
     Returns:
         tuple(GPTDataset, GPTDataset, GPTDataset): The train, valid and test datasets
