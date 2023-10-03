@@ -10,9 +10,9 @@ from typing import Callable, Optional, Tuple
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
+from megatron.core.models.retro.config import RetroConfig
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class RetroEncoderCrossAttention(BaseRetroCrossAttention):
@@ -85,7 +85,7 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: RetroConfig,
     ):
         super().__init__(config=config)
         self.retro_num_neighbors = config.retro_num_neighbors
@@ -137,7 +137,7 @@ class RetroEncoderLayerNorm(MegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: RetroConfig,
         **kwargs,
     ):
         super().__init__(config=config)

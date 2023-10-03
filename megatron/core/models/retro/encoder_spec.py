@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.encoder_attention import (
     RetroEncoderCrossAttention,
     RetroEncoderBiasDropoutAdd,
@@ -10,7 +11,6 @@ from megatron.core.transformer import (
     ModuleSpec,
     TransformerBlock,
     TransformerBlockSubmodules,
-    TransformerConfig,
 )
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -55,7 +55,7 @@ def get_retro_encoder_layer_spec() -> ModuleSpec:
     return spec
 
 
-def get_retro_encoder_block_spec(config: TransformerConfig) -> ModuleSpec:
+def get_retro_encoder_block_spec(config: RetroConfig) -> ModuleSpec:
 
     """
     The retro encoder block consists of one customized Retro encoder layer
@@ -70,7 +70,18 @@ def get_retro_encoder_block_spec(config: TransformerConfig) -> ModuleSpec:
     gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
     retro_layer_spec = get_retro_encoder_layer_spec()
     for spec in (gpt_layer_spec, retro_layer_spec):
+        # >>>
+        # spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
+        # +++
+        spec.params["hidden_dropout"] = config.retro_encoder_hidden_dropout
         spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
+        spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
+            module=TEDotProductAttention,
+            params={
+                "attention_dropout" : config.retro_encoder_attention_dropout,
+            },
+        )
+        # <<<
 
     layer_specs = []
     for layer_number in range(1, num_layers + 1):

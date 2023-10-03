@@ -44,10 +44,12 @@ class TransformerLayer(MegatronModule):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
+        hidden_dropout: float = None,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number + self._get_layer_offset()
+        self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -174,7 +176,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -199,7 +201,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -215,7 +217,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.config.hidden_dropout
+                mlp_output_with_bias, residual, self.hidden_dropout
             )
 
         # Jit compiled function creates 'view' tensor. This tensor

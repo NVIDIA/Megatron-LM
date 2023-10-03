@@ -1,9 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.models.retro.config import RetroConfig
 from megatron.core.transformer.attention import CrossAttention, CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class BaseRetroCrossAttention(MegatronModule):
@@ -17,7 +17,7 @@ class BaseRetroCrossAttention(MegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: RetroConfig,
         submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,

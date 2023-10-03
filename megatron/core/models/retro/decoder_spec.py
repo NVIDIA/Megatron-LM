@@ -2,6 +2,7 @@
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
     RetroDecoderBiasDropoutAdd,
     RetroDecoderCrossAttention,
@@ -18,7 +19,6 @@ from megatron.core.transformer import (
     ModuleSpec,
     TransformerBlock,
     TransformerBlockSubmodules,
-    TransformerConfig,
 )
 
 
@@ -47,7 +47,7 @@ def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> Modul
     return spec
 
 
-def get_retro_decoder_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
+def get_retro_decoder_block_spec(config: RetroConfig) -> TransformerBlockSubmodules:
 
     """
     Retro decoder block implementation details:

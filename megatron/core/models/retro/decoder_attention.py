@@ -11,11 +11,8 @@ from typing import Callable
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
-from megatron.core.transformer import (
-    build_module,
-    TransformerBlockSubmodules,
-    TransformerConfig,
-)
+from megatron.core.models.retro.config import RetroConfig
+from megatron.core.transformer import build_module, TransformerBlockSubmodules
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
@@ -33,7 +30,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: RetroConfig,
         submodules: CrossAttentionSubmodules,
         layer_number: int = 1,
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
@@ -173,7 +170,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
 
     def __init__(
         self,
-        config: TransformerConfig,
+        config: RetroConfig,
     ):
         super().__init__(config=config)
         self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
