@@ -168,13 +168,17 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
     all_data_parallel_group_ranks = []
+    nccl_options = torch.distributed.ProcessGroupNCCL.Options()
+    nccl_options.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_DP_CGA_GROUPS", 4))
+    nccl_options.config.max_ctas = int(os.getenv("MEGATRON_CORE_DP_MAX_CTAS", 32))
+    nccl_options.config.min_ctas = int(os.getenv("MEGATRON_CORE_DP_MIN_CTAS", 1))
     for i in range(pipeline_model_parallel_size):
         start_rank = i * num_pipeline_model_parallel_groups
         end_rank = (i + 1) * num_pipeline_model_parallel_groups
         for j in range(tensor_model_parallel_size):
             ranks = range(start_rank + j, end_rank, tensor_model_parallel_size)
             all_data_parallel_group_ranks.append(list(ranks))
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, pg_options=nccl_options)
             group_gloo = torch.distributed.new_group(ranks, backend="gloo")
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
@@ -186,13 +190,17 @@ def initialize_model_parallel(
     assert _AMAX_REDUCTION_GROUP is None, \
         'FP8 amax reduction group is already initialized'
     if use_fp8:
+        nccl_options = torch.distributed.ProcessGroupNCCL.Options()
+        nccl_options.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_AMAX_CGA_GROUPS", 4))
+        nccl_options.config.max_ctas = int(os.getenv("MEGATRON_CORE_AMAX_MAX_CTAS", 32))
+        nccl_options.config.min_ctas = int(os.getenv("MEGATRON_CORE_AMAX_MIN_CTAS", 1))
         amax_group_size: int = tensor_model_parallel_size * data_parallel_size
         num_amax_groups: int = world_size // amax_group_size
         for i in range(num_amax_groups):
             start_rank = i * amax_group_size
             end_rank = (i + 1) * amax_group_size
             ranks = range(start_rank, end_rank)
-            group = torch.distributed.new_group(ranks)
+            group = torch.distributed.new_group(ranks, pg_options=nccl_options)
             if rank in ranks:
                 _AMAX_REDUCTION_GROUP = group
 
@@ -210,7 +218,7 @@ def initialize_model_parallel(
             )
         use_sharp_dp = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_DP", 1)))
         use_sharp_amax = bool(int(os.getenv("MEGATRON_CORE_USE_SHARP_AMAX", 0)))
-        # TODO: Use SHARP at multiple communication jobs.
+        # SHARP does not supprt multiple communicators that have a topological overlap
         assert not (use_sharp_dp and use_sharp_amax)
         # Apply SHARP to DP process groups
         if use_sharp_dp:
@@ -228,10 +236,14 @@ def initialize_model_parallel(
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
+    nccl_options = torch.distributed.ProcessGroupNCCL.Options()
+    nccl_options.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_MP_CGA_GROUPS", 4))
+    nccl_options.config.max_ctas = int(os.getenv("MEGATRON_CORE_MP_MAX_CTAS", 32))
+    nccl_options.config.min_ctas = int(os.getenv("MEGATRON_CORE_MP_MIN_CTAS", 1))
     for i in range(data_parallel_size):
         ranks = [data_parallel_group_ranks[i]
                  for data_parallel_group_ranks in all_data_parallel_group_ranks]
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, pg_options=nccl_options)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
 
@@ -239,10 +251,14 @@ def initialize_model_parallel(
     global _TENSOR_MODEL_PARALLEL_GROUP
     assert _TENSOR_MODEL_PARALLEL_GROUP is None, \
         'tensor model parallel group is already initialized'
+    nccl_options = torch.distributed.ProcessGroupNCCL.Options()
+    nccl_options.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_TP_CGA_GROUPS", 4))
+    nccl_options.config.max_ctas = int(os.getenv("MEGATRON_CORE_TP_MAX_CTAS", 32))
+    nccl_options.config.min_ctas = int(os.getenv("MEGATRON_CORE_TP_MIN_CTAS", 1))
     for i in range(num_tensor_model_parallel_groups):
         ranks = range(i * tensor_model_parallel_size,
                       (i + 1) * tensor_model_parallel_size)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, pg_options=nccl_options)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
 
@@ -259,9 +275,17 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, \
         'position embedding group is already initialized'
+    nccl_options_p2p = torch.distributed.ProcessGroupNCCL.Options()
+    nccl_options_p2p.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_P2P_CGA_GROUPS", 4))
+    nccl_options_p2p.config.max_ctas = int(os.getenv("MEGATRON_CORE_P2P_MAX_CTAS", 32))
+    nccl_options_p2p.config.min_ctas = int(os.getenv("MEGATRON_CORE_P2P_MIN_CTAS", 1))
+    nccl_options_embd = torch.distributed.ProcessGroupNCCL.Options()
+    nccl_options_embd.config.cga_cluster_size = int(os.getenv("MEGATRON_CORE_EMBD_CGA_GROUPS", 4))
+    nccl_options_embd.config.max_ctas = int(os.getenv("MEGATRON_CORE_EMBD_MAX_CTAS", 32))
+    nccl_options_embd.config.min_ctas = int(os.getenv("MEGATRON_CORE_EMBD_MIN_CTAS", 1))
     for i in range(num_pipeline_model_parallel_groups):
         ranks = range(i, world_size, num_pipeline_model_parallel_groups)
-        group = torch.distributed.new_group(ranks)
+        group = torch.distributed.new_group(ranks, pg_options=nccl_options_p2p)
         if rank in ranks:
             _PIPELINE_MODEL_PARALLEL_GROUP = group
             _PIPELINE_GLOBAL_RANKS = ranks
@@ -282,13 +306,13 @@ def initialize_model_parallel(
             embedding_ranks = ranks
             position_embedding_ranks = ranks
 
-        group = torch.distributed.new_group(embedding_ranks)
+        group = torch.distributed.new_group(embedding_ranks, pg_options=nccl_options_embd)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
         if rank in ranks:
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
 
-        group = torch.distributed.new_group(position_embedding_ranks)
+        group = torch.distributed.new_group(position_embedding_ranks, pg_options=nccl_options_embd)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
         if rank in ranks:
