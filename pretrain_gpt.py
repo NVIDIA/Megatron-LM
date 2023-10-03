@@ -127,6 +127,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 def set_device_and_init_torch_dist():
     from mpi4py import MPI
+    import os
+
     world_rank = MPI.COMM_WORLD.Get_rank()
     world_size = MPI.COMM_WORLD.Get_size()
 
@@ -146,6 +148,9 @@ def set_device_and_init_torch_dist():
                 world_size=world_size,
                 rank=world_rank
     )
+
+    os.environ["RANK"] = str(world_rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
 
 
 if __name__ == "__main__":
