@@ -58,7 +58,8 @@ def make_sharded_optimizer_tensor(
 
 
 def optim_state_to_sharding_state(
-    optim_state_dict: StateDict, id_to_sharded_param_map: Dict[int, ShardedTensor],
+    optim_state_dict: StateDict,
+    id_to_sharded_param_map: Dict[int, ShardedTensor],
     exclude_keys: Tuple[str] = (),
 ):
     sharded_state = {}
