@@ -247,7 +247,8 @@ def initialize_model_parallel(
                 "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
             )
         torch.distributed.barrier(
-            group=get_data_parallel_group(), device_ids=[torch.cuda.current_device()]
+            group=get_data_parallel_group(with_context_parallel=context_parallel_size > 1),
+            device_ids=[torch.cuda.current_device()],
         )
         # Set `NCCL_SHARP_DISABLE=1` to restrict SHARP application to DP process groups
         os.environ["NCCL_SHARP_DISABLE"] = "1"
@@ -405,7 +406,7 @@ def get_pipeline_model_parallel_group():
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
-def get_data_parallel_group(with_context_parallel=True):
+def get_data_parallel_group(with_context_parallel=False):
     """Get the data parallel group the caller rank belongs to."""
     if with_context_parallel:
         assert (
@@ -417,7 +418,7 @@ def get_data_parallel_group(with_context_parallel=True):
         return _DATA_PARALLEL_GROUP
 
 
-def get_data_parallel_group_gloo(with_context_parallel=True):
+def get_data_parallel_group_gloo(with_context_parallel=False):
     """Get the data parallel group-gloo the caller rank belongs to."""
     if with_context_parallel:
         assert (
@@ -644,7 +645,7 @@ def get_tensor_model_parallel_src_rank():
     return (global_rank // local_world_size) * local_world_size
 
 
-def get_data_parallel_src_rank(with_context_parallel=True):
+def get_data_parallel_src_rank(with_context_parallel=False):
     """Calculate the global rank corresponding to the first local rank
     in the data parallel group."""
     if with_context_parallel:
