@@ -7,10 +7,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.transformer.attention import CrossAttentionSubmodules, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.mlp import MLP, SwitchMLP
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
