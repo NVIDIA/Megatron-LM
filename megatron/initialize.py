@@ -20,6 +20,7 @@ from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
+from axonn import axonn as ax
 
 
 def initialize_megatron(
@@ -202,7 +203,7 @@ def _initialize_distributed():
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
-    if device_count > 0:
+    if device_count > 0: ## why do we need device count > 0??
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
@@ -213,6 +214,22 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_split_rank,
                 args.fp8 is not None,
             )
+
+            ## adding code to initialize axonn 
+            data_parallel_size: int = torch.distributed.get_world_size() // (
+                args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+            )
+
+            assert args.pipeline_model_parallel_size == 1
+            print(args.row_tensor_model_parallel_size, args.column_tensor_model_parallel_size, data_parallel_size)
+
+            ax.init(
+                G_inter=args.pipeline_model_parallel_size,
+                G_data = data_parallel_size,
+                G_intra_r = args.row_tensor_model_parallel_size,
+                G_intra_c = args.column_tensor_model_parallel_size,
+            )
+
             if args.rank == 0:
                 print(
                     f"> initialized tensor model parallel with size "
@@ -221,6 +238,10 @@ def _initialize_distributed():
                 print(
                     f"> initialized pipeline model parallel with size "
                     f"{mpu.get_pipeline_model_parallel_world_size()}"
+                )
+                print(
+                    f"> initialized AxoNN with G_intra_r={args.row_tensor_model_parallel_size}," 
+                    f"G_intra_c={args.column_tensor_model_parallel_size}"
                 )
 
 

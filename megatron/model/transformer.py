@@ -17,6 +17,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
+from axonn.intra_layer import Tensor_Parallel_Linear, drop, gather
 
 try:
     from einops import rearrange
@@ -87,15 +88,12 @@ class ParallelMLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
-            config.hidden_size,
-            ffn_hidden_size,
-            config=config,
-            init_method=config.init_method,
-            bias=self.add_bias,
-            gather_output=False,
-            skip_bias_add=True,
-        )
+        self.dense_h_to_4h = Tensor_Parallel_Linear(
+                    in_features=config.hidden_size,
+                    out_features=ffn_hidden_size,
+                    skip_bias_add=True,
+                    init_method=config.init_method
+                )
 
         self.bias_gelu_fusion = False
         self.activation_func = None
@@ -119,18 +117,18 @@ class ParallelMLP(MegatronModule):
             self.activation_func = F.gelu
 
         # Project back to h.
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
-            config.ffn_hidden_size,
-            config.hidden_size,
-            config=config,
-            init_method=config.output_layer_init_method,
-            bias=self.add_bias,
-            input_is_parallel=True
+        self.dense_4h_to_h = Tensor_Parallel_Linear(
+            in_features=config.ffn_hidden_size,
+            out_features=config.hidden_size,
+            skip_bias_add=True,
+            init_method=config.init_method,
+            transpose=True
         )
 
     def forward(self, hidden_states):
 
         # [s, b, 4hp]
+        hidden_states = drop(hidden_states)
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
         if self.bias_gelu_fusion:
@@ -144,6 +142,7 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        output, output_bias = gather(output), gather(output_bias)
         return output, output_bias
 
 
