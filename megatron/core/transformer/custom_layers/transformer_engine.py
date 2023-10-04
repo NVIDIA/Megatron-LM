@@ -41,11 +41,13 @@ class TENorm:
         normalization="LayerNorm",
         **kwargs
     ):
+        zero_centered_gamma = kwargs.get('zero_centered_gamma', 'False')
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
+                zero_centered_gamma=zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         elif normalization == "RMSNorm":
@@ -56,6 +58,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
+                zero_centered_gamma=zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         else:
@@ -164,6 +167,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
+            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **_get_extra_te_kwargs(config),
             **kwargs,
         )
