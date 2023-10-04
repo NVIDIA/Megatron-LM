@@ -297,9 +297,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         model = [DDP(model_module,
-                     mpu.get_data_parallel_group(),
-                     args.accumulate_allreduce_grads_in_fp32,
-                     args.overlap_grad_reduce)
+                     data_parallel_group=mpu.get_data_parallel_group(),
+                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+                     overlap_grad_reduce=args.overlap_grad_reduce,
+                     use_distributed_optimizer=args.use_distributed_optimizer)
                  for model_module in model]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -692,7 +693,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     config.timers = timers
     # TODO: Remove this once we move DDP to Core.
     if len(model) == 1 and isinstance(model[0], DDP) and \
-        args.pipeline_model_parallel_size == 1:
+        args.overlap_grad_reduce:
+        assert config.no_sync_func is None, \
+            ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
+             'a custom no_sync_func is not supported when overlapping grad-reduce')
+        if args.delay_grad_reduce:
+            config.grad_sync_func = model[0].grad_sync
         config.no_sync_func = model[0].no_sync
 
     timers('interval-time', log_level=0).start(barrier=True)
