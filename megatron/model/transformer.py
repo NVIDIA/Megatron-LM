@@ -128,7 +128,6 @@ class ParallelMLP(MegatronModule):
     def forward(self, hidden_states):
 
         # [s, b, 4hp]
-        hidden_states = drop(hidden_states)
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
         if self.bias_gelu_fusion:
@@ -142,7 +141,6 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-        output, output_bias = gather(output), gather(output_bias)
         return output, output_bias
 
 
@@ -499,7 +497,7 @@ class ParallelAttention(MegatronModule):
                 in_features=query_projection_size,
                 out_features=config.hidden_size,
                 skip_bias_add=True,
-                init_method=config.init_method,
+                init_method=config.output_layer_init_method,
                 transpose=True)
 
 
@@ -568,7 +566,6 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
 
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-            hidden_states = drop(hidden_states)
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
@@ -715,7 +712,6 @@ class ParallelAttention(MegatronModule):
         # =================
 
         output, bias = self.dense(context_layer)
-        output, bias = gather(output), gather(bias)
         return output, bias
 
 
@@ -766,6 +762,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         super(ParallelTransformerLayer, self).__init__()
         self.layer_number = layer_number
+        self.is_first_layer = ( layer_number == 1 )
+        self.is_last_layer = ( layer_number == args.num_layers )
         self.layer_type = layer_type
 
         self.apply_residual_connection_post_norm \
@@ -775,7 +773,11 @@ class ParallelTransformerLayer(MegatronModule):
         self.fp32_residual_connection = config.fp32_residual_connection
 
         # Normalize the input data.
+        original_hidden_size = config.hidden_size
+        config.hidden_size = core.utils.divide(original_hidden_size, 
+                                               args.column_tensor_model_parallel_size)
         self.input_norm = get_norm(config)
+        config.hidden_size = original_hidden_size
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -788,7 +790,11 @@ class ParallelTransformerLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Normalize the attention output
+        original_hidden_size = config.hidden_size
+        config.hidden_size = core.utils.divide(original_hidden_size, 
+                                               args.column_tensor_model_parallel_size)
         self.post_attention_norm = get_norm(config)
+        config.hidden_size = original_hidden_size
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,
@@ -1049,6 +1055,8 @@ class ParallelTransformerLayer(MegatronModule):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
+        if self.is_first_layer:
+            hidden_states = drop(hidden_states)
         norm_output = self.input_norm(hidden_states)
 
         # Self attention.
@@ -1168,6 +1176,8 @@ class ParallelTransformerLayer(MegatronModule):
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
         else:
+            if self.is_last_layer:
+                output = gather(output)
             return output
 
 
