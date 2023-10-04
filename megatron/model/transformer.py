@@ -204,6 +204,7 @@ class CoreAttention(MegatronModule):
     def __init__(self, layer_number, config,
                  attn_mask_type=AttnMaskType.padding):
         super(CoreAttention, self).__init__()
+        args = get_args()
         self.fp16 = config.fp16
         self.bf16 = config.bf16
 
@@ -218,7 +219,7 @@ class CoreAttention(MegatronModule):
         projection_size = config.kv_channels * config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
+        world_size = args.row_tensor_model_parallel_size ## attention heads are divided across the row tensor parallel group
         self.hidden_size_per_partition = core.utils.divide(projection_size,
                                                            world_size)
         self.hidden_size_per_attention_head = core.utils.divide(
@@ -438,7 +439,7 @@ class ParallelAttention(MegatronModule):
                 raise ImportError('einops is not installed, please install with pip install einops')
 
         # Per attention head and per partition values.
-        world_size = mpu.get_tensor_model_parallel_world_size()
+        world_size = args.row_tensor_model_parallel_size ## attention heads are divided across the row tensor parallel group
         self.hidden_size_per_attention_head = core.utils.divide(
             query_projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = core.utils.divide(
@@ -455,14 +456,13 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                query_projection_size + 2 * kv_projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=args.add_bias_linear,
-                gather_output=False)
+            self.query_key_value = Tensor_Parallel_Linear(
+                    in_features=config.hidden_size,
+                    out_features=query_projection_size + 2 * kv_projection_size,
+                    skip_bias_add=True,
+                    init_method=config.init_method)
         else:
+            raise NotImplementedError
             assert attention_type == AttnType.cross_attn
 
             if self.group_query_attention:
@@ -495,14 +495,13 @@ class ParallelAttention(MegatronModule):
             )
 
         # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
-            query_projection_size,
-            config.hidden_size,
-            config=config,
-            init_method=config.output_layer_init_method,
-            bias=args.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True)
+        self.dense = Tensor_Parallel_Linear(
+                in_features=query_projection_size,
+                out_features=config.hidden_size,
+                skip_bias_add=True,
+                init_method=config.init_method,
+                transpose=True)
+
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -569,6 +568,7 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
 
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+            hidden_states = drop(hidden_states)
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
@@ -715,7 +715,7 @@ class ParallelAttention(MegatronModule):
         # =================
 
         output, bias = self.dense(context_layer)
-
+        output, bias = gather(output), gather(bias)
         return output, bias
 
 
