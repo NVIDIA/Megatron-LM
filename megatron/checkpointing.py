@@ -79,9 +79,9 @@ def ensure_directory_exists(filename):
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
                         pipeline_parallel=None,
-                        tensor_rank=None, pipeline_rank=None):
+                        tensor_rank=None, pipeline_rank=None,
+                        expert_parallel=None):
     """Determine the directory name for this rank's checkpoint."""
-    args=get_args()
     if release:
         directory = 'release'
     else:
@@ -94,6 +94,9 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
         tensor_rank = mpu.get_tensor_model_parallel_rank()
     if pipeline_rank is None:
         pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+    if expert_parallel is None:
+        args = get_args()
+        expert_parallel = args.expert_parallel
 
     data_rank = mpu.get_data_parallel_rank()
 
@@ -107,7 +110,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
         common_path = os.path.join(checkpoints_path, directory,
                 f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
 
-    if args.expert_parallel:
+    if expert_parallel:
         common_path = common_path + f'_{data_rank:03d}'
 
     return os.path.join(common_path, "model_optim_rng.pt")
@@ -120,24 +123,42 @@ def get_distributed_optimizer_checkpoint_name(model_checkpoint_name):
 
 def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     """Finds the checkpoint for rank 0 without knowing if we are using
-    pipeline parallelism or not.
+    pipeline parallelism/expert parallelism or not.
 
-    Since the checkpoint naming scheme changes if pipeline parallelism
-    is present, we need to look for both naming schemes if we don't
-    know if the checkpoint has pipeline parallelism.
+    Since the checkpoint naming scheme changes if pipeline or expert
+    parallelism is present, we need to look for both naming schemes if
+    we don't know if the checkpoint has pipeline or expert parallelism.
     """
 
-    # Look for checkpoint with no pipelining
+    # Look for checkpoint with no pipelining and no expert parallelism
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=False,
-                                   tensor_rank=0, pipeline_rank=0)
+                                   tensor_rank=0, pipeline_rank=0,
+                                   expert_parallel=False)
     if os.path.isfile(filename):
         return filename
 
-    # Look for checkpoint with pipelining
+    # Look for checkpoint with no pipelining and expert parallelism
+    filename = get_checkpoint_name(checkpoints_path, iteration, release,
+                                   pipeline_parallel=False,
+                                   tensor_rank=0, pipeline_rank=0,
+                                   expert_parallel=True)
+    if os.path.isfile(filename):
+        return filename
+
+    # Look for checkpoint with pipelining and no expert parallelism
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=True,
-                                   tensor_rank=0, pipeline_rank=0)
+                                   tensor_rank=0, pipeline_rank=0,
+                                   expert_parallel=False)
+    if os.path.isfile(filename):
+        return filename
+
+    # Look for checkpoint with pipelining and expert parallelism
+    filename = get_checkpoint_name(checkpoints_path, iteration, release,
+                                   pipeline_parallel=True,
+                                   tensor_rank=0, pipeline_rank=0,
+                                   expert_parallel=True)
     if os.path.isfile(filename):
         return filename
 
