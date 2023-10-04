@@ -17,9 +17,6 @@ __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 class RotaryEmbedding(nn.Module):
     """Rotary Embedding for language model.
 
-    Attributes:
-        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
-    
     Args:
         kv_channels (int): Projection weights dimension in multi-head attention. Obtained from transformer config
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
@@ -40,14 +37,14 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
     def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
-        """Forward pass of RoPE embedding 
+        """Forward pass of RoPE embedding.
 
         Args:
             max_seq_len (int): Maximum size of sequence
             offset (int, optional): _description_. Defaults to 0.
 
         Returns:
-            Tensor: Embeddings after applying RoPE. 
+            Tensor: Embeddings after applying RoPE.
         """
         seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
         if self.seq_len_interpolation_factor is not None:
@@ -71,8 +68,8 @@ class RotaryEmbedding(nn.Module):
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
     ) -> float:
-        """Function to get the rotary sequence length
-        
+        """Function to get the rotary sequence length.
+
         Args:
             inference_params : Used during Inference time
             transformer (TransformerBlock): The transformer block (decoder/encoder) used by the model
@@ -110,7 +107,7 @@ def _rotate_half(x: Tensor) -> Tensor:
 
 
 def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
-    """Apply rotary positional embedding to input tensor T 
+    """Apply rotary positional embedding to input tensor T.
 
     check https://kexue.fm/archives/8265 for detailed formulas
 

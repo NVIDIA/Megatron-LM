@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
-
-"""Megatron Module"""
+"""Megatron Module."""
 
 import torch
 from torch.autograd import Variable
@@ -19,13 +18,10 @@ def param_is_not_shared(param):
 
 
 class MegatronModule(torch.nn.Module):
-    """Base Megatron module inhertied by all Models
+    """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
     for pipelining
-
-    Attributes:
-        config (TransformerConfig): Transformer config
 
     Args:
         config (TransformerConfig): Transformer config
@@ -37,8 +33,8 @@ class MegatronModule(torch.nn.Module):
         self.config = config
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
-        """Override state dict for saving checkpoints
-            Use this function to override the state dict for saving checkpoints
+        """Override state dict for saving checkpoints Use this function to override the
+        state dict for saving checkpoints.
 
         Args:
             prefix (str, optional): _description_. Defaults to ''.
@@ -51,7 +47,7 @@ class MegatronModule(torch.nn.Module):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix: str = ''):
-        """Override sharded state dict with Dist Checkpointing
+        """Override sharded state dict with Dist Checkpointing.
 
         Override sharded_state_dict when using distributed checkpointing. keep_vars must always be set to True so that optimizer states can be sharded.
 
@@ -102,10 +98,10 @@ class Float16Module(MegatronModule):
 
     Attributes:
         config (TransformerConfig): Transformer config
-        fp16 (bool) : Specifies if the model runs in fp16 mode 
-        bf16 (bool) : Specifies if the model runs in bf16 mode 
-    
-    Args: 
+        fp16 (bool) : Specifies if the model runs in fp16 mode
+        bf16 (bool) : Specifies if the model runs in bf16 mode
+
+    Args:
         config (TransformerConfig): The transformer config used to initalize the model
     """
 
@@ -147,12 +143,13 @@ class Float16Module(MegatronModule):
         return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """ Retrieve state_dict from the module being wrapped."""
+        """Retrieve state_dict from the module being wrapped."""
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix=''):
-        """ Retrieve state_dict from the module being wrapped.
-            When using distributed checkpointing, keep_vars must always be set to True.
+        """Retrieve state_dict from the module being wrapped.
+
+        When using distributed checkpointing, keep_vars must always be set to True.
         """
         return self.module.sharded_state_dict(prefix=prefix, keep_vars=True)
 

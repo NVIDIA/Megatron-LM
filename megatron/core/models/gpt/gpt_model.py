@@ -20,32 +20,19 @@ from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
 
-    Attributes:
+    Args:
         config (TransformerConfig): Transformer config
-        transformer_layer_spec (ModuleSpec) : Specifies module to use for transformer layers
-        vocab_size (int) : Vocabulary size
-        max_sequence_length (int) : Maximum size of sequence. This is used for positional embedding
-        pre_process (bool) : Include embedding layer (used with pipeline parallelism)
-        post_process (bool) :  Include an output layer (used with pipeline parallelism)
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared.
-        position_embedding_type (string) : Position embedding type
-        model_type (ModelType) : The type of model. (Encoder or Decoder, or Encoder and decoder etc.)
-        decoder (TransformerBlock) : The main transformer block of the model 
-        output_layer (ColumnParallelLinear): The post processing layer that produces the final logits
-
-        Args:
-            config (TransformerConfig): Transformer config
-            transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
-            vocab_size (int): Vocabulary size
-            max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-            pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
-            post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
-            fp16_lm_cross_entropy (bool, optional): Defaults to False.
-            parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
-            share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-            position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
-            rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
-            seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.        
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
+        vocab_size (int): Vocabulary size
+        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
+        pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
+        fp16_lm_cross_entropy (bool, optional): Defaults to False.
+        parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
+        rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
@@ -128,8 +115,11 @@ class GPTModel(LanguageModule):
         labels: Tensor = None,
         inference_params=None,
     ) -> Tensor:
-        """Forward function of the GPT Model
-        This function passes the input tensors through the embedding layer, and then the decoeder and finally into the post processing layer (optional). It either returns the Loss values if labels are given  or the final hidden units
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -178,7 +168,7 @@ class GPTModel(LanguageModule):
         return loss
 
     def shared_embedding_or_output_weight(self) -> Tensor:
-        """Function to share the input embeddings and output logit weights
+        """Function to share the input embeddings and output logit weights.
 
         Returns:
             Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight

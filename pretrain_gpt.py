@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
-
-"""Pretrain GPT"""
+"""Pretrain GPT."""
 
 import os
 import torch
@@ -24,9 +23,9 @@ from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
-    """Builds the model
+    """Builds the model.
 
-    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model. 
+    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
@@ -73,7 +72,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
 def get_batch(data_iterator):
-    """Generate a batch"""
+    """Generate a batch."""
     args = get_args()
     tokenizer = get_tokenizer()
 
@@ -104,11 +103,11 @@ def get_batch(data_iterator):
     return tokens, labels, loss_mask, attention_mask, position_ids
 
 def loss_func(loss_mask: Tensor, output_tensor: Tensor) -> tuple(Tensor, dict):
-    """Loss function
+    """Loss function.
 
     Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss 
-        output_tensor (Tensor): The tensor with the losses 
+        loss_mask (Tensor): Used to mask out some portions of the loss
+        output_tensor (Tensor): The tensor with the losses
 
     Returns:
         tuple(Tensor, dict): Returns a tuple of the total loss, and the averaged loss across data parallel group as a dictionary
@@ -133,12 +132,11 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor) -> tuple(Tensor, dict):
 
 
 def forward_step(data_iterator, model: GPTModel):
-    """Forward training step
+    """Forward training step.
 
     Args:
         data_iterator : Input data iterator
-        model (GPTModel): The GPT Model 
-
+        model (GPTModel): The GPT Model
     """
     args = get_args()
     timers = get_timers()
@@ -156,10 +154,10 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples) -> tuple(GPTDataset, GPTDataset, GPTDataset):
-    """Build the train test and validation datasets
+    """Build the train test and validation datasets.
 
     Args:
-        train_val_test_num_samples : A list containing the number of samples in train test and validation. 
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
 
     Returns:
         tuple(GPTDataset, GPTDataset, GPTDataset): The train, valid and test datasets

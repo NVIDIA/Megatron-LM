@@ -19,12 +19,12 @@ class LanguageModule(MegatronModule):
         super().__init__(config=config)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
-        """Sets input tensor to the model
+        """Sets input tensor to the model.
 
         See megatron.model.transformer.set_input_tensor()
 
         Args:
-            input_tensor (Tensor): Sets the input tensor for the model. 
+            input_tensor (Tensor): Sets the input tensor for the model.
         """
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
@@ -35,7 +35,7 @@ class LanguageModule(MegatronModule):
         self.decoder.set_input_tensor(input_tensor[0])
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
-        """ Computes the language model loss (Cross entropy across vocabulary)
+        """Computes the language model loss (Cross entropy across vocabulary)
 
         Args:
             labels (Tensor): The labels of dimension [batch size, seq length]
@@ -53,9 +53,11 @@ class LanguageModule(MegatronModule):
         return loss
 
     def initialize_last_stage_with_word_embeddings(self) -> None:
-        """Intializes the word embeddings in the final stage
+        """Intializes the word embeddings in the final stage.
 
-        This function just initalizes word embeddings in the final stage, when we are using pipeline parallelism and sharind word embeddings. Nothing to do if we arn't sharing weights or aren't using Pipeline parallelism
+        This function just initalizes word embeddings in the final stage, when we are
+        using pipeline parallelism and sharind word embeddings. Nothing to do if we
+        arn't sharing weights or aren't using Pipeline parallelism
         """
         if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
             return
