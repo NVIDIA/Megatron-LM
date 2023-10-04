@@ -1,11 +1,16 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import re
+from functools import partial
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
@@ -191,16 +196,22 @@ class TransformerLayer(MegatronModule):
             layer_key = f'{prefix}{global_layer_offset - offset}.{layer_name}'  # module list index in TransformerBlock
             sharded_offsets = [(0, global_layer_offset, num_layers)]  # PP sharding
 
+            # TODO: move it to MLP after merging the "sharded_state_dict modularization" MR
+            is_glu_weight = (
+                layer_name == 'mlp.linear_fc1.weight' and self.mlp.config.gated_linear_unit
+            )
+
             if layer_name in tensor_parallel_layers_axis_map:
                 tp_axis = tensor_parallel_layers_axis_map[layer_name]
                 # TP sharding
-                sharded_offsets.append(
-                    [
-                        tp_axis + 1,  # +1 for PP dimension
-                        parallel_state.get_tensor_model_parallel_rank(),
-                        parallel_state.get_tensor_model_parallel_world_size(),
-                    ]
-                )
+                if not is_glu_weight:
+                    sharded_offsets.append(
+                        [
+                            tp_axis + 1,  # +1 for PP dimension
+                            parallel_state.get_tensor_model_parallel_rank(),
+                            parallel_state.get_tensor_model_parallel_world_size(),
+                        ]
+                    )
                 replica_id = parallel_state.get_data_parallel_rank()
             else:
                 replica_id = (
@@ -217,7 +228,36 @@ class TransformerLayer(MegatronModule):
                     (global_layer_offset,),
                     replica_id,
                 )
+            elif is_glu_weight:
+                # We must split the tensor into 2 parts, each sharded separately.
+                # This requires a ShardedTensorFactory which `chunk`s during saving
+                # and `cat`s during loading
+                assert tp_axis == 0, f'TP axis for GLU weight should be 0, got: {tp_axis}'
+                tp_rank = parallel_state.get_tensor_model_parallel_rank()
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
 
+                sh_ten_builder = partial(
+                    ShardedTensor.from_rank_offsets, replica_id=replica_id, prepend_axis_num=1
+                )  # for PP sharding
+
+                # NOTE: passing `tp_axis` as argument due to late binding in closures
+                def sh_ten_build_fn(key: str, t: torch.Tensor, tp_axis=tp_axis):
+                    offset_w = (tp_axis + 1, tp_rank, tp_size * 2)
+                    offset_v = (tp_axis + 1, tp_size + tp_rank, tp_size * 2)
+                    with torch.no_grad():
+                        tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_axis)
+                    return [
+                        sh_ten_builder(key, tensor_w, *sharded_offsets, offset_w),
+                        sh_ten_builder(key, tensor_v, *sharded_offsets, offset_v),
+                    ]
+
+                def sh_ten_merge_fn(sub_state_dict):
+                    with torch.no_grad():
+                        return torch.cat(sub_state_dict)
+
+                sharded_state_dict[layer_key] = ShardedTensorFactory(
+                    f'{prefix}{layer_name}', tensor, sh_ten_build_fn, sh_ten_merge_fn
+                )
             else:
                 sharded_state_dict[layer_key] = ShardedTensor.from_rank_offsets(
                     f'{prefix}{layer_name}',
