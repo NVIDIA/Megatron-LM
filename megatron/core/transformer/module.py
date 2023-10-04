@@ -124,10 +124,9 @@ class Float16Module(MegatronModule):
         return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
 
     def sharded_state_dict(self, prefix=''):
-        """ Retrieve state_dict from the module being wrapped.
-            When using distributed checkpointing, keep_vars must always be set to True.
+        """ Retrieve sharded_state_dict from the module being wrapped.
         """
-        return self.module.sharded_state_dict(prefix=prefix, keep_vars=True)
+        return self.module.sharded_state_dict(prefix=prefix)
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
