@@ -371,12 +371,19 @@ def validate_args(args, defaults={}):
     # don't allow it to keep things simple
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
+    
+    # MoE Spec check
+    if args.num_experts is not None:
+        assert args.model_spec is None, "Model Spec must be None when using MoEs"
 
     # Expert parallelism check
-    if args.expert_parallel and args.tensor_model_parallel_size > 1:
+    if args.expert_parallel:
+        assert args.num_experts is not None, "num_experts must be non None to use expert-parallel"
         assert args.num_experts % args.data_parallel_size == 0, \
             "Number of experts should be a multiple of data parallel_size."
-        args.sequence_parallel = True
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel, \
+                "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
 
     # Print arguments.
     _print_args("arguments", args)
