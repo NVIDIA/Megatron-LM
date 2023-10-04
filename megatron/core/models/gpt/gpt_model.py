@@ -40,10 +40,10 @@ class GPTModel(LanguageModule):
             max_sequence_length (int): maximum size of sequence. This is used for positional embedding
             pre_process (bool, optional): Include embedding layer (used with pipeline parallelism). Defaults to True.
             post_process (bool, optional): Include an output layer (used with pipeline parallelism). Defaults to True.
-            fp16_lm_cross_entropy (bool, optional): _description_. Defaults to False.
+            fp16_lm_cross_entropy (bool, optional): Defaults to False.
             parallel_output (bool, optional): Do not gather the outputs, keep them split across tensor parallel ranks. Defaults to True.
             share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
-            position_embedding_type (Literal[&#39;learned_absolute&#39;, &#39;rope&#39;], optional): _description_. Defaults to 'learned_absolute'.
+            position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
             rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
             seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.        
     """
@@ -129,9 +129,7 @@ class GPTModel(LanguageModule):
         inference_params=None,
     ) -> Tensor:
         """Forward function of the GPT Model
-
         This function passes the input tensors through the embedding layer, and then the decoeder and finally into the post processing layer (optional). It either returns the Loss values if labels are given  or the final hidden units
-
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
