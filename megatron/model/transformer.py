@@ -121,7 +121,7 @@ class ParallelMLP(MegatronModule):
             in_features=config.ffn_hidden_size,
             out_features=config.hidden_size,
             skip_bias_add=True,
-            init_method=config.init_method,
+            init_method=config.output_layer_init_method,
             transpose=True
         )
 
