@@ -150,14 +150,11 @@ def forward_step(data_iterator, model: GPTModel):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples) -> tuple(GPTDataset, GPTDataset, GPTDataset):
+def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
-
-    Returns:
-        tuple(GPTDataset, GPTDataset, GPTDataset): The train, valid and test datasets
     """
     args = get_args()
 
