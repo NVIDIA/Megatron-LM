@@ -61,6 +61,9 @@ _DATA_PARALLEL_GROUP_WITH_CP = None
 _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 
+# combined parallel group of TP, DP, and CP used for fp8
+_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
+
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
@@ -343,18 +346,33 @@ def initialize_model_parallel(
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
+    global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
-    tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
-    num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
-    for i in range(num_tensor_and_data_groups):
-        start_rank = i * tensor_and_data_group_size
-        end_rank = (i + 1) * tensor_and_data_group_size
+    tensor_and_data_group_size_with_cp: int = tensor_model_parallel_size * data_parallel_size * context_parallel_size
+    num_tensor_and_data_groups_with_cp: int = world_size // tensor_and_data_group_size_with_cp
+    for i in range(num_tensor_and_data_groups_with_cp):
+        start_rank = i * tensor_and_data_group_size_with_cp
+        end_rank = start_rank + tensor_and_data_group_size_with_cp
         ranks = range(start_rank, end_rank)
         group = torch.distributed.new_group(ranks)
         if rank in ranks:
-            _TENSOR_AND_DATA_PARALLEL_GROUP = group
+            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+
+        for j in range(context_parallel_size):
+            ranks = []
+            for k in range(data_parallel_size):
+                start_rank = (
+                    i * tensor_and_data_group_size_with_cp
+                    + j * tensor_model_parallel_size
+                    + k * tensor_model_parallel_size * context_parallel_size
+                )
+                end_rank = start_rank + tensor_model_parallel_size
+                ranks = ranks + list(range(start_rank, end_rank))
+            group = torch.distributed.new_group(ranks)
+            if rank in ranks:
+                _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -450,20 +468,32 @@ def get_position_embedding_group():
     return _POSITION_EMBEDDING_GROUP
 
 
-def get_amax_reduction_group():
+def get_amax_reduction_group(with_context_parallel=False):
     """Get the FP8 amax reduction group the caller rank belongs to."""
-    assert (
-        _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-    ), 'FP8 amax reduction group is not initialized'
-    return _TENSOR_AND_DATA_PARALLEL_GROUP
+    if with_context_parallel:
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+        ), 'FP8 amax reduction group is not initialized'
+        return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    else:
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+        ), 'FP8 amax reduction group is not initialized'
+        return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 
-def get_tensor_and_data_parallel_group():
+def get_tensor_and_data_parallel_group(with_context_parallel=False):
     """Get the tensor and data parallel group the caller rank belongs to."""
-    assert (
-        _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-    ), 'tensor and data parallel group is not initialized'
-    return _TENSOR_AND_DATA_PARALLEL_GROUP
+    if with_context_parallel:
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+        ), 'tensor and data parallel group is not initialized'
+        return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    else:
+        assert (
+            _TENSOR_AND_DATA_PARALLEL_GROUP is not None
+        ), 'tensor and data parallel group is not initialized'
+        return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 
 def set_tensor_model_parallel_world_size(world_size):
@@ -772,6 +802,8 @@ def destroy_model_parallel():
     _POSITION_EMBEDDING_GROUP = None
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     _TENSOR_AND_DATA_PARALLEL_GROUP = None
+    global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
