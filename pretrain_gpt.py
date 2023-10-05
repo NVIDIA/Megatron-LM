@@ -102,15 +102,12 @@ def get_batch(data_iterator):
 
     return tokens, labels, loss_mask, attention_mask, position_ids
 
-def loss_func(loss_mask: Tensor, output_tensor: Tensor) -> tuple(Tensor, dict):
+def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """Loss function.
 
     Args:
         loss_mask (Tensor): Used to mask out some portions of the loss
         output_tensor (Tensor): The tensor with the losses
-
-    Returns:
-        tuple(Tensor, dict): Returns a tuple of the total loss, and the averaged loss across data parallel group as a dictionary
     """    
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
