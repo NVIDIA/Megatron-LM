@@ -12,7 +12,7 @@ if [ "$#" != 2 ]; then
 fi
 USE_CORE=$1
 ADD_RETRIEVER=$2
-NPROCS=8
+NPROCS=1 # 8
 NWORKERS=32
 
 # ARGS_PATH="/lustre/fsw/portfolios/adlr/users/lmcafee/retro/scripts/train/args_843m.sh"

@@ -45,7 +45,10 @@ def core_model_provider(pre_process=True, post_process=True):
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
+        # >>>
         post_process=post_process,
+        # post_process=False,
+        # <<<
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
