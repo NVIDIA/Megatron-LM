@@ -329,6 +329,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
         self.module = module
         self.grad_buffers = {}
+        self.expert_grads = []
         self.grad_buffer_param_index_map = {}
         self.param_to_grad_buffer = {}
 
@@ -337,7 +338,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         grad_dtype_to_numel = {}
         param_to_name = {}
         for name, param in self.module.named_parameters():
-            if param.requires_grad:
+            if param.requires_grad and getattr(param, 'allreduce', True):
                 param.grad_added_to_main_grad = False
                 param_to_name[param] = name
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
@@ -389,6 +390,17 @@ class DistributedDataParallel(DistributedDataParallelBase):
                     index + param.data.nelement(),
                     self.grad_buffers[dtype].param_to_bucket_index[param],
                 )
+
+        # Allocate discreate buffer for MoE params' grads
+        for param in self.module.parameters():
+            if param.requires_grad and not getattr(param, 'allreduce', True):
+                dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+                param.main_grad = \
+                    torch.zeros(param.data.shape,
+                                dtype=dtype,
+                                device=torch.cuda.current_device(),
+                                requires_grad=False)
+                self.expert_grads.append(param.main_grad)
 
         # Register backward hook.
         # Accumulation function for the gradients need to be stored so they
@@ -446,6 +458,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
                 param.grad_added_to_main_grad = False
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.reset()
+        for expert_grad in self.expert_grads:
+            expert_grad.zero_()
 
     def broadcast_params(self):
         """Sync params across all DP ranks."""
