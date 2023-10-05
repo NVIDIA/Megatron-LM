@@ -81,6 +81,7 @@ def model_provider(pre_process=True, post_process=True,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent
     )
+
     return model
 
 

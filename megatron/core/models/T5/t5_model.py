@@ -49,19 +49,19 @@ class T5LMHead(MegatronModule):
     def __init__(self, mpu_vocab_size, config, parallel_output, vocab_size, pre_process, share_embeddings_and_output_weights):
         super(T5LMHead, self).__init__(config=config)
 
-        self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        self.bias.model_parallel = True
-        self.bias.partition_dim = 0
-        self.bias.stride = 1
-        self.parallel_output = parallel_output
+        # self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
+        # self.bias.model_parallel = True
+        # self.bias.partition_dim = 0
+        # self.bias.stride = 1
+        # self.parallel_output = parallel_output
 
         self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 vocab_size,
                 config=config,
                 init_method=config.init_method,
-                bias=False,
-                skip_bias_add=True,
+                bias=True,
+                skip_bias_add=False,
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
             )       
@@ -421,6 +421,9 @@ class T5Model(MegatronModule):
         add an extra key."""
 
         state_dict_ = {}
+        state_dict_["embedding"] \
+            = self.embedding.state_dict_for_save_checkpoint(prefix=prefix,
+                                                                 keep_vars=keep_vars)
         state_dict_["encoder"] \
             = self.encoder.state_dict_for_save_checkpoint(prefix=prefix,
                                                                  keep_vars=keep_vars)
@@ -442,6 +445,8 @@ class T5Model(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
+        self.embedding.load_state_dict(
+            state_dict["encoder"], strict=strict)
 
         self.encoder.load_state_dict(
             state_dict["encoder"], strict=strict)
