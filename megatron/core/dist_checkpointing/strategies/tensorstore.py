@@ -4,6 +4,7 @@
 
 from functools import partial
 from itertools import starmap
+from logging import getLogger
 from pathlib import Path
 
 import tensorstore as ts
@@ -13,9 +14,11 @@ from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy, StrategyAction, default_strategies
-from .zarr import postprocess_numpy_array
+from .zarr import postprocess_numpy_array, numpy_to_torch_dtype_dict
 
 _import_trigger = None
+
+logger = getLogger(__name__)
 
 
 class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
@@ -34,6 +37,28 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
             load_directly_on_device=self.load_directly_on_device,
         )
         dict_list_map_inplace(load_fn, sharded_state_dict)
+        return sharded_state_dict
+
+    def load_sharded_metadata(self, checkpoint_dir: Path):
+        sharded_state_dict = {}
+        for subdir in checkpoint_dir.iterdir():
+            if not subdir.is_dir() or not (subdir / '.zarray').exists():
+                continue
+            key = subdir.name
+            try:
+                arr = open_ts_array(subdir)
+            except CheckpointingException as e:
+                logger.warning(f'Array {key} will not be included in metadata state dict. Error during loading metadata: {e}')
+
+            sharded_state_dict[key] = ShardedTensor(
+                key,
+                None,
+                numpy_to_torch_dtype_dict[arr.dtype.numpy_dtype],
+                arr.shape,
+                arr.shape,
+                tuple(0 for _ in arr.shape),
+                tuple(1 for _ in arr.shape),
+            )
         return sharded_state_dict
 
     def check_backend_compatibility(self, loaded_version):
@@ -74,18 +99,7 @@ def _load_from_array(
 
 def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
     assert isinstance(sharded_tensor, ShardedTensor), type(sharded_tensor)
-    spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
-    spec['kvstore'] = {
-        'driver': 'file',
-        'path': str(checkpoint_dir / sharded_tensor.key),
-    }
-    try:
-        arr = ts.open(ts.Spec(spec), open=True).result()
-    except Exception as e:
-        raise CheckpointingException(
-            f'Array {checkpoint_dir / sharded_tensor.key} could not be loaded. Error: {e}'
-        ) from e
-
+    arr = open_ts_array(checkpoint_dir / sharded_tensor.key)
     if sharded_tensor.global_shape == arr.shape:
         x = (
             arr[sharded_tensor.global_slice()].read().result()
@@ -103,6 +117,21 @@ def _load_regular_chunk(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
         )
         raise CheckpointingException(_msg)
     return x
+
+
+def open_ts_array(arr_path: Path):
+    spec = {'driver': 'zarr', 'metadata_key': '.zarray', 'kvstore': {}}
+    spec['kvstore'] = {
+        'driver': 'file',
+        'path': str(arr_path),
+    }
+    try:
+        arr = ts.open(ts.Spec(spec), open=True).result()
+    except Exception as e:
+        raise CheckpointingException(
+            f'Array {arr_path} could not be loaded. Error: {e}'
+        ) from e
+    return arr
 
 
 default_strategies[StrategyAction.LOAD_SHARDED.value][

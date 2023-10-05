@@ -3,6 +3,7 @@
 """ Strategies using Zarr as an underlying format. """
 import os
 from functools import partial
+from logging import getLogger
 from pathlib import Path
 from typing import List
 
@@ -16,17 +17,17 @@ from ..mapping import ShardedStateDict, ShardedTensor, is_main_replica
 from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
 
 numpy_to_torch_dtype_dict = {
-    np.bool_: torch.bool,
-    np.uint8: torch.uint8,
-    np.int8: torch.int8,
-    np.int16: torch.int16,
-    np.int32: torch.int32,
-    np.int64: torch.int64,
-    np.float16: torch.float16,
-    np.float32: torch.float32,
-    np.float64: torch.float64,
-    np.complex64: torch.complex64,
-    np.complex128: torch.complex128,
+    np.dtype('bool'): torch.bool,
+    np.dtype('uint8'): torch.uint8,
+    np.dtype('int8'): torch.int8,
+    np.dtype('int16'): torch.int16,
+    np.dtype('int32'): torch.int32,
+    np.dtype('int64'): torch.int64,
+    np.dtype('float16'): torch.float16,
+    np.dtype('float32'): torch.float32,
+    np.dtype('float64'): torch.float64,
+    np.dtype('complex64'): torch.complex64,
+    np.dtype('complex128'): torch.complex128,
 }
 
 torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
@@ -42,6 +43,8 @@ except ImportError:
     HAS_BFLOAT16 = False
 
 _import_trigger = None
+
+logger = getLogger(__name__)
 
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
@@ -131,6 +134,29 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
         dict_list_map_inplace(
             partial(_load_from_array, checkpoint_dir=checkpoint_dir), sharded_state_dict
         )
+        return sharded_state_dict
+
+    def load_sharded_metadata(self, checkpoint_dir: Path):
+        # TODO: share implementation with tensorstore strategy?
+        sharded_state_dict = {}
+        for subdir in checkpoint_dir.iterdir():
+            if not subdir.is_dir() or not (subdir / '.zarray').exists():
+                continue
+            key = subdir.name
+            try:
+                arr = zarr.open(str(subdir), 'r')
+            except CheckpointingException as e:
+                logger.warning(f'Array {key} will not be included in metadata state dict. Error during loading metadata: {e}')
+
+            sharded_state_dict[key] = ShardedTensor(
+                key,
+                None,
+                numpy_to_torch_dtype_dict[arr.dtype],
+                arr.shape,
+                arr.shape,
+                tuple(0 for _ in arr.shape),
+                tuple(1 for _ in arr.shape),
+            )
         return sharded_state_dict
 
     def check_backend_compatibility(self, loaded_version):

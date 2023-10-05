@@ -17,7 +17,7 @@ import torch
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor, StateDict
 from .base import LoadShardedStrategy
-from .tensorstore import _load_from_array
+from .tensorstore import _load_from_array, TensorStoreLoadShardedStrategy
 from .zarr import flatten_range
 
 _import_trigger = None
@@ -247,3 +247,8 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             return sharded_tensor.data
 
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
+
+    def load_sharded_metadata(self, checkpoint_dir: Path):
+        # Share implementation with TS
+        # TODO: do this in a clean way, currently we are breaking abstraction
+        return TensorStoreLoadShardedStrategy.load_sharded_metadata(self, checkpoint_dir)

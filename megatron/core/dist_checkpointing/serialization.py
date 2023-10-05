@@ -47,6 +47,7 @@ def load(
     checkpoint_dir: str,
     sharded_strategy: Union[LoadShardedStrategy, None] = None,
     common_strategy: Union[LoadCommonStrategy, None] = None,
+    validate_access_integrity: bool = True
 ) -> StateDict:
     """Loading entrypoint.
 
@@ -57,6 +58,8 @@ def load(
         checkpoint_dir: directory with the checkpoint
         sharded_strategy: configures loading behavior for sharded tensors
         common_strategy: configures loading behavior for common data
+        validate_access_integrity: checks if each tensor shard is accessed
+            exactly once by some process
     """
     if common_strategy is not None:
         raise NotImplementedError('The only supported common strategy is torch')
@@ -78,7 +81,8 @@ def load(
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
     merge(common_state_dict, nonpersistent_state_dict)
 
-    validate_sharding_integrity(nested_values(sharded_state_dict))
+    if validate_access_integrity:
+        validate_sharding_integrity(nested_values(sharded_state_dict))
 
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(
@@ -112,6 +116,23 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
         return loaded_obj
 
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
+
+
+def load_sharded_metadata(checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None,):
+    saved_config = maybe_load_config(checkpoint_dir)
+    if saved_config is None:
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
+
+    if sharded_strategy is None:
+        sharded_strategy = get_default_strategy(
+            StrategyAction.LOAD_SHARDED,
+            saved_config.sharded_backend,
+            saved_config.sharded_backend_version,
+        )
+    else:
+        # TODO: implement consistency checks here
+        pass
+    return sharded_strategy.load_sharded_metadata(checkpoint_dir)
 
 
 def save(
