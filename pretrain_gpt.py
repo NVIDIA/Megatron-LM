@@ -20,7 +20,10 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    gpt_layer_with_transformer_engine_spec,
+    gpt_layer_with_transformer_engine_spec_moe
+)
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
     """Builds the model.
@@ -44,7 +47,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.model_spec is not None:
             transformer_layer_spec = import_module(args.model_spec)
         else:
+        if args.num_experts is None:
             transformer_layer_spec = gpt_layer_with_transformer_engine_spec
+        else:
+            transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
 
         model = GPTModel(
             config=config,
