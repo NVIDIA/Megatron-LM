@@ -22,7 +22,10 @@ def print_model_with_params(key, model, depth=0):
 
 def compare_top_nparams(key, default_module, core_module):
     get_nparams = lambda m : "--" if m is None else sum(t.numel() for t in m.parameters())
-    get_param_shapes = lambda m : "--" if m is None else ", ".join(str(tuple(p.shape)) for p in m.parameters())
+    # >>>
+    # get_param_shapes = lambda m : "--" if m is None else ", ".join(str(tuple(p.shape)) for p in m.parameters())
+    get_param_shapes = lambda m : "--"
+    # <<<
     # get_param_shapes = lambda m : "--" if m is None else "-some-"
     default_nparams = get_nparams(default_module)
     core_nparams = get_nparams(core_module)
@@ -183,16 +186,16 @@ def compare_models():
     default_encoder_xattn = default_encoder_layers[0].inter_attention
     core_encoder_xattn = core_encoder_layers[0].cross_attention.attn
 
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params("default norm", default_encoder_layers[0].post_attention_norm)
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params("core norm", core_encoder_layers[0].pre_cross_attn_layernorm)
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params("default xattn", default_encoder_xattn)
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params("core xattn", core_encoder_xattn)
-    print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    exit()
+    # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    # print_model_with_params("default norm", default_encoder_layers[0].post_attention_norm)
+    # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    # print_model_with_params("core norm", core_encoder_layers[0].pre_cross_attn_layernorm)
+    # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    # print_model_with_params("default xattn", default_encoder_xattn)
+    # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    # print_model_with_params("core xattn", core_encoder_xattn)
+    # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+    # exit()
 
     # pax("default_encoder_layers, core_encoder_layers")
 
@@ -203,6 +206,7 @@ def compare_models():
     compare_layer_nparams("encoder layer", 0, default_encoder_layers, core_encoder_layers)
     # compare_sub_nparams("encoder xattn", default_encoder_xattn, core_encoder_xattn)
     compare_xattn_nparams("encoder", default_encoder_xattn, core_encoder_xattn)
+    compare_top_nparams("model", default_model, core_model)
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     exit()
 

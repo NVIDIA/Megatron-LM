@@ -74,6 +74,7 @@ class TransformerLayer(MegatronModule):
         ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = build_module(
             submodules.pre_cross_attn_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,

@@ -16,7 +16,7 @@ from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -31,14 +31,15 @@ def get_retro_encoder_layer_spec() -> ModuleSpec:
     and processing them individually.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
+    spec.submodules.pre_cross_attn_layernorm=TENorm
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroEncoderCrossAttention,
         params={
             "attn_mask_type" : AttnMaskType.padding,
         },
         submodules=CrossAttentionSubmodules(
-            linear_q=TELayerNormColumnParallelLinear,
-            linear_kv=TELayerNormColumnParallelLinear,
+            linear_q=TEColumnParallelLinear,
+            linear_kv=TEColumnParallelLinear,
             core_attention=TEDotProductAttention,
             linear_proj=TERowParallelLinear,
         )

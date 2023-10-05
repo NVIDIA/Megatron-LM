@@ -10,8 +10,9 @@ from megatron.core.models.retro.decoder_attention import (
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
     TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
+    TENorm,
     TERowParallelLinear,
 )
 from megatron.core.transformer import (
@@ -31,14 +32,15 @@ def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> Modul
     provided for the first Retro decoder layer.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
+    spec.submodules.pre_cross_attn_layernorm=TENorm
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
         params={
             "encoder_block_spec" : encoder_block_spec,
         },
         submodules=CrossAttentionSubmodules(
-            linear_q=TELayerNormColumnParallelLinear,
-            linear_kv=TELayerNormColumnParallelLinear,
+            linear_q=TEColumnParallelLinear,
+            linear_kv=TEColumnParallelLinear,
             core_attention=TEDotProductAttention,
             linear_proj=TERowParallelLinear,
         ),
