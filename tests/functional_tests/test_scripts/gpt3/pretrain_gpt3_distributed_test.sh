@@ -1,20 +1,18 @@
 #! /bin/bash
-set -x 
+echo "------ARGUMENTS LIST --------"
+for ARGUMENT in "$@"
+do
+   KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
-DATA_PATH=$1
-CHECKPOINT_PATH=$2
-TENSORBOARD_DIR=$3
-USE_TE=$4
-TP_SIZE=$5
-PP_SIZE=$6
-NUM_NODES=$7
-MAX_STEPS=$8
-USE_CORE=$9
-VP_SIZE=${10}
-MBS=${11}
-GBS=${12}
-ADDITIONAL_PARAMS=${13}
+   KEY_LENGTH=${#KEY}
+   VALUE="${ARGUMENT:$KEY_LENGTH+1}"
 
+   export "$KEY"="$VALUE"
+   echo "$KEY=$VALUE"
+done
+echo "---------------------------------"
+
+set -x
 if [[ -n $MBS ]]; then MBS=4; fi
 if [[ -n $GBS ]]; then GBS=32; fi
 if [[ -n $VP_SIZE ]]; then VP_SIZE="" ; fi
@@ -25,7 +23,8 @@ MASTER_ADDR=localhost
 MASTER_PORT=6000
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+commad="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
@@ -36,7 +35,7 @@ if [[ $USE_CORE -eq 1 ]]; then
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
        CALLING_SCRIPT=pretrain_gpt_core.py
-       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+       commad="$commad export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
@@ -47,10 +46,11 @@ else
        echo "Running with local transformer implementation ..."
 fi
 
+set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
-torchrun $DISTRIBUTED_ARGS \
+torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        $CALLING_SCRIPT \
        --num-layers 12 \
        --hidden-size 512 \
@@ -90,4 +90,12 @@ torchrun $DISTRIBUTED_ARGS \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
-       --${TRAINING_DTYPE}
+       --${TRAINING_DTYPE}"
+
+commad="$commad $torch_run_cmd"
+echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
+echo "$commad"
+echo "-----------------------------------------------------------------------------"
+
+echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
+eval $command
