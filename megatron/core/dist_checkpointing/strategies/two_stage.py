@@ -17,8 +17,9 @@ import torch
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor, StateDict
 from .base import LoadShardedStrategy
-from .tensorstore import _load_from_array, TensorStoreLoadShardedStrategy
-from .zarr import flatten_range
+from .tensorstore import _load_from_array, TensorStoreLoadShardedStrategy, \
+    open_ts_array
+from .zarr import flatten_range, load_zarr_based_sharded_metadata
 
 _import_trigger = None
 
@@ -249,6 +250,8 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
-        # Share implementation with TS
-        # TODO: do this in a clean way, currently we are breaking abstraction
-        return TensorStoreLoadShardedStrategy.load_sharded_metadata(self, checkpoint_dir)
+        def get_ts_shape_dtype(path):
+            arr = open_ts_array(path)
+            return arr.shape, arr.dtype.numpy_dtype
+
+        return load_zarr_based_sharded_metadata(checkpoint_dir, get_ts_shape_dtype)

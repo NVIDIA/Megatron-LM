@@ -55,6 +55,7 @@ class LoadShardedStrategy(LoadStrategyBase):
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         raise NotImplementedError
 
+    @abstractmethod
     def load_sharded_metadata(self, checkpoint_dir: Path):
         """Load tensors metadata from the checkpoint.
 
@@ -65,7 +66,7 @@ class LoadShardedStrategy(LoadStrategyBase):
         Dict values are ShardedTensors without any sharding (so, the only useful
         information is tensors global shape and dtype).
         """
-        raise NotImplementedError(f'{self.__class__.__name__} doesnt allow loading only sharded metadat')
+        raise NotImplementedError(f'{self.__class__.__name__} doesnt allow loading only sharded metadata')
 
 
 class SaveCommonStrategy(SaveStrategyBase):

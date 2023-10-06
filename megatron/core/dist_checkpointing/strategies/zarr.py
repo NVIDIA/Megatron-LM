@@ -5,7 +5,7 @@ import os
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import List
+from typing import List, Callable, Tuple
 
 import numpy as np
 import torch
@@ -137,27 +137,11 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
         return sharded_state_dict
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
-        # TODO: share implementation with tensorstore strategy?
-        sharded_state_dict = {}
-        for subdir in checkpoint_dir.iterdir():
-            if not subdir.is_dir() or not (subdir / '.zarray').exists():
-                continue
-            key = subdir.name
-            try:
-                arr = zarr.open(str(subdir), 'r')
-            except CheckpointingException as e:
-                logger.warning(f'Array {key} will not be included in metadata state dict. Error during loading metadata: {e}')
+        def get_zarr_shape_dtype(path):
+            arr = zarr.open(path, 'r')
+            return arr.shape, arr.dtype
 
-            sharded_state_dict[key] = ShardedTensor(
-                key,
-                None,
-                numpy_to_torch_dtype_dict[arr.dtype],
-                arr.shape,
-                arr.shape,
-                tuple(0 for _ in arr.shape),
-                tuple(1 for _ in arr.shape),
-            )
-        return sharded_state_dict
+        return load_zarr_based_sharded_metadata(checkpoint_dir, get_zarr_shape_dtype)
 
     def check_backend_compatibility(self, loaded_version):
         pass  # TODO
@@ -248,6 +232,33 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
             .bfloat16()
         )
     return torch.nn.functional.pad(x.unsqueeze(0), pad_args, mode='replicate').squeeze(0)
+
+
+def load_zarr_based_sharded_metadata(checkpoint_dir: Path, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]) -> ShardedStateDict:
+    """Load metadata of Zarr arrays.
+
+    Arguments:
+        checkpoint_dir: checkpoint root directory
+        get_shape_dtype_fn: a function returning array shape and dtype
+            for a given Zarr array path
+    """
+    sharded_state_dict = {}
+    for subdir in checkpoint_dir.iterdir():
+        if not subdir.is_dir() or not (subdir / '.zarray').exists():
+            continue
+        key = subdir.name
+        arr_shape, arr_dtype = get_shape_dtype_fn(str(subdir))
+
+        sharded_state_dict[key] = ShardedTensor(
+            key,
+            None,
+            numpy_to_torch_dtype_dict[arr_dtype],
+            arr_shape,
+            arr_shape,
+            tuple(0 for _ in arr_shape),
+            tuple(1 for _ in arr_shape),
+        )
+    return sharded_state_dict
 
 
 # default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = ZarrLoadShardedStrategy()

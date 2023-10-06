@@ -14,7 +14,8 @@ from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy, StrategyAction, default_strategies
-from .zarr import postprocess_numpy_array, numpy_to_torch_dtype_dict
+from .zarr import postprocess_numpy_array, numpy_to_torch_dtype_dict, \
+    load_zarr_based_sharded_metadata
 
 _import_trigger = None
 
@@ -40,26 +41,11 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         return sharded_state_dict
 
     def load_sharded_metadata(self, checkpoint_dir: Path):
-        sharded_state_dict = {}
-        for subdir in checkpoint_dir.iterdir():
-            if not subdir.is_dir() or not (subdir / '.zarray').exists():
-                continue
-            key = subdir.name
-            try:
-                arr = open_ts_array(subdir)
-            except CheckpointingException as e:
-                logger.warning(f'Array {key} will not be included in metadata state dict. Error during loading metadata: {e}')
+        def get_ts_shape_dtype(path):
+            arr = open_ts_array(path)
+            return arr.shape, arr.dtype.numpy_dtype
 
-            sharded_state_dict[key] = ShardedTensor(
-                key,
-                None,
-                numpy_to_torch_dtype_dict[arr.dtype.numpy_dtype],
-                arr.shape,
-                arr.shape,
-                tuple(0 for _ in arr.shape),
-                tuple(1 for _ in arr.shape),
-            )
-        return sharded_state_dict
+        return load_zarr_based_sharded_metadata(checkpoint_dir, get_ts_shape_dtype)
 
     def check_backend_compatibility(self, loaded_version):
         pass  # TODO

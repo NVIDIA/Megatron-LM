@@ -118,7 +118,19 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
 
 
-def load_sharded_metadata(checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None,):
+def load_sharded_metadata(checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None) -> ShardedStateDict:
+    """Load tensors metadata from the checkpoint.
+
+    Returns a dictionary similar to a sharded state dict, but note that
+    the dictionary keys are simply ShardedTensor keys (contrary to the
+    actual sharded state dicts where keys correspond to state dict keys).
+
+    Dict values are ShardedTensors without any sharding (so, the only useful
+    information is tensors global shape and dtype).
+
+    Concrete implementation depends on the loading strategy. If no strategy is
+    given, a default for a given backend is used.
+    """
     saved_config = maybe_load_config(checkpoint_dir)
     if saved_config is None:
         raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
