@@ -47,10 +47,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         if args.model_spec is not None:
             transformer_layer_spec = import_module(args.model_spec)
         else:
-        if args.num_experts is None:
-            transformer_layer_spec = gpt_layer_with_transformer_engine_spec
-        else:
-            transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
+            if args.num_experts is None:
+                transformer_layer_spec = gpt_layer_with_transformer_engine_spec
+            else:
+                transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
 
         model = GPTModel(
             config=config,
