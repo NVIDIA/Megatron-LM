@@ -24,6 +24,7 @@ class ModuleSpec:
 
     module: Union[Tuple, type]
     params: dict = field(default_factory=lambda: {})
+    submodules: type = None
 
 
 def import_module(module_path: Tuple[str]):
@@ -55,11 +56,11 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
-    # If the passed `spec_or_module` is an already initialized module or if it's
+    # If the passed `spec_or_module` is
     # a `Function`, then return it as it is
-    if isinstance(spec_or_module, torch.nn.Module) or isinstance(
-        spec_or_module, types.FunctionType
-    ):
+    # NOTE: to support an already initialized module add the following condition
+    # `or isinstance(spec_or_module, torch.nn.Module)` to the following if check
+    if isinstance(spec_or_module, types.FunctionType):
         return spec_or_module
 
     # If the passed `spec_or_module` is actually a spec (instance of
@@ -86,9 +87,12 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
 
     # Finally return the initialized module with params from the spec as well
     # as those passed as **kwargs from the code
-    try:
-        return module(
-            *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
-        )
-    except Exception as e:
-        raise Exception(f"error instantiating {module.__name__}, with error: {type(e).__name__}: '{e}'")
+
+    # Add the `submodules` argument to the module init call if it exists in the
+    # spec.
+    if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
+        kwargs["submodules"] = spec_or_module.submodules
+
+    return module(
+        *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
+    )

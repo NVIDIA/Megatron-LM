@@ -45,6 +45,9 @@ class TransformerConfig(ModelParallelConfig):
 
         activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
 
+        num_moe_experts (int): Number of experts to use for Mixture of Experts. 
+                               When set, it replaces MLP with Switch MLP. Defaults to None (no MoE).
+
         # initialization
         init_method (Callable): Method to initialize weights. Note that bias is always set to
                                 zero. Should be a function that takes a single Tensor and
@@ -82,7 +85,8 @@ class TransformerConfig(ModelParallelConfig):
                                      are also less compute intensive which makes activation checkpointing more efficient
                                      for LLMs (20B+).  See Reducing Activation Recomputation in Large Transformer
                                      Models: https://arxiv.org/abs/2205.05198 for more details.  'full' will checkpoint
-                                     the entire transformer layer.  Must be 'selective' or 'full'. Defaults to None.
+                                     the entire transformer layer.  Must be 'selective' or 'full'. 'selective' always uses all layers.
+                                     Defaults to None.
 
         recompute_method (str): uniform will uniformly divide the total number of transformer layers in a transformer
                                 block and recompute the input activation of each divided chunk at the specified
@@ -94,7 +98,7 @@ class TransformerConfig(ModelParallelConfig):
         recompute_num_layers (int): When recompute_method is uniform, recompute_num_layers is the number of transformer
                                     layers in each uniformly divided recompute unit.  When recompute_method is block,
                                     recompute_num_layers is the number of transformer layers to recompute within each
-                                    pipeline stage.  Defaults to None.
+                                    pipeline stage.  Must be None for 'selective' activation checkpointing. Defaults to None.
 
         distribute_saved_activations (bool): If true, distribute recomputed activations across the model parallel
                                              group. Defaults to None.
@@ -144,6 +148,7 @@ class TransformerConfig(ModelParallelConfig):
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
+    num_moe_experts: int = None
 
     # initialization
     init_method: Callable = None
@@ -226,6 +231,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        if self.expert_parallel and self.num_moe_experts is None:
+            raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
+
         if self.recompute_granularity is not None:
             if not self.recompute_granularity in ['full', 'selective']:
                 raise ValueError(
@@ -242,10 +250,16 @@ class TransformerConfig(ModelParallelConfig):
                     f'Using recompute_granularity: {self.recompute_granularity} so recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_num_layers is None:
+            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} so recompute_num_layers must be between '
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be between '
                     f'1 and num_layers_per_pipeline_rank: {self.num_layers // self.pipeline_model_parallel_size}'
+                )
+            elif (
+                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
+            ):
+                raise ValueError(
+                    f'When using recompute_granularity: {self.recompute_granularity} recompute_num_layers must be None.'
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:

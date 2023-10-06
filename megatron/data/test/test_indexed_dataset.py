@@ -15,7 +15,7 @@ sys.path.append(os.path.join(script_dir, "../../../"))
 
 
 def test_indexed_dataset(args):
-    ds = indexed_dataset.make_dataset(args.data, args.dataset_impl)
+    ds = indexed_dataset.MMapIndexedDataset(args.data)
     tokenizer = build_tokenizer(args)
     print(len(ds.doc_idx))
     print(len(ds))
@@ -41,7 +41,7 @@ def test_indexed_dataset(args):
 
 
 def test_indexed_dataset_get(args):
-    ds = indexed_dataset.make_dataset(args.data, args.dataset_impl)
+    ds = indexed_dataset.MMapIndexedDataset(args.data)
     tokenizer = build_tokenizer(args)
     size = ds.sizes[0]
     print(f"size: {size}")
@@ -61,29 +61,10 @@ def test_indexed_dataset_get(args):
     print(part)
     # print(tokenizer.detokenize(part.data.tolist()))
 
-# def test_albert_dataset(args):
-#     # tokenizer = FullBertTokenizer(args.vocab, do_lower_case=True)
-#     # idataset = indexed_dataset.make_dataset(args.data, args.dataset_impl)
-#     # ds = AlbertDataset(idataset, tokenizer)
-#     ds = AlbertDataset.from_paths(args.vocab, args.data, args.dataset_impl,
-#                                   args.epochs, args.max_num_samples,
-#                                   args.masked_lm_prob, args.seq_length,
-#                                   args.short_seq_prob, args.seed)
-#     truncated = 0
-#     total = 0
-#     for i, s in enumerate(ds):
-#         ids = s['text']
-#         tokens = ds.tokenizer.convert_ids_to_tokens(ids)
-#         print(tokens)
-#         if i >= args.count-1:
-#             exit()
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, help='prefix to data files')
-    parser.add_argument('--dataset-impl', type=str, default='infer',
-                        choices=['lazy', 'cached', 'mmap', 'infer'])
     parser.add_argument('--count', type=int, default=10,
                         help='Number of samples/documents to print')
 
@@ -114,10 +95,6 @@ def main():
     args.make_vocab_size_divisible_by = 128
     args.tensor_model_parallel_size = 1
 
-    if args.dataset_impl == "infer":
-        args.dataset_impl = indexed_dataset.infer_dataset_impl(args.data)
-
-#    test_albert_dataset(args)
     test_indexed_dataset_get(args)
 
 

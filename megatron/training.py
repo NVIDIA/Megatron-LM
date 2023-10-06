@@ -9,7 +9,6 @@ import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
-from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -33,7 +32,7 @@ from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.model import DistributedDataParallel as LocalDDP
+from megatron.model import DistributedDataParallel as DDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
@@ -297,24 +296,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         model = [Float16Module(model_module, args) for model_module in model]
 
     if wrap_with_ddp:
-        if args.DDP_impl == 'torch':
-            i = torch.cuda.current_device()
-            model = [torchDDP(model_module, device_ids=[i], output_device=i,
-                              process_group=mpu.get_data_parallel_group())
-                     for model_module in model]
+        model = [DDP(model_module,
+                     data_parallel_group=mpu.get_data_parallel_group(),
+                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+                     overlap_grad_reduce=args.overlap_grad_reduce,
+                     use_distributed_optimizer=args.use_distributed_optimizer)
+                 for model_module in model]
 
-        elif args.DDP_impl == 'local':
-            model = [LocalDDP(model_module,
-                              args.accumulate_allreduce_grads_in_fp32,
-                              args.use_contiguous_buffers_in_local_ddp)
-                     for model_module in model]
-            # broad cast params from data parallel src rank to other data parallel ranks
-            if args.data_parallel_random_init:
-                for model_module in model:
-                    model_module.broadcast_params()
-        else:
-            raise NotImplementedError('Unknown DDP implementation specified: '
-                                      '{}. Exiting.'.format(args.DDP_impl))
+        # Broadcast params from data parallel src rank to other data parallel ranks.
+        if args.data_parallel_random_init:
+            for model_module in model:
+                model_module.broadcast_params()
 
     return model
 
@@ -378,8 +370,7 @@ def setup_model_and_optimizer(model_provider_func,
     args = get_args()
 
     model = get_model(model_provider_func, model_type)
-    unwrapped_model = unwrap_model(model,
-                                   (torchDDP, LocalDDP, Float16Module))
+    unwrapped_model = unwrap_model(model)
 
     optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
@@ -394,11 +385,7 @@ def setup_model_and_optimizer(model_provider_func,
     else:
         args.iteration = 0
 
-    # We only support local DDP with multiple micro-batches.
-    if len(model) > 1 or mpu.get_pipeline_model_parallel_world_size() > 1:
-        assert args.DDP_impl == 'local'
-
-    # get model without FP16 and/or TorchDDP wrappers
+    # get model without FP16 and/or DDP wrappers
     if args.iteration == 0 and len(unwrapped_model) == 1 \
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert'):
         print_rank_0("Initializing ICT from pretrained BERT model")
@@ -417,20 +404,12 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    if args.DDP_impl == 'local' and args.use_contiguous_buffers_in_local_ddp:
-        for partition in model:
-            partition.zero_grad_buffer()
+    for partition in model:
+        partition.zero_grad_buffer()
     optimizer.zero_grad()
 
     # Forward pass.
-    timers('forward-backward', log_level=1).start(
-        barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
-
-    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
-    if args.timing_log_level < 2:
-        config.timers = None
-
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -441,22 +420,13 @@ def train_step(forward_step_func, data_iterator,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False)
 
-    # reset timers if necessary
-    if config.timers is None:
-        config.timers = timers
-    timers('forward-backward').stop()
-
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
-    # Reduce gradients.
-    optimizer.reduce_model_grads(args, timers)
-
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
@@ -470,8 +440,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
-        unwrapped_model = unwrap_model(model[0],
-                                       (torchDDP, LocalDDP, Float16Module))
+        unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
@@ -552,8 +521,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'forward-backward-send-forward-backward-recv',
         'layernorm-grads-all-reduce',
         'embedding-grads-all-reduce',
-        'grads-all-reduce',
-        'grads-reduce-scatter',
+        'all-grads-sync',
         'params-all-gather',
         'optimizer-copy-to-main-grad',
         'optimizer-unscale-and-check-inf',
@@ -707,6 +675,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
+    # TODO: Remove this once we move DDP to Core.
+    if len(model) == 1 and isinstance(model[0], DDP) and \
+        args.overlap_grad_reduce:
+        assert config.no_sync_func is None, \
+            ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
+             'a custom no_sync_func is not supported when overlapping grad-reduce')
+        if args.delay_grad_reduce:
+            config.grad_sync_func = model[0].grad_sync
+        config.no_sync_func = model[0].no_sync
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')

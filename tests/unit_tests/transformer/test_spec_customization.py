@@ -8,7 +8,7 @@ import transformer_engine as te
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSpec
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
@@ -19,7 +19,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -32,15 +32,17 @@ class TestSpecCustomization:
         )
 
         # specify Transformer Layer spec with all identity ops
-        self.transformer_layer_spec = TransformerLayerSpec()
+        self.transformer_layer_spec = TransformerLayerSubmodules()
 
         # specify attention spec using already imported class
-        self.attention_spec = SelfAttentionSpec(
+        self.attention_spec = ModuleSpec(
             module=SelfAttention,
             params={"attn_mask_type": AttnMaskType.causal},
-            layernorm_linear_qkv=TELayerNormColumnParallelLinear,
-            dot_product_attention=TEDotProductAttention,
-            linear_proj=TERowParallelLinear,
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                dot_product_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear
+            ),
         )
 
         # specify layernorm spec with module path to test dynamic importing
@@ -99,19 +101,22 @@ class TestSpecCustomization:
         # Check SelfAttention but with already initialized module
         # `self_attention`. In this test, `build_module` acts as a no op as it
         # simply returns the initialized module.
-        self_attention2 = build_module(
-            self_attention, config=self.config, spec=self.attention_spec,
-        )
-        assert isinstance(self_attention2, SelfAttention)
-        assert self_attention2.layer_number == 1
-        assert self_attention2.attn_mask_type == self.attention_spec.params['attn_mask_type']
+        # NOTE: (sudhakars) Uncomment this test once this feature gets added
+        # back.
+        # self_attention2 = build_module(
+        #     self_attention, config=self.config, spec=self.attention_spec,
+        # )
+        # assert isinstance(self_attention2, SelfAttention)
+        # assert self_attention2.layer_number == 1
+        # assert self_attention2.attn_mask_type == self.attention_spec.params['attn_mask_type']
 
-        num_weights = sum([p.numel() for p in self_attention2.parameters()])
-        assert num_weights == 648
+        # num_weights = sum([p.numel() for p in self_attention2.parameters()])
+        # assert num_weights == 648
 
         # Check LayerNorm
         layernorm = build_module(
             self.layernorm_spec,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,

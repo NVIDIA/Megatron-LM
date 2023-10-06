@@ -10,7 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class LayernormMLP(MegatronModule):
+class LayerNormMLP(MegatronModule):
     """
     LayernormLinear is just a composite module composed of `Layernorm` and
     `Linear` layers

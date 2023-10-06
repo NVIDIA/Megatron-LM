@@ -22,6 +22,7 @@ unit_tests:
   script:
     - pip install pytest-cov
     - pip install pytest_mock
+    - pip install nltk 
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -397,6 +398,58 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
+
+# Note: Core MoE models currently will run TE by default
+train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_2experts"
+    ADDITIONAL_PARAMS: "--num-experts 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp2_4parallelexperts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_4parallelexperts"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-parallel"
+
+train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "4experts"
+    ADDITIONAL_PARAMS: "--num-experts 4"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher

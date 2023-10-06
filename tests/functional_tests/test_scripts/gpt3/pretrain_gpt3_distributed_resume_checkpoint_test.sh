@@ -44,7 +44,6 @@ torchrun $DISTRIBUTED_ARGS \
        --data-path $DATA_PATH \
        --vocab-file /workspace/data/gpt3_data/gpt2-vocab.json \
        --merge-file /workspace/data/gpt3_data/gpt2-merges.txt \
-       --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.00015 \
@@ -89,7 +88,6 @@ torchrun $DISTRIBUTED_ARGS \
        --data-path $DATA_PATH \
        --vocab-file /workspace/data/gpt3_data/gpt2-vocab.json \
        --merge-file /workspace/data/gpt3_data/gpt2-merges.txt \
-       --data-impl mmap \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.00015 \

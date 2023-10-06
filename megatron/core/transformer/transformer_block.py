@@ -2,56 +2,18 @@
 
 import re
 from contextlib import nullcontext
-from dataclasses import dataclass
+
 import torch
-from typing import List
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSpec
-from megatron.core.utils import make_viewless_tensor, make_sharded_tensor_for_checkpoint
-
-
-def get_num_layers_to_build(config) -> int:
-
-    num_layers_per_pipeline_rank = \
-        config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-
-    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-        # Interleaved pipeline parallelism:
-        # Number of layers in each model chunk is the number of layers in the stage,
-        # divided by the number of model chunks in a stage.
-        # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0]  [2]  [4]  [6]
-        # Stage 1: [1]  [3]  [5]  [7]
-        # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0, 1]  [4, 5]
-        # Stage 1: [2, 3]  [6, 7]
-
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-
-        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
-
-        num_layers_to_build = num_layers_per_virtual_rank
-
-    else:
-        # Non-interleaved pipeline parallelism:
-        # Each stage gets a contiguous set of layers.
-
-        num_layers_to_build = num_layers_per_pipeline_rank
-
-    return num_layers_to_build
-
-
-@dataclass
-class TransformerBlockSpec:
-    layers: List[TransformerLayerSpec] = None
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
 class TransformerBlock(MegatronModule):
@@ -60,14 +22,18 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        spec: TransformerBlockSpec,
+        transformer_layer_spec: ModuleSpec,
+        self_attn_mask_type=AttnMaskType.padding,
         post_layer_norm=True,
         pre_process=True,
         post_process=True,
     ):
         super().__init__(config=config)
 
-        self.spec = spec
+        self.config: TransformerConfig = config
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
+
+        self.self_attn_mask_type = self_attn_mask_type
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -77,24 +43,55 @@ class TransformerBlock(MegatronModule):
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
-        self._build_layers()
+        self.num_layers_per_pipeline_rank = (
+            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+        )
 
-    def _build_layers(self):
+        self._build_layers(self.transformer_layer_spec)
+
+    def _build_layers(self, transformer_layer_spec):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
         # currently it's only used in CoreAttention?
         # if self.apply_query_key_layer_scaling:
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
-        def build_layer(spec, layer_number):
-            return TransformerLayer(
+        def build_layer(layer_number):
+            layer = TransformerLayer(
                 config=self.config,
-                spec=spec,
+                submodules=transformer_layer_spec.submodules,
                 layer_number=layer_number,
+                self_attn_mask_type=self.self_attn_mask_type,
             )
+            return layer
+
+        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+            # Interleaved pipeline parallelism:
+            # Number of layers in each model chunk is the number of layers in the stage,
+            # divided by the number of model chunks in a stage.
+            # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0]  [2]  [4]  [6]
+            # Stage 1: [1]  [3]  [5]  [7]
+            # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
+            # layers to stages like (each list is a model chunk):
+            # Stage 0: [0, 1]  [4, 5]
+            # Stage 1: [2, 3]  [6, 7]
+
+            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+            num_layers_per_virtual_rank = self.num_layers_per_pipeline_rank // vp_size
+
+            num_layers_to_build = num_layers_per_virtual_rank
+
+        else:
+            # Non-interleaved pipeline parallelism:
+            # Each stage gets a contiguous set of layers.
+
+            num_layers_to_build = self.num_layers_per_pipeline_rank
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([build_layer(spec, i + 1) for i, spec in enumerate(self.spec.layers)])
+        self.layers = torch.nn.ModuleList([build_layer(i + 1) for i in range(num_layers_to_build)])
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:
@@ -185,15 +182,7 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        context=None,
-        context_mask=None,
-        inference_params=None,
-        rotary_pos_emb=None,
-    ):
+    def forward(self, hidden_states, attention_mask, inference_params=None, rotary_pos_emb=None):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
 
@@ -243,8 +232,11 @@ class TransformerBlock(MegatronModule):
                 amax_history_len=self.config.fp8_amax_history_len,
                 override_linear_precision=(False, False, not self.config.fp8_wgrad),
             )
+            fp8_group = None
+            if parallel_state.model_parallel_is_initialized():
+                fp8_group = parallel_state.get_amax_reduction_group()
             fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe
+                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )
         else:
             fp8_context = nullcontext()
@@ -259,11 +251,9 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for layer in self.layers:
-                    hidden_states, context = layer(
+                    hidden_states = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_params=inference_params,
                     )
@@ -283,11 +273,18 @@ class TransformerBlock(MegatronModule):
             sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
 
         if self.post_process and self.post_layer_norm:
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.weight']
+            state_dict = self.state_dict(keep_vars=True)
+
+            tensor = state_dict['final_layernorm.weight']
             layer_name = f'{prefix}final_layernorm.weight'
             sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
-            tensor = self.state_dict(keep_vars=True)['final_layernorm.bias']
-            layer_name = f'{prefix}final_layernorm.bias'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
+
+            # RMSNorm doesn't have bias.
+            if 'final_layernorm.bias' in state_dict.keys():
+                tensor = state_dict['final_layernorm.bias']
+                layer_name = f'{prefix}final_layernorm.bias'
+                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(
+                    tensor, layer_name
+                )
 
         return sharded_state_dict
