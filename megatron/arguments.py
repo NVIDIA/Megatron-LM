@@ -174,9 +174,9 @@ def validate_args(args, defaults={}):
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
 
-    # Overlapping grad reduce only supported without pipeline parallelism right now.
+    # Overlapping grad reduce not supported with interleaved PP right now.
     if args.overlap_grad_reduce:
-        assert args.pipeline_model_parallel_size == 1
+        assert args.virtual_pipeline_model_parallel_size is None
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -371,6 +371,19 @@ def validate_args(args, defaults={}):
     # don't allow it to keep things simple
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
+    
+    # MoE Spec check
+    if args.num_experts is not None:
+        assert args.model_spec is None, "Model Spec must be None when using MoEs"
+
+    # Expert parallelism check
+    if args.expert_parallel:
+        assert args.num_experts is not None, "num_experts must be non None to use expert-parallel"
+        assert args.num_experts % args.data_parallel_size == 0, \
+            "Number of experts should be a multiple of data parallel_size."
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel, \
+                "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
 
     # Print arguments.
     _print_args("arguments", args)
@@ -412,6 +425,7 @@ def core_transformer_config_from_args(args):
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
+    kw_args['num_moe_experts'] = args.num_experts
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -601,8 +615,6 @@ def _add_network_size_args(parser):
                        help='Number of Experts in Switch Transformer (None means no Switch)')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.'),
-    group.add_argument('--embedding-weights-in-fp32', action='store_true',
-                       help='Cast word embedding weights to fp32 before embedding fwd.'),
     return parser
 
 
@@ -845,6 +857,8 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--expert-parallel', action='store_true',
+                       help='Enable expert parallel optimization.')
     return parser
 
 
@@ -1016,8 +1030,11 @@ def _add_distributed_args(parser):
                        help='Timeout minutes for torch.distributed.')
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
+    group.add_argument('--no-delay-grad-reduce', action='store_false',
+                       help='If not set, delay grad reduction in all but first PP stage.',
+                       dest='delay_grad_reduce')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
-                       help='Use scatter/gather to optimize communication of tensors in pipeline',
+                       help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')
     group.add_argument('--use-ring-exchange-p2p', action='store_true',
                        default=False, help='If set, use custom-built ring exchange '

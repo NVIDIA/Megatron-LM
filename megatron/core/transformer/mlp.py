@@ -6,7 +6,6 @@ from typing import Union
 import torch
 import torch.nn.functional as F
 
-from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -36,7 +35,9 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
+    def __init__(
+        self, config: TransformerConfig, submodules: MLPSubmodules, is_expert: bool = False
+    ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -52,8 +53,10 @@ class MLP(MegatronModule):
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
+            is_expert=is_expert,
         )
 
         if self.config.gated_linear_unit:
@@ -73,7 +76,9 @@ class MLP(MegatronModule):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
+            input_is_parallel=True,
             skip_bias_add=True,
+            is_expert=is_expert,
         )
 
     def forward(self, hidden_states):

@@ -129,10 +129,6 @@ class Embedding(MegatronModule):
         init_method: weight initialization method
         num_tokentypes: size of the token-type embeddings. 0 value
                         will ignore this embedding
-        embedding_weights_in_fp32: casts word embedding weights to
-                                   fp32 before sampling. Required to
-                                   maintain reproducibility when
-                                   training in bf16.
     """
 
     def __init__(self,
@@ -141,8 +137,7 @@ class Embedding(MegatronModule):
                  max_sequence_length,
                  embedding_dropout_prob,
                  config,
-                 num_tokentypes=0,
-                 embedding_weights_in_fp32=False):
+                 num_tokentypes=0):
         super(Embedding, self).__init__()
 
         self.hidden_size = hidden_size
@@ -152,7 +147,6 @@ class Embedding(MegatronModule):
         args = get_args()
 
         # Word embeddings (parallel).
-        self.embedding_weights_in_fp32 = embedding_weights_in_fp32
         self.params_dtype = args.params_dtype
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             vocab_size, self.hidden_size, config=config, init_method=config.init_method)
@@ -217,12 +211,7 @@ class Embedding(MegatronModule):
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
         # Embeddings.
-        if self.embedding_weights_in_fp32:
-            self.word_embeddings = self.word_embeddings.to(torch.float32)
         words_embeddings = self.word_embeddings(input_ids)
-        if self.embedding_weights_in_fp32:
-            words_embeddings = words_embeddings.to(self.params_dtype)
-            self.word_embeddings = self.word_embeddings.to(self.params_dtype)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
@@ -366,8 +355,7 @@ class TransformerLanguageModel(MegatronModule):
                                        args.max_position_embeddings,
                                        args.hidden_dropout,
                                        config,
-                                       self.num_tokentypes,
-                                       args.embedding_weights_in_fp32)
+                                       self.num_tokentypes)
             self._embedding_key = 'embedding'
 
         # Rotary positional embeddings

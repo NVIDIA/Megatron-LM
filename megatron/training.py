@@ -297,9 +297,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if wrap_with_ddp:
         model = [DDP(model_module,
-                     mpu.get_data_parallel_group(),
-                     args.accumulate_allreduce_grads_in_fp32,
-                     args.overlap_grad_reduce)
+                     data_parallel_group=mpu.get_data_parallel_group(),
+                     accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
+                     overlap_grad_reduce=args.overlap_grad_reduce,
+                     use_distributed_optimizer=args.use_distributed_optimizer)
                  for model_module in model]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -408,14 +409,7 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
-    timers('forward-backward', log_level=1).start(
-        barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
-
-    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
-    if args.timing_log_level < 2:
-        config.timers = None
-
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -426,17 +420,9 @@ def train_step(forward_step_func, data_iterator,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False)
 
-    # reset timers if necessary
-    if config.timers is None:
-        config.timers = timers
-    timers('forward-backward').stop()
-
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
-
-    # Reduce gradients.
-    optimizer.reduce_model_grads(args, timers)
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -535,8 +521,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'forward-backward-send-forward-backward-recv',
         'layernorm-grads-all-reduce',
         'embedding-grads-all-reduce',
-        'grads-all-reduce',
-        'grads-reduce-scatter',
+        'all-grads-sync',
         'params-all-gather',
         'optimizer-copy-to-main-grad',
         'optimizer-unscale-and-check-inf',
@@ -692,7 +677,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     config.timers = timers
     # TODO: Remove this once we move DDP to Core.
     if len(model) == 1 and isinstance(model[0], DDP) and \
-        args.pipeline_model_parallel_size == 1:
+        args.overlap_grad_reduce:
+        assert config.no_sync_func is None, \
+            ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
+             'a custom no_sync_func is not supported when overlapping grad-reduce')
+        if args.delay_grad_reduce:
+            config.grad_sync_func = model[0].grad_sync
         config.no_sync_func = model[0].no_sync
 
     timers('interval-time', log_level=0).start(barrier=True)

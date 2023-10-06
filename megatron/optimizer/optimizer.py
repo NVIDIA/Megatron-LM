@@ -7,14 +7,12 @@ from abc import abstractmethod
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 import torch
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
-from megatron.utils import unwrap_model
 
 from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
 
@@ -193,96 +191,6 @@ class MegatronOptimizer(ABC):
         """
         pass
 
-
-    def allreduce_word_embedding_grads(self, args):
-        """
-        All-reduce word embedding grads.
-
-        Reduce grads across first and last stages to ensure that word_embeddings
-        parameters stay in sync. This should only run for models that support
-        pipelined model parallelism (BERT and GPT-2).
-        """
-
-        if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
-                mpu.get_pipeline_model_parallel_world_size() > 1:
-            if mpu.is_pipeline_first_stage(ignore_virtual=True):
-                unwrapped_model = self.models[0]
-            elif mpu.is_pipeline_last_stage(ignore_virtual=True):
-                unwrapped_model = self.models[-1]
-            else:  # We do not support the interleaved schedule for T5 yet.
-                unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(unwrapped_model)
-
-            if unwrapped_model.share_embeddings_and_output_weights:
-                weight = unwrapped_model.shared_embedding_or_output_weight()
-                grad = weight.main_grad
-                torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
-
-
-    def allreduce_position_embedding_grads(self, args):
-        """
-        All-reduce position_embeddings grad across first (encoder) and
-        split (decoder) stages to ensure that position embeddings parameters
-        stay in sync. This should only run for T5 models with pipeline
-        parallelism.
-        """
-        if mpu.is_rank_in_position_embedding_group() and \
-                mpu.get_pipeline_model_parallel_world_size() > 1 and \
-                args.pipeline_model_parallel_split_rank is not None:
-            unwrapped_model = self.models[0]
-            unwrapped_model = unwrap_model(unwrapped_model)
-            grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
-            torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
-
-
-    def allreduce_embedding_grads(self, args):
-        """All-reduce both word and position embeddings."""
-        self.allreduce_word_embedding_grads(args)
-        self.allreduce_position_embedding_grads(args)
-
-
-    def allreduce_layernorm_grads(self, args):
-        """All-reduce layernorm grads (for sequence parallelism)."""
-
-        # All-reduce layernorm parameters across model parallel nodes
-        # when sequence parallelism is used
-        if mpu.get_tensor_model_parallel_world_size() > 1 and \
-                args.sequence_parallel:
-            grads = []
-            for model_module in self.models:
-                unwrapped_model = unwrap_model(model_module)
-                for param in unwrapped_model.parameters():
-                    if getattr(param, 'sequence_parallel', False):
-                        grad = param.main_grad
-                        grads.append(grad.data)
-            coalesced = _flatten_dense_tensors(grads)
-            torch.distributed.all_reduce(
-                coalesced, group=mpu.get_tensor_model_parallel_group())
-            for buf, synced in zip(grads, _unflatten_dense_tensors(
-                    coalesced, grads)):
-                buf.copy_(synced)
-
-    def reduce_model_grads(self, args, timers):
-        """All-reduce all grads, and all-reduce embeddings."""
-
-        # All-reduce.
-        timers('grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        for model in self.models:
-            model.allreduce_gradients()
-        timers('grads-all-reduce').stop()
-
-        # All-reduce layer-norm grads (for sequence parallelism).
-        timers('layernorm-grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        self.allreduce_layernorm_grads(args)
-        timers('layernorm-grads-all-reduce').stop()
-            
-        # All-reduce embedding grads.
-        timers('embedding-grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        self.allreduce_embedding_grads(args)
-        timers('embedding-grads-all-reduce').stop()
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
