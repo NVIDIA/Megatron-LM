@@ -3,7 +3,7 @@
 import importlib.util
 
 import torch
-from torch import einsum, nn
+from torch import nn
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
@@ -31,7 +31,6 @@ class RotaryEmbedding(nn.Module):
             seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
 
-        # freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
         freqs = torch.outer(seq, inv_freq)
 
         # first part even vector components, second part odd vector components,
