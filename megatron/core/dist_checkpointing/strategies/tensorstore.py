@@ -43,7 +43,7 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         dict_list_map_inplace(load_fn, sharded_state_dict)
         return sharded_state_dict
 
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Path):
         def get_ts_shape_dtype(path):
             arr = open_ts_array(path)
             return arr.shape, arr.dtype.numpy_dtype

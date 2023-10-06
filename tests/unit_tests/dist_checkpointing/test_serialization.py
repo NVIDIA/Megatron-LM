@@ -7,7 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
 from megatron.core.dist_checkpointing.core import CheckpointingException
-from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
+from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -148,7 +148,7 @@ class TestSerialization:
             assert ten_b.shape == (5, 10 * 8)
             assert torch.all(ten_b == torch.arange(80).unsqueeze(0).expand(5, 80) + Utils.rank // 2 * 100)
 
-    def test_load_sharded_metadata(self, tmp_path_dist_ckpt):
+    def test_load_tensors_metadata(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2,4)
 
         state_dict = {
@@ -156,12 +156,12 @@ class TestSerialization:
             'sd_keyB': ShardedTensor.from_rank_offsets('keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)),
         }
 
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_sharded_metadata') as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata') as ckpt_dir:
             save(state_dict, ckpt_dir)
             assert (ckpt_dir / 'keyA').is_dir()
 
             del state_dict
-            sharded_state_dict = load_sharded_metadata(ckpt_dir)
+            sharded_state_dict = load_tensors_metadata(ckpt_dir)
             # loaded dict keys are ShardedTensor keys!
             assert 'keyA' in sharded_state_dict
             assert 'sd_keyA' not in sharded_state_dict

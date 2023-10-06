@@ -248,7 +248,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
 
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Path):
         def get_ts_shape_dtype(path):
             arr = open_ts_array(path)
             return arr.shape, arr.dtype.numpy_dtype

@@ -136,7 +136,7 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
         )
         return sharded_state_dict
 
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Path):
         def get_zarr_shape_dtype(path):
             arr = zarr.open(path, 'r')
             return arr.shape, arr.dtype

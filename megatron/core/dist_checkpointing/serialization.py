@@ -118,8 +118,8 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
 
 
-def load_sharded_metadata(
-    checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None
+def load_tensors_metadata(
+    checkpoint_dir: str, sharded_strategy: Union[LoadShardedStrategy, None] = None
 ) -> ShardedStateDict:
     """Load tensors metadata from the checkpoint.
 
@@ -146,7 +146,17 @@ def load_sharded_metadata(
     else:
         # TODO: implement consistency checks here
         pass
-    return sharded_strategy.load_sharded_metadata(checkpoint_dir)
+    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+
+
+def load_plain_tensors(checkpoint_dir: str):
+    """Load checkpoint tensors without any sharding.
+
+    NOTE: common state dict is NOT included."""
+    sharded_state_dict = load_tensors_metadata(checkpoint_dir)
+    # Don't validate integrity because shards will be overlapped
+    # if world_size > 1 (all processes load whole tensors)
+    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
 
 
 def save(

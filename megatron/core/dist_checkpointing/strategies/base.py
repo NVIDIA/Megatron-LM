@@ -56,7 +56,7 @@ class LoadShardedStrategy(LoadStrategyBase):
         raise NotImplementedError
 
     @abstractmethod
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Path):
         """Load tensors metadata from the checkpoint.
 
         Returns a dictionary similar to a sharded state dict, but note that
