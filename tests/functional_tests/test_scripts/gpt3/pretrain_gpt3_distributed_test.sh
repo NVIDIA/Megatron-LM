@@ -14,6 +14,11 @@ VP_SIZE=${10}
 MBS=${11}
 GBS=${12}
 ADDITIONAL_PARAMS=${13}
+
+if [[ -n $MBS ]]; then MBS=4; fi
+if [[ -n $GBS ]]; then GBS=32; fi
+if [[ -n $VP_SIZE ]]; then VP_SIZE="" ; fi
+
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
