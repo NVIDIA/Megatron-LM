@@ -20,7 +20,7 @@ def extract_matching_values(
                 match, nonmatch = extract_matching_values(v, predicate)
                 if match:
                     matching_vals[k] = match
-                if nonmatch:
+                if nonmatch or not v:
                     nonmatching_vals[k] = nonmatch
             elif predicate(v):
                 matching_vals[k] = v
@@ -35,7 +35,7 @@ def extract_matching_values(
                 match, nonmatch = extract_matching_values(v, predicate)
                 if match:
                     matching_vals.append(match)
-                if nonmatch:
+                if nonmatch or not v:
                     nonmatching_vals.append(nonmatch)
             elif predicate(v):
                 matching_vals.append(v)
