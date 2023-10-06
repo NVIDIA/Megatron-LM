@@ -311,3 +311,9 @@ class GPTModel(MegatronModule):
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
+
+    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+        pass
+    
+    def load_state_dict(self, state_dict, strict=True):
+        pass

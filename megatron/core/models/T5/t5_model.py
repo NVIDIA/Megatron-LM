@@ -446,7 +446,7 @@ class T5Model(MegatronModule):
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
         self.embedding.load_state_dict(
-            state_dict["encoder"], strict=strict)
+            state_dict["embedding"], strict=strict)
 
         self.encoder.load_state_dict(
             state_dict["encoder"], strict=strict)
