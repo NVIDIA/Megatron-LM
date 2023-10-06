@@ -14,8 +14,11 @@ from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy, StrategyAction, default_strategies
-from .zarr import postprocess_numpy_array, numpy_to_torch_dtype_dict, \
-    load_zarr_based_sharded_metadata
+from .zarr import (
+    load_zarr_based_sharded_metadata,
+    numpy_to_torch_dtype_dict,
+    postprocess_numpy_array,
+)
 
 _import_trigger = None
 
@@ -114,9 +117,7 @@ def open_ts_array(arr_path: Path):
     try:
         arr = ts.open(ts.Spec(spec), open=True).result()
     except Exception as e:
-        raise CheckpointingException(
-            f'Array {arr_path} could not be loaded. Error: {e}'
-        ) from e
+        raise CheckpointingException(f'Array {arr_path} could not be loaded. Error: {e}') from e
     return arr
 
 

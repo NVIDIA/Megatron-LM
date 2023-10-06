@@ -47,7 +47,7 @@ def load(
     checkpoint_dir: str,
     sharded_strategy: Union[LoadShardedStrategy, None] = None,
     common_strategy: Union[LoadCommonStrategy, None] = None,
-    validate_access_integrity: bool = True
+    validate_access_integrity: bool = True,
 ) -> StateDict:
     """Loading entrypoint.
 
@@ -118,7 +118,9 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
 
 
-def load_sharded_metadata(checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None) -> ShardedStateDict:
+def load_sharded_metadata(
+    checkpoint_dir: Path, sharded_strategy: Union[LoadShardedStrategy, None] = None
+) -> ShardedStateDict:
     """Load tensors metadata from the checkpoint.
 
     Returns a dictionary similar to a sharded state dict, but note that

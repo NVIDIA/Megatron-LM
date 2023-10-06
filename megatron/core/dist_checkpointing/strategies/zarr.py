@@ -5,7 +5,7 @@ import os
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import List, Callable, Tuple
+from typing import Callable, List, Tuple
 
 import numpy as np
 import torch
@@ -234,7 +234,9 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
     return torch.nn.functional.pad(x.unsqueeze(0), pad_args, mode='replicate').squeeze(0)
 
 
-def load_zarr_based_sharded_metadata(checkpoint_dir: Path, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]) -> ShardedStateDict:
+def load_zarr_based_sharded_metadata(
+    checkpoint_dir: Path, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]
+) -> ShardedStateDict:
     """Load metadata of Zarr arrays.
 
     Arguments:

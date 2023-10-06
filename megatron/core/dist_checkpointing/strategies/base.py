@@ -66,7 +66,9 @@ class LoadShardedStrategy(LoadStrategyBase):
         Dict values are ShardedTensors without any sharding (so, the only useful
         information is tensors global shape and dtype).
         """
-        raise NotImplementedError(f'{self.__class__.__name__} doesnt allow loading only sharded metadata')
+        raise NotImplementedError(
+            f'{self.__class__.__name__} doesnt allow loading only sharded metadata'
+        )
 
 
 class SaveCommonStrategy(SaveStrategyBase):
