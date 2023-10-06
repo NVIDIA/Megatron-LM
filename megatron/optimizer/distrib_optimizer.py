@@ -825,35 +825,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return self.get_model_buffer_dp_views(self.param_buffers)
 
 
-    def reduce_model_grads(self, args, timers):
-        """
-        Reduce-scatter model grads.
-
-        The DDP's grad buffer is used for the reduce-scatter, and thus no
-        tensors are dynamically allocated.
-        """
-
-        # Reduce-scatter setup.
-        timers('grads-reduce-scatter', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        for model in self.models:
-            model.sync_gradients()
-        timers('grads-reduce-scatter').stop()
-
-        # All-reduce layer-norm grads (for sequence parallelism).
-        timers('layernorm-grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        self.allreduce_layernorm_grads(args)
-        timers('layernorm-grads-all-reduce').stop()
-
-        # All-reduce embedding grads.
-        timers('embedding-grads-all-reduce', log_level=1).start(
-            barrier=args.barrier_with_L1_time)
-        self.allreduce_embedding_grads(args)
-        timers('embedding-grads-all-reduce').stop()
-
-
-
     def gather_model_params(self, args, timers):
         """
         All-gather updated model params.

@@ -92,7 +92,7 @@ class ModelParallelConfig:
     batch_p2p_sync (bool, default=True): When using batch_isend_irecv, do a cuda.device.synchronize afterward to work
         around a bug in older version of PyTorch.
 
-    use_ring_exchange_p2p (bool, default = False): Use custom ring_exchange kernel instead of
+    use_ring_exchange_p2p (bool, default=False): Use custom ring_exchange kernel instead of
         torch.distributed.batch_isend_irecv(). Requires custom built torch with torch.distributed.ring_exchange.
 
     deallocate_pipeline_outputs (optional, default=False): If True, output data is deallocated after the tensor is sent
@@ -109,6 +109,13 @@ class ModelParallelConfig:
     param_sync_func (optional): Function that launches asynchronous parameter synchronizations (e.g. distributed
         optimizer parameter all-gathers). The function should take one argument: an iterable of parameters to be
         synchronized.
+
+    pipeline_model_parallel_split_rank (int, default=None): If int, rank where encoder and decoder should be split in
+        cases where the model has both an encoder and decoder (e.g., T5). Ignored if None.
+
+    barrier_with_L1_time (bool, default=True): If true, use barrier with level 1 time measurements. It is up to the user
+        to make sure calling barrier with their timers will not result in hangs. This can happen if for example the user
+        adds a level 1 timer that is not called by all ranks.
 
     """
 
@@ -148,6 +155,10 @@ class ModelParallelConfig:
     no_sync_func: Callable = None
     grad_sync_func: Callable = None
     param_sync_func: Callable = None
+    pipeline_model_parallel_split_rank: Optional[int] = None
+
+    # Timing
+    barrier_with_L1_time: bool = True
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

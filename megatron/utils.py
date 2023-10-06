@@ -54,14 +54,13 @@ def calc_params_l2_norm(model):
     params_data = []
     for model_ in model:
         for param in model_.parameters():
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
             if args.expert_parallel and mpu.get_data_parallel_rank() > 0:
-                if not getattr(param, 'allreduce', True):
+                if not getattr(param, 'allreduce', True) and is_not_tp_duplicate:
                     assert param_is_not_shared(param)
-                    assert param_is_not_tensor_parallel_duplicate(param)
                     params_data.append(param.data.float() if args.bf16 else param.data)
             else:
                 is_not_shared = param_is_not_shared(param)
-                is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
                 if is_not_shared and is_not_tp_duplicate:
                     params_data.append(param.data.float() if args.bf16 else param.data)
 

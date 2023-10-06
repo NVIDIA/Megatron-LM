@@ -409,14 +409,7 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
-    timers('forward-backward', log_level=1).start(
-        barrier=args.barrier_with_L1_time)
     forward_backward_func = get_forward_backward_func()
-
-    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
-    if args.timing_log_level < 2:
-        config.timers = None
-
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
@@ -427,17 +420,9 @@ def train_step(forward_step_func, data_iterator,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False)
 
-    # reset timers if necessary
-    if config.timers is None:
-        config.timers = timers
-    timers('forward-backward').stop()
-
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
-
-    # Reduce gradients.
-    optimizer.reduce_model_grads(args, timers)
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -536,8 +521,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'forward-backward-send-forward-backward-recv',
         'layernorm-grads-all-reduce',
         'embedding-grads-all-reduce',
-        'grads-all-reduce',
-        'grads-reduce-scatter',
+        'all-grads-sync',
         'params-all-gather',
         'optimizer-copy-to-main-grad',
         'optimizer-unscale-and-check-inf',
