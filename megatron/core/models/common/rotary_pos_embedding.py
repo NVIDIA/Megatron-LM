@@ -28,7 +28,7 @@ class RotaryEmbedding(nn.Module):
             inv_freq = self.inv_freq
 
         if self.seq_len_interpolation_factor is not None:
-            # seq = seq.type_as(self.inv_freq) # @Evelina: FIX/TEST THIS
+            seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
 
         # freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
