@@ -63,16 +63,17 @@ def make_sharded_tensors_for_checkpoint(
     sharded according to `tensor_parallel_layers_axis_map`
 
     Args:
-        state_dict: state_dict to convert
-        state_dict_prefix: prefix appended to keys in final state dict
-        sharded_key_prefix: prefix appended to ShardedTensor keys
-        tensor_parallel_layers_axis_map: dict mapping layer names to the axis
-            for TP sharding
-        sharded_offsets: sharding already applied (e.g. PP related),
-            passed along to ShardedTensor
-        extra_state_suffix: layers with this suffix will be wrapped with ShardedObject
-            instead of ShardedTensor. The mapping for ShardedObjects is based on the
-            mapping of the corresponding ShardedTensor.
+        state_dict (StateDict): state_dict to convert
+        state_dict_prefix (str): prefix appended to keys in final state dict
+        sharded_key_prefix (str): prefix appended to ShardedTensor keys
+        tensor_parallel_layers_axis_map (Dict[str, int]): dict mapping layer
+            names to the axis for TP sharding
+        sharded_offsets (Iterable[Tuple[int, int, int]]): sharding already
+            applied (e.g. PP related), passed along to ShardedTensor
+        extra_state_suffix (str, default = '_extra_state'): layers with this
+            suffix will be wrapped with ShardedObject instead of ShardedTensor.
+            The mapping for ShardedObjects is based on the mapping
+             of the corresponding ShardedTensor.
 
     """
     sharded_state_dict = {}
