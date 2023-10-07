@@ -24,7 +24,7 @@ MASTER_PORT=6000
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-commad="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
+command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
@@ -35,7 +35,7 @@ if [[ $USE_CORE -eq 1 ]]; then
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
        CALLING_SCRIPT=pretrain_gpt_core.py
-       commad="$commad export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
@@ -45,7 +45,7 @@ if [[ $USE_TE -eq 1 ]]; then
 else
        echo "Running with local transformer implementation ..."
 fi
-
+set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
@@ -91,9 +91,9 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --no-gradient-accumulation-fusion \
        --${TRAINING_DTYPE}"
 
-commad="$commad $torch_run_cmd"
+command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
-echo "$commad"
+echo "$command"
 echo "-----------------------------------------------------------------------------"
 
 echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
