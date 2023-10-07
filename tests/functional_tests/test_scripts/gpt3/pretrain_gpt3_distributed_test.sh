@@ -46,7 +46,6 @@ else
        echo "Running with local transformer implementation ..."
 fi
 
-set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 

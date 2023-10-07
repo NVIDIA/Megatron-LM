@@ -18,28 +18,26 @@ export BUILD_DIR=`pwd` #Path to megatron-lm repo
 
 # step 2 : SETTING RUN NAME
 export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
-echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results for result logs."
+echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug for result logs."
 echo "Run name is $RUN_NAME"
 
 # step 3 : CREATING REQUIRED DIRECTORIES
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
-mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
-mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
-mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/scripts
+mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/tensorboard_logs
+mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug
 rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
-rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
-rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
-rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/scripts/*
+rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/tensorboard_logs/*
+rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/*
 
 # step 4 : EXPORTING SOME ENV VARIABLES 
-export LOGS_DIR=$BASE_DIR/logs
+export LOGS_DIR=$BASE_DIR/tensorboard_logs
 export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
 export OMP_NUM_THREADS=2
 export GOTO_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=2
 
 # step 5 : CREATING A COPY OF THE SBATCH SCRIPT THAT WILL BE RUN FOR DEBUGGING
-envsubst '$BASE_DIR $PYTORCH_IMAGE $BUILD_DIR $DATA_DIR $VP_SIZE $MBS $GBS $TP_SIZE $PP_SIZE $NUM_NODES $MAX_STEPS'  <$BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh > $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/scripts/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh
+envsubst '$BASE_DIR $PYTORCH_IMAGE $BUILD_DIR $DATA_DIR $VP_SIZE $MBS $GBS $TP_SIZE $PP_SIZE $NUM_NODES $MAX_STEPS'  <$BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh > $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh
 
 # step 6 : SUBMITTING THE JOB
 sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES,PYTORCH_IMAGE`
@@ -56,10 +54,10 @@ echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
 echo "Finished job"
 export SLURM_STATE=$(sacct -j "${SLURM_JOBID}" --format State --parsable2 --noheader |& head -n 1)
 echo "Slurm job state $SLURM_STATE"
-if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
+if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug directory for result logs. Skipping pytest."; exit 1; fi
 
 # step 8 : COMPARING THE GROUND TRUTH VALUES TO THE OBTAINED VALUES FROM THE JOB
 source $PYTHON_VIRTUAL_ENV
 PYTEST_EXIT=0
 pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py || PYTEST_EXIT=$?
-if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
+if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug directory for result logs"; exit $PYTEST_EXIT; fi
