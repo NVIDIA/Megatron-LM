@@ -80,7 +80,7 @@ def ensure_directory_exists(filename):
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
                         pipeline_parallel=None,
                         tensor_rank=None, pipeline_rank=None,
-                        expert_parallel=None):
+                        expert_parallel=None, expert_rank=None):
     """Determine the directory name for this rank's checkpoint."""
     if release:
         directory = 'release'
@@ -95,10 +95,9 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
     if pipeline_rank is None:
         pipeline_rank = mpu.get_pipeline_model_parallel_rank()
     if expert_parallel is None:
-        args = get_args()
-        expert_parallel = args.expert_parallel
-
-    data_rank = mpu.get_data_parallel_rank()
+        expert_parallel = (mpu.get_expert_model_parallel_world_size() > 1)
+    if expert_rank is None:
+        expert_rank = mpu.get_expert_model_parallel_rank()
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
@@ -111,7 +110,7 @@ def get_checkpoint_name(checkpoints_path, iteration, release=False,
                 f'mp_rank_{tensor_rank:02d}_{pipeline_rank:03d}')
 
     if expert_parallel:
-        common_path = common_path + f'_{data_rank:03d}'
+        common_path = common_path + f'_{expert_rank:03d}'
 
     return os.path.join(common_path, "model_optim_rng.pt")
 
@@ -134,7 +133,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=False)
+                                   expert_parallel=False, expert_rank=0)
     if os.path.isfile(filename):
         return filename
 
@@ -142,7 +141,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=True)
+                                   expert_parallel=True, expert_rank=0)
     if os.path.isfile(filename):
         return filename
 
@@ -150,7 +149,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=False)
+                                   expert_parallel=False, expert_rank=0)
     if os.path.isfile(filename):
         return filename
 
@@ -158,7 +157,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
     filename = get_checkpoint_name(checkpoints_path, iteration, release,
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
-                                   expert_parallel=True)
+                                   expert_parallel=True, expert_rank=0)
     if os.path.isfile(filename):
         return filename
 
@@ -264,8 +263,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler):
 
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
-       or mpu.get_data_parallel_rank() == 0 \
-       or args.expert_parallel:
+            or mpu.get_data_modulo_expert_parallel_rank() == 0:
 
         # Arguments, iteration, and model.
         state_dict = {}

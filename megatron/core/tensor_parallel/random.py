@@ -16,6 +16,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_expert_model_parallel_rank,
 )
 from megatron.core.utils import safely_set_viewless_tensor_data
 
@@ -174,7 +175,7 @@ def model_parallel_cuda_manual_seed(seed):
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    expert_parallel_seed = seed + 100 * get_data_parallel_rank() + get_tensor_model_parallel_rank()
+    expert_parallel_seed = seed + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 

@@ -81,6 +81,23 @@ def _allreduce_layernorm_grads(model, config):
         for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
             buf.copy_(synced)
 
+def _allreduce_expert_grads(model, config):
+    """All-reduce expert grads (for expert parallelism)."""
+
+    # All-reduce switchmlp parameters across data modulo expert parallel nodes
+    if config.expert_model_parallel_size > 1 and \
+            config.expert_model_parallel_size < mpu.get_data_parallel_world_size():
+        grads = []
+        for model_chunk in model:
+            for param in get_attr_wrapped_model(model_chunk, 'parameters')():
+                if not getattr(param, 'allreduce', True):
+                    grad = param.main_grad
+                    grads.append(grad.data)
+        coalesced = _flatten_dense_tensors(grads)
+        torch.distributed.all_reduce(coalesced, group=mpu.get_data_modulo_expert_parallel_group())
+        for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+            buf.copy_(synced)
+
 
 def finalize_model_grads(model):
     """All-reduce all grads across DP replicas, layernorm grads
@@ -114,3 +131,12 @@ def finalize_model_grads(model):
     _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
+
+    # All-reduce expert grads (for expert parallelism).
+    if config.timers is not None:
+        config.timers('expert-grads-all-reduce', log_level=1).start(
+            barrier=config.barrier_with_L1_time
+        )
+    _allreduce_expert_grads(model, config)
+    if config.timers is not None:
+        config.timers('expert-grads-all-reduce').stop()

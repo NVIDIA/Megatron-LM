@@ -211,6 +211,7 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                expert_model_parallel_size=args.expert_model_parallel_size,
             )
             if args.rank == 0:
                 print(
