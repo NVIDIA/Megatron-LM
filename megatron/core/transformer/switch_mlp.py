@@ -4,7 +4,7 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.parallel_state import (
-    get_tensor_and_data_parallel_group,
+    get_tensor_and_expert_parallel_group,
     get_tensor_model_parallel_group,
 )
 from megatron.core.transformer.module import MegatronModule
@@ -48,7 +48,7 @@ class SwitchMLP(MegatronModule):
         self.router_activation = torch.sigmoid
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
 
-        assert self.config.num_moe_experts % self.expert_parallel_size_ == 0
+        assert self.config.num_moe_experts % self.expert_parallel_size == 0
         self.num_local_experts = (
             self.config.num_moe_experts // self.expert_parallel_size
         )
