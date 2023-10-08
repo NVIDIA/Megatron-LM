@@ -506,7 +506,8 @@ class ParallelAttention(MegatronModule):
         self.use_flash_attn_triton = args.use_flash_attn_triton
         if self.use_flash_attn:
             if args.use_flash_attn_v1:
-                assert flash_attn_unpadded_func != None, "Cannot import FlashAttention v1 "
+                assert flash_attn_unpadded_func != None or flash_attn_builder != None, ("Cannot import FlashAttention v1 "
+                                                                                        "and Cannot find FlashAttention Builder")
             if args.use_flash_attn_v2:
                 assert flash_attn_varlen_func != None, "Cannot import FlashAttention v2 "
             if args.use_flash_attn_triton:
