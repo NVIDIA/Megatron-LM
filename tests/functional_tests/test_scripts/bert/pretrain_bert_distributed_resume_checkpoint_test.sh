@@ -1,11 +1,17 @@
 #! /bin/bash
 
-DATA_PATH=$1
-CHECKPOINT_PATH=$2
-TENSORBOARD_DIR=$3
-TP_SIZE=$4
-PP_SIZE=$5
-NNODES=$6
+echo "------ARGUMENTS LIST --------"
+for ARGUMENT in "$@"
+do
+   KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+   KEY_LENGTH=${#KEY}
+   VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+   export "$KEY"="$VALUE"
+   echo "$KEY=$VALUE"
+done
+echo "---------------------------------"
 
 GPUS_PER_NODE=8
 # Change for multinode config
