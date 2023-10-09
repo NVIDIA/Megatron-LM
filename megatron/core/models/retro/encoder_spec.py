@@ -1,7 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec,
+)
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.encoder_attention import (
     RetroEncoderCrossAttention,
@@ -68,7 +71,7 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     database. Each operator is responsible for iterating the retrieved chunks
     and processing them individually.
     """
-    spec = get_gpt_layer_with_transformer_engine_spec()
+    spec = get_gpt_layer_local_spec()
     spec.submodules.pre_cross_attn_layernorm=FusedLayerNorm
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroEncoderCrossAttention,
@@ -109,7 +112,8 @@ def get_retro_encoder_block_spec(
     retro_layer_numbers = [1]
 
     # Layer specs.
-    gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec() \
+        if use_transformer_engine else get_gpt_layer_local_spec()
     get_retro_encoder_layer_spec = get_retro_encoder_layer_te_spec \
         if use_transformer_engine \
         else get_retro_encoder_layer_local_spec

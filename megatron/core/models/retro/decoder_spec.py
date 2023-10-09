@@ -2,7 +2,10 @@
 
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec,
+)
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
     RetroDecoderBiasDropoutAdd,
@@ -62,7 +65,7 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
     cross attention module takes an optional encoder block spec, which is only
     provided for the first Retro decoder layer.
     """
-    spec = get_gpt_layer_with_transformer_engine_spec()
+    spec = get_gpt_layer_local_spec()
     spec.submodules.pre_cross_attn_layernorm=FusedLayerNorm
     spec.submodules.cross_attention=ModuleSpec(
         module=RetroDecoderCrossAttention,
@@ -107,7 +110,8 @@ def get_retro_decoder_block_spec(
     retro_layer_numbers = list(range(retro_layer_start, num_layers + 1, 3))
 
     # Layer specs.
-    gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec() \
+        if use_transformer_engine else get_gpt_layer_local_spec()
     get_retro_decoder_layer_spec = get_retro_decoder_layer_te_spec \
         if use_transformer_engine \
         else get_retro_decoder_layer_local_spec

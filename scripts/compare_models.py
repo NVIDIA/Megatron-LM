@@ -28,6 +28,10 @@ def print_model(key, model, depth=0):
         ))
     for k, m in model.named_children():
         print_model(k, m, depth + 1)
+    if depth == 0:
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print("%s nparams : %d." % (key, sum(t.numel() for t in model.parameters())))
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
 def compare_top_nparams(key, default_module, core_module):
     get_nparams = lambda m : "--" if m is None else sum(t.numel() for t in m.parameters())
