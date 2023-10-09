@@ -26,8 +26,8 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
         hint = ''
         if backend == 'zarr':
             try:
-                import zarr
                 import tensorstore
+                import zarr
             except ImportError:
                 hint = ' Please install `zarr` and `tensorstore` packages'
         raise CheckpointingException(
