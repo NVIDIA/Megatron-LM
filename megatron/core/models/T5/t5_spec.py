@@ -1,65 +1,101 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSpec, CrossAttention, CrossAttentionSpec
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules, CrossAttention, CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
-    TELayerNormMLP,
+    TEColumnParallelLinear,
     TERowParallelLinear,
     TENorm
 )
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
+from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.transformer_block import (
     get_num_layers_to_build,
-    TransformerBlockSpec,
+    TransformerBlockSubmodules,
 )
 
 
-def encoder_model_with_transformer_engine_default_spec() -> TransformerLayerSpec:
-    return TransformerLayerSpec(
-        self_attention=SelfAttentionSpec(
-        module=SelfAttention,
-        params={"attn_mask_type": AttnMaskType.padding},
-        layernorm_linear_qkv=TELayerNormColumnParallelLinear,
-        core_attention=TEDotProductAttention,
-        linear_proj=TERowParallelLinear,
-    ),
-    self_attn_bda=get_bias_dropout_add,
-    ln_mlp=TELayerNormMLP,
-    mlp_bda=get_bias_dropout_add,
+def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                ),
+            ),  
+            self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=TENorm,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear,
+                ),
+            ),
+            mlp_bda=get_bias_dropout_add,
+        )
     )
 
-def decoder_model_with_transformer_engine_default_spec() -> TransformerLayerSpec:
-    return TransformerLayerSpec(
-        self_attention=SelfAttentionSpec(
-        module=SelfAttention,
-        params={"attn_mask_type": AttnMaskType.causal},
-        layernorm_linear_qkv=TELayerNormColumnParallelLinear,
-        core_attention=TEDotProductAttention,
-        linear_proj=TERowParallelLinear,
+
+
+def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
+    return ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.causal},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                ),
+            ),
+            pre_cross_attn_layernorm=TENorm,
+            self_attn_bda=get_bias_dropout_add,
+            cross_attention=ModuleSpec(
+                module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=CrossAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                ),
+            ),
+            cross_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=TENorm,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear,
+                ),
+            ),
+            mlp_bda=get_bias_dropout_add,
         ),
-        self_attn_bda=get_bias_dropout_add,
-        cross_attention=CrossAttentionSpec(
-            module=CrossAttention,
-            layernorm_linear_q=TELayerNormColumnParallelLinear,
-            layernorm_linear_kv=TELayerNormColumnParallelLinear,
-            core_attention=TEDotProductAttention,
-            linear_proj=TERowParallelLinear,
-        ),
-        cross_attn_bda=get_bias_dropout_add,
-        ln_mlp=TELayerNormMLP,
-        mlp_bda=get_bias_dropout_add,
-        # post_mlp_layernorm = TENorm,
     )
 
-def get_t5_encoder_block_spec(config) -> TransformerBlockSpec:
+
+
+
+def get_t5_encoder_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)
     layer_spec = encoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSpec([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
 
-def get_t5_decoder_block_spec(config) -> TransformerBlockSpec:
+def get_t5_decoder_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)
     layer_spec = decoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSpec([layer_spec] * num_layers)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec

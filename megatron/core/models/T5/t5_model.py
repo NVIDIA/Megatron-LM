@@ -6,15 +6,14 @@ from typing import Literal, Optional, List
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel, InferenceParams
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.T5.t5_embedding import T5Embedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSpec
-from megatron.core.transformer.transformer_block import TransformerBlockSpec
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
@@ -105,7 +104,7 @@ class T5Model(MegatronModule):
     def __init__(
             self,
             config: TransformerConfig,
-            spec: List[TransformerBlockSpec],
+            spec: List[ModuleSpec],
             vocab_size: int,
             max_sequence_length: int,
             pre_process: bool = True,
@@ -121,7 +120,7 @@ class T5Model(MegatronModule):
         super(T5Model, self).__init__(config=config)   
 
         self.config: TransformerConfig = config
-        self.spec: List[TransformerBlockSpec] = spec
+        self.spec: List[ModuleSpec] = spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -159,14 +158,14 @@ class T5Model(MegatronModule):
         encoder_spec, decoder_spec = self.spec
         self.encoder = TransformerBlock(
             config=self.config,
-            spec=encoder_spec,
+            submodules=encoder_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
         # Transformer decoder
         self.decoder = TransformerBlock(
             config=self.config,
-            spec=decoder_spec,
+            submodules=decoder_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -203,7 +202,7 @@ class T5Model(MegatronModule):
         decoder_attn_mask: Tensor,
         encoder_decoder_attn_mask: Tensor,
         labels: Tensor = None,
-        inference_params = None,
+        inference_params: InferenceParams = None,
     ):
 
         encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = t5_extended_attention_mask(

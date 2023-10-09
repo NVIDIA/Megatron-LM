@@ -22,42 +22,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.models.T5.t5_spec import get_t5_encoder_block_spec, get_t5_decoder_block_spec
 
 
-"""
-Pipeline parallelism for T5
-===========================
-
-T5 is a model architecture with both encoder and decoder blocks.
-Consequently, pipeline parallelism is implemented slightly differently
-compared to architectures like GPT and BERT.
-
-In particular, when pipeline_model_parallel_world_size > 1, each stage
-either executes an encoder block or a decoder block. The
---pipeline-model-parallel-split-rank argument controls the rank at which
-the split happens: all ranks lower than this argument execute the
-encoder block, and all ranks equal to or higher than this argument value
-execute the decoder block.
-
-In the encoder section of the model, only one tensor is sent downstream:
-the intermediate encoder_hidden_state. In the decoder section of the
-model, two tensors are sent downstream in the forward pass: the fully
-computed encoder_hidden_state, and the intermediate decoder_hidden_state.
-
-In particular, these are the shapes of the tensors sent between
-different workers:
-    If rank is in decoder section:
-        intermediate decoder_hidden_state (pre-transpose),
-        complete encoder_hidden_state (post-transpose).
-    If rank is at boundary between encoder and decoder sections:
-        complete encoder_hidden_state (post-transpose).
-    If rank is in encoder section:
-        intermediate encoder_hidden_state (pre-transpose).
-
-Additionally, we have code in the backward_step function in schedules.py
-to accumulate the encoder_hidden_state gradient across skip connections
-(encoder_hidden_state fed in as input to each layer in the decoder).
-"""
-
-
 def model_provider(pre_process=True, post_process=True,
                    add_encoder=True, add_decoder=True):
     """Build the model."""
