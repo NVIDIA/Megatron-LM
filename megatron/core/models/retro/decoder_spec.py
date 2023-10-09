@@ -8,6 +8,15 @@ from megatron.core.models.retro.decoder_attention import (
     RetroDecoderCrossAttention,
 )
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
+# >>>
+# from megatron.core.models.retro.local_layer_wrappers import LocalLayerNorm
+# <<<
+from megatron.core.transformer import (
+    get_num_layers_to_build,
+    ModuleSpec,
+    TransformerBlock,
+    TransformerBlockSubmodules,
+)
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
@@ -15,16 +24,17 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
-from megatron.core.transformer import (
-    get_num_layers_to_build,
-    ModuleSpec,
-    TransformerBlock,
-    TransformerBlockSubmodules,
-)
 
 
-def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
-    """
+# >>>
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.dot_product_attention import DotProductAttention
+# <<<
+
+def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
+    """Retro decoder TE spec (uses Transformer Engine components).
+
     A Retro decoder layer uses custom attention and bias-dropout-add operators
     to perform chunked-cross attention. Additionally, the first Retro decoder
     layer instantiates an entire encoder transformer block. As such, the decoder
@@ -49,7 +59,37 @@ def get_retro_decoder_layer_spec(encoder_block_spec: ModuleSpec = None) -> Modul
     return spec
 
 
-def get_retro_decoder_block_spec(config: RetroConfig) -> TransformerBlockSubmodules:
+def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
+    """Retro decoder local spec (uses Megatron-Core components).
+
+    A Retro decoder layer uses custom attention and bias-dropout-add operators
+    to perform chunked-cross attention. Additionally, the first Retro decoder
+    layer instantiates an entire encoder transformer block. As such, the decoder
+    cross attention module takes an optional encoder block spec, which is only
+    provided for the first Retro decoder layer.
+    """
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    spec.submodules.pre_cross_attn_layernorm=FusedLayerNorm
+    spec.submodules.cross_attention=ModuleSpec(
+        module=RetroDecoderCrossAttention,
+        params={
+            "encoder_block_spec" : encoder_block_spec,
+        },
+        submodules=CrossAttentionSubmodules(
+            linear_q=ColumnParallelLinear,
+            linear_kv=ColumnParallelLinear,
+            core_attention=DotProductAttention,
+            linear_proj=RowParallelLinear,
+        ),
+    )
+    spec.submodules.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    return spec
+
+
+def get_retro_decoder_block_spec(
+        config: RetroConfig,
+        use_transformer_engine: bool,
+) -> TransformerBlockSubmodules:
 
     """
     Retro decoder block implementation details:
@@ -74,9 +114,12 @@ def get_retro_decoder_block_spec(config: RetroConfig) -> TransformerBlockSubmodu
 
     # Layer specs.
     gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    get_retro_decoder_layer_spec = get_retro_decoder_layer_te_spec \
+        if use_transformer_engine \
+        else get_retro_decoder_layer_local_spec
     retro_layer_spec = get_retro_decoder_layer_spec()
-    retro_layer_spec_with_retriever = \
-        get_retro_decoder_layer_spec(get_retro_encoder_block_spec(config))
+    retro_layer_spec_with_retriever = get_retro_decoder_layer_spec(
+        get_retro_encoder_block_spec(config, use_transformer_engine))
 
     layer_specs = []
     for layer_number in range(1, num_layers + 1):

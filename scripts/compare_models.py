@@ -6,19 +6,28 @@ from megatron.core.enums import ModelType
 from megatron.training import get_model
 from pretrain_retro import core_model_provider, default_model_provider
 
-from lutil import pax
+from lutil import pax, tp
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~    
-def print_model_with_params(key, model, depth=0):
+# def print_model_with_params(key, model, depth=0):
+def print_model(key, model, depth=0):
+    if depth == 0:
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     print("%s%s%s" % (
         "  " * depth,
         "" if key is None else f"({key}) ",
         type(model).__name__,
     ))
     for k, p in model.named_parameters(recurse=False):
-        print("%s* %s : %s." % ("  " * (depth + 1), k, list(p.shape)))
+        print("%s* %s : %s ... [%s]." % (
+            "  " * (depth + 1),
+            k,
+            list(p.shape),
+            # ",".join(map(str, p.view(-1)[None:None:p.numel()//4].tolist())),
+            tp(p),
+        ))
     for k, m in model.named_children():
-        print_model_with_params(k, m, depth + 1)
+        print_model(k, m, depth + 1)
 
 def compare_top_nparams(key, default_module, core_module):
     get_nparams = lambda m : "--" if m is None else sum(t.numel() for t in m.parameters())
@@ -161,17 +170,21 @@ def compare_block_nparams(key, default_layers, core_layers):
             core_layers[i],
         )
 
-def compare_models():
-
-    args = get_args()
+def get_default_and_core_models():
 
     # model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
     #     model_provider, model_type)
-    default_model, core_model = [
+    return [
         get_model(fn, ModelType.retro_decoder)[0].module.module
         for fn in (default_model_provider, core_model_provider)
     ]
     # unwrapped_model = unwrap_model(model)
+
+def compare_models():
+
+    args = get_args()
+
+    default_model, core_model = get_default_and_core_models()
 
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     print(default_model)

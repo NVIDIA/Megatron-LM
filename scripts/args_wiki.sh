@@ -38,7 +38,9 @@ GLOBAL_BATCH_SIZE=256
 # <<<
 
 # CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c${USE_CORE}-r${ADD_RETRIEVER}
-# TENSORBOARD_DIR="${CHECKPOINT_DIR}/tensorboard"
+# CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c0-r${ADD_RETRIEVER}
+# CHECKPOINT_DIR=${RETRO_WORKDIR}/checkpoints/c1-r${ADD_RETRIEVER}
+# TENSORBOARD_DIR="${CHECKPOINT_DIR}/tb"
 # mkdir -p ${TENSORBOARD_DIR}
 
 # --loss-scale 1024 \
@@ -51,8 +53,10 @@ NUM_LAYERS=12 # 4, [*12]
 HIDDEN_SIZE=768 # 256, [512], *768
 NUM_HEADS=12 # [4], 8, *12
 MICRO_BATCH_SIZE=4 # [4], *8
-LOG_INTERVAL=20 # *10
-# SAVE_INTERVAL=2000 # [2000], *10000
+LOG_INTERVAL=5 # 20
+# SAVE_INTERVAL=2000 EXIT_INTERVAL=1000
+# SAVE_INTERVAL=10 EXIT_INTERVAL=20
+EXIT_INTERVAL=10
 # ARGS=" \
 #     --tensorboard-dir ${TENSORBOARD_DIR} \
 #     --log-validation-ppl-to-tensorboard \
@@ -61,7 +65,7 @@ LOG_INTERVAL=20 # *10
 #     --load ${CHECKPOINT_DIR} \
 #     \
 ARGS=" \
-    --exit-interval 1000 \
+    --exit-interval ${EXIT_INTERVAL} \
     \
     ${TOKENIZER_ARGS} \
     --tensor-model-parallel-size 1 \
