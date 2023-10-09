@@ -26,8 +26,10 @@ if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
 if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
 if [[ -n $METADATA ]]; then RUN_NAME=${RUN_NAME}_${METADATA}; fi
 export $RUN_NAME
+echo "----------------- DEBUG FOLDER INFORMATION ---------------------------"
 echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug directory for result logs."
 echo "Run name is $RUN_NAME"
+echo "----------------------------------------------------------------------"
 
 # step 3 : CREATING REQUIRED DIRECTORIES
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints

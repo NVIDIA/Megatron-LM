@@ -18,8 +18,10 @@ export BUILD_DIR=`pwd` #Path to megatron-lm repo
 
 # step 2 : SETTING RUN NAME
 export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
+echo "----------------- DEBUG FOLDER INFORMATION ---------------------------"
 echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug for result logs."
 echo "Run name is $RUN_NAME"
+echo "----------------------------------------------------------------------"
 
 # step 3 : CREATING REQUIRED DIRECTORIES
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
