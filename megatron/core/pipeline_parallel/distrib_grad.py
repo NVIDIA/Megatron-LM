@@ -81,12 +81,15 @@ def _allreduce_layernorm_grads(model, config):
         for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
             buf.copy_(synced)
 
+
 def _allreduce_expert_grads(model, config):
     """All-reduce expert grads (for expert parallelism)."""
 
     # All-reduce switchmlp parameters across data modulo expert parallel nodes
-    if config.expert_model_parallel_size > 1 and \
-            config.expert_model_parallel_size < mpu.get_data_parallel_world_size():
+    if (
+        config.expert_model_parallel_size > 1
+        and config.expert_model_parallel_size < mpu.get_data_parallel_world_size()
+    ):
         grads = []
         for model_chunk in model:
             for param in get_attr_wrapped_model(model_chunk, 'parameters')():

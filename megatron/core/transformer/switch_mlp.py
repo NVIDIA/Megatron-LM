@@ -49,15 +49,13 @@ class SwitchMLP(MegatronModule):
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
 
         assert self.config.num_moe_experts % self.expert_parallel_size == 0
-        self.num_local_experts = (
-            self.config.num_moe_experts // self.expert_parallel_size
-        )
+        self.num_local_experts = self.config.num_moe_experts // self.expert_parallel_size
         local_expert_indices_offset = (
             parallel_state.get_expert_model_parallel_rank() * self.num_local_experts
         )
-        self.local_expert_indices = (
-            [local_expert_indices_offset + i for i in range(self.num_local_experts)]
-        )
+        self.local_expert_indices = [
+            local_expert_indices_offset + i for i in range(self.num_local_experts)
+        ]
 
         self.local_experts = torch.nn.ModuleList()
         for _ in range(self.num_local_experts):

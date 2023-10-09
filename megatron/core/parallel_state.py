@@ -391,9 +391,13 @@ def initialize_model_parallel(
 
     # Build the tensor + expert parallel groups
     global _TENSOR_AND_EXPERT_PARALLEL_GROUP
-    assert _TENSOR_AND_EXPERT_PARALLEL_GROUP is None, 'Tensor + expert parallel group is already initialized'
+    assert (
+        _TENSOR_AND_EXPERT_PARALLEL_GROUP is None
+    ), 'Tensor + expert parallel group is already initialized'
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP
-    assert _DATA_MODULO_EXPERT_PARALLEL_GROUP is None, 'Data modulo expert group is already initialized'
+    assert (
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP is None
+    ), 'Data modulo expert group is already initialized'
     tensor_and_data_group_size: int = tensor_model_parallel_size * data_parallel_size
     num_tensor_and_data_groups: int = world_size // tensor_and_data_group_size
     tensor_and_expert_group_size: int = tensor_model_parallel_size * expert_model_parallel_size
@@ -540,15 +544,15 @@ def get_tensor_and_data_parallel_group(with_context_parallel=False):
 
 def get_tensor_and_expert_parallel_group():
     assert (
-            _TENSOR_AND_EXPERT_PARALLEL_GROUP is not None
-        ), 'tensor and expert parallel group is not initialized'
+        _TENSOR_AND_EXPERT_PARALLEL_GROUP is not None
+    ), 'tensor and expert parallel group is not initialized'
     return _TENSOR_AND_EXPERT_PARALLEL_GROUP
 
 
 def get_data_modulo_expert_parallel_group():
     assert (
-            _DATA_MODULO_EXPERT_PARALLEL_GROUP is not None
-        ), 'data modulo expert parallel group is not initialized'
+        _DATA_MODULO_EXPERT_PARALLEL_GROUP is not None
+    ), 'data modulo expert parallel group is not initialized'
     return _DATA_MODULO_EXPERT_PARALLEL_GROUP
 
 
@@ -816,25 +820,28 @@ def get_context_parallel_rank():
     else:
         return 0
 
+
 def get_expert_model_parallel_world_size():
     """Return my rank for the expert parallel group"""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        tensor_and_expert_parallel_world_size =\
-                torch.distributed.get_world_size(
-                    group=get_tensor_and_expert_parallel_group()
-                )
+        tensor_and_expert_parallel_world_size = torch.distributed.get_world_size(
+            group=get_tensor_and_expert_parallel_group()
+        )
         return tensor_and_expert_parallel_world_size // get_tensor_model_parallel_world_size()
     else:
         return 0
 
+
 def get_expert_model_parallel_rank():
     """Return my rank for the expert parallel group"""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        tensor_and_expert_parallel_rank =\
-            torch.distributed.get_rank(group=get_tensor_and_expert_parallel_group())
+        tensor_and_expert_parallel_rank = torch.distributed.get_rank(
+            group=get_tensor_and_expert_parallel_group()
+        )
         return tensor_and_expert_parallel_rank // get_tensor_model_parallel_world_size()
     else:
         return 0
+
 
 def get_data_modulo_expert_parallel_rank():
     """Return my rank for the context parallel group."""
@@ -842,6 +849,7 @@ def get_data_modulo_expert_parallel_rank():
         return torch.distributed.get_rank(group=get_data_modulo_expert_parallel_group())
     else:
         return 0
+
 
 def _set_global_memory_buffer():
     """Initialize global buffer"""
