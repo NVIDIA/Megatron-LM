@@ -5,7 +5,11 @@ import torch
 import transformer_engine as te
 from pkg_resources import packaging
 
-from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_global_ranks,
+    get_context_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -211,6 +215,9 @@ class TERowParallelLinear(TELinear):
         )
 
 
+cp_stream = torch.cuda.Stream()
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
@@ -239,6 +246,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
+            cp_group=get_context_parallel_group(),
+            cp_global_ranks=get_context_parallel_global_ranks(),
+            cp_stream=cp_stream,
             **kwargs,
         )
 

@@ -135,6 +135,17 @@ class GPTModel(MegatronModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    def get_pos_emb_on_this_cp_rank(self, pos_emb, seq_dim):
+        cp_size = self.config.context_parallel_size
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+        pos_emb = pos_emb.view(
+            *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
+        )
+        pos_emb = pos_emb.index_select(seq_dim, cp_idx)
+        pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+        return pos_emb
+
     def forward(
         self,
         input_ids: Tensor,
@@ -172,7 +183,13 @@ class GPTModel(MegatronModule):
                 if self.config.sequence_parallel:
                     rotary_seq_len *= self.config.tensor_model_parallel_size
 
+                rotary_seq_len *= self.config.context_parallel_size
+
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+            if self.config.context_parallel_size > 1:
+                rotary_pos_emb = self.get_pos_emb_on_this_cp_rank(rotary_pos_emb, 0)
 
         # Run decoder.
         hidden_states = self.decoder(
