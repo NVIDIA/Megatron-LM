@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core import parallel_state
+from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
@@ -8,9 +9,7 @@ from megatron.core.models.retro.decoder_attention import (
     RetroDecoderCrossAttention,
 )
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
-# >>>
-# from megatron.core.models.retro.local_layer_wrappers import LocalLayerNorm
-# <<<
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import (
     get_num_layers_to_build,
     ModuleSpec,
@@ -24,13 +23,8 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
     TENorm,
     TERowParallelLinear,
 )
-
-
-# >>>
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-# <<<
+
 
 def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> ModuleSpec:
     """Retro decoder TE spec (uses Transformer Engine components).

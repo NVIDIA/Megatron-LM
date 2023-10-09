@@ -101,9 +101,9 @@ def compare_xattn_nparams(key, default_xattn, core_xattn):
     # print(lift_params(core_xattn))
 
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params(None, default_xattn)
+    print_model(None, default_xattn)
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    print_model_with_params(None, core_xattn)
+    print_model(None, core_xattn)
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
     # pax({
@@ -200,13 +200,13 @@ def compare_models():
     core_encoder_xattn = core_encoder_layers[0].cross_attention.attn
 
     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    # print_model_with_params("default norm", default_encoder_layers[0].post_attention_norm)
+    # print_model("default norm", default_encoder_layers[0].post_attention_norm)
     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    # print_model_with_params("core norm", core_encoder_layers[0].pre_cross_attn_layernorm)
+    # print_model("core norm", core_encoder_layers[0].pre_cross_attn_layernorm)
     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    # print_model_with_params("default xattn", default_encoder_xattn)
+    # print_model("default xattn", default_encoder_xattn)
     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-    # print_model_with_params("core xattn", core_encoder_xattn)
+    # print_model("core xattn", core_encoder_xattn)
     # print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     # exit()
 

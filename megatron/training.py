@@ -106,12 +106,6 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
-    # >>>
-    # from scripts.compare_params_norm import compare_params_norm
-    # compare_params_norm()
-    # raise Exception("hi.")
-    # <<<
-
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -730,10 +724,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         params_norm = None
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-            # >>>
-            from lutil import pax
-            pax("params_norm")
-            # <<<
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
