@@ -15,15 +15,16 @@ echo "---------------------------------"
 set -x 
 
 # Change for multinode config
+GPUS_PER_NODE=8
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NODE_RANK=0
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_bert.py \
