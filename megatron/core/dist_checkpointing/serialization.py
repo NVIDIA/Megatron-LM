@@ -164,7 +164,7 @@ def save(
     checkpoint_dir: str,
     sharded_strategy: Union[SaveShardedStrategy, None] = None,
     common_strategy: Union[SaveCommonStrategy, None] = None,
-    validate_access_integrity: bool = True
+    validate_access_integrity: bool = True,
 ):
     """Saving entrypoint.
 
