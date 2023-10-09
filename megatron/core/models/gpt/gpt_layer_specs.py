@@ -77,7 +77,7 @@ gpt_layer_with_transformer_engine_spec_moe = ModuleSpec(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,
-                dot_product_attention=TEDotProductAttention,
+                core_attention=TEDotProductAttention,
                 linear_proj=TERowParallelLinear,
             ),
         ),
@@ -103,7 +103,7 @@ gpt_layer_local_spec_moe = ModuleSpec(
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=ColumnParallelLinear,
-                dot_product_attention=DotProductAttention,
+                core_attention=DotProductAttention,
                 linear_proj=RowParallelLinear,
             ),
         ),
@@ -118,4 +118,3 @@ gpt_layer_local_spec_moe = ModuleSpec(
         mlp_bda=get_bias_dropout_add,
     ),
 )
->>>>>>> main
