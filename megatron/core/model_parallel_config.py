@@ -64,6 +64,12 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
 
+    Parallelism
+    -----------
+
+    finalize_model_grads_func (optional): Function that finalizes gradients on all workers. Could include ensuring that
+        grads are all-reduced across data parallelism, pipeline parallelism, and sequence parallelism dimensions.
+
     Pipeline Parallelism
     --------------------
 
@@ -142,6 +148,9 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
+
+    # Parallelism
+    finalize_model_grads_func: Callable = None
 
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None
