@@ -2,4 +2,10 @@
 
 from .core import check_is_distributed_checkpoint
 from .mapping import LocalNonpersitentObject, ShardedTensor
-from .serialization import load, load_common_state_dict, save
+from .serialization import (
+    load,
+    load_common_state_dict,
+    load_plain_tensors,
+    load_tensors_metadata,
+    save,
+)
