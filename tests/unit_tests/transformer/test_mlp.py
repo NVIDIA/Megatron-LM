@@ -8,7 +8,7 @@ from megatron.core.transformer.mlp import MLP
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 
 class TestParallelMLP:
 
@@ -17,7 +17,7 @@ class TestParallelMLP:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.mlp = MLP(transformer_config,
-                       gpt_layer_local_spec.submodules.mlp.submodules)
+                       get_gpt_layer_local_spec().submodules.mlp.submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
