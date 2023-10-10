@@ -154,8 +154,8 @@ class TransformerLayer(MegatronModule):
         attention_mask,
         context=None,
         context_mask=None,
-        inference_params=None,
         rotary_pos_emb=None,
+        inference_params=None,
     ):
         # hidden_states: [s, b, h]
 
