@@ -164,25 +164,6 @@ class TransformerBlock(MegatronModule):
     ):
         """Forward method with activation checkpointing."""
 
-        # >>>
-        # def custom(start: int, end: int):
-        #     def custom_forward(*args, **kwargs):
-        #         x_, context_, *args = args
-        #         for index in range(start, end):
-        #             layer = self._get_layer(index)
-        #             # >>>
-        #             # x_, context_ = layer(x_, *args, **{
-        #             #     **kwargs,
-        #             #     "context" : context_,
-        #             # })
-        #             x_, context_ = layer(x_, *args, **{
-        #                 **kwargs,
-        #                 "context" : context_,
-        #             })
-        #             # <<<
-        #         return x_, context_
-
-        #     return custom_forward
         def custom(start: int, end: int):
             def custom_forward(
                 hidden_states,
@@ -205,9 +186,7 @@ class TransformerBlock(MegatronModule):
                         **kwargs,
                     )
                 return hidden_states, context
-
             return custom_forward
-        # <<<
 
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
