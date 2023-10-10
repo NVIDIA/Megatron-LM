@@ -12,31 +12,25 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, seq_len_interpolation_factor=None, enforce_fp32_pos_idx: bool = False):
         super().__init__()
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
-        self.enforce_fp32_pos_idx = enforce_fp32_pos_idx
+        self.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+
+        if torch.cuda.is_available():
+            self.inv_freq = self.inv_freq.to(torch.cuda.current_device())
+        
 
     def forward(self, max_seq_len, offset=0):
-        if self.enforce_fp32_pos_idx:
-            if self.inv_freq.dtype != torch.float32:
-                inv_freq = self.inv_freq.to(torch.float32)
-            else:
-                inv_freq = self.inv_freq
-            seq = torch.arange(max_seq_len, device=self.inv_freq.device, dtype=torch.float32) + offset
-        else:
-            seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
-            inv_freq = self.inv_freq
+        seq = torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype) + offset
 
         if self.seq_len_interpolation_factor is not None:
-            seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
 
-        freqs = torch.outer(seq, inv_freq)
-
+        freqs = torch.outer(seq, self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
+
+        assert freqs.dtype == torch.float32 and self.inv_freq.dtype == torch.float32
         return emb[:, None, None, :]
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
