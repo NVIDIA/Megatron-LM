@@ -8,7 +8,7 @@ pip install pytest-cov
 pip install pytest_mock
 pip install nltk
 
-# SUBDIR=""
+SUBDIR=""
 # SUBDIR=data
 # SUBDIR=models
 # SUBDIR=pipeline_parallel
@@ -26,7 +26,7 @@ pip install nltk
 # SUBDIR=transformer/test_spec_customization.py # *
 # SUBDIR=transformer/test_switch_mlp.py
 # SUBDIR=transformer/test_transformer_block.py
-SUBDIR=transformer/test_transformer_layer.py # *
+# SUBDIR=transformer/test_transformer_layer.py # *
 
 NPROCS=8
 torchrun --nproc_per_node=${NPROCS} -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests/${SUBDIR}
