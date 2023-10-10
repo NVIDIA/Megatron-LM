@@ -100,10 +100,14 @@ class SwitchMLP(MegatronModule):
         max_prob = torch.unsqueeze(max_prob, 1)
         hidden_states = hidden_states.view(-1, hidden_shape[-1])
 
-        global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
-            hidden_states
-        )
-        global_indices = self.gather_indices(max_ind)
+        if self.sequence_parallel or (self.expert_parallel_size > 1):
+            global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
+                hidden_states
+            )
+            global_indices = self.gather_indices(max_ind)
+        else:
+            global_hidden_states = hidden_states
+            globa_indices = max_ind
 
         output_total = torch.zeros_like(global_hidden_states)
         if self.add_bias:
@@ -120,18 +124,19 @@ class SwitchMLP(MegatronModule):
                 output_bias = output_bias.expand_as(output)
                 output_bias_total[local_indices, :] = output_bias
 
-        output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-            output_total
-        )
-        if self.add_bias:
-            output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
-                output_bias_total
+        if self.sequence_parallel or (self.expert_parallel_size > 1):
+            output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                output_total
             )
-            # bias is duplicated across tensor parallelism ranks;
-            # reduce scatter reduces bias across tensor parallel_ranks
-            output_bias_total = (
-                output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
-            )
+            if self.add_bias:
+                output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                    output_bias_total
+                )
+                # bias is duplicated across tensor parallelism ranks;
+                # reduce scatter reduces bias across tensor parallel_ranks
+                output_bias_total = (
+                    output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
+                )
 
         output_total = output_total * max_prob
         output_total = output_total.view(hidden_shape)
