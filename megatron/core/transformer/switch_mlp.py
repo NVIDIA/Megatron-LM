@@ -107,7 +107,7 @@ class SwitchMLP(MegatronModule):
             global_indices = self.gather_indices(max_ind)
         else:
             global_hidden_states = hidden_states
-            globa_indices = max_ind
+            global_indices = max_ind
 
         output_total = torch.zeros_like(global_hidden_states)
         if self.add_bias:
