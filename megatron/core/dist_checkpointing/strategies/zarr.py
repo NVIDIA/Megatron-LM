@@ -240,9 +240,9 @@ def load_zarr_based_sharded_metadata(
     """Load metadata of Zarr arrays.
 
     Arguments:
-        checkpoint_dir: checkpoint root directory
-        get_shape_dtype_fn: a function returning array shape and dtype
-            for a given Zarr array path
+        checkpoint_dir (str): checkpoint root directory
+        get_shape_dtype_fn (str -> ((int, ...), np.dtype)): a function returning
+            an array shape and dtype for a given Zarr array path
     """
     sharded_state_dict = {}
     for subdir in checkpoint_dir.iterdir():
