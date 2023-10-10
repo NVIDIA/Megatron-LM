@@ -183,7 +183,7 @@ class GPTModel(MegatronModule):
                 if self.config.sequence_parallel:
                     rotary_seq_len *= self.config.tensor_model_parallel_size
 
-                rotary_seq_len *= self.config.context_parallel_size
+            rotary_seq_len *= self.config.context_parallel_size
 
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
