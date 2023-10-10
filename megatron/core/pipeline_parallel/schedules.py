@@ -8,7 +8,7 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.pipeline_parallel import distrib_grad, p2p_communication
+from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
 # Types
@@ -356,10 +356,10 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
-        distrib_grad.finalize_model_grads([model])
+        config.finalize_model_grads_func([model])
 
     return forward_data_store
 
@@ -916,11 +916,11 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-        distrib_grad.finalize_model_grads(model)
+        config.finalize_model_grads_func(model)
 
     return forward_data_store
 
@@ -1270,10 +1270,10 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if not forward_only:
+    if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism, layernorm all-reduce for sequence parallelism, and
         # embedding all-reduce for pipeline parallelism).
-        distrib_grad.finalize_model_grads([model])
+        config.finalize_model_grads_func([model])
 
     return forward_data_store
