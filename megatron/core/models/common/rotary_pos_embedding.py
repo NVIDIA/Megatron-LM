@@ -5,7 +5,21 @@ import importlib.util
 import torch
 from torch import einsum, nn
 
+from megatron.core import parallel_state
+
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
+
+def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+    pos_emb = pos_emb.view(
+        *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
+    )
+    pos_emb = pos_emb.index_select(seq_dim, cp_idx)
+    pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+    return pos_emb
 
 
 class RotaryEmbedding(nn.Module):
@@ -16,7 +30,8 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
     def forward(self, max_seq_len, offset=0):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
+        cp_size = parallel_state.get_context_parallel_world_size()
+        seq = torch.arange(max_seq_len*cp_size, device=self.inv_freq.device) + offset
         if self.seq_len_interpolation_factor is not None:
             seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
@@ -25,7 +40,11 @@ class RotaryEmbedding(nn.Module):
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
-        return emb[:, None, None, :]
+        emb = emb[:, None, None, :]
+        if cp_size > 1:
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+        return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
