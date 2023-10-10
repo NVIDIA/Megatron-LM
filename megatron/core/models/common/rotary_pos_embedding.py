@@ -31,7 +31,7 @@ class RotaryEmbedding(nn.Module):
 
     def forward(self, max_seq_len, offset=0):
         cp_size = parallel_state.get_context_parallel_world_size()
-        seq = torch.arange(max_seq_len*cp_size, device=self.inv_freq.device) + offset
+        seq = torch.arange(max_seq_len * cp_size, device=self.inv_freq.device) + offset
         if self.seq_len_interpolation_factor is not None:
             seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
