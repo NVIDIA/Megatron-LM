@@ -1,5 +1,5 @@
 from importlib.metadata import version
-from typing import Callable
+from typing import Callable, List, Union
 
 import torch
 import transformer_engine as te
@@ -215,9 +215,6 @@ class TERowParallelLinear(TELinear):
         )
 
 
-cp_stream = torch.cuda.Stream()
-
-
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
@@ -236,6 +233,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         **kwargs
     ):
         self.config = config
+
+        global cp_stream
+        cp_stream = torch.cuda.Stream()
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
@@ -246,11 +247,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            cp_group=get_context_parallel_group(),
-            cp_global_ranks=get_context_parallel_global_ranks(),
+            cp_group=get_context_parallel_group(check_initialized=False),
+            cp_global_ranks=get_context_parallel_global_ranks(check_initialized=False),
             cp_stream=cp_stream,
             **kwargs,
         )
+
+    # If Megatron's parallel_state had not been initialized while this module was
+    # instantiated, call this function to set up context parallel running.
+    def set_context_parallel_running(
+        self,
+        cp_group: Union[torch.distributed.ProcessGroup, None],
+        cp_global_ranks: List[int],
+        cp_stream: torch.cuda.Stream,
+    ):
+        self.cp_group = cp_group
+        self.cp_global_ranks = cp_global_ranks
+        self.cp_stream = cp_stream
 
 
 class TELayerNormMLP(te.pytorch.LayerNormMLP):
