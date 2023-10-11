@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.common.embeddings.base_lm_embedding import BaseLanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -15,14 +15,14 @@ class TestBaseEmbedding:
         Utils.initialize_model_parallel(1, 1)
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        self.base_embedding = BaseLanguageModelEmbedding(
+        self.base_embedding = LanguageModelEmbedding(
             config=transformer_config, vocab_size=100, max_sequence_length=4, position_embedding_type='learned_absolute')
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     def test_constructor(self):
-        assert isinstance(self.base_embedding, BaseLanguageModelEmbedding)
+        assert isinstance(self.base_embedding, LanguageModelEmbedding)
         num_weights = sum([p.numel()
                           for p in self.base_embedding.parameters()])
         assert num_weights == 1248

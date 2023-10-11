@@ -32,10 +32,15 @@ class FusedLayerNorm(torch.nn.Module):
         persist_layer_norm=True,
         sequence_parallel=False,
         zero_centered_gamma=False,
+        normalization="LayerNorm",
     ):
         super().__init__()
 
         self.zero_centered_gamma = zero_centered_gamma
+        self.normalization = normalization
+        assert normalization == "LayerNorm", '({}) is not supported in ' 'FusedLayerNorm'.format(
+            normalization
+        )
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent

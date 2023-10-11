@@ -148,6 +148,7 @@ def save_checkpoint(queue, args):
                         'vocab_file', 'tokenizer_model',
                         'save_interval', 'save',
                         'perform_initialization', 'use_cpu_initialization',
+                        'recompute_granularity', 'recompute_num_layers', 'recompute_method',
                         'encoder_num_layers', 'encoder_seq_length',
                         'distribute_saved_activations',
                         'train_iters', 'lr_decay_iters', 'lr_warmup_iters', 'lr_warmup_fraction',
@@ -251,9 +252,6 @@ def save_checkpoint(queue, args):
         else:
             assert not hasattr(model.language_model.embedding, "position_embeddings")
 
-    # Layernorm has bias; RMSNorm does not.
-    norm_has_bias = md.checkpoint_args.normalization == "LayerNorm"
-
     # Transformer layers
     #-------------------
     total_layer_num = 0
@@ -269,10 +267,10 @@ def save_checkpoint(queue, args):
 
             # duplicated tensors
             input_norm_weight = msg.pop("input norm weight")
-            if norm_has_bias:
+            if md.norm_has_bias:
                 input_norm_bias = msg.pop("input norm bias")
             post_norm_weight = msg.pop("post norm weight")
-            if norm_has_bias:
+            if md.norm_has_bias:
                 post_norm_bias = msg.pop("post norm bias")
             if md.linear_bias:
                 dense_bias = msg.pop("dense bias")
@@ -304,12 +302,12 @@ def save_checkpoint(queue, args):
             for tp_rank in range(args.target_tensor_parallel_size):
                 l = models[tp_rank].language_model.encoder.layers[layer]
                 l.input_norm.weight.data.copy_(input_norm_weight)
-                if norm_has_bias:
+                if md.norm_has_bias:
                     l.input_norm.bias.data.copy_(input_norm_bias)
                 l.self_attention.query_key_value.weight.data.copy_(qkv_weight[tp_rank])
                 l.self_attention.dense.weight.data.copy_(dense_weight[tp_rank])
                 l.post_attention_norm.weight.data.copy_(post_norm_weight)
-                if norm_has_bias:
+                if md.norm_has_bias:
                     l.post_attention_norm.bias.data.copy_(post_norm_bias)
                 l.mlp.dense_h_to_4h.weight.data.copy_(mlp_l0_weight[tp_rank])
                 l.mlp.dense_4h_to_h.weight.data.copy_(mlp_l1_weight[tp_rank])
@@ -326,17 +324,17 @@ def save_checkpoint(queue, args):
         if post_process:
             msg = queue_get("final norm")
             final_norm_weight = msg.pop("weight")
-            if norm_has_bias:
+            if md.norm_has_bias:
                 final_norm_bias = msg.pop("bias")
             for tp_rank in range(args.target_tensor_parallel_size):
                 models[tp_rank].language_model.encoder.final_norm.weight.data.copy_(final_norm_weight)
-                if norm_has_bias:
+                if md.norm_has_bias:
                     models[tp_rank].language_model.encoder.final_norm.bias.data.copy_(final_norm_bias)
                 if pp_rank != 0 and not md.output_layer:
                     # Copy word embeddings to final pipeline rank
                     models[tp_rank].word_embeddings.weight.data.copy_(out_word_embed[tp_rank])
             del final_norm_weight
-            if norm_has_bias:
+            if md.norm_has_bias:
                 del final_norm_bias
             check_message(msg)
 
@@ -375,13 +373,13 @@ def save_checkpoint(queue, args):
                 lm_head_dense_weight = msg.pop("dense weight")
                 lm_head_dense_bias = msg.pop("dense bias")
                 lm_head_norm_weight = msg.pop("norm weight")
-                if norm_has_bias:
+                if md.norm_has_bias:
                     lm_head_norm_bias = msg.pop("norm bias")
                 for tp_rank in range(args.target_tensor_parallel_size):
                     models[tp_rank].lm_head.dense.weight.data.copy_(lm_head_dense_weight)
                     models[tp_rank].lm_head.dense.bias.data.copy_(lm_head_dense_bias)
                     models[tp_rank].lm_head.norm.weight.data.copy_(lm_head_norm_weight)
-                    if norm_has_bias:
+                    if md.norm_has_bias:
                         models[tp_rank].lm_head.norm.bias.data.copy_(lm_head_norm_bias)
                 check_message(msg)
                 msg = queue_get()
