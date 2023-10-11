@@ -6,8 +6,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from megatron.core import ModelParallelConfig
-from megatron.core.utils import init_method_normal, scaled_init_method_normal
+from ..model_parallel_config import ModelParallelConfig
+from ..utils import init_method_normal, scaled_init_method_normal
 
 
 @dataclass

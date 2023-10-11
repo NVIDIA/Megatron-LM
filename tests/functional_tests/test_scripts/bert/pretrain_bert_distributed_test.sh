@@ -1,25 +1,26 @@
 #! /bin/bash
+echo "------ARGUMENTS LIST --------"
+for ARGUMENT in "$@"
+do
+   KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+   KEY_LENGTH=${#KEY}
+   VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+   export "$KEY"="$VALUE"
+   echo "$KEY=$VALUE"
+done
+echo "---------------------------------"
+
 set -x 
 
-DATA_PATH=$1
-CHECKPOINT_PATH=$2
-TENSORBOARD_DIR=$3
-TP_SIZE=$4
-PP_SIZE=$5
-NNODES=$6
-MAX_STEPS=$7
-USE_CORE=$8
-VP_SIZE=$9
-MBS=${10}
-GBS=${11}
-ADDITIONAL_PARAMS=${12}
-GPUS_PER_NODE=8
 # Change for multinode config
+GPUS_PER_NODE=8
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NODE_RANK=0
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
+command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 TRAINING_DTYPE=fp16
 TRANSFORMER_IMPL=local
@@ -32,9 +33,9 @@ if [[ $USE_CORE -eq 1 ]]; then
 fi
 
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
-torchrun $DISTRIBUTED_ARGS \
+torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_bert.py \
        --num-layers 24 \
        --hidden-size 1024 \
@@ -70,4 +71,16 @@ torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
+<<<<<<< HEAD
        --${TRAINING_DTYPE}
+=======
+       --fp16 "
+
+command="$command $torch_run_cmd"
+echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
+echo "$command"
+echo "-----------------------------------------------------------------------------"
+
+echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
+eval $command
+>>>>>>> main
