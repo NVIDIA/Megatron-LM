@@ -2,6 +2,7 @@ from importlib.metadata import version
 from typing import Callable
 
 import torch
+import os
 import transformer_engine as te
 from pkg_resources import packaging
 
@@ -107,6 +108,8 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
+            ub_split_rs=self.config.ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_OVERLAP", "1"))) and bool(int(os.getenv("NVTE_UB_SPLIT_RS", "1"))),
+            ub_split_ag=self.config.ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_OVERLAP", "1"))) and bool(int(os.getenv("NVTE_UB_SPLIT_AG", "1"))),
             **_get_extra_te_kwargs(config),
         )
 
@@ -163,6 +166,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
+            ub_bulk_wgrad= self.config.ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_OVERLAP", "1"))) and bool(int(os.getenv("NVTE_UB_BULK_WGRAD", "1"))),
+            ub_bulk_dgrad= self.config.ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_OVERLAP", "1"))) and bool(int(os.getenv("NVTE_UB_BULK_DGRAD", "1"))),
+            ub_split_ag= self.config.ub_tp_comm_overlap and bool(int(os.getenv("NVTE_UB_OVERLAP", "1"))) and bool(int(os.getenv("NVTE_UB_SPLIT_AG", "1"))),
             **_get_extra_te_kwargs(config),
         )
 
