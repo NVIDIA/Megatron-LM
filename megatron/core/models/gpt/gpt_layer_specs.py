@@ -41,6 +41,7 @@ def get_gpt_layer_with_transformer_engine_spec() -> ModuleSpec:
         ),
     )
 
+
 # Use this spec for an implementation using only modules in megatron core
 def get_gpt_layer_local_spec() -> ModuleSpec:
     return ModuleSpec(
@@ -54,8 +55,7 @@ def get_gpt_layer_local_spec() -> ModuleSpec:
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
                     linear_proj=ModuleSpec(
-                        module=RowParallelLinear,
-                        params={"input_is_parallel": True},
+                        module=RowParallelLinear, params={"input_is_parallel": True},
                     ),
                 ),
             ),
@@ -70,6 +70,7 @@ def get_gpt_layer_local_spec() -> ModuleSpec:
             mlp_bda=get_bias_dropout_add,
         ),
     )
+
 
 # Use this spec to use lower level Transformer Engine modules and SwitchMLP based MoE
 gpt_layer_with_transformer_engine_spec_moe = ModuleSpec(

@@ -45,8 +45,5 @@ class RetroModel(GPTModel):
             decoder_input=decoder_input,
             labels=labels,
             inference_params=inference_params,
-            extra_block_kwargs={
-                "context" : context,
-                "context_mask" : context_mask,
-            },
+            extra_block_kwargs={"context": context, "context_mask": context_mask,},
         )

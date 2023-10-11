@@ -20,8 +20,9 @@ from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewles
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
 
-    num_layers_per_pipeline_rank = \
+    num_layers_per_pipeline_rank = (
         config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+    )
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -57,8 +58,7 @@ class TransformerBlockSubmodules:
 
 
 def _get_block_submodules(
-    config: TransformerConfig,
-    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec],
 ) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
@@ -85,9 +85,9 @@ class TransformerBlock(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: Union[TransformerBlockSubmodules, ModuleSpec],
-        post_layer_norm: bool=True,
-        pre_process: bool=True,
-        post_process: bool=True,
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
     ):
         super().__init__(config=config)
 
@@ -112,17 +112,15 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(
-                layer_spec,
-                config=self.config,
-                layer_number=layer_number,
-            )
+            return build_module(layer_spec, config=self.config, layer_number=layer_number,)
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([
-            build_layer(layer_spec, i + 1)
-            for i, layer_spec in enumerate(self.submodules.layer_specs)
-        ])
+        self.layers = torch.nn.ModuleList(
+            [
+                build_layer(layer_spec, i + 1)
+                for i, layer_spec in enumerate(self.submodules.layer_specs)
+            ]
+        )
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:
@@ -186,6 +184,7 @@ class TransformerBlock(MegatronModule):
                         **kwargs,
                     )
                 return hidden_states, context
+
             return custom_forward
 
         if self.config.recompute_method == 'uniform':
@@ -223,11 +222,7 @@ class TransformerBlock(MegatronModule):
                     )
                 else:
                     hidden_states, context = custom(l, l + 1)(
-                        hidden_states,
-                        attention_mask,
-                        context,
-                        context_mask,
-                        rotary_pos_emb,
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -248,10 +243,10 @@ class TransformerBlock(MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        context: Tensor=None,
-        context_mask: Tensor=None,
-        rotary_pos_emb: Tensor=None,
-        inference_params: InferenceParams=None,
+        context: Tensor = None,
+        context_mask: Tensor = None,
+        rotary_pos_emb: Tensor = None,
+        inference_params: InferenceParams = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -338,7 +333,7 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix: str=''):
+    def sharded_state_dict(self, prefix: str = ''):
 
         sharded_state_dict = {}
 

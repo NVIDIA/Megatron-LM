@@ -83,16 +83,11 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention,
-            config=self.config,
-            layer_number=layer_number,
+            submodules.cross_attention, config=self.config, layer_number=layer_number,
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(
-            submodules.cross_attn_bda,
-            config=self.config,
-        )
+        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config,)
 
         ## [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(
@@ -194,8 +189,7 @@ class TransformerLayer(MegatronModule):
             inference_params=inference_params,
         )
 
-        if isinstance(attention_output_with_bias, dict) \
-           and "context" in attention_output_with_bias:
+        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
             context = attention_output_with_bias["context"]
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
