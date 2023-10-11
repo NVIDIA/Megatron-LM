@@ -23,8 +23,10 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
-def get_attr_wrapped_model(model, attr, allow_none=True):
-    """Get an attribute from a wrapped model"""
+def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
+    """Get an attribute from a wrapped model.
+    If return_model_obj is true, return the object that has the 'attr' attribute;
+    otherwise, return the attribute directly."""
     if isinstance(model, list):
         raise RuntimeError("_get_attr_wrapped_model given a list of models")
 
@@ -43,6 +45,9 @@ def get_attr_wrapped_model(model, attr, allow_none=True):
             raise RuntimeError(f"_get_attr_wrapped_model couldn't find attribute {attr}")
 
         model = model.module
+
+    if return_model_obj:
+        return model
     return getattr(model, attr)
 
 

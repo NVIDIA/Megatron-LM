@@ -108,7 +108,6 @@ class TELinear(te.pytorch.Linear):
             bias=bias,
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs,
         )
 
     def forward(self, x):
@@ -165,7 +164,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs,
         )
 
     def forward(self, x):
@@ -271,7 +269,6 @@ class TELayerNormMLP(te.pytorch.LayerNormMLP):
             init_method=self.config.init_method,
             params_dtype=self.config.params_dtype,
             return_bias=not self.config.add_bias_linear,
-            **kwargs,
         )
 
     def forward(self, x):

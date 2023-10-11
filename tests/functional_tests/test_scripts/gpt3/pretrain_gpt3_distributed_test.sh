@@ -28,14 +28,14 @@ command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
 TRANSFORMER_IMPL=local
 TRAINING_DTYPE=fp16
-CALLING_SCRIPT=pretrain_gpt.py
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       CALLING_SCRIPT=pretrain_gpt_core.py
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       USE_MCORE=1
+       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
@@ -50,7 +50,7 @@ set +x
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
-       $CALLING_SCRIPT \
+       pretrain_gpt.py \
        --num-layers 12 \
        --hidden-size 512 \
        --num-attention-heads 8 \
@@ -88,6 +88,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
+       ${USE_MCORE:+--use-mcore-models} \
        --no-gradient-accumulation-fusion \
        --${TRAINING_DTYPE}"
 

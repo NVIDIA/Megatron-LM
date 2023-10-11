@@ -54,13 +54,16 @@ def calc_params_l2_norm(model):
     params_data = []
     for model_ in model:
         for param in model_.parameters():
-            is_not_shared = param_is_not_shared(param)
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if is_not_shared and is_not_tp_duplicate:
-                if args.bf16:
-                    params_data.append(param.data.float())
-                else:
-                    params_data.append(param.data)
+            if mpu.get_expert_model_parallel_rank() > 0:
+                if not getattr(param, 'allreduce', True) and is_not_tp_duplicate:
+                    assert param_is_not_shared(param)
+                    params_data.append(param.data.float() if args.bf16 else param.data)
+            else:
+                is_not_shared = param_is_not_shared(param)
+                if is_not_shared and is_not_tp_duplicate:
+                    params_data.append(param.data.float() if args.bf16 else param.data)
+
     # Check the availability of apex
     assert multi_tensor_applier is not None and amp_C is not None, \
         "apex is not available, please install it from https://github.com/NVIDIA/apex"
@@ -74,10 +77,19 @@ def calc_params_l2_norm(model):
         False # no per-parameter norm
     )
     norm_2 = norm * norm
-    # Sum across all model-parallel GPUs.
-    torch.distributed.all_reduce(norm_2,
-                                 op=torch.distributed.ReduceOp.SUM,
-                                 group=mpu.get_model_parallel_group())
+    if mpu.get_expert_model_parallel_world_size() == 1:
+        # Sum across all model-parallel GPUs(tensor + pipeline).
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_model_parallel_group())
+    else:
+        # Sum across tensor, pipeline and expert model-parallel GPUs.
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_tensor_and_expert_parallel_group())
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_pipeline_model_parallel_group())
     return norm_2.item() ** 0.5
 
 

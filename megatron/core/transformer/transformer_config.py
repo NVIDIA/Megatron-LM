@@ -44,6 +44,9 @@ class TransformerConfig(ModelParallelConfig):
 
         activation_func (Callable): Activation function to use for the non-linearity in the MLP. Defaults to F.gelu.
 
+        num_moe_experts (int): Number of experts to use for Mixture of Experts. 
+                               When set, it replaces MLP with Switch MLP. Defaults to None (no MoE).
+
         # initialization
         init_method (Callable): Method to initialize weights. Note that bias is always set to
                                 zero. Should be a function that takes a single Tensor and
@@ -144,6 +147,7 @@ class TransformerConfig(ModelParallelConfig):
     add_bias_linear: bool = True
     gated_linear_unit: bool = False
     activation_func: Callable = F.gelu
+    num_moe_experts: int = None
 
     # initialization
     init_method: Callable = None
@@ -212,6 +216,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
+
+        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
+            raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
 
         if self.recompute_granularity is not None:
             if not self.recompute_granularity in ['full', 'selective']:
