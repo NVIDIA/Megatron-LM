@@ -30,7 +30,7 @@ from megatron import (
     get_args,
     print_rank_0
 )
-from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.indexed_dataset import MMapIndexedDataset
 
@@ -780,11 +780,11 @@ def get_samples_mapping(indexed_dataset,
     # device_index=rank which is not the case for model
     # parallel case
     counts = torch.cuda.LongTensor([1])
-    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
+    torch.distributed.all_reduce(counts, group=parallel_state.get_data_parallel_group())
+    torch.distributed.all_reduce(counts, group=parallel_state.get_pipeline_model_parallel_group())
     assert counts[0].item() == (
         torch.distributed.get_world_size() //
-        torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))
+        torch.distributed.get_world_size(group=parallel_state.get_tensor_model_parallel_group()))
 
     # Load indexed dataset.
     print_rank_0(' > loading indexed mapping from {}'.format(
