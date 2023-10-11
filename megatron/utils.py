@@ -55,7 +55,7 @@ def calc_params_l2_norm(model):
     for model_ in model:
         for param in model_.parameters():
             is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if args.expert_parallel and mpu.get_data_parallel_rank() > 0:
+            if mpu.get_expert_model_parallel_rank() > 0:
                 if not getattr(param, 'allreduce', True) and is_not_tp_duplicate:
                     assert param_is_not_shared(param)
                     params_data.append(param.data.float() if args.bf16 else param.data)
@@ -77,14 +77,19 @@ def calc_params_l2_norm(model):
         False # no per-parameter norm
     )
     norm_2 = norm * norm
-    # Sum across all model-parallel GPUs.
-    if not args.expert_parallel:
+    if mpu.get_expert_model_parallel_world_size() == 1:
+        # Sum across all model-parallel GPUs(tensor + pipeline).
         torch.distributed.all_reduce(norm_2,
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=mpu.get_model_parallel_group())
     else:
+        # Sum across tensor, pipeline and expert model-parallel GPUs.
         torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM)
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_tensor_and_expert_parallel_group())
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_pipeline_model_parallel_group())
     return norm_2.item() ** 0.5
 
 
