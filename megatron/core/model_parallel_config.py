@@ -139,6 +139,7 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
+    ub_tp_comm_overlap: bool = False
 
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None
