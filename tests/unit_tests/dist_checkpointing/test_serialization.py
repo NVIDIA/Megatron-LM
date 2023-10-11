@@ -7,6 +7,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
 from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -27,7 +28,8 @@ class TestSerialization:
             assert (ckpt_dir / 'keyA').is_dir()
             assert (ckpt_dir / 'keyB').is_dir()
             assert not (ckpt_dir / 'keyC').exists()
-            
+            assert not (ckpt_dir / 'sd_keyA').is_dir()
+
             load_ssd = {
                 'load_sd_keyA': ShardedTensor.from_rank_offsets('keyA', torch.ones(2, 4), replica_id=Utils.rank),
             }
@@ -54,6 +56,7 @@ class TestSerialization:
             assert (ckpt_dir / 'keyA').is_dir()
             assert (ckpt_dir / 'keyB').is_dir()
             assert not (ckpt_dir / 'keyC').exists()
+            assert not (ckpt_dir / 'sd_keyA').is_dir()
 
         Utils.destroy_model_parallel()
 
@@ -144,3 +147,39 @@ class TestSerialization:
             assert isinstance(ten_b, torch.Tensor)
             assert ten_b.shape == (5, 10 * 8)
             assert torch.all(ten_b == torch.arange(80).unsqueeze(0).expand(5, 80) + Utils.rank // 2 * 100)
+
+    def test_load_tensors_metadata(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(2,4)
+
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets('keyA', torch.arange(10) + Utils.rank * 10, (0, Utils.rank, Utils.world_size)),
+            'sd_keyB': ShardedTensor.from_rank_offsets('keyB', torch.ones(3, 5, 7), (2, Utils.rank, Utils.world_size)),
+        }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_tensors_metadata') as ckpt_dir:
+            save(state_dict, ckpt_dir)
+            assert (ckpt_dir / 'keyA').is_dir()
+
+            del state_dict
+            sharded_state_dict = load_tensors_metadata(ckpt_dir)
+            # loaded dict keys are ShardedTensor keys!
+            assert 'keyA' in sharded_state_dict
+            assert 'sd_keyA' not in sharded_state_dict
+
+            # Check metadata
+            assert sharded_state_dict['keyA'].global_shape == (10 * Utils.world_size,)
+            assert sharded_state_dict['keyB'].global_shape == (3, 5, 7 * Utils.world_size)
+            assert sharded_state_dict['keyA'].local_shape == sharded_state_dict['keyA'].global_shape
+            assert sharded_state_dict['keyB'].local_shape == sharded_state_dict['keyB'].global_shape
+            assert sharded_state_dict['keyA'].global_offset == (0,)
+            assert sharded_state_dict['keyB'].global_offset == (0, 0, 0)
+            assert sharded_state_dict['keyA'].axis_fragmentations == (1,)
+            assert sharded_state_dict['keyB'].axis_fragmentations == (1, 1, 1)
+            assert sharded_state_dict['keyA'].replica_id == 0
+            assert sharded_state_dict['keyB'].replica_id == 0
+
+            # metadata dict can be loaded. We don't validate access because there are multiple replica_id=0
+            state_dict = load(sharded_state_dict, ckpt_dir, validate_access_integrity=False)
+            assert torch.all(state_dict['keyA'] == torch.arange(10 * Utils.world_size))
+
+        Utils.destroy_model_parallel()
