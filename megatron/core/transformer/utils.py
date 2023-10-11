@@ -4,14 +4,13 @@
 
 import torch
 
-from megatron import get_args
-
 
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
 
 
+<<<<<<< HEAD
 def get_linear_layer(rows, columns, init_method):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
@@ -22,6 +21,8 @@ def get_linear_layer(rows, columns, init_method):
     return layer
 
 
+=======
+>>>>>>> refactor
 @torch.jit.script
 def gelu_impl(x):
     """OpenAI's gelu implementation."""

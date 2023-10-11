@@ -23,8 +23,15 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
     try:
         return default_strategies[action.value][(backend, version)]
     except KeyError as e:
+        hint = ''
+        if backend == 'zarr':
+            try:
+                import tensorstore
+                import zarr
+            except ImportError:
+                hint = ' Please install `zarr` and `tensorstore` packages'
         raise CheckpointingException(
-            f'Cannot find default strategy for: {(action, backend, version)}'
+            f'Cannot find a default strategy for: {(action.value, backend, version)}.{hint}'
         ) from e
 
 
@@ -54,6 +61,21 @@ class LoadShardedStrategy(LoadStrategyBase):
     @abstractmethod
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         raise NotImplementedError
+
+    @abstractmethod
+    def load_tensors_metadata(self, checkpoint_dir: Path):
+        """Load tensors metadata from the checkpoint.
+
+        Returns a dictionary similar to a sharded state dict, but note that
+        the dictionary keys are simply ShardedTensor keys (contrary to the
+        actual sharded state dicts where keys correspond to state dict keys).
+
+        Dict values are ShardedTensors without any sharding (so, the only useful
+        information is tensors global shape and dtype).
+        """
+        raise NotImplementedError(
+            f'{self.__class__.__name__} doesnt allow loading only sharded metadata'
+        )
 
 
 class SaveCommonStrategy(SaveStrategyBase):
