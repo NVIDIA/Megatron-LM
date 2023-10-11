@@ -225,6 +225,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     via set_tensor_parallel_group() and set_context_parallel_group().
     """
 
+    cp_stream: torch.cuda.Stream = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -233,6 +235,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         **kwargs
     ):
         self.config = config
+
+        if getattr(TEDotProductAttention, "cp_stream") is None:
+            TEDotProductAttention.cp_stream = torch.cuda.Stream()
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
@@ -245,7 +251,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             cp_group=get_context_parallel_group(check_initialized=False),
             cp_global_ranks=get_context_parallel_global_ranks(check_initialized=False),
-            cp_stream=torch.cuda.Stream(),
+            cp_stream=TEDotProductAttention.cp_stream,
             **kwargs,
         )
 
