@@ -150,7 +150,7 @@ class Float16Module(MegatronModule):
         """Retrieve state_dict from the module being wrapped.
 
         When using distributed checkpointing, keep_vars must always be set to True.
-        """ 
+        """
         return self.module.sharded_state_dict(prefix=prefix)
 
     def load_state_dict(self, state_dict, strict=True):
