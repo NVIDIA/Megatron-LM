@@ -24,6 +24,7 @@ unit_tests:
     - pip install pytest_mock
     - pip install nltk
     - pip install zarr tensorstore  # for distributed checkpointing tests
+    - pip install git+https://github.com/NVIDIA/TransformerEngine.git@2574a1ca23f6d7fe9b4748c6cc347f158d232e22 # TE DotProductAttention API working with context parallelism
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
