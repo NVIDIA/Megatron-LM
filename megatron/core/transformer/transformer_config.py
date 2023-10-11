@@ -218,7 +218,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_parallel and self.num_moe_experts is None:
+        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
 
         if self.recompute_granularity is not None:

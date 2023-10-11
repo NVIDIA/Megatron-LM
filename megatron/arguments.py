@@ -378,10 +378,10 @@ def validate_args(args, defaults={}):
         assert args.model_spec is None, "Model Spec must be None when using MoEs"
 
     # Expert parallelism check
-    if args.expert_parallel:
-        assert args.num_experts is not None, "num_experts must be non None to use expert-parallel"
-        assert args.num_experts % args.data_parallel_size == 0, \
-            "Number of experts should be a multiple of data parallel_size."
+    if args.expert_model_parallel_size  > 1:
+        assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
+        assert args.num_experts % args.expert_model_parallel_size == 0, \
+            "Number of experts should be a multiple of expert model parallel_size."
         if args.tensor_model_parallel_size > 1:
             assert args.sequence_parallel, \
                 "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
@@ -727,7 +727,6 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
-
     return parser
 
 
@@ -872,8 +871,12 @@ def _add_training_args(parser):
                        help='Disable fusing gradient accumulation to weight '
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
+    group.add_argument('--use-mcore-models', action='store_true',
+                       help='Use the implementation from megatron core',
+                       dest='use_mcore_models')                       
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
+
     return parser
 
 
@@ -1078,7 +1081,8 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-
+    group.add_argument('--expert-model-parallel-size', type=int, default=1,
+                       help='Degree of expert model parallelism.')
     return parser
 
 

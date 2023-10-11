@@ -37,7 +37,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -684,6 +684,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.delay_grad_reduce:
             config.grad_sync_func = model[0].grad_sync
         config.no_sync_func = model[0].no_sync
+    config.finalize_model_grads_func = finalize_model_grads
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
