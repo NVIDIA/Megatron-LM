@@ -43,7 +43,6 @@ python -m torch.distributed.run $DISTRIBUTED_ARGS \
      --data-path2 ${DATA_BLEND} \
      --vocab-file $VOCAB_FILE \
      --merge-file $MERGE_FILE \
-     --data-impl mmap \
      --split 100,0,0 \
      --distributed-backend nccl \
      --lr-decay-style constant \

@@ -38,7 +38,7 @@ class TENorm:
         hidden_size: int,
         eps: float = 1e-5,
         sequence_parallel: bool = False,
-        normalization="LayerNorm",
+        normalization: str = "LayerNorm",
         **kwargs
     ):
         if normalization == "LayerNorm":
@@ -108,7 +108,6 @@ class TELinear(te.pytorch.Linear):
             bias=bias,
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs,
         )
 
     def forward(self, x):
@@ -165,7 +164,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_bias=self.te_return_bias,
             **_get_extra_te_kwargs(config),
-            **kwargs,
         )
 
     def forward(self, x):
@@ -243,3 +241,42 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             **kwargs,
         )
+
+
+class TELayerNormMLP(te.pytorch.LayerNormMLP):
+    """
+    Wrapper for the Transformer-Engine's `LayerNormMLP` layer that combines
+    `LayerNorm` and the MLP (2 x feedforward layers) into a single module which
+    is performance-efficient as it removes the unnecessary FP8 -> FP32 casts.
+    """
+
+    def __init__(self, config: TransformerConfig, **kwargs):
+        self.config = config
+
+        # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version >= packaging.version.Version("0.11.0"):
+            kwargs["normalization"] = self.config.normalization
+
+        super().__init__(
+            self.config.hidden_size,
+            self.config.ffn_hidden_size,
+            self.config.layernorm_epsilon,
+            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+            tp_group=get_tensor_model_parallel_group(check_initialized=False),
+            tp_size=self.config.tensor_model_parallel_size,
+            get_rng_state_tracker=get_cuda_rng_tracker,
+            init_method=self.config.init_method,
+            params_dtype=self.config.params_dtype,
+            return_bias=not self.config.add_bias_linear,
+        )
+
+    def forward(self, x):
+        out = super().forward(x)
+
+        # TE only returns a tuple when return_bias is True, otherwise
+        # it returns a single Tensor, we always want to return two
+        # values regardless of the arguments.
+        if isinstance(out, (list, tuple)):
+            return out
+        return out, None

@@ -53,8 +53,13 @@ class Encoder(object):
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
                 exit()
-            library = "tokenizers/punkt/{}.pickle".format(self.args.lang)
-            splitter = nltk.load(library)
+            if os.environ.get("NLTK_DATA"):
+                library = os.path.join(os.environ.get("NLTK_DATA"), "tokenizers", "punkt", f"{self.args.lang}.pickle")
+                url = f"file:{library}"
+            else:
+                library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
+                url = f"nltk:{library}"
+            splitter = nltk.load(url)
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
@@ -160,9 +165,10 @@ class Partition(object):
                                                           key, level)
             output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
                                                           key, level)
-            builders[key] = indexed_dataset.make_builder(output_bin_files[key],
-                                                   impl=self.args.dataset_impl,
-                                                   vocab_size=tokenizer.vocab_size)
+            builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+                output_bin_files[key],
+                dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
+            )
 
         startup_end = time.time()
         proc_start = time.time()
@@ -211,8 +217,6 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-    group.add_argument('--dataset-impl', type=str, default='mmap',
-                       choices=['lazy', 'cached', 'mmap'])
 
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
@@ -265,7 +269,7 @@ def main():
 
     if args.split_sentences:
         if nltk_available:
-            nltk.download("punkt", quiet=True)
+            nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
         else:
             raise Exception(
                 "nltk library required for sentence splitting is not available.")
@@ -385,9 +389,11 @@ def main():
                                                       key, level)
         output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
                                                       key, level)
-        builders[key] = indexed_dataset.make_builder(output_bin_files[key],
-                                                     impl=args.dataset_impl,
-                                                     vocab_size=tokenizer.vocab_size)
+        builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+            output_bin_files[key],
+            dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
+        )
+
         for name in in_ss_out_names:
             parition_output_prefix = name['output_prefix']
             full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,

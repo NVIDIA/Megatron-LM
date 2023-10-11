@@ -1,6 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Literal, Optional
+
 import torch
+from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
@@ -11,7 +14,7 @@ from megatron.core.utils import (
 )
 
 
-class GPTEmbedding(MegatronModule):
+class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
     Arguments:
@@ -28,14 +31,14 @@ class GPTEmbedding(MegatronModule):
         config: TransformerConfig,
         vocab_size: int,
         max_sequence_length: int,
-        add_position_embedding: bool,
+        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
     ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
-        self.add_position_embedding: bool = add_position_embedding
+        self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -65,8 +68,15 @@ class GPTEmbedding(MegatronModule):
         self.position_embeddings.weight.data.fill_(0)
         self.position_embeddings.weight.shared = True
 
-    def forward(self, input_ids, position_ids):
-        # Embeddings.
+    def forward(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
+        """Forward pass of the embedding module
+        Args:
+            input_ids (Tensor): The input tokens
+            position_ids (Tensor): The position id's used to calculate position embeddings
+
+        Returns:
+            Tensor: The output embeddings
+        """
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
@@ -100,11 +110,6 @@ class GPTEmbedding(MegatronModule):
             prefix=word_embeddings_prefix, keep_vars=True
         )
 
-        position_embeddings_prefix = f'{prefix}position_embeddings.'
-        position_embeddings_state_dict = self.position_embeddings.state_dict(
-            prefix=position_embeddings_prefix, keep_vars=True
-        )
-
         sharded_word_embeddings_key = f'{word_embeddings_prefix}weight'
         sharded_word_embeddings_tensor = make_tp_sharded_tensor_for_checkpoint(
             tensor=word_embeddings_state_dict[sharded_word_embeddings_key],
@@ -113,11 +118,16 @@ class GPTEmbedding(MegatronModule):
         )
         sharded_state_dict[sharded_word_embeddings_key] = sharded_word_embeddings_tensor
 
-        sharded_position_embeddings_key = f'{position_embeddings_prefix}weight'
-        sharded_position_embeddings_tensor = make_sharded_tensor_for_checkpoint(
-            tensor=position_embeddings_state_dict[sharded_position_embeddings_key],
-            key=sharded_position_embeddings_key,
-        )
-        sharded_state_dict[sharded_position_embeddings_key] = sharded_position_embeddings_tensor
+        if self.add_position_embedding:
+            position_embeddings_prefix = f'{prefix}position_embeddings.'
+            position_embeddings_state_dict = self.position_embeddings.state_dict(
+                prefix=position_embeddings_prefix, keep_vars=True
+            )
+            sharded_position_embeddings_key = f'{position_embeddings_prefix}weight'
+            sharded_position_embeddings_tensor = make_sharded_tensor_for_checkpoint(
+                tensor=position_embeddings_state_dict[sharded_position_embeddings_key],
+                key=sharded_position_embeddings_key,
+            )
+            sharded_state_dict[sharded_position_embeddings_key] = sharded_position_embeddings_tensor
 
         return sharded_state_dict

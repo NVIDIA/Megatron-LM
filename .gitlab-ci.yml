@@ -11,7 +11,7 @@ variables: &VARS
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
-  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests 
+  TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
@@ -22,6 +22,8 @@ unit_tests:
   script:
     - pip install pytest-cov
     - pip install pytest_mock
+    - pip install nltk
+    - pip install zarr tensorstore  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -397,6 +399,75 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
+
+# Note: Core MoE models currently will run TE by default
+train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_2experts"
+    ADDITIONAL_PARAMS: "--num-experts 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_4experts2parallel"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_8experts2parallel"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+
+train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "4experts"
+    ADDITIONAL_PARAMS: "--num-experts 4"
 
 train.bert.345m_tp4_pp1_1node_50steps:
   <<: *selene-test-launcher

@@ -1,24 +1,38 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Union
 
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
+from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 from .utils import make_sharded_tensors_for_checkpoint
+
+
+@dataclass
+class SelfAttentionSubmodules:
+    linear_qkv: Union[ModuleSpec, type] = None
+    dot_product_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
+
+
+@dataclass
+class CrossAttentionSubmodules:
+    linear_q: Union[ModuleSpec, type] = None
+    linear_kv: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
 
 
 class Attention(MegatronModule, ABC):
@@ -29,7 +43,12 @@ class Attention(MegatronModule, ABC):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding,
+        self,
+        config: TransformerConfig,
+        submodules: Union[SelfAttentionSubmodules, CrossAttentionSubmodules],
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs,
     ):
         super().__init__(config=config)
 
@@ -50,14 +69,18 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = TEDotProductAttention(
-            config=self.config, layer_number=self.layer_number, attn_mask_type=self.attn_mask_type
+        self.dot_product_attention = build_module(
+            submodules.dot_product_attention,
+            config=self.config,
+            layer_number=self.layer_number,
+            attn_mask_type=self.attn_mask_type,
         )
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
-        self.linear_proj = TERowParallelLinear(
+        self.linear_proj = build_module(
+            submodules.linear_proj,
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
@@ -251,11 +274,23 @@ class SelfAttention(Attention):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+        self,
+        config: TransformerConfig,
+        submodules: SelfAttentionSubmodules,
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs,
     ):
-        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            **kwargs,
+        )
 
-        self.linear_qkv = TELayerNormColumnParallelLinear(
+        self.linear_qkv = build_module(
+            submodules.linear_qkv,
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
@@ -326,9 +361,20 @@ class CrossAttention(Attention):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+        self,
+        config: TransformerConfig,
+        submodules: CrossAttentionSubmodules,
+        layer_number: int = 1,
+        attn_mask_type=AttnMaskType.padding,
+        **kwargs,
     ):
-        super().__init__(config=config, layer_number=layer_number, attn_mask_type=attn_mask_type)
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            **kwargs,
+        )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(
@@ -336,7 +382,8 @@ class CrossAttention(Attention):
             )
         assert self.query_projection_size == self.kv_projection_size
 
-        self.linear_q = TELayerNormColumnParallelLinear(
+        self.linear_q = build_module(
+            submodules.linear_q,
             self.config.hidden_size,
             self.query_projection_size,
             config=self.config,
@@ -345,7 +392,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
         )
 
-        self.linear_kv = TELayerNormColumnParallelLinear(
+        self.linear_kv = build_module(
+            submodules.linear_kv,
             self.config.hidden_size,
             2 * self.kv_projection_size,
             config=self.config,
