@@ -1,9 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 from typing import Literal, Optional
 from megatron.core.models.bert.bert_lm_head import BertLMHead
-from megatron.core.models.common.embeddings.base_lm_embedding import BaseLanguageModelEmbedding
-from megatron.core.models.common.embeddings.language_model.base_language_model import (
-    BaseLanguageModel,
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_module.language_module import (
+    LanguageModule,
 )
 from megatron.core.transformer.utils import get_linear_layer
 from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
@@ -19,7 +19,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class BertModel(BaseLanguageModel):
+class BertModel(LanguageModule):
     """Transformer language model.
 
     Arguments:
@@ -83,7 +83,7 @@ class BertModel(BaseLanguageModel):
 
         # Embeddings.
         if self.pre_process:
-            self.embedding = BaseLanguageModelEmbedding(
+            self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,

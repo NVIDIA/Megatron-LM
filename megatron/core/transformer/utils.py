@@ -10,19 +10,6 @@ def attention_mask_func(attention_scores, attention_mask):
     return attention_scores
 
 
-<<<<<<< HEAD
-def get_linear_layer(rows, columns, init_method):
-    """Simple linear layer with weight initialization."""
-    layer = torch.nn.Linear(rows, columns)
-    if init_method is not None:
-        init_method(layer.weight)
-    with torch.no_grad():
-        layer.bias.zero_()
-    return layer
-
-
-=======
->>>>>>> refactor
 @torch.jit.script
 def gelu_impl(x):
     """OpenAI's gelu implementation."""
