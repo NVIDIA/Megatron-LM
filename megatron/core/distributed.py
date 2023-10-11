@@ -7,9 +7,22 @@ from typing import Dict, List
 
 import torch
 
-from megatron.core import mpu
+from . import parallel_state
+from .transformer.module import MegatronModule
+from .transformer.transformer_config import TransformerConfig
 
-from .module import MegatronModule
+
+def shard_buffer(buffer):
+    """
+    Shard buffer into dp_size chunks of equal size.
+    """
+    data_parallel_world_size = parallel_state.get_data_parallel_world_size()
+    assert buffer.numel() % data_parallel_world_size == 0
+    shard_size = buffer.numel() // data_parallel_world_size
+    sharded_buffer = [
+        buffer[(r * shard_size) : ((r + 1) * shard_size)] for r in range(data_parallel_world_size)
+    ]
+    return sharded_buffer
 
 
 class MemoryBuffer:
@@ -86,9 +99,6 @@ class Bucket:
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            # TODO: Move this import to top of file.
-            # Import is here for now because of circular import errors.
-            from megatron.optimizer.utils import shard_buffer
             local_data_view = shard_buffer(self.data)[self.data_parallel_rank]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
@@ -141,7 +151,7 @@ class GradBuffer(MemoryBuffer):
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
     ):
-        super(GradBuffer, self).__init__(numel, numel_padded, dtype)
+        super().__init__(numel, numel_padded, dtype)
 
         self.buckets = []
         self.param_to_bucket = {}
@@ -261,8 +271,8 @@ class GradBuffer(MemoryBuffer):
 class DistributedDataParallelBase(MegatronModule, ABC):
     """Abstract class for DDP."""
 
-    def __init__(self, module):
-        super(DistributedDataParallelBase, self).__init__()
+    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+        super().__init__(config=config)
         # Keep a pointer to the model.
         self.module = module
 
@@ -310,6 +320,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
 
     def __init__(
         self,
+        config: TransformerConfig,
         module: torch.nn.Module,
         data_parallel_group: torch.distributed.ProcessGroup,
         accumulate_allreduce_grads_in_fp32: bool,
@@ -317,7 +328,7 @@ class DistributedDataParallel(DistributedDataParallelBase):
         use_distributed_optimizer: bool,
         bucket_size: int = 40000000,
     ):
-        super(DistributedDataParallel, self).__init__(module)
+        super().__init__(config=config, module=module)
 
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         self.overlap_grad_reduce = overlap_grad_reduce
@@ -395,11 +406,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
         for param in self.module.parameters():
             if param.requires_grad and not getattr(param, 'allreduce', True):
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
-                param.main_grad = \
-                    torch.zeros(param.data.shape,
-                                dtype=dtype,
-                                device=torch.cuda.current_device(),
-                                requires_grad=False)
+                param.main_grad = torch.zeros(
+                    param.data.shape,
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
                 self.expert_grads.append(param.main_grad)
 
         # Register backward hook.
@@ -466,8 +478,8 @@ class DistributedDataParallel(DistributedDataParallelBase):
         for param in self.module.parameters():
             torch.distributed.broadcast(
                 param.data,
-                src=mpu.get_data_parallel_src_rank(),
-                group=mpu.get_data_parallel_group(),
+                src=parallel_state.get_data_parallel_src_rank(),
+                group=parallel_state.get_data_parallel_group(),
             )
 
     def sync_gradients(self):

@@ -105,8 +105,8 @@ class ModelParallelConfig:
         to the next pipeline stage.  Helps with saving memory, does nothing when pipeline parallel is not used.
 
     no_sync_func (optional): Function that creates a context that suppresses asynchronous data-parallel
-        communication. If the model is an instance of torch.nn.DistributedDataParallel, the default is to use
-        torch.nn.DistributedDataParallel.no_sync.
+        communication. If the model is an instance of core.distributed.DistributedDataParallel, the default is to use
+        core.distributed.DistributedDataParallel.no_sync.
 
     grad_sync_func (optional): Function that launches asynchronous gradient reductions (e.g. distributed optimizer
         gradient reduce-scatters). The function should take one argument: an iterable of parameters whose gradients are
