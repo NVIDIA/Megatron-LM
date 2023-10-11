@@ -2,7 +2,7 @@
 
 """Utilities for transformer layers."""
 from operator import itemgetter
-from typing import Dict, Tuple, Iterable
+from typing import Dict, Iterable, Tuple
 
 import torch
 
