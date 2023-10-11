@@ -51,7 +51,7 @@ GLOBAL_BATCH_SIZE=256
     # --lr-warmup-samples 162761 \
 NUM_LAYERS=12 # 4, [*12]
 HIDDEN_SIZE=768 # 256, [512], *768
-NUM_HEADS=12 # [4], 8, *12
+NUM_HEADS=16 # 12 # [4], 8, *12
 MICRO_BATCH_SIZE=4 # [4], *8
 LOG_INTERVAL=1 # 20
 # SAVE_INTERVAL=2000 EXIT_INTERVAL=1000
@@ -64,11 +64,13 @@ EXIT_INTERVAL=10
 #     --save ${CHECKPOINT_DIR} \
 #     --load ${CHECKPOINT_DIR} \
 #     \
+
+TP=8
 ARGS=" \
     --exit-interval ${EXIT_INTERVAL} \
     \
     ${TOKENIZER_ARGS} \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size ${TP} \
     --pipeline-model-parallel-size 1 \
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
@@ -99,6 +101,56 @@ ARGS=" \
     --dataloader-type cyclic \
     --no-data-sharding \
 "
+
+# --split-constraint 99,1,0 \
+# --split-constraint 98,2,0 \
+# TP=8
+# ARGS=" \
+#     --exit-interval 10 \
+#     \
+#     --recompute-activations \
+#     --use-flash-attn \
+#     --apply-layernorm-1p \
+#     --untie-embeddings-and-output-weights \
+#     --disable-bias-linear \
+#     --no-position-embedding \
+#     --use-rotary-position-embeddings \
+#     --rotary-percent 0.5 \
+#     --swiglu \
+#     --attention-dropout 0.0 \
+#     --hidden-dropout 0.0 \
+#     --exit-duration-in-mins 220 \
+#     --tensor-model-parallel-size ${TP} \
+#     --pipeline-model-parallel-size 1 \
+#     --num-layers 24 \
+#     --hidden-size 1024 \
+#     --num-attention-heads 16 \
+#     --seq-length 2048 \
+#     --max-position-embeddings 2048 \
+#     --micro-batch-size ${MICRO_BATCH_SIZE} \
+#     --global-batch-size ${GLOBAL_BATCH_SIZE} \
+#     --train-samples 100000 \
+#     --lr-decay-samples 99000 \
+#     --lr-warmup-samples 1000 \
+#     --lr 2.5e-5 \
+#     --min-lr 2.5e-6 \
+#     --lr-decay-style cosine \
+#     --log-interval 1 \
+#     --eval-iters 100 \
+#     --eval-interval 2000 \
+#     --tokenizer-type GPTSentencePieceTokenizer \
+#     --tokenizer-model /lustre/fsw/portfolios/adlr/projects/adlr_nlp_arch/adlr_nlp_sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
+#     --data-path ${DATA_PATH} \
+#     --split 98,2,0 \
+#     --clip-grad 1.0 \
+#     --weight-decay 0.1 \
+#     --adam-beta1 0.9 \
+#     --adam-beta2 0.95 \
+#     --init-method-std 0.007 \
+#     --log-params-norm \
+#     --log-num-zeros-in-grad \
+#     --bf16 \
+# "
 
 if [ "$ADD_RETRIEVER" = "0" ]; then
     if [ "$USE_CORE" = "0" ]; then

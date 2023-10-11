@@ -8,7 +8,7 @@ pip install pytest-cov
 pip install pytest_mock
 pip install nltk
 
-SUBDIR=""
+# SUBDIR=""
 # SUBDIR=data
 # SUBDIR=models
 # SUBDIR=pipeline_parallel
@@ -23,6 +23,7 @@ SUBDIR=""
 # SUBDIR=transformer/test_core_attention.py
 # SUBDIR=transformer/test_mlp.py
 # SUBDIR=transformer/test_module.py
+SUBDIR=transformer/test_retro_attention.py
 # SUBDIR=transformer/test_spec_customization.py # *
 # SUBDIR=transformer/test_switch_mlp.py
 # SUBDIR=transformer/test_transformer_block.py
