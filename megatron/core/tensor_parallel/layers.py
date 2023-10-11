@@ -588,6 +588,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.output_size_per_partition = divide(output_size, world_size)
         self.skip_bias_add = skip_bias_add
         self.is_expert = is_expert
+        self.expert_parallel = config.expert_model_parallel_size > 1
         self.config = config
 
         # Parameters.
@@ -627,10 +628,10 @@ class ColumnParallelLinear(torch.nn.Module):
                         init_method,
                         partition_dim=0,
                         stride=stride,
-                        expert_parallel=(self.is_expert and config.expert_parallel),
+                        expert_parallel=(self.is_expert and self.expert_parallel),
                     )
 
-            setattr(self.weight, 'allreduce', not (self.is_expert and config.expert_parallel))
+            setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
         else:
             self.weight = None
 
@@ -652,7 +653,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and config.expert_parallel))
+            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
         else:
             self.register_parameter('bias', None)
 
@@ -688,7 +689,7 @@ class ColumnParallelLinear(torch.nn.Module):
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
         self.explicit_expert_comm = self.is_expert and (
-            self.sequence_parallel or config.expert_parallel
+            self.sequence_parallel or self.expert_parallel
         )
 
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None):
@@ -819,6 +820,7 @@ class RowParallelLinear(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         self.config = config
         self.is_expert = is_expert
+        self.expert_parallel = config.expert_model_parallel_size > 1
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and not self.input_is_parallel:
@@ -861,9 +863,9 @@ class RowParallelLinear(torch.nn.Module):
                     init_method,
                     partition_dim=1,
                     stride=stride,
-                    expert_parallel=(self.is_expert and config.expert_parallel),
+                    expert_parallel=(self.is_expert and self.expert_parallel),
                 )
-        setattr(self.weight, 'allreduce', not (self.is_expert and config.expert_parallel))
+        setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
 
         if bias:
             if config.use_cpu_initialization:
@@ -881,14 +883,14 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and config.expert_parallel))
+            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
             setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
         else:
             self.register_parameter('bias', None)
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
         self.explicit_expert_comm = self.is_expert and (
-            self.sequence_parallel or config.expert_parallel
+            self.sequence_parallel or self.expert_parallel
         )
 
     def forward(self, input_):

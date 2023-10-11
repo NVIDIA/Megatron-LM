@@ -28,7 +28,7 @@ class ModelParallelConfig:
         parallelizing layer norms and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer
         Models: https://arxiv.org/abs/2205.05198 for more details. Defaults to False.
 
-    expert_parallel (bool): Distributes Moe Experts across data parallel dimension. Defaults to False.
+    expert_model_parallel_size (int): Distributes Moe Experts across sub data parallel dimension. Defaults to False.
 
     Initialization
     --------------
@@ -62,6 +62,12 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
 
+    Parallelism
+    -----------
+
+    finalize_model_grads_func (optional): Function that finalizes gradients on all workers. Could include ensuring that
+        grads are all-reduced across data parallelism, pipeline parallelism, and sequence parallelism dimensions.
+
     Pipeline Parallelism
     --------------------
 
@@ -92,7 +98,7 @@ class ModelParallelConfig:
     batch_p2p_sync (bool, default=True): When using batch_isend_irecv, do a cuda.device.synchronize afterward to work
         around a bug in older version of PyTorch.
 
-    use_ring_exchange_p2p (bool, default = False): Use custom ring_exchange kernel instead of
+    use_ring_exchange_p2p (bool, default=False): Use custom ring_exchange kernel instead of
         torch.distributed.batch_isend_irecv(). Requires custom built torch with torch.distributed.ring_exchange.
 
     deallocate_pipeline_outputs (optional, default=False): If True, output data is deallocated after the tensor is sent
@@ -110,6 +116,13 @@ class ModelParallelConfig:
         optimizer parameter all-gathers). The function should take one argument: an iterable of parameters to be
         synchronized.
 
+    pipeline_model_parallel_split_rank (int, default=None): If int, rank where encoder and decoder should be split in
+        cases where the model has both an encoder and decoder (e.g., T5). Ignored if None.
+
+    barrier_with_L1_time (bool, default=True): If true, use barrier with level 1 time measurements. It is up to the user
+        to make sure calling barrier with their timers will not result in hangs. This can happen if for example the user
+        adds a level 1 timer that is not called by all ranks.
+
     """
 
     # Model parallelism
@@ -117,7 +130,7 @@ class ModelParallelConfig:
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     sequence_parallel: bool = False
-    expert_parallel: bool = False
+    expert_model_parallel_size: int = 1
 
     # Initialization
     perform_initialization: bool = True
@@ -132,6 +145,9 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
+
+    # Parallelism
+    finalize_model_grads_func: Callable = None
 
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None
@@ -148,6 +164,10 @@ class ModelParallelConfig:
     no_sync_func: Callable = None
     grad_sync_func: Callable = None
     param_sync_func: Callable = None
+    pipeline_model_parallel_split_rank: Optional[int] = None
+
+    # Timing
+    barrier_with_L1_time: bool = True
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
@@ -169,7 +189,7 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        if self.expert_parallel and self.tensor_model_parallel_size > 1:
+        if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
                 raise ValueError(
                     "When using expert parallelism and tensor parallelism, sequence parallelism must be used"

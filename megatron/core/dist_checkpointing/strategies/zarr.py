@@ -3,8 +3,9 @@
 """ Strategies using Zarr as an underlying format. """
 import os
 from functools import partial
+from logging import getLogger
 from pathlib import Path
-from typing import List
+from typing import Callable, List, Tuple
 
 import numpy as np
 import torch
@@ -16,17 +17,17 @@ from ..mapping import ShardedStateDict, ShardedTensor, is_main_replica
 from .base import LoadShardedStrategy, SaveShardedStrategy, StrategyAction, default_strategies
 
 numpy_to_torch_dtype_dict = {
-    np.bool_: torch.bool,
-    np.uint8: torch.uint8,
-    np.int8: torch.int8,
-    np.int16: torch.int16,
-    np.int32: torch.int32,
-    np.int64: torch.int64,
-    np.float16: torch.float16,
-    np.float32: torch.float32,
-    np.float64: torch.float64,
-    np.complex64: torch.complex64,
-    np.complex128: torch.complex128,
+    np.dtype('bool'): torch.bool,
+    np.dtype('uint8'): torch.uint8,
+    np.dtype('int8'): torch.int8,
+    np.dtype('int16'): torch.int16,
+    np.dtype('int32'): torch.int32,
+    np.dtype('int64'): torch.int64,
+    np.dtype('float16'): torch.float16,
+    np.dtype('float32'): torch.float32,
+    np.dtype('float64'): torch.float64,
+    np.dtype('complex64'): torch.complex64,
+    np.dtype('complex128'): torch.complex128,
 }
 
 torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
@@ -42,6 +43,8 @@ except ImportError:
     HAS_BFLOAT16 = False
 
 _import_trigger = None
+
+logger = getLogger(__name__)
 
 
 class ZarrSaveShardedStrategy(SaveShardedStrategy):
@@ -133,6 +136,13 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
         )
         return sharded_state_dict
 
+    def load_tensors_metadata(self, checkpoint_dir: Path):
+        def get_zarr_shape_dtype(path):
+            arr = zarr.open(path, 'r')
+            return arr.shape, arr.dtype
+
+        return load_zarr_based_sharded_metadata(checkpoint_dir, get_zarr_shape_dtype)
+
     def check_backend_compatibility(self, loaded_version):
         pass  # TODO
 
@@ -222,6 +232,35 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
             .bfloat16()
         )
     return torch.nn.functional.pad(x.unsqueeze(0), pad_args, mode='replicate').squeeze(0)
+
+
+def load_zarr_based_sharded_metadata(
+    checkpoint_dir: Path, get_shape_dtype_fn: Callable[[str], Tuple[Tuple[int], np.dtype]]
+) -> ShardedStateDict:
+    """Load metadata of Zarr arrays.
+
+    Arguments:
+        checkpoint_dir (str): checkpoint root directory
+        get_shape_dtype_fn (str -> ((int, ...), np.dtype)): a function returning
+            an array shape and dtype for a given Zarr array path
+    """
+    sharded_state_dict = {}
+    for subdir in checkpoint_dir.iterdir():
+        if not subdir.is_dir() or not (subdir / '.zarray').exists():
+            continue
+        key = subdir.name
+        arr_shape, arr_dtype = get_shape_dtype_fn(str(subdir))
+
+        sharded_state_dict[key] = ShardedTensor(
+            key,
+            None,
+            numpy_to_torch_dtype_dict[arr_dtype],
+            arr_shape,
+            arr_shape,
+            tuple(0 for _ in arr_shape),
+            tuple(1 for _ in arr_shape),
+        )
+    return sharded_state_dict
 
 
 # default_strategies[StrategyAction.LOAD_SHARDED.value][('zarr', 1)] = ZarrLoadShardedStrategy()

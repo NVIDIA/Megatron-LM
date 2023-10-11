@@ -17,8 +17,8 @@ import torch
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor, StateDict
 from .base import LoadShardedStrategy
-from .tensorstore import _load_from_array
-from .zarr import flatten_range
+from .tensorstore import TensorStoreLoadShardedStrategy, _load_from_array, open_ts_array
+from .zarr import flatten_range, load_zarr_based_sharded_metadata
 
 _import_trigger = None
 
@@ -247,3 +247,10 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             return sharded_tensor.data
 
         dict_list_map_inplace(_fill_in_data, sharded_state_dict)
+
+    def load_tensors_metadata(self, checkpoint_dir: Path):
+        def get_ts_shape_dtype(path):
+            arr = open_ts_array(path)
+            return arr.shape, arr.dtype.numpy_dtype
+
+        return load_zarr_based_sharded_metadata(checkpoint_dir, get_ts_shape_dtype)

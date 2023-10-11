@@ -47,16 +47,19 @@ def load(
     checkpoint_dir: str,
     sharded_strategy: Union[LoadShardedStrategy, None] = None,
     common_strategy: Union[LoadCommonStrategy, None] = None,
+    validate_access_integrity: bool = True,
 ) -> StateDict:
     """Loading entrypoint.
 
     Arguments:
-        sharded_state_dict: state dict of the existing model populated with
-            ShardedTensors. Used as a mapping to determine which parts of
-            global tensors stored in the checkpoint should be loaded.
-        checkpoint_dir: directory with the checkpoint
-        sharded_strategy: configures loading behavior for sharded tensors
-        common_strategy: configures loading behavior for common data
+        sharded_state_dict (ShardedStateDict): state dict of the existing model
+            populated with ShardedTensors. Used as a mapping to determine which
+            parts of global tensors stored in the checkpoint should be loaded.
+        checkpoint_dir (str): directory with the checkpoint
+        sharded_strategy (LoadShardedStrategy, optional): configures loading behavior for sharded tensors
+        common_strategy (LoadCommonStrategy, optional): configures loading behavior for common data
+        validate_access_integrity (bool default = True): checks if each tensor shard is accessed
+            exactly once (as main replica) by some process
     """
     if common_strategy is not None:
         raise NotImplementedError('The only supported common strategy is torch')
@@ -78,7 +81,8 @@ def load(
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
     merge(common_state_dict, nonpersistent_state_dict)
 
-    validate_sharding_integrity(nested_values(sharded_state_dict))
+    if validate_access_integrity:
+        validate_sharding_integrity(nested_values(sharded_state_dict))
 
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(
@@ -114,11 +118,53 @@ def load_sharded_objects(sharded_state_dict: ShardedStateDict, checkpoint_dir: P
     return dict_list_map_inplace(load_sharded_object, sharded_objects), sharded_state_dict
 
 
+def load_tensors_metadata(
+    checkpoint_dir: str, sharded_strategy: Union[LoadShardedStrategy, None] = None
+) -> ShardedStateDict:
+    """Load tensors metadata from the checkpoint.
+
+    Returns a dictionary similar to a sharded state dict, but note that
+    the dictionary keys are simply ShardedTensor keys (contrary to the
+    actual sharded state dicts where keys correspond to state dict keys).
+
+    Dict values are ShardedTensors without any sharding (so, the only useful
+    information is tensors global shape and dtype).
+
+    Concrete implementation depends on the loading strategy. If no strategy is
+    given, a default for a given backend is used.
+    """
+    saved_config = maybe_load_config(checkpoint_dir)
+    if saved_config is None:
+        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
+
+    if sharded_strategy is None:
+        sharded_strategy = get_default_strategy(
+            StrategyAction.LOAD_SHARDED,
+            saved_config.sharded_backend,
+            saved_config.sharded_backend_version,
+        )
+    else:
+        # TODO: implement consistency checks here
+        pass
+    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+
+
+def load_plain_tensors(checkpoint_dir: str):
+    """Load checkpoint tensors without any sharding.
+
+    NOTE: common state dict is NOT included."""
+    sharded_state_dict = load_tensors_metadata(checkpoint_dir)
+    # Don't validate integrity because shards will be overlapped
+    # if world_size > 1 (all processes load whole tensors)
+    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+
+
 def save(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
     sharded_strategy: Union[SaveShardedStrategy, None] = None,
     common_strategy: Union[SaveCommonStrategy, None] = None,
+    validate_access_integrity: bool = True,
 ):
     """Saving entrypoint.
 
@@ -128,12 +174,14 @@ def save(
     config.
 
     Arguments:
-        sharded_state_dict: state dict of the populated with
+        sharded_state_dict (ShardedStateDict): state dict of the populated with
             ShardedTensors. Used as a mapping to determine how local tensors
             should be saved as global tensors in the checkpoint.
-        checkpoint_dir: directory to save the checkpoint to
-        sharded_strategy: configures sharded tensors saving behavior and backend
-        common_strategy: configures common data saving behavior and backend
+        checkpoint_dir (str): directory to save the checkpoint to
+        sharded_strategy (SaveShardedStrategy, optional): configures sharded tensors saving behavior and backend
+        common_strategy (SaveCommonStrategy, optional): configures common data saving behavior and backend
+        validate_access_integrity (bool default = True): checks if each tensor shard is accessed
+            exactly once (as main replica) by some process
     """
     checkpoint_dir = Path(checkpoint_dir)
 
@@ -157,7 +205,8 @@ def save(
     sharded_state_dict, state_dict = extract_sharded_tensors_or_nonpersistent(sharded_state_dict)
     sharded_state_dict, _ = extract_sharded_tensors(sharded_state_dict)
     sharded_tensors = list(nested_values(sharded_state_dict))
-    validate_sharding_integrity(sharded_tensors)
+    if validate_access_integrity:
+        validate_sharding_integrity(sharded_tensors)
 
     _save_common_dict(state_dict, checkpoint_dir, True)
 
