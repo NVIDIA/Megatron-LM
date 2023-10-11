@@ -12,11 +12,19 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, seq_len_interpolation_factor=None):
         super().__init__()
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        self.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device()) / dim))
-        
+        self.inv_freq = 1.0 / (
+            10000
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
+                / dim
+            )
+        )
 
     def forward(self, max_seq_len, offset=0):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype) + offset
+        seq = (
+            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            + offset
+        )
 
         if self.seq_len_interpolation_factor is not None:
             seq *= 1 / self.seq_len_interpolation_factor
