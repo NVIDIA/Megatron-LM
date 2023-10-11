@@ -22,10 +22,13 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
     if bias is not None:
         x = x + bias
-    out = torch.nn.functional.dropout(x, p=prob, training=training)
-    out = residual + out
-    return out
-
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
+        out = residual + out
+        return out
+    else:
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
+        out = residual + out
+        return out
 
 def bias_dropout_add_unfused(training):
     def _bias_dropout_add(x_with_bias, residual, prob):
