@@ -45,10 +45,6 @@ class GPTModel(MegatronModule):
 
         seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
-
-        enforce_fp32_pos_idx (bool): If True, enforce position indices to be fp32. Defaults to False.
-            Ignored unless position_embedding_type is 'rope'.
-
     """
 
     def __init__(
@@ -65,7 +61,6 @@ class GPTModel(MegatronModule):
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         seq_len_interpolation_factor: Optional[float] = None,
-        enforce_fp32_pos_idx: bool = False,
     ):
         super(GPTModel, self).__init__(config=config)
 
@@ -99,7 +94,7 @@ class GPTModel(MegatronModule):
             if rotary_percent < 1.0:
                 rotary_dim = int(rotary_dim * rotary_percent)
 
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor, enforce_fp32_pos_idx)
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
         else:
             self.rotary_pos_emb = None
 

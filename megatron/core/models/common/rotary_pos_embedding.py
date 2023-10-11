@@ -9,13 +9,10 @@ __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, seq_len_interpolation_factor=None, enforce_fp32_pos_idx: bool = False):
+    def __init__(self, dim, seq_len_interpolation_factor=None):
         super().__init__()
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        self.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-
-        if torch.cuda.is_available():
-            self.inv_freq = self.inv_freq.to(torch.cuda.current_device())
+        self.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device()) / dim))
         
 
     def forward(self, max_seq_len, offset=0):
@@ -29,8 +26,6 @@ class RotaryEmbedding(nn.Module):
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
-
-        assert freqs.dtype == torch.float32 and self.inv_freq.dtype == torch.float32
         return emb[:, None, None, :]
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
