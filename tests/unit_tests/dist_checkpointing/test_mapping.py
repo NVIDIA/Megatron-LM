@@ -7,7 +7,6 @@ import torch
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import is_main_replica
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from tests.unit_tests.test_utilities import Utils
 
 class TestShardedTensor:
