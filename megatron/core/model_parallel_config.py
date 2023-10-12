@@ -62,6 +62,10 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
 
+    ub_tp_comm_overlap (bool, default=False): If true, allows overlapping of Linear layer execution with tensor parallel
+        communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever possible
+        during the forward and the backward pass.  Defaults to False.
+
     Parallelism
     -----------
 
