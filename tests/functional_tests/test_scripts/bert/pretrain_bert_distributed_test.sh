@@ -71,9 +71,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
-<<<<<<< HEAD
        --${TRAINING_DTYPE}
-=======
        --fp16 "
 
 command="$command $torch_run_cmd"
@@ -83,4 +81,3 @@ echo "--------------------------------------------------------------------------
 
 echo "$command" > $SCRIPTS_DIR/pretrain_bert_distributed_command.sh
 eval $command
->>>>>>> main
