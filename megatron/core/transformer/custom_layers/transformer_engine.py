@@ -6,7 +6,11 @@ import os
 import transformer_engine as te
 from pkg_resources import packaging
 
-from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.parallel_state import (
+    get_context_parallel_global_ranks,
+    get_context_parallel_group,
+    get_tensor_model_parallel_group,
+)
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -222,10 +226,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     Wrapper for the Transformer-Engine's `DotProductAttention` layer that also
     has "flash attention" enabled.
 
-    Note that if Megatron's parallel_state has not been initialized
-    yet, the tp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group().
+    Note that if Megatron's parallel_state has not been initialized yet, the
+    tp_group and cp_group passed to TE will be None and must be set later
+    via set_tensor_parallel_group() and set_context_parallel_group().
     """
+
+    cp_stream: torch.cuda.Stream = None
 
     def __init__(
         self,
@@ -235,6 +241,20 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         **kwargs
     ):
         self.config = config
+
+        # Only Transformer-Engine version > 0.13.0 supports context parallelism
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version > packaging.version.Version("0.13.0"):
+            if getattr(TEDotProductAttention, "cp_stream") is None:
+                TEDotProductAttention.cp_stream = torch.cuda.Stream()
+            kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
+            kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(check_initialized=False)
+            kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+        else:
+            assert (
+                self.config.context_parallel_size == 1
+            ), "Only Transformer-Engine version > 0.13.0 supports context parallelism"
+
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,

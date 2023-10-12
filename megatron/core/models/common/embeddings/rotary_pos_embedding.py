@@ -11,7 +11,21 @@ if TYPE_CHECKING:
 import torch
 from torch import Tensor, einsum, nn
 
+from megatron.core import parallel_state
+
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
+
+def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+    pos_emb = pos_emb.view(
+        *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
+    )
+    pos_emb = pos_emb.index_select(seq_dim, cp_idx)
+    pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+    return pos_emb
 
 
 class RotaryEmbedding(nn.Module):
@@ -55,7 +69,11 @@ class RotaryEmbedding(nn.Module):
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
-        return emb[:, None, None, :]
+        emb = emb[:, None, None, :]
+        if parallel_state.get_context_parallel_world_size() > 1:
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+        return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
@@ -89,6 +107,9 @@ class RotaryEmbedding(nn.Module):
 
             if transformer_config.sequence_parallel:
                 rotary_seq_len *= transformer_config.tensor_model_parallel_size
+
+        rotary_seq_len *= transformer_config.context_parallel_size
+
         return rotary_seq_len
 
 

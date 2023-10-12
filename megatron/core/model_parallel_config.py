@@ -15,6 +15,8 @@ class ModelParallelConfig:
 
     tensor_model_parallel_size (int): Intra-layer model parallelism. Splits tensors across GPU ranks. Defaults to 1.
 
+    context_parallel_size (int): Splits network input along sequence dimension across GPU ranks. Defaults to 1.
+
     pipeline_model_parallel_size (int): Inter-layer model parallelism. Splits transformer layers across GPU
         ranks. Defaults to 1.
 
@@ -109,8 +111,8 @@ class ModelParallelConfig:
         to the next pipeline stage.  Helps with saving memory, does nothing when pipeline parallel is not used.
 
     no_sync_func (optional): Function that creates a context that suppresses asynchronous data-parallel
-        communication. If the model is an instance of torch.nn.DistributedDataParallel, the default is to use
-        torch.nn.DistributedDataParallel.no_sync.
+        communication. If the model is an instance of core.distributed.DistributedDataParallel, the default is to use
+        core.distributed.DistributedDataParallel.no_sync.
 
     grad_sync_func (optional): Function that launches asynchronous gradient reductions (e.g. distributed optimizer
         gradient reduce-scatters). The function should take one argument: an iterable of parameters whose gradients are
@@ -131,6 +133,7 @@ class ModelParallelConfig:
 
     # Model parallelism
     tensor_model_parallel_size: int = 1
+    context_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     sequence_parallel: bool = False
