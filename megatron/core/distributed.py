@@ -12,11 +12,10 @@ from .transformer.module import MegatronModule
 from .transformer.transformer_config import TransformerConfig
 
 
-def shard_buffer(buffer):
+def shard_buffer(buffer, data_parallel_world_size):
     """
     Shard buffer into dp_size chunks of equal size.
     """
-    data_parallel_world_size = parallel_state.get_data_parallel_world_size()
     assert buffer.numel() % data_parallel_world_size == 0
     shard_size = buffer.numel() // data_parallel_world_size
     sharded_buffer = [
@@ -99,7 +98,9 @@ class Bucket:
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data)[self.data_parallel_rank]
+            local_data_view = shard_buffer(self.data, data_parallel_world_size)[
+                self.data_parallel_rank
+            ]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.data,
@@ -478,8 +479,12 @@ class DistributedDataParallel(DistributedDataParallelBase):
         for param in self.module.parameters():
             torch.distributed.broadcast(
                 param.data,
-                src=parallel_state.get_data_parallel_src_rank(),
-                group=parallel_state.get_data_parallel_group(),
+                src=parallel_state.get_data_parallel_src_rank(
+                    with_context_parallel=self.config.context_parallel_size > 1
+                ),
+                group=parallel_state.get_data_parallel_group(
+                    with_context_parallel=self.config.context_parallel_size > 1
+                ),
             )
 
     def sync_gradients(self):

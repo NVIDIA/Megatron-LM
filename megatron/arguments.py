@@ -1066,6 +1066,8 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--context-parallel-size', type=int, default=1,
+                       help='Degree of context parallelism.')
     return parser
 
 
