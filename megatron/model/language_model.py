@@ -366,15 +366,12 @@ class TransformerLanguageModel(MegatronModule):
             rotary_dim = args.hidden_size // args.num_attention_heads \
                 if args.kv_channels is None else args.kv_channels
 
-            if args.rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * args.rotary_percent)
-
             # partial rotary embeddings, which is better than full rotary
             # Wang and Komatsuzaki et al
             # https://github.com/kingoflolz/mesh-transformer-jax/
             self.rotary_pos_emb = RotaryEmbedding(
                 rotary_dim,
-                rotary_percent=args.rotary_percent,
+                args.rotary_percent,
                 seq_len_interpolation_factor=args.rotary_seq_len_interpolation_factor
             )
 
