@@ -3,8 +3,8 @@
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.decoder_attention import (
@@ -14,10 +14,10 @@ from megatron.core.models.retro.decoder_attention import (
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import (
-    get_num_layers_to_build,
     ModuleSpec,
     TransformerBlock,
     TransformerBlockSubmodules,
+    get_num_layers_to_build,
 )
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (

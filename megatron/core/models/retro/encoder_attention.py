@@ -3,9 +3,10 @@
 """Retro's cross attention modules for the encoder block."""
 
 from functools import partial
+from typing import Callable, Optional, Tuple
+
 import torch
 from torch import Tensor
-from typing import Callable, Optional, Tuple
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add

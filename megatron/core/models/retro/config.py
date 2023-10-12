@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
 import types
+from dataclasses import dataclass
 
 from megatron.core.transformer import TransformerConfig
 

@@ -2,21 +2,17 @@
 
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.encoder_attention import (
-    RetroEncoderCrossAttention,
     RetroEncoderBiasDropoutAdd,
+    RetroEncoderCrossAttention,
     RetroEncoderLayerNorm,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer import (
-    ModuleSpec,
-    TransformerBlock,
-    TransformerBlockSubmodules,
-)
+from megatron.core.transformer import ModuleSpec, TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,

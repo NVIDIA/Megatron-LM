@@ -6,7 +6,7 @@ from typing import Literal, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel, InferenceParams
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding

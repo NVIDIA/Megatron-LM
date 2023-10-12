@@ -1,8 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import types
 from dataclasses import dataclass
 from typing import Callable
-import types
 
 import torch
 import torch.nn.functional as F

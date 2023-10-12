@@ -3,9 +3,10 @@
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import List, Union
+
 import torch
 from torch import Tensor
-from typing import List, Union
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm

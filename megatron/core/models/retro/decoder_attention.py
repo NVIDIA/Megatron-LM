@@ -3,16 +3,17 @@
 """Retro's cross attention modules for the decoder block."""
 
 from functools import partial
+from typing import Callable
+
 import numpy as np
 import torch
 from torch import Tensor
-from typing import Callable
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
-from megatron.core.transformer import build_module, TransformerBlockSubmodules
+from megatron.core.transformer import TransformerBlockSubmodules, build_module
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule

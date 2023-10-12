@@ -16,6 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
+
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec() -> ModuleSpec:
     return ModuleSpec(
