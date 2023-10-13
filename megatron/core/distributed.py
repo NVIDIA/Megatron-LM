@@ -98,7 +98,7 @@ class Bucket:
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data, data_parallel_world_size)[
+            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
                 self.data_parallel_rank
             ]
             self.communication_handle = torch.distributed._reduce_scatter_base(
