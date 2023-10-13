@@ -211,7 +211,7 @@ class UL2Dataset(torch.utils.data.Dataset):
         samples = get_samples(self.indexed_dataset, self.doc_idx,
                               self.sample_idx, self.shuffle_idx, idx)
         samples_dict = create_samples_dict(
-            self.max_seq_length, self.max_seq_length, self.model_type)
+            self.max_seq_length, self.max_seq_length_dec, self.model_type)
         prev_len = 0
         prev_len_dec = 0
         cls_ids = self.cls_ids
