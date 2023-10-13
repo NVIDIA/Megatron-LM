@@ -6,8 +6,9 @@ from datetime import datetime
 import math
 import logging
 import sys
-# Make default logging level INFO.
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+from .log_handler import CustomHandler
+# Make default logging level INFO, but filter out all log messages not from MCore.
+logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
