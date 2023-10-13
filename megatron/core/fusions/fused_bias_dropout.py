@@ -24,7 +24,7 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
     # The Dropout operation, Residual Addition and the tensor returning can be
     # done generically outside the if statement, but that stops fusing of Bias
     # Addition-Dropout-Residual Addition operation. So doing it together inside
-    # the conditional branch to improve performance 
+    # the conditional branch to improve performance
     if bias is not None:
         x = x + bias
         out = torch.nn.functional.dropout(x, p=prob, training=training)
@@ -34,6 +34,7 @@ def _bias_dropout_add_func(x_with_bias, residual, prob, training):
         out = torch.nn.functional.dropout(x, p=prob, training=training)
         out = residual + out
         return out
+
 
 def bias_dropout_add_unfused(training):
     def _bias_dropout_add(x_with_bias, residual, prob):
