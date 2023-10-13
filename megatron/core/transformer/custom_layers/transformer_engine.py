@@ -101,6 +101,7 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
+        te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.8.0"):
             extra_kwargs["ub_split_ag"] = self.config.ub_tp_comm_overlap and bool(
                 int(os.getenv("MCORE_UB_SPLIT_AG", "1"))
