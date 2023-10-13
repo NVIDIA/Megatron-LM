@@ -16,6 +16,7 @@ _GLOBAL_RETRO_ARGS = None
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
+_GLOBAL_WANDB_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
@@ -56,6 +57,12 @@ def get_tensorboard_writer():
     return _GLOBAL_TENSORBOARD_WRITER
 
 
+def get_wandb_writer():
+    """Return tensorboard writer. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_WANDB_WRITER
+
+
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
     to check if it is initialized."""
@@ -92,12 +99,13 @@ def set_global_variables(args, build_tokenizer=True):
     if build_tokenizer:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
+    _set_wandb_writer(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
 
     if args.exit_signal_handler:
         _set_signal_handler()
-    
+
 
 def set_args(args):
     global _GLOBAL_ARGS
@@ -151,6 +159,26 @@ def _set_tensorboard_writer(args):
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
+
+
+def _set_wandb_writer(args):
+    global _GLOBAL_WANDB_WRITER
+    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
+                                   'wandb writer')
+    if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
+        if args.wandb_exp_name == '':
+            raise ValueError("Please also specify the wandb experiment name!")
+
+        import wandb
+        # Update the wandb save_dir
+        wandb_kwargs = {
+            'dir': os.path.join(args.save, 'wandb'),
+            'name': args.wandb_exp_name,
+            'project': args.wandb_project,
+            'config': vars(args)}
+        os.makedirs(wandb_kwargs['dir'], exist_ok=True)
+        wandb.init(**wandb_kwargs)
+        _GLOBAL_WANDB_WRITER = wandb
 
 
 def _set_adlr_autoresume(args):
