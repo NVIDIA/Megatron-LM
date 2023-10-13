@@ -371,7 +371,7 @@ def validate_args(args, defaults={}):
     # don't allow it to keep things simple
     if not args.add_position_embedding and args.position_embedding_type != 'rope':
         raise RuntimeError('--no-position-embedding is deprecated, use --position-embedding-type')
-    
+
     # MoE Spec check
     if args.num_experts is not None:
         assert args.model_spec is None, "Model Spec must be None when using MoEs"
@@ -677,7 +677,12 @@ def _add_logging_args(parser):
     group.add_argument('--log-world-size-to-tensorboard',
                        action='store_true',
                        help='Enable world size logging to tensorboard.')
-
+    group.add_argument('--wandb-project', type=str, default='',
+                       help='The wandb project name. Ignore wandb by default.')
+    group.add_argument('--wandb-exp-name', type=str, default='',
+                       help='The wandb experiment name.')
+    group.add_argument('--wandb-save-dir', type=str, default='',
+                       help='Path to save the wandb results locally.')
     return parser
 
 
@@ -856,7 +861,7 @@ def _add_training_args(parser):
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
                        help='Use the implementation from megatron core',
-                       dest='use_mcore_models')                       
+                       dest='use_mcore_models')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
 
