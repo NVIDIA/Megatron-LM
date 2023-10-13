@@ -12,10 +12,14 @@ from .transformer.module import MegatronModule
 from .transformer.transformer_config import TransformerConfig
 
 
-def shard_buffer(buffer, data_parallel_world_size):
+def shard_buffer(buffer):
     """
     Shard buffer into dp_size chunks of equal size.
     """
+    context_parallel = parallel_state.get_context_parallel_world_size() > 1
+    data_parallel_world_size = parallel_state.get_data_parallel_world_size(
+        with_context_parallel=context_parallel
+    )
     assert buffer.numel() % data_parallel_world_size == 0
     shard_size = buffer.numel() // data_parallel_world_size
     sharded_buffer = [
@@ -98,9 +102,7 @@ class Bucket:
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
-                self.data_parallel_rank
-            ]
+            local_data_view = shard_buffer(self.data)[self.data_parallel_rank]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.data,
