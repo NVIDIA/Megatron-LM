@@ -4,7 +4,10 @@
 
 from datetime import datetime
 import math
+import logging
 import sys
+# Make default logging level INFO.
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()

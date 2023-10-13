@@ -3,6 +3,7 @@
 import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from logging import getLogger
 from typing import Dict, List
 
 import torch
@@ -10,6 +11,8 @@ import torch
 from . import parallel_state
 from .transformer.module import MegatronModule
 from .transformer.transformer_config import TransformerConfig
+
+logger = getLogger(__name__)
 
 
 def shard_buffer(buffer):
@@ -231,14 +234,16 @@ class GradBuffer(MemoryBuffer):
 
         # Print buckets.
         if torch.distributed.get_rank() == 0:
-            print('> buckets for gradient all-reduce / reduce-scatter:')
+            logger.info(
+                f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
+            )
             for index, bucket in enumerate(self.buckets):
-                print(f'    params for bucket {index+1}')
                 numel = 0
                 for param in bucket.params:
                     numel += param.data.nelement()
-                    print(f'      {param_to_name[param]}')
-                print(f'     total number of elements: {numel}')
+                logger.info(f'Params for bucket {index+1} ({numel} elements):')
+                for param in bucket.params:
+                    logger.info(f'    {param_to_name[param]}')
 
     def reset(self):
         """Set the data to zero and reset all buckets."""
