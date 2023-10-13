@@ -167,12 +167,16 @@ def _set_wandb_writer(args):
                                    'wandb writer')
     if getattr(args, 'wandb_project', '') and args.rank == (args.world_size - 1):
         if args.wandb_exp_name == '':
-            raise ValueError("Please also specify the wandb experiment name!")
+            raise ValueError("Please specify the wandb experiment name!")
 
         import wandb
-        # Update the wandb save_dir
+        if args.wandb_save_dir:
+            save_dir = args.wandb_save_dir
+        else:
+            # Defaults to the save dir.
+            save_dir = os.path.join(args.save, 'wandb')
         wandb_kwargs = {
-            'dir': os.path.join(args.save, 'wandb'),
+            'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
             'config': vars(args)}
