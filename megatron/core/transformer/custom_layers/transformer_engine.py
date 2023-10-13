@@ -1,8 +1,8 @@
+import os
 from importlib.metadata import version
 from typing import Callable
 
 import torch
-import os
 import transformer_engine as te
 from pkg_resources import packaging
 
@@ -99,6 +99,16 @@ class TELinear(te.pytorch.Linear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_split_ag"] = self.config.ub_tp_comm_overlap and bool(
+                int(os.getenv("MCORE_UB_SPLIT_AG", "1"))
+            )
+            extra_kwargs["ub_split_rs"] = self.config.ub_tp_comm_overlap and bool(
+                int(os.getenv("MCORE_UB_SPLIT_RS", "1"))
+            )
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -112,9 +122,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            ub_split_rs=self.config.ub_tp_comm_overlap and bool(int(os.getenv("MCORE_UB_SPLIT_RS", "1"))),
-            ub_split_ag=self.config.ub_tp_comm_overlap and bool(int(os.getenv("MCORE_UB_SPLIT_AG", "1"))),
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
 
     def forward(self, x):
@@ -152,10 +160,23 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.11.0"):
             kwargs["normalization"] = self.config.normalization
+
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_bulk_wgrad"] = self.config.ub_tp_comm_overlap and bool(
+                int(os.getenv("MCORE_UB_BULK_WGRAD", "1"))
+            )
+            extra_kwargs["ub_bulk_dgrad"] = self.config.ub_tp_comm_overlap and bool(
+                int(os.getenv("MCORE_UB_BULK_DGRAD", "1"))
+            )
+            extra_kwargs["ub_split_ag"] = self.config.ub_tp_comm_overlap and bool(
+                int(os.getenv("MCORE_UB_SPLIT_AG", "1"))
+            )
 
         super().__init__(
             in_features=input_size,
@@ -170,10 +191,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
-            ub_bulk_wgrad= self.config.ub_tp_comm_overlap and bool(int(os.getenv("MCORE_UB_BULK_WGRAD", "1"))),
-            ub_bulk_dgrad= self.config.ub_tp_comm_overlap and bool(int(os.getenv("MCORE_UB_BULK_DGRAD", "1"))),
-            ub_split_ag= self.config.ub_tp_comm_overlap and bool(int(os.getenv("MCORE_UB_SPLIT_AG", "1"))),
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
 
     def forward(self, x):
