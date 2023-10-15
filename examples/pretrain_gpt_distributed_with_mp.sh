@@ -12,10 +12,14 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=<Specify path>
-VOCAB_FILE=<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=<Specify path to file>/gpt2-merges.txt
-DATA_PATH=<Specify path and file prefix>_text_document
+# CHECKPOINT_PATH=<Specify path>
+# VOCAB_FILE=<Specify path to file>/gpt2-vocab.json
+# MERGE_FILE=<Specify path to file>/gpt2-merges.txt
+# DATA_PATH=<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=/home/tangjingqi/Megatron-LM/
+VOCAB_FILE=/home/tangjingqi/Megatron-LM/gpt2-vocab.json
+MERGE_FILE=/home/tangjingqi/Megatron-LM/gpt2-merges.txt
+DATA_PATH=/home/tangjingqi/Megatron-LM/my-100-sample_text_document
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -44,7 +48,8 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16
+    --fp16 \
+    --use-terapipe
 "
 
 DATA_ARGS="

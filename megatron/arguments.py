@@ -1042,7 +1042,10 @@ def _add_distributed_args(parser):
                        'affects the encoder embedding.)')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
-
+    
+    # add terapipe argument
+    group.add_argument('--use-terapipe', action='store_true',
+                       help='Use terapipe.')
     return parser
 
 

@@ -7,3 +7,14 @@ build
 slurm*
 logs
 .vscode
+parrot*
+sample_data.json
+tokenizer.json
+my-corpus.json
+my-100-sample_text_document.bin
+my-100-sample_text_document.idx
+.hypothesis/
+gpt2-merges.txt
+gpt2-vocab.json
+examples/*
+index-cache

@@ -106,6 +106,12 @@ def pretrain(train_valid_test_dataset_provider,
     args = get_args()
     timers = get_timers()
 
+    # # log args in Rank 0
+    # if mpu.get_data_parallel_rank() == 0:
+    #     print_rank_0('@@@debug@@@')
+    #     print_rank_0('arguments = {}'.format(args))
+    #     print_rank_0(f'terapipe:{args.use_terapipe}')
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
