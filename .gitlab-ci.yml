@@ -51,7 +51,7 @@ formatting:
   script: &selene-test-resume-launcher-script
     - echo "Running selene resume from checkpoint test. "
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -72,7 +72,7 @@ formatting:
   script: &selene-test-launcher-script
     - echo "Running selene test"
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
