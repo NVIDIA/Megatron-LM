@@ -21,9 +21,17 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
     """Retro encoder's cross attention operator.
 
     See this paper for more details: https://arxiv.org/abs/2112.04426.
-
     Neighboring chunks are retrieved from the chunk database, encoded, and
     used by the decoder layers for chunked cross attention.
+
+    Arguments:
+      config (RetroConfig): Retro config.
+
+      submodules (CrossAttentionSubmodules): Cross attention submodules.
+
+      layer_number (int): Layer number within transformer block.
+
+      attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
     """
 
     def forward(
@@ -45,6 +53,15 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             l  : Number of chunks per sample (i.e., seq_length/chunk_length).
             k  : Number of neighbors.
             r  : Number of retrieved tokens (neighbors + continuation).
+
+        Arguments:
+          hidden_states (Tensor): Transformer layer hidden states.
+
+          attention_mask (Tensor): Attention mask.
+
+          key_value_states (Tensor): Neighbor embeddings.
+
+          inference_params (InferenceParams): Inference params.
         """
 
         ns, bs, d = hidden_states.shape  # [r, bs * l * k, d]
@@ -80,6 +97,9 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
     This operator applies bias-dropout-add individually on each neighboring
     chunk that is retrieved from the chunk database.
+
+    Arguments:
+      config (RetroConfig): Retro config.
     """
 
     def __init__(
@@ -97,6 +117,19 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
         retro_num_neighbors: int,
         bias_dropout_add: Callable,
     ) -> Tensor:
+        """Per-chunk bias-dropout-add.
+
+        Arguments:
+          x_with_bias (dict): Attention output and bias tuple.
+
+          residual (Tensor): Transformer layer residual.
+
+          prob (float): Dropout probability.
+
+          retro_num_neighbors (int): Number of retrieved neighbor chunks (e.g., 2).
+
+          bias_dropout_add (Callable): Bias-dropout-add function.
+        """
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
@@ -119,6 +152,13 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
         return output
 
     def forward(self, training: bool, fused: bool) -> Tensor:
+        """Retro decoder bias-dropout-add.
+
+        Arguments:
+          training (bool): If training, then apply dropout.
+
+          fused (bool): Fuse bias-dropout-add.
+        """
         return partial(
             self._forward,
             retro_num_neighbors=self.retro_num_neighbors,
@@ -133,6 +173,9 @@ class RetroEncoderLayerNorm(MegatronModule):
     This operator applies layernorm individually on each neighboring chunk that
     is retrieved from the chunk database, and then concatenates the chunks into
     a single tensor.
+
+    Arguments:
+      config (RetroConfig): Retro config.
     """
 
     def __init__(
@@ -143,6 +186,11 @@ class RetroEncoderLayerNorm(MegatronModule):
         self.retro_num_neighbors = config.retro_num_neighbors
 
     def forward(self, input: Tensor) -> Tensor:
+        """Per-chunk layer norm.
+
+        Arguments:
+          input (Tensor): Input chunks, concatenated into a single tensor.
+        """
 
         # Split input into 'num_neighbors' tensors.
         chunk_size = input.shape[1] // self.retro_num_neighbors

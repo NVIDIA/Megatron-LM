@@ -37,6 +37,10 @@ def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> Mo
     layer instantiates an entire encoder transformer block. As such, the decoder
     cross attention module takes an optional encoder block spec, which is only
     provided for the first Retro decoder layer.
+
+    Arguments:
+      encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
+      for the first Retro decoder layer.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
@@ -62,6 +66,10 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
     layer instantiates an entire encoder transformer block. As such, the decoder
     cross attention module takes an optional encoder block spec, which is only
     provided for the first Retro decoder layer.
+
+    Arguments:
+      encoder_block_spec (ModuleSpec): Retro encoder block spec, to be provided
+      for the first Retro decoder layer.
     """
     spec = get_gpt_layer_local_spec()
     spec.submodules.pre_cross_attn_layernorm = FusedLayerNorm
@@ -80,10 +88,12 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
 
 
 def get_retro_decoder_block_spec(
-    config: RetroConfig, use_transformer_engine: bool,
+    config: RetroConfig,
+    use_transformer_engine: bool,
 ) -> TransformerBlockSubmodules:
 
-    """
+    """Retro decoder block spec.
+
     Retro decoder block implementation details:
     - The retro decoder block consists of interleaved GPT layers and customized
       Retro decoder layers.
@@ -91,6 +101,13 @@ def get_retro_decoder_block_spec(
       6 or 9 (depending on the total number of layers).
     - The first decoder layer instantiates an encoder block, and it therefore
       passes in an encoder_block_spec.
+
+
+    Arguments:
+      config (RetroConfig): Retro config.
+
+      use_transformer_engine (bool): If True, use Transformer Engine (instead
+      of local modules.
     """
 
     # Num layers.

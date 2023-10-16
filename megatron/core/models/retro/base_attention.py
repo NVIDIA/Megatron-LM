@@ -13,6 +13,15 @@ class BaseRetroCrossAttention(MegatronModule):
     This class collects the retro arguments below (i.e., num neighbors, chunk
     length, and retrieve length) for use in Retro's custom cross attention
     operators.
+
+    Arguments:
+      config (RetroConfig): Retro config.
+
+      submodules (CrossAttentionSubmodules): Cross attention submodules.
+
+      layer_number (int): Layer number within transformer block.
+
+      attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
     """
 
     def __init__(

@@ -85,11 +85,21 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     return spec
 
 
-def get_retro_encoder_block_spec(config: RetroConfig, use_transformer_engine: bool,) -> ModuleSpec:
+def get_retro_encoder_block_spec(
+    config: RetroConfig,
+    use_transformer_engine: bool,
+) -> ModuleSpec:
 
-    """
+    """Retro encoder block spec.
+
     The retro encoder block consists of one customized Retro encoder layer
     (layer 1), and all of the following layers are standard GPT layers.
+
+    Arguments:
+      config (RetroConfig): Retro config.
+
+      use_transformer_engine (bool): If True, use Transformer Engine (instead
+      of local modules.
     """
 
     # Num layers.

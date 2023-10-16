@@ -31,17 +31,23 @@ class FusedLayerNorm(torch.nn.Module):
 
     Arguments:
       hidden_size (int): Transformer hidden dimension.
+
       eps (float): Epsilon added to denominator, for numerical stability.
+
       persist_layer_norm (bool): Use persistent fused layer norm kernel.
-        This kernel supports only a set of hidden sizes. Please
-        check persist_ln_hidden_sizes if your hidden size is supported.
+      This kernel supports only a set of hidden sizes. Please
+      check persist_ln_hidden_sizes if your hidden size is supported.
+
       sequence parallel (bool): Apply sequence parallelism optimization.
+
       zero_centered_gamma (bool): Adjust LayerNorm weights such that they are
-        centered around zero. This improves numerical stability.
+      centered around zero. This improves numerical stability.
+
       config (TransformerConfig): Transformer config. Include to match custom
-        layer norm interfaces.
+      layer norm interfaces.
+
       normalization (str): Normalization type, used for Transformer Engine.
-        Must equal 'LayerNorm' here.
+      Must equal 'LayerNorm' here.
     """
 
     def __init__(
