@@ -21,7 +21,8 @@ if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
 fi
 
 # step 2 : SETTING RUN NAME
-RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
+if [[ -n $VP_SIZE ]]; then INTERLEAVED_STR="_interleaved"; else INTERLEAVED_STR=""; fi
+RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}${INTERLEAVED_STR}_${NUM_NODES}nodes_${MAX_STEPS}steps
 if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
 if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
 if [[ -n $METADATA ]]; then RUN_NAME=${RUN_NAME}_${METADATA}; fi
