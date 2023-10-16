@@ -15,6 +15,8 @@ class ModelParallelConfig:
 
     tensor_model_parallel_size (int): Intra-layer model parallelism. Splits tensors across GPU ranks. Defaults to 1.
 
+    context_parallel_size (int): Splits network input along sequence dimension across GPU ranks. Defaults to 1.
+
     pipeline_model_parallel_size (int): Inter-layer model parallelism. Splits transformer layers across GPU
         ranks. Defaults to 1.
 
@@ -28,7 +30,7 @@ class ModelParallelConfig:
         parallelizing layer norms and dropout sequentially.  See Reducing Activation Recomputation in Large Transformer
         Models: https://arxiv.org/abs/2205.05198 for more details. Defaults to False.
 
-    expert_parallel (bool): Distributes Moe Experts across data parallel dimension. Defaults to False.
+    expert_model_parallel_size (int): Distributes Moe Experts across sub data parallel dimension. Defaults to False.
 
     Initialization
     --------------
@@ -61,6 +63,12 @@ class ModelParallelConfig:
 
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
+
+    Parallelism
+    -----------
+
+    finalize_model_grads_func (optional): Function that finalizes gradients on all workers. Could include ensuring that
+        grads are all-reduced across data parallelism, pipeline parallelism, and sequence parallelism dimensions.
 
     Pipeline Parallelism
     --------------------
@@ -99,8 +107,8 @@ class ModelParallelConfig:
         to the next pipeline stage.  Helps with saving memory, does nothing when pipeline parallel is not used.
 
     no_sync_func (optional): Function that creates a context that suppresses asynchronous data-parallel
-        communication. If the model is an instance of torch.nn.DistributedDataParallel, the default is to use
-        torch.nn.DistributedDataParallel.no_sync.
+        communication. If the model is an instance of core.distributed.DistributedDataParallel, the default is to use
+        core.distributed.DistributedDataParallel.no_sync.
 
     grad_sync_func (optional): Function that launches asynchronous gradient reductions (e.g. distributed optimizer
         gradient reduce-scatters). The function should take one argument: an iterable of parameters whose gradients are
@@ -121,10 +129,11 @@ class ModelParallelConfig:
 
     # Model parallelism
     tensor_model_parallel_size: int = 1
+    context_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     sequence_parallel: bool = False
-    expert_parallel: bool = False
+    expert_model_parallel_size: int = 1
 
     # Initialization
     perform_initialization: bool = True
@@ -139,6 +148,9 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
+
+    # Parallelism
+    finalize_model_grads_func: Callable = None
 
     # Pipeline Parallel
     pipeline_dtype: torch.dtype = None
@@ -180,7 +192,7 @@ class ModelParallelConfig:
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
 
-        if self.expert_parallel and self.tensor_model_parallel_size > 1:
+        if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
                 raise ValueError(
                     "When using expert parallelism and tensor parallelism, sequence parallelism must be used"

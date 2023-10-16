@@ -6,7 +6,7 @@ import logging
 from copy import deepcopy
 from dataclasses import replace
 from itertools import chain
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +58,16 @@ def make_sharded_optimizer_tensor(
 
 
 def optim_state_to_sharding_state(
-    optim_state_dict: StateDict, id_to_sharded_param_map: Dict[int, ShardedTensor]
+    optim_state_dict: StateDict,
+    id_to_sharded_param_map: Dict[int, ShardedTensor],
+    exclude_keys: Tuple[str] = (),
 ):
     sharded_state = {}
     for param_id, param_state in optim_state_dict['state'].items():
         sharded_state[param_id] = {}
         for state_key, param in param_state.items():
+            if state_key in exclude_keys:
+                continue
             if param_id in id_to_sharded_param_map:
                 sharded_state[param_id][state_key] = make_sharded_optimizer_tensor(
                     id_to_sharded_param_map[param_id], param, prefix=f'optimizer.state.{state_key}'

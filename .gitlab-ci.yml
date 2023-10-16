@@ -199,7 +199,189 @@ resume.checkpoint.t5_core.220m_tp1_pp1_1node:
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
-resume.checkpoint.t5_core.220m_tp2_pp1_1node:
+train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+# Note: Core MoE models currently will run TE by default
+train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_2experts"
+    ADDITIONAL_PARAMS: "--num-experts 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_4experts2parallel"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
+
+train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "te_8experts2parallel"
+    ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
+
+train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: "4experts"
+    ADDITIONAL_PARAMS: "--num-experts 4"
+
+train.bert.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+resume.checkpoint.bert.345m_tp1_pp2_1node:
   <<: *selene-test-resume-checkpoint-launcher
   variables:
     <<: [*VARS]
