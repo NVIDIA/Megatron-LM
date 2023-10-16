@@ -64,7 +64,6 @@ class GPTModel(MegatronModule):
     ):
         super(GPTModel, self).__init__(config=config)
 
-        self.config: TransformerConfig = config
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -101,8 +100,7 @@ class GPTModel(MegatronModule):
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            transformer_layer_spec=self.transformer_layer_spec,
-            self_attn_mask_type=AttnMaskType.causal,
+            submodules=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )

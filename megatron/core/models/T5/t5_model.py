@@ -52,7 +52,7 @@ class T5LMHead(MegatronModule):
         # self.bias.model_parallel = True
         # self.bias.partition_dim = 0
         # self.bias.stride = 1
-        # self.parallel_output = parallel_output
+        self.parallel_output = parallel_output
 
         self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
@@ -76,7 +76,7 @@ class T5Model(MegatronModule):
     Arguments:
         config (TransformerConfig): transformer config
 
-        spec (List[TransformerBlockSpec]): transformer layer customization specs for encoder and decoder
+        transformer_layer_spec (List[ModuleSpec]): transformer layer customization specs for encoder and decoder
         
         vocab_size (int): vocabulary size
 
@@ -104,7 +104,7 @@ class T5Model(MegatronModule):
     def __init__(
             self,
             config: TransformerConfig,
-            spec: List[ModuleSpec],
+            transformer_layer_spec: List[ModuleSpec],
             vocab_size: int,
             max_sequence_length: int,
             pre_process: bool = True,
@@ -120,7 +120,7 @@ class T5Model(MegatronModule):
         super(T5Model, self).__init__(config=config)   
 
         self.config: TransformerConfig = config
-        self.spec: List[ModuleSpec] = spec
+        self.transformer_layer_spec: List[ModuleSpec] = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -155,7 +155,7 @@ class T5Model(MegatronModule):
             self.rotary_pos_emb = None
 
         # Transformer encoder
-        encoder_spec, decoder_spec = self.spec
+        encoder_spec, decoder_spec = self.transformer_layer_spec
         self.encoder = TransformerBlock(
             config=self.config,
             submodules=encoder_spec,

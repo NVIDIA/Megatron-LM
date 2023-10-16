@@ -42,15 +42,18 @@ class TransformerLayer(MegatronModule):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
+        hidden_dropout: float = None,
     ):
         super().__init__(config=config)
 
         self.layer_number = layer_number + self._get_layer_offset()
+        self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             submodules.input_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -70,6 +73,7 @@ class TransformerLayer(MegatronModule):
         ## [Module 4: Post SelfAttention] Optional Layernorm after self-attn
         self.pre_cross_attn_layernorm = build_module(
             submodules.pre_cross_attn_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -80,15 +84,21 @@ class TransformerLayer(MegatronModule):
 
         ## [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention, config=self.config, layer_number=layer_number,
+            submodules.cross_attention,
+            config=self.config,
+            layer_number=layer_number,
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(submodules.cross_attn_bda)
+        self.cross_attn_bda = build_module(
+            submodules.cross_attn_bda,
+            config=self.config,
+        )
 
-        ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
+        ## [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
             persist_layer_norm=self.config.persist_layer_norm,
@@ -168,7 +178,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -180,8 +190,8 @@ class TransformerLayer(MegatronModule):
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
-            attention_mask=attention_mask,
-            context=context,
+            attention_mask=context_mask,
+            key_value_states=context,
             inference_params=inference_params,
         )
 
@@ -193,7 +203,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -209,7 +219,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.config.hidden_dropout
+                mlp_output_with_bias, residual, self.hidden_dropout
             )
 
         # Jit compiled function creates 'view' tensor. This tensor

@@ -184,18 +184,6 @@ class TransformerConfig(ModelParallelConfig):
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
 
-    # retro
-    retro_workdir: str = None
-    # retro_add_retriever: bool = False # ... implicit w/ core
-    # retro_cyclic_train_iters: int = None # ... necessary?
-    retro_encoder_num_layers: int = 2
-    retro_encoder_hidden_dropout: float = 0.1
-    retro_encoder_attention_dropout: float = 0.1
-    retro_num_neighbors: int = 2
-    retro_num_retrieved_chunks: int = 2
-    # retro_return_doc_ids: bool = False # ... needed for data preprocessing
-    retro_preprocess: types.SimpleNamespace = None
-
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.

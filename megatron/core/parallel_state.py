@@ -428,7 +428,7 @@ def get_data_parallel_group(with_context_parallel=False):
         ), 'data parallel group with context parallel combined is not initialized'
         return _DATA_PARALLEL_GROUP_WITH_CP
     else:
-        assert _DATA_PARALLEL_GROUP is not None, 'data parallel group is not initialized'
+        # assert _DATA_PARALLEL_GROUP is not None, 'data parallel group is not initialized'
         return _DATA_PARALLEL_GROUP
 
 

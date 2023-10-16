@@ -31,7 +31,11 @@ class DotProductAttention(MegatronModule):
     """
 
     def __init__(
-        self, config: TransformerConfig, layer_number: int = 1, attn_mask_type=AttnMaskType.padding
+        self,
+        config: TransformerConfig,
+        layer_number: int = 1,
+        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        attention_dropout: float = None,
     ):
         super().__init__(config=config)
 
@@ -67,7 +71,9 @@ class DotProductAttention(MegatronModule):
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
-        self.attention_dropout = torch.nn.Dropout(self.config.attention_dropout)
+        self.attention_dropout = torch.nn.Dropout(
+            self.config.attention_dropout if attention_dropout is None
+            else attention_dropout)
 
     def forward(
         self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor

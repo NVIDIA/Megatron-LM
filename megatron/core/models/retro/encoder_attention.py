@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+"""Retro's cross attention modules for the encoder block."""
+
 from functools import partial
 import torch
 from torch import Tensor
@@ -7,25 +9,30 @@ from typing import Callable, Optional, Tuple
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.retro.attn import BaseRetroCrossAttention
+from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
+from megatron.core.models.retro.config import RetroConfig
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
+    """Retro encoder's cross attention operator.
+
+    See this paper for more details: https://arxiv.org/abs/2112.04426.
+
+    Neighboring chunks are retrieved from the chunk database, encoded, and
+    used by the decoder layers for chunked cross attention.
+    """
+
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_params=None,
-        # rotary_pos_emb=None, # unsupported for retro.
-        # retriever_output=None, # set as key_value_states
-        **kwargs,
-    ):
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Tensor = None,
+        inference_params: InferenceParams = None,
+        # rotary_pos_emb: Tensor = None, # unsupported for retro.
+    ) -> Tensor:
         # hidden_states: [sq, b, h]
 
         """Cross attention for Retro encoder.
@@ -70,14 +77,17 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
 class RetroEncoderBiasDropoutAdd(MegatronModule):
 
+    """Retro encoder's bias-dropout-add operator.
+
+    This operator applies bias-dropout-add individually on each neighboring
+    chunk that is retrieved from the chunk database.
+    """
+
     def __init__(
         self,
-        config: TransformerConfig,
-        spec: ModuleSpec,
-        **kwargs,
+        config: RetroConfig,
     ):
         super().__init__(config=config)
-        self.spec = spec
         self.retro_num_neighbors = config.retro_num_neighbors
 
     @classmethod
@@ -102,9 +112,13 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
                 for attention_output, attention_bias, residual in x_with_bias
             ]
 
-        return outputs
+        # Concatenate outputs (to shape [r, k*bs*l, d]; see notation above).
+        ns, _, d = outputs[0].shape
+        output = torch.stack(outputs, dim=1).reshape(ns, -1, d)
 
-    def forward(self, training, fused):
+        return output
+
+    def forward(self, training: bool, fused: bool) -> Tensor:
         return partial(
             self._forward,
             retro_num_neighbors=self.retro_num_neighbors,
@@ -114,23 +128,34 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
 class RetroEncoderLayerNorm(MegatronModule):
 
+    """Retro encoder's layernorm operator.
+
+    This operator applies layernorm individually on each neighboring chunk that
+    is retrieved from the chunk database, and then concatenates the chunks into
+    a single tensor.
+    """
+
     def __init__(
         self,
-        config: TransformerConfig,
-        spec: ModuleSpec,
+        config: RetroConfig,
         **kwargs,
     ):
         super().__init__(config=config)
-        self.spec = spec
         self.norm = TENorm(config=config, **kwargs)
+        self.retro_num_neighbors = config.retro_num_neighbors
 
-    def forward(self, layernorm_inputs):
+    def forward(self, input: Tensor) -> Tensor:
 
-        layernorm_outputs = [ self.norm(inp) for inp in layernorm_inputs ]
+        # Split input into 'num_neighbors' tensors.
+        chunk_size = input.shape[1] // self.retro_num_neighbors
+        inputs = torch.split(input, chunk_size, dim=1)
+
+        # Norm.
+        outputs = [ self.norm(inp.contiguous()) for inp in inputs ]
 
         # Concatenate layer norms (to shape [r, k*bs*l, d]; see notation above).
-        ns, _, d = layernorm_inputs[0].shape
-        layernorm_output = torch.stack(layernorm_outputs, dim=1).reshape(ns,-1,d)
+        ns, _, d = inputs[0].shape
+        output = torch.stack(outputs, dim=1).reshape(ns,-1,d)
 
-        return layernorm_output
+        return output
 

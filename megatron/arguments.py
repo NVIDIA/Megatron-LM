@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
+from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
 
 
@@ -438,17 +439,15 @@ def core_transformer_config_from_args(args):
     else:
         kw_args['num_query_groups'] = None
 
+    # If using Retro, return Retro config.
     retro_args = get_retro_args()
     if retro_args:
-        kw_args['retro_workdir'] = args.retro_workdir
-        kw_args['retro_encoder_num_layers'] = args.retro_encoder_layers
-        kw_args['retro_encoder_hidden_dropout'] = args.retro_encoder_hidden_dropout
-        kw_args['retro_encoder_attention_dropout'] = args.retro_encoder_attention_dropout
-        kw_args['retro_num_neighbors'] = args.retro_num_neighbors
-        kw_args['retro_num_retrieved_chunks'] = args.retro_num_retrieved_chunks
         kw_args['retro_preprocess'] = retro_args
+        return RetroConfig(**kw_args)
 
+    # Return Transformer config.
     return TransformerConfig(**kw_args)
+
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
@@ -507,6 +506,10 @@ def _add_inference_args(parser):
 def _add_retro_args(parser):
     group = parser.add_argument_group(title='retro')
 
+    group.add_argument('--retro-use-core', action="store_true",
+                       help="Use the Megatron-Core Retro model (megatron/core/"
+                       "models/retro/model.py) instead of the default model "
+                       "(via megatron/models/gpt_model.py).")
     group.add_argument('--retro-workdir', default=None,
                        help='Retro working directory, which contains the '
                        'preprocessed data for for pretraining. This directory '
@@ -537,6 +540,10 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
+    group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
+                       dest="retro_verify_neighbor_count",
+                       help="Skip verifying that len(GPT dataset) == len(saved "
+                       "neighbors).")
 
     # Enforce argument naming convention.
     for action in group._group_actions:

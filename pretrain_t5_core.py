@@ -19,8 +19,10 @@ from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.T5.t5_spec import get_t5_encoder_block_spec, get_t5_decoder_block_spec
-
+from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_engine_block_spec,
+                                            get_t5_decoder_with_transformer_engine_block_spec,
+                                            get_t5_encoder_with_local_block_spec,
+                                            get_t5_decoder_with_local_block_spec)
 
 def model_provider(pre_process=True, post_process=True,
                    add_encoder=True, add_decoder=True):
@@ -29,12 +31,16 @@ def model_provider(pre_process=True, post_process=True,
     args = get_args()
     config = core_transformer_config_from_args(args)
     # NOTE: Experimental customization feature
-    en_block_spec = get_t5_encoder_block_spec(config)
-    de_block_spec = get_t5_decoder_block_spec(config)
+    if args.transformer_impl=="local":
+        en_block_spec = get_t5_encoder_with_local_block_spec(config)
+        de_block_spec = get_t5_decoder_with_local_block_spec(config)
+    elif args.transformer_impl=="transformer_engine":
+        en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(config)
+        de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(config)
     print_rank_0('building T5 model ...')
     model = T5Model(
         config=config,
-        spec=[en_block_spec, de_block_spec],
+        transformer_layer_spec=[en_block_spec, de_block_spec],
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
@@ -118,7 +124,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for T5 ...')
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
-        data_impl=args.data_impl,
         splits_string=args.split,
         train_valid_test_num_samples=train_val_test_num_samples,
         max_seq_length=args.encoder_seq_length,
