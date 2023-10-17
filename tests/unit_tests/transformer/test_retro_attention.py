@@ -100,7 +100,7 @@ class TestRetroAttention:
     def test_gpu_forward(self):
 
         config = self.decoder_attn.config
-        sequence_length = 32
+        seq_length = 32
         micro_batch_size = 2
 
         self.decoder_attn.cuda()
@@ -109,19 +109,22 @@ class TestRetroAttention:
         self.encoder_bda.cuda()
         self.encoder_norm.cuda()
 
-        # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size)).cuda()
-        # attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        # [seq length, batch size, hidden size]
+        hidden_states = torch.ones((
+            seq_length,
+            micro_batch_size,
+            config.hidden_size,
+        )).cuda()
         attention_mask = None
         # >>>
         # context = torch.ones((
-        #     sequence_length // config.retro_preprocess.retro_gpt_chunk_length,
+        #     seq_length // config.retro_preprocess.retro_gpt_chunk_length,
         #     config.retro_num_neighbors,
         #     micro_batch_size * config.retro_preprocess.retro_gpt_retrieved_length,
         # )).cuda()
         # context = torch.ones((
         #     # micro_batch_size,
-        #     # sequence_length // config.retro_preprocess.retro_gpt_chunk_length,
+        #     # seq_length // config.retro_preprocess.retro_gpt_chunk_length,
         #     config.retro_num_neighbors,
         #     config.retro_preprocess.retro_gpt_chunk_length,
         #     micro_batch_size,
@@ -129,7 +132,7 @@ class TestRetroAttention:
         # )).cuda()
 
         # [r, k * bs * l , d]
-        n_chunks_per_sample = sequence_length // config.retro_preprocess.retro_gpt_chunk_length
+        n_chunks_per_sample = seq_length // config.retro_preprocess.retro_gpt_chunk_length
         decoder_context = torch.ones((
             config.retro_preprocess.retro_gpt_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
@@ -137,8 +140,7 @@ class TestRetroAttention:
         )).cuda()
         encoder_context = torch.ones((
             config.retro_preprocess.retro_gpt_chunk_length,
-            micro_batch_size,
-            n_chunks_per_sample,
+            micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )).cuda()
         # <<<
@@ -148,25 +150,52 @@ class TestRetroAttention:
             attention_mask,
             decoder_context,
         )
-        with self.bias_dropout_add_exec_handler():
+        with torch.enable_grad():
             decoder_bda_output = self.decoder_bda(True, True)(
-                decoder_attn_output, hidden_states, config.hidden_dropout
+                decoder_attn_output,
+                hidden_states,
+                config.hidden_dropout,
             )
 
         encoder_attn_output = self.encoder_attn(
-            context,
+            decoder_context,
             None,
-            chunked_output,
+            encoder_context,
         )
+        with torch.enable_grad():
+            encoder_bda_output = self.encoder_bda(True, True)(
+                encoder_attn_output,
+                decoder_context,
+                config.retro_encoder_hidden_dropout,
+            )
+        encoder_norm_output = self.encoder_norm(encoder_bda_output)
 
         # >>>
-        from lutil import tp
-        # raise Exception("attn_output_with_bias = %s." % attn_output_with_bias)
-        raise Exception("output.keys = %s." % list(output.keys()))
+        # from lutil import tp
+        # # raise Exception("attn_output_with_bias = %s." % attn_output_with_bias)
+        # raise Exception("output.keys = %s." % list(output.keys()))
         # <<<
 
-        assert tupl
-        assert output.shape[0] == sequence_length
+        # raise Exception("keys = %s." % list(decoder_attn_output.keys()))
+        assert set(decoder_attn_output.keys()) == set([ "ns", "bs", "d", "l", "pad", "attention_output", "attention_bias", "context"])
+        assert decoder_attn_output["ns"] == seq_length
+        assert decoder_attn_output["bs"] == micro_batch_size
+        assert decoder_attn_output["d"] == config.hidden_size
+        assert decoder_attn_output["l"] == n_chunks_per_sample
+        assert decoder_attn_output["pad"] == 3
+        assert tuple(decoder_attn_output["attention_output"].shape) == (
+            config.retro_preprocess.retro_gpt_chunk_length,
+            micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )
+        assert decoder_attn_output["attention_bias"] == 7
+        assert decoder_attn_output["context"] == 7
+        assert tuple(decoder_bda_output.shape) == (7, 7, 7, 7, 7)
+
+        raise Exception("hi.")
+
+
+        assert output.shape[0] == seq_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
@@ -179,23 +208,23 @@ class TestRetroAttention:
     #                                                     get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules)
     #     config = checkpointed_parallel_attention.config
 
-    #     sequence_length = 32
+    #     seq_length = 32
     #     micro_batch_size = 2
 
     #     checkpointed_parallel_attention.cuda()
 
-    #     # [sequence length, batch size, hidden size]
+    #     # [seq length, batch size, hidden size]
     #     hidden_states = torch.ones(
-    #         (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
+    #         (seq_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
     #     )
     #     hidden_states = hidden_states.cuda()
 
-    #     attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+    #     attention_mask = torch.ones((1, 1, seq_length, seq_length), dtype=bool).cuda()
 
     #     output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 
     #     assert config.recompute_granularity == 'selective'
-    #     assert output.shape[0] == sequence_length
+    #     assert output.shape[0] == seq_length
     #     assert output.shape[1] == micro_batch_size
     #     assert output.shape[2] == config.hidden_size
     #     assert bias.shape[0] == config.hidden_size
