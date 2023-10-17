@@ -1,3 +1,33 @@
+This repository integrates AxoNN's 2D tensor parallelism within Megatron-LM. The general workflow to quickly get up and running is as follows:
+
+1.  Install AxoNN
+```
+git clone git@github.com:axonn-ai/axonn.git
+cd axonn
+pip install -e .
+```
+
+2. Download vocabulary
+```
+wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-vocab.json
+wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt
+```
+
+3. Prepare dataset
+
+Follow the instructions here - [Data Preprocessing](#data-preprocessing).
+
+4. Prepare a bash script.
+
+A sample bash script, that works on [Perlmutter](#https://docs.nersc.gov/systems/perlmutter/), can be found in `examples/run_axonn.sh`. You can build your 
+own bash scripts on top of that. Modify the `DATA_DIR` environment variable to point to the datasets and vocabulary files you created in the previous steps.
+Lines 31-34 control your architecture. The `COLUMN_TENSOR_PARR` and `ROW_TENSOR_PARR` variables define the dimensions of the 2D grid over which AxoNN's tensor
+parallelism operates. In the sample script, both these variables are set to 2, which means that AxoNN is sharding your model across 4 GPUs organized in a 
+2x2 grid. You should tune these variables based on the memory requirements of your model. 
+
+
+# Old Megatron-LM Readme
+
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
 Below are some of the projects where we have directly used Megatron:
