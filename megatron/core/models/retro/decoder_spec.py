@@ -88,8 +88,7 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
 
 
 def get_retro_decoder_block_spec(
-    config: RetroConfig,
-    use_transformer_engine: bool,
+    config: RetroConfig, use_transformer_engine: bool
 ) -> TransformerBlockSubmodules:
 
     """Retro decoder block spec.
