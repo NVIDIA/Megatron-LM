@@ -874,6 +874,17 @@ def evaluate(forward_step_func,
 
             args.consumed_valid_samples += eval_batch_size
 
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    print_rank_0('Exiting during evaluation, timelimit reached')
+                    return None, None, True
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -887,18 +898,7 @@ def evaluate(forward_step_func,
                 forward_only=True,
                 collect_non_loss_data=True)
         
-        if args.exit_duration_in_mins:
-            train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-            done_cuda = torch.cuda.IntTensor(
-                [train_time > args.exit_duration_in_mins])
-            torch.distributed.all_reduce(
-                done_cuda, op=torch.distributed.ReduceOp.MAX)
-            done = done_cuda.item()
-            if done:
-                print_rank_0('Exiting during evaluation, timelimit reached')
-                for model_module in model:
-                    model_module.train()
-                return None, None, True
+        
 
 
     # Move model back to the train mode.
