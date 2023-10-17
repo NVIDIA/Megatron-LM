@@ -13,7 +13,7 @@ from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
-from megatron.core.transformer import build_module, ModuleSpec
+from megatron.core.transformer import ModuleSpec, build_module
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
