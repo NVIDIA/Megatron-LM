@@ -13,8 +13,8 @@ from megatron.core.models.retro.decoder_attention import (
 )
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer import (
-    ModuleSpec,
+from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.transformer_block import (
     TransformerBlock,
     TransformerBlockSubmodules,
     get_num_layers_to_build,
