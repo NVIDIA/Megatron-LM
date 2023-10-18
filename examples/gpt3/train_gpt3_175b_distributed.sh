@@ -48,7 +48,8 @@ TRAINING_ARGS="
     --lr-decay-style cosine \
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 \
-    --lr-decay-iters 430000 
+    --lr-decay-iters 430000 \
+    --use-mcore-models
 "
 
 MODEL_PARALLEL_ARGS="
@@ -73,7 +74,7 @@ EVAL_AND_LOGGING_ARGS="
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_gpt_core.py \
+torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
     $GPT_MODEL_ARGS \
     $TRAINING_ARGS \
     $MODEL_PARALLEL_ARGS \
