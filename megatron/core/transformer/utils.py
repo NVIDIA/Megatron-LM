@@ -4,7 +4,7 @@
 
 import torch
 
-def get_linear_layer(rows, columns, init_method, perform_initialization):
+def get_linear_layer(rows, columns, init_method, perform_initialization=True):
     """Simple linear layer with weight initialization."""
     layer = torch.nn.Linear(rows, columns)
     if perform_initialization: # Take from modelparallel config
