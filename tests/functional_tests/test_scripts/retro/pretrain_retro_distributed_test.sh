@@ -48,9 +48,12 @@ set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
+# >>>
+# --vocab-file /workspace/data/retro_data/gpt2-vocab.json \
+# --merge-file /workspace/data/retro_data/gpt2-merges.txt \
+# <<<
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
-       --retro-use-core \
        --num-layers 12 \
        --hidden-size 512 \
        --num-attention-heads 8 \
@@ -69,8 +72,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/retro_data/gpt2-vocab.json \
-       --merge-file /workspace/data/retro_data/gpt2-merges.txt \
+       --vocab-file /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/workdirs/wiki-tiny/gpt2-vocab.json \
+       --merge-file /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/workdirs/wiki-tiny/gpt2-merges.txt \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.00015 \

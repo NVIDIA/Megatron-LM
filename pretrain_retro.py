@@ -64,10 +64,8 @@ def model_provider(pre_process=True, post_process=True):
     """
 
     args = get_args()
-    provider = core_model_provider if args.use_mcore_models \
-        else default_model_provider
-    return provider(pre_process=pre_process,
-                    post_process=post_process)
+    provider = core_model_provider if args.use_mcore_models else default_model_provider
+    return provider(pre_process=pre_process, post_process=post_process)
 
 
 def get_batch(data_iterator):

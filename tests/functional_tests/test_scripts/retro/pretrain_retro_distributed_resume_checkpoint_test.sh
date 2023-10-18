@@ -27,7 +27,6 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 # Run for 100 iterations and save checkpoint at 50
 torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
-       --retro-use-core \
        --use-checkpoint-args \
        --use-checkpoint-opt_param-scheduler \
        --num-layers 12 \
