@@ -877,8 +877,7 @@ def _add_training_args(parser):
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
-                       help='Use the implementation from megatron core',
-                       dest='use_mcore_models')
+                       help='Use the implementation from megatron core')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
 
