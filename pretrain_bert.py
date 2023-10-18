@@ -18,7 +18,8 @@ from megatron.core.models.bert.bert_model import BertModel
 from megatron.training import pretrain
 from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
-
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
@@ -30,8 +31,15 @@ def model_provider(pre_process=True, post_process=True):
     num_tokentypes = 2 if args.bert_binary_head else 0
 
     if args.use_mcore_models:
+
+        if args.model_spec is not None:
+            transformer_layer_spec = import_module(args.model_spec)
+        else:
+            transformer_layer_spec = bert_layer_with_transformer_engine_spec 
+
         model = BertModel(
             config=config,
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             # num_tokentypes=0, #TODO : num_tokentypes This is sent in original bert and gpt model

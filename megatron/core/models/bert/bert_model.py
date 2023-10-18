@@ -5,6 +5,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.language_module.language_module import (
     LanguageModule,
 )
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.utils import get_linear_layer
 from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
 from megatron.model.language_model import Pooler
@@ -24,22 +25,16 @@ class BertModel(LanguageModule):
 
     Arguments:
         config (TransformerConfig): transformer config
-
+        transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
-
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
-
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-
         share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
             shared. Defaults to False.
-
         position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
             Defaults is 'learned_absolute'.
-
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
     """
@@ -47,6 +42,7 @@ class BertModel(LanguageModule):
     def __init__(
         self,
         config: TransformerConfig,
+        transformer_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -67,6 +63,7 @@ class BertModel(LanguageModule):
             assert self.post_process and self.add_binary_head
 
         self.config: TransformerConfig = config
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -98,6 +95,7 @@ class BertModel(LanguageModule):
         # Transformer.
         self.transformer = TransformerBlock(
             config=self.config,
+            transformer_layer_spec=self.transformer_layer_spec,
             self_attn_mask_type=AttnMaskType.padding,
             pre_process=self.pre_process,
             post_process=self.post_process,
