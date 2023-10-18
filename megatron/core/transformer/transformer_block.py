@@ -143,6 +143,9 @@ class TransformerBlock(MegatronModule):
                     self.config.distribute_saved_activations,
                     hidden_states,
                     attention_mask,
+                    None,
+                    None,
+                    None,
                     rotary_pos_emb,
                 )
 
@@ -159,6 +162,9 @@ class TransformerBlock(MegatronModule):
                         self.config.distribute_saved_activations,
                         hidden_states,
                         attention_mask,
+                        None,
+                        None,
+                        None,
                         rotary_pos_emb,
                     )
                 else:
