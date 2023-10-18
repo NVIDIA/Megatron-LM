@@ -3,8 +3,8 @@
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from megatron.core import mpu
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from .. import parallel_state
+from ..utils import get_attr_wrapped_model, get_model_config
 
 
 def _allreduce_word_embedding_grads(model, config):
@@ -17,12 +17,12 @@ def _allreduce_word_embedding_grads(model, config):
     """
 
     if (
-        mpu.is_rank_in_embedding_group(ignore_virtual=True)
-        and mpu.get_pipeline_model_parallel_world_size() > 1
+        parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
+        and parallel_state.get_pipeline_model_parallel_world_size() > 1
     ):
-        if mpu.is_pipeline_first_stage(ignore_virtual=True):
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
-        elif mpu.is_pipeline_last_stage(ignore_virtual=True):
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             model_module = model[-1]
         else:  # We do not support the interleaved schedule for T5 yet.
             model_module = model[0]
@@ -36,7 +36,7 @@ def _allreduce_word_embedding_grads(model, config):
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
             grad = weight.main_grad
-            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+            torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
 
 def _allreduce_position_embedding_grads(model, config):
@@ -47,15 +47,15 @@ def _allreduce_position_embedding_grads(model, config):
     parallelism.
     """
     if (
-        mpu.is_rank_in_position_embedding_group()
-        and mpu.get_pipeline_model_parallel_world_size() > 1
+        parallel_state.is_rank_in_position_embedding_group()
+        and parallel_state.get_pipeline_model_parallel_world_size() > 1
         and config.pipeline_model_parallel_split_rank is not None
     ):
         model_module = model[0]
         grad = get_attr_wrapped_model(
             model_module, 'language_model.embedding.position_embeddings.weight.main_grad'
         )
-        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+        torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 
 def _allreduce_embedding_grads(model, config):
@@ -69,7 +69,7 @@ def _allreduce_layernorm_grads(model, config):
 
     # All-reduce layernorm parameters across model parallel nodes
     # when sequence parallelism is used
-    if mpu.get_tensor_model_parallel_world_size() > 1 and config.sequence_parallel:
+    if parallel_state.get_tensor_model_parallel_world_size() > 1 and config.sequence_parallel:
         grads = []
         for model_chunk in model:
             for param in get_attr_wrapped_model(model_chunk, 'parameters')():
@@ -77,7 +77,9 @@ def _allreduce_layernorm_grads(model, config):
                     grad = param.main_grad
                     grads.append(grad.data)
         coalesced = _flatten_dense_tensors(grads)
-        torch.distributed.all_reduce(coalesced, group=mpu.get_tensor_model_parallel_group())
+        torch.distributed.all_reduce(
+            coalesced, group=parallel_state.get_tensor_model_parallel_group()
+        )
         for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
             buf.copy_(synced)
 
@@ -88,7 +90,7 @@ def _allreduce_expert_grads(model, config):
     # All-reduce switchmlp parameters across data modulo expert parallel nodes
     if (
         config.expert_model_parallel_size > 1
-        and config.expert_model_parallel_size < mpu.get_data_parallel_world_size()
+        and config.expert_model_parallel_size < parallel_state.get_data_parallel_world_size()
     ):
         grads = []
         for model_chunk in model:
@@ -97,7 +99,9 @@ def _allreduce_expert_grads(model, config):
                     grad = param.main_grad
                     grads.append(grad.data)
         coalesced = _flatten_dense_tensors(grads)
-        torch.distributed.all_reduce(coalesced, group=mpu.get_data_modulo_expert_parallel_group())
+        torch.distributed.all_reduce(
+            coalesced, group=parallel_state.get_data_modulo_expert_parallel_group()
+        )
         for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
             buf.copy_(synced)
 
