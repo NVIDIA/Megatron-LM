@@ -29,7 +29,7 @@ def model_provider(pre_process=True, post_process=True):
     config = core_transformer_config_from_args(args)
     num_tokentypes = 2 if args.bert_binary_head else 0
 
-    if args.use_mcore:
+    if args.use_mcore_models:
         model = BertModel(
             config=config,
             vocab_size=args.padded_vocab_size,
