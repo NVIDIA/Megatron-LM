@@ -38,10 +38,10 @@ TRAINING_ARGS="
     --global-batch-size 1536 \
     --rampup-batch-size 16 16 5859375 \
     --train-iters 500000 \
-	--weight-decay 0.1 \
-	--adam-beta1 0.9 \
-	--adam-beta2 0.95 \
-	--init-method-std 0.006 \
+    --weight-decay 0.1 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --init-method-std 0.006 \
     --clip-grad 1.0 \
     --fp16
     --lr 6.0e-5 \
@@ -67,6 +67,8 @@ EVAL_AND_LOGGING_ARGS="
     --log-interval 100 \
     --save-interval 10000 \
     --eval-interval 1000 \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH \
     --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
 "
