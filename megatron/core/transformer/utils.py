@@ -4,6 +4,14 @@
 
 import torch
 
+def get_linear_layer(rows, columns, init_method, perform_initialization):
+    """Simple linear layer with weight initialization."""
+    layer = torch.nn.Linear(rows, columns)
+    if perform_initialization: # Take from modelparallel config
+        init_method(layer.weight)
+    with torch.no_grad():
+        layer.bias.zero_()
+    return layer
 
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
