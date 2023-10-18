@@ -15,6 +15,8 @@ class ModelParallelConfig:
 
     tensor_model_parallel_size (int): Intra-layer model parallelism. Splits tensors across GPU ranks. Defaults to 1.
 
+    context_parallel_size (int): Splits network input along sequence dimension across GPU ranks. Defaults to 1.
+
     pipeline_model_parallel_size (int): Inter-layer model parallelism. Splits transformer layers across GPU
         ranks. Defaults to 1.
 
@@ -127,6 +129,7 @@ class ModelParallelConfig:
 
     # Model parallelism
     tensor_model_parallel_size: int = 1
+    context_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     sequence_parallel: bool = False

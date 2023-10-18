@@ -1,4 +1,4 @@
-import megatron.core.parallel_state
+from megatron.core import parallel_state
 import megatron.core.tensor_parallel
 import megatron.core.utils
 from megatron.core.distributed import DistributedDataParallel

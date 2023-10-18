@@ -15,7 +15,6 @@ echo "---------------------------------"
 set -x
 if [[ -n $MBS ]]; then MBS=4; fi
 if [[ -n $GBS ]]; then GBS=32; fi
-if [[ -n $VP_SIZE ]]; then VP_SIZE="" ; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
