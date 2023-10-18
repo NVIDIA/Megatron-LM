@@ -231,7 +231,8 @@ def get_batch_on_this_cp_rank(batch):
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
     args = get_args()
-    if args.context_parallel_size > 1:
+    cp_size = args.context_parallel_size
+    if cp_size > 1:
         cp_rank = mpu.get_context_parallel_rank()
         for key, val in batch.items():
             seq_dim = 1 if key != 'attention_mask' else 2
