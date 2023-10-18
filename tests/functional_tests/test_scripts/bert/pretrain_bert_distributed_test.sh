@@ -71,8 +71,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
-       --${TRAINING_DTYPE}
-       --fp16 "
+       --${TRAINING_DTYPE}"
 
 command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
