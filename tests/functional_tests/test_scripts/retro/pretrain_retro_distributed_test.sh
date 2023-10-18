@@ -13,8 +13,8 @@ done
 echo "---------------------------------"
 
 set -x
-if [[ -n $MBS ]]; then MBS=4; fi
-if [[ -n $GBS ]]; then GBS=32; fi
+if [[ -z $MBS ]]; then MBS=4; fi
+if [[ -z $GBS ]]; then GBS=32; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -54,6 +54,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 # <<<
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
+       --exit-interval $MAX_STEPS \
        --num-layers 12 \
        --hidden-size 512 \
        --num-attention-heads 8 \
@@ -66,9 +67,12 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --global-batch-size ${GBS:-32} \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
-       --train-iters $MAX_STEPS \
+       --train-samples 100000 \
+       --lr-decay-samples 99000 \
+       --lr-warmup-samples 1000 \
+       --eval-iters 100 \
+       --eval-interval 2000 \
        --timing-log-level 2 \
-       --lr-decay-iters 320000 \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
@@ -81,11 +85,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --min-lr 1.0e-5 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
-       --lr-warmup-fraction .01 \
        --log-interval 1 \
        --save-interval 10000 \
-       --eval-interval 1000 \
-       --eval-iters 10 \
        --transformer-impl $TRANSFORMER_IMPL \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \

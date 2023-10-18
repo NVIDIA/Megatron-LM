@@ -27,6 +27,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 # Run for 100 iterations and save checkpoint at 50
 torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
+       --exit-interval 100 \
        --use-checkpoint-args \
        --use-checkpoint-opt_param-scheduler \
        --num-layers 12 \
@@ -41,9 +42,12 @@ torchrun $DISTRIBUTED_ARGS \
        --global-batch-size 32 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
-       --train-iters 100 \
+       --train-samples 100000 \
+       --lr-decay-samples 99000 \
+       --lr-warmup-samples 1000 \
+       --eval-iters 100 \
+       --eval-interval 2000 \
        --timing-log-level 2 \
-       --lr-decay-iters 320000 \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
@@ -56,11 +60,8 @@ torchrun $DISTRIBUTED_ARGS \
        --min-lr 1.0e-5 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
-       --lr-warmup-fraction .01 \
        --log-interval 1 \
        --save-interval 50 \
-       --eval-interval 1000 \
-       --eval-iters 10 \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \
@@ -71,6 +72,7 @@ echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 # Resume from 50th iteration ckpt and continue to 100 iterations
 torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
+       --exit-interval 100 \
        --use-checkpoint-args \
        --use-checkpoint-opt_param-scheduler \
        --num-layers 12 \
@@ -85,9 +87,12 @@ torchrun $DISTRIBUTED_ARGS \
        --global-batch-size 32 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
-       --train-iters 100 \
+       --train-samples 100000 \
+       --lr-decay-samples 99000 \
+       --lr-warmup-samples 1000 \
+       --eval-iters 100 \
+       --eval-interval 2000 \
        --timing-log-level 2 \
-       --lr-decay-iters 320000 \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
@@ -100,11 +105,8 @@ torchrun $DISTRIBUTED_ARGS \
        --min-lr 1.0e-5 \
        --weight-decay 1e-2 \
        --clip-grad 1.0 \
-       --lr-warmup-fraction .01 \
        --log-interval 1 \
        --save-interval 10000 \
-       --eval-interval 1000 \
-       --eval-iters 10 \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        --no-gradient-accumulation-fusion \

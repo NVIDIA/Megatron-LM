@@ -128,7 +128,7 @@ def forward_step(data_iterator, model):
     timers('batch-generator').stop()
 
     # Model call.
-    if args.retro_use_core:
+    if args.use_mcore_models:
         forward_kwargs = {
             "context_input_ids" : neighbor_tokens,
             "context_position_ids" : neighbor_position_ids,
