@@ -102,6 +102,7 @@ class TestRetroAttention:
         config = self.decoder_attn.config
         seq_length = 32
         micro_batch_size = 2
+        n_chunks_per_sample = seq_length // config.retro_preprocess.retro_gpt_chunk_length
 
         self.decoder_attn.cuda()
         self.decoder_bda.cuda()
@@ -109,30 +110,13 @@ class TestRetroAttention:
         self.encoder_bda.cuda()
         self.encoder_norm.cuda()
 
-        # [seq length, batch size, hidden size]
+        # Init tensors.
         hidden_states = torch.ones((
             seq_length,
             micro_batch_size,
             config.hidden_size,
         )).cuda()
         attention_mask = None
-        # >>>
-        # context = torch.ones((
-        #     seq_length // config.retro_preprocess.retro_gpt_chunk_length,
-        #     config.retro_num_neighbors,
-        #     micro_batch_size * config.retro_preprocess.retro_gpt_retrieved_length,
-        # )).cuda()
-        # context = torch.ones((
-        #     # micro_batch_size,
-        #     # seq_length // config.retro_preprocess.retro_gpt_chunk_length,
-        #     config.retro_num_neighbors,
-        #     config.retro_preprocess.retro_gpt_chunk_length,
-        #     micro_batch_size,
-        #     config.hidden_size,
-        # )).cuda()
-
-        # [r, k * bs * l , d]
-        n_chunks_per_sample = seq_length // config.retro_preprocess.retro_gpt_chunk_length
         decoder_context = torch.ones((
             config.retro_preprocess.retro_gpt_retrieved_length,
             config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
@@ -143,8 +127,8 @@ class TestRetroAttention:
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )).cuda()
-        # <<<
 
+        # Forward decoder.
         decoder_attn_output = self.decoder_attn(
             hidden_states,
             attention_mask,
@@ -157,26 +141,21 @@ class TestRetroAttention:
                 config.hidden_dropout,
             )
 
-        encoder_attn_output = self.encoder_attn(
+        # Forward encoder.
+        encoder_attn_output_tuples = self.encoder_attn(
             decoder_context,
             None,
             encoder_context,
         )
         with torch.enable_grad():
             encoder_bda_output = self.encoder_bda(True, True)(
-                encoder_attn_output,
+                encoder_attn_output_tuples,
                 decoder_context,
                 config.retro_encoder_hidden_dropout,
             )
         encoder_norm_output = self.encoder_norm(encoder_bda_output)
 
-        # >>>
-        # from lutil import tp
-        # # raise Exception("attn_output_with_bias = %s." % attn_output_with_bias)
-        # raise Exception("output.keys = %s." % list(output.keys()))
-        # <<<
-
-        # raise Exception("keys = %s." % list(decoder_attn_output.keys()))
+        # Verify decoder.
         assert set(decoder_attn_output.keys()) == set([ "ns", "bs", "d", "l", "pad", "attention_output", "attention_bias", "context"])
         assert decoder_attn_output["ns"] == seq_length
         assert decoder_attn_output["bs"] == micro_batch_size
@@ -188,43 +167,66 @@ class TestRetroAttention:
             micro_batch_size * n_chunks_per_sample,
             config.hidden_size,
         )
-        assert decoder_attn_output["attention_bias"] == 7
-        assert decoder_attn_output["context"] == 7
-        assert tuple(decoder_bda_output.shape) == (7, 7, 7, 7, 7)
+        assert tuple(decoder_attn_output["attention_bias"].shape) == (
+            config.hidden_size,
+        )
+        assert decoder_attn_output["context"].shape == (
+            config.retro_preprocess.retro_gpt_retrieved_length * config.retro_num_neighbors,
+            micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )
+        assert decoder_bda_output.shape == hidden_states.shape
 
+        # Verify encoder.
+        assert len(encoder_attn_output_tuples) == config.retro_num_neighbors
+        for output, bias, residual in encoder_attn_output_tuples:
+            assert tuple(output.shape) == (
+                config.retro_preprocess.retro_gpt_retrieved_length,
+                micro_batch_size * n_chunks_per_sample,
+                config.hidden_size,
+            )
+            assert tuple(bias.shape) == (config.hidden_size,)
+            assert tuple(residual.shape) == (
+                config.retro_preprocess.retro_gpt_retrieved_length,
+                micro_batch_size * n_chunks_per_sample,
+                config.hidden_size,
+            )
+        assert encoder_bda_output.shape == (
+            config.retro_preprocess.retro_gpt_retrieved_length,
+            config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )
+        assert encoder_norm_output.shape == (
+            config.retro_preprocess.retro_gpt_retrieved_length,
+            config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )
+
+    def test_checkpointed_gpu_forward(self):
         raise Exception("hi.")
+        transformer_config = self.transformer_config
+        transformer_config.recompute_granularity='selective'
+        checkpointed_parallel_attention = SelfAttention(transformer_config,
+                                                        get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules)
+        config = checkpointed_parallel_attention.config
 
+        seq_length = 32
+        micro_batch_size = 2
 
+        checkpointed_parallel_attention.cuda()
+
+        # [seq length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (seq_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
+        )
+        hidden_states = hidden_states.cuda()
+
+        attention_mask = torch.ones((1, 1, seq_length, seq_length), dtype=bool).cuda()
+
+        output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
+
+        assert config.recompute_granularity == 'selective'
         assert output.shape[0] == seq_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
-
-    # def test_checkpointed_gpu_forward(self):
-    #     raise Exception("hi.")
-    #     transformer_config = self.transformer_config
-    #     transformer_config.recompute_granularity='selective'
-    #     checkpointed_parallel_attention = SelfAttention(transformer_config,
-    #                                                     get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules)
-    #     config = checkpointed_parallel_attention.config
-
-    #     seq_length = 32
-    #     micro_batch_size = 2
-
-    #     checkpointed_parallel_attention.cuda()
-
-    #     # [seq length, batch size, hidden size]
-    #     hidden_states = torch.ones(
-    #         (seq_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
-    #     )
-    #     hidden_states = hidden_states.cuda()
-
-    #     attention_mask = torch.ones((1, 1, seq_length, seq_length), dtype=bool).cuda()
-
-    #     output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
-
-    #     assert config.recompute_granularity == 'selective'
-    #     assert output.shape[0] == seq_length
-    #     assert output.shape[1] == micro_batch_size
-    #     assert output.shape[2] == config.hidden_size
-    #     assert bias.shape[0] == config.hidden_size
