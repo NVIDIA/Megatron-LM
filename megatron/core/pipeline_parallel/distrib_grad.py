@@ -113,7 +113,7 @@ def finalize_model_grads(model):
     if config.timers is not None:
         config.timers('all-grads-sync', log_level=1).start(barrier=config.barrier_with_L1_time)
     for model_chunk in model:
-        model_chunk.sync_gradients()
+        model_chunk.finish_grad_sync()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 

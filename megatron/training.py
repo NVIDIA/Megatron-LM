@@ -712,7 +712,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
              'a custom no_sync_func is not supported when overlapping grad-reduce')
         if args.delay_grad_reduce:
-            config.grad_sync_func = model[0].grad_sync
+            config.grad_sync_func = model[0].start_grad_sync
         config.no_sync_func = model[0].no_sync
     config.finalize_model_grads_func = finalize_model_grads
 
