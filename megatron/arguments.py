@@ -506,10 +506,6 @@ def _add_inference_args(parser):
 def _add_retro_args(parser):
     group = parser.add_argument_group(title='retro')
 
-    group.add_argument('--retro-use-core', action="store_true",
-                       help="Use the Megatron-Core Retro model (megatron/core/"
-                       "models/retro/model.py) instead of the default model "
-                       "(via megatron/models/gpt_model.py).")
     group.add_argument('--retro-workdir', default=None,
                        help='Retro working directory, which contains the '
                        'preprocessed data for for pretraining. This directory '
