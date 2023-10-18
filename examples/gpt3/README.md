@@ -20,7 +20,7 @@ VOCAB_FILE="" #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE="" #<Specify path to file>/gpt2-merges.txt
 DATA_PATH="" #<Specify path and file prefix>_text_document
 
-srun -N $NUM_NODES --container-image  --container-mounts "/path/to/data:/path/to/data,/path/to/megatron-lm:/workspace/megatron-lm" --account $ACCOUNT -N 1 -J $JOB_NAME  -p $PARTITION --no-container-mount-home  -c "
+srun -N $NUM_NODES --container-image $PYTORCH_IMAGE --container-mounts "/path/to/data:/path/to/data,/path/to/megatron-lm:/workspace/megatron-lm" --account $ACCOUNT -N 1 -J $JOB_NAME  -p $PARTITION --no-container-mount-home  -c "
   cd /workspace/megatron-lm
   ./examples/gpt3/train_gpt3_175b_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $MERGE_FILE $DATA_PATH"
 
