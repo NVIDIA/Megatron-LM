@@ -13,7 +13,6 @@ from megatron.core.models.retro.encoder_attention import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
     TEColumnParallelLinear,
@@ -24,6 +23,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:
