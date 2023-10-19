@@ -5,17 +5,16 @@ import torch
 from torch import Tensor
 
 from megatron.core.models.bert.bert_lm_head import BertLMHead
+from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
-from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
 from megatron.model.bert_model import bert_extended_attention_mask, bert_position_ids
-from megatron.model.language_model import Pooler
 
 
 class BertModel(LanguageModule):
@@ -116,7 +115,9 @@ class BertModel(LanguageModule):
                 self.binary_head = get_linear_layer(config.hidden_size, 2, config.init_method)
 
                 # TODO : Should we add our pooler layer in megatron core as well ?
-                self.pooler = Pooler(config.hidden_size, config.init_method)
+                self.pooler = Pooler(
+                    config.hidden_size, config.init_method, config.sequence_parallel
+                )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
