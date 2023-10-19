@@ -14,10 +14,7 @@ echo "---------------------------------"
 
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
-# >>>
-# if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data/retro_data; fi
-# <<<
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -50,53 +47,6 @@ fi
 set +x
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
-
-# >>>
-# --vocab-file /workspace/data/retro_data/gpt2-vocab.json \
-# --merge-file /workspace/data/retro_data/gpt2-merges.txt \
-# <<<
-# ARGS=" \
-#        --exit-interval $MAX_STEPS \
-#        --num-layers 12 \
-#        --hidden-size 512 \
-#        --num-attention-heads 8 \
-#        --log-params-norm \
-#        --log-num-zeros-in-grad \
-#        --log-validation-ppl-to-tensorboard \
-#        --log-timers-to-tensorboard \
-#        --tensorboard-dir ${TENSORBOARD_DIR} \
-#        --micro-batch-size ${MBS:-4} \
-#        --global-batch-size ${GBS:-32} \
-#        --seq-length 1024 \
-#        --max-position-embeddings 1024 \
-#        --train-samples 100000 \
-#        --lr-decay-samples 99000 \
-#        --lr-warmup-samples 1000 \
-#        --eval-iters 100 \
-#        --eval-interval 2000 \
-#        --timing-log-level 2 \
-#        --save $CHECKPOINT_PATH \
-#        --load $CHECKPOINT_PATH \
-#        --data-path $DATA_PATH \
-#        --vocab-file /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/workdirs/wiki-tiny/gpt2-vocab.json \
-#        --merge-file /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/workdirs/wiki-tiny/gpt2-merges.txt \
-#        --split 949,50,1 \
-#        --distributed-backend nccl \
-#        --lr 0.00015 \
-#        --lr-decay-style cosine \
-#        --min-lr 1.0e-5 \
-#        --weight-decay 1e-2 \
-#        --clip-grad 1.0 \
-#        --log-interval 1 \
-#        --save-interval 10000 \
-#        --transformer-impl $TRANSFORMER_IMPL \
-#        --tensor-model-parallel-size $TP_SIZE \
-#        --pipeline-model-parallel-size $PP_SIZE \
-#        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
-#        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
-#        ${USE_MCORE:+--use-mcore-models} \
-#        --no-gradient-accumulation-fusion \
-#        --${TRAINING_DTYPE}"
 
 ARGS=" \
     --exit-interval $MAX_STEPS \
