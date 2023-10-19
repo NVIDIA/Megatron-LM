@@ -28,7 +28,7 @@ class TestBertodel:
         assert self.bert_model.max_sequence_length == 4
 
         num_weights = sum([p.numel() for p in self.bert_model.parameters()])
-        assert num_weights == 6240
+        assert num_weights == 6702
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.bert_model.config
@@ -56,11 +56,11 @@ class TestBertodel:
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        logits = self.bert_model.forward(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
+        logits = self.bert_model.forward(input_ids=input_ids, attention_mask=attention_mask)
 
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == self.bert_model.vocab_size
+        assert logits[0].shape[0] == micro_batch_size
+        assert logits[0].shape[1] == sequence_length
+        assert logits[0].shape[2] == self.bert_model.vocab_size
 
     def test_no_post_process_forward(self):
         pass

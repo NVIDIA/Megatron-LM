@@ -195,11 +195,16 @@ class BertModel(LanguageModule):
         return loss, binary_logits
 
     def shared_embedding_or_output_weight(self):
+        # TODO : Should check this function
         if self.pre_process:
             return self.embedding.word_embeddings.weight
-        elif self.post_process:
-            return self.lm_head.output_layer.weight
-        return None
+        else:
+            if not self.share_embeddings_and_output_weights:
+                raise Exception(
+                    'shared_embedding_or_output_weight() called for last '
+                    'stage, but share_embeddings_and_output_weights is false'
+                )
+            return self.embedding.word_embeddings.weight
 
     # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
