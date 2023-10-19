@@ -113,5 +113,9 @@ echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN --
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
+pip install h5py
+pip install transformers
+pip install faiss-gpu
+
 echo "$command" > $SCRIPTS_DIR/pretrain_retro_distributed_command.sh
 eval $command
