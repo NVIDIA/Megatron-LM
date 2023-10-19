@@ -1,4 +1,5 @@
 #! /bin/bash
+
 echo "------ARGUMENTS LIST --------"
 for ARGUMENT in "$@"
 do
