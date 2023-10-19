@@ -12,7 +12,7 @@ variables: &VARS
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
   TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
-  TEST_REGEX_ON_THIS_COMMIT:  /.*gpt3.*/ #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
+  TEST_REGEX_ON_THIS_COMMIT:  /.*bert_core.*/ #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
 unit_tests:
