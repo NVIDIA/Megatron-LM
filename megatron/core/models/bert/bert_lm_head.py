@@ -1,7 +1,9 @@
 import torch
+from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import erf_gelu, get_linear_layer, openai_gelu
 from megatron.model import LayerNorm
 
@@ -9,22 +11,25 @@ from megatron.model import LayerNorm
 class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
-    Arguments:
-        config: TransformerConfig object
-        mpu_vocab_size: model parallel size of vocabulary.
+    Args:
+        mpu_vocab_size(int): model parallel size of vocabulary.
         hidden_size: hidden size
-        parallel_output: whether output logits being distributed or not.
+        config (TransformerConfig): TransformerConfig object
+        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
+        vocab_size(int): The vocabulary size
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared. Defaults to False
+        pre_process (bool): Include embedding layer (used with pipeline parallelism)
     """
 
     def __init__(
         self,
-        mpu_vocab_size,
-        hidden_size,
-        config,
-        parallel_output,
-        vocab_size,
-        pre_process,
-        share_embeddings_and_output_weights,
+        mpu_vocab_size: int,
+        hidden_size: int,
+        config: TransformerConfig,
+        parallel_output: bool,
+        vocab_size: int,
+        pre_process: bool,
+        share_embeddings_and_output_weights: bool = False,
     ):
         super().__init__(config=config)
 
@@ -61,7 +66,7 @@ class BertLMHead(MegatronModule):
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
         )
 
-    def forward(self, hidden_states, word_embeddings_weight):
+    def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.gelu(hidden_states)
         hidden_states = self.layernorm(hidden_states)

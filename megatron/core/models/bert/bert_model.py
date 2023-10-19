@@ -20,7 +20,7 @@ from megatron.model.bert_model import bert_extended_attention_mask, bert_positio
 class BertModel(LanguageModule):
     """Transformer language model.
 
-    Arguments:
+    Args:
         config (TransformerConfig): transformer config
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
@@ -28,8 +28,7 @@ class BertModel(LanguageModule):
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared. Defaults to False.
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are shared. Defaults to False.
         position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
             Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
@@ -114,9 +113,8 @@ class BertModel(LanguageModule):
                 # TODO: Shoudl switch this to TELinear ?
                 self.binary_head = get_linear_layer(config.hidden_size, 2, config.init_method)
 
-                # TODO : Should we add our pooler layer in megatron core as well ?
                 self.pooler = Pooler(
-                    config.hidden_size, config.init_method, config.sequence_parallel
+                    config.hidden_size, config.init_method, config.sequence_parallel, config
                 )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
