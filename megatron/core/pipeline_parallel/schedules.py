@@ -902,16 +902,16 @@ def forward_backward_pipelining_with_interleaving(
                 )
             )
 
-    # Launch any remaining grad reductions
-    enable_grad_sync()
-    if config.grad_sync_func is not None:
-        params = []
-        for model_chunk_id in range(num_model_chunks):
-            if model_chunk_id not in synchronized_model_chunks:
-                params.extend(model[model_chunk_id].parameters())
-                synchronized_model_chunks.add(model_chunk_id)
-        if params:
-            config.grad_sync_func(params)
+        # Launch any remaining grad reductions.
+        enable_grad_sync()
+        if config.grad_sync_func is not None:
+            params = []
+            for model_chunk_id in range(num_model_chunks):
+                if model_chunk_id not in synchronized_model_chunks:
+                    params.extend(model[model_chunk_id].parameters())
+                    synchronized_model_chunks.add(model_chunk_id)
+            if params:
+                config.grad_sync_func(params)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -1261,11 +1261,11 @@ def forward_backward_pipelining_without_interleaving(
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
-    # Launch any remaining grad reductions
-    if no_sync_context is not None:
-        enable_grad_sync()
-        if config.grad_sync_func is not None:
-            config.grad_sync_func(model.parameters())
+        # Launch any remaining grad reductions.
+        if no_sync_context is not None:
+            enable_grad_sync()
+            if config.grad_sync_func is not None:
+                config.grad_sync_func(model.parameters())
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

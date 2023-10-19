@@ -15,7 +15,7 @@ from megatron.core.enums import ModelType
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region_to_moe, reduce_scatter_to_sequence_parallel_region_from_moe
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
@@ -753,14 +753,15 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        key_layer = key_layer.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-            dim = 2
-        )
-        value_layer = value_layer.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
-            dim = 2
-        )
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            key_layer = key_layer.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+                dim = 2
+            )
+            value_layer = value_layer.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
+                dim = 2
+            )
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
