@@ -74,8 +74,7 @@ def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
 def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
     def maybe_copy(attribute):
         if hasattr(source_tensor, attribute):
-            setattr(destination_tensor, attribute,
-                    getattr(source_tensor, attribute))
+            setattr(destination_tensor, attribute, getattr(source_tensor, attribute))
 
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         maybe_copy(attribute)
@@ -120,15 +119,13 @@ def _initialize_affine_weight_cpu(
     )
 
     # Initialize master weight
-    master_weight = torch.empty(
-        output_size, input_size, dtype=torch.float, requires_grad=False)
+    master_weight = torch.empty(output_size, input_size, dtype=torch.float, requires_grad=False)
     init_method(master_weight)
     master_weight = master_weight.to(dtype=params_dtype)
 
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
-    weight_list = torch.split(
-        master_weight, per_partition_per_stride_size, dim=partition_dim)
+    weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
     rank = get_tensor_model_parallel_rank()
     world_size = get_tensor_model_parallel_world_size()
     my_weight_list = weight_list[rank::world_size]
@@ -202,14 +199,12 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(
-                    self.weight, init_method, partition_dim=0, stride=1)
+                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
-            input_mask = (input_ < self.vocab_start_index) | (
-                input_ >= self.vocab_end_index)
+            input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
             # Mask the input.
             masked_input = input_.clone() - self.vocab_start_index
             masked_input[input_mask] = 0
@@ -289,8 +284,7 @@ def linear_with_frozen_weight(
     """
 
     if sequence_parallel:
-        input = gather_from_sequence_parallel_region(
-            input, tensor_parallel_output_grad=True)
+        input = gather_from_sequence_parallel_region(input, tensor_parallel_output_grad=True)
     else:
         input = input
 
@@ -328,8 +322,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            all_gather_buffer = get_global_memory_buffer(
-            ).get_tensor(dim_size, input.dtype, "mpu")
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             torch.distributed._all_gather_base(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group()
             )
@@ -353,8 +346,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
-            all_gather_buffer = get_global_memory_buffer(
-            ).get_tensor(dim_size, input.dtype, "mpu")
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             handle = torch.distributed._all_gather_base(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
             )
@@ -413,8 +405,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     total_input, grad_output, weight.main_grad
                 )
             else:
-                raise RuntimeError(
-                    "Unsupported gradient type for gradient accumulation fusion")
+                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
             if hasattr(weight, 'grad_added_to_main_grad'):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
@@ -647,8 +638,7 @@ class ColumnParallelLinear(torch.nn.Module):
         if bias:
             if config.use_cpu_initialization:
                 self.bias = Parameter(
-                    torch.empty(self.output_size_per_partition,
-                                dtype=config.params_dtype)
+                    torch.empty(self.output_size_per_partition, dtype=config.params_dtype)
                 )
             else:
                 self.bias = Parameter(
@@ -834,8 +824,7 @@ class RowParallelLinear(torch.nn.Module):
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and not self.input_is_parallel:
-            raise RuntimeError(
-                "To enable `sequence_parallel`, `input_is_parallel` must be `True`")
+            raise RuntimeError("To enable `sequence_parallel`, `input_is_parallel` must be `True`")
 
         # Parameters.
         # Note: torch.nn.functional.linear performs XA^T + b and as a result
@@ -880,8 +869,7 @@ class RowParallelLinear(torch.nn.Module):
 
         if bias:
             if config.use_cpu_initialization:
-                self.bias = Parameter(torch.empty(
-                    self.output_size, dtype=config.params_dtype))
+                self.bias = Parameter(torch.empty(self.output_size, dtype=config.params_dtype))
             else:
                 self.bias = Parameter(
                     torch.empty(

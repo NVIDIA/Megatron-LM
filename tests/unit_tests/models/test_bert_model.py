@@ -8,6 +8,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.bert.bert_model import BertModel
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
 class TestBertodel:
 
@@ -16,7 +17,7 @@ class TestBertodel:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         #TODO : Tests wont run properly becaues Pooler layer uses get_args(). Will get it resolved and fix tests accordingly
-        self.bert_model = BertModel(config=transformer_config, vocab_size=100, max_sequence_length=4)
+        self.bert_model = BertModel(config=transformer_config, transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()    
