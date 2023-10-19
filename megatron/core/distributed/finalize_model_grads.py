@@ -1,19 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from typing import List
+
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from .. import parallel_state
+from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
 
-def _allreduce_word_embedding_grads(model, config):
+def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce word embedding grads.
 
-    Reduce grads across first and last stages to ensure that word_embeddings
-    parameters stay in sync. This should only run for models that support
-    pipelined model parallelism (BERT and GPT-2).
+    Reduce grads across first and last stages to ensure that word_embeddings parameters stay in
+    sync. This should only run for models that support pipelined model parallelism (BERT and GPT).
     """
 
     if (
@@ -39,12 +41,11 @@ def _allreduce_word_embedding_grads(model, config):
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
 
-def _allreduce_position_embedding_grads(model, config):
+def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
-    All-reduce position_embeddings grad across first (encoder) and
-    split (decoder) stages to ensure that position embeddings parameters
-    stay in sync. This should only run for T5 models with pipeline
-    parallelism.
+    All-reduce position_embeddings grad across first (encoder) and split (decoder) stages to
+    ensure that position embeddings parameters stay in sync. This should only run for T5 models
+    with pipeline parallelism.
     """
     if (
         parallel_state.is_rank_in_position_embedding_group()
@@ -58,14 +59,18 @@ def _allreduce_position_embedding_grads(model, config):
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 
-def _allreduce_embedding_grads(model, config):
-    """All-reduce both word and position embeddings."""
+def _allreduce_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce both word and position embeddings.
+    """
     _allreduce_word_embedding_grads(model, config)
     _allreduce_position_embedding_grads(model, config)
 
 
-def _allreduce_layernorm_grads(model, config):
-    """All-reduce layernorm grads (for sequence parallelism)."""
+def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce layernorm grads (for sequence parallelism).
+    """
 
     # All-reduce layernorm parameters across model parallel nodes
     # when sequence parallelism is used
@@ -84,8 +89,10 @@ def _allreduce_layernorm_grads(model, config):
             buf.copy_(synced)
 
 
-def _allreduce_expert_grads(model, config):
-    """All-reduce expert grads (for expert parallelism)."""
+def _allreduce_expert_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce expert grads (for expert parallelism).
+    """
 
     # All-reduce switchmlp parameters across data modulo expert parallel nodes
     if (
@@ -106,10 +113,12 @@ def _allreduce_expert_grads(model, config):
             buf.copy_(synced)
 
 
-def finalize_model_grads(model):
-    """All-reduce all grads across DP replicas, layernorm grads
-    for sequence parallelism, and embedding grads across first and
-    last pipeline stages (if not tied)."""
+def finalize_model_grads(model: List[torch.nn.Module]):
+    """
+    All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
+    embedding grads across first and last pipeline stages (if not tied), and expert grads
+    for expert parallelism.
+    """
 
     config = get_model_config(model[0])
 
@@ -130,7 +139,7 @@ def finalize_model_grads(model):
     if config.timers is not None:
         config.timers('layernorm-grads-all-reduce').stop()
 
-    # All-reduce embedding grads.
+    # All-reduce embedding grads (for pipeline parallelism).
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
