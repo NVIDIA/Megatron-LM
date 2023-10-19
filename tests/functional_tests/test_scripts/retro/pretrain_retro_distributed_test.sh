@@ -17,7 +17,10 @@ set -x
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data/retro_data; fi
 
-GPUS_PER_NODE=8
+# >>>
+# GPUS_PER_NODE=8
+GPUS_PER_NODE=1
+# <<<
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
