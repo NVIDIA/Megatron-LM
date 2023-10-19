@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --partition=luna
 
-DATA_PATH=/workspace/data/retro_data/my-retro_00_text_document
+DATA_PATH=/workspace/data/retro_data/inputs/wiki-200k_text_document
 CHECKPOINT_PATH=/workspace/checkpoints
 TENSORBOARD_DIR=/workspace/tensorboard_logs
 SCRIPTS_DIR=/workspace/debug
