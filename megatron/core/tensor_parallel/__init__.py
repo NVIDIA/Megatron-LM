@@ -1,4 +1,5 @@
 from .cross_entropy import vocab_parallel_cross_entropy
+from .max_z import vocab_parallel_max_z
 from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,
@@ -29,6 +30,8 @@ from .utils import (
 __all__ = [
     # cross_entropy.py
     "vocab_parallel_cross_entropy",
+    # max_z.py
+    "vocab_parallel_max_z",
     # data.py
     "broadcast_data",
     # layers.py
