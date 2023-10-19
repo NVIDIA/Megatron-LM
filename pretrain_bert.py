@@ -44,6 +44,7 @@ def model_provider(pre_process=True, post_process=True):
             max_sequence_length=args.max_position_embeddings,
             # num_tokentypes=0, #TODO : num_tokentypes This is sent in original bert and gpt model
             add_binary_head=args.bert_binary_head,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process)

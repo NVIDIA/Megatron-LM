@@ -38,7 +38,7 @@ class BertLMHead(MegatronModule):
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
-        # TODO: Shoudl switch this to TELinear ? Or club this sand the LayerNorm to TELayerNormColumnParallelLinear ?
+        # TODO: Shoudl switch this to TE ?
         self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method)
 
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)

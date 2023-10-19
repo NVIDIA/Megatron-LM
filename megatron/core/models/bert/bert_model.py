@@ -110,7 +110,7 @@ class BertModel(LanguageModule):
 
             self.binary_head = None
             if self.add_binary_head:
-                # TODO: Shoudl switch this to TELinear ?
+                # TODO: Shoudl switch this to TE ?
                 self.binary_head = get_linear_layer(config.hidden_size, 2, config.init_method)
 
                 self.pooler = Pooler(
@@ -204,7 +204,7 @@ class BertModel(LanguageModule):
                     'shared_embedding_or_output_weight() called for last '
                     'stage, but share_embeddings_and_output_weights is false'
                 )
-            return self.embedding.word_embeddings.weight
+            return self.lm_head.output_layer.weight
 
     # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
