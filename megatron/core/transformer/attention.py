@@ -231,7 +231,6 @@ class Attention(MegatronModule, ABC):
             q_pos_emb, k_pos_emb = rotary_pos_emb
             query = apply_rotary_pos_emb(query, q_pos_emb)
             key = apply_rotary_pos_emb(key, k_pos_emb)
-            value = value.contiguous()
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
