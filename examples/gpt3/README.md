@@ -7,24 +7,28 @@
 
 ## 1. Training setup
 <a id="markdown-training-setup" name="training-setup"></a>
-To run the model on Selene 
+
+To run the model using a docker container run it as follows
 ```
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:23.09-py3
-ACCOUNT_NAME=""
-PARTITION=""
-JOB_NAME=""
-NUM_NODES=1
 CHECKPOINT_PATH="" #<Specify path>
 TENSORBOARD_LOGS_PATH=""#<Specify path>
 VOCAB_FILE="" #<Specify path to file>/gpt2-vocab.json
 MERGE_FILE="" #<Specify path to file>/gpt2-merges.txt
 DATA_PATH="" #<Specify path and file prefix>_text_document
 
-srun -N $NUM_NODES --container-image $PYTORCH_IMAGE --container-mounts "/path/to/data:/path/to/data,/path/to/megatron-lm:/workspace/megatron-lm" --account $ACCOUNT -N 1 -J $JOB_NAME  -p $PARTITION --no-container-mount-home  -c "
-  cd /workspace/megatron-lm
-  ./examples/gpt3/train_gpt3_175b_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $MERGE_FILE $DATA_PATH"
+docker run \
+  --gpus=all \
+  --ipc=host \
+  --workdir /workspace/megatron-lm \
+  -v /path/to/data:/path/to/data \
+  -v /path/to/megatron-lm:/workspace/megatron-lm \
+  megatron-lm nvcr.io/nvidia/pytorch:23.04-py3 \
+  bash /examples/gpt3/train_gpt3_175b_distributed.sh $CHECKPOINT_PATH $TENSORBOARD_LOGS_PATH $VOCAB_FILE $MERGE_FILE $DATA_PATH "
 
 ```
+NOTE: Depending on the environment you are running it the above command might like slightly different.
+
 
 ## 2. Configurations
 <a id="markdown-configurations" name="configurations"></a>
@@ -51,10 +55,3 @@ The example in this folder shows you how to run 175B model. There are other conf
        --pipeline-model-parallel-size 1 \
 
 ```
-
-## 3. Training Results
-<a id="markdown-training-results" name="training-results"></a>
-The following is the results we got for the 175B model on <FILLHERE> data. 
-// Insert Loss curve here
-TRAINING ITERATION TIME : <FILLHERE>
-// If possible talk about linear scaling. 
