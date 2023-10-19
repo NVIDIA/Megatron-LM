@@ -15,7 +15,7 @@ echo "---------------------------------"
 
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
-if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data/retro_data; fi
+if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data; fi
 
 # >>>
 # GPUS_PER_NODE=8
@@ -86,9 +86,9 @@ ARGS=" \
     --eval-iters 100 \
     --eval-interval 2000 \
     --tokenizer-type GPT2BPETokenizer \
-    --vocab-file $DATA_DIR/vocab/gpt2-vocab.json \
-    --merge-file $DATA_DIR/vocab/gpt2-merges.txt \
-    --data-path $DATA_DIR/inputs/wiki-200k_text_document \
+    --vocab-file $DATA_DIR/retro_data/vocab/gpt2-vocab.json \
+    --merge-file $DATA_DIR/retro_data/vocab/gpt2-merges.txt \
+    --data-path $DATA_DIR/retro_data/inputs/wiki-200k_text_document \
     --split 98,2,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
@@ -102,7 +102,7 @@ ARGS=" \
     --${TRAINING_DTYPE} \
     ${USE_MCORE:+--use-mcore-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
-    --retro-workdir $DATA_DIR/neighbors \
+    --retro-workdir $DATA_DIR/retro_data/neighbors \
     --retro-add-retriever \
     --num-workers 32 \
 "
