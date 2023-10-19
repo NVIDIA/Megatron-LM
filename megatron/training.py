@@ -874,6 +874,17 @@ def evaluate(forward_step_func,
 
             args.consumed_valid_samples += eval_batch_size
 
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    print_rank_0('Exiting during evaluation, timelimit reached')
+                    return None, None, True
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -886,6 +897,9 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
+        
+        
+
 
     # Move model back to the train mode.
     for model_module in model:
@@ -894,7 +908,7 @@ def evaluate(forward_step_func,
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
 
-    return total_loss_dict, collected_non_loss_data
+    return total_loss_dict, collected_non_loss_data, False
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
@@ -909,9 +923,12 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data = evaluate(
+    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
+    # Timelimit hit during evaluation
+    if timelimit:
+        return
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
