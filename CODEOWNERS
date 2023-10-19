@@ -1,3 +1,9 @@
-megatron/core/ @shanmugamr @maanug
+@test_and_doc_group = @shanmugamr @maanug
+@adlr_group = @jcasper
+@nemo_group = @eharper
 
-tests/ @shanmugamr @maanug
+megatron/core/ @test_and_doc_group @adlr_group @nemo_group
+
+tests/ @test_and_doc_group
+
+megatron/core/ @test_and_doc_group @adlr_group @nemo_group -codeowners
