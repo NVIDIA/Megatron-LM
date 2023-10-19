@@ -7,6 +7,7 @@ import glob
 from tensorboard.backend.event_processing import event_accumulator
 
 LOGS_DIR = os.getenv('LOGS_DIR')
+STEP_INTERVAL = 5
 
 def read_tb_logs_as_list(path, summary_name, index):
     files = glob.glob(f"{path}/events*tfevents*")
@@ -26,7 +27,7 @@ def collect_train_test_metrics(logs_dir, index):
     train_loss_list = read_tb_logs_as_list(logs_dir, "lm loss", index)
     train_loss_list = [round(elem,3) for elem in train_loss_list]
     train_metrics = {
-        "lm loss": train_loss_list[0:len(train_loss_list):5],
+        "lm loss": train_loss_list[0:len(train_loss_list):STEP_INTERVAL],
     } 
     str_train_metrics = str(train_metrics).replace("'", "\"")
     print(f"\n ----------- The following are the metrics for ----------")
@@ -40,8 +41,12 @@ class TestCIPipeline:
 
     def _test_helper(self, loss_type):
         expected = self.train_metrics_100[loss_type]
+        assert len(expected) == 100 // STEP_INTERVAL, \
+            f"Train metrics from first run (before checkpoint load) should have {100 // STEP_INTERVAL} elements"
         print('expected : '  + str(expected))
         actual = self.train_metrics_50_to_100[loss_type]
+        assert len(actual) == 50 // STEP_INTERVAL, \
+            f"Train metrics from second run (after checkpoint load) should have {50 // STEP_INTERVAL} elements"
         print('actual : '  + str(actual))
         # NOTE : Doing this way because in gpt3 model when I run from 0 - 100 directly, it produces 1 extra element
         # i.e expected is [10.84266, 10.89696, 10.90542, 10.87498, 10.86265, 10.83608, 10.64368, 10.62319, 10.53908, 10.25005, 10.20907, 9.96542, 9.96802, 9.92436, 9.79086, 9.26718, 9.61784, 9.19018, 9.45986, 9.62168, 9.73772, 8.85732, 9.43185, 9.27912, 9.6832, 9.5127, 9.5419, 9.02549, 8.55077, 8.91355, 8.83375, 9.17722, 9.22436, 9.19436, 9.11323, 9.09711, 9.04421, 9.36795]

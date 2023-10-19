@@ -775,7 +775,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+                break
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
@@ -796,7 +796,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
-                sys.exit()
+                break
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
@@ -805,12 +805,20 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
-            sys.exit()
+            break
 
         if args.profile and \
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+
+    # Flush TensorBoard and WandB writers.
+    writer = get_tensorboard_writer()
+    if writer:
+        writer.flush()
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
 
     return iteration
 
