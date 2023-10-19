@@ -16,6 +16,7 @@ set -x
 if [[ -z $MBS ]]; then MBS=4; fi
 # >>>
 # if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data/retro_data; fi
 # <<<
 
 GPUS_PER_NODE=8
