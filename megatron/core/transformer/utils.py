@@ -72,7 +72,9 @@ def make_sharded_tensors_for_checkpoint(
         sharded_key = f'{sharded_key_prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
-            make_sharded_object_for_checkpoint(tensor, sharded_key, sharded_offsets)
+            sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
+                tensor, sharded_key, sharded_offsets
+            )
 
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
