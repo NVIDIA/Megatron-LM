@@ -66,8 +66,8 @@ class TestGPTModelReconfiguration:
     ])
     def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
         """ Test model saving and loading with different TP/PP """
-        with (TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A,
-              TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A') as ckpt_dir_A, \
+             TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
             Utils.initialize_model_parallel(*src_tp_pp)
             gpt_model_A = initialize_gpt_model()
@@ -91,8 +91,8 @@ class TestGPTModelReconfiguration:
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 4)
-        with (TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A,
-              TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A, \
+             TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B:
             gpt_model_A = initialize_gpt_model()
             save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
             gpt_model_B = initialize_gpt_model()
