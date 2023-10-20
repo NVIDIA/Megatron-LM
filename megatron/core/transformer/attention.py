@@ -337,20 +337,14 @@ class SelfAttention(Attention):
         return query, key, value
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
-        if sharded_key_prefix is None:
-            sharded_key_prefix = prefix
-
-        tensor_parallel_layers_axis_map = {
-            'linear_qkv.weight': 0,
-            'linear_qkv.bias': 0,
-            'linear_proj.weight': 1,
-        }
-
-        state_dict = self.state_dict(prefix='', keep_vars=True)
-
-        sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_key_prefix, tensor_parallel_layers_axis_map, sharded_offsets
-        )
+        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
+        sharded_state_dict = {}
+        for name, module in (
+                ('linear_qkv', self.linear_qkv),
+                ('linear_proj', self.linear_proj),
+        ):
+            sub_sd = module.sharded_state_dict(prefix=f'{prefix}{name}.', sharded_key_prefix=f'{sharded_key_prefix}{name}.', sharded_offsets=sharded_offsets)
+            sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
 
