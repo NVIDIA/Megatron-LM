@@ -544,7 +544,7 @@ train.retro_core.tp1_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: LRETRO
+    TEST_LEVEL: L0
 
 resume.checkpoint.retro_core.tp1_pp1_1node_50steps:
   <<: *selene-test-resume-checkpoint-launcher
@@ -558,7 +558,7 @@ resume.checkpoint.retro_core.tp1_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "30:00"
-    TEST_LEVEL: LRETRO
+    TEST_LEVEL: L0
 
 cleanup.selene:
   tags:
