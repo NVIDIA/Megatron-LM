@@ -355,6 +355,9 @@ def validate_args(args, defaults={}):
 
         # Load retro args.
         retro_args_path = get_retro_args_path(args.retro_workdir)
+        # >>>
+        print("*** retro_args_path = '%s'. ***" % retro_args_path)
+        # <<<
         assert os.path.exists(retro_args_path), "retro workdir missing args.json"
         with open(retro_args_path) as f:
             retro_args = types.SimpleNamespace(**json.load(f))

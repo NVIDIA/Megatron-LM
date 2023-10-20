@@ -102,7 +102,7 @@ ARGS=" \
     --${TRAINING_DTYPE} \
     ${USE_MCORE:+--use-mcore-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
-    --retro-workdir /workspace/data/retro_data/
+    --retro-workdir /workspace/data/retro_data/neighbors
     --retro-add-retriever \
     --num-workers 32 \
 "
