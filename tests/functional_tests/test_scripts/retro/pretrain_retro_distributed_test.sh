@@ -78,7 +78,7 @@ ARGS=" \
     --lr 2.5e-5 \
     --min-lr 2.5e-6 \
     --lr-decay-style cosine \
-    --log-interval 1 \
+    --log-interval 5 \
     --eval-iters 100 \
     --eval-interval 2000 \
     --tokenizer-type GPT2BPETokenizer \
