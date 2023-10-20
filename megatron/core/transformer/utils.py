@@ -2,12 +2,12 @@
 
 """Utilities for transformer layers."""
 from operator import itemgetter
-from typing import Dict, Iterable, Tuple, Optional, Any, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import StateDict, ShardedObject
+from megatron.core.dist_checkpointing.mapping import ShardedObject, StateDict
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
@@ -89,11 +89,11 @@ def make_sharded_tensors_for_checkpoint(
 
 
 def make_sharded_object_for_checkpoint(
-        obj: Any,
-        key: str,
-        sharded_offsets: Iterable[Tuple[int, int, int]] = (),
-        replica_id: Union[None, int, Tuple[int, ...]] = None,
-        **kwargs
+    obj: Any,
+    key: str,
+    sharded_offsets: Iterable[Tuple[int, int, int]] = (),
+    replica_id: Union[None, int, Tuple[int, ...]] = None,
+    **kwargs,
 ):
     """ Helper for instantiating a non-sharded ShardedObject (replicated across TP and DP group).
 
@@ -112,18 +112,19 @@ def make_sharded_object_for_checkpoint(
             parallel_state.get_data_parallel_rank(),
         )
 
-    return ShardedObject(
-        key, obj, *_get_extra_state_offsets(sharded_offsets), replica_id, **kwargs
-    )
+    return ShardedObject(key, obj, *_get_extra_state_offsets(sharded_offsets), replica_id, **kwargs)
 
 
-def _get_extra_state_offsets(sharded_offsets: Iterable[Tuple[int, int, int]]) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+def _get_extra_state_offsets(
+    sharded_offsets: Iterable[Tuple[int, int, int]]
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
     """ Turns ShardedTensor offsets into offsets suitable for ShardedObject. """
     if sharded_offsets:
-        sharded_offsets = sorted(sharded_offsets,
-                                 key=itemgetter(0))  # sort by axis
+        sharded_offsets = sorted(sharded_offsets, key=itemgetter(0))  # sort by axis
         axis, extra_state_offset, extra_state_shape = zip(*sharded_offsets)
-        assert list(axis) == list(range(len(axis))), f'Expected contiguous axis for offsets: {sharded_offsets}'
+        assert list(axis) == list(
+            range(len(axis))
+        ), f'Expected contiguous axis for offsets: {sharded_offsets}'
     else:
         extra_state_shape = (1,)
         extra_state_offset = (0,)

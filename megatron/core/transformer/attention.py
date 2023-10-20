@@ -340,10 +340,14 @@ class SelfAttention(Attention):
         sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
         sharded_state_dict = {}
         for name, module in (
-                ('linear_qkv', self.linear_qkv),
-                ('linear_proj', self.linear_proj),
+            ('linear_qkv', self.linear_qkv),
+            ('linear_proj', self.linear_proj),
         ):
-            sub_sd = module.sharded_state_dict(prefix=f'{prefix}{name}.', sharded_key_prefix=f'{sharded_key_prefix}{name}.', sharded_offsets=sharded_offsets)
+            sub_sd = module.sharded_state_dict(
+                prefix=f'{prefix}{name}.',
+                sharded_key_prefix=f'{sharded_key_prefix}{name}.',
+                sharded_offsets=sharded_offsets,
+            )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
