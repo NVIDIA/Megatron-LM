@@ -15,7 +15,6 @@ echo "---------------------------------"
 
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
-# if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data; fi
 
 # >>>
 # GPUS_PER_NODE=8
@@ -86,9 +85,9 @@ ARGS=" \
     --eval-iters 100 \
     --eval-interval 2000 \
     --tokenizer-type GPT2BPETokenizer \
-    --vocab-file $DATA_DIR/retro_data/vocab/gpt2-vocab.json \
-    --merge-file $DATA_DIR/retro_data/vocab/gpt2-merges.txt \
-    --data-path $DATA_DIR/retro_data/inputs/wiki-200k_text_document \
+    --vocab-file /workspace/data/retro_data/vocab/gpt2-vocab.json \
+    --merge-file /workspace/data/retro_data/vocab/gpt2-merges.txt \
+    --data-path /workspace/data/retro_data/inputs/wiki-200k_text_document \
     --split 98,2,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
@@ -106,9 +105,6 @@ ARGS=" \
     --retro-add-retriever \
     --num-workers 32 \
 "
-# >>>
-#     --retro-workdir $DATA_DIR/retro_data/neighbors \
-# <<<
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     pretrain_retro.py \
