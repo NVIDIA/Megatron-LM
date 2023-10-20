@@ -36,11 +36,10 @@ from megatron.data.indexed_dataset import MMapIndexedDataset
 
 DSET_TYPE_BERT = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
-DSET_TYPE_T5 = 't5'
+DSET_TYPE_T5  = 't5'
 DSET_TYPE_MULTIMODAL = 'multimodal'
 
-DSET_TYPES = [DSET_TYPE_BERT, DSET_TYPE_ICT,
-              DSET_TYPE_T5, DSET_TYPE_MULTIMODAL]
+DSET_TYPES = [DSET_TYPE_BERT, DSET_TYPE_ICT, DSET_TYPE_T5, DSET_TYPE_MULTIMODAL]
 
 
 def get_datasets_weights_and_num_samples(data_prefix,
@@ -70,7 +69,7 @@ def get_datasets_weights_and_num_samples(data_prefix,
         for weight in weights:
             datasets_train_valid_test_num_samples.append(
                 [int(math.ceil(val * weight * 1.005))
-                 for val in train_valid_test_num_samples])
+                for val in train_valid_test_num_samples])
     else:
         # Used when separate dataset files are provided for train,
         # valid and test
@@ -128,7 +127,7 @@ def get_a_and_b_segments(sample, np_rng):
 
 def truncate_segments(tokens_a, tokens_b, len_a, len_b, max_num_tokens, np_rng):
     """Truncates a pair of sequences to a maximum sequence length."""
-    # print(len_a, len_b, max_num_tokens)
+    #print(len_a, len_b, max_num_tokens)
     assert len_a > 0
     if len_a + len_b <= max_num_tokens:
         return False
@@ -313,16 +312,14 @@ def create_masked_lm_predictions(tokens,
                         masked_token = tokens[index]
                     # 10% of the time, replace with random word
                     else:
-                        masked_token = vocab_id_list[np_rng.randint(
-                            0, len(vocab_id_list))]
+                        masked_token = vocab_id_list[np_rng.randint(0, len(vocab_id_list))]
             elif masking_style == "t5":
                 masked_token = mask_id
             else:
                 raise ValueError("invalid value of masking style")
 
             output_tokens[index] = masked_token
-            masked_lms.append(MaskedLmInstance(
-                index=index, label=tokens[index]))
+            masked_lms.append(MaskedLmInstance(index=index, label=tokens[index]))
 
         masked_spans.append(MaskedLmInstance(
             index=index_set,
@@ -378,8 +375,7 @@ def create_masked_lm_predictions(tokens,
 
         for src_i, tgt_i in zip(select_indexes, permute_indexes):
             output_tokens[src_i] = orig_token[tgt_i]
-            masked_lms.append(MaskedLmInstance(
-                index=src_i, label=orig_token[src_i]))
+            masked_lms.append(MaskedLmInstance(index=src_i, label=orig_token[src_i]))
 
     masked_lms = sorted(masked_lms, key=lambda x: x.index)
     # Sort the spans by the index of the first span
@@ -508,16 +504,13 @@ def build_train_valid_test_datasets(data_prefix, splits_string,
     # Blend.
     blending_train_dataset = None
     if train_datasets:
-        blending_train_dataset = BlendableDataset(
-            train_datasets, weights, train_num_samples)
+        blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples)
     blending_valid_dataset = None
     if valid_datasets:
-        blending_valid_dataset = BlendableDataset(
-            valid_datasets, weights, valid_num_samples)
+        blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples)
     blending_test_dataset = None
     if test_datasets:
-        blending_test_dataset = BlendableDataset(
-            test_datasets, weights, test_num_samples)
+        blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples)
 
     return (blending_train_dataset, blending_valid_dataset,
             blending_test_dataset)
@@ -583,7 +576,7 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
             assert indexed_dataset.doc_idx.shape[0] == \
                 (total_num_of_documents + 1)
         return dataset
-
+    
     train_dataset = build_split_dataset(0, 'train')
     valid_dataset = build_split_dataset(1, 'valid')
     test_dataset = build_split_dataset(2, 'test')
@@ -717,7 +710,6 @@ def get_train_valid_test_split_(splits_string, size):
     assert splits_index[-1] == size
     return splits_index
 
-
 def get_samples_mapping(indexed_dataset,
                         data_prefix,
                         num_epochs,
@@ -789,8 +781,7 @@ def get_samples_mapping(indexed_dataset,
     # parallel case
     counts = torch.cuda.LongTensor([1])
     torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    torch.distributed.all_reduce(
-        counts, group=mpu.get_pipeline_model_parallel_group())
+    torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     assert counts[0].item() == (
         torch.distributed.get_world_size() //
         torch.distributed.get_world_size(group=mpu.get_tensor_model_parallel_group()))
@@ -799,8 +790,7 @@ def get_samples_mapping(indexed_dataset,
     print_rank_0(' > loading indexed mapping from {}'.format(
         indexmap_filename))
     start_time = time.time()
-    samples_mapping = np.load(
-        indexmap_filename, allow_pickle=True, mmap_mode='r')
+    samples_mapping = np.load(indexmap_filename, allow_pickle=True, mmap_mode='r')
     print_rank_0('    loaded indexed file in {:3.3f} seconds'.format(
         time.time() - start_time))
     print_rank_0('    total number of samples: {}'.format(
