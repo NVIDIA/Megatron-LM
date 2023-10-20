@@ -15,7 +15,7 @@ echo "---------------------------------"
 
 set -x
 if [[ -z $MBS ]]; then MBS=4; fi
-if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data; fi
+# if [[ -z $DATA_DIR ]]; then DATA_DIR=/workspace/data; fi
 
 # >>>
 # GPUS_PER_NODE=8
@@ -102,10 +102,13 @@ ARGS=" \
     --${TRAINING_DTYPE} \
     ${USE_MCORE:+--use-mcore-models} \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
-    --retro-workdir $DATA_DIR/retro_data/neighbors \
+    --retro-workdir /workspace/data/retro_data/
     --retro-add-retriever \
     --num-workers 32 \
 "
+# >>>
+#     --retro-workdir $DATA_DIR/retro_data/neighbors \
+# <<<
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     pretrain_retro.py \
