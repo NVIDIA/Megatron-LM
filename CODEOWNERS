@@ -1,9 +1,13 @@
-[ADLR] @adlr
+@test_and_doc_group = @shanmugamr @maanug
+@adlr_group = @jcasper
+@nemo_group = @eharper
+
+[ADLR] @adlr_group
 *
 
-[Nemo] @nemo
+[Nemo] @nemo_group
 /megatron/core
 
-[Doc-test] @doc-test
+[Doc-test] @test_and_doc_group
 /megatron/core
 /tests
