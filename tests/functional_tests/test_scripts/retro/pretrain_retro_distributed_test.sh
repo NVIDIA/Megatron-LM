@@ -93,6 +93,12 @@ ARGS=" \
     --init-method-std 0.007 \
     --log-params-norm \
     --log-num-zeros-in-grad \
+    --log-validation-ppl-to-tensorboard \
+    --log-timers-to-tensorboard \
+    --tensorboard-dir ${TENSORBOARD_DIR} \
+    --save-interval 10000 \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH \
     --bf16 \
     --transformer-impl $TRANSFORMER_IMPL \
     --${TRAINING_DTYPE} \
