@@ -11,7 +11,7 @@ class _VocabParallelMaxZ(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits):
         # Maximum value along vocab dimension across all GPUs.
-        global_logits_values = torch.max(vocab_parallel_logits, dim=-1)
+        global_logits_values = torch.max(vocab_parallel_logits, dim=-1)[0]
 
         torch.distributed.all_reduce(
             global_logits_values, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
