@@ -1,4 +1,5 @@
 #! /bin/bash
+
 echo "------ARGUMENTS LIST --------"
 for ARGUMENT in "$@"
 do
@@ -20,95 +21,83 @@ NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+pip install h5py
+pip install transformers
+pip install faiss-gpu
 
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
+# Arguments.
+ARGS=" \
+    --recompute-activations \
+    --use-flash-attn \
+    --apply-layernorm-1p \
+    --untie-embeddings-and-output-weights \
+    --disable-bias-linear \
+    --no-position-embedding \
+    --use-rotary-position-embeddings \
+    --rotary-percent 0.5 \
+    --swiglu \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --exit-duration-in-mins 220 \
+    --tensor-model-parallel-size $TP_SIZE \
+    --pipeline-model-parallel-size 1 \
+    --num-layers 24 \
+    --hidden-size 1024 \
+    --num-attention-heads 16 \
+    --seq-length 2048 \
+    --max-position-embeddings 2048 \
+    --micro-batch-size $MBS \
+    --global-batch-size 256 \
+    --train-samples 100000 \
+    --lr-decay-samples 99000 \
+    --lr-warmup-samples 1000 \
+    --lr 2.5e-5 \
+    --min-lr 2.5e-6 \
+    --lr-decay-style cosine \
+    --log-interval 5 \
+    --eval-iters 100 \
+    --eval-interval 2000 \
+    --tokenizer-type GPT2BPETokenizer \
+    --vocab-file /workspace/data/retro_data/vocab/gpt2-vocab.json \
+    --merge-file /workspace/data/retro_data/vocab/gpt2-merges.txt \
+    --data-path /workspace/data/retro_data/inputs/wiki-200k_text_document \
+    --split 98,2,0 \
+    --clip-grad 1.0 \
+    --weight-decay 0.1 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --init-method-std 0.007 \
+    --log-params-norm \
+    --log-num-zeros-in-grad \
+    --log-validation-ppl-to-tensorboard \
+    --log-timers-to-tensorboard \
+    --tensorboard-dir ${TENSORBOARD_DIR} \
+    --save-interval 50 \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH \
+    --bf16 \
+    --transformer-impl $TRANSFORMER_IMPL \
+    --${TRAINING_DTYPE} \
+    ${USE_MCORE:+--use-mcore-models} \
+    ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
+    --retro-workdir /workspace/data/retro_data/neighbors
+    --retro-add-retriever \
+    --num-workers 32 \
+"
+
 # Run for 100 iterations and save checkpoint at 50
 torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
-       --exit-interval 100 \
-       --use-checkpoint-args \
-       --use-checkpoint-opt_param-scheduler \
-       --num-layers 12 \
-       --hidden-size 512 \
-       --num-attention-heads 8 \
-       --log-params-norm \
-       --log-num-zeros-in-grad \
-       --log-validation-ppl-to-tensorboard \
-       --log-timers-to-tensorboard \
-       --tensorboard-dir ${TENSORBOARD_DIR} \
-       --micro-batch-size 4 \
-       --global-batch-size 32 \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
-       --train-samples 100000 \
-       --lr-decay-samples 99000 \
-       --lr-warmup-samples 1000 \
-       --eval-iters 100 \
-       --eval-interval 2000 \
-       --timing-log-level 2 \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH \
-       --vocab-file /workspace/data/retro_data/gpt2-vocab.json \
-       --merge-file /workspace/data/retro_data/gpt2-merges.txt \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.00015 \
-       --lr-decay-style cosine \
-       --min-lr 1.0e-5 \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --log-interval 1 \
-       --save-interval 50 \
-       --tensor-model-parallel-size $TP_SIZE \
-       --pipeline-model-parallel-size $PP_SIZE \
-       --no-gradient-accumulation-fusion \
-       --fp16
+       $ARGS \
+       --exit-interval 100
 
 echo 50 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
 # Resume from 50th iteration ckpt and continue to 100 iterations
 torchrun $DISTRIBUTED_ARGS \
        pretrain_retro.py \
-       --exit-interval 100 \
-       --use-checkpoint-args \
-       --use-checkpoint-opt_param-scheduler \
-       --num-layers 12 \
-       --hidden-size 512 \
-       --num-attention-heads 8 \
-       --log-params-norm \
-       --log-num-zeros-in-grad \
-       --log-validation-ppl-to-tensorboard \
-       --log-timers-to-tensorboard \
-       --tensorboard-dir ${TENSORBOARD_DIR} \
-       --micro-batch-size 4 \
-       --global-batch-size 32 \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
-       --train-samples 100000 \
-       --lr-decay-samples 99000 \
-       --lr-warmup-samples 1000 \
-       --eval-iters 100 \
-       --eval-interval 2000 \
-       --timing-log-level 2 \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH \
-       --vocab-file /workspace/data/retro_data/gpt2-vocab.json \
-       --merge-file /workspace/data/retro_data/gpt2-merges.txt \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.00015 \
-       --lr-decay-style cosine \
-       --min-lr 1.0e-5 \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --log-interval 1 \
-       --save-interval 10000 \
-       --tensor-model-parallel-size $TP_SIZE \
-       --pipeline-model-parallel-size $PP_SIZE \
-       --no-gradient-accumulation-fusion \
-       --fp16
-
+       $ARGS \
+       --exit-interval 50
