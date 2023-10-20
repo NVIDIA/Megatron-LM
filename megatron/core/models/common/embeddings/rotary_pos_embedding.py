@@ -9,9 +9,23 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_block import TransformerBlock
 
 import torch
-from torch import Tensor, einsum, nn
+from torch import Tensor, nn
+
+from megatron.core import parallel_state
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
+
+
+def get_pos_emb_on_this_cp_rank(pos_emb, seq_dim):
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    cp_idx = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device=pos_emb.device)
+    pos_emb = pos_emb.view(
+        *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
+    )
+    pos_emb = pos_emb.index_select(seq_dim, cp_idx)
+    pos_emb = pos_emb.view(*pos_emb.shape[:seq_dim], -1, *pos_emb.shape[(seq_dim + 2) :])
+    return pos_emb
 
 
 class RotaryEmbedding(nn.Module):
@@ -33,8 +47,13 @@ class RotaryEmbedding(nn.Module):
             dim = int(dim * rotary_percent)
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.inv_freq = 1.0 / (
+            10000
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
+                / dim
+            )
+        )
 
     def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of RoPE embedding.
@@ -46,16 +65,24 @@ class RotaryEmbedding(nn.Module):
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
+        seq = (
+            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            + offset
+        )
+
         if self.seq_len_interpolation_factor is not None:
-            seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
-        freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
+
+        freqs = torch.outer(seq, self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
-        return emb[:, None, None, :]
+        emb = emb[:, None, None, :]
+        if parallel_state.get_context_parallel_world_size() > 1:
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+        return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
@@ -89,6 +116,9 @@ class RotaryEmbedding(nn.Module):
 
             if transformer_config.sequence_parallel:
                 rotary_seq_len *= transformer_config.tensor_model_parallel_size
+
+        rotary_seq_len *= transformer_config.context_parallel_size
+
         return rotary_seq_len
 
 
@@ -125,5 +155,8 @@ def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+
+    t = (t * cos_) + (_rotate_half(t) * sin_)
     return torch.cat((t, t_pass), dim=-1)

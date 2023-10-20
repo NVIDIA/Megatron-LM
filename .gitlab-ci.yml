@@ -23,7 +23,7 @@ unit_tests:
     - pip install pytest-cov
     - pip install pytest_mock
     - pip install nltk
-    - pip install zarr tensorstore  # for distributed checkpointing tests
+    - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -51,45 +51,9 @@ formatting:
   script: &selene-test-resume-launcher-script
     - echo "Running selene resume from checkpoint test. "
     - pwd
-    - export BUILD_DIR=`pwd`
-    - export RUN_NAME=resume_${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes
-    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export TP_SIZE PP_SIZE NUM_NODES MAX_STEPS PYTORCH_IMAGE
-    - export DATA_DIR=$DATA_DIR
-    - echo "Run name is $RUN_NAME"
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
-    - export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
-    - export LOGS_DIR=$BASE_DIR/logs
-    - export RESULTS_DIR=$BASE_DIR/results
-    - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
-    - export OMP_NUM_THREADS=2
-    - export GOTO_NUM_THREADS=2
-    - export OPENBLAS_NUM_THREADS=2
-    - echo "Submitting job"
-    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_resume_checkpoint_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,TP_SIZE,PP_SIZE,NUM_NODES,PYTORCH_IMAGE`
-    - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
-    - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
-    - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
-                "----------WAITING FOR SLURM JOB TO BEGIN-----------\n"
-                "---------------------------------------------------\n"
-                "$(scontrol show job=${SLURM_JOBID})\n"
-                "---------------------------------------------------\n"
-    # Gitlab logs collapsible section markers
-    - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
-    # Follow output of the job
-    - echo "Finished job"
-    - export SLURM_STATE=$(sacct -j "${SLURM_JOBID}" --format State --parsable2 --noheader |& head -n 1)
-    - echo "Slurm job state $SLURM_STATE"
-    - if [[ "$SLURM_STATE" != "COMPLETED" ]]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
-    - source $PYTHON_VIRTUAL_ENV
-    - PYTEST_EXIT=0
-    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py || PYTEST_EXIT=$?
-    - if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR"
+    - echo "$run_cmd"
+    - ${run_cmd}
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
@@ -99,7 +63,6 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
-  retry: 2
 
 .selene_test_launcher: &selene-test-launcher
   tags:
@@ -107,65 +70,10 @@ formatting:
   stage: test
   script: &selene-test-launcher-script
     - echo "Running selene test"
-    - echo "$CI_MERGE_REQUEST_APPROVED"
     - pwd
-    - export BUILD_DIR=`pwd`
-    - |
-      if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
-        echo "Cannot run megatron core and transformer engine together"
-        exit 1
-      fi
-    - RUN_NAME=${RUN_MODEL}_tp${TP_SIZE}_pp${PP_SIZE}_${NUM_NODES}nodes_${MAX_STEPS}steps
-    - if [[ $USE_TE == 1 ]]; then RUN_NAME=${RUN_NAME}_te_enabled; fi
-    - if [[ $USE_CORE == 1 ]]; then RUN_NAME=${RUN_NAME}_core_enabled; fi
-    - if [[ -n $METADATA ]]; then RUN_NAME=${RUN_NAME}_${METADATA}; fi
-    - export $RUN_NAME
-    - echo "In case of error check ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs."
-    - export USE_TE TP_SIZE PP_SIZE NUM_NODES MAX_STEPS VP_SIZE USE_CORE PYTORCH_IMAGE ADDITIONAL_PARAMS
-    - export MBS GBS
-    - export DATA_DIR=$DATA_DIR
-    - echo "Run name is $RUN_NAME"
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs
-    - mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/logs/*
-    - rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
-    - export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
-    - export LOGS_DIR=$BASE_DIR/logs
-    - export RESULTS_DIR=$BASE_DIR/results
-    - export CHECKPOINTS_DIR=$BASE_DIR/checkpoints
-    - export OMP_NUM_THREADS=2
-    - export GOTO_NUM_THREADS=2
-    - export OPENBLAS_NUM_THREADS=2
-    - echo "Submitting job"
-    - sbatch_submission=`sbatch $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,NUM_NODES,MAX_STEPS,VP_SIZE,MBS,GBS,PYTORCH_IMAGE,ADDITIONAL_PARAMS`
-    - export SLURM_JOBID=$(echo $sbatch_submission| grep 'Submitted batch job' | awk '{ print $4 }');
-    - bash $BUILD_DIR/tests/functional_tests/shell_test_utils/jobwait.sh $SLURM_JOBID
-    - \[ ! -z ${SLURM_JOBID} \] && echo -e " --------------------------------------------------\n"
-                "----------WAITING FOR SLURM JOB TO BEGIN-----------\n"
-                "---------------------------------------------------\n"
-                "$(scontrol show job=${SLURM_JOBID})\n"
-                "---------------------------------------------------\n"
-    # Gitlab logs collapsible section markers
-    - echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
-    # Follow output of the job
-    - echo "Finished job"
-    - echo "Slurm log dump start ------------------------------------------------------------"
-    - cat $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
-    - echo "Slurm log dump end --------------------------------------------------------------"
-    - python3 $BUILD_DIR/tests/functional_tests/python_test_utils/check_slurm_job_completion.py $SLURM_JOBID
-    - if [ $? -ne 0 ]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs. Skipping pytest."; exit 1; fi
-    - source $PYTHON_VIRTUAL_ENV
-    - |
-      if [[ "$DISPLAY_OUTPUT" == "True" ]]; then
-        python3 $BUILD_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py $LOGS_DIR $RUN_NAME
-      fi
-    - echo "Checking against ground truth file"
-    - export EXPECTED_METRICS_FILE=$BUILD_DIR/tests/functional_tests/test_results/$RUN_MODEL/$RUN_NAME.json
-    - PYTEST_EXIT=0
-    - pytest $BUILD_DIR/tests/functional_tests/python_test_utils/test_ci_pipeline.py || PYTEST_EXIT=$?
-    - if [[ $PYTEST_EXIT == 0 ]]; then echo "Pytest succeded"; else echo "Pytest failed. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/results directory for result logs"; exit $PYTEST_EXIT; fi
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE"
+    - echo "$run_cmd"
+    - ${run_cmd}
     - echo "Completed the job"
   rules:
     - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
@@ -175,7 +83,6 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
-  retry: 2
 
 train.te_gpt3.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -241,6 +148,20 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
     VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
@@ -272,7 +193,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_swiglu:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -289,7 +209,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_disable_bias_linear:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -306,7 +225,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_untie_embeddings_and_outputs:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -323,7 +241,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_sequence_parallel:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -382,6 +299,20 @@ train.gpt3.345m_tp1_pp4_1node_50steps:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
     VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
@@ -400,6 +331,70 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
 
+train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
 # Note: Core MoE models currently will run TE by default
 train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
   <<: *selene-test-launcher
@@ -409,7 +404,6 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -426,7 +420,6 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -443,7 +436,6 @@ train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 1
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -460,7 +452,6 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
@@ -506,6 +497,18 @@ train.bert.345m_tp1_pp2_1node_50steps:
     TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
