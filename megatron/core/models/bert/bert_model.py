@@ -99,7 +99,6 @@ class BertModel(LanguageModule):
         # Output
         if post_process:
             self.lm_head = BertLMHead(
-                self.shared_embedding_or_output_weight().size(0),
                 config.hidden_size,
                 config,
                 parallel_output,
@@ -107,6 +106,8 @@ class BertModel(LanguageModule):
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
             )
+
+            self.output_layer = self.lm_head.output_layer
 
             self.binary_head = None
             if self.add_binary_head:
@@ -193,18 +194,6 @@ class BertModel(LanguageModule):
         loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss, binary_logits
-
-    def shared_embedding_or_output_weight(self):
-        # TODO : Should check this function
-        if self.pre_process:
-            return self.embedding.word_embeddings.weight
-        else:
-            if not self.share_embeddings_and_output_weights:
-                raise Exception(
-                    'shared_embedding_or_output_weight() called for last '
-                    'stage, but share_embeddings_and_output_weights is false'
-                )
-            return self.lm_head.output_layer.weight
 
     # TODO: add distributed checkpointing
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):

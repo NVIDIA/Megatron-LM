@@ -23,7 +23,6 @@ class BertLMHead(MegatronModule):
 
     def __init__(
         self,
-        mpu_vocab_size: int,
         hidden_size: int,
         config: TransformerConfig,
         parallel_output: bool,
@@ -34,7 +33,10 @@ class BertLMHead(MegatronModule):
         super().__init__(config=config)
 
         self.vocab_size = vocab_size
-        self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
+        # TODO Make sure this is correct. In original bert : 
+        # mpu_vocab_size = self.shared_embedding_or_output_weight().size(0)
+        # self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
+        self.bias = torch.nn.Parameter(torch.zeros(vocab_size))
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
@@ -49,7 +51,7 @@ class BertLMHead(MegatronModule):
         )
 
         self.gelu = torch.nn.functional.gelu
-        # TODO Use activation_func in config to etermine what to use
+        # TODO Use activation_func in config to determine what to use
         # if config.openai_gelu: # Dont have these configs in transfomer config yet
         #    self.gelu = openai_gelu
         # elif config.onnx_safe: # Dont have these configs in transfomer config yet

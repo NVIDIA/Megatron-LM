@@ -100,3 +100,15 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
+            
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Function to share the input embeddings and output logit weights.
+
+        Returns:
+            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
+        """
+        if self.pre_process:
+            return self.embedding.word_embeddings.weight
+        elif self.post_process:
+            return self.output_layer.weight
+        return None
