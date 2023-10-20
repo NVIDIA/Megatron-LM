@@ -23,7 +23,7 @@ unit_tests:
     - pip install pytest-cov
     - pip install pytest_mock
     - pip install nltk
-    - pip install zarr tensorstore  # for distributed checkpointing tests
+    - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:

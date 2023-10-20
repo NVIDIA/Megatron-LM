@@ -29,7 +29,7 @@ def get_default_strategy(action: StrategyAction, backend: str, version: int):
                 import tensorstore
                 import zarr
             except ImportError:
-                hint = ' Please install `zarr` and `tensorstore` packages'
+                hint = ' Please install `zarr` and `tensorstore<=0.1.45` packages'
         raise CheckpointingException(
             f'Cannot find a default strategy for: {(action.value, backend, version)}.{hint}'
         ) from e
