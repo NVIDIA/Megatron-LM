@@ -32,9 +32,8 @@ def core_model_provider(pre_process=True, post_process=True):
     config = core_transformer_config_from_args(args)
 
     # NOTE: Experimental customization feature
-    if args.block_spec is not None:
-        block_spec_func = import_module(args.block_spec)
-        block_spec = block_spec_func()
+    if args.spec is not None:
+        block_spec = import_module(args.spec)()
     else:
         block_spec = get_retro_decoder_block_spec(config, use_transformer_engine=True)
 

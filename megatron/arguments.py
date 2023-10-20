@@ -375,7 +375,7 @@ def validate_args(args, defaults={}):
 
     # MoE Spec check
     if args.num_experts is not None:
-        assert args.model_spec is None, "Model Spec must be None when using MoEs"
+        assert args.spec is None, "Model Spec must be None when using MoEs"
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -1329,12 +1329,11 @@ def _add_vision_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--block-spec',
-                       type=str, default=None, nargs=2,
+    group.add_argument('--spec', type=str, default=None, nargs=2,
                        help='Specify the <module_location function_name> pair '
-                            'that returns a spec to customize the transformer '
-                            'block implementation. For more details, check the'
-                            '`transformer_block.py` file that details the use '
-                            'of spec based customization.')
+                       'that returns a spec to customize a model, transformer '
+                       'block, or transformer layer, depending on the use case. '
+                       'For more details, see the model class, '
+                       '`transformer_block.py`, or `transformer_layer.py`')
 
     return parser
