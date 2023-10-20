@@ -11,10 +11,10 @@ from megatron.core.models.retro.decoder_attention import (
 from megatron.core.models.retro.encoder_spec import get_retro_encoder_block_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer import (
-    get_num_layers_to_build,
     ModuleSpec,
     TransformerBlock,
     TransformerBlockSubmodules,
+    get_num_layers_to_build,
 )
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.custom_layers.transformer_engine import (
@@ -36,12 +36,10 @@ def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> Mo
     provided for the first Retro decoder layer.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
-    spec.submodules.pre_cross_attn_layernorm=TENorm
-    spec.submodules.cross_attention=ModuleSpec(
+    spec.submodules.pre_cross_attn_layernorm = TENorm
+    spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec" : encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec,},
         submodules=CrossAttentionSubmodules(
             linear_q=TEColumnParallelLinear,
             linear_kv=TEColumnParallelLinear,
@@ -49,7 +47,7 @@ def get_retro_decoder_layer_te_spec(encoder_block_spec: ModuleSpec = None) -> Mo
             linear_proj=TERowParallelLinear,
         ),
     )
-    spec.submodules.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
     return spec
 
 
@@ -63,12 +61,10 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
     provided for the first Retro decoder layer.
     """
     spec = get_gpt_layer_with_transformer_engine_spec()
-    spec.submodules.pre_cross_attn_layernorm=FusedLayerNorm
-    spec.submodules.cross_attention=ModuleSpec(
+    spec.submodules.pre_cross_attn_layernorm = FusedLayerNorm
+    spec.submodules.cross_attention = ModuleSpec(
         module=RetroDecoderCrossAttention,
-        params={
-            "encoder_block_spec" : encoder_block_spec,
-        },
+        params={"encoder_block_spec": encoder_block_spec,},
         submodules=CrossAttentionSubmodules(
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
@@ -76,13 +72,12 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
             linear_proj=RowParallelLinear,
         ),
     )
-    spec.submodules.cross_attn_bda=ModuleSpec(module=RetroDecoderBiasDropoutAdd)
+    spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
     return spec
 
 
 def get_retro_decoder_block_spec(
-        config: RetroConfig,
-        use_transformer_engine: bool,
+    config: RetroConfig, use_transformer_engine: bool,
 ) -> TransformerBlockSubmodules:
 
     """
@@ -96,10 +91,12 @@ def get_retro_decoder_block_spec(
     """
 
     # Num layers.
-    assert parallel_state.get_pipeline_model_parallel_world_size() == 1, \
-        "retro does not currently support pipeline parallelism."
-    assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, \
-        "retro does not currently support virtual pipeline parallelism."
+    assert (
+        parallel_state.get_pipeline_model_parallel_world_size() == 1
+    ), "retro does not currently support pipeline parallelism."
+    assert (
+        parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
+    ), "retro does not currently support virtual pipeline parallelism."
     num_layers = get_num_layers_to_build(config)
 
     # Retro layer numbers.
@@ -108,12 +105,15 @@ def get_retro_decoder_block_spec(
 
     # Layer specs.
     gpt_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-    get_retro_decoder_layer_spec = get_retro_decoder_layer_te_spec \
-        if use_transformer_engine \
+    get_retro_decoder_layer_spec = (
+        get_retro_decoder_layer_te_spec
+        if use_transformer_engine
         else get_retro_decoder_layer_local_spec
+    )
     retro_layer_spec = get_retro_decoder_layer_spec()
     retro_layer_spec_with_retriever = get_retro_decoder_layer_spec(
-        get_retro_encoder_block_spec(config, use_transformer_engine))
+        get_retro_encoder_block_spec(config, use_transformer_engine)
+    )
 
     layer_specs = []
     for layer_number in range(1, num_layers + 1):
@@ -126,8 +126,7 @@ def get_retro_decoder_block_spec(
 
     # Block spec.
     block_spec = ModuleSpec(
-        module=TransformerBlock,
-        submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
+        module=TransformerBlock, submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
     )
 
     return block_spec

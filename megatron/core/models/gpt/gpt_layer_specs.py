@@ -16,6 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
+
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec() -> ModuleSpec:
     return ModuleSpec(
@@ -40,6 +41,7 @@ def get_gpt_layer_with_transformer_engine_spec() -> ModuleSpec:
             mlp_bda=get_bias_dropout_add,
         ),
     )
+
 
 # Use this spec for an implementation using only modules in megatron core
 def get_gpt_layer_local_spec() -> ModuleSpec:
@@ -67,6 +69,7 @@ def get_gpt_layer_local_spec() -> ModuleSpec:
             mlp_bda=get_bias_dropout_add,
         ),
     )
+
 
 # Use this spec to use lower level Transformer Engine modules and SwitchMLP based MoE
 gpt_layer_with_transformer_engine_spec_moe = ModuleSpec(

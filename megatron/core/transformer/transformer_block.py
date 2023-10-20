@@ -3,8 +3,9 @@
 import re
 from contextlib import nullcontext
 from dataclasses import dataclass
-import torch
 from typing import List, Union
+
+import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
@@ -19,8 +20,9 @@ from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewles
 
 def get_num_layers_to_build(config) -> int:
 
-    num_layers_per_pipeline_rank = \
+    num_layers_per_pipeline_rank = (
         config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
+    )
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -99,6 +101,8 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
 
+        self.num_layers_per_pipeline_rank = len(self.layers)
+
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?
@@ -107,17 +111,15 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(
-                layer_spec,
-                config=self.config,
-                layer_number=layer_number,
-            )
+            return build_module(layer_spec, config=self.config, layer_number=layer_number,)
 
         # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList([
-            build_layer(layer_spec, i + 1)
-            for i, layer_spec in enumerate(self.submodules.layer_specs)
-        ])
+        self.layers = torch.nn.ModuleList(
+            [
+                build_layer(layer_spec, i + 1)
+                for i, layer_spec in enumerate(self.submodules.layer_specs)
+            ]
+        )
 
         # # TODO: add back standalone_embedding_stage
         # if self.num_layers == 0:

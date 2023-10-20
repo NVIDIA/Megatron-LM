@@ -40,7 +40,6 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # print_rank_0("[vocab_start_index, vocab_end_index]: " + str([vocab_start_index, vocab_end_index]))
         # print_rank_0("masked_target.shape: " + str(masked_target.shape))
         # print_rank_0("masked_target: " + str(masked_target[:,0]))
-        
 
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size

@@ -40,7 +40,7 @@ class TestSpecCustomization:
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,
-                dot_product_attention=TEDotProductAttention,
+                core_attention=TEDotProductAttention,
                 linear_proj=TERowParallelLinear
             ),
         )

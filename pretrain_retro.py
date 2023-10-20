@@ -39,6 +39,7 @@ def core_model_provider(pre_process=True, post_process=True):
         block_spec = get_retro_decoder_block_spec(config, use_transformer_engine=True)
 
     print_rank_0('building GPT model ...')
+    print_rank_0("Print model architecture.")
     model = RetroModel(
         config=config,
         transformer_layer_spec=block_spec,
@@ -52,6 +53,8 @@ def core_model_provider(pre_process=True, post_process=True):
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent
     )
+    print_rank_0("Print model architecture.")
+    print_rank_0(model)
     return model
 
 

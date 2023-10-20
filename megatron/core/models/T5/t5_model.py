@@ -1,12 +1,12 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from typing import Literal, Optional, List
+from typing import List, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel, InferenceParams
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.T5.t5_embedding import T5Embedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -18,7 +18,6 @@ from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
 def t5_extended_attention_mask(attention_mask_list):
-
     def attn_mask_postprocess(attn_mask):
         # [b, 1, s, s]
         extended_attention_mask = attn_mask.unsqueeze(1)
@@ -30,8 +29,7 @@ def t5_extended_attention_mask(attention_mask_list):
 def t5_position_ids(token_ids):
     # Create position ids
     seq_length = token_ids.size(1)
-    position_ids = torch.arange(seq_length, dtype=torch.long,
-                                device=token_ids.device)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
     position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
 
     return position_ids
@@ -43,27 +41,35 @@ class T5LMHead(MegatronModule):
     Arguments:
         mpu_vocab_size: model parallel size of vocabulary.
         parallel_output: wether output logits being distributed or not.
+        vocab_size (int): vocabulary size
+        pre_process (bool): Include embedding layer
+        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
+            shared.
     """
 
-    def __init__(self, mpu_vocab_size, config, parallel_output, vocab_size, pre_process, share_embeddings_and_output_weights):
+    def __init__(
+        self,
+        mpu_vocab_size,
+        config,
+        parallel_output,
+        vocab_size,
+        pre_process,
+        share_embeddings_and_output_weights,
+    ):
         super(T5LMHead, self).__init__(config=config)
 
-        # self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        # self.bias.model_parallel = True
-        # self.bias.partition_dim = 0
-        # self.bias.stride = 1
         self.parallel_output = parallel_output
 
         self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                vocab_size,
-                config=config,
-                init_method=config.init_method,
-                bias=True,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
-            )       
+            config.hidden_size,
+            vocab_size,
+            config=config,
+            init_method=config.init_method,
+            bias=True,
+            skip_bias_add=False,
+            gather_output=not self.parallel_output,
+            skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+        )
 
     def forward(self, hidden_states, word_embeddings_weight):
         logits, _ = self.output_layer(hidden_states, weight=word_embeddings_weight)
@@ -85,6 +91,8 @@ class T5Model(MegatronModule):
         pre_process (bool): Include embedding layer (used with pipeline parallelism)
         post_process (bool): Include an output layer (used with pipeline parallelism)
 
+        fp16_lm_cross_entropy (bool, optional): Defaults to False
+
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
 
         share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
@@ -100,24 +108,23 @@ class T5Model(MegatronModule):
             The value must be a float larger than 1.0. Defaults to None.
     """
 
-
     def __init__(
-            self,
-            config: TransformerConfig,
-            transformer_layer_spec: List[ModuleSpec],
-            vocab_size: int,
-            max_sequence_length: int,
-            pre_process: bool = True,
-            post_process: bool = True,
-            fp16_lm_cross_entropy: bool = False,
-            parallel_output: bool = True,
-            share_embeddings_and_output_weights: bool = False,
-            position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
-            rotary_percent: float = 1.0,
-            seq_len_interpolation_factor: Optional[float] = None,
-            ):
-        
-        super(T5Model, self).__init__(config=config)   
+        self,
+        config: TransformerConfig,
+        transformer_layer_spec: List[ModuleSpec],
+        vocab_size: int,
+        max_sequence_length: int,
+        pre_process: bool = True,
+        post_process: bool = True,
+        fp16_lm_cross_entropy: bool = False,
+        parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = False,
+        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        rotary_percent: float = 1.0,
+        seq_len_interpolation_factor: Optional[float] = None,
+    ):
+
+        super(T5Model, self).__init__(config=config)
 
         self.config: TransformerConfig = config
         self.transformer_layer_spec: List[ModuleSpec] = transformer_layer_spec
@@ -136,13 +143,13 @@ class T5Model(MegatronModule):
         self.model_type = ModelType.encoder_and_decoder
 
         # Embeddings.
-        if self.pre_process: # lOOK INTO transformer.py in nemo (GPT/ BERT model)
+        if self.pre_process:  # lOOK INTO transformer.py in nemo (GPT/ BERT model)
             self.embedding = T5Embedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 add_position_embedding=(self.position_embedding_type == 'learned_absolute'),
-            ) 
+            )
 
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
@@ -173,17 +180,18 @@ class T5Model(MegatronModule):
         # Output
         if post_process:
             self.lm_head = T5LMHead(
-                self.shared_embedding_or_output_weight().size(0), 
-                config, 
+                self.shared_embedding_or_output_weight().size(0),
+                config,
                 parallel_output,
                 self.vocab_size,
                 self.pre_process,
-                self.share_embeddings_and_output_weights)
+                self.share_embeddings_and_output_weights,
+            )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
 
-    def set_input_tensor(self, input_tensor): ### what does this do?
+    def set_input_tensor(self, input_tensor):
         """ See megatron.model.transformer.set_input_tensor()"""
 
         # This is usually handled in schedules.py but some inference code still
@@ -205,17 +213,22 @@ class T5Model(MegatronModule):
         inference_params: InferenceParams = None,
     ):
 
-        encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask = t5_extended_attention_mask(
+        (
+            encoder_attn_mask,
+            decoder_attn_mask,
+            encoder_decoder_attn_mask,
+        ) = t5_extended_attention_mask(
             [encoder_attn_mask, decoder_attn_mask, encoder_decoder_attn_mask]
         )
         encoder_position_ids = t5_position_ids(encoder_input_ids)
         decoder_position_ids = t5_position_ids(decoder_input_ids)
-        
 
         ## Encoder forward
         # Encoder embedding.
         if self.pre_process:
-            encoder_input = self.embedding(input_ids=encoder_input_ids, position_ids=encoder_position_ids)
+            encoder_input = self.embedding(
+                input_ids=encoder_input_ids, position_ids=encoder_position_ids
+            )
         else:
             # intermediate stage of pipeline
             encoder_input = None
@@ -239,10 +252,12 @@ class T5Model(MegatronModule):
         ## Decoder forward
         # Decoder embedding.
         if self.pre_process:
-            decoder_input = self.embedding(input_ids=decoder_input_ids, position_ids=decoder_position_ids)
+            decoder_input = self.embedding(
+                input_ids=decoder_input_ids, position_ids=decoder_position_ids
+            )
         else:
             # intermediate stage of pipeline
-            decoder_input = None   ### should it take encoder_hidden_states
+            decoder_input = None  ### should it take encoder_hidden_states
 
         # Rotary positional embeddings
         rotary_pos_emb = None
@@ -346,7 +361,6 @@ class T5Model(MegatronModule):
             )
             T5Model.embedding_warning_printed = True
 
-
     def sharded_state_dict(self, prefix=''):
         sharded_state_dict = {}
 
@@ -406,59 +420,45 @@ class T5Model(MegatronModule):
 
         return sharded_state_dict
 
-
-    # def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-    #     pass
-
-
-    # def load_state_dict(self, state_dict, strict=True):
-    #     pass
-
-
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
         state_dict_ = {}
-        state_dict_["embedding"] \
-            = self.embedding.state_dict_for_save_checkpoint(prefix=prefix,
-                                                                 keep_vars=keep_vars)
-        state_dict_["encoder"] \
-            = self.encoder.state_dict_for_save_checkpoint(prefix=prefix,
-                                                                 keep_vars=keep_vars)
-        state_dict_["decoder"] \
-            = self.decoder.state_dict_for_save_checkpoint(prefix=prefix,
-                                                                 keep_vars=keep_vars)
+        state_dict_["embedding"] = self.embedding.state_dict_for_save_checkpoint(
+            prefix=prefix, keep_vars=keep_vars
+        )
+        state_dict_["encoder"] = self.encoder.state_dict_for_save_checkpoint(
+            prefix=prefix, keep_vars=keep_vars
+        )
+        state_dict_["decoder"] = self.decoder.state_dict_for_save_checkpoint(
+            prefix=prefix, keep_vars=keep_vars
+        )
 
         if self.post_process and self.add_decoder:
-            state_dict_["lm_head"] \
-                = self.lm_head.state_dict_for_save_checkpoint(prefix=prefix,
-                                                              keep_vars=keep_vars)
-         # Save word_embeddings.
+            state_dict_["lm_head"] = self.lm_head.state_dict_for_save_checkpoint(
+                prefix=prefix, keep_vars=keep_vars
+            )
+        # Save word_embeddings.
         if self.post_process and not self.pre_process and self.add_decoder:
-            state_dict_["word_embeddings_for_head"] \
-                = self.embedding.state_dict(prefix=prefix,
-                                                  keep_vars=keep_vars)
+            state_dict_["word_embeddings_for_head"] = self.embedding.state_dict(
+                prefix=prefix, keep_vars=keep_vars
+            )
         return state_dict_
-
 
     def load_state_dict(self, state_dict, strict=True):
         """Customized load."""
-        self.embedding.load_state_dict(
-            state_dict["embedding"], strict=strict)
+        self.embedding.load_state_dict(state_dict["embedding"], strict=strict)
 
-        self.encoder.load_state_dict(
-            state_dict["encoder"], strict=strict)
+        self.encoder.load_state_dict(state_dict["encoder"], strict=strict)
 
-        self.decoder.load_state_dict(
-            state_dict["decoder"], strict=strict)
-        
+        self.decoder.load_state_dict(state_dict["decoder"], strict=strict)
+
         if self.post_process and self.add_decoder:
-            self.lm_head.load_state_dict(state_dict["lm_head"],
-                                         strict=strict)
-            
+            self.lm_head.load_state_dict(state_dict["lm_head"], strict=strict)
+
         # Load word embeddings
         if self.post_process and not self.pre_process and self.add_decoder:
             self.word_embeddings.load_state_dict(
-                state_dict["word_embeddings_for_head"], strict=strict)
-
+                state_dict["word_embeddings_for_head"], strict=strict
+            )

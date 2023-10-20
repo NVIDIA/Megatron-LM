@@ -3,9 +3,10 @@
 """Retro's cross attention modules for the encoder block."""
 
 from functools import partial
+from typing import Callable, Optional, Tuple
+
 import torch
 from torch import Tensor
-from typing import Callable, Optional, Tuple
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -46,31 +47,29 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             r  : Number of retrieved tokens (neighbors + continuation).
         """
 
-        ns, bs, d = hidden_states.shape # [r, bs * l * k, d]
+        ns, bs, d = hidden_states.shape  # [r, bs * l * k, d]
 
         # Divide sequence dimension into chunks.
-        chunked_outputs = hidden_states.reshape(self.retro_retrieved_length,
-                                                -1,
-                                                self.retro_num_neighbors,
-                                                d)
+        chunked_outputs = hidden_states.reshape(
+            self.retro_retrieved_length, -1, self.retro_num_neighbors, d
+        )
 
         # Per-chunk attention.
         attention_output_tuples = []
         for k in range(self.retro_num_neighbors):
 
             # Attention.
-            chunked_output = chunked_outputs[:,:,k].contiguous()
+            chunked_output = chunked_outputs[:, :, k].contiguous()
             attention_output, attention_bias = self.attn(
-                hidden_states=chunked_output, # Q (neighbor embedding)
+                hidden_states=chunked_output,  # Q (neighbor embedding)
                 attention_mask=None,
-                key_value_states=key_value_states) # K, V (hidden act)
+                key_value_states=key_value_states,
+            )  # K, V (hidden act)
 
             # Residual connection.
             residual = chunked_output
 
-            attention_output_tuples.append((attention_output,
-                                            attention_bias,
-                                            residual))
+            attention_output_tuples.append((attention_output, attention_bias, residual))
 
         return attention_output_tuples
 
@@ -84,8 +83,7 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
     """
 
     def __init__(
-        self,
-        config: RetroConfig,
+        self, config: RetroConfig,
     ):
         super().__init__(config=config)
         self.retro_num_neighbors = config.retro_num_neighbors
@@ -104,8 +102,10 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
         with torch.enable_grad():
             outputs = [
                 bias_dropout_add(
-                    (attention_output,
-                     None if attention_bias is None else attention_bias.expand_as(residual)),
+                    (
+                        attention_output,
+                        None if attention_bias is None else attention_bias.expand_as(residual),
+                    ),
                     residual,
                     prob,
                 )
@@ -136,9 +136,7 @@ class RetroEncoderLayerNorm(MegatronModule):
     """
 
     def __init__(
-        self,
-        config: RetroConfig,
-        **kwargs,
+        self, config: RetroConfig, **kwargs,
     ):
         super().__init__(config=config)
         self.norm = TENorm(config=config, **kwargs)
@@ -151,11 +149,10 @@ class RetroEncoderLayerNorm(MegatronModule):
         inputs = torch.split(input, chunk_size, dim=1)
 
         # Norm.
-        outputs = [ self.norm(inp.contiguous()) for inp in inputs ]
+        outputs = [self.norm(inp.contiguous()) for inp in inputs]
 
         # Concatenate layer norms (to shape [r, k*bs*l, d]; see notation above).
         ns, _, d = inputs[0].shape
-        output = torch.stack(outputs, dim=1).reshape(ns,-1,d)
+        output = torch.stack(outputs, dim=1).reshape(ns, -1, d)
 
         return output
-

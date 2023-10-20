@@ -72,8 +72,8 @@ class DotProductAttention(MegatronModule):
         # different outputs on different number of parallel partitions but
         # on average it should not be partition dependent.
         self.attention_dropout = torch.nn.Dropout(
-            self.config.attention_dropout if attention_dropout is None
-            else attention_dropout)
+            self.config.attention_dropout if attention_dropout is None else attention_dropout
+        )
 
     def forward(
         self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor

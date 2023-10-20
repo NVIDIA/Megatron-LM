@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel, InferenceParams
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -316,6 +316,6 @@ class GPTModel(MegatronModule):
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
         pass
-    
+
     def load_state_dict(self, state_dict, strict=True):
         pass

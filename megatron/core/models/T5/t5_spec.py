@@ -1,23 +1,28 @@
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules, CrossAttention, CrossAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TEColumnParallelLinear,
-    TERowParallelLinear,
-    TENorm
-)
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.attention import (
+    CrossAttention,
+    CrossAttentionSubmodules,
+    SelfAttention,
+    SelfAttentionSubmodules,
+)
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TELayerNormColumnParallelLinear,
+    TENorm,
+    TERowParallelLinear,
+)
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.transformer_block import (
-    get_num_layers_to_build,
     TransformerBlockSubmodules,
+    get_num_layers_to_build,
 )
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
@@ -33,7 +38,7 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                     core_attention=TEDotProductAttention,
                     linear_proj=TERowParallelLinear,
                 ),
-            ),  
+            ),
             self_attn_bda=get_bias_dropout_add,
             # pre_mlp_layernorm=TENorm,
             mlp=ModuleSpec(
@@ -43,8 +48,9 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
-        )
+        ),
     )
+
 
 def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
@@ -83,6 +89,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
         ),
     )
 
+
 def encoder_model_with_local_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
@@ -94,9 +101,11 @@ def encoder_model_with_local_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=RowParallelLinear,
+                    linear_proj=ModuleSpec(
+                        module=RowParallelLinear, params={"input_is_parallel": True},
+                    ),
                 ),
-            ),  
+            ),
             self_attn_bda=get_bias_dropout_add,
             pre_mlp_layernorm=FusedLayerNorm,
             mlp=ModuleSpec(
@@ -106,8 +115,9 @@ def encoder_model_with_local_spec() -> ModuleSpec:
                 ),
             ),
             mlp_bda=get_bias_dropout_add,
-        )
+        ),
     )
+
 
 def decoder_model_with_local_spec() -> ModuleSpec:
     return ModuleSpec(
@@ -120,7 +130,9 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=RowParallelLinear,
+                    linear_proj=ModuleSpec(
+                        module=RowParallelLinear, params={"input_is_parallel": True},
+                    ),
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -131,7 +143,9 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                     linear_q=ColumnParallelLinear,
                     linear_kv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=RowParallelLinear,
+                    linear_proj=ModuleSpec(
+                        module=RowParallelLinear, params={"input_is_parallel": True},
+                    ),
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
@@ -146,11 +160,13 @@ def decoder_model_with_local_spec() -> ModuleSpec:
         ),
     )
 
+
 def get_t5_encoder_with_transformer_engine_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)
     layer_spec = encoder_model_with_transformer_engine_default_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
+
 
 def get_t5_decoder_with_transformer_engine_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)
@@ -158,11 +174,13 @@ def get_t5_decoder_with_transformer_engine_block_spec(config) -> TransformerBloc
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
 
+
 def get_t5_encoder_with_local_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)
     layer_spec = encoder_model_with_local_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
+
 
 def get_t5_decoder_with_local_block_spec(config) -> TransformerBlockSubmodules:
     num_layers = get_num_layers_to_build(config)

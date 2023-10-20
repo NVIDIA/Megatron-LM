@@ -28,12 +28,12 @@ class FusedLayerNorm(torch.nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        eps: float=1e-5,
-        persist_layer_norm: bool=True,
-        sequence_parallel: bool=False,
-        zero_centered_gamma: bool=False,
-        config=None, # included to match custom norms
-        normalization: str="LayerNorm", # included to match TE interface
+        eps: float = 1e-5,
+        persist_layer_norm: bool = True,
+        sequence_parallel: bool = False,
+        zero_centered_gamma: bool = False,
+        config=None,  # included to match custom norms
+        normalization: str = "LayerNorm",  # included to match TE interface
     ):
         super().__init__()
 

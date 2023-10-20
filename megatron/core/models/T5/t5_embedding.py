@@ -20,7 +20,6 @@ class T5Embedding(MegatronModule):
         max_sequence_length (int): maximum size of sequence. This
                              is used for positional embedding
         add_position_embedding (bool): Add a position embedding.
-        embedding_dropout_prob float): dropout probability for embeddings
     """
 
     def __init__(

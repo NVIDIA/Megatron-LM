@@ -3,16 +3,17 @@
 """Retro's cross attention modules for the decoder block."""
 
 from functools import partial
+from typing import Callable
+
 import numpy as np
 import torch
 from torch import Tensor
-from typing import Callable
 
 from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
-from megatron.core.transformer import build_module, TransformerBlockSubmodules
+from megatron.core.transformer import TransformerBlockSubmodules, build_module
 from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
@@ -62,10 +63,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         if encoder_block_spec:
             self.encoder = build_module(
-                encoder_block_spec,
-                config=config,
-                pre_process=True,
-                post_process=False,
+                encoder_block_spec, config=config, pre_process=True, post_process=False,
             )
             # self._encoder_key = 'encoder' # ... necessary?
         else:
@@ -101,22 +99,19 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             first_ns = ns % self.retro_chunk_length
             if first_ns > 0:
                 raise Exception("test this case.")
-                first_chunk, rest_chunk = \
-                    hidden_states[:first_ns], hidden_states[first_ns:]
+                first_chunk, rest_chunk = hidden_states[:first_ns], hidden_states[first_ns:]
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk,
-                    (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
-                    'constant',
-                    0)
-                chunked_output = \
-                    torch.cat((first_chunk, rest_chunk), dim=0) # [l * m, bs, d]
+                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0
+                )
+                chunked_output = torch.cat((first_chunk, rest_chunk), dim=0)  # [l * m, bs, d]
             else:
-                chunked_output = hidden_states # [l * m, bs, d]
-            chunked_output = chunked_output \
-                .reshape(l, self.retro_chunk_length, bs, d) \
-                .permute(1, 2, 0, 3) \
-                .reshape(self.retro_chunk_length, bs * l, d) \
+                chunked_output = hidden_states  # [l * m, bs, d]
+            chunked_output = (
+                chunked_output.reshape(l, self.retro_chunk_length, bs, d)
+                .permute(1, 2, 0, 3)
+                .reshape(self.retro_chunk_length, bs * l, d)
                 .contiguous()
+            )
 
             # Get Encoder Output
             key_value_states = self.encoder(
@@ -124,39 +119,40 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 attention_mask=attention_mask,
                 context=chunked_output,
                 context_mask=None,
-                inference_params=inference_params) # [r, k * bs * l , d]
+                inference_params=inference_params,
+            )  # [r, k * bs * l , d]
             key_value_states = key_value_states.reshape(
-                self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
+                self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d
+            )  # [r * k, bs * l, d]
 
         # Chunks.
         pad = (ns - 1) % self.retro_chunk_length
         attending_chunks = hidden_states[pad:]
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks,
-            (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
-            'constant', 0)
-        padded_chunked_output = padded_chunks \
-            .reshape(l, self.retro_chunk_length, bs, d) \
-            .permute(1, 2, 0, 3)
+            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0
+        )
+        padded_chunked_output = padded_chunks.reshape(l, self.retro_chunk_length, bs, d).permute(
+            1, 2, 0, 3
+        )
         padded_chunked_output = padded_chunked_output.reshape(
-            self.retro_chunk_length, bs * l, d).contiguous()
+            self.retro_chunk_length, bs * l, d
+        ).contiguous()
 
         # Encoder output.
-        attention_output, attention_bias = \
-            self.attn(padded_chunked_output,
-                      None,
-                      key_value_states=key_value_states)
+        attention_output, attention_bias = self.attn(
+            padded_chunked_output, None, key_value_states=key_value_states
+        )
 
         # Return dimensions for bias-dropout step.
         return {
-            "ns" : ns,
-            "bs" : bs,
-            "d" : d,
-            "l" : l,
-            "pad" : pad,
-            "attention_output" : attention_output,
-            "attention_bias" : attention_bias,
-            "context" : key_value_states,
+            "ns": ns,
+            "bs": bs,
+            "d": d,
+            "l": l,
+            "pad": pad,
+            "attention_output": attention_output,
+            "attention_bias": attention_bias,
+            "context": key_value_states,
         }
 
 
@@ -169,8 +165,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
     """
 
     def __init__(
-        self,
-        config: RetroConfig,
+        self, config: RetroConfig,
     ):
         super().__init__(config=config)
         self.retro_chunk_length = config.retro_preprocess.retro_gpt_chunk_length
@@ -196,18 +191,16 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
             x = bias_dropout_add(
-                (attention_output,
-                 None if attention_bias is None else attention_bias.expand_as(attention_output)),
+                (
+                    attention_output,
+                    None if attention_bias is None else attention_bias.expand_as(attention_output),
+                ),
                 torch.zeros_like(attention_output),
-                prob)
-            x = x \
-                .reshape(retro_chunk_length, bs, l, d) \
-                .permute(2, 0, 1, 3) # [l, m, bs, d]
+                prob,
+            )
+            x = x.reshape(retro_chunk_length, bs, l, d).permute(2, 0, 1, 3)  # [l, m, bs, d]
             x = x.reshape(retro_chunk_length * l, bs, d)
-            x = torch.nn.functional.pad(
-                x,
-                (0, 0, 0, 0, pad, 0),
-                'constant', 0)[:ns] # [ns, b, d]
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0)[:ns]  # [ns, b, d]
             x = x + residual
 
         return x
