@@ -13,6 +13,9 @@ do
 done
 echo "---------------------------------"
 
+set -x
+if [[ -z $MBS ]]; then MBS=4; fi
+
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
@@ -21,9 +24,26 @@ NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-pip install h5py
-pip install transformers
-pip install faiss-gpu
+TRANSFORMER_IMPL=local
+TRAINING_DTYPE=bf16
+
+if [[ $USE_CORE -eq 1 ]]; then
+       echo "Running using megatron core"
+       TRANSFORMER_IMPL=local
+       TRAINING_DTYPE=bf16
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       USE_MCORE=1
+       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
+fi
+
+if [[ $USE_TE -eq 1 ]]; then
+       echo "Running with TransformerEngine ..."
+       TRANSFORMER_IMPL=transformer_engine
+       TRAINING_DTYPE=bf16
+else
+       echo "Running with local transformer implementation ..."
+fi
+set +x
 
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
@@ -87,6 +107,10 @@ ARGS=" \
     --retro-add-retriever \
     --num-workers 32 \
 "
+
+pip install h5py
+pip install transformers
+pip install faiss-gpu
 
 # Run for 100 iterations and save checkpoint at 50
 torchrun $DISTRIBUTED_ARGS \
