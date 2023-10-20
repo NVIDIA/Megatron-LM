@@ -31,7 +31,8 @@ from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import GPTModel
-from megatron.core import DistributedDataParallel as DDP
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
@@ -42,7 +43,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -712,7 +713,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
              'a custom no_sync_func is not supported when overlapping grad-reduce')
         if args.delay_grad_reduce:
-            config.grad_sync_func = model[0].grad_sync
+            config.grad_sync_func = model[0].start_grad_sync
         config.no_sync_func = model[0].no_sync
     config.finalize_model_grads_func = finalize_model_grads
 
@@ -775,7 +776,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+                break
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
@@ -796,7 +797,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
-                sys.exit()
+                break
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
@@ -805,12 +806,20 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
-            sys.exit()
+            break
 
         if args.profile and \
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+
+    # Flush TensorBoard and WandB writers.
+    writer = get_tensorboard_writer()
+    if writer:
+        writer.flush()
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
 
     return iteration
 
@@ -874,6 +883,17 @@ def evaluate(forward_step_func,
 
             args.consumed_valid_samples += eval_batch_size
 
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    print_rank_0('Exiting during evaluation, timelimit reached')
+                    return None, None, True
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -886,6 +906,9 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
+        
+        
+
 
     # Move model back to the train mode.
     for model_module in model:
@@ -894,7 +917,7 @@ def evaluate(forward_step_func,
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
 
-    return total_loss_dict, collected_non_loss_data
+    return total_loss_dict, collected_non_loss_data, False
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
@@ -909,9 +932,12 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data = evaluate(
+    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
+    # Timelimit hit during evaluation
+    if timelimit:
+        return
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
