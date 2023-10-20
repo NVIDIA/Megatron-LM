@@ -8,8 +8,8 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
