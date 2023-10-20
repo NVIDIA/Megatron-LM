@@ -100,7 +100,7 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
-            
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Function to share the input embeddings and output logit weights.
 

@@ -33,7 +33,7 @@ class BertLMHead(MegatronModule):
         super().__init__(config=config)
 
         self.vocab_size = vocab_size
-        # TODO Make sure this is correct. In original bert : 
+        # TODO Make sure this is correct. In original bert :
         # mpu_vocab_size = self.shared_embedding_or_output_weight().size(0)
         # self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         self.bias = torch.nn.Parameter(torch.zeros(vocab_size))
