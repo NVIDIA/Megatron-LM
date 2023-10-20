@@ -270,7 +270,9 @@ class TransformerBlock(MegatronModule):
             )
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group()
+                fp8_group = parallel_state.get_amax_reduction_group(
+                    with_context_parallel=self.config.context_parallel_size > 1
+                )
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )

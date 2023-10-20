@@ -7,8 +7,8 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from megatron.core import ModelParallelConfig
-from megatron.core.utils import init_method_normal, scaled_init_method_normal
+from ..model_parallel_config import ModelParallelConfig
+from ..utils import init_method_normal, scaled_init_method_normal
 
 
 @dataclass
@@ -218,7 +218,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_parallel and self.num_moe_experts is None:
+        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError(f'num_moe_experts must be non None to use expert-parallel.')
 
         if self.recompute_granularity is not None:

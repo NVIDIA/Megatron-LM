@@ -1,23 +1,29 @@
 #! /bin/bash
 
-DATA_PATH=$1
-CHECKPOINT_PATH=$2
-TENSORBOARD_DIR=$3
-TP_SIZE=$4
-PP_SIZE=$5
-NNODES=$6
+echo "------ARGUMENTS LIST --------"
+for ARGUMENT in "$@"
+do
+   KEY=$(echo $ARGUMENT | cut -f1 -d=)
+
+   KEY_LENGTH=${#KEY}
+   VALUE="${ARGUMENT:$KEY_LENGTH+1}"
+
+   export "$KEY"="$VALUE"
+   echo "$KEY=$VALUE"
+done
+echo "---------------------------------"
 
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NODE_RANK=0
-WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 
 # Runs the "345M" parameter model
-DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES"
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 # Run for 100 iterations
 torchrun $DISTRIBUTED_ARGS \

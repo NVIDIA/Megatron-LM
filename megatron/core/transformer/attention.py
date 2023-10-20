@@ -7,7 +7,7 @@ from typing import Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -244,12 +244,13 @@ class Attention(MegatronModule, ABC):
         # This is a noop for normal attention where ng == np. When using group query attention this
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
-        key = key.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
-        )
-        value = value.repeat_interleave(
-            self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
-        )
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            key = key.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+            value = value.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
 
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
