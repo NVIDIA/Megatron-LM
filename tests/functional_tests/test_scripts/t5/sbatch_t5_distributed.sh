@@ -1,26 +1,27 @@
 #!/bin/bash
 
 # Parameters
-#SBATCH --account=coreai_dlalgo_llm
-#SBATCH --job-name=coreai_dlalgo_llm-run:t5_mcore
+#SBATCH --account=llmservice_dev_mcore
+#SBATCH --job-name=llmservice_dev_mcore-run:t5_mcore
 #SBATCH --nodes=4
 #SBATCH --partition=luna
 #SBATCH --time=04:00:00
 
-CONT="nvcr.io#ea-bignlp/nemofw-training:23.07-py3"
+# CONT="nvcr.io#ea-bignlp/nemofw-training:23.07-py3"
+CONT="nvcr.io/nvidia/pytorch:23.08-py3"
 MOUNT="/lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm:/lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm,/lustre/fsw/joc/huvu/data/t5:/lustre/fsw/joc/huvu/data/t5,/lustre/fsw/joc/big_nlp/t5/dataset/Pile/:/lustre/fsw/joc/big_nlp/t5/dataset/Pile/"
 
 
 ### Model's arguments setup
 # # NeMo Pile dataset
 # CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_multinodes_test1"
-# VOCAB_FILE="/lustre/fsw/joc/big_nlp/t5/dataset/Pile/vocab.txt"
+# VOCAB_FILE="/lustre/fsw/joc/big_nlp/t5/dataset/Pile/bert-large-cased-vocab.txt"
 # DATA_PATH="/lustre/fsw/joc/huvu/data/t5/training_data/my-t5_00_bert_tokenizer_text_document"
 # TENSORBOARD_DIR=$CHECKPOINT_PATH
 # LOG_DIR=$CHECKPOINT_PATH
 # Pile dataset full (original path: /lustre/fsw/joc/big_nlp/t5/dataset/Pile/)
-CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_multinodes_fullPile_checkpoint"
-VOCAB_FILE="/lustre/fsw/joc/big_nlp/t5/dataset/Pile/vocab.txt"
+CHECKPOINT_PATH="/lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_final_pile_multinodes_fullPile_checkpoint"
+VOCAB_FILE="/lustre/fsw/joc/big_nlp/t5/dataset/Pile/bert-large-cased-vocab.txt"
 DATA_PATH=""
 for k in {00..29}; do
     DATA_PATH+=" 0.033 /lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_${k}_bert_tokenizer_text_document"
@@ -50,14 +51,16 @@ T5_ARGS="\
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16 \
+    --bf16 \
     --vocab-extra-ids 100 \
+    --init-method-std 0.015 \
+    --transformer-impl transformer_engine \
 "
 DATA_ARGS="\
     --data-path $DATA_PATH \
     --vocab-file $VOCAB_FILE \
-    --data-impl mmap \
-    --split 949,50,1 \
+    --tokenizer-type BertWordPieceCase \
+    --split 99982,9,9 \
 "
 OUTPUT_ARGS="\
     --save $CHECKPOINT_PATH \

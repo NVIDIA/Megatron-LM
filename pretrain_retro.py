@@ -55,6 +55,11 @@ def core_model_provider(pre_process=True, post_process=True):
     )
     print_rank_0("Print model architecture.")
     print_rank_0(model)
+    state_dict=model.state_dict()
+    allweights = list(state_dict.keys())
+    allweights = [(item + ": " + str(state_dict[item].shape)) for item in allweights]
+    print_rank_0("\n".join(allweights))
+
     return model
 
 

@@ -1,0 +1,234 @@
+cfg:
+  # model parallelism 
+  micro_batch_size: 64
+  global_batch_size: 2048 # will use more micro batches to reach global batch size
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  resume_from_checkpoint: null # manually set the checkpoint file to load from
+  pipeline_model_parallel_split_rank: 0 # rank at which decoder starts.
+
+  # model architecture
+  encoder:
+    num_layers: 12 # For perceiver models, this is the number of cross-attention blocks. Each layer has 1 cross-attention and "num_self_attention_per_cross_attention" self-attention layers.
+    hidden_size: 768
+    ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
+    num_attention_heads: 12
+    init_method_std: 0.015 # Standard deviation of the zero mean normal distribution used for weight initialization.')
+    hidden_dropout: 0.1 # Dropout probability for hidden state transformer.
+    attention_dropout: 0.1 # Dropout probability in the attention layer.
+    ffn_dropout: 0.0 # Dropout probability in the feed-forward layer.
+    position_embedding_type: 'learned_absolute' # Position embedding type. Options ['learned_absolute', 'relative', 'alibi', 'kerple']
+    relative_attention_num_buckets: 32 # Relative position number of buckets for computing the bias
+    relative_attention_max_distance: 128 # max_distance to keep relative distance in the attention_num_buckets.
+    relative_position_bias_self_attention_only: True # whether to only use relative position bias for self attention only.
+    kv_channels: null # Projection weights dimension in multi-head attention. Set to hidden_size // num_attention_heads if null
+    apply_query_key_layer_scaling: False # scale Q * K^T by 1 / layer-number.
+    layernorm_epsilon: 0.00001
+    persist_layer_norm: True # Use of persistent fused layer norm kernel.
+    bias_activation_fusion: True # Use a kernel that fuses the bias addition from weight matrices with the subsequent activation function.
+    grad_div_ar_fusion: True # Fuse grad division into torch.distributed.all_reduce
+    masked_softmax_fusion: True # Use a kernel that fuses the attention softmax with it's mask.
+    bias_dropout_add_fusion: True # Use a kernel that fuses the bias addition, dropout and residual connection addition.
+    bias: True # Whether to use bias terms in all weight matrices.
+    normalization: 'layernorm' # Normalization layer to use. Options are 'layernorm', 'rmsnorm'
+    arch: 'transformer' # Options: ['transformer', 'perceiver']
+    activation: 'gelu' # Options ['gelu', 'geglu', 'swiglu', 'reglu', 'squared-relu', 'fast-geglu', 'fast-swiglu', 'fast-reglu']
+    headscale: False # Whether to learn extra parameters that scale the output of the each self-attention head.
+    transformer_block_type: 'pre_ln' # Options ['pre_ln', 'post_ln', 'normformer']
+    hidden_steps: 32 # Number of latent vectors to use for pereceiver encoders
+    num_self_attention_per_cross_attention: 1 # Number of self-attention layers for every cross-attention layer.
+    openai_gelu: False # Use OpenAI's GELU instead of the default GeLU
+    onnx_safe: False # Use work-arounds for known problems with Torch ONNX exporter.
+    fp32_residual_connection: False # Use FP32 for residual connections.
+    activations_checkpoint_method: null # 'uniform', 'block'
+    activations_checkpoint_num_layers: 1 
+    activations_checkpoint_granularity: null
+    megatron_legacy: False # Whether to use the legacy Megatron model. This affects the way q,k,v is partitioned from the mixed q,k,v layer in ParallelAttention. This needs to be True for models converted from HF.
+    normalize_attention_scores: True # Whether to scale the output Q * K^T by 1 / sqrt(hidden_size_per_head). This arg is provided as a configuration option mostly for compatibility with models that have been weight-converted from HF. You almost always want to se this to True.
+    num_moe_experts: 1 # When >1, FFNs are changed to MoE layers
+    moe_frequency: 1 # every Nth ffn layer will be made MoE 
+    moe_dropout: 0.0 # Dropout value for MoE layers
+    use_flash_attention: false # Use flash attention in self-attention module
+  decoder:
+    num_layers: 12 # For perceiver models, this is the number of cross-attention blocks. Each layer has 1 cross-attention and "num_self_attention_per_cross_attention" self-attention layers.
+    hidden_size: 768
+    ffn_hidden_size: 3072 # Transformer FFN hidden size. Usually 4 * hidden_size.
+    num_attention_heads: 12
+    init_method_std: 0.015 # Standard deviation of the zero mean normal distribution used for weight initialization.')
+    hidden_dropout: 0.1 # Dropout probability for hidden state transformer.
+    attention_dropout: 0.1 # Dropout probability in the attention layer.
+    ffn_dropout: 0.0 # Dropout probability in the feed-forward layer.
+    position_embedding_type: 'learned_absolute' # Position embedding type. Options ['learned_absolute', 'relative', 'alibi', 'kerple']
+    relative_attention_num_buckets: 32 # Relative position number of buckets for computing the bias
+    relative_attention_max_distance: 128 # max_distance to keep relative distance in the attention_num_buckets.
+    relative_position_bias_self_attention_only: True # whether to only use relative position bias for self attention only.
+    kv_channels: null # Projection weights dimension in multi-head attention. Set to hidden_size // num_attention_heads if null
+    apply_query_key_layer_scaling: False # scale Q * K^T by 1 / layer-number.
+    layernorm_epsilon: 0.00001
+    persist_layer_norm: True # Use of persistent fused layer norm kernel.
+    bias_activation_fusion: True # Use a kernel that fuses the bias addition from weight matrices with the subsequent activation function.
+    grad_div_ar_fusion: True # Fuse grad division into torch.distributed.all_reduce
+    masked_softmax_fusion: True # Use a kernel that fuses the attention softmax with it's mask.
+    bias_dropout_add_fusion: True # Use a kernel that fuses the bias addition, dropout and residual connection addition.
+    bias: True # Whether to use bias terms in all weight matrices.
+    normalization: 'layernorm' # Normalization layer to use. Options are 'layernorm', 'rmsnorm'
+    arch: 'transformer' # Options: ['transformer', 'perceiver']
+    activation: 'gelu' # Options ['gelu', 'geglu', 'swiglu', 'reglu', 'squared-relu', 'fast-geglu', 'fast-swiglu', 'fast-reglu']
+    headscale: False # Whether to learn extra parameters that scale the output of the each self-attention head.
+    transformer_block_type: 'pre_ln' # Options ['pre_ln', 'post_ln', 'normformer']
+    hidden_steps: 32 # Number of latent vectors to use for pereceiver encoders
+    num_self_attention_per_cross_attention: 1 # Number of self-attention layers for every cross-attention layer.
+    openai_gelu: False # Use OpenAI's GELU instead of the default GeLU
+    onnx_safe: False # Use work-arounds for known problems with Torch ONNX exporter.
+    fp32_residual_connection: False # Use FP32 for residual connections.
+    activations_checkpoint_method: null # 'uniform', 'block'
+    activations_checkpoint_num_layers: 1 
+    activations_checkpoint_granularity: null
+    megatron_legacy: False # Whether to use the legacy Megatron model. This affects the way q,k,v is partitioned from the mixed q,k,v layer in ParallelAttention. This needs to be True for models converted from HF.
+    normalize_attention_scores: True # Whether to scale the output Q * K^T by 1 / sqrt(hidden_size_per_head). This arg is provided as a configuration option mostly for compatibility with models that have been weight-converted from HF. You almost always want to se this to True.
+    num_moe_experts: 1 # When >1, FFNs are changed to MoE layers
+    moe_frequency: 1 # every Nth ffn layer will be made MoE 
+    moe_dropout: 0.0 # Dropout value for MoE layers
+    use_flash_attention: false # Use flash attention in self-attention module
+  make_vocab_size_divisible_by: 128 # Pad the vocab size to be divisible by this value for computation efficiency.
+  encoder_seq_length: 512
+  max_position_embeddings: ${.encoder_seq_length}
+  pre_process: True 
+  post_process: True
+
+  # Megatron O2-style half-precision
+  precision: bf16
+  megatron_amp_O2: True # use AMP with O2 style mixed precision instead of native amp on-the-fly weight autocasting.
+  grad_allreduce_chunk_size_mb: 125
+  grad_div_ar_fusion: True # Fuse grad division into torch.distributed.all_reduce
+  gradient_as_bucket_view: True # Allocate gradients in a contiguous bucket to save memory (less fragmentation and buffer memory)
+
+  seq_length: 512
+  max_position_embeddings: 512
+
+  tokenizer:
+    library: 'megatron'
+    type: 'BertWordPieceCase'
+    model: null
+    vocab_file: '/lustre/fsw/joc/big_nlp/t5/dataset/Pile/bert-large-cased-vocab.txt'
+    merge_file: null
+    num_sentinel_tokens: 100
+    sentencepiece_legacy: True # Legacy=True allows you to add special tokens to sentencepiece tokenizers.
+
+  # weight init
+  embedding_init_method_std: 0.015 # Standard deviation of the zero mean normal distribution used for weight initialization.')
+
+  # embedding dropout
+  embedding_dropout: 0.1
+
+  # embedding sharing
+  share_token_embeddings: True # If True share encoder/decoder embeddings
+  share_decoder_tokens_head_embeddings: True # If True share decoder embeddings and decoder projection to logits
+
+  # token head
+  tokens_head_bias: True
+
+  # precision
+  native_amp_init_scale: 4294967296 # 2 ** 32
+  native_amp_growth_interval: 1000
+  fp16_lm_cross_entropy: False # Move the cross entropy unreduced loss calculation for lm head to fp16
+
+  # miscellaneous
+  seed: 1234
+  use_cpu_initialization: False # Init weights on the CPU (slow for large models)
+  apex_transformer_log_level: 30 # Python logging level displays logs with severity greater than or equal to this
+
+  data:
+    data_prefix:
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_00_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_01_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_02_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_03_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_04_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_05_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_06_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_07_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_08_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_09_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_10_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_11_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_12_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_13_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_14_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_15_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_16_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_17_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_18_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_19_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_20_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_21_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_22_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_23_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_24_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_25_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_26_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_27_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_28_bert_tokenizer_text_document'
+      - '0.033'
+      - '/lustre/fsw/joc/huvu/data/t5/training_data/symlinks/my-t5_29_bert_tokenizer_text_document'
+    index_mapping_dir: null # path to save index mapping .npy files, by default will save in the same location as data_prefix
+    data_impl: mmap # mmap, retmmap, text_mmap, csv_mmap
+    splits_string: 99982,9,9
+    seq_length: ${cfg.seq_length}
+    seq_length_dec: 128
+    skip_warmup: True
+    num_workers: 0
+    dataloader_type: single # cyclic
+    masked_lm_prob: 0.15
+    dataset_type: 't5'
+    short_seq_prob: 0.1
+    max_ngram_size: 10
+    mean_ngram_size: null
+    geometric_dist: True
+    permutation: False
+    whole_word_masking: True
+    favor_longer_ngrams: False
+    respect_document_boundaries: True # If true, a single training exampl cannot cross document boundaries, increasing the fraction of <pad> tokens within a batch.
+
+  optim:
+    name: fused_adam
+    lr: 0.0001
+    betas:
+      - 0.9
+      - 0.999
+    eps: 0.00000001
+    weight_decay: 0.01
+    sched:
+      name: WarmupAnnealing
+      min_lr: 0.00001
+      last_epoch: -1
+      warmup_ratio: 0.01

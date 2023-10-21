@@ -1,0 +1,12 @@
+# experiment for checkpointing
+nano /lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_debug1/slurm-4166803.out
+(iteration     2100/ 1000000 | consumed samples:      2150400 | elapsed time per iteration (ms): 875.7 | learning rate: 2.083E-05 | global batch size:  1024 | lm loss: 5.542775E+00 | loss scale: 262144.0 | grad norm: 1.799 | number of skipped iterations:   0 | number of nan iterations:   0 |)
+nano /lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_debug1/slurm-4167122.out
+( iteration     4000/ 1000000 | consumed samples:      4096000 | elapsed time per iteration (ms): 786.7 | learning rate: 3.981E-05 | global batch size:  1024 | lm loss: 4.764409E+00 | loss scale: 131072.0 | grad norm: 2.373 | number of skipped iterations:   0 | number of nan iterations:   0 |)
+
+# experiment for checkpointing with multinodes
+nano /lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_debug_multinodes/slurm-4167491.out
+(iteration     2500/ 1000000 | consumed samples:      2560000 | elapsed time per iteration (ms): 410.8 | learning rate: 2.484E-05 | global batch size:  1024 | lm loss: 5.331187E+00 | loss scale: 262144.0 | grad norm: 2.045 | number of skipped iterations:   0 | number of nan iterations:   0 |)
+(iteration     2800/ 1000000 | consumed samples:      2867200 | elapsed time per iteration (ms): 409.1 | learning rate: 2.784E-05 | global batch size:  1024 | lm loss: 5.198639E+00 | loss scale: 262144.0 | grad norm: 1.381 | number of skipped iterations:   0 | number of nan iterations:   0 |)
+nano /lustre/fsw/joc/huvu/data/t5/trained_models/sbatch_pile_debug_multinodes/slurm-4167547.out
+(iteration     2600/ 1000000 | consumed samples:      2662400 | elapsed time per iteration (ms): 634.4 | learning rate: 2.581E-05 | global batch size:  1024 | lm loss: 5.322028E+00 | loss scale: 65536.0 | grad norm: 1.291 | number of skipped iterations:   3 | number of nan iterations:   0 |)
