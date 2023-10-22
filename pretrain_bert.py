@@ -42,7 +42,7 @@ def model_provider(pre_process=True, post_process=True):
             transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
-            num_tokentypes=0, 
+            num_tokentypes=2, 
             add_binary_head=args.bert_binary_head,
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             parallel_output=True,
