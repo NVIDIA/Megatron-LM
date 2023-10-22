@@ -29,7 +29,6 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            # input_layernorm=TENorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
@@ -40,7 +39,6 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            # pre_mlp_layernorm=TENorm,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
@@ -56,7 +54,6 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            # input_layernorm=TENorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -78,7 +75,6 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
-            # pre_mlp_layernorm=TENorm,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
