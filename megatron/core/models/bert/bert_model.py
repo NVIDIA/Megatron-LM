@@ -122,7 +122,7 @@ class BertModel(LanguageModule):
                 )
 
                 self.pooler = Pooler(
-                    config.hidden_size, config.init_method, config.sequence_parallel, config
+                    config.hidden_size, config.init_method, config, config.sequence_parallel
                 )
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):

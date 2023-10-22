@@ -10,7 +10,7 @@ from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
-class TestBertodel:
+class TestBertModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
