@@ -34,8 +34,9 @@ class BertLMHead(MegatronModule):
         super().__init__(config=config)
 
         self.vocab_size = vocab_size
-        self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+        #TODO : Setting bias to true i think it gets initalized in CPL
+        #self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
+        #tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         # TODO: Shoudl switch this to TE ?
@@ -62,7 +63,7 @@ class BertLMHead(MegatronModule):
             self.vocab_size,
             config=config,
             init_method=config.init_method,
-            bias=False,
+            bias=True,
             skip_bias_add=False,
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
