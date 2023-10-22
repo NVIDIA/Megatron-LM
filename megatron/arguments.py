@@ -57,7 +57,6 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     return args
 
-
 def validate_args(args, defaults={}):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
@@ -76,7 +75,7 @@ def validate_args(args, defaults={}):
     )
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
-        args.tensor_model_parallel_size
+                          args.tensor_model_parallel_size
     assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
         ' divisible by tensor parallel size ({}) times pipeline parallel ' \
         'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
@@ -92,9 +91,9 @@ def validate_args(args, defaults={}):
     if args.pipeline_model_parallel_size > 1:
         if args.pipeline_model_parallel_split_rank is not None:
             assert args.pipeline_model_parallel_split_rank < \
-                args.pipeline_model_parallel_size, 'split rank needs'\
-                ' to be less than pipeline model parallel size ({})'.format(
-                    args.pipeline_model_parallel_size)
+                    args.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.pipeline_model_parallel_size)
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -128,7 +127,7 @@ def validate_args(args, defaults={}):
                 print('WARNING: overriding default arguments for {key}:{v} \
                        with {key}:{v2}'.format(key=key, v=defaults[key],
                                                v2=getattr(args, key)),
-                      flush=True)
+                                               flush=True)
         else:
             setattr(args, key, defaults[key])
 
@@ -247,8 +246,7 @@ def validate_args(args, defaults={}):
             # the same ballpark as the counterpart with 4*h size
             # we keep it a multiple of 64, which means the actual tensor size
             # will be a multiple of 64 / tp_size
-            args.ffn_hidden_size = int(
-                (4 * args.hidden_size * 2 / 3) / 64) * 64
+            args.ffn_hidden_size = int((4 * args.hidden_size * 2 / 3) / 64) * 64
         else:
             args.ffn_hidden_size = 4 * args.hidden_size
 
@@ -356,8 +354,7 @@ def validate_args(args, defaults={}):
 
         # Load retro args.
         retro_args_path = get_retro_args_path(args.retro_workdir)
-        assert os.path.exists(
-            retro_args_path), "retro workdir missing args.json"
+        assert os.path.exists(retro_args_path), "retro workdir missing args.json"
         with open(retro_args_path) as f:
             retro_args = types.SimpleNamespace(**json.load(f))
             retro_args.retro_return_doc_ids = args.retro_return_doc_ids
@@ -392,8 +389,7 @@ def validate_args(args, defaults={}):
     _print_args("arguments", args)
     retro_args = get_retro_args()
     if retro_args and args != retro_args:
-        _print_args("retro arguments", types.SimpleNamespace(
-            **{k: v for k, v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
+        _print_args("retro arguments", types.SimpleNamespace(**{k:v for k,v in vars(retro_args).items() if k.startswith("retro")}, rank=args.rank))
 
     return args
 
@@ -415,7 +411,6 @@ def _print_args(title, args):
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
-
 
 def core_transformer_config_from_args(args):
 
@@ -445,7 +440,6 @@ def core_transformer_config_from_args(args):
 
     return TransformerConfig(**kw_args)
 
-
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
@@ -474,7 +468,6 @@ def _add_transformer_engine_args(parser):
                        help='Which Transformer implementation to use.')
 
     return parser
-
 
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
@@ -567,7 +560,7 @@ def _add_network_size_args(parser):
                        '   args.hidden_size // args.num_attention_heads '
                        'if not provided.')
     group.add_argument('--group-query-attention', action='store_true',
-                       help='Use group-query attention.')
+                          help='Use group-query attention.')
     group.add_argument('--num-query-groups', type=int, default=1)
 
     group.add_argument('--max-position-embeddings', type=int, default=None,
@@ -631,7 +624,7 @@ def _add_logging_args(parser):
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--timing-log-level', type=int,
-                       default=0, choices=range(0, 3),
+                       default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '
                        '   0: report only iteration time and make sure timing '
                        '      does not introduce extra overhead.'
@@ -800,6 +793,7 @@ def _add_training_args(parser):
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
 
+
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
@@ -900,8 +894,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learing rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear',
-                                'cosine', 'inverse-square-root'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -1060,10 +1053,10 @@ def _add_distributed_args(parser):
                        'skips DDP initialization and returns function to '
                        'complete it instead.Also turns on '
                        '--use-cpu-initialization flag. This is for '
-                       'external DDP manager.')
+                       'external DDP manager.' )
     group.add_argument('--use-cpu-initialization', action='store_true',
                        default=None, help='If set, affine parallel weights '
-                       'initialization uses CPU')
+                       'initialization uses CPU' )
     group.add_argument('--empty-unused-memory-level', default=0, type=int,
                        choices=[0, 1, 2],
                        help='Call torch.cuda.empty_cache() each iteration '
@@ -1202,13 +1195,13 @@ def _add_biencoder_args(parser):
     # network size
     group.add_argument('--ict-head-size', type=int, default=None,
                        help='Size of block embeddings to be used in ICT and '
-                       'REALM (paper default: 128)')
+                        'REALM (paper default: 128)')
     group.add_argument('--biencoder-projection-dim', type=int, default=0,
                        help='Size of projection head used in biencoder (paper'
-                       ' default: 128)')
+                        ' default: 128)')
     group.add_argument('--biencoder-shared-query-context-model', action='store_true',
-                       help='Whether to share the parameters of the query '
-                       'and context models or not')
+                        help='Whether to share the parameters of the query '
+                        'and context models or not')
 
     # checkpointing
     group.add_argument('--ict-load', type=str, default=None,
@@ -1230,18 +1223,18 @@ def _add_biencoder_args(parser):
 
     # training
     group.add_argument('--retriever-report-topk-accuracies', nargs='+', type=int,
-                       default=[], help="Which top-k accuracies to report "
-                       "(e.g. '1 5 20')")
+                        default=[], help="Which top-k accuracies to report "
+                        "(e.g. '1 5 20')")
     group.add_argument('--retriever-score-scaling', action='store_true',
                        help='Whether to scale retriever scores by inverse '
-                       'square root of hidden size')
+                        'square root of hidden size')
 
     # faiss index
     group.add_argument('--block-data-path', type=str, default=None,
                        help='Where to save/load BlockData to/from')
     group.add_argument('--embedding-path', type=str, default=None,
                        help='Where to save/load Open-Retrieval Embedding'
-                       ' data to/from')
+                        ' data to/from')
 
     # indexer
     group.add_argument('--indexer-batch-size', type=int, default=128,

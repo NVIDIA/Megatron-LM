@@ -29,7 +29,9 @@ class Pooler(MegatronModule):
     ):
         super(Pooler, self).__init__(config)
         # TODO: Shoudl switch this to TE ?
-        self.dense = get_linear_layer(hidden_size, hidden_size, init_method)
+        self.dense = get_linear_layer(
+            hidden_size, hidden_size, init_method, config.perform_initialization
+        )
         self.sequence_parallel = sequence_parallel
 
     def forward(self, hidden_states: Tensor, sequence_index=0):

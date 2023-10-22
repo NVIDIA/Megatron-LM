@@ -12,8 +12,8 @@ class BertLMHead(MegatronModule):
     """Masked LM head for Bert
 
     Args:
-        mpu_vocab_size(int): model parallel size of vocabulary.
         hidden_size: hidden size
+        mpu_vocab_size(int): model parallel size of vocabulary.
         config (TransformerConfig): TransformerConfig object
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
         vocab_size(int): The vocabulary size
@@ -24,6 +24,7 @@ class BertLMHead(MegatronModule):
     def __init__(
         self,
         hidden_size: int,
+        mpu_vocab_size: int,
         config: TransformerConfig,
         parallel_output: bool,
         vocab_size: int,
@@ -33,15 +34,14 @@ class BertLMHead(MegatronModule):
         super().__init__(config=config)
 
         self.vocab_size = vocab_size
-        # TODO Make sure this is correct. In original bert :
-        # mpu_vocab_size = self.shared_embedding_or_output_weight().size(0)
-        # self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
-        self.bias = torch.nn.Parameter(torch.zeros(vocab_size))
+        self.bias = torch.nn.Parameter(torch.zeros(mpu_vocab_size))
         tensor_parallel.set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
         self.parallel_output = parallel_output
 
         # TODO: Shoudl switch this to TE ?
-        self.dense = get_linear_layer(hidden_size, hidden_size, config.init_method)
+        self.dense = get_linear_layer(
+            hidden_size, hidden_size, config.init_method, config.perform_initialization
+        )
 
         setattr(self.dense.weight, 'sequence_parallel', config.sequence_parallel)
         setattr(self.dense.bias, 'sequence_parallel', config.sequence_parallel)

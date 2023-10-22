@@ -22,6 +22,7 @@ class BertModel(LanguageModule):
 
     Args:
         config (TransformerConfig): transformer config
+        num_tokentypes (int) : Set to 2 when args.bert_binary_head is True, and 0 otherwise. Defaults to 0.
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -38,6 +39,7 @@ class BertModel(LanguageModule):
     def __init__(
         self,
         config: TransformerConfig,
+        num_tokentypes: int,
         transformer_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
@@ -80,6 +82,7 @@ class BertModel(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                num_tokentypes=num_tokentypes,
             )
 
         if self.position_embedding_type == 'rope':
@@ -98,8 +101,10 @@ class BertModel(LanguageModule):
 
         # Output
         if post_process:
+            # TODO: Make sure you are passing in the mpu_vocab_size properly
             self.lm_head = BertLMHead(
                 config.hidden_size,
+                self.embedding.word_embeddings.weight.size(0),
                 config,
                 parallel_output,
                 self.vocab_size,
@@ -112,7 +117,9 @@ class BertModel(LanguageModule):
             self.binary_head = None
             if self.add_binary_head:
                 # TODO: Shoudl switch this to TE ?
-                self.binary_head = get_linear_layer(config.hidden_size, 2, config.init_method)
+                self.binary_head = get_linear_layer(
+                    config.hidden_size, 2, config.init_method, config.perform_initialization
+                )
 
                 self.pooler = Pooler(
                     config.hidden_size, config.init_method, config.sequence_parallel, config
@@ -129,14 +136,23 @@ class BertModel(LanguageModule):
         lm_labels: Tensor = None,
         inference_params=None,
     ):
+        """Forward function of BERT model
+
+        Forward function of the BERT Model This function passes the input tensors
+        through the embedding layer, and then the encoder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+        """
         extended_attention_mask = bert_extended_attention_mask(attention_mask)
 
         position_ids = bert_position_ids(input_ids)
 
         # Encoder embedding.
         if self.pre_process:
-            # TODO : tokentype_ids should be used to be consistant with non core bert model
-            encoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            encoder_input = self.embedding(
+                input_ids=input_ids, position_ids=position_ids, tokentype_ids=tokentype_ids
+            )
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
