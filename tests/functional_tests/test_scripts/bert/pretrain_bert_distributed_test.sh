@@ -71,6 +71,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${USE_MCORE:+--use-mcore-models} \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
+       --bert-no-binary-head \
        --${TRAINING_DTYPE}"
 
 command="$command $torch_run_cmd"
