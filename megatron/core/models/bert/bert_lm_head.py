@@ -13,7 +13,6 @@ class BertLMHead(MegatronModule):
 
     Args:
         hidden_size: hidden size
-        mpu_vocab_size(int): model parallel size of vocabulary.
         config (TransformerConfig): TransformerConfig object
         parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
         vocab_size(int): The vocabulary size
@@ -24,7 +23,6 @@ class BertLMHead(MegatronModule):
     def __init__(
         self,
         hidden_size: int,
-        mpu_vocab_size: int,
         config: TransformerConfig,
         parallel_output: bool,
         vocab_size: int,

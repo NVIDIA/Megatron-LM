@@ -104,7 +104,6 @@ class BertModel(LanguageModule):
             # TODO: Make sure you are passing in the mpu_vocab_size properly
             self.lm_head = BertLMHead(
                 config.hidden_size,
-                self.embedding.word_embeddings.weight.size(0),
                 config,
                 parallel_output,
                 self.vocab_size,
