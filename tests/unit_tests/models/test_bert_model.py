@@ -15,7 +15,7 @@ class TestBertodel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True, perform_initialization=True)
         self.bert_model = BertModel(config=transformer_config, num_tokentypes=0, transformer_layer_spec=bert_layer_with_transformer_engine_spec, vocab_size=100, max_sequence_length=4)
 
     def teardown_method(self, method):

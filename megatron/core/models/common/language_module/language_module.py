@@ -31,7 +31,7 @@ class LanguageModule(MegatronModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.transformer.set_input_tensor(input_tensor[0])
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
