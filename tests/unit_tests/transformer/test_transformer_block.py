@@ -1,360 +1,107 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import re
-from contextlib import nullcontext
-from dataclasses import dataclass
-from typing import List, Union
+import os
+import pytest
 
 import torch
-from torch import Tensor
+from megatron.core import dist_checkpointing
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
+from megatron.core.transformer.transformer_block import TransformerBlock
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
+class TestParallelTransformerBlock:
 
-def get_num_layers_to_build(config: TransformerConfig) -> int:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
+        self.parallel_transformer_block = TransformerBlock(self.transformer_config,
+                                                           get_gpt_layer_with_transformer_engine_spec())
 
-    num_layers_per_pipeline_rank = (
-        config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-    )
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
-    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-        # Interleaved pipeline parallelism:
-        # Number of layers in each model chunk is the number of layers in the stage,
-        # divided by the number of model chunks in a stage.
-        # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0]  [2]  [4]  [6]
-        # Stage 1: [1]  [3]  [5]  [7]
-        # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0, 1]  [4, 5]
-        # Stage 1: [2, 3]  [6, 7]
+    def test_constructor(self):
+        parallel_transformer_block = self.parallel_transformer_block
+        assert isinstance(parallel_transformer_block, TransformerBlock)
+        num_weights = sum([p.numel() for p in parallel_transformer_block.parameters()])
+        assert num_weights == 3792
+        assert parallel_transformer_block.num_layers_per_pipeline_rank == 2
+        assert len(parallel_transformer_block.layers) == 2
+        layer_0: TransformerLayer = parallel_transformer_block._get_layer(0)
+        assert layer_0.layer_number == 1
+        layer_1: TransformerLayer = parallel_transformer_block._get_layer(1)
+        assert layer_1.layer_number == 2
 
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+    def test_gpu_forward(self):
+        parallel_transformer_block = self.parallel_transformer_block
+        config: TransformerConfig = parallel_transformer_block.config
 
-        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        sequence_length = 32
+        micro_batch_size = 2
+        parallel_transformer_block.cuda()
 
-        num_layers_to_build = num_layers_per_virtual_rank
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
 
-    else:
-        # Non-interleaved pipeline parallelism:
-        # Each stage gets a contiguous set of layers.
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        num_layers_to_build = num_layers_per_pipeline_rank
+        hidden_states = parallel_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == config.hidden_size
 
-    return num_layers_to_build
+    def test_gpu_forward_full_checkpoint(self):
+        transformer_config = self.transformer_config
+        config = transformer_config
+        config.recompute_granularity = 'full'
+        config.recompute_method = 'block'
+        config.recompute_num_layers = config.num_layers
+        full_transformer_block = TransformerBlock(config,
+                                                  get_gpt_layer_with_transformer_engine_spec())
+        assert full_transformer_block.config.recompute_granularity == 'full'
+        assert full_transformer_block.config.recompute_method == 'block'
 
+        sequence_length = 32
+        micro_batch_size = 2
+        full_transformer_block.cuda()
 
-@dataclass
-class TransformerBlockSubmodules:
-    layer_specs: List[ModuleSpec] = None
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
 
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-def _get_block_submodules(
-    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec],
-) -> TransformerBlockSubmodules:
+        hidden_states = full_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == config.hidden_size
 
-    # Transformer block submodules.
-    if isinstance(spec, TransformerBlockSubmodules):
-        return spec
+    def test_gpu_forward_selective_checkpoint(self):
+        transformer_config = self.transformer_config
+        config = transformer_config
+        config.recompute_granularity = 'selective'
+        selective_transformer_block = TransformerBlock(config,
+                                                       get_gpt_layer_with_transformer_engine_spec())
+        assert selective_transformer_block.config.recompute_granularity == 'selective'
+        assert selective_transformer_block.checkpoint_core_attention
 
-    # ModuleSpec here is generally assumed to be for a transformer layer.
-    elif isinstance(spec, ModuleSpec):
-        if issubclass(spec.module, TransformerBlock):
-            return spec.submodules
-        elif issubclass(spec.module, TransformerLayer):
-            num_layers = get_num_layers_to_build(config)
-            return TransformerBlockSubmodules(layer_specs=[spec] * num_layers)
-        else:
-            raise Exception(f"specialize for {spec.module.__name__}.")
-    else:
-        raise Exception(f"specialize for {type(spec).__name__}.")
+        sequence_length = 32
+        micro_batch_size = 2
+        selective_transformer_block.cuda()
 
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
+        hidden_states = hidden_states.cuda()
 
-class TransformerBlock(MegatronModule):
-    """Transformer class."""
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: Union[TransformerBlockSubmodules, ModuleSpec],
-        post_layer_norm: bool = True,
-        pre_process: bool = True,
-        post_process: bool = True,
-    ):
-        super().__init__(config=config)
-
-        self.submodules = _get_block_submodules(config, submodules)
-        self.post_layer_norm = post_layer_norm
-        self.pre_process = pre_process
-        self.post_process = post_process
-
-        # required for pipeline parallel schedules
-        self.input_tensor = None
-
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
-
-        self._build_layers()
-        self.num_layers_per_pipeline_rank = len(self.layers)
-
-    def _build_layers(self):
-        # Transformer layers.
-        # @jcasper can we improve how we deal with layer_number?
-        # currently it's only used in CoreAttention?
-        # if self.apply_query_key_layer_scaling:
-        #     coeff = self.layer_number
-        #     self.norm_factor *= coeff
-        def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number,)
-
-        # offset is implicit in TransformerLayer
-        self.layers = torch.nn.ModuleList(
-            [
-                build_layer(layer_spec, i + 1)
-                for i, layer_spec in enumerate(self.submodules.layer_specs)
-            ]
-        )
-
-        # # TODO: add back standalone_embedding_stage
-        # if self.num_layers == 0:
-        #     # When a standalone embedding stage is used (e.g.,
-        #     # args.standalone_embedding_stage == True), virtual pipeline ranks
-        #     # on pipeline rank 0 will have zero transformer layers assigned to
-        #     # them. This results in the model's input and output tensors to be
-        #     # the same, which will cause failure for certain output tensor
-        #     # optimizations (e.g., pipeline output deallocation). To remedy
-        #     # this, we assign a 'no-op' layer on these ranks, which will
-        #     # disconnect the input tensor from the output tensor.
-        #     self.num_layers = 1
-        #     self.layers = torch.nn.ModuleList([NoopTransformerLayer(1)])
-        # else:
-        #     self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
-
-        if self.post_process and self.post_layer_norm:
-            # Final layer norm before output.
-            self.final_layernorm = TENorm(
-                config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel,
-                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                normalization=self.config.normalization,
-            )
-
-    def _get_layer(self, layer_number: int):
-        return self.layers[layer_number]
-
-    def _checkpointed_forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        rotary_pos_emb: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-    ):
-        """Forward method with activation checkpointing."""
-
-        def custom(start: int, end: int):
-            def custom_forward(
-                hidden_states,
-                attention_mask,
-                context,
-                context_mask,
-                rotary_pos_emb,
-                *args,
-                **kwargs,
-            ):
-                for index in range(start, end):
-                    layer = self._get_layer(index)
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        *args,
-                        **kwargs,
-                    )
-                return hidden_states, context
-
-            return custom_forward
-
-        if self.config.recompute_method == 'uniform':
-            # Uniformly divide the total number of Transformer layers and checkpoint
-            # the input activation of each divided chunk.
-            # A method to further reduce memory usage reducing checkpoints.
-            l = 0
-            while l < self.num_layers_per_pipeline_rank:
-                hidden_states, context = tensor_parallel.checkpoint(
-                    custom(l, l + self.config.recompute_num_layers),
-                    self.config.distribute_saved_activations,
-                    hidden_states,
-                    attention_mask,
-                    context,
-                    context_mask,
-                    rotary_pos_emb,
-                )
-
-                l += self.config.recompute_num_layers
-
-        elif self.config.recompute_method == 'block':
-            # Checkpoint the input activation of only a set number of individual
-            # Transformer layers and skip the rest.
-            # A method fully use the device memory removing redundant re-computation.
-            for l in range(self.num_layers_per_pipeline_rank):
-                if l < self.config.recompute_num_layers:
-                    hidden_states, context = tensor_parallel.checkpoint(
-                        custom(l, l + 1),
-                        self.config.distribute_saved_activations,
-                        hidden_states,
-                        attention_mask,
-                        context,
-                        context_mask,
-                        rotary_pos_emb,
-                    )
-                else:
-                    hidden_states, context = custom(l, l + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
-                    )
-        else:
-            raise ValueError("Invalid activation recompute method.")
-
-        return hidden_states
-
-    def set_input_tensor(self, input_tensor: Tensor):
-        """Set input tensor to be used instead of forward()'s input.
-
-        When doing pipeline parallelism the input from the previous
-        stage comes from communication, not from the input, so the
-        model's forward_step_func won't have it. This function is thus
-        used by internal code to bypass the input provided by the
-        forward_step_func"""
-        self.input_tensor = input_tensor
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        inference_params: InferenceParams = None,
-    ):
-        # hidden_states (float): [s, b, h]
-        # attention_mask (bool): [1, 1, s, s]
-
-        if not self.pre_process:
-            # See set_input_tensor()
-            hidden_states = self.input_tensor
-
-        # Viewless tensor.
-        # - We only need to create a viewless tensor in the case of micro batch
-        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
-        #   above creates a view tensor, and '.contiguous()' is a pass-through.
-        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
-        #   the need to make it viewless.
-        #
-        #   However, we don't explicitly check mbs == 1 here because
-        #   make_viewless_tensor() has negligible overhead when its input
-        #   is already viewless.
-        #
-        # - For the 'else' case above, calling make_viewless_tensor() here is
-        #   likely redundant, since p2p_communication.py (likely originator)
-        #   already creates viewless tensors. That said, make_viewless_tensor()
-        #   is called here to be future-proof and corner-case-proof.
-        hidden_states = make_viewless_tensor(
-            inp=hidden_states, requires_grad=True, keep_graph=True,
-        )
-
-        if self.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
-        else:
-            rng_context = nullcontext()
-
-        if self.config.fp8:
-            import transformer_engine  # To keep out TE dependency when not training in fp8
-
-            if self.config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif self.config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            fp8_recipe = transformer_engine.common.recipe.DelayedScaling(
-                margin=self.config.fp8_margin,
-                interval=self.config.fp8_interval,
-                fp8_format=fp8_format,
-                amax_compute_algo=self.config.fp8_amax_compute_algo,
-                amax_history_len=self.config.fp8_amax_history_len,
-                override_linear_precision=(False, False, not self.config.fp8_wgrad),
-            )
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group()
-            fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
-            )
-        else:
-            fp8_context = nullcontext()
-
-        with rng_context and fp8_context:
-            # Forward pass.
-            if self.config.recompute_granularity == 'full':
-                hidden_states = self._checkpointed_forward(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    context=context,
-                    context_mask=context_mask,
-                    rotary_pos_emb=rotary_pos_emb,
-                )
-            else:
-                for layer in self.layers:
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        inference_params=inference_params,
-                    )
-
-        # Final layer norm.
-        if self.post_process and self.post_layer_norm:
-            hidden_states = self.final_layernorm(hidden_states)
-
-        return hidden_states
-
-    def sharded_state_dict(self, prefix: str = ''):
-
-        sharded_state_dict = {}
-
-        layer_prefix = f'{prefix}layers.'
-        for layer in self.layers:
-            sharded_state_dict.update(layer.sharded_state_dict(prefix=layer_prefix))
-
-        if self.post_process and self.post_layer_norm:
-            state_dict = self.state_dict(keep_vars=True)
-
-            tensor = state_dict['final_layernorm.weight']
-            layer_name = f'{prefix}final_layernorm.weight'
-            sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(tensor, layer_name)
-
-            # RMSNorm doesn't have bias.
-            if 'final_layernorm.bias' in state_dict.keys():
-                tensor = state_dict['final_layernorm.bias']
-                layer_name = f'{prefix}final_layernorm.bias'
-                sharded_state_dict[layer_name] = make_sharded_tensor_for_checkpoint(
-                    tensor, layer_name
-                )
-
-        return sharded_state_dict
+        hidden_states = selective_transformer_block(hidden_states=hidden_states, attention_mask=attention_mask)
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == config.hidden_size
