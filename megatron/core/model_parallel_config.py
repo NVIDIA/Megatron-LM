@@ -162,7 +162,7 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce: bool = False
     tp_comm_overlap: bool = False
 
-    #Debug Options
+    # Debug Options
     tp_comm_split_ag: bool = True
     tp_comm_split_rs: bool = True
     tp_comm_bulk_wgrad: bool = True
