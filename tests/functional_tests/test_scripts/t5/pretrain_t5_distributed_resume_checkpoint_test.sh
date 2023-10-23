@@ -86,7 +86,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --save-interval 500 \
     --eval-interval 1000 \
     --eval-iters 10 \
-    --distributed-backend nccl"
+    --distributed-backend nccl \
+    ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 echo 500 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
@@ -128,7 +129,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --save-interval 500 \
     --eval-interval 1000 \
     --eval-iters 10 \
-    --distributed-backend nccl"
+    --distributed-backend nccl \
+    ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
 command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
