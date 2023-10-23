@@ -63,6 +63,23 @@ def print_datetime(string):
     time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
+'''
+Since v0.9.0, deepspeed.initialize() has forbidden simultaneous setting of args.deepspeed_config (Path) and ds_config dict.
+So, we use ds_config dict which is the more flexible option. 
+'''
+def _create_ds_config_dict():
+    args = get_args()
+    ds_config_dict = json.load(
+        open(args.deepspeed_config, 'r', encoding='utf-8'))
+    
+    if args.universal_checkpoint:
+        ds_config_dict["checkpoint"] = {"load_universal": True}
+
+    # Clear config path
+    args.deepspeed_config = None 
+
+    return ds_config_dict
+    
 
 def pretrain(train_valid_test_dataset_provider,
              model_provider,
@@ -124,18 +141,17 @@ def pretrain(train_valid_test_dataset_provider,
     timers = get_timers()
 
     if args.deepspeed:
-        args.deepspeed_configuration = json.load(
-            open(args.deepspeed_config, 'r', encoding='utf-8'))
-        if "curriculum_learning" in args.deepspeed_configuration and \
-            "enabled" in args.deepspeed_configuration["curriculum_learning"]:
-            args.curriculum_learning_legacy = args.deepspeed_configuration[ \
+        args.deepspeed_config_dict = _create_ds_config_dict()
+        if "curriculum_learning" in args.deepspeed_config_dict and \
+            "enabled" in args.deepspeed_config_dict["curriculum_learning"]:
+            args.curriculum_learning_legacy = args.deepspeed_config_dict[ \
                 "curriculum_learning"]["enabled"]
         if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
             from deepspeed.runtime.data_pipeline.curriculum_scheduler \
                 import CurriculumScheduler
             args.curriculum_scheduler = CurriculumScheduler( \
-                args.deepspeed_configuration["curriculum_learning"])
-        if "compression_training" in args.deepspeed_configuration:
+                args.deepspeed_config_dict["curriculum_learning"])
+        if "compression_training" in args.deepspeed_config_dict:
             args.compression_training = True
 
     # Model, optimizer, and learning rate.
@@ -211,7 +227,7 @@ def pretrain(train_valid_test_dataset_provider,
         print_datetime('after training is done')
         # Clean the model
         if args.compression_training:
-            model = [redundancy_clean(model[0], args.deepspeed_config, mpu)]
+            model = [redundancy_clean(model[0], args.deepspeed_config_dict, mpu)]
 
         if args.save and iteration != 0:
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler)
@@ -468,16 +484,13 @@ def load_model_weights_only(model_provider_func):
     lr_scheduler = None
 
     if args.deepspeed:
-        with open(args.deepspeed_config, 'r') as fd:
-            ds_config = json.load(fd)
-
         # When loading just the model weights, ZeRO can be disabled.
-        if 'zero_optimization' in ds_config:
-            del ds_config['zero_optimization']
+        if 'zero_optimization' in args.deepspeed_config_dict:
+            del args.deepspeed_config_dict['zero_optimization']
 
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model[0],
-            config=ds_config
+            config=args.deepspeed_config_dict
         )
 
         assert not isinstance(model, deepspeed.PipelineEngine), \
@@ -513,7 +526,8 @@ def setup_model_and_optimizer(model_provider_func,
         model, _, _, _ = deepspeed.initialize(
                 model=model[0],
                 args=args,
-                mpu=mpu if args.no_pipeline_parallel else None
+                mpu=mpu if args.no_pipeline_parallel else None,
+                config=args.deepspeed_config_dict,
             )
         model = [model]
         if args.load is not None:
@@ -527,10 +541,11 @@ def setup_model_and_optimizer(model_provider_func,
         model, _, _, _ = deepspeed.initialize(
             model=model[0],
             args=args,
-            mpu=mpu if args.no_pipeline_parallel else None
+            mpu=mpu if args.no_pipeline_parallel else None,
+            config=args.deepspeed_config_dict,
         )
         model = [model]
-        model = [init_compression(model[0].module, args.deepspeed_config, mpu)]
+        model = [init_compression(model[0].module, args.deepspeed_config_dict, mpu)]
 
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
@@ -581,7 +596,8 @@ def setup_model_and_optimizer(model_provider_func,
                 args=args,
                 lr_scheduler=opt_param_scheduler,
                 training_data=train_ds,
-                mpu=mpu if args.no_pipeline_parallel else None
+                mpu=mpu if args.no_pipeline_parallel else None,
+                config=args.deepspeed_config_dict,
             )
             model.set_data_post_process_func(data_post_process)
         else:
@@ -590,7 +606,8 @@ def setup_model_and_optimizer(model_provider_func,
                 optimizer=optimizer,
                 args=args,
                 lr_scheduler=opt_param_scheduler,
-                mpu=mpu if args.no_pipeline_parallel else None
+                mpu=mpu if args.no_pipeline_parallel else None,
+                config=args.deepspeed_config_dict,
             )
         if isinstance(model, deepspeed.PipelineEngine):
             # hack to get batch_fn from pretrain_gpt.py
@@ -860,7 +877,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
                               args.consumed_train_tokens)
-        if args.log_loss_scale_to_tensorboard:
+        if args.fp16 and args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)

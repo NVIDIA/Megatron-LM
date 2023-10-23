@@ -115,6 +115,8 @@ class MegatronModule(torch.nn.Module):
             torch.distributed.all_reduce(position_embeddings.weight.data,
                                          group=mpu.get_position_embedding_group())
 
+    def universal_checkpoint_info(self):
+        return {}
 
 def conversion_helper(val, conversion):
     """Apply conversion to val. Recursively apply conversion if `val`

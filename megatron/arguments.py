@@ -1039,7 +1039,8 @@ def _add_checkpointing_args(parser):
                        help="If '--load' is set, but checkpoint is not found "
                        "(e.g., path typo), then exit instead of random "
                        "initialization.")
-
+    group.add_argument('--universal-checkpoint', action='store_true',
+                        help='Loading a universal format checkpoint.')
     return parser
 
 

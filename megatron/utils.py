@@ -286,3 +286,84 @@ def checkpoint_throughput_calculator(model, latency_second):
     checkpoint_GB = approx_parameters_in_billions * checkpoint_multiplier
     GB_per_second = checkpoint_GB / latency_second
     print_rank_0(f"Checkpoint Save GB: {round(checkpoint_GB, 3)}, GB/Sec: {round(GB_per_second,2)}, Latency(second): {round(latency_second, 3)}")
+
+
+def get_fingerprint_header():
+    return f"{'min':^13} {'max':^13} {'mean':^13} {'l2 norm':^12} metadata"
+
+def get_fingerprint(p):
+    return f"{p.min():13.6e} {p.max():13.6e} {p.mean():13.6e} {p.norm():12.6e}"
+
+
+def dump_position_embed_weights(preamble, iteration, model):
+    # return 
+    from deepspeed.utils import safe_get_full_fp32_param
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    dp_rank = mpu.get_data_parallel_rank()
+    get_fingerprint_header()
+    for n, p in model[0].named_parameters():
+        if 'position_embeddings' in n:
+            tag = "pos_embed"
+        elif "word_embeddings" in n:
+            tag = "word_embed"
+        else:
+            continue 
+        print(f"iter {iteration} {preamble} {tag} lp {tp_rank}/{pp_rank}/{dp_rank}: {get_fingerprint(p)} {p.shape}\n")
+        fp32_value = safe_get_full_fp32_param(p)
+        if fp32_value is not None: 
+            print(f"iter {iteration} {preamble} {tag} hp {tp_rank}/{pp_rank}/{dp_rank}: {get_fingerprint(fp32_value)} {p.shape}\n")
+
+def dump_weights(preamble, iteration, model, optimizer, tensor=None):
+    # return
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    dp_rank = mpu.get_data_parallel_rank()
+    dp_size = mpu.get_data_parallel_world_size()
+    fn = f"debug-bf16-{iteration}-pp{pp_rank}-tp{tp_rank}-dp{dp_rank}-{preamble}.txt"
+
+    # only care for first and last pp stages and dp0 tp0
+    #if not (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()):
+    #    return
+
+    #if not (tp_rank == 0 and dp_rank == 0):
+    #    return
+
+    if tensor is not None:
+        orig_tensor = tensor
+        if hasattr(tensor, "_hp_param"):
+            numel = tensor._hp_param.numel() # // dp_size
+            tensor = tensor.flatten().narrow(0, 0, numel)
+
+    #print(fn)
+    with open(fn, "w") as fh:
+        fh.write(f"{get_fingerprint_header()}\n")
+
+        if tensor is not None:
+            fh.write(f"{get_fingerprint(tensor)} tensor {tensor.shape}\n")
+        else:
+            for n, p in model[0].named_parameters():
+                fh.write(f"{get_fingerprint(p)} {n} {p.shape}\n")
+
+
+    return
+
+
+    # until we figure out how to dump the actual fp32 values don't do this
+    fn = f"debug-fp32-{iteration}-pp{pp_rank}-tp{tp_rank}-dp{dp_rank}-{preamble}.txt"
+    with open(fn, "w") as fh:
+        fh.write(f"{get_fingerprint_header()}\n")
+        if tensor is not None:
+            tensor = orig_tensor
+            if hasattr(tensor, "_hp_param"):
+                fh.write(f"{get_fingerprint(tensor._hp_param)} tensor {tensor._hp_param.shape}\n")
+                #fh.write(f"{get_fingerprint(tensor._hp_grad)} tensor grad\n")
+            else:
+                fh.write(f"{get_fingerprint(tensor)} tensor {tensor.shape}\n")
+                #fh.write(f"{get_fingerprint(tensor.grad)} tensor grad\n")
+
+        else:
+            if hasattr(model[0].module.tied_modules, "embed"):
+                p = model[0].module.tied_modules.embed.word_embeddings.weight._hp_param
+                fh.write(f"{get_fingerprint(p)} module.tied_modules.embed.word_embeddings.weight._hp_param {p.shape}\n")
+
