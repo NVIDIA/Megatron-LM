@@ -103,11 +103,9 @@ class TELinear(te.pytorch.Linear):
 
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.8.0"):
-            extra_kwargs["ub_split_ag"] = self.config.ub_tp_comm_overlap and bool(
-                int(os.getenv("MCORE_UB_SPLIT_AG", "1"))
+            extra_kwargs["ub_split_ag"] = self.config.tp_comm_overlap and self.config.tp_comm_split_ag
             )
-            extra_kwargs["ub_split_rs"] = self.config.ub_tp_comm_overlap and bool(
-                int(os.getenv("MCORE_UB_SPLIT_RS", "1"))
+            extra_kwargs["ub_split_rs"] = self.config.tp_comm_overlap and self.config.tp_comm_split_rs
             )
 
         super().__init__(
@@ -169,14 +167,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             kwargs["normalization"] = self.config.normalization
 
         if te_version >= packaging.version.Version("0.8.0"):
-            extra_kwargs["ub_bulk_wgrad"] = self.config.ub_tp_comm_overlap and bool(
-                int(os.getenv("MCORE_UB_BULK_WGRAD", "1"))
+            extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_overlap and self.config.tp_comm_bulk_wgrad
             )
-            extra_kwargs["ub_bulk_dgrad"] = self.config.ub_tp_comm_overlap and bool(
-                int(os.getenv("MCORE_UB_BULK_DGRAD", "1"))
+            extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_overlap and self.config.tp_comm_bulk_dgrad
             )
-            extra_kwargs["ub_split_ag"] = self.config.ub_tp_comm_overlap and bool(
-                int(os.getenv("MCORE_UB_SPLIT_AG", "1"))
+            extra_kwargs["ub_split_ag"] = self.config.tp_comm_overlap and self.config.tp_comm_split_ag
             )
 
         super().__init__(

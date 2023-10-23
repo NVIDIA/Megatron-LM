@@ -5,6 +5,7 @@
 import random
 import os
 import time
+import yaml
 
 import numpy as np
 import torch
@@ -21,6 +22,8 @@ from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
+import transformer_engine
+from transformer_engine.pytorch import module as te_module
 
 def initialize_megatron(
     extra_args_provider=None,
@@ -84,6 +87,9 @@ def initialize_megatron(
 
         # Compile dependencies.
         _compile_dependencies()
+
+        if args.tp_comm_overlap:
+           _initialize_userbuffer()
 
         # No continuation function
         return None
@@ -161,6 +167,22 @@ def _compile_dependencies():
             flush=True,
         )
 
+def _initialize_userbuffer():
+    """ Function to initialize user buffer configuration """
+
+    args = get_args()
+
+    if args.tp_comm_overlap_cfg is not None:
+       with open(args.tp_comm_overlap_cfg,"r") as stream:    
+          ub_cfgs = yaml.safe_load(stream)
+    else:
+       ub_cfgs = {}
+
+    input_shape = [args.seq_length * args.micro_batch_size , args.hidden_size]
+
+    torch.distributed.new_group(backend='mpi')
+
+    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
 
 def _initialize_distributed():
     """Initialize torch.distributed and core model parallel."""
