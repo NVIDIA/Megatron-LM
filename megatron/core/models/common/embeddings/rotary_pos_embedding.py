@@ -71,6 +71,7 @@ class RotaryEmbedding(nn.Module):
         )
 
         if self.seq_len_interpolation_factor is not None:
+            seq = seq.to(torch.float32)
             seq *= 1 / self.seq_len_interpolation_factor
 
         freqs = torch.outer(seq, self.inv_freq)
@@ -82,7 +83,7 @@ class RotaryEmbedding(nn.Module):
         if parallel_state.get_context_parallel_world_size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0)
-        return emb
+        return emb.type_as(self.inv_freq)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         state_dict.pop(f'{prefix}inv_freq', None)
