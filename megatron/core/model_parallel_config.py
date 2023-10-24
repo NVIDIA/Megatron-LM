@@ -68,13 +68,17 @@ class ModelParallelConfig:
         communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever possible
         during the forward and the backward pass.  Defaults to False.
 
-    tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap is False.
+    tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
+        is False.
 
-    tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if tp_comm_overlap is False.
+    tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
+        tp_comm_overlap is False.
 
-    tp_comm_bulk_dgrad (bool, default=True): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't care if tp_comm_overlap is False.
+    tp_comm_bulk_dgrad (bool, default=True): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't 
+        care if tp_comm_overlap is False.
 
-    tp_comm_bulk_wgrad (bool, default=True): If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if tp_comm_overlap is False.
+    tp_comm_bulk_wgrad (bool, default=True): If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't 
+        care if tp_comm_overlap is False.
 
     Parallelism
     -----------

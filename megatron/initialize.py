@@ -5,7 +5,6 @@
 import random
 import os
 import time
-import yaml
 
 import numpy as np
 import torch
@@ -21,9 +20,6 @@ from megatron.checkpointing import load_args_from_checkpoint
 from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
-
-import transformer_engine
-from transformer_engine.pytorch import module as te_module
 
 def initialize_megatron(
     extra_args_provider=None,
@@ -89,7 +85,7 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
-           _initialize_userbuffer()
+           _initialize_tp_communicators()
 
         # No continuation function
         return None
@@ -167,8 +163,19 @@ def _compile_dependencies():
             flush=True,
         )
 
-def _initialize_userbuffer():
-    """ Function to initialize user buffer configuration """
+def _initialize_tp_communicators():
+    """ initializing the communicators with user buffers for high-performance tensor-model-parallel 
+        communication overlap """
+
+    try:
+       import yaml
+
+       import transformer_engine
+       from transformer_engine.pytorch import module as te_module
+
+    except ImportError:
+       print("Error: Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
+             "'transformer_engine' packages") 
 
     args = get_args()
 
@@ -182,7 +189,8 @@ def _initialize_userbuffer():
 
     torch.distributed.new_group(backend='mpi')
 
-    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
+    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, 
+                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
 
 def _initialize_distributed():
     """Initialize torch.distributed and core model parallel."""

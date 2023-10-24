@@ -430,10 +430,10 @@ def core_transformer_config_from_args(args):
     kw_args['pipeline_dtype'] = args.params_dtype
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['tp_comm_overlap'] = args.tp_comm_overlap
-    kw_args['tp_comm_split_ag'] = not args.disable_tp_comm_split_ag
-    kw_args['tp_comm_split_rs'] = not args.disable_tp_comm_split_rs
-    kw_args['tp_comm_bulk_dgrad'] = not args.disable_tp_comm_bulk_dgrad
-    kw_args['tp_comm_bulk_wgrad'] = not args.disable_tp_comm_bulk_wgrad
+    kw_args['tp_comm_split_ag'] = args.tp_comm_split_ag
+    kw_args['tp_comm_split_rs'] = args.tp_comm_split_rs
+    kw_args['tp_comm_bulk_dgrad'] = args.tp_comm_bulk_dgrad
+    kw_args['tp_comm_bulk_wgrad'] = args.tp_comm_bulk_wgrad
     kw_args['num_moe_experts'] = args.num_experts
     if args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -796,12 +796,18 @@ def _add_training_args(parser):
                        help='Gloable step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
-    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the overlap of Tensor parallel communication and GEMM kernels.')
-    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, help = 'Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-split-ag', action='store_true', help = 'Disables the All-Gather overlap with fprop GEMM.')
-    group.add_argument('--disable-tp-comm-split-rs', action='store_true', help = 'Disables the Reduce-Scatter overlap with fprop GEMM.')
-    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_true', help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.')
-    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_true', help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.')
+    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
+                       ' overlap of Tensor parallel communication and GEMM kernels.')
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+                       help = 'Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--tp-comm-split-ag', action='store_false', 
+                       help = 'Disables the All-Gather overlap with fprop GEMM.')
+    group.add_argument('--tp-comm-split-rs', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with fprop GEMM.')
+    group.add_argument('--tp-comm-bulk-dgrad', action='store_false', 
+                       help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.')
+    group.add_argument('--tp-comm-bulk-wgrad', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.')
 
 
     # deprecated
