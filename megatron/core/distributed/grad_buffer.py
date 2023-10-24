@@ -261,8 +261,11 @@ class GradBuffer:
                 params
             ), 'All params should be in one bucket when overlap_grad_reduce is False'
 
-        # Print buckets.
-        if torch.distributed.get_rank() == 0:
+        # Print buckets for all PP stages.
+        if (
+            parallel_state.get_data_parallel_rank() == 0
+            and parallel_state.get_tensor_model_parallel_rank() == 0
+        ):
             logger.info(
                 f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
             )

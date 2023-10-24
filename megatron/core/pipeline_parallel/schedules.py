@@ -395,9 +395,21 @@ def forward_backward_pipelining_with_interleaving(
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
+    if isinstance(no_sync_func, list):
+
+        def multi_no_sync():
+            stack = contextlib.ExitStack()
+            for model_chunk_no_sync_func in config.no_sync_func:
+                stack.enter_context(model_chunk_no_sync_func())
+            return stack
+
+        no_sync_func = multi_no_sync
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
+
+    if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
+        config.grad_sync_func = [config.grad_sync_func for model_chunk in model]
 
     def disable_grad_sync():
         """Disable asynchronous grad reductions"""
@@ -596,7 +608,7 @@ def forward_backward_pipelining_with_interleaving(
             ):
                 grad_sync_chunk_id = get_model_chunk_id(grad_sync_microbatch_id, forward=False)
                 enable_grad_sync()
-                config.grad_sync_func(model[grad_sync_chunk_id].parameters())
+                config.grad_sync_func[grad_sync_chunk_id](model[grad_sync_chunk_id].parameters())
                 synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
 
@@ -905,13 +917,10 @@ def forward_backward_pipelining_with_interleaving(
         # Launch any remaining grad reductions.
         enable_grad_sync()
         if config.grad_sync_func is not None:
-            params = []
             for model_chunk_id in range(num_model_chunks):
                 if model_chunk_id not in synchronized_model_chunks:
-                    params.extend(model[model_chunk_id].parameters())
+                    config.grad_sync_func[model_chunk_id](model[model_chunk_id].parameters())
                     synchronized_model_chunks.add(model_chunk_id)
-            if params:
-                config.grad_sync_func(params)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

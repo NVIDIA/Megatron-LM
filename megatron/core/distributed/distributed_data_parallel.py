@@ -31,6 +31,9 @@ class DistributedDataParallel(MegatronModule):
             is used instead.
         use_distributed_optimizer: If true, issue reduce-scatter communication calls as part
             of distributed optimizer. If false, issue all-reduce communication calls.
+        disable_bucketing: If true, force assign all parameters to a single bucket. If false,
+            use standard bucketing policy: assign parameters to smaller buckets and all-reduce
+            per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
 
     """
 
@@ -42,6 +45,7 @@ class DistributedDataParallel(MegatronModule):
         accumulate_allreduce_grads_in_fp32: bool,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
+        disable_bucketing: bool = False,
         bucket_size: int = 40000000,
     ):
         super().__init__(config=config)
@@ -51,7 +55,16 @@ class DistributedDataParallel(MegatronModule):
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
 
+        # Turn off bucketing if overlap_grad_reduce is False, if we are on a pipeline stage
+        # that is not the first (since data-parallel communication on these stages is not on
+        # the critical path), or if disable_bucketing is True (e.g., we might not want to
+        # break up model parameters into buckets for model chunks after the first
+        # in the interleaved schedule).
         if not self.overlap_grad_reduce:
+            bucket_size = None
+        if parallel_state.get_pipeline_model_parallel_rank() > 0:
+            bucket_size = None
+        if disable_bucketing:
             bucket_size = None
         self.bucket_size = bucket_size
 
@@ -209,7 +222,7 @@ class DistributedDataParallel(MegatronModule):
 
     def zero_grad_buffer(self):
         """
-        Zeros out all grad buffers. Needs to be called at the begining of each
+        Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
         for param in self.module.parameters():

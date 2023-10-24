@@ -51,7 +51,7 @@ formatting:
   script: &selene-test-resume-launcher-script
     - echo "Running selene resume from checkpoint test. "
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR TIME_LIMIT=$TIME_LIMIT"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -71,7 +71,7 @@ formatting:
   script: &selene-test-launcher-script
     - echo "Running selene test"
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE TIME_LIMIT=$TIME_LIMIT"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -331,6 +331,22 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
 
+train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: dist_optimizer
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer"
+
 train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
   variables:
@@ -346,6 +362,22 @@ train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: dist_optimizer_overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
 train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
@@ -363,6 +395,22 @@ train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
+train.gpt3.345m_tp4_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: dist_optimizer_overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
+
 train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
   variables:
@@ -378,6 +426,40 @@ train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--overlap-grad-reduce"
+
+train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_dist_optimizer_overlap_grad_reduce:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: dist_optimizer_overlap_grad_reduce
+    ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
 train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
   <<: *selene-test-launcher
