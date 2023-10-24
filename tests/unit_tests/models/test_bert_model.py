@@ -53,7 +53,7 @@ class TestBertModel:
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
         position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
 
         logits = self.bert_model.forward(input_ids=input_ids, attention_mask=attention_mask)
 
