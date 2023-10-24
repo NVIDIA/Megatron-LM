@@ -224,9 +224,7 @@ class GPTModel(LanguageModule):
                 output_layer_tensor = output_layer_state_dict[output_layer_key]
                 # independent output layer
                 sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_key,
-                    allow_shape_mismatch=True,
+                    tensor=output_layer_tensor, key=output_layer_key, allow_shape_mismatch=True,
                 )
 
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
