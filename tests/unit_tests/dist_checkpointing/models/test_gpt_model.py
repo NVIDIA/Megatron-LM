@@ -13,17 +13,19 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import \
+    gpt_layer_with_transformer_engine_spec, gpt_layer_local_spec
 
 
-def initialize_gpt_model(**config_kwargs):
+def initialize_gpt_model(use_te=True, **config_kwargs):
     default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True)
     default_config_kwargs.update(**config_kwargs)
     model_parallel_cuda_manual_seed(123)
     transformer_config = TransformerConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()
     post_process = ps.is_pipeline_last_stage()
-    model = GPTModel(config=transformer_config, transformer_layer_spec=gpt_layer_with_transformer_engine_spec, vocab_size=128, max_sequence_length=4,
+    layer_spec = gpt_layer_with_transformer_engine_spec if use_te else gpt_layer_local_spec
+    model = GPTModel(config=transformer_config, transformer_layer_spec=layer_spec, vocab_size=128, max_sequence_length=4,
                      pre_process=pre_process, post_process=post_process)
 
     with torch.no_grad():
@@ -36,25 +38,22 @@ class TestGPTModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(2,4)
-        self.gpt_model = initialize_gpt_model()
-
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _save_sharded_state_dict(self, ckpt_dir, strategy=None):
-        sharded_state_dict = self.gpt_model.sharded_state_dict()
-        save(sharded_state_dict, ckpt_dir, strategy)
-
-    def _load_sharded_state_dict(self, ckpt_dir):
-        sharded_state_dict = self.gpt_model.sharded_state_dict()
-        state_dict = load(sharded_state_dict, ckpt_dir)
-        self.gpt_model.load_state_dict(state_dict)
-
-    def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('use_te', [True])  # non-TE not supported yet
+    def test_sharded_state_dict_save_load(self, use_te, tmp_path_dist_ckpt):
+        gpt_model = initialize_gpt_model(use_te)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
-            self._save_sharded_state_dict(ckpt_dir)
-            self._load_sharded_state_dict(ckpt_dir)
+            # Save
+            sharded_state_dict = gpt_model.sharded_state_dict()
+            save(sharded_state_dict, ckpt_dir)
+
+            # Load
+            sharded_state_dict = gpt_model.sharded_state_dict()
+            state_dict = load(sharded_state_dict, ckpt_dir)
+            gpt_model.load_state_dict(state_dict)
 
 
 class TestGPTModelReconfiguration:
