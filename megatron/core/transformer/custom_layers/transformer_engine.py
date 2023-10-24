@@ -45,7 +45,7 @@ class TENorm:
         normalization: str = "LayerNorm",
         **kwargs
     ):
-        zero_centered_gamma = kwargs.get('zero_centered_gamma', 'False')
+        zero_centered_gamma = kwargs.get('zero_centered_gamma', False)
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
