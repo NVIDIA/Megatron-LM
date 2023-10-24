@@ -17,10 +17,12 @@ from megatron.core.models.gpt.gpt_layer_specs import \
     gpt_layer_with_transformer_engine_spec, gpt_layer_local_spec
 
 
-def initialize_gpt_model(use_te=True, **config_kwargs):
+def initialize_gpt_model(seed, use_te=True, **config_kwargs):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
     default_config_kwargs=dict(num_layers=8, hidden_size=16, num_attention_heads=8, use_cpu_initialization=True)
     default_config_kwargs.update(**config_kwargs)
-    model_parallel_cuda_manual_seed(123)
     transformer_config = TransformerConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()
     post_process = ps.is_pipeline_last_stage()
@@ -69,13 +71,13 @@ class TestGPTModelReconfiguration:
              TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_B') as ckpt_dir_B:
             # Save checkpoint A
             Utils.initialize_model_parallel(*src_tp_pp)
-            gpt_model_A = initialize_gpt_model()
+            gpt_model_A = initialize_gpt_model(1)
             save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
-            gpt_model_B = initialize_gpt_model()
+            gpt_model_B = initialize_gpt_model(2)
             state_dict = load(gpt_model_B.sharded_state_dict(), ckpt_dir_A)
             gpt_model_B.load_state_dict(state_dict)
             save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
@@ -92,9 +94,9 @@ class TestGPTModelReconfiguration:
         Utils.initialize_model_parallel(2, 4)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_A') as ckpt_dir_A, \
              TempNamedDir(tmp_path_dist_ckpt / 'test_state_dict_comparison_B') as ckpt_dir_B:
-            gpt_model_A = initialize_gpt_model()
+            gpt_model_A = initialize_gpt_model(1)
             save(gpt_model_A.sharded_state_dict(), ckpt_dir_A)
-            gpt_model_B = initialize_gpt_model()
+            gpt_model_B = initialize_gpt_model(2)
             save(gpt_model_B.sharded_state_dict(), ckpt_dir_B)
 
             state_dict_A = load_plain_tensors(ckpt_dir_A)
