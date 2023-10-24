@@ -305,7 +305,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = get_model_config(model[0])
         model = [DDP(config,
                      model_chunk,
-                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=args.context_parallel_size > 1),
+                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                      accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
                      overlap_grad_reduce=args.overlap_grad_reduce,
                      use_distributed_optimizer=args.use_distributed_optimizer,

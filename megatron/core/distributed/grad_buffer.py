@@ -14,9 +14,8 @@ def shard_buffer(buffer: torch.Tensor):
     """
     Shard buffer into dp_size chunks of equal size.
     """
-    context_parallel = parallel_state.get_context_parallel_world_size() > 1
     data_parallel_world_size = parallel_state.get_data_parallel_world_size(
-        with_context_parallel=context_parallel
+        with_context_parallel=True
     )
     assert buffer.numel() % data_parallel_world_size == 0
     shard_size = buffer.numel() // data_parallel_world_size
@@ -263,7 +262,7 @@ class GradBuffer:
 
         # Print buckets for all PP stages.
         if (
-            parallel_state.get_data_parallel_rank() == 0
+            parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
             and parallel_state.get_tensor_model_parallel_rank() == 0
         ):
             logger.info(

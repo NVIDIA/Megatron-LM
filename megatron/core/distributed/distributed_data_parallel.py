@@ -240,12 +240,8 @@ class DistributedDataParallel(MegatronModule):
         for param in self.module.parameters():
             torch.distributed.broadcast(
                 param.data,
-                src=parallel_state.get_data_parallel_src_rank(
-                    with_context_parallel=self.config.context_parallel_size > 1
-                ),
-                group=parallel_state.get_data_parallel_group(
-                    with_context_parallel=self.config.context_parallel_size > 1
-                ),
+                src=parallel_state.get_data_parallel_src_rank(with_context_parallel=True),
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
 
     def state_dict(self, prefix='', keep_vars=False):

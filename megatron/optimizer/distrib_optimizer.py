@@ -137,9 +137,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         reduce-scatter and all-gather.
         """
 
-        context_parallel = mpu.get_context_parallel_world_size() > 1
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=context_parallel)
-        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=context_parallel)
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
 
         bucket = model.grad_buffers[dtype].buckets[bucket_index]
         bucket_buffer = bucket.data
@@ -602,11 +601,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Data parallelism variables.
-        context_parallel = mpu.get_context_parallel_world_size() > 1
-        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=context_parallel)
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=context_parallel)
-        data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(with_context_parallel=context_parallel)
-        data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP) if context_parallel else list(mpu._DATA_PARALLEL_GLOBAL_RANKS)
+        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
+        data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP)
 
         # Collect param states.
         state = {"bucket_sizes": self.bucket_sizes}
@@ -700,11 +698,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Data parallelism variables.
-        context_parallel = mpu.get_context_parallel_world_size() > 1
-        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=context_parallel)
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=context_parallel)
-        data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(with_context_parallel=context_parallel)
-        data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP) if context_parallel else list(mpu._DATA_PARALLEL_GLOBAL_RANKS)
+        data_parallel_world_size = mpu.get_data_parallel_world_size(with_context_parallel=True)
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(with_context_parallel=True)
+        data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP)
 
         # Load on DP rank 0.
         if data_parallel_rank == 0:
@@ -840,9 +837,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         timers('params-all-gather', log_level=1).start(
             barrier=args.barrier_with_L1_time)
 
-        context_parallel = mpu.get_context_parallel_world_size() > 1
-        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=context_parallel)
-        data_parallel_group = mpu.get_data_parallel_group(with_context_parallel=context_parallel)
+        data_parallel_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+        data_parallel_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
         # All-gather updated main params.
         # - All param buffer views are guaranteed to have the same num elements
