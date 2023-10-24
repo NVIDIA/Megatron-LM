@@ -13,9 +13,10 @@ done
 echo "---------------------------------"
 
 set -x
-if [[ -n $MBS ]]; then MBS=4; fi
-if [[ -n $GBS ]]; then GBS=32; fi
-if [[ -n $VP_SIZE ]]; then VP_SIZE="" ; fi
+if [[ -z $MBS ]]; then MBS=4; fi
+if [[ -z $GBS ]]; then GBS=32; fi
+if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
+if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -69,8 +70,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --save $CHECKPOINT_PATH \
        --load $CHECKPOINT_PATH \
        --data-path $DATA_PATH \
-       --vocab-file /workspace/data/gpt3_data/gpt2-vocab.json \
-       --merge-file /workspace/data/gpt3_data/gpt2-merges.txt \
+       --vocab-file $VOCAB_FILE \
+       --merge-file $MERGE_FILE \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.00015 \
@@ -90,6 +91,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        ${USE_MCORE:+--use-mcore-models} \
        --no-gradient-accumulation-fusion \
+       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
 
 command="$command $torch_run_cmd"

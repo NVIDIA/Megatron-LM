@@ -23,7 +23,7 @@ unit_tests:
     - pip install pytest-cov
     - pip install pytest_mock
     - pip install nltk
-    - pip install zarr tensorstore  # for distributed checkpointing tests
+    - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
   artifacts:
@@ -51,7 +51,7 @@ formatting:
   script: &selene-test-resume-launcher-script
     - echo "Running selene resume from checkpoint test. "
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_resume_checkpoint_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR TIME_LIMIT=$TIME_LIMIT"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -63,7 +63,6 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
-  retry: 2
 
 .selene_test_launcher: &selene-test-launcher
   tags:
@@ -72,7 +71,7 @@ formatting:
   script: &selene-test-launcher-script
     - echo "Running selene test"
     - pwd
-    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE"
+    - run_cmd="bash tests/functional_tests/shell_test_utils/run_selene_test_launcher_script.sh RUN_MODEL=$RUN_MODEL TP_SIZE=$TP_SIZE PP_SIZE=$PP_SIZE VP_SIZE=$VP_SIZE NUM_NODES=$NUM_NODES SELENE_ADLR_CI_PATH=$SELENE_ADLR_CI_PATH CI_PIPELINE_ID=$CI_PIPELINE_ID RUN_NAME=$RUN_NAME MAX_STEPS=$MAX_STEPS PYTORCH_IMAGE=$PYTORCH_IMAGE DATA_DIR=$DATA_DIR USE_CORE=$USE_CORE USE_TE=$USE_TE TIME_LIMIT=$TIME_LIMIT"
     - echo "$run_cmd"
     - ${run_cmd}
     - echo "Completed the job"
@@ -84,7 +83,6 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
-  retry: 2
 
 train.te_gpt3.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -150,6 +148,20 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 1
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
     VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
@@ -181,7 +193,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_swiglu:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -198,7 +209,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_disable_bias_linear:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -215,7 +225,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_untie_embeddings_and_outputs:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -232,7 +241,6 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_sequence_parallel:
     USE_TE: 0
     TP_SIZE: 1
     PP_SIZE: 4
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -284,6 +292,20 @@ train.gpt3.345m_tp1_pp2_1node_50steps:
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: gpt3
+    USE_TE: 0
+    TP_SIZE: 1
+    PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    USE_CORE: 0
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
@@ -382,7 +404,6 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -399,7 +420,6 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -416,7 +436,6 @@ train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 1
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
@@ -433,7 +452,6 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     USE_TE: 0
     TP_SIZE: 2
     PP_SIZE: 2
-    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
@@ -479,6 +497,18 @@ train.bert.345m_tp1_pp2_1node_50steps:
     TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
