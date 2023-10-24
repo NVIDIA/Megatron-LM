@@ -226,7 +226,6 @@ class GPTModel(LanguageModule):
                 sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
                     tensor=output_layer_tensor,
                     key=output_layer_key,
-                    replica_id=(0, 0, parallel_state.get_data_parallel_rank()),
                     allow_shape_mismatch=True,
                 )
 

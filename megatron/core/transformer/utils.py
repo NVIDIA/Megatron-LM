@@ -40,23 +40,25 @@ def erf_gelu(x):
 def make_sharded_tensors_for_checkpoint(
     state_dict: StateDict,
     state_dict_prefix: str,
-    sharded_key_prefix: Optional[str],
-    tensor_parallel_layers_axis_map: Dict[str, int],
-    sharded_offsets: Iterable[Tuple[int, int, int]],
+    sharded_key_prefix: Optional[str] = None,
+    tensor_parallel_layers_axis_map: Optional[Dict[str, int]] = None,
+    sharded_offsets: Iterable[Tuple[int, int, int]] = (),
     extra_state_suffix: str = '_extra_state',
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
-    For a given `state_dict`, wraps all regular tensors with ShardedTensor
-    sharded according to `tensor_parallel_layers_axis_map`
+    For a given `state_dict`, wraps:
+    - all _extra_states with ShardedObject
+    - all tensors specified in tensor_parallel_layers_axis_map with TP and DP sharded ShardedTensor
+    - other values with DP sharded ShardedTensor
 
     Args:
         state_dict (StateDict): state_dict to convert
         state_dict_prefix (str): prefix appended to keys in final state dict
-        sharded_key_prefix (str): prefix appended to ShardedTensor keys
-        tensor_parallel_layers_axis_map (Dict[str, int]): dict mapping layer
+        sharded_key_prefix (str, optional): prefix appended to ShardedTensor keys
+        tensor_parallel_layers_axis_map (Dict[str, int], optional): dict mapping layer
             names to the axis for TP sharding
-        sharded_offsets (Iterable[Tuple[int, int, int]]): sharding already
+        sharded_offsets (Iterable[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related), passed along to ShardedTensor
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
@@ -64,6 +66,9 @@ def make_sharded_tensors_for_checkpoint(
     """
     if sharded_key_prefix is None:
         sharded_key_prefix = state_dict_prefix
+
+    if tensor_parallel_layers_axis_map is None:
+        tensor_parallel_layers_axis_map = {}
 
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
