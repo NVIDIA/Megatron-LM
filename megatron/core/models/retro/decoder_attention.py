@@ -118,16 +118,34 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Retrieve neighbors.
         if self.encoder:
+
+            # Sequence length remainder.
             first_ns = ns % self.retro_chunk_length
+
+            # Case 1: Sequence length not divisible by chunk length.
             if first_ns > 0:
-                raise Exception("test this case.")
+
+                # Split sequence into first partial chunk & remaining chunks.
                 first_chunk, rest_chunk = hidden_states[:first_ns], hidden_states[first_ns:]
+
+                # Pad partial chunk with zeros.
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0
+                    first_chunk,
+                    (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
+                    'constant',
+                    0,
                 )
+
+                # Concatenate padded chunk with remaining chunks.
                 chunked_output = torch.cat((first_chunk, rest_chunk), dim=0)  # [l * m, bs, d]
+
+            # Case 2: Sequence length is divisible by chunk length.
             else:
                 chunked_output = hidden_states  # [l * m, bs, d]
+
+            # Chunk & permute hidden states.
+            # - hidden_states:  [ l*m, bs, d ]
+            # - chunked_output: [ m, bs*l, d ]
             chunked_output = (
                 chunked_output.reshape(l, self.retro_chunk_length, bs, d)
                 .permute(1, 2, 0, 3)
@@ -135,7 +153,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 .contiguous()
             )
 
-            # Get Encoder Output
+            # Encode neighbors. (Note: 'key_value_states' re-assigned here.)
             key_value_states = self.encoder(
                 hidden_states=key_value_states,
                 attention_mask=attention_mask,
@@ -147,22 +165,33 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d
             )  # [r * k, bs * l, d]
 
-        # Chunks.
+        # Attend starting at last token of first chunk.
         pad = (ns - 1) % self.retro_chunk_length
         attending_chunks = hidden_states[pad:]
+
+        # Pad attending tokens to sequence length.
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0
+            attending_chunks,
+            (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
+            'constant',
+            0,
         )
-        padded_chunked_output = padded_chunks.reshape(l, self.retro_chunk_length, bs, d).permute(
-            1, 2, 0, 3
-        )
+
+        # Permute attending chunks.
+        # - padded_chunks:         [ l*m, bs, d ]
+        # - padded_chunked_output: [ m, bs*l, d ] (matches 'chunked_output' above)
+        padded_chunked_output = padded_chunks \
+            .reshape(l, self.retro_chunk_length, bs, d) \
+            .permute(1, 2, 0, 3)
         padded_chunked_output = padded_chunked_output.reshape(
             self.retro_chunk_length, bs * l, d
         ).contiguous()
 
-        # Encoder output.
+        # Attend to encoded neighbors.
         attention_output, attention_bias = self.attn(
-            padded_chunked_output, None, key_value_states=key_value_states
+            padded_chunked_output,
+            None,
+            key_value_states=key_value_states,
         )
 
         # Return dimensions for bias-dropout step.
@@ -229,6 +258,8 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
+
+            # Bias-dropout-add.
             x = bias_dropout_add(
                 (
                     attention_output,
@@ -237,9 +268,26 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
                 torch.zeros_like(attention_output),
                 prob,
             )
-            x = x.reshape(retro_chunk_length, bs, l, d).permute(2, 0, 1, 3)  # [l, m, bs, d]
-            x = x.reshape(retro_chunk_length * l, bs, d)
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0)[:ns]  # [ns, b, d]
+
+            # Permute chunks back to sequence dimension.
+            # 1. [ m, bs*l, d ]
+            # 2. [ m, bs, l, d ]
+            # 3. [ l, m, bs, d ]
+            # 4. [ m*l, bs, d ] == [ ns, bs, d ]
+            x = x \
+                .reshape(retro_chunk_length, bs, l, d) \
+                .permute(2, 0, 1, 3) \
+                .reshape(retro_chunk_length * l, bs, d)
+
+            # Prepend zeros for non-attending tokens.
+            x = torch.nn.functional.pad(
+                x,
+                (0, 0, 0, 0, pad, 0),
+                'constant',
+                0,
+            )[:ns] # [ns, b, d]
+
+            # Add residual.
             x = x + residual
 
         return x
