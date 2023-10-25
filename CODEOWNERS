@@ -1,3 +1,13 @@
-megatron/core/ @shanmugamr @maanug
+@test_and_doc_group = @shanmugamr @maanug
+@adlr_group = @jcasper
+@nemo_group = @eharper
 
-tests/ @shanmugamr @maanug
+[ADLR] @adlr_group
+*
+
+[Nemo] @nemo_group
+/megatron/core
+
+[Doc-test] @test_and_doc_group
+/megatron/core
+/tests
