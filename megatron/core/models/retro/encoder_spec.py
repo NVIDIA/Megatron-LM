@@ -47,7 +47,10 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm)
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(
+        module=RetroEncoderLayerNorm,
+        submodules=TENorm,
+    )
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
@@ -78,7 +81,10 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm)
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(
+        module=RetroEncoderLayerNorm,
+        submodules=FusedLayerNorm,
+    )
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear,),

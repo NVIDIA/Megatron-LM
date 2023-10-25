@@ -35,7 +35,11 @@ def core_model_provider(pre_process=True, post_process=True):
     if args.spec is not None:
         block_spec = import_module(args.spec)()
     else:
-        block_spec = get_retro_decoder_block_spec(config, use_transformer_engine=True)
+        block_spec = get_retro_decoder_block_spec(
+            config,
+            # use_transformer_engine=True,
+            use_transformer_engine=False,
+        )
 
     print_rank_0('building GPT model ...')
     model = RetroModel(

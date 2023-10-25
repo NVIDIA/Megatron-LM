@@ -3,7 +3,7 @@
 """Retro's cross attention modules for the encoder block."""
 
 from functools import partial
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Type
 
 import torch
 from torch import Tensor
@@ -12,7 +12,6 @@ from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
-from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.module import MegatronModule
 
 
@@ -186,10 +185,11 @@ class RetroEncoderLayerNorm(MegatronModule):
     """
 
     def __init__(
-        self, config: RetroConfig, **kwargs,
+        self, config: RetroConfig, submodules: Type, **kwargs,
     ):
         super().__init__(config=config)
-        self.norm = TENorm(config=config, **kwargs)
+        norm_class = submodules
+        self.norm = norm_class(config=config, **kwargs)
         self.retro_num_neighbors = config.retro_num_neighbors
 
     def forward(self, input: Tensor) -> Tensor:
