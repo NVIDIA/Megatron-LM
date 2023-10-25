@@ -2,5 +2,5 @@
 megatron/core/ @shanmugamr @maanug @jcasper @eharper
 
 [TESTS]
-tests/ @@shanmugamr @maanug
+tests/ @shanmugamr @maanug
 
