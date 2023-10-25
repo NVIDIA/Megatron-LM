@@ -13,6 +13,7 @@ from megatron.core.parallel_state import (
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -184,6 +185,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             return out
         return out, None
 
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 0, bias sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
+
 
 class TEColumnParallelLinear(TELinear):
     """
@@ -201,6 +209,13 @@ class TEColumnParallelLinear(TELinear):
             **kwargs,
         )
 
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 0, bias sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
+
 
 class TERowParallelLinear(TELinear):
     """
@@ -216,6 +231,13 @@ class TERowParallelLinear(TELinear):
             config=self.config,
             parallel_mode="row",
             **kwargs,
+        )
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 1, bias not sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 1}, sharded_offsets
         )
 
 
