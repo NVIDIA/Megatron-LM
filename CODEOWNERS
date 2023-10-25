@@ -2,8 +2,9 @@
 @adlr_group = @jcasper
 @nemo_group = @eharper
 
+[MCORE][3]
 megatron/core/ @test_and_doc_group @adlr_group @nemo_group
 
+[TESTS]
 tests/ @test_and_doc_group
 
-megatron/core/ @test_and_doc_group @adlr_group @nemo_group -codeowners
