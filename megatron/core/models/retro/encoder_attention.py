@@ -79,18 +79,14 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
             attention_output, attention_bias = self.attn(
                 hidden_states=chunked_output,  # Q (neighbor embedding)
                 attention_mask=None,
-                key_value_states=key_value_states, # K, V (hidden act)
+                key_value_states=key_value_states,  # K, V (hidden act)
             )
 
             # Residual connection.
             residual = chunked_output
 
             # Collect tensors.
-            attention_output_tuples.append((
-                attention_output,
-                attention_bias,
-                residual,
-            ))
+            attention_output_tuples.append((attention_output, attention_bias, residual,))
 
         return attention_output_tuples
 

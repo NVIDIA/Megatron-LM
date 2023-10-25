@@ -128,10 +128,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
                 # Pad partial chunk with zeros.
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk,
-                    (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns),
-                    'constant',
-                    0,
+                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0,
                 )
 
                 # Concatenate padded chunk with remaining chunks.
@@ -169,27 +166,22 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Pad attending tokens to sequence length.
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks,
-            (0, 0, 0, 0, 0, self.retro_chunk_length - 1),
-            'constant',
-            0,
+            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0,
         )
 
         # Permute attending chunks.
         # - padded_chunks:         [ l*m, bs, d ]
         # - padded_chunked_output: [ m, bs*l, d ] (matches 'chunked_output' above)
-        padded_chunked_output = padded_chunks \
-            .reshape(l, self.retro_chunk_length, bs, d) \
-            .permute(1, 2, 0, 3)
+        padded_chunked_output = padded_chunks.reshape(l, self.retro_chunk_length, bs, d).permute(
+            1, 2, 0, 3
+        )
         padded_chunked_output = padded_chunked_output.reshape(
             self.retro_chunk_length, bs * l, d
         ).contiguous()
 
         # Attend to encoded neighbors.
         attention_output, attention_bias = self.attn(
-            padded_chunked_output,
-            None,
-            key_value_states=key_value_states,
+            padded_chunked_output, None, key_value_states=key_value_states,
         )
 
         # Return dimensions for bias-dropout step.
@@ -272,18 +264,14 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             # 2. [ m, bs, l, d ]
             # 3. [ l, m, bs, d ]
             # 4. [ m*l, bs, d ] == [ ns, bs, d ]
-            x = x \
-                .reshape(retro_chunk_length, bs, l, d) \
-                .permute(2, 0, 1, 3) \
+            x = (
+                x.reshape(retro_chunk_length, bs, l, d)
+                .permute(2, 0, 1, 3)
                 .reshape(retro_chunk_length * l, bs, d)
+            )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(
-                x,
-                (0, 0, 0, 0, pad, 0),
-                'constant',
-                0,
-            )[:ns] # [ns, b, d]
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[:ns]  # [ns, b, d]
 
             # Add residual.
             x = x + residual
