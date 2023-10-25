@@ -13,6 +13,8 @@ done
 echo "---------------------------------"
 
 set -x 
+if [[ -z $MBS ]]; then MBS=4; fi
+if [[ -z $GBS ]]; then GBS=32; fi
 
 # Change for multinode config
 GPUS_PER_NODE=8
@@ -28,8 +30,9 @@ TRANSFORMER_IMPL=local
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
        TRANSFORMER_IMPL=local
-       USE_MCORE=1
        TRAINING_DTYPE=bf16
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       USE_MCORE=1
 fi
 
 # Runs the "345M" parameter model

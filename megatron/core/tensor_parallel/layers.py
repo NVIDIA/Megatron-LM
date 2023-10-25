@@ -922,7 +922,8 @@ class RowParallelLinear(torch.nn.Module):
             async_grad_allreduce=False,
             sequence_parallel=False,
         )
-
+        
+        # All-reduce across all the partitions.
         if self.explicit_expert_comm:
             assert self.skip_bias_add
             output_ = output_parallel
