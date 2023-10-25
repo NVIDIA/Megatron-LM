@@ -450,8 +450,7 @@ def _build_index_mappings(name, data_prefix, documents, sizes,
             data_cache_success = False
 
     counts = torch.cuda.LongTensor([data_cache_success])
-    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
-    torch.distributed.all_reduce(counts, group=mpu.get_context_parallel_group())
+    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group(with_context_parallel=True))
     torch.distributed.all_reduce(counts, group=mpu.get_pipeline_model_parallel_group())
     if counts[0].item() != (
         torch.distributed.get_world_size() //
