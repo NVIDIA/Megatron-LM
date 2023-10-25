@@ -725,6 +725,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
+    exit = False
 
     while iteration < args.train_iters:
         if args.profile and \
@@ -781,6 +782,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
+                exit = True
                 break
 
         if args.save and args.save_interval and \
@@ -802,6 +804,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
+                exit = True
                 break
 
         # Exiting based on iterations
@@ -811,6 +814,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
+            exit = True
             break
 
         if args.profile and \
@@ -825,6 +829,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         wandb_writer.finish()
+
+    # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
+    if exit:
+        sys.exit()
 
     return iteration
 
