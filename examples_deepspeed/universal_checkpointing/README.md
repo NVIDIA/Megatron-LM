@@ -47,11 +47,13 @@ drwxr-xr-x 2 user group  4096 Oct 21 09:01 global_step200
 -rwxr--r-- 1 user group 24177 Oct 21 09:50 zero_to_fp32.py
 ```
 
-### Step3: Resume training with Universal checkpoint of iteration 100
+### Step 3: Resume training with Universal checkpoint of iteration 100
 ```bash 
 bash examples_deepspeed/universal_checkpointing/run_universal_bf16.sh
 ```
 This resumption script effects the loading of universal checkpoint rather than the ZeRO checkpoint in the folder by passing `--universal-checkpoint` command line flag to the main training script (i.e., `pretrain_gpt.py`). 
+
+Please see the corresponding [pull request](https://github.com/microsoft/Megatron-DeepSpeed/pull/265) for visualizations of matching loss values between original and universal checkpoint runs for bf16 and fp16 examples. 
 
 ## ZeRO stage 2 training (**Coming soon**)
 
