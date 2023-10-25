@@ -1,10 +1,6 @@
-@test_and_doc_group = @shanmugamr @maanug
-@adlr_group = @jcasper
-@nemo_group = @eharper
-
 [MCORE][3]
-megatron/core/ @test_and_doc_group @adlr_group @nemo_group
+megatron/core/ @shanmugamr @maanug @jcasper @eharper
 
 [TESTS]
-tests/ @test_and_doc_group
+tests/ @@shanmugamr @maanug
 
