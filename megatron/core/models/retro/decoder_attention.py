@@ -89,8 +89,6 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         inference_params: InferenceParams = None,
         # rotary_pos_emb: Tensor = None, # ... unsupported for retro.
     ) -> Tensor:
-        # hidden_states: [sq, b, h]
-
         """Cross attention for Retro decoder.
 
         Notation:

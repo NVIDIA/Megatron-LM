@@ -42,8 +42,6 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         inference_params: InferenceParams = None,
         # rotary_pos_emb: Tensor = None, # unsupported for retro.
     ) -> Tensor:
-        # hidden_states: [sq, b, h]
-
         """Cross attention for Retro encoder.
 
         Notation:
@@ -66,7 +64,9 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
 
         ns, bs, d = hidden_states.shape  # [r, bs * l * k, d]
 
-        # Divide sequence dimension into chunks.
+        # Reshape sequence into neighboring chunks.
+        # - hidden_states: [ r, bs*l*k, d ]
+        # - chunked_outputs: [ r, bs*l, k, d ]
         chunked_outputs = hidden_states.reshape(
             self.retro_retrieved_length, -1, self.retro_num_neighbors, d
         )
@@ -75,18 +75,23 @@ class RetroEncoderCrossAttention(BaseRetroCrossAttention):
         attention_output_tuples = []
         for k in range(self.retro_num_neighbors):
 
-            # Attention.
+            # Attend to current neighboring chunks.
             chunked_output = chunked_outputs[:, :, k].contiguous()
             attention_output, attention_bias = self.attn(
                 hidden_states=chunked_output,  # Q (neighbor embedding)
                 attention_mask=None,
-                key_value_states=key_value_states,
-            )  # K, V (hidden act)
+                key_value_states=key_value_states, # K, V (hidden act)
+            )
 
             # Residual connection.
             residual = chunked_output
 
-            attention_output_tuples.append((attention_output, attention_bias, residual))
+            # Collect tensors.
+            attention_output_tuples.append((
+                attention_output,
+                attention_bias,
+                residual,
+            ))
 
         return attention_output_tuples
 
@@ -133,6 +138,8 @@ class RetroEncoderBiasDropoutAdd(MegatronModule):
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
+
+            # Per-neighbor bias-dropout-add.
             outputs = [
                 bias_dropout_add(
                     (
