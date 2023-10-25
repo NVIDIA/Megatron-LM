@@ -25,7 +25,7 @@ def read_tb_logs_as_list(path, summary_name, index):
 
 def collect_train_test_metrics(logs_dir, index):
     train_loss_list = read_tb_logs_as_list(logs_dir, "lm loss", index)
-    train_loss_list = [round(elem,3) for elem in train_loss_list]
+    train_loss_list = [round(elem,5) for elem in train_loss_list]
     train_metrics = {
         "lm loss": train_loss_list[0:len(train_loss_list):STEP_INTERVAL],
     } 
