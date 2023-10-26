@@ -9,9 +9,10 @@ from megatron import get_args, get_retro_args
 from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import print_rank_0
-from megatron.core import mpu, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.model import GPTModel
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from tools.retro.query.retro_dataset import get_retro_datasets
@@ -19,7 +20,7 @@ from tools.retro.query.retro_dataset import get_retro_datasets
 from pretrain_gpt import (
     loss_func,
     model_provider,
-    train_valid_test_datasets_provider as standard_datasets_provider,
+    core_gpt_dataset_config_from_args
 )
 
 
@@ -110,10 +111,23 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     if args.retro_add_retriever:
         return get_retro_datasets()
     else:
-        return standard_datasets_provider(train_val_test_num_samples)
+        print_rank_0("> building train, validation, and test datasets for GPT ...")
+
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            GPTDataset,
+            train_val_test_num_samples,
+            core_gpt_dataset_config_from_args(args)
+        ).build()
+
+        print_rank_0("> finished creating GPT datasets ...")
+
+        return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
+
+    # Temporary for transitiont to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(train_valid_test_datasets_provider,
              model_provider,
