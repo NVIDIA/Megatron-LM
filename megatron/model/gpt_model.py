@@ -24,12 +24,16 @@ try:
 except ImportError:
     MixedFusedRMSNorm = None
 
-from deepspeed.checkpoint import (
-    VOCABULARY_PARAMETER_PATTERNS,
-    PIPELINE_REPLICATED_PARAMETER_PATTERNS,
-    TP_REPLICATED_PARAMETER_PATTERNS,
-    PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
-)
+try:         
+    from deepspeed.checkpoint import (
+        VOCABULARY_PARAMETER_PATTERNS,
+        PIPELINE_REPLICATED_PARAMETER_PATTERNS,
+        TP_REPLICATED_PARAMETER_PATTERNS,
+        PARAMETER_WITH_ROW_PARALLELISM_PATTERNS,
+    )
+    DS_UNIVERSAL_CHECKPOINT_INFO = True 
+except ImportError:
+    DS_UNIVERSAL_CHECKPOINT_INFO = None 
 
 def post_language_model_processing(lm_output, labels, logit_weights,
                                    parallel_output,
@@ -177,32 +181,32 @@ class GPTModel(MegatronModule):
 
     def universal_checkpoint_info(self):
         info = dict()
+        if DS_UNIVERSAL_CHECKPOINT_INFO:
+            # Vocabulary parameters (embeddings) that require special handling due to padding.
+            info[VOCABULARY_PARAMETER_PATTERNS] = [
+                r"tied_modules.embed.word_embeddings.weight"
+            ]
 
-        # Vocabulary parameters (embeddings) that require special handling due to padding.
-        info[VOCABULARY_PARAMETER_PATTERNS] = [
-            r"tied_modules.embed.word_embeddings.weight"
-        ]
+            # Parameter slices that should be averaged not concatenated.
+            info[TP_REPLICATED_PARAMETER_PATTERNS] = [
+                r"tied_modules.embed.word_embeddings.norm.weight",
+                r"tied_modules.embed.word_embeddings.norm.bias",
+                r"tied_modules.embed.position_embeddings.weight",
+                r"\d+.input_layernorm.weight",
+                r"\d+.input_layernorm.bias",
+                r"\d+.post_attention_layernorm.weight",
+                r"\d+.post_attention_layernorm.bias",
+                r"\d+.self_attention.dense.bias",
+                r"\d+.mlp.dense_4h_to_h.bias",
+                r"\d+.weight",
+                r"\d+.bias",
+            ]
 
-        # Parameter slices that should be averaged not concatenated.
-        info[TP_REPLICATED_PARAMETER_PATTERNS] = [
-            r"tied_modules.embed.word_embeddings.norm.weight",
-            r"tied_modules.embed.word_embeddings.norm.bias",
-            r"tied_modules.embed.position_embeddings.weight",
-            r"\d+.input_layernorm.weight",
-            r"\d+.input_layernorm.bias",
-            r"\d+.post_attention_layernorm.weight",
-            r"\d+.post_attention_layernorm.bias",
-            r"\d+.self_attention.dense.bias",
-            r"\d+.mlp.dense_4h_to_h.bias",
-            r"\d+.weight",
-            r"\d+.bias",
-        ]
-
-        # Parameter that are sliced on the row dimension
-        info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
-            r"\d+.mlp.dense_4h_to_h.weight",
-            r"\d+.mlp.self_attention.dense.weight",
-        ]
+            # Parameter that are sliced on the row dimension
+            info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
+                r"\d+.mlp.dense_4h_to_h.weight",
+                r"\d+.mlp.self_attention.dense.weight",
+            ]
 
         return info
     
