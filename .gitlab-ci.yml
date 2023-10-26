@@ -585,7 +585,7 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     TP_SIZE: 1
     PP_SIZE: 2
     NUM_NODES: 1
-    TEST_LEVEL: L1
+    TEST_LEVEL: L0
 
 cleanup.selene:
   tags:
