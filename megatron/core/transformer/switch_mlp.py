@@ -9,7 +9,10 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.tensor_parallel import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name
+)
 from .mlp import MLP, MLPSubmodules
 
 
@@ -30,6 +33,17 @@ def sinkhorn(cost, tol=0.0001):
     return d1 * cost * d0.unsqueeze(1)
 
 
+def get_router_linear_layer(config):
+    router = torch.nn.Linear(config.hidden_size, config.num_moe_experts)
+    with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+        config.init_method(router.weight)
+    with torch.no_grad():
+        router.bias.zero_()
+    setattr(router.weight, 'sequence_parallel', config.sequence_parallel)
+    setattr(router.bias, 'sequence_parallel', config.sequence_parallel)
+    return router
+
+
 class SwitchMLP(MegatronModule):
     """
     Top-1 Mixture of Experts Layer. Routes input to one of N MLP "experts"
@@ -41,7 +55,7 @@ class SwitchMLP(MegatronModule):
 
         self.config: TransformerConfig = config
 
-        self.router = torch.nn.Linear(self.config.hidden_size, self.config.num_moe_experts)
+        self.router = get_router_linear_layer(self.config)
         self.add_bias = config.add_bias_linear
         self.sequence_parallel = config.sequence_parallel
         self.route_algo = sinkhorn
