@@ -113,7 +113,7 @@ def get_megatron_optimizer(model,
 
     # Determine whether the params have main-grad field.
     params_have_main_grad = False
-    if args.DDP_impl == 'local':
+    if args.use_contiguous_buffers_in_local_ddp:
         params_have_main_grad = True
 
     # Mixed precision optimizer.
