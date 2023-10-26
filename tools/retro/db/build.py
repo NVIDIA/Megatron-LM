@@ -14,7 +14,7 @@ from tqdm import tqdm
 import types
 
 from megatron import get_retro_args, print_rank_0
-from megatron.data.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.tokenizer.tokenizer import (
     _BertWordPieceTokenizer,
     _GPT2BPETokenizer,
@@ -45,7 +45,7 @@ def init_indexed_dataset_infos():
     args = get_retro_args()
 
     assert len(args.data_path) % 2 == 0, \
-        "currently, only blendable dataset is supported."
+        "currently, only blended dataset is supported."
 
     # Dataset infos.
     infos = []
@@ -61,7 +61,7 @@ def init_indexed_dataset_infos():
             "path" : path,
             "name" : name,
             "db_dir" : get_individual_db_dir(name),
-            "dataset" : MMapIndexedDataset(prefix, skip_warmup=True),
+            "dataset" : MMapIndexedDataset(prefix),
         })
 
     return infos
@@ -328,7 +328,7 @@ def update_chunk_counts(indexed_dataset_infos):
         db_paths = sorted(glob.glob(db_dir + "/*.hdf5"))
 
         # Update counts.
-        ds_info["n_docs"] = len(ds_info["dataset"].doc_idx) - 1
+        ds_info["n_docs"] = len(ds_info["dataset"].document_indices) - 1
         ds_info["n_docs_train"] = int(train_fraction * ds_info["n_docs"])
         ds_info["n_chunks"] = 0 # previously, 'n_chunks_valid'
         ds_info["n_chunks_train"] = 0

@@ -10,6 +10,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 @dataclass
@@ -99,3 +100,15 @@ class MLP(MegatronModule):
         output, output_bias = self.linear_fc2(intermediate_parallel)
 
         return output, output_bias
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
+        sharded_state_dict = {}
+        for name, module in self._modules.items():
+            sub_sd = module.sharded_state_dict(
+                prefix=f'{prefix}{name}.',
+                sharded_key_prefix=f'{sharded_key_prefix}{name}.',
+                sharded_offsets=sharded_offsets,
+            )
+            sharded_state_dict.update(sub_sd)
+        return sharded_state_dict

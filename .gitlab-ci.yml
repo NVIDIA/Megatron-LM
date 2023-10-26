@@ -63,6 +63,7 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
+  retry: 2
 
 .selene_test_launcher: &selene-test-launcher
   tags:
@@ -83,6 +84,7 @@ formatting:
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
   allow_failure: false
+  retry: 2
 
 train.te_gpt3.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
