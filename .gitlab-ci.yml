@@ -98,7 +98,7 @@ train.te_gpt3.345m_tp2_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "50:00"
+    TIME_LIMIT: "20:00"
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
@@ -113,7 +113,7 @@ train.gpt3_core.345m_tp4_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3_core.345m_tp2_pp2_1node_50steps:
@@ -127,7 +127,7 @@ train.gpt3_core.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3_core.345m_tp1_pp2_1node_50steps:
@@ -141,7 +141,7 @@ train.gpt3_core.345m_tp1_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3_core.345m_tp1_pp4_1node_50steps:
@@ -155,7 +155,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
@@ -170,7 +170,7 @@ train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3_core.345m_tp1_pp2_1node_50steps_rope:
@@ -184,7 +184,7 @@ train.gpt3_core.345m_tp1_pp2_1node_50steps_rope:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: rope_embeddings
     ADDITIONAL_PARAMS: "--position-embedding-type rope"
@@ -200,7 +200,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_swiglu:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: swiglu
     ADDITIONAL_PARAMS: "--swiglu"
@@ -216,7 +216,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_disable_bias_linear:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: disable_bias_linear
     ADDITIONAL_PARAMS: "--disable-bias-linear"
@@ -232,7 +232,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_untie_embeddings_and_outputs:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: untie_embeddings_and_outputs
     ADDITIONAL_PARAMS: "--untie-embeddings-and-output-weights"
@@ -248,7 +248,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_sequence_parallel:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: sequence_parallel
     ADDITIONAL_PARAMS: "--sequence-parallel"
@@ -264,7 +264,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp2_pp2_1node_50steps:
@@ -278,7 +278,7 @@ train.gpt3.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp2_1node_50steps:
@@ -292,7 +292,7 @@ train.gpt3.345m_tp1_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp4_1node_50steps:
@@ -306,7 +306,7 @@ train.gpt3.345m_tp1_pp4_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
@@ -321,7 +321,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 resume.checkpoint.gpt3.345m_tp1_pp2_1node:
@@ -332,7 +332,7 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     TP_SIZE: 1
     PP_SIZE: 2
     NUM_NODES: 1
-    TIME_LIMIT: "30:00"
+    TIME_LIMIT: "15:00"
     TEST_LEVEL: L0
 
 train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer:
@@ -346,7 +346,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: dist_optimizer
     ADDITIONAL_PARAMS: "--use-distributed-optimizer"
@@ -362,7 +362,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
@@ -378,7 +378,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
@@ -394,7 +394,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
@@ -410,7 +410,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
@@ -426,7 +426,7 @@ train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
@@ -443,7 +443,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
@@ -460,7 +460,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_dist_optimizer_overlap_grad_re
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
@@ -476,7 +476,7 @@ train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
@@ -493,7 +493,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: "te_2experts"
     ADDITIONAL_PARAMS: "--num-experts 2"
@@ -509,7 +509,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: "te_4experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
@@ -525,7 +525,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: "te_8experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
@@ -541,7 +541,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
     METADATA: "4experts"
     ADDITIONAL_PARAMS: "--num-experts 4"
@@ -555,7 +555,7 @@ train.bert.345m_tp4_pp1_1node_50steps:
     PP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.bert.345m_tp2_pp2_1node_50steps:
@@ -567,7 +567,7 @@ train.bert.345m_tp2_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp2_1node_50steps:
@@ -579,7 +579,7 @@ train.bert.345m_tp1_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp4_1node_50steps:
@@ -591,7 +591,7 @@ train.bert.345m_tp1_pp4_1node_50steps:
     PP_SIZE: 4
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 train.bert.345m_tp1_pp4_interleaved_1node_50steps:
@@ -604,7 +604,7 @@ train.bert.345m_tp1_pp4_interleaved_1node_50steps:
     VP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TIME_LIMIT: "20:00"
+    TIME_LIMIT: "10:00"
     TEST_LEVEL: L0
 
 resume.checkpoint.bert.345m_tp1_pp2_1node:
@@ -615,7 +615,7 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     TP_SIZE: 1
     PP_SIZE: 2
     NUM_NODES: 1
-    TIME_LIMIT: "30:00"
+    TIME_LIMIT: "15:00"
     TEST_LEVEL: L0
 
 cleanup.selene:
