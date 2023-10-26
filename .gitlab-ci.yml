@@ -7,7 +7,7 @@ stages:
 variables: &VARS
   SELENE_ADLR_CI_PATH: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron"
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
-  PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.04-py3 # This is the image that is run by all nodes on selene for tests
+  PYTORCH_IMAGE: /lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/nvcr_pytorch_23.04.sqsh # This is the image that is run by all nodes on selene for tests
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
   TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
   TESTS_TO_RUN_AFTER_MERGING: L0  # Can specify levels
@@ -16,6 +16,7 @@ variables: &VARS
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
 
 unit_tests:
+  image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:
     - docker_local_runner
   stage: test
@@ -34,6 +35,7 @@ unit_tests:
     - when: always
 
 formatting:
+  image: nvcr.io/nvidia/pytorch:23.04-py3
   tags:
     - docker_local_runner
   stage: test
