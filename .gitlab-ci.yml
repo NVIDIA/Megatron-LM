@@ -9,8 +9,8 @@ variables: &VARS
   DATA_DIR: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/data"
   PYTORCH_IMAGE: /lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/nvcr_pytorch_23.04.sqsh # This is the image that is run by all nodes on selene for tests
   PYTHON_VIRTUAL_ENV: /lustre/fsw/adlr/adlr-nlp/adlr_ci/cienv/bin/activate
-  TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: L0 # Can specify levels
-  TESTS_TO_RUN_AFTER_MERGING: L0 L1 # Can specify levels
+  TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED: MR_TESTS # Can specify levels
+  TESTS_TO_RUN_AFTER_MERGING: MR_TESTS NIGHTLY_TESTS # Can specify levels
   TESTS_TO_RUN_ON_THIS_COMMIT: unit_tests
   TEST_REGEX_ON_THIS_COMMIT:  NONE #https://github.com/google/re2/wiki/Syntax (Can define regex as in this spec) e.g /.*gpt3.*/
   DISPLAY_OUTPUT: "True" # Set to true for new tests to copy the logs for creating golden truth file
@@ -100,7 +100,7 @@ train.te_gpt3.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 train.gpt3_core.345m_tp4_pp1_1node_50steps:
@@ -114,7 +114,7 @@ train.gpt3_core.345m_tp4_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3_core.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -127,7 +127,7 @@ train.gpt3_core.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.gpt3_core.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -141,7 +141,7 @@ train.gpt3_core.345m_tp1_pp2_1node_50steps:
     MAX_STEPS: 50
     USE_CORE: 1
     TIME_LIMIT: "10:00"
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3_core.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -154,7 +154,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
@@ -168,7 +168,7 @@ train.gpt3_core.345m_tp1_pp4_interleaved_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.gpt3_core.345m_tp1_pp2_1node_50steps_rope:
   <<: *selene-test-launcher
@@ -181,7 +181,7 @@ train.gpt3_core.345m_tp1_pp2_1node_50steps_rope:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: rope_embeddings
     ADDITIONAL_PARAMS: "--position-embedding-type rope"
 
@@ -196,7 +196,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_swiglu:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: swiglu
     ADDITIONAL_PARAMS: "--swiglu"
 
@@ -211,7 +211,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_disable_bias_linear:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: disable_bias_linear
     ADDITIONAL_PARAMS: "--disable-bias-linear"
 
@@ -226,7 +226,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_untie_embeddings_and_outputs:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: untie_embeddings_and_outputs
     ADDITIONAL_PARAMS: "--untie-embeddings-and-output-weights"
 
@@ -241,7 +241,7 @@ train.gpt3_core.345m_tp1_pp4_1node_50steps_sequence_parallel:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: sequence_parallel
     ADDITIONAL_PARAMS: "--sequence-parallel"
 
@@ -256,7 +256,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -269,7 +269,7 @@ train.gpt3.345m_tp2_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.gpt3.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -282,7 +282,7 @@ train.gpt3.345m_tp1_pp2_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -295,7 +295,7 @@ train.gpt3.345m_tp1_pp4_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
@@ -309,7 +309,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 resume.checkpoint.gpt3.345m_tp1_pp2_1node:
   <<: *selene-test-resume-checkpoint-launcher
@@ -320,7 +320,7 @@ resume.checkpoint.gpt3.345m_tp1_pp2_1node:
     PP_SIZE: 2
     NUM_NODES: 1
     TIME_LIMIT: "15:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer:
   <<: *selene-test-launcher
@@ -333,7 +333,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: dist_optimizer
     ADDITIONAL_PARAMS: "--use-distributed-optimizer"
 
@@ -348,7 +348,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
@@ -363,7 +363,7 @@ train.gpt3.345m_tp1_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
@@ -378,7 +378,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
@@ -393,7 +393,7 @@ train.gpt3.345m_tp4_pp1_1node_50steps_dist_optimizer_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
@@ -408,7 +408,7 @@ train.gpt3.345m_tp1_pp4_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
@@ -424,7 +424,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
@@ -440,7 +440,7 @@ train.gpt3.345m_tp1_pp4_interleaved_1node_50steps_dist_optimizer_overlap_grad_re
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: dist_optimizer_overlap_grad_reduce
     ADDITIONAL_PARAMS: "--use-distributed-optimizer --overlap-grad-reduce"
 
@@ -455,7 +455,7 @@ train.gpt3.345m_tp2_pp2_1node_50steps_overlap_grad_reduce:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: overlap_grad_reduce
     ADDITIONAL_PARAMS: "--overlap-grad-reduce"
 
@@ -471,7 +471,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_2experts_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_2experts"
     ADDITIONAL_PARAMS: "--num-experts 2"
 
@@ -486,7 +486,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "te_4experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
 
@@ -501,7 +501,7 @@ train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: "te_8experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 8 --expert-model-parallel-size 2"
 
@@ -516,7 +516,7 @@ train.moe_gpt3.345m_tp2_pp2_4experts_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     USE_CORE: 0
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
     METADATA: "4experts"
     ADDITIONAL_PARAMS: "--num-experts 4"
 
@@ -530,7 +530,7 @@ train.bert.345m_tp4_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "10:00"
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -541,7 +541,7 @@ train.bert.345m_tp2_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.bert.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -552,7 +552,7 @@ train.bert.345m_tp1_pp2_1node_50steps:
     PP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -563,7 +563,7 @@ train.bert.345m_tp1_pp4_1node_50steps:
     PP_SIZE: 4
     NUM_NODES: 1
     MAX_STEPS: 50
-    TEST_LEVEL: L1
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert.345m_tp1_pp4_interleaved_1node_50steps:
   <<: *selene-test-launcher
@@ -575,7 +575,7 @@ train.bert.345m_tp1_pp4_interleaved_1node_50steps:
     VP_SIZE: 2
     NUM_NODES: 1
     MAX_STEPS: 50
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 resume.checkpoint.bert.345m_tp1_pp2_1node:
   <<: *selene-test-resume-checkpoint-launcher
@@ -585,7 +585,7 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     TP_SIZE: 1
     PP_SIZE: 2
     NUM_NODES: 1
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 cleanup.selene:
   tags:
