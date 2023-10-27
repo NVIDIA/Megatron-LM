@@ -471,7 +471,7 @@ train.gpt3_core.345m_cp2_tp2_pp1_1node_50steps:
     MAX_STEPS: 50
     USE_CORE: 1
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
     METADATA: "context_parallelism_cp2"
     PYTORCH_IMAGE: "/lustre/fsw/adlr/adlr-nlp/adlr_ci/megatron/pytorch_23.10_flash_attn_1.0.9_context_parallelism.sqsh"
     ADDITIONAL_PARAMS: "--context-parallel-size 2 --sequence-parallel --hidden-dropout 0.0 --attention-dropout 0.0"
