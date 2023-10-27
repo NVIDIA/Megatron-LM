@@ -111,6 +111,9 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
           inference_params (InferenceParams): Inference params.
         """
 
+        # hidden_states: [ ns, bs, d ]
+        # key_value_states: [ r, k*bs*l, d ]
+
         ns, bs, d = hidden_states.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
 
@@ -132,11 +135,11 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 )
 
                 # Concatenate padded chunk with remaining chunks.
-                chunked_output = torch.cat((first_chunk, rest_chunk), dim=0)  # [l * m, bs, d]
+                chunked_output = torch.cat((first_chunk, rest_chunk), dim=0) # [ l*m, bs, d ]
 
             # Case 2: Sequence length is divisible by chunk length.
             else:
-                chunked_output = hidden_states  # [l * m, bs, d]
+                chunked_output = hidden_states  # [ l*m, bs, d ]
 
             # Chunk & permute hidden states.
             # - hidden_states:  [ l*m, bs, d ]
@@ -155,10 +158,10 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 context=chunked_output,
                 context_mask=None,
                 inference_params=inference_params,
-            )  # [r, k * bs * l , d]
+            )  # [ r, k*bs*l, d ]
             key_value_states = key_value_states.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d
-            )  # [r * k, bs * l, d]
+            )  # [ r*k, bs*l, d ]
 
         # Attend starting at last token of first chunk.
         pad = (ns - 1) % self.retro_chunk_length
@@ -191,9 +194,9 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             "d": d,
             "l": l,
             "pad": pad,
-            "attention_output": attention_output,
-            "attention_bias": attention_bias,
-            "context": key_value_states,
+            "attention_output": attention_output, # [ m, bs*l, d ]
+            "attention_bias": attention_bias,     # [ d ]
+            "context": key_value_states,          # [ r*k, bs*l, d ]
         }
 
 
@@ -238,13 +241,14 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
           bias_dropout_add (Callable): Bias-dropout-add function.
         """
 
+        # Extract input dict.
         ns = x_with_bias["ns"]
         bs = x_with_bias["bs"]
         d = x_with_bias["d"]
         l = x_with_bias["l"]
         pad = x_with_bias["pad"]
-        attention_output = x_with_bias["attention_output"]
-        attention_bias = x_with_bias["attention_bias"]
+        attention_output = x_with_bias["attention_output"] # [ m, bs*l, d ]
+        attention_bias = x_with_bias["attention_bias"]     # [ d ]
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
@@ -271,11 +275,12 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[:ns]  # [ns, b, d]
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[:ns] # [ ns, bs, d ]
 
-            # Add residual.
+            # Add residual. [ ns, bs, d ]
             x = x + residual
 
+        # Output. [ ns, bs, d ]
         return x
 
     def forward(self, training: bool, fused: bool) -> Tensor:

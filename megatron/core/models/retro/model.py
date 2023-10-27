@@ -58,6 +58,19 @@ class RetroModel(GPTModel):
           inference_params (InferenceParams): Parameters for inference.
         """
 
+        # Argument shapes:
+        #   Notation:
+        #     ns : Sequence length.
+        #     bs : Batch size.
+        #     d  : Hidden size.
+        #     l  : Number of chunks per sample (i.e., seq_length/chunk_length).
+        #     k  : Number of neighbors.
+        #     r  : Number of retrieved tokens (neighbors + continuation).
+        # - input_ids:   [ bs, ns ]
+        # - context_ids: [ k*bs*l, r ]
+        # - context:     [ r, k*bs*l, d ]
+        # - output:      [ ns, bs, d ]
+
         # Context embedding (e.g., for Retro neighbor tokens).
         if context_input_ids is not None:
             context = self.embedding(context_input_ids, context_position_ids)
