@@ -135,7 +135,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 )
 
                 # Concatenate padded chunk with remaining chunks.
-                chunked_output = torch.cat((first_chunk, rest_chunk), dim=0) # [ l*m, bs, d ]
+                chunked_output = torch.cat((first_chunk, rest_chunk), dim=0)  # [ l*m, bs, d ]
 
             # Case 2: Sequence length is divisible by chunk length.
             else:
@@ -194,9 +194,9 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
             "d": d,
             "l": l,
             "pad": pad,
-            "attention_output": attention_output, # [ m, bs*l, d ]
-            "attention_bias": attention_bias,     # [ d ]
-            "context": key_value_states,          # [ r*k, bs*l, d ]
+            "attention_output": attention_output,  # [ m, bs*l, d ]
+            "attention_bias": attention_bias,  # [ d ]
+            "context": key_value_states,  # [ r*k, bs*l, d ]
         }
 
 
@@ -247,8 +247,8 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         d = x_with_bias["d"]
         l = x_with_bias["l"]
         pad = x_with_bias["pad"]
-        attention_output = x_with_bias["attention_output"] # [ m, bs*l, d ]
-        attention_bias = x_with_bias["attention_bias"]     # [ d ]
+        attention_output = x_with_bias["attention_output"]  # [ m, bs*l, d ]
+        attention_bias = x_with_bias["attention_bias"]  # [ d ]
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
@@ -275,7 +275,9 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[:ns] # [ ns, bs, d ]
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0,)[
+                :ns
+            ]  # [ ns, bs, d ]
 
             # Add residual. [ ns, bs, d ]
             x = x + residual
