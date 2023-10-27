@@ -187,6 +187,8 @@ def _initialize_tp_communicators():
 
     input_shape = [args.seq_length * args.micro_batch_size , args.hidden_size]
 
+    #We create a MPI process group, which is needed to bootstrap the pipelined 
+    #tensor-model-parallel communication overlap
     torch.distributed.new_group(backend='mpi')
 
     te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, 
