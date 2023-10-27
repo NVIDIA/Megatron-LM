@@ -15,8 +15,9 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import print_rank_0
 from megatron.core import mpu
-from megatron.data.blendable_dataset import BlendableDataset
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.model import GPTModel
 from megatron.core.enums import ModelType
 from megatron.training import pretrain
@@ -101,22 +102,32 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
-    train_ds, valid_ds1, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup))
+    train_ds, _, test_ds = BlendedMegatronDatasetBuilder(
+        GPTDataset,
+        train_val_test_num_samples,
+        GPTDatasetConfig(
+            blend=args.data_path,
+            split=args.split,
+            random_seed=args.seed,
+            sequence_length=args.seq_length,
+            path_to_cache=args.data_cache_path,
+            return_document_ids=False
+        )
+    ).build()
     print_rank_0("> finished creating finetuning GPT datasets ...")
 
-    _, valid_ds, _ = build_train_valid_test_datasets(
-        data_prefix=args.data_path2,
-        splits_string="98,2,0",
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=2048,
-        seed=1234,
-        skip_warmup=(not args.mmap_warmup))
+    _, valid_ds, _ = BlendedMegatronDatasetBuilder(
+        GPTDataset,
+        train_val_test_num_samples,
+        GPTDatasetConfig(
+            blend=args.data_path2,
+            split="98,2,0",
+            random_seed=1234,
+            sequence_length=2048,
+            path_to_cache=args.data_cache_path,
+            return_document_ids=False
+        )
+    ).build()
     print_rank_0("> finished creating pretrained GPT datasets ...")
 
     return train_ds, valid_ds, test_ds

@@ -10,19 +10,16 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron import print_rank_0
 from megatron.arguments import core_transformer_config_from_args
-from megatron.core import mpu, tensor_parallel
+from megatron.core import tensor_parallel
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.retro import get_retro_decoder_block_spec, RetroModel
-from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from tools.retro.query.retro_dataset import get_retro_datasets
 
-from pretrain_gpt import (
-    loss_func,
-    model_provider as default_model_provider,
-    train_valid_test_datasets_provider as standard_datasets_provider,
-)
+from pretrain_gpt import loss_func, model_provider as default_model_provider
 
 
 def core_model_provider(pre_process=True, post_process=True):
@@ -152,6 +149,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+
+    # Temporary for transitiont to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(train_valid_test_datasets_provider,
              model_provider,

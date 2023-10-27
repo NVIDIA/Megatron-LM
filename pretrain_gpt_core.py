@@ -16,12 +16,14 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     gpt_layer_with_transformer_engine_spec_moe
 )
 from megatron.core.transformer.spec_utils import import_module
-from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.training import pretrain
 from megatron.utils import (
     average_losses_across_data_parallel_group,
     get_ltor_masks_and_position_ids,
 )
+from pretrain_gpt import core_gpt_dataset_config_from_args
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -119,25 +121,22 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print_rank_0('> building train, validation, and test datasets ' 'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        train_data_prefix=args.train_data_path,
-        valid_data_prefix=args.valid_data_path,
-        test_data_prefix=args.test_data_path,
-        data_cache_path=args.data_cache_path,
-    )
+    print_rank_0('> building train, validation, and test datasets '
+                 'for GPT ...')
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        GPTDataset,
+        train_val_test_num_samples,
+        core_gpt_dataset_config_from_args(args)
+    ).build()
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
+
+    # Temporary for transitiont to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
 
     pretrain(
         train_valid_test_datasets_provider,

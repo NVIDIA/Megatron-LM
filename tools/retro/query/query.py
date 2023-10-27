@@ -150,8 +150,8 @@ def query_block_neighbors(db_dataset, query_dataset,
     for i in sample_ids:
         sample = query_dataset.sample_dataset[i]
         sample_map[i] = {
-            "dataset_idx" : sample["dataset_idx"],
-            "doc_ids" : sample["doc_ids"],
+            "dataset_idx" : sample["dataset_id"],
+            "doc_ids" : sample["document_ids"],
         }
 
     # Embed block.

@@ -66,7 +66,6 @@ class TestCIPipeline:
             else:
                 assert actual_val == expected_val, f"The value at step {step} should be {expected_val} but it is {actual_val}."
 
-    @pytest.mark.xfail
     def test_lm_loss_deterministic(self):
         # Expected training loss curve at different global steps.
         self._test_helper("lm loss", TypeOfTest.DETERMINISTIC)
