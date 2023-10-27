@@ -174,7 +174,7 @@ def _initialize_tp_communicators():
        from transformer_engine.pytorch import module as te_module
 
     except ImportError:
-       print("Error: Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
+       raise RuntimeError("Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
              "'transformer_engine' packages") 
 
     args = get_args()
