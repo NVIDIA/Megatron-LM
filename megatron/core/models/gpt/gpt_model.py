@@ -81,7 +81,7 @@ class GPTModel(LanguageModule):
             )
 
         # Transformer.
-        self.transformer = TransformerBlock(
+        self.decoder = TransformerBlock(
             config=self.config,
             transformer_layer_spec=self.transformer_layer_spec,
             self_attn_mask_type=AttnMaskType.causal,
@@ -105,6 +105,22 @@ class GPTModel(LanguageModule):
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
+
+    def set_input_tensor(self, input_tensor: Tensor) -> None:
+        """Sets input tensor to the model.
+
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model.
+        """
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor[0])
 
     def forward(
         self,
@@ -138,12 +154,12 @@ class GPTModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.transformer, decoder_input, self.config
+                inference_params, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
-        hidden_states = self.transformer(
+        hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_params=inference_params,
@@ -178,7 +194,7 @@ class GPTModel(LanguageModule):
             sharded_state_dict.update(embedding_sharded_state_dict)
 
         decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.transformer.sharded_state_dict(prefix=decoder_prefix)
+        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
         sharded_state_dict.update(decoder_sharded_state_dict)
 
         if self.post_process:

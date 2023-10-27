@@ -39,9 +39,9 @@ class TestBertModel:
 
         self.bert_model.set_input_tensor(input_tensor)
 
-        assert self.bert_model.transformer.input_tensor.shape[0] == sequence_length
-        assert self.bert_model.transformer.input_tensor.shape[1] == micro_batch_size
-        assert self.bert_model.transformer.input_tensor.shape[2] == config.hidden_size
+        assert self.bert_model.encoder.input_tensor.shape[0] == sequence_length
+        assert self.bert_model.encoder.input_tensor.shape[1] == micro_batch_size
+        assert self.bert_model.encoder.input_tensor.shape[2] == config.hidden_size
 
     def test_post_process_forward(self):
         config: TransformerConfig = self.bert_model.config

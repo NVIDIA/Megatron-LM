@@ -39,9 +39,9 @@ class TestGPTModel:
 
         self.gpt_model.set_input_tensor(input_tensor)
 
-        assert self.gpt_model.transformer.input_tensor.shape[0] == sequence_length
-        assert self.gpt_model.transformer.input_tensor.shape[1] == micro_batch_size
-        assert self.gpt_model.transformer.input_tensor.shape[2] == config.hidden_size
+        assert self.gpt_model.decoder.input_tensor.shape[0] == sequence_length
+        assert self.gpt_model.decoder.input_tensor.shape[1] == micro_batch_size
+        assert self.gpt_model.decoder.input_tensor.shape[2] == config.hidden_size
 
     def test_post_process_forward(self):
         config: TransformerConfig = self.gpt_model.config
