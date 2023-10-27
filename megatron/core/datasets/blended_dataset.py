@@ -106,13 +106,6 @@ class BlendedDataset(torch.utils.data.Dataset):
         """
         path_to_cache = getattr(self.config, "path_to_cache")
 
-        # >>>
-        # if path_to_cache is None:
-        #     path_to_cache = os.path.dirname(config.blend[-1])
-        # from lutil import pax
-        # pax({"config": self.config})
-        # <<<
-
         if path_to_cache:
             get_path_to = lambda suffix: os.path.join(
                 path_to_cache, f"{self.unique_description_hash}-{type(self).__name__}-{suffix}"
@@ -132,10 +125,6 @@ class BlendedDataset(torch.utils.data.Dataset):
                 logger, logging.INFO, f"Build and save the {type(self).__name__} indices",
             )
 
-            # >>>
-            # from lutil import pax
-            # pax("path_to_cache")
-            # <<<
             os.makedirs(path_to_cache, exist_ok=True)
 
             # Write the description

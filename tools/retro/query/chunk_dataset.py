@@ -50,10 +50,6 @@ class ChunkDataset(torch.utils.data.Dataset):
 
         # Extract sample data.
         sample = self.sample_dataset[sample_idx]
-        # >>>
-        # from lutil import pax
-        # pax("sample")
-        # <<<
         sample_token_ids = sample["text"]
         sample_doc_ids = sample["document_ids"]
 
@@ -108,10 +104,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
     
-    # >>>
-    # from lutil import pax
-    # pax({"config": core_gpt_dataset_config_from_retro_args(args)})
-    # <<<
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         GPTDataset,
         train_val_test_num_samples,

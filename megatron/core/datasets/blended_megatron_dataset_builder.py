@@ -94,23 +94,6 @@ class BlendedMegatronDatasetBuilder(object):
 
             blended_datasets = []
 
-            # >>>
-            # import json
-            # from lutil import pax
-            # def print_ds(ds):
-            #     desc = json.loads(ds.unique_description)
-            #     pax("desc")
-            #     return "%s / %s" % (desc["index_split"], desc["path_prefix"])
-            # pax(
-            #     {f"megatron_datasets / {i}":"%s ... %s" % (len(d) if d else "--", d) for i,d in enumerate(megatron_datasets)},
-            #     {"ds / 0": megatron_datasets[0]},
-            #     {"ds / 1": megatron_datasets[1]},
-            #     {"ds / 0 / 0": print_ds(megatron_datasets[0][0])},
-            #     {"ds / 0 / 1": print_ds(megatron_datasets[0][1])},
-            #     {"ds / 1 / 0": print_ds(megatron_datasets[1][0])},
-            #     {"ds / 1 / 1": print_ds(megatron_datasets[1][1])},
-            # )
-            # <<<
             for i in range(len(megatron_datasets)):
                 is_none = map(lambda _: _ is None, megatron_datasets[i])
 
@@ -119,10 +102,6 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(None)
                 else:
                     assert all(is_none) or not any(is_none)
-                    # >>>
-                    # from lutil import pax
-                    # pax({"dss": megatron_datasets[i]})
-                    # <<<
                     blended_datasets.append(
                         self._build_generic_dataset(
                             BlendedDataset,
