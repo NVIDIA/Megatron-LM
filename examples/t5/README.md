@@ -10,12 +10,12 @@
 To run the model on Selene 
 ```
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:23.09-py3
-ACCOUNT_NAME=""
+ACCOUNT_NAME="" 
 PARTITION=""
 JOB_NAME=""
 NUM_NODES=1
-CHECKPOINT_PATH="" #<Specify path>
-TENSORBOARD_LOGS_PATH=""#<Specify path>
+CHECKPOINT_PATH="" #<Specify path to checkpoint>
+TENSORBOARD_LOGS_PATH=""#<Specify path to tensorboard log>
 VOCAB_FILE="" #<Specify path to file>/bert-large-cased-vocab.txt
 DATA_PATH="" #<Specify path and file prefix>_text_document
 
@@ -27,7 +27,7 @@ srun -N $NUM_NODES --container-image $PYTORCH_IMAGE --container-mounts "/path/to
 
 ## 2. Configurations
 <a id="markdown-configurations" name="configurations"></a>
-The example in this folder shows you how to run 220M model. 
+The architecture arguments below shows configuration for T5 220M model. 
 
 ### 220M 
 ```
@@ -47,7 +47,22 @@ The example in this folder shows you how to run 220M model.
 
 ## 3. Training Results
 <a id="markdown-training-results" name="training-results"></a>
-The following is the results we got for the 220M model on Pile dataset. The training takes 4 days on 32 GPUs, with batch size of 2048. 
+Below is the training curve for the 220M model on Pile dataset. The training takes 4 days on 32 GPUs, with batch size of 2048. 
+
+Finetuning on SQUAD dataset, the validation result is: 63.44\%
 <!-- ![Alt text](examples/t5/training_curve.png.png "Training loss curve for T5 220M model on Pile dataset (batch size of 2048)") -->
-<!-- ![IMAGE_DESCRIPTION](training_curve.png) -->
-<img src="training_curve.png"  width="700" height="500">
+<p align="center">
+<img src="/lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm/examples/t5/t5_mcore_train_curve.png"  width="800" height="400">
+</p>
+
+<!-- ## 4. Functional supports
+The table below show current T5 functional supports.
+
+|               | Transformer engine  | Flash-attention | Tensor parallel | Pipeline parallel | Sequence parallel | Distributed optimizer | 
+| ------------- | :---: | :---: | :---: | :---: | :---: | :---: | 
+| **Transformer engine**   | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |
+| **Flash-attention**   | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
+| **Tensor parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
+| **Pipeline parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
+| **Sequence parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |
+| **Distributed optimizer**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |  -->

@@ -7,8 +7,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.T5.t5_embedding import T5Embedding
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -17,30 +18,12 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
 
-def t5_extended_attention_mask(attention_mask_list):
-    def attn_mask_postprocess(attn_mask):
-        # [b, 1, s, s]
-        extended_attention_mask = attn_mask.unsqueeze(1)
-        return extended_attention_mask
-
-    return [attn_mask_postprocess(attn_mask) for attn_mask in attention_mask_list]
-
-
-def t5_position_ids(token_ids):
-    # Create position ids
-    seq_length = token_ids.size(1)
-    position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
-    position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
-
-    return position_ids
-
-
 class T5LMHead(MegatronModule):
     """Masked LM head for T5
 
     Arguments:
-        mpu_vocab_size: model parallel size of vocabulary.
-        parallel_output: wether output logits being distributed or not.
+        config (TransformerConfig): transformer config
+        parallel_output (bool): wether output logits being distributed or not.
         vocab_size (int): vocabulary size
         pre_process (bool): Include embedding layer
         share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
@@ -49,12 +32,11 @@ class T5LMHead(MegatronModule):
 
     def __init__(
         self,
-        mpu_vocab_size,
-        config,
-        parallel_output,
-        vocab_size,
-        pre_process,
-        share_embeddings_and_output_weights,
+        config: TransformerConfig,
+        parallel_output: bool,
+        vocab_size: int,
+        pre_process: bool = True,
+        share_embeddings_and_output_weights: bool = True,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -71,12 +53,22 @@ class T5LMHead(MegatronModule):
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
         )
 
-    def forward(self, hidden_states, word_embeddings_weight):
+    def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
+        """Forward pass.
+
+        Arguments:
+            hidden_states (Tensor): output hidden states from decoder
+            word_embeddings_weight (Tensor): word embedding weight
+
+        Returns:
+            Tensor: logits tensor
+        """
+
         logits, _ = self.output_layer(hidden_states, weight=word_embeddings_weight)
         return logits
 
 
-class T5Model(MegatronModule):
+class T5Model(LanguageModule):
     """T5 Language model.
 
     Arguments:
@@ -144,11 +136,11 @@ class T5Model(MegatronModule):
 
         # Embeddings.
         if self.pre_process:  # lOOK INTO transformer.py in nemo (GPT/ BERT model)
-            self.embedding = T5Embedding(
+            self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
-                add_position_embedding=(self.position_embedding_type == 'learned_absolute'),
+                position_embedding_type=self.position_embedding_type,
             )
 
         # Rotary Position Embeddings
@@ -180,27 +172,16 @@ class T5Model(MegatronModule):
         # Output
         if post_process:
             self.lm_head = T5LMHead(
-                self.shared_embedding_or_output_weight().size(0),
                 config,
                 parallel_output,
                 self.vocab_size,
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
             )
+        self.output_layer = self.lm_head.output_layer
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
-
-    def set_input_tensor(self, input_tensor):
-        """ See megatron.model.transformer.set_input_tensor()"""
-
-        # This is usually handled in schedules.py but some inference code still
-        # gives us non-lists or None
-        if not isinstance(input_tensor, list):
-            input_tensor = [input_tensor]
-
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
-        self.decoder.set_input_tensor(input_tensor[0])
 
     def forward(
         self,
@@ -211,7 +192,21 @@ class T5Model(MegatronModule):
         encoder_decoder_attn_mask: Tensor,
         labels: Tensor = None,
         inference_params: InferenceParams = None,
-    ):
+    ) -> Tensor:
+        """Forward pass.
+
+        Arguments:
+            encoder_input_ids (Tensor): input ids for encoder
+            decoder_input_ids (Tensor): input ids for decoder
+            encoder_attn_mask (Tensor): self-attention mask for encoder
+            decoder_attn_mask (Tensor): self-attention mask for decoder
+            encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
+            labels (Tensor): labels for decoder output
+            inference_params (InferenceParams): relevant arguments for inferencing
+
+        Returns:
+            Tensor: loss tensor
+        """
 
         (
             encoder_attn_mask,
@@ -298,70 +293,20 @@ class T5Model(MegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        # [b s] => [s b]
-        labels = labels.transpose(0, 1).contiguous()
-        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
+        loss = self.compute_language_model_loss(labels, logits)
 
-        # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    def shared_embedding_or_output_weight(self):
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Function to share the input embeddings and output logit weights."""
+
         if self.pre_process:
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.lm_head.output_layer.weight
         return None
 
-    def initialize_last_stage_with_word_embeddings(self):
-
-        # This function just initializes the word embeddings in the final stage
-        # when we are using pipeline parallelism and sharing word
-        # embeddings. Nothing to do if we aren't sharing weights or aren't using
-        # pipeline parallelism.
-        if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
-            return
-
-        if self.post_process and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage()
-            # set word_embeddings weights to 0 here, then copy first
-            # stage's weights using all_reduce below.
-            self.lm_head.output_layer.weight.data.fill_(0)
-            self.lm_head.output_layer.weight.shared = True
-
-        # Parameters are shared between the word embeddings layers, and the
-        # heads at the end of the model. In a pipelined setup with more than
-        # one stage, the initial embedding layer and the head are on different
-        # workers, so we do the following:
-        # 1. Create a second copy of word_embeddings on the last stage, with
-        #    initial parameters of 0.0.
-        # 2. Do an all-reduce between the first and last stage to ensure that
-        #    the two copies of word_embeddings start off with the same
-        #    parameter values.
-        # 3. In the training loop, before an all-reduce between the grads of
-        #    the two word_embeddings layers to ensure that every applied weight
-        #    update is the same on both stages.
-
-        # Ensure that first and last stages have the same initial parameter
-        # values.
-        if torch.distributed.is_initialized():
-            if parallel_state.is_rank_in_embedding_group():
-                weight = self.shared_embedding_or_output_weight()
-                torch.distributed.all_reduce(
-                    weight.data, group=parallel_state.get_embedding_group()
-                )
-
-        elif not getattr(T5Model, "embedding_warning_printed", False):
-            logging.getLogger(__name__).warning(
-                "Distributed processes aren't initialized, so the output layer "
-                "is not initialized with weights from the word embeddings. "
-                "If you are just manipulating a model this is fine, but "
-                "this needs to be handled manually. If you are training "
-                "something is definitely wrong."
-            )
-            T5Model.embedding_warning_printed = True
-
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix: str = ''):
         sharded_state_dict = {}
 
         if self.pre_process:
@@ -420,7 +365,7 @@ class T5Model(MegatronModule):
 
         return sharded_state_dict
 
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
+    def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """For easy load when model is combined with other heads,
         add an extra key."""
 
@@ -462,3 +407,27 @@ class T5Model(MegatronModule):
             self.word_embeddings.load_state_dict(
                 state_dict["word_embeddings_for_head"], strict=strict
             )
+
+
+def t5_extended_attention_mask(attention_mask_list: List[Tensor]) -> List[Tensor]:
+    def attn_mask_postprocess(attn_mask):
+        # [b, 1, s, s]
+        extended_attention_mask = attn_mask.unsqueeze(1)
+        return extended_attention_mask
+
+    return [attn_mask_postprocess(attn_mask) for attn_mask in attention_mask_list]
+
+
+def t5_position_ids(token_ids: Tensor) -> Tensor:
+    """Calculate position ids from token ids
+    Args:
+        token_ids (Tensor): input tokens
+
+    Returns:
+        Tensor: position ids
+    """
+    seq_length = token_ids.size(1)
+    position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
+    position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
+
+    return position_ids

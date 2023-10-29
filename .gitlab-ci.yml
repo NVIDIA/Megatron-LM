@@ -114,6 +114,20 @@ train.t5_core.220m_tp2_pp1_1node_100steps:
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
+train.t5_core.220m_tp4_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
 train.t5_core.220m_te_tp1_pp1_1node_100steps:
   <<: *selene-test-launcher
   variables:
@@ -142,6 +156,65 @@ train.t5_core.220m_te_tp2_pp1_1node_100steps:
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
+train.t5_core.220m_te_tp4_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_nofa_tp1_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    NO_FA: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_tp4_pp1_sp_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
+train.t5_core.220m_te_tp4_pp1_sp_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
 train.t5_core.220m_do_tp1_pp1_1node_100steps:
   <<: *selene-test-launcher
   variables:
@@ -157,21 +230,6 @@ train.t5_core.220m_do_tp1_pp1_1node_100steps:
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
     ADDITIONAL_PARAMS: "--use-distributed-optimizer"
 
-train.t5_core.220m_do_tp2_pp1_1node_100steps:
-  <<: *selene-test-launcher
-  variables:
-    <<: [*VARS]
-    RUN_MODEL: t5
-    USE_TE: 0
-    TP_SIZE: 2
-    PP_SIZE: 1
-    NUM_NODES: 1
-    MAX_STEPS: 100
-    TIME_LIMIT: 30:00"
-    TEST_LEVEL: L0
-    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
-    ADDITIONAL_PARAMS: "--use-distributed-optimizer"
-
 train.t5_core.220m_te_do_tp1_pp1_1node_100steps:
   <<: *selene-test-launcher
   variables:
@@ -179,21 +237,6 @@ train.t5_core.220m_te_do_tp1_pp1_1node_100steps:
     RUN_MODEL: t5
     USE_TE: 1
     TP_SIZE: 1
-    PP_SIZE: 1
-    NUM_NODES: 1
-    MAX_STEPS: 100
-    TIME_LIMIT: 30:00"
-    TEST_LEVEL: L0
-    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
-    ADDITIONAL_PARAMS: "--use-distributed-optimizer"
-
-train.t5_core.220m_te_do_tp2_pp1_1node_100steps:
-  <<: *selene-test-launcher
-  variables:
-    <<: [*VARS]
-    RUN_MODEL: t5
-    USE_TE: 1
-    TP_SIZE: 2
     PP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
@@ -228,6 +271,20 @@ resume.checkpoint.t5_core.220m_tp1_pp1_1node:
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+resume.checkpoint.t5_core.220m_te_tp1_pp1_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: L0
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
 
 
 # train.t5_core.220m_tp1_pp1_rope_1node_100steps:

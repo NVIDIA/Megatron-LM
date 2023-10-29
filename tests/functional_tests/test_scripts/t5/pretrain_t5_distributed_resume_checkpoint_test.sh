@@ -37,6 +37,12 @@ if [[ $USE_CORE -eq 1 ]]; then
        export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
+if [[ $NO_FA -eq 1 ]]; then
+       echo "Turn off flash attention environment variable"
+       export NVTE_FLASH_ATTN=0
+       export NVTE_FUSED_ATTN=0
+fi
+
 if [[ $USE_TE -eq 1 ]]; then
        echo "Running with TransformerEngine ..."
        TRANSFORMER_IMPL=transformer_engine
@@ -45,6 +51,10 @@ else
        echo "Running with local transformer implementation ..."
 fi
 set +x
+
+# install neccessary library
+pip install pydantic==2.2.1
+
 # Runs the "220M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 

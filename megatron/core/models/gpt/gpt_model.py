@@ -6,7 +6,7 @@ from typing import Literal, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -111,7 +111,8 @@ class GPTModel(LanguageModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params=None,
+        inference_params: InferenceParams = None,
+        extra_block_kwargs: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -201,11 +202,11 @@ class GPTModel(LanguageModule):
                     # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
                     tensor = self.shared_embedding_or_output_weight()
                     first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    dp_rank = parallel_state.get_data_parallel_rank()
-                    dp_size = parallel_state.get_data_parallel_world_size()
                     last_stage_word_emb_replica_id = (
-                        dp_rank + dp_size
-                    )  # copy of first stage embedding
+                        1,  # copy of first stage embedding
+                        0,
+                        parallel_state.get_data_parallel_rank(),
+                    )
 
                     sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
                         tensor=tensor,
@@ -223,18 +224,9 @@ class GPTModel(LanguageModule):
                 output_layer_tensor = output_layer_state_dict[output_layer_key]
                 # independent output layer
                 sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_key,
-                    replica_id=parallel_state.get_data_parallel_rank(),
-                    allow_shape_mismatch=True,
+                    tensor=output_layer_tensor, key=output_layer_key, allow_shape_mismatch=True,
                 )
 
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
-
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        pass
-
-    def load_state_dict(self, state_dict, strict=True):
-        pass

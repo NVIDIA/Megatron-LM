@@ -22,10 +22,13 @@ from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
+    """T5 encoder TE spec (uses Transformer Engine components)."""
+
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -51,6 +54,8 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
 
 
 def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
+    """T5 decoder TE spec (uses Transformer Engine components)."""
+
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -87,6 +92,8 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
 
 
 def encoder_model_with_local_spec() -> ModuleSpec:
+    """T5 encoder local spec (uses Megatron-Core components)."""
+
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -116,6 +123,8 @@ def encoder_model_with_local_spec() -> ModuleSpec:
 
 
 def decoder_model_with_local_spec() -> ModuleSpec:
+    """T5 decoder local spec (uses Megatron-Core components)."""
+
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -157,28 +166,56 @@ def decoder_model_with_local_spec() -> ModuleSpec:
     )
 
 
-def get_t5_encoder_with_transformer_engine_block_spec(config) -> TransformerBlockSubmodules:
+def get_t5_encoder_with_transformer_engine_block_spec(
+    config: TransformerConfig,
+) -> TransformerBlockSubmodules:
+    """T5 encoder block spec for Transformer Engine
+
+    Arguments:
+      config (TransformerConfig): config, containing number of layers for encoder
+    """
+
     num_layers = get_num_layers_to_build(config)
     layer_spec = encoder_model_with_transformer_engine_default_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
 
 
-def get_t5_decoder_with_transformer_engine_block_spec(config) -> TransformerBlockSubmodules:
+def get_t5_decoder_with_transformer_engine_block_spec(
+    config: TransformerConfig,
+) -> TransformerBlockSubmodules:
+    """T5 decoder block spec for Transformer Engine
+
+    Arguments:
+      config (TransformerConfig): config, containing number of layers for decoder
+    """
+
     num_layers = get_num_layers_to_build(config)
     layer_spec = decoder_model_with_transformer_engine_default_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
 
 
-def get_t5_encoder_with_local_block_spec(config) -> TransformerBlockSubmodules:
+def get_t5_encoder_with_local_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
+    """T5 encoder block spec for local (uses Megatron-Core components)
+
+    Arguments:
+      config (TransformerConfig): config, containing number of layers for encoder
+    """
+
     num_layers = get_num_layers_to_build(config)
     layer_spec = encoder_model_with_local_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)
     return block_spec
 
 
-def get_t5_decoder_with_local_block_spec(config) -> TransformerBlockSubmodules:
+def get_t5_decoder_with_local_block_spec(config: TransformerConfig) -> TransformerBlockSubmodules:
+    """T5 decoder block spec for local (uses Megatron-Core components)
+
+    Arguments:
+      config (TransformerConfig): config, containing number of layers for decoder
+    """
+
     num_layers = get_num_layers_to_build(config)
     layer_spec = decoder_model_with_local_spec()
     block_spec = TransformerBlockSubmodules([layer_spec] * num_layers)

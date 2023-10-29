@@ -5,6 +5,7 @@
 from functools import partial
 
 import torch
+from torch import Tensor
 
 from megatron import (
     get_args,
@@ -24,9 +25,18 @@ from megatron.core.models.T5.t5_spec import (get_t5_encoder_with_transformer_eng
                                             get_t5_encoder_with_local_block_spec,
                                             get_t5_decoder_with_local_block_spec)
 
-def model_provider(pre_process=True, post_process=True,
-                   add_encoder=True, add_decoder=True):
-    """Build the model."""
+def model_provider(pre_process=True, post_process=True, add_encoder=True, add_decoder=True) -> T5Model:
+    """Builds the model.
+
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        add_encoder (bool, optional): Defaults to True
+        add_decoder (bool, optional): Defaults to True
+    Returns:
+        T5Model: The returned T5 model
+    """
+
 
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -56,7 +66,7 @@ def model_provider(pre_process=True, post_process=True,
 
 
 def get_batch(data_iterator):
-    """Build the batch."""
+    """Build a batch."""
 
     keys = ['text_enc', 'text_dec', 'labels', 'loss_mask',
             'enc_mask', 'dec_mask', 'enc_dec_mask']
@@ -83,7 +93,13 @@ def get_batch(data_iterator):
            enc_mask, dec_mask, enc_dec_mask
 
 
-def loss_func(loss_mask, output_tensor):
+def loss_func(loss_mask: Tensor, output_tensor: Tensor):
+    """Loss function.
+
+    Args:
+        loss_mask (Tensor): Used to mask out some portions of the loss
+        output_tensor (Tensor): The tensor with the losses
+    """   
     lm_loss_ = output_tensor.float()
     lm_loss = torch.sum(
         lm_loss_.view(-1) * loss_mask.reshape(-1)) / loss_mask.sum()
@@ -94,8 +110,14 @@ def loss_func(loss_mask, output_tensor):
     return loss, {'lm loss': averaged_losses[0]}
 
 
-def forward_step(data_iterator, model):
-    """Forward step."""
+def forward_step(data_iterator, model: T5Model):
+    """Forward training step.
+
+    Args:
+        data_iterator : Input data iterator
+        model (GPTModel): The T5 Model
+    """
+
     args = get_args()
     timers = get_timers()
 
@@ -116,8 +138,12 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
-    """Build train, valid, and test datasets."""
+def train_valid_test_datasets_provider(train_val_test_num_samples: int):
+    """Build the train test and validation datasets.
+
+    Args:
+        train_val_test_num_samples : A list containing the number of samples in train test and validation.
+    """
     args = get_args()
 
     print_rank_0('> building train, validation, and test datasets '
