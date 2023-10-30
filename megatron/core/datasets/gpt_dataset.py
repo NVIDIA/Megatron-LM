@@ -178,7 +178,6 @@ class GPTDataset(MegatronDataset):
             path_to_cache = os.path.join(
                 self.indexed_dataset.path_prefix, "cache", f"{type(self).__name__}_indices"
             )
-            self.config.path_to_cache = path_to_cache
 
         get_path_to = lambda suffix: os.path.join(
             path_to_cache, f"{self.unique_description_hash}-{type(self).__name__}-{suffix}"
