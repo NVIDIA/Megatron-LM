@@ -145,7 +145,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_valid_test_num_samples=train_val_test_num_samples,
         max_seq_length=args.seq_length,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
         binary_head=args.bert_binary_head)
     print_rank_0("> finished creating BERT datasets ...")
 

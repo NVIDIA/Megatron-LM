@@ -21,7 +21,7 @@ except ImportError:
     nltk_available = False
 
 from megatron.tokenizer import build_tokenizer
-from megatron.data import indexed_dataset
+from megatron.core.datasets import indexed_dataset
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
@@ -177,7 +177,7 @@ class Partition(object):
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
             for key in doc.keys():
-                builders[key].add_doc(doc[key], sentence_lens[key])
+                builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
@@ -398,7 +398,7 @@ def main():
             parition_output_prefix = name['output_prefix']
             full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
                                                              key, level)
-            builders[key].merge_file_(full_partition_output_prefix)
+            builders[key].add_index(full_partition_output_prefix)
         builders[key].finalize(output_idx_files[key])
 
 

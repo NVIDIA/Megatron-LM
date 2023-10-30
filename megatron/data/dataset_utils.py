@@ -31,8 +31,8 @@ from megatron import (
     print_rank_0
 )
 from megatron.core import mpu
-from megatron.data.blendable_dataset import BlendableDataset
-from megatron.data.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
+
 
 DSET_TYPE_BERT = 'standard_bert'
 DSET_TYPE_ICT = 'ict'
@@ -78,19 +78,6 @@ def get_datasets_weights_and_num_samples(data_prefix,
             for weight in weights]
 
     return prefixes, weights, datasets_train_valid_test_num_samples
-
-
-def compile_helper():
-    """Compile helper function ar runtime. Make sure this
-    is invoked on a single process."""
-    import os
-    import subprocess
-    path = os.path.abspath(os.path.dirname(__file__))
-    ret = subprocess.run(['make', '-C', path])
-    if ret.returncode != 0:
-        print("Making C++ dataset helpers module failed, exiting.")
-        import sys
-        sys.exit(1)
 
 
 def get_a_and_b_segments(sample, np_rng):
@@ -423,7 +410,6 @@ def pad_and_convert_to_numpy(tokens, tokentypes, masked_positions,
 def build_train_valid_test_datasets_with_prefixes(train_valid_test_num_samples,
                                                   max_seq_length,
                                                   seed,
-                                                  skip_warmup,
                                                   train_data_prefix=None,
                                                   valid_data_prefix=None,
                                                   test_data_prefix=None,
@@ -437,7 +423,7 @@ def build_train_valid_test_datasets_with_prefixes(train_valid_test_num_samples,
     if train_data_prefix is not None:
         train_dataset = build_dataset("train", train_data_prefix,
                                       train_valid_test_num_samples[0],
-                                      max_seq_length, seed, skip_warmup,
+                                      max_seq_length, seed,
                                       binary_head, max_seq_length_dec,
                                       dataset_type=dataset_type)
 
@@ -461,7 +447,7 @@ def build_train_valid_test_datasets_with_prefixes(train_valid_test_num_samples,
 def build_train_valid_test_datasets(data_prefix, splits_string,
                                     train_valid_test_num_samples,
                                     max_seq_length, seed,
-                                    skip_warmup, binary_head=False,
+                                    binary_head=False,
                                     max_seq_length_dec=None,
                                     dataset_type='standard_bert'):
 
@@ -470,68 +456,28 @@ def build_train_valid_test_datasets(data_prefix, splits_string,
                                                 splits_string,
                                                 train_valid_test_num_samples,
                                                 max_seq_length, seed,
-                                                skip_warmup,
                                                 binary_head,
                                                 max_seq_length_dec,
                                                 dataset_type=dataset_type)
-    # Blending dataset.
-    # Parse the values.
-    output = get_datasets_weights_and_num_samples(data_prefix,
-                                                  train_valid_test_num_samples)
-    prefixes, weights, datasets_train_valid_test_num_samples = output
-    train_num_samples, valid_num_samples, test_num_samples = map(
-        sum,
-        zip(*datasets_train_valid_test_num_samples)
-    )
 
-    # Build individual datasets.
-    train_datasets = []
-    valid_datasets = []
-    test_datasets = []
-    for i in range(len(prefixes)):
-        train_ds, valid_ds, test_ds = _build_train_valid_test_datasets(
-            prefixes[i], splits_string,
-            datasets_train_valid_test_num_samples[i],
-            max_seq_length, seed, skip_warmup, binary_head,
-            max_seq_length_dec, dataset_type=dataset_type)
-        if train_ds:
-            train_datasets.append(train_ds)
-        if valid_ds:
-            valid_datasets.append(valid_ds)
-        if test_ds:
-            test_datasets.append(test_ds)
-
-    # Blend.
-    blending_train_dataset = None
-    if train_datasets:
-        blending_train_dataset = BlendableDataset(train_datasets, weights, train_num_samples)
-    blending_valid_dataset = None
-    if valid_datasets:
-        blending_valid_dataset = BlendableDataset(valid_datasets, weights, valid_num_samples)
-    blending_test_dataset = None
-    if test_datasets:
-        blending_test_dataset = BlendableDataset(test_datasets, weights, test_num_samples)
-
-    return (blending_train_dataset, blending_valid_dataset,
-            blending_test_dataset)
+    raise NotImplementedError("Blending currently unsupported for non-GPT dataset instances")
 
 
 def _build_train_valid_test_datasets(data_prefix, splits_string,
                                      train_valid_test_num_samples,
                                      max_seq_length, seed,
-                                     skip_warmup, binary_head,
+                                     binary_head,
                                      max_seq_length_dec,
                                      dataset_type='standard_bert'):
 
     # Indexed dataset.
     indexed_dataset = get_indexed_dataset_(data_prefix,
-                                           dataset_type,
-                                           skip_warmup)
+                                           dataset_type)
 
     # Get start and end indices of train/valid/train into doc-idx
     # Note that doc-idx is desinged to be num-docs + 1 so we can
     # easily iterate over it.
-    total_num_of_documents = indexed_dataset.doc_idx.shape[0] - 1
+    total_num_of_documents = indexed_dataset.document_indices.shape[0] - 1
     splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
 
     # Print stats about the splits.
@@ -542,8 +488,8 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
         print_rank_0('     document indices in [{}, {}) total of {} '
                      'documents'.format(splits[index], splits[index + 1],
                                         splits[index + 1] - splits[index]))
-        start_index = indexed_dataset.doc_idx[splits[index]]
-        end_index = indexed_dataset.doc_idx[splits[index + 1]]
+        start_index = indexed_dataset.document_indices[splits[index]]
+        end_index = indexed_dataset.document_indices[splits[index + 1]]
         print_rank_0('     sentence indices in [{}, {}) total of {} '
                      'sentences'.format(start_index, end_index,
                                         end_index - start_index))
@@ -555,25 +501,25 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
         dataset = None
         if splits[index + 1] > splits[index]:
             # Get the pointer to the original doc-idx so we can set it later.
-            doc_idx_ptr = indexed_dataset.get_doc_idx()
+            doc_idx_ptr = indexed_dataset.get_document_indices()
             # Slice the doc-idx
             start_index = splits[index]
             # Add +1 so we can index into the dataset to get the upper bound.
             end_index = splits[index + 1] + 1
             # New doc_idx view.
-            indexed_dataset.set_doc_idx(doc_idx_ptr[start_index:end_index])
+            indexed_dataset.set_document_indices(doc_idx_ptr[start_index:end_index])
 
             dataset = build_dataset(
                 name, data_prefix,
                 train_valid_test_num_samples[index], max_seq_length,
-                seed, skip_warmup, binary_head, max_seq_length_dec,
+                seed, binary_head, max_seq_length_dec,
                 dataset_type, indexed_dataset)
 
             # Set the original pointer so dataset remains the main dataset.
-            indexed_dataset.set_doc_idx(doc_idx_ptr)
+            indexed_dataset.set_document_indices(doc_idx_ptr)
             # Checks.
-            assert indexed_dataset.doc_idx[0] == 0
-            assert indexed_dataset.doc_idx.shape[0] == \
+            assert indexed_dataset.document_indices[0] == 0
+            assert indexed_dataset.document_indices.shape[0] == \
                 (total_num_of_documents + 1)
         return dataset
     
@@ -585,7 +531,7 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
 
 
 def build_dataset(name, data_prefix, max_num_samples,
-                  max_seq_length, seed, skip_warmup, binary_head,
+                  max_seq_length, seed, binary_head,
                   max_seq_length_dec, dataset_type='standard_bert',
                   indexed_dataset=None):
 
@@ -599,8 +545,7 @@ def build_dataset(name, data_prefix, max_num_samples,
 
     if indexed_dataset is None:
         indexed_dataset = get_indexed_dataset_(data_prefix,
-                                               dataset_type,
-                                               skip_warmup)
+                                               dataset_type)
 
     kwargs = dict(
         name=name,
@@ -616,8 +561,7 @@ def build_dataset(name, data_prefix, max_num_samples,
 
         title_dataset = get_indexed_dataset_(
             args.titles_data_path,
-            dataset_type,
-            skip_warmup)
+            dataset_type)
 
         dataset = ICTDataset(
             block_dataset=indexed_dataset,
@@ -663,22 +607,22 @@ def build_dataset(name, data_prefix, max_num_samples,
     return dataset
 
 
-def get_indexed_dataset_(data_prefix, dataset_type, skip_warmup):
+def get_indexed_dataset_(data_prefix, dataset_type):
 
     print_rank_0(' > building dataset index ...')
 
     start_time = time.time()
     multimodal = dataset_type == DSET_TYPE_MULTIMODAL
-    indexed_dataset = MMapIndexedDataset(data_prefix, skip_warmup, multimodal)
-    assert indexed_dataset.sizes.shape[0] == indexed_dataset.doc_idx[-1]
+    indexed_dataset = MMapIndexedDataset(data_prefix, multimodal)
+    assert indexed_dataset.sequence_lengths.shape[0] == indexed_dataset.document_indices[-1]
     print_rank_0(' > finished creating indexed dataset in {:4f} '
                  'seconds'.format(time.time() - start_time))
 
     print_rank_0(' > indexed dataset stats:')
     print_rank_0('    number of documents: {}'.format(
-        indexed_dataset.doc_idx.shape[0] - 1))
+        indexed_dataset.document_indices.shape[0] - 1))
     print_rank_0('    number of sentences: {}'.format(
-        indexed_dataset.sizes.shape[0]))
+        indexed_dataset.sequence_lengths.shape[0]))
 
     return indexed_dataset
 
@@ -748,8 +692,8 @@ def get_samples_mapping(indexed_dataset,
               'the indices on rank 0 ...'.format(indexmap_filename))
 
         # Make sure the types match the helpers input types.
-        assert indexed_dataset.doc_idx.dtype == np.int64
-        assert indexed_dataset.sizes.dtype == np.int32
+        assert indexed_dataset.document_indices.dtype == np.int64
+        assert indexed_dataset.sequence_lengths.dtype == np.int32
 
         # Build samples mapping
         verbose = torch.distributed.get_rank() == 0
@@ -757,10 +701,10 @@ def get_samples_mapping(indexed_dataset,
         print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
         # First compile and then import.
-        from megatron.data import helpers
+        from megatron.core.datasets import helpers
         samples_mapping = helpers.build_mapping(
-            indexed_dataset.doc_idx,
-            indexed_dataset.sizes,
+            indexed_dataset.document_indices,
+            indexed_dataset.sequence_lengths,
             num_epochs,
             max_num_samples,
             max_seq_length,

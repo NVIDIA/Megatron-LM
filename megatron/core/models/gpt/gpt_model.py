@@ -206,11 +206,11 @@ class GPTModel(LanguageModule):
                     # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
                     tensor = self.shared_embedding_or_output_weight()
                     first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    dp_rank = parallel_state.get_data_parallel_rank()
-                    dp_size = parallel_state.get_data_parallel_world_size()
                     last_stage_word_emb_replica_id = (
-                        dp_rank + dp_size
-                    )  # copy of first stage embedding
+                        1,  # copy of first stage embedding
+                        0,
+                        parallel_state.get_data_parallel_rank(),
+                    )
 
                     sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
                         tensor=tensor,
@@ -228,10 +228,7 @@ class GPTModel(LanguageModule):
                 output_layer_tensor = output_layer_state_dict[output_layer_key]
                 # independent output layer
                 sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_key,
-                    replica_id=parallel_state.get_data_parallel_rank(),
-                    allow_shape_mismatch=True,
+                    tensor=output_layer_tensor, key=output_layer_key, allow_shape_mismatch=True,
                 )
 
                 sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
