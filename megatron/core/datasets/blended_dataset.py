@@ -119,17 +119,13 @@ class BlendedDataset(torch.utils.data.Dataset):
                     [path_to_description, path_to_dataset_index, path_to_dataset_sample_index],
                 )
             )
+        else:
+            cache_hit = False
 
-        if not (path_to_cache and cache_hit) and torch.distributed.get_rank() == 0:
+        if not path_to_cache or (not cache_hit and torch.distributed.get_rank() == 0):
             log_single_rank(
                 logger, logging.INFO, f"Build and save the {type(self).__name__} indices",
             )
-
-            os.makedirs(path_to_cache, exist_ok=True)
-
-            # Write the description
-            with open(path_to_description, "wt") as writer:
-                writer.write(self.unique_description)
 
             # Build the dataset and dataset sample indexes
             log_single_rank(
@@ -148,13 +144,26 @@ class BlendedDataset(torch.utils.data.Dataset):
                 self.size,
                 _VERBOSE,
             )
-            if not path_to_cache:
-                return dataset_index, dataset_sample_index
-            else:
+
+            if path_to_cache:
+                os.makedirs(path_to_cache, exist_ok=True)
+                # Write the description
+                with open(path_to_description, "wt") as writer:
+                    writer.write(self.unique_description)
+                # Save the indexes
                 numpy.save(path_to_dataset_index, dataset_index, allow_pickle=True)
                 numpy.save(path_to_dataset_sample_index, dataset_sample_index, allow_pickle=True)
+            else:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "Unable to save the indexes because path_to_cache is None",
+                )
+
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
+
+            return dataset_index, dataset_sample_index
 
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} indices")
 
