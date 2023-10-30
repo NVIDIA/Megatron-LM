@@ -880,7 +880,7 @@ def _add_training_args(parser):
     group.add_argument('--no-manual-gc-eval', action='store_false',
                        help='When using manual garbage collection, disable '
                        'garbage collection at the start and the end of each '
-                       'evaluation run.')
+                       'evaluation run.', dest='manual_gc_eval')
 
     return parser
 

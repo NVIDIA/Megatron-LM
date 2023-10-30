@@ -728,7 +728,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     exit = False
 
     if args.manual_gc:
-        # Disable the default garbage collector and performance the collection manually.
+        # Disable the default garbage collector and perform the collection manually.
         # This is to align the timing of garbage collection across ranks.
         assert args.manual_gc_interval >= 0, \
             'Manual garbage collection interval should be laerger than or equal to 0.'
@@ -776,7 +776,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
-            if args.manual_gc and not args.no_manual_gc_eval:
+            if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
             prefix = 'iteration {}'.format(iteration)
@@ -784,7 +784,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, False)
-            if args.manual_gc and not args.no_manual_gc_eval:
+            if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
 
