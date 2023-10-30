@@ -60,7 +60,7 @@ class TestParallelTransformerLayer:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True)
         parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                      gpt_layer_with_transformer_engine_spec.submodules)
+                                                      get_gpt_layer_with_transformer_engine_spec().submodules)
 
         sharded_state_dict = parallel_transformer_layer.sharded_state_dict()
 
