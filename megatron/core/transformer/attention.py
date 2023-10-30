@@ -245,7 +245,7 @@ class Attention(MegatronModule, ABC):
         # This is a noop for normal attention where ng == np. When using group query attention this
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
-        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+        if (self.num_attention_heads_per_partition // self.num_query_groups_per_partition) > 1:
             key = key.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
             )

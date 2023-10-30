@@ -95,6 +95,10 @@ def validate_args(args, defaults={}):
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
 
+    if args.tp_comm_overlap:
+        assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+
+
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
         'valid, use --micro-batch-size instead'
@@ -793,6 +797,22 @@ def _add_training_args(parser):
                        help='Gloable step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
+    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
+                       ' overlap of Tensor parallel communication and GEMM kernels.')
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+                       help = 'Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false', 
+                       help = 'Disables the All-Gather overlap with fprop GEMM.',
+                       dest='tp_comm_split_ag')
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
+                       dest='tp_comm_split_rs')
+    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false', 
+                       help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
+                       dest='tp_comm_bulk_dgrad')
+    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
+                       dest='tp_comm_bulk_wgrad')
 
 
     # deprecated
