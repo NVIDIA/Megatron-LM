@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import gc
 from datetime import datetime
 import math
 import logging
@@ -726,6 +727,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     report_memory_flag = True
     exit = False
 
+    if args.manual_gc:
+        # Disable the default garbage collector and perform the collection manually.
+        # This is to align the timing of garbage collection across ranks.
+        assert args.manual_gc_interval >= 0, \
+            'Manual garbage collection interval should be laerger than or equal to 0.'
+        gc.disable()
+        gc.collect()
+
     while iteration < args.train_iters:
         if args.profile and \
            iteration == args.profile_step_start and \
@@ -767,11 +776,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect all objects.
+                gc.collect()
             prefix = 'iteration {}'.format(iteration)
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, False)
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect only the objects created and used in evaluation.
+                gc.collect(generation=0)
 
         # Checkpointing
         saved_checkpoint = False
@@ -820,6 +835,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if args.manual_gc:
+            if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
+                gc.collect()
 
     # Flush TensorBoard and WandB writers.
     writer = get_tensorboard_writer()

@@ -888,6 +888,22 @@ def _add_training_args(parser):
                        dest='use_mcore_models')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
+    group.add_argument('--manual-gc', action='store_true',
+                       help='Disable the threshold-based default garbage '
+                       'collector and trigger the garbage collection manually. '
+                       'Manual garbage collection helps to align the timing of '
+                       'the collection across ranks which mitigates the impact '
+                       'of CPU-associated jitters. When the manual gc is enabled, '
+                       'garbage collection is performed only at the start and the '
+                       'end of the validation routine by default.')
+    group.add_argument('--manual-gc-interval', type=int, default=0,
+                       help='Training step interval to trigger manual garbage '
+                       'collection. When the value is set to 0, garbage '
+                       'collection is not triggered between training steps.')
+    group.add_argument('--no-manual-gc-eval', action='store_false',
+                       help='When using manual garbage collection, disable '
+                       'garbage collection at the start and the end of each '
+                       'evaluation run.', dest='manual_gc_eval')
 
     return parser
 
