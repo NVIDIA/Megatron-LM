@@ -145,13 +145,9 @@ class T5Model(LanguageModule):
 
         # Rotary Position Embeddings
         if self.position_embedding_type == 'rope':
-            rotary_dim = self.config.kv_channels
-            if rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * rotary_percent)
-
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
-        else:
-            self.rotary_pos_emb = None
+            self.rotary_pos_emb = RotaryEmbedding(
+                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+            )
 
         # Transformer encoder
         encoder_spec, decoder_spec = self.transformer_layer_spec
@@ -230,10 +226,10 @@ class T5Model(LanguageModule):
 
         # Rotary positional embeddings
         rotary_pos_emb = None
-        if self.rotary_pos_emb is not None:
-            rotary_seq_len = self.max_sequence_length
-            if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_length
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_params, self.encoder, encoder_input, self.config
+            )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run encoder.
@@ -256,17 +252,10 @@ class T5Model(LanguageModule):
 
         # Rotary positional embeddings
         rotary_pos_emb = None
-        if self.rotary_pos_emb is not None:
-            if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_length
-            else:
-                if self.decoder.input_tensor is not None:
-                    rotary_seq_len = self.decoder.input_tensor.size(0)
-                else:
-                    rotary_seq_len = decoder_input.size(0)
-                # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
-                if self.config.sequence_parallel:
-                    rotary_seq_len *= self.config.tensor_model_parallel_size
+        if self.position_embedding_type == 'rope':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_params, self.decoder, decoder_input, self.config
+            )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
