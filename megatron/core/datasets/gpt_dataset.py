@@ -8,6 +8,10 @@ from typing import Dict, Tuple
 import numpy
 import torch
 
+from megatron import get_args
+from megatron import get_tokenizer
+from megatron.utils import get_ltor_masks_and_position_ids
+
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -63,7 +67,7 @@ class GPTDataset(MegatronDataset):
         """
         return self.sample_index.shape[0] - 1
 
-    def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Abstract method implementation
 
         Args:
@@ -74,10 +78,28 @@ class GPTDataset(MegatronDataset):
             dictionary
         """
         text, document_ids = self._query_document_sample_shuffle_indices(idx)
+
+        text = torch.from_numpy(text)
+        document_ids = torch.from_numpy(document_ids)
+
+        args = get_args()
+        tokenizer = get_tokenizer()
+
+        tokens_ = text.long()
+        labels = tokens_[1:].contiguous()
+        tokens = tokens_[:-1].contiguous()
+
+        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+         tokens,
+         tokenizer.eod,
+         args.reset_position_ids,
+         args.reset_attention_mask,
+         args.eod_mask_loss)
+
         if getattr(self.config, "return_document_ids"):
-            return {"text": text, "document_ids": document_ids}
+            return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids,"document_ids": document_ids}
         else:
-            return {"text": text}
+            return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids}
 
     @staticmethod
     def is_multimodal() -> bool:

@@ -87,34 +87,12 @@ def get_batch(data_iterator):
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    args = get_args()
-    tokenizer = get_tokenizer()
-
-    # Items and their type.
-    keys = ['text']
-    datatype = torch.int64
-
-    # Broadcast data.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
-    # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
-
-    return tokens, labels, loss_mask, attention_mask, position_ids
+    return data["tokens"].cuda(non_blocking = True), data["labels"].cuda(non_blocking = True), data["loss_mask"].cuda(non_blocking = True), data["attention_mask"].cuda(non_blocking = True), data["position_ids"].cuda(non_blocking = True)
 
 def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """Loss function.
@@ -165,7 +143,7 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def is_dataset_built_on_rank():
-    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and mpu.get_tensor_model_parallel_rank() == 0
+    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage())
 
 
 def core_gpt_dataset_config_from_args(args):
