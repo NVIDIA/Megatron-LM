@@ -26,6 +26,7 @@ def initialize_megatron(
     args_defaults={},
     ignore_unknown_args=False,
     allow_no_cuda=False,
+    skip_mpu_initialization=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -62,6 +63,9 @@ def initialize_megatron(
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
+
+    if skip_mpu_initialization:
+        return None
 
     args = get_args()
     if args.lazy_mpu_init:
@@ -243,6 +247,7 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                context_parallel_size=args.context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
             )
             if args.rank == 0:

@@ -76,16 +76,19 @@ def validate_args(args, defaults={}):
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
-    assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
-        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
-        'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
-                           args.pipeline_model_parallel_size)
-    args.data_parallel_size = args.world_size // model_parallel_size
+    assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
+        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
+        'pipeline parallel size ({}) times context parallel size ({})'.format(
+        args.world_size, args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size, args.context_parallel_size)
+    args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel-size: {}, '
+              'context-parallel-size: {} '
               'tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
+                  args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
     if args.pipeline_model_parallel_size > 1:
@@ -885,6 +888,22 @@ def _add_training_args(parser):
                        dest='use_mcore_models')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
+    group.add_argument('--manual-gc', action='store_true',
+                       help='Disable the threshold-based default garbage '
+                       'collector and trigger the garbage collection manually. '
+                       'Manual garbage collection helps to align the timing of '
+                       'the collection across ranks which mitigates the impact '
+                       'of CPU-associated jitters. When the manual gc is enabled, '
+                       'garbage collection is performed only at the start and the '
+                       'end of the validation routine by default.')
+    group.add_argument('--manual-gc-interval', type=int, default=0,
+                       help='Training step interval to trigger manual garbage '
+                       'collection. When the value is set to 0, garbage '
+                       'collection is not triggered between training steps.')
+    group.add_argument('--no-manual-gc-eval', action='store_false',
+                       help='When using manual garbage collection, disable '
+                       'garbage collection at the start and the end of each '
+                       'evaluation run.', dest='manual_gc_eval')
 
     return parser
 
@@ -1091,6 +1110,8 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--context-parallel-size', type=int, default=1,
+                       help='Degree of context parallelism.')
     return parser
 
 
