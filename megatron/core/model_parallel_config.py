@@ -68,6 +68,10 @@ class ModelParallelConfig:
         communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever possible
         during the forward and the backward pass.  Defaults to False.
 
+    tp_comm_buffer_name (str, default=None): The name of userbuffer to stage the inputs for tensor-parallel communication.
+        The buffer names are also used to register and identify the communication overlap optimization configurations
+        of each tensor-parallel communication case.
+
     tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
         is False.
 
@@ -165,6 +169,7 @@ class ModelParallelConfig:
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
     tp_comm_overlap: bool = False
+    tp_comm_buffer_name: str = None
 
     # Debug Options
     tp_comm_split_ag: bool = True

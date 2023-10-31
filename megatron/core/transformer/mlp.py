@@ -48,6 +48,9 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        if self.config.tp_comm_overlap:
+            self.config.tp_comm_buffer_name = 'fc1'
+
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.config.hidden_size,
@@ -69,6 +72,9 @@ class MLP(MegatronModule):
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
+
+        if self.config.tp_comm_overlap:
+            self.config.tp_comm_buffer_name = 'fc2'
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,

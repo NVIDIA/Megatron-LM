@@ -80,6 +80,9 @@ class Attention(MegatronModule, ABC):
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
+        if self.config.tp_comm_overlap:
+            self.config.tp_comm_buffer_name = 'proj'
+
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,
@@ -280,6 +283,9 @@ class SelfAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
         )
+
+        if self.config.tp_comm_overlap:
+            self.config.tp_comm_buffer_name = 'qkv'
 
         self.linear_qkv = build_module(
             submodules.linear_qkv,
