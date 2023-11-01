@@ -14,13 +14,18 @@ ADD_RETRIEVER=1
 
 ######## Megatron, Retro dirs. ########
 
-REPO_DIR="<path/to/megatron/repo>"
-RETRO_WORKDIR="<path/to/retro/data/directory>"
+REPO_DIR="/lustre/fs4/portfolios/adlr/users/boxinw/github-version/retro/Megatron-LM"
+RETRO_WORKDIR="/lustre/fs4/portfolios/adlr/users/boxinw/workdirs/wiki"
 
 ######## Data. ########
 
-DATA_BLEND="<see --data-path in arguments.py>"
+DATA_HOME="/lustre/fs4/portfolios/adlr/users/boxinw/pretraining_data/"
 
+WIK="${DATA_HOME}/MTNLG/Wikipedia_shuf_text_document"
+
+DATA_BLEND=" \
+  1 ${WIK} \
+"
 ######## Args. ########
 
 ARGS=" \
@@ -54,7 +59,7 @@ ARGS=" \
     --eval-iters 50 \
     --eval-interval 2000 \
     --tokenizer-type GPTSentencePieceTokenizer \
-    --tokenizer-model <path/to/gpt/tokenizer/model> \
+    --tokenizer-model /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/next-llm-tokenizer/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
     --data-path ${DATA_BLEND} \
     --split 98,2,0 \
     --clip-grad 1.0 \
@@ -65,7 +70,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
-    --retro-fix-sub-epoch \
 "
 
 ######## Retro. ########
@@ -82,7 +86,9 @@ fi
 
 ######## Command. ########
 
-NPROCS=8
+NPROCS=8 # Number of GPUs.
+NODE_RANK=0
+MASTER_ADDR=localhost
 CMD="\
     pwd && cd ${REPO_DIR} && pwd && \
     export PYTHONPATH=$PYTHONPATH:${REPO_DIR} && \

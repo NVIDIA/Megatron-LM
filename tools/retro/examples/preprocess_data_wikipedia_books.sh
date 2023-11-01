@@ -6,21 +6,29 @@ unset NCCL_DEBUG
 
 ######## Megatron, Retro dirs. ########
 
-REPO_DIR="<path/to/megatron/repo>"
-RETRO_WORKDIR="<path/to/retro/data/directory>"
+REPO_DIR="/lustre/fs4/portfolios/adlr/users/boxinw/github-version/retro/Megatron-LM"
+RETRO_WORKDIR="/lustre/fs4/portfolios/adlr/users/boxinw/workdirs/wiki2"
 
 ######## Task (e.g., db, index, query). ########
 
-# RETRO_TASKS="db-build"
+#RETRO_TASKS="db-build"
 # RETRO_TASKS="index-train"
 # RETRO_TASKS="index-add"
 # RETRO_TASKS="query-pretraining-neighbors"
-
 RETRO_TASKS=$1
 
 ######## Data. ########
 
-DATA_BLEND="<see --data-path in arguments.py>"
+DATA_HOME="/lustre/fs4/portfolios/adlr/users/boxinw/pretraining_data/"
+
+B3="${DATA_HOME}/MTNLG/Books3_shuf_text_document"
+WIK="${DATA_HOME}/MTNLG/Wikipedia_shuf_text_document"
+
+
+DATA_BLEND=" \
+  0.5 ${WIK} \
+  0.5 ${B3} \
+"
 
 ######## Index. ########
 
@@ -63,13 +71,13 @@ ARGS=" \
     --global-batch-size ${RETRO_GPT_GLOBAL_BATCH_SIZE} \
     --seq-length 512 \
     --max-position-embeddings 512 \
-    --load <path/to/bert/checkpoint> \
+    --load /lustre/fsw/portfolios/adlr/users/lmcafee/bert-23/checkpoints \
     --exit-on-missing-checkpoint \
     --no-load-optim \
     --no-load-rng \
     --data-path ${RETRO_GPT_DATA_PATH} \
     --tokenizer-type BertWordPieceLowerCase \
-    --vocab-file <path/to/bert/vocab> \
+    --vocab-file  /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/vocab/bert-large-uncased-vocab.txt \
     --split ${RETRO_GPT_SPLIT} \
     --distributed-backend nccl \
     --lr 0.0001 \
@@ -93,11 +101,11 @@ ARGS=" \
     --retro-workdir ${RETRO_WORKDIR} \
     --retro-tasks ${RETRO_TASKS} \
     --retro-return-doc-ids \
-    --retro-bert-vocab-file <path/to/bert/vocab> \
+    --retro-bert-vocab-file  /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/vocab/bert-large-uncased-vocab.txt \
     --retro-bert-tokenizer-type BertWordPieceLowerCase \
     --retro-gpt-seed ${RETRO_GPT_SEED} \
     --retro-gpt-tokenizer-type GPTSentencePieceTokenizer \
-    --retro-gpt-tokenizer-model <path/to/gpt/tokenizer/model> \
+    --retro-gpt-tokenizer-model /lustre/fsw/portfolios/adlr/users/lmcafee/retro/misc/next-llm-tokenizer/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
     --retro-gpt-seq-length ${RETRO_GPT_SEQ_LENGTH} \
     --retro-gpt-chunk-length ${RETRO_GPT_CHUNK_LENGTH} \
     --retro-gpt-global-batch-size ${RETRO_GPT_GLOBAL_BATCH_SIZE} \
@@ -120,6 +128,8 @@ ARGS=" \
 ######## Command. ########
 
 NPROCS=8 # Number of GPUs.
+NODE_RANK=0
+MASTER_ADDR=localhost
 CMD="\
     cd ${REPO_DIR} && pwd && \
     export PYTHONPATH=$PYTHONPATH:${REPO_DIR} && \

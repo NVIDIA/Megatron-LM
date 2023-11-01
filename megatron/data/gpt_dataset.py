@@ -126,6 +126,15 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
 
     total_num_of_documents = indexed_dataset.sizes.shape[0]
     splits = get_train_valid_test_split_(splits_string, total_num_of_documents)
+    # >>>
+    from megatron import get_args
+    args = get_args()
+    if args.retro_split_constraint:
+        split_constraint_strings = args.retro_split_constraint
+        split_constraints = [ get_train_valid_test_split_(s, total_num_of_documents)
+                              for s in split_constraint_strings ]
+        split_constraints.append(splits)
+    # <<<
 
     # Print stats about the splits.
     print_rank_0(' > dataset split:')
@@ -142,7 +151,14 @@ def _build_train_valid_test_datasets(data_prefix, splits_string,
     def build_dataset(index, name):
         dataset = None
         if splits[index + 1] > splits[index]:
-            documents = np.arange(start=splits[index], stop=splits[index + 1],
+            if args.retro_split_constraint:
+                start_doc_idx = max(s[index] for s in split_constraints)
+                stop_doc_idx = min(s[index + 1] for s in split_constraints)
+                assert stop_doc_idx >= start_doc_idx
+                documents = np.arange(start=start_doc_idx, stop=stop_doc_idx,
+                                      step=1, dtype=np.int32)
+            else:
+                documents = np.arange(start=splits[index], stop=splits[index + 1],
                                   step=1, dtype=np.int32)
             dataset = GPTDataset(name, data_prefix, documents, indexed_dataset,
                                  splits_string,
@@ -266,6 +282,13 @@ class GPTDataset(torch.utils.data.Dataset):
         return self.sample_idx.shape[0] - 1
 
     def __getitem__(self, idx):
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # ......... hacky mchackers [ until sub-epoch fix ] .........
+        from megatron import get_args
+        args = get_args()
+        if args.retro_fix_sub_epoch:
+            idx = idx % len(self)
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         # Get the shuffled index.
         idx = self.shuffle_idx[idx]
         # Start and end documents and offsets.
