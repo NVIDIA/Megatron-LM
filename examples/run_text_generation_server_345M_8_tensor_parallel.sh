@@ -24,9 +24,6 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS tools/run_text_generation_s
        --fp16  \
        --micro-batch-size 1  \
        --seq-length 1024  \
-       --out-seq-length 1024  \
-       --temperature 1.0  \
        --vocab-file $VOCAB_FILE  \
        --merge-file $MERGE_FILE  \
-       --top_p 0.9  \
        --seed 42
