@@ -1,0 +1,24 @@
+# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+
+[build-system]
+requires = [
+    "setuptools",
+    "pybind11",
+]
+
+[tool.isort]
+profile = "black"  # black-compatible
+line_length = 100  # should match black parameters
+py_version = 38  # python 3.8 as a target version
+known_first_party = ["megatron"]  # FIRSTPARTY section
+known_third_party = ["transformer_engine"]  # THIRDPARTY section
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+default_section = "THIRDPARTY"
+extend_skip = ["setup.py"]
+
+[tool.black]
+line_length = 100
+skip_string_normalization = true
+# recongized by future versions, disallows to reformat code with incompatible versions
+# Matches NeMO version so people working on both codebases don't need two different version of black installed
+required_version = "19.10b0"  
