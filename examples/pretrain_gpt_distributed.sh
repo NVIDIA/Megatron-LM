@@ -25,6 +25,8 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
+# To train WITHOUT MoE, remove the argument line specifying --num-experts in GPT_ARGS
+
 GPT_ARGS="
     --num-layers 24 \
     --hidden-size 1024 \
@@ -41,8 +43,10 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --fp16
+    --fp16 \
+    --num-experts 4
 "
+
 
 DATA_ARGS="
     --data-path $DATA_PATH \
