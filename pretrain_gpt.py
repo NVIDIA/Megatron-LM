@@ -10,8 +10,7 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
-from megatron.core import mpu
-from megatron.core import tensor_parallel
+from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
@@ -20,8 +19,11 @@ import megatron.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
-from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.utils import (
+    get_ltor_masks_and_position_ids,
+    get_batch_on_this_cp_rank,
+    average_losses_across_data_parallel_group
+)
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import (
     gpt_layer_with_transformer_engine_spec,
@@ -69,6 +71,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             rotary_percent=args.rotary_percent
         )
     else:
+        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
+
         model = megatron.model.GPTModel(
             config,
             num_tokentypes=0,
@@ -114,7 +118,17 @@ def get_batch(data_iterator):
         args.reset_attention_mask,
         args.eod_mask_loss)
 
-    return tokens, labels, loss_mask, attention_mask, position_ids
+    batch = {
+        'tokens': tokens,
+        'labels': labels,
+        'loss_mask': loss_mask,
+        'attention_mask': attention_mask,
+        'position_ids': position_ids
+    }
+    # slice batch along sequence dimension for context parallelism
+    batch = get_batch_on_this_cp_rank(batch)
+
+    return batch.values()
 
 def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     """Loss function.
@@ -123,12 +137,18 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
         loss_mask (Tensor): Used to mask out some portions of the loss
         output_tensor (Tensor): The tensor with the losses
     """    
+    args = get_args()
+
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    if args.context_parallel_size > 1:
+        loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        loss = loss[0] / loss[1]
+    else:
+        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
-    args = get_args()
     if args.check_for_nan_in_loss_and_grad:
         global_rank = torch.distributed.get_rank()
         assert not loss.isnan(), (
@@ -139,7 +159,7 @@ def loss_func(loss_mask: Tensor, output_tensor: Tensor):
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
-    return loss, {'lm loss': averaged_loss[0]}
+    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
 
 
 def forward_step(data_iterator, model: GPTModel):

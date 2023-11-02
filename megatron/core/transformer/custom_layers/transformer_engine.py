@@ -102,6 +102,17 @@ class TELinear(te.pytorch.Linear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_split_ag"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
+            )
+            extra_kwargs["ub_split_rs"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_rs
+            )
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -115,7 +126,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
 
     def forward(self, x):
@@ -153,10 +164,23 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.11.0"):
             kwargs["normalization"] = self.config.normalization
+
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_bulk_wgrad"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_bulk_wgrad
+            )
+            extra_kwargs["ub_bulk_dgrad"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_bulk_dgrad
+            )
+            extra_kwargs["ub_split_ag"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
+            )
 
         super().__init__(
             in_features=input_size,
@@ -172,7 +196,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             parallel_mode="column",
             return_bias=self.te_return_bias,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
 
     def forward(self, x):
