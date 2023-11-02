@@ -524,3 +524,10 @@ There are currently two known Megatron optimizations that break reproducibility 
 2. Flash attention is non-deterministic. If reproducibility is required do not use `--use-flash-attn`.
 
 These sources of non-determinism are under active investigation. If you observe non-determinism in Megatron training under other circumstances please open an issue.
+
+# Training with MoE
+
+1. Launch an instance of the docker container
+2. navigate to Megatron-LM and run ```pip install .```
+3. Specify paths to the dataset files in examples/pretrain_gpt_distributed.sh. You may also need to modify the last line (with ```torchrun```) to contain the full path to ```pretrain_gpt.py``` within your container. You can also set the number of experts by modifying the ```--num-experts``` argument within ```GPT_ARGS``` in this file.
+4. run ```bash Megatron-LM/examples/pretrain_gpt_distributed.sh```
