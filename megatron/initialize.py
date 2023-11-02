@@ -249,6 +249,7 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_split_rank,
                 context_parallel_size=args.context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
+                nccl_communicator_config_path=args.nccl_communicator_config_path,
             )
             if args.rank == 0:
                 print(
