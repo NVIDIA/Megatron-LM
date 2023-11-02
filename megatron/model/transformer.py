@@ -919,7 +919,8 @@ class ParallelTransformerLayer(MegatronModule):
                     eps=config.layernorm_epsilon,
                     no_persist_layer_norm=args.no_persist_layer_norm,
                     sequence_parallel=config.sequence_parallel,
-                    apply_layernorm_1p=args.apply_layernorm_1p)
+                    apply_layernorm_1p=args.apply_layernorm_1p,
+                    mem_efficient_ln=not args.disable_mem_efficient_ln)
             else:
                 self.input_layernorm = LayerNorm(
                     config.hidden_size,
@@ -944,7 +945,8 @@ class ParallelTransformerLayer(MegatronModule):
                     eps=config.layernorm_epsilon,
                     no_persist_layer_norm=not config.persist_layer_norm,
                     sequence_parallel=config.sequence_parallel,
-                    apply_layernorm_1p=args.apply_layernorm_1p)
+                    apply_layernorm_1p=args.apply_layernorm_1p,
+                    mem_efficient_ln=not args.disable_mem_efficient_ln)
             else:
                 self.post_attention_layernorm = LayerNorm(
                     config.hidden_size,
@@ -967,7 +969,8 @@ class ParallelTransformerLayer(MegatronModule):
                     eps=config.layernorm_epsilon,
                     no_persist_layer_norm=not config.persist_layer_norm,
                     sequence_parallel=config.sequence_parallel,
-                    apply_layernorm_1p=args.apply_layernorm_1p)
+                    apply_layernorm_1p=args.apply_layernorm_1p,
+                    mem_efficient_ln=not args.disable_mem_efficient_ln)
             else:
                 self.post_inter_attention_layernorm = MixedFusedRMSNorm(config.hidden_size, config.layernorm_epsilon)
 
@@ -1726,7 +1729,8 @@ class ParallelTransformer(MegatronModule):
                         eps=config.layernorm_epsilon,
                         no_persist_layer_norm=args.no_persist_layer_norm,
                         sequence_parallel=config.sequence_parallel,
-                        apply_layernorm_1p=args.apply_layernorm_1p)
+                        apply_layernorm_1p=args.apply_layernorm_1p,
+                        mem_efficient_ln=not args.disable_mem_efficient_ln)
                 else:
                     self.final_layernorm = LayerNorm(
                         config.hidden_size,

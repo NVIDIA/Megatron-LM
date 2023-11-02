@@ -626,6 +626,9 @@ def _add_network_size_args(parser):
     group.add_argument('--apply-layernorm-1p', action='store_true',
                        help='Adjust LayerNorm weights such that they are centered '
                        'around zero. This improves numerical stability.')
+    group.add_argument('--disable-mem-efficient-ln', action='store_false', 
+                       help='Disable the memory-efficient fused LayerNorm optimization '
+                       'introduced in https://github.com/NVIDIA/apex/pull/1715')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '
