@@ -1112,6 +1112,11 @@ def _add_distributed_args(parser):
                        help='Degree of expert model parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
+    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
+                       help='Path to the yaml file with NCCL communicator '
+                       'configurations. The number of min/max thread groups and thread '
+                       'group cluster size of each communicator can be configured by '
+                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     return parser
 
 
