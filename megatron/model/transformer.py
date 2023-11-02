@@ -17,7 +17,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.core.models.common.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get_norm
-from axonn.intra_layer import Tensor_Parallel_Linear, drop, gather
+from axonn.intra_layer import Linear, drop, gather
 
 try:
     from einops import rearrange
@@ -88,11 +88,11 @@ class ParallelMLP(MegatronModule):
             ffn_hidden_size *= 2
 
         # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = Tensor_Parallel_Linear(
+        self.dense_h_to_4h = Linear(
                     in_features=config.hidden_size,
                     out_features=ffn_hidden_size,
                     skip_bias_add=True,
-                    init_method=config.init_method
+                    init_method=config.init_method,
                 )
 
         self.bias_gelu_fusion = False
@@ -117,18 +117,18 @@ class ParallelMLP(MegatronModule):
             self.activation_func = F.gelu
 
         # Project back to h.
-        self.dense_4h_to_h = Tensor_Parallel_Linear(
+        self.dense_4h_to_h = Linear(
             in_features=config.ffn_hidden_size,
             out_features=config.hidden_size,
             skip_bias_add=True,
             init_method=config.output_layer_init_method,
-            transpose=True
+            transpose=True,
         )
 
     def forward(self, hidden_states):
 
         # [s, b, 4hp]
-        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+        intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states, scatter_input=False, gather_output=False)
 
         if self.bias_gelu_fusion:
             assert self.add_bias is True
@@ -140,7 +140,7 @@ class ParallelMLP(MegatronModule):
             intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
-        output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        output, output_bias = self.dense_4h_to_h(intermediate_parallel, scatter_input=False, gather_output=False)
         return output, output_bias
 
 
@@ -454,7 +454,7 @@ class ParallelAttention(MegatronModule):
 
         # Strided linear layer.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = Tensor_Parallel_Linear(
+            self.query_key_value = Linear(
                     in_features=config.hidden_size,
                     out_features=query_projection_size + 2 * kv_projection_size,
                     skip_bias_add=True,
@@ -493,7 +493,7 @@ class ParallelAttention(MegatronModule):
             )
 
         # Output.
-        self.dense = Tensor_Parallel_Linear(
+        self.dense = Linear(
                 in_features=query_projection_size,
                 out_features=config.hidden_size,
                 skip_bias_add=True,
@@ -566,7 +566,7 @@ class ParallelAttention(MegatronModule):
         if self.attention_type == AttnType.self_attn:
 
             # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states)
+            mixed_x_layer, _ = self.query_key_value(hidden_states, scatter_input=False, gather_output=False)
 
             # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
             new_tensor_shape = mixed_x_layer.size()[:-1] + (
@@ -711,7 +711,7 @@ class ParallelAttention(MegatronModule):
         # Output. [sq, b, h]
         # =================
 
-        output, bias = self.dense(context_layer)
+        output, bias = self.dense(context_layer, scatter_input=False, gather_output=False)
         return output, bias
 
 

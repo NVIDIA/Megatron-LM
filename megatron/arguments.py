@@ -59,7 +59,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
 def validate_args(args, defaults={}):
     # Tensor model parallel size.
-    args.tensor_model_parallel_size = args.row_tensor_model_parallel_size * args.column_tensor_model_parallel_size
+    args.tensor_model_parallel_size = args.row_tensor_model_parallel_size * args.column_tensor_model_parallel_size * args.depth_tensor_model_parallel_size
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
     assert args.world_size % args.tensor_model_parallel_size == 0, 'world size'\
@@ -993,6 +993,8 @@ def _add_distributed_args(parser):
     group.add_argument('--row-tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
     group.add_argument('--column-tensor-model-parallel-size', type=int, default=1,
+                       help='Degree of tensor model parallelism.')
+    group.add_argument('--depth-tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')

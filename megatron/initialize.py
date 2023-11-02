@@ -221,13 +221,13 @@ def _initialize_distributed():
             )
 
             assert args.pipeline_model_parallel_size == 1
-            print(args.row_tensor_model_parallel_size, args.column_tensor_model_parallel_size, data_parallel_size)
 
             ax.init(
                 G_inter=args.pipeline_model_parallel_size,
                 G_data = data_parallel_size,
                 G_intra_r = args.row_tensor_model_parallel_size,
                 G_intra_c = args.column_tensor_model_parallel_size,
+                G_intra_d = args.depth_tensor_model_parallel_size,
             )
 
             if args.rank == 0:

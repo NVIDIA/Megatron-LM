@@ -34,18 +34,20 @@ HIDDEN_SIZE=1024
 NUM_HEADS=16
 
 ## PARALLELISM DETAILS
-COLUMN_TENSOR_PARR=2
-ROW_TENSOR_PARR=2
+COLUMN_TENSOR_PARR=1
+ROW_TENSOR_PARR=1
+DEPTH_TENSOR_PARR=4
 
 ## BATCH SIZES
-MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=4
-SEQUENCE_LENGTH=2048
+MICRO_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=16
+SEQUENCE_LENGTH=1024
 
 
 GPT_ARGS="
     --row-tensor-model-parallel-size ${ROW_TENSOR_PARR} \
     --column-tensor-model-parallel-size ${COLUMN_TENSOR_PARR} \
+    --depth-tensor-model-parallel-size ${DEPTH_TENSOR_PARR} \
     --num-layers ${NUM_LAYERS} \
     --hidden-size ${HIDDEN_SIZE} \
     --num-attention-heads ${NUM_HEADS} \
@@ -61,8 +63,7 @@ GPT_ARGS="
     --weight-decay 1e-2 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
-    --bf16 \
-    --recompute-activations 
+    --fp16 \
 "
 
 DATA_ARGS="
