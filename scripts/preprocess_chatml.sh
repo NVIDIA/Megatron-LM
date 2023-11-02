@@ -3,7 +3,7 @@ mkdir -p $OUTPUT_PATH
 
 DATA_PATH="/mnt/deva100/sbmaruf/OpenAlphaCodeAssets/prompted_for_training_bigdata_v2/*.jsonl"
 for _inp in $DATA_PATH; do
-    python tools/project_chatml.py \
+    python tools/preprocess_chatml.py \
     --input "$_inp" \
     --json-keys 'inputs' 'targets' \
     --tokenizer-type 'Llama2Tokenizer' \
