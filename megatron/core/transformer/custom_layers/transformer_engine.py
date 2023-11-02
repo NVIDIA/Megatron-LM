@@ -3,6 +3,7 @@ from typing import Callable
 
 import torch
 import transformer_engine as te
+from transformer_engine.pytorch.attention import _SplitAlongDim
 from pkg_resources import packaging
 
 from megatron.core.parallel_state import (
@@ -350,3 +351,5 @@ class TELayerNormMLP(te.pytorch.LayerNormMLP):
         if isinstance(out, (list, tuple)):
             return out
         return out, None
+
+SplitAlongDim = _SplitAlongDim.apply

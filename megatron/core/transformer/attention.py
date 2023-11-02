@@ -12,6 +12,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.custom_layers.transformer_engine import SplitAlongDim
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
@@ -318,8 +319,9 @@ class SelfAttention(Attention):
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         # [sq, b, ng, (np/ng + 2) * hn] --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
-        (query, key, value) = torch.split(
+        (query, key, value) = SplitAlongDim(
             mixed_qkv,
+            3,
             [
                 (
                     self.num_attention_heads_per_partition
@@ -329,8 +331,8 @@ class SelfAttention(Attention):
                 self.hidden_size_per_attention_head,
                 self.hidden_size_per_attention_head,
             ],
-            dim=3,
         )
+ 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
