@@ -13,6 +13,8 @@ done
 echo "---------------------------------"
 
 set -x 
+if [[ -z $MBS ]]; then MBS=4; fi
+if [[ -z $GBS ]]; then GBS=128; fi
 
 # Change for multinode config
 GPUS_PER_NODE=8
@@ -22,6 +24,16 @@ NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 command="export CUDA_DEVICE_MAX_CONNECTIONS=1;"
 
+TRAINING_DTYPE=fp16
+TRANSFORMER_IMPL=local
+
+if [[ $USE_CORE -eq 1 ]]; then
+       echo "Running using megatron core"
+       TRANSFORMER_IMPL=local
+       TRAINING_DTYPE=bf16
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
+       USE_MCORE=1
+fi
 
 # Runs the "345M" parameter model
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
@@ -36,8 +48,8 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --log-validation-ppl-to-tensorboard \
        --log-timers-to-tensorboard \
        --tensorboard-dir ${TENSORBOARD_DIR} \
-       --micro-batch-size 4 \
-       --global-batch-size 128 \
+       --micro-batch-size ${MBS:-4} \
+       --global-batch-size ${GBS:-128} \
        --seq-length 512 \
        --max-position-embeddings 512 \
        --train-iters $MAX_STEPS \
@@ -59,8 +71,10 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --tensor-model-parallel-size $TP_SIZE \
        --pipeline-model-parallel-size $PP_SIZE \
        ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
+       ${USE_MCORE:+--use-mcore-models} \
+       ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
        --no-gradient-accumulation-fusion \
-       --fp16 "
+       --${TRAINING_DTYPE}"
 
 command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"

@@ -227,7 +227,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs 
     mathematically-identical forward and DGRAD. 
-    
+
     Conceptually this op is the same as torch.nn.functional.linear with
     weight.requires_grad==False, but in experiments they are not identical 
     mathematically. """
