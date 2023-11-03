@@ -134,6 +134,7 @@ class DistributedDataParallel(MegatronModule):
         # Allocate discreate buffer for MoE params' grads
         for param in self.module.parameters():
             if param.requires_grad and not getattr(param, 'allreduce', True):
+                param.grad_added_to_main_grad = False
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
                 param.main_grad = torch.zeros(
                     param.data.shape,
