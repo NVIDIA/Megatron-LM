@@ -7,6 +7,7 @@ import torch
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
+from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
 try:
@@ -26,21 +27,14 @@ except:
 
 class FusedLayerNorm(torch.nn.Module):
     def __init__(
-        self,
-        hidden_size,
-        eps=1e-5,
-        persist_layer_norm=True,
-        sequence_parallel=False,
-        zero_centered_gamma=False,
-        normalization="LayerNorm",
+        self, config: TransformerConfig, hidden_size: int, eps: float = 1e-5,
     ):
         super().__init__()
 
-        self.zero_centered_gamma = zero_centered_gamma
-        self.normalization = normalization
-        assert normalization == "LayerNorm", '({}) is not supported in ' 'FusedLayerNorm'.format(
-            normalization
-        )
+        self.zero_centered_gamma = config.layernorm_zero_centered_gamma
+        assert (
+            config.normalization == "LayerNorm"
+        ), f'({config.normalization}) is not supported in FusedLayerNorm'
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -71,6 +65,7 @@ class FusedLayerNorm(torch.nn.Module):
             49152,
             65536,
         ]
+        persist_layer_norm = config.persist_layer_norm
         if hidden_size not in persist_ln_hidden_sizes or not HAVE_PERSIST_LAYER_NORM:
             persist_layer_norm = False
 
@@ -86,7 +81,7 @@ class FusedLayerNorm(torch.nn.Module):
         self.bias = Parameter(torch.Tensor(*hidden_size))
         self.reset_parameters()
         self.persist_layer_norm = persist_layer_norm
-        self.sequence_parallel = sequence_parallel
+        self.sequence_parallel = config.sequence_parallel
 
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)

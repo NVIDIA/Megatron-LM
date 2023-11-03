@@ -804,11 +804,11 @@ class RowParallelLinear(torch.nn.Module):
         *,
         config: ModelParallelConfig,
         init_method: Callable,
-        bias: bool = True,
-        input_is_parallel: bool = False,
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
-        skip_bias_add: bool = False,
         is_expert: bool = False,
     ):
         super(RowParallelLinear, self).__init__()
