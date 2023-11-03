@@ -48,9 +48,6 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        if self.config.tp_comm_overlap:
-            self.config.tp_comm_buffer_name = 'fc1'
-
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
             self.config.hidden_size,
@@ -61,6 +58,7 @@ class MLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
+            tp_comm_buffer_name='fc1',
         )
 
         if self.config.gated_linear_unit:
@@ -73,9 +71,6 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        if self.config.tp_comm_overlap:
-            self.config.tp_comm_buffer_name = 'fc2'
-
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
@@ -86,6 +81,7 @@ class MLP(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
+            tp_comm_buffer_name='fc2',
         )
 
     def forward(self, hidden_states):

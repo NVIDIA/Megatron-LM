@@ -87,6 +87,7 @@ class TELinear(te.pytorch.Linear):
         bias: bool,
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
+        tp_comm_buffer_name: str = None,
     ):
         self.config = config
 
@@ -110,7 +111,11 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                 extra_kwargs["ub_split_rs"] = self.config.tp_comm_split_rs
                 if te_version > packaging.version.Version("1.0.0"):
-                    extra_kwargs["ub_name"] = self.config.tp_comm_buffer_name
+                    assert (
+                        tp_comm_buffer_name is not None
+                    ), "Buffer name should be set to configure communication overlap settings"
+                    extra_kwargs["ub_name"] = tp_comm_buffer_name
+
 
         super().__init__(
             in_features=input_size,
@@ -154,8 +159,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         gather_output: bool,
         bias: bool,
         skip_bias_add: bool,
-        is_expert: bool,
         skip_weight_param_allocation: bool = False,
+        tp_comm_buffer_name: str = None,
     ):
         self.config = config
 
@@ -194,7 +199,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
                 extra_kwargs["ub_split_ag"] = self.config.tp_comm_split_ag
                 if te_version > packaging.version.Version("1.0.0"):
-                    extra_kwargs["ub_name"] = self.config.tp_comm_buffer_name
+                    assert (
+                        tp_comm_buffer_name is not None
+                    ), "Buffer name should be set to configure communication overlap settings"
+                    extra_kwargs["ub_name"] = tp_comm_buffer_name
 
         super().__init__(
             in_features=input_size,

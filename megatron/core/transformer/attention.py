@@ -80,9 +80,6 @@ class Attention(MegatronModule, ABC):
 
         self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
 
-        if self.config.tp_comm_overlap:
-            self.config.tp_comm_buffer_name = 'proj'
-
         # Output.
         self.linear_proj = build_module(
             submodules.linear_proj,
@@ -94,6 +91,7 @@ class Attention(MegatronModule, ABC):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
+            tp_comm_buffer_name='proj',
         )
 
     def _checkpointed_attention_forward(
@@ -284,9 +282,6 @@ class SelfAttention(Attention):
             attention_type="self",
         )
 
-        if self.config.tp_comm_overlap:
-            self.config.tp_comm_buffer_name = 'qkv'
-
         self.linear_qkv = build_module(
             submodules.linear_qkv,
             self.config.hidden_size,
@@ -297,6 +292,7 @@ class SelfAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name='qkv',
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
