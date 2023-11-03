@@ -628,7 +628,7 @@ def _add_network_size_args(parser):
                        'around zero. This improves numerical stability.')
     group.add_argument('--disable-mem-efficient-ln', action='store_false', 
                        help='Disable the memory-efficient fused LayerNorm optimization '
-                       'introduced in https://github.com/NVIDIA/apex/pull/1715')
+                       'introduced in https://github.com/NVIDIA/apex/pull/1715', dest='mem_efficient_ln')
     group.add_argument('--apply-residual-connection-post-layernorm',
                        action='store_true',
                        help='If set, use original BERT residula connection '
