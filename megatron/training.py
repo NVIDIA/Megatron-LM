@@ -4,6 +4,7 @@
 
 import gc
 from datetime import datetime
+import collections
 import math
 import logging
 import sys
@@ -26,8 +27,10 @@ from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import get_model_config
+from megatron.timers import Timer
 from megatron import print_rank_0
 from megatron import print_rank_last
+from megatron.utils import print_second_last_pipeline_stage
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
@@ -45,6 +48,8 @@ from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.weight_grad_store import WeightGradStore
+from megatron.core.pipeline_parallel.zb_schedules import ScheduleTimers
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -423,16 +428,27 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
-    forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=get_num_microbatches(),
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False)
+    timers('forward-backward', log_level=1).start(
+        barrier=args.barrier_with_L1_time)
+    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
+    if args.timing_log_level < 2:
+        config.timers = None
+
+    WeightGradStore.set_optimizer(optimizer)
+
+    def run_forward_backward_func():
+        forward_backward_func = get_forward_backward_func()
+        return forward_backward_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=get_num_microbatches(),
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False)
+
+    losses_reduced = run_forward_backward_func()
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -445,7 +461,18 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    if get_args().profile:
+        torch.cuda.nvtx.range_push('Optimizer')
+    if args.enable_optimizer_post_validation:
+        optimizer.pre_step(args, timers)
+        from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
+        zb_scheduler = get_zb_scheduler_instance()
+        assert zb_scheduler.do_post_validation
+        update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func()
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    if get_args().profile:
+        torch.cuda.nvtx.range_pop()
     timers('optimizer').stop()
 
     # Vision momentum.
@@ -467,7 +494,8 @@ def train_step(forward_step_func, data_iterator,
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if (get_args().zero_bubble_interleaved and mpu.is_pipeline_first_stage(ignore_virtual=True)) or \
+        (not get_args().zero_bubble_interleaved and mpu.is_pipeline_last_stage(ignore_virtual=True)):
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0]:
@@ -517,6 +545,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     # Logging.
     timers_to_log = [
+        'wait_all_reduce',
         'forward-backward',
         'forward-compute',
         'backward-compute',
@@ -539,6 +568,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'optimizer-clip-main-grad',
         'optimizer-count-zeros',
         'optimizer-inner-step',
+        'optimizer-local-step',
         'optimizer-copy-main-to-model-params',
         'optimizer']
 
@@ -626,7 +656,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             )
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        # timers._log_option = 'all'
+        # timers.log(timers_to_log, normalizer=total_iterations)
+        elapsed_time = timers('interval-time').elapsed(barrier=False)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         if writer:
             if args.log_timers_to_tensorboard:
@@ -665,12 +697,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
-        if report_memory_flag and learning_rate > 0.:
+
+        if get_args().zero_bubble_interleaved:
+            print_rank_0(log_string)
+            # print_rank_last(log_string)
+        else:
+            print_rank_last(log_string)
+        if report_memory_flag and learning_rate > 0. and iteration > args.zero_bubble_pipeline_timers_end_iter + args.log_interval:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
-        timers.log(timers_to_log, normalizer=args.log_interval)
+        # Removed to avoid global sync
+        # timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
 
@@ -726,7 +764,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
-    timers('interval-time', log_level=0).start(barrier=True)
+    timers('interval-time', log_level=0).start(barrier=False)
     print_datetime('before the start of training step')
     report_memory_flag = True
     exit = False
@@ -744,7 +782,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
-            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+            # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
@@ -909,7 +947,8 @@ def evaluate(forward_step_func,
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if (get_args().zero_bubble_interleaved and mpu.is_pipeline_first_stage(ignore_virtual=True)) or \
+                (not get_args().zero_bubble_interleaved and mpu.is_pipeline_last_stage(ignore_virtual=True)):
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
@@ -1092,6 +1131,40 @@ def build_train_valid_test_data_loaders(
     return train_dataloader, valid_dataloader, test_dataloader
 
 
+class RollbackDataIteratorWrapper:
+
+    def __init__(self, data_iterator):
+        self._data_iterator = data_iterator
+        self._buffer = collections.deque()
+        self._save_to_buffer = False
+        self._pop_from_buffer = True
+
+    def save_to_buffer(self):
+        self._save_to_buffer = True
+        self._pop_from_buffer = False
+
+    def pop_from_buffer(self):
+        self._save_to_buffer = False
+        self._pop_from_buffer = True
+
+    def clear_buffer(self):
+        self._buffer.clear()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pop_from_buffer:
+            assert not self._save_to_buffer
+            if len(self._buffer) > 0:
+                return self._buffer.popleft()
+        elem = next(self._data_iterator)
+        if self._save_to_buffer:
+            assert not self._pop_from_buffer
+            self._buffer.append(elem)
+        return elem
+
+
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
     """Build pretraining data iterators."""
@@ -1125,4 +1198,6 @@ def build_train_valid_test_data_iterators(
     else:
         test_data_iterator = None
 
+    if train_data_iterator is not None:
+        train_data_iterator = RollbackDataIteratorWrapper(train_data_iterator)
     return train_data_iterator, valid_data_iterator, test_data_iterator

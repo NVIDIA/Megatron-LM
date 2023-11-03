@@ -1287,7 +1287,7 @@ class NoopTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None):
+                inference_params=None, **kwargs):
         return hidden_states.clone()
 
 
@@ -1450,7 +1450,7 @@ class ParallelTransformer(MegatronModule):
 
         self.drop_path_rates = [
             rate.item() for rate in
-            torch.linspace(0, self.drop_path_rate, config.num_layers)]
+            torch.linspace(0, self.drop_path_rate, config.num_layers - 2)]
 
         self.retro_layer_numbers = None
         if model_type == ModelType.retro_decoder:
@@ -1534,6 +1534,14 @@ class ParallelTransformer(MegatronModule):
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
+            if args.zero_bubble_interleaved:
+                assert config.virtual_pipeline_model_parallel_size == 2
+                if mpu.get_virtual_pipeline_model_parallel_rank() == 0:
+                    offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
+                else:
+                    offset = config.num_layers - (mpu.get_pipeline_model_parallel_rank() + 1) * self.num_layers
+            if offset != 0:
+                offset -= 1
         else:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
@@ -1541,12 +1549,21 @@ class ParallelTransformer(MegatronModule):
                 pipeline_rank = mpu.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
+                    if offset != 0:
+                        offset -= 1
                 else:
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
-
+                if offset != 0:
+                    offset -= 1
+        # TODO
+        if mpu.is_pipeline_last_stage():
+            self.num_layers -= 1
+        if mpu.is_pipeline_first_stage():
+            self.num_layers -= 1
+        print(f'num layers on rank {torch.distributed.get_rank()}: {self.num_layers} offset: {offset}')
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
             # args.standalone_embedding_stage == True), virtual pipeline ranks

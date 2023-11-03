@@ -229,8 +229,10 @@ def _initialize_distributed():
                 args.local_rank = device
             torch.cuda.set_device(device)
         # Call the init process
+        print(f"init process group {args.rank} of {args.world_size}")
+        assert args.distributed_backend == "nccl"
         torch.distributed.init_process_group(
-            backend=args.distributed_backend,
+            backend="cpu:gloo,cuda:nccl",
             world_size=args.world_size,
             rank=args.rank,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),

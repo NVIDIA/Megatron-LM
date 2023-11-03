@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 from .utils import GlobalMemoryBuffer
+from megatron import get_args
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -17,6 +18,8 @@ _PIPELINE_MODEL_PARALLEL_GROUP = None
 _MODEL_PARALLEL_GROUP = None
 # Embedding group.
 _EMBEDDING_GROUP = None
+# Embedding all reduce group.
+_EMBEDDING_AR_GROUP = None
 # Position embedding group.
 _POSITION_EMBEDDING_GROUP = None
 # Data parallel group that the current rank belongs to.
@@ -366,6 +369,7 @@ def initialize_model_parallel(
         _PIPELINE_MODEL_PARALLEL_GROUP is None
     ), 'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
+    global _EMBEDDING_AR_GROUP
     global _EMBEDDING_GLOBAL_RANKS
     assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
     global _POSITION_EMBEDDING_GROUP
@@ -384,7 +388,10 @@ def initialize_model_parallel(
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
             position_embedding_ranks = [ranks[0]]
+            if get_args().zero_bubble_interleaved:
+                embedding_ranks = [ranks[0]]
             if pipeline_model_parallel_split_rank is not None:
+                assert not get_args().zero_bubble_interleaved
                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
                     embedding_ranks = [
                         ranks[0],
@@ -396,6 +403,15 @@ def initialize_model_parallel(
         else:
             embedding_ranks = ranks
             position_embedding_ranks = ranks
+
+        all_embedding_ranks = []
+        for embedding_rank in embedding_ranks:
+            for data_parallel_group_ranks in all_data_parallel_group_ranks_with_cp:
+                if embedding_rank in data_parallel_group_ranks:
+                    all_embedding_ranks.extend(data_parallel_group_ranks)
+        ar_group = torch.distributed.new_group(all_embedding_ranks)
+        if rank in all_embedding_ranks:
+            _EMBEDDING_AR_GROUP = ar_group
 
         group = torch.distributed.new_group(
             embedding_ranks, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
@@ -574,6 +590,12 @@ def get_embedding_group():
     return _EMBEDDING_GROUP
 
 
+def get_embedding_ar_group():
+    """Get the embedding group the caller rank belongs to."""
+    assert _EMBEDDING_AR_GROUP is not None, 'embedding ar group is not initialized'
+    return _EMBEDDING_AR_GROUP
+
+
 def get_position_embedding_group():
     """Get the position embedding group the caller rank belongs to."""
     assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
@@ -713,6 +735,9 @@ def is_pipeline_last_stage(ignore_virtual=False):
         virtual_pipeline_model_parallel_world_size = (
             get_virtual_pipeline_model_parallel_world_size()
         )
+        if get_args().zero_bubble_interleaved:
+            assert virtual_pipeline_model_parallel_world_size == 2
+            return get_pipeline_model_parallel_rank() == 0 and get_virtual_pipeline_model_parallel_rank() == virtual_pipeline_model_parallel_world_size - 1
         if virtual_pipeline_model_parallel_world_size is not None and get_virtual_pipeline_model_parallel_rank() != (
             virtual_pipeline_model_parallel_world_size - 1
         ):
@@ -726,6 +751,8 @@ def is_rank_in_embedding_group(ignore_virtual=False):
     global _EMBEDDING_GLOBAL_RANKS
     if ignore_virtual:
         return rank in _EMBEDDING_GLOBAL_RANKS
+    if get_args().zero_bubble_interleaved:
+        return is_pipeline_first_stage(ignore_virtual=False) or is_pipeline_last_stage(ignore_virtual=False)
     if rank in _EMBEDDING_GLOBAL_RANKS:
         if rank == _EMBEDDING_GLOBAL_RANKS[0]:
             return is_pipeline_first_stage(ignore_virtual=False)

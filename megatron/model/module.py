@@ -19,7 +19,22 @@ _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 def param_is_not_shared(param):
     return not hasattr(param, 'shared') or not param.shared
 
-
+cache = {}
+used_key = set()
+def local_binary_reduction(param: torch.nn.parameter.Parameter, key):
+    assert param.grad is None
+    if key in cache:
+        cache[key].add_(param)
+        param.copy_(cache[key])
+        a = cache[key]
+        del cache[key]
+        used_key.add(key)
+        return {a, param}
+    else:
+        assert not (key in used_key)
+        assert len(cache) == 0, f"{cache.keys()}, {key}"
+        cache[key] = param
+        return None
 
 class MegatronModule(torch.nn.Module):
     """Megatron specific extensions of torch Module with support
@@ -100,9 +115,13 @@ class MegatronModule(torch.nn.Module):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
+        print(f'rank {torch.distributed.get_rank()} is in embedding group {mpu.is_rank_in_embedding_group()}')
         if mpu.is_rank_in_embedding_group():
-            torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
-                                         group=mpu.get_embedding_group())
+            if get_args().zero_bubble_interleaved:
+                local_binary_reduction(self.shared_embedding_or_output_weight().data, key="embedding_initialization")
+            else:
+                torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
+                                             group=mpu.get_embedding_group())
 
         # Ensure that encoder(first stage) and decoder(split stage) position
         # embeddings have the same initial parameter values

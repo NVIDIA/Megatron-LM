@@ -22,6 +22,7 @@ from megatron import (
 )
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
@@ -269,3 +270,53 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def get_ltor_masks_and_position_ids_for_non_data_ranks(data_shape,
+                                    _,
+                                    reset_position_ids,
+                                    reset_attention_mask,
+                                    eod_mask_loss):
+    """Build masks and position id for left to right model."""
+
+    # Extract batch size and sequence length.
+    micro_batch_size, seq_length = data_shape
+    # Attention mask (lower triangular).
+    if reset_attention_mask:
+        att_mask_batch = micro_batch_size
+    else:
+        att_mask_batch = 1
+    attention_mask = torch.tril(torch.ones(
+        (att_mask_batch, seq_length, seq_length), device=torch.cuda.current_device())).view(
+            att_mask_batch, 1, seq_length, seq_length)
+
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
+
+    return attention_mask, None, None #loss_mask, position_ids
+
+
+def is_second_last_pipeline_stage():
+    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    pipeline_rank_to_run = pipeline_model_parallel_size - 2 if pipeline_model_parallel_size > 1 else 0
+    return parallel_state.get_pipeline_model_parallel_rank() == pipeline_rank_to_run and parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0
+
+
+def print_second_last_pipeline_stage(message):
+    if torch.distributed.is_initialized():
+        if is_second_last_pipeline_stage():
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def nvtx_profile(func, name):
+    def profile(*args, **kwargs):
+        # print(f"profile {name}")
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(name)
+        results = func(*args, **kwargs)
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+        return results
+    return profile

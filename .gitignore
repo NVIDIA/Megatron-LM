@@ -7,3 +7,5 @@ build
 slurm*
 logs
 .vscode
+*.log
+*.nsys-rep

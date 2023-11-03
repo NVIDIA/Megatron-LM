@@ -8,25 +8,27 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
+from megatron import get_args
 
 
-def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+embedding_grad_counter = 0
+
+def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig, async_op=False):
     """
     All-reduce word embedding grads.
 
     Reduce grads across first and last stages to ensure that word_embeddings parameters stay in
     sync. This should only run for models that support pipelined model parallelism (BERT and GPT).
     """
-
-    if (
-        parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-        and parallel_state.get_pipeline_model_parallel_world_size() > 1
-    ):
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+    handles = []
+    ignore_virtual = not get_args().zero_bubble_interleaved
+    if parallel_state.is_rank_in_embedding_group(ignore_virtual=ignore_virtual):
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=ignore_virtual):
             model_module = model[0]
-        elif parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        elif parallel_state.is_pipeline_last_stage(ignore_virtual=ignore_virtual):
             model_module = model[-1]
         else:  # We do not support the interleaved schedule for T5 yet.
+            assert ignore_virtual
             model_module = model[0]
 
         # Look for module with 'pre_process' attribute to get around the fact that DDP and
@@ -38,15 +40,24 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
             grad = weight.main_grad
-            torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
+            if get_args().zero_bubble_interleaved:
+                from megatron.model.module import local_binary_reduction
+                global embedding_grad_counter
+                local_binary_reduction(grad.data, key=f"embedding_grads_{int(embedding_grad_counter // 2)}")
+                embedding_grad_counter += 1
+            else:
+                handle = torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group(), async_op=async_op)
+                handles.append(handle)
+    return handles
 
 
-def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig, async_op=False):
     """
     All-reduce position_embeddings grad across first (encoder) and split (decoder) stages to
     ensure that position embeddings parameters stay in sync. This should only run for T5 models
     with pipeline parallelism.
     """
+    handles = []
     if (
         parallel_state.is_rank_in_position_embedding_group()
         and parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -56,15 +67,18 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         grad = get_attr_wrapped_model(
             model_module, 'language_model.embedding.position_embeddings.weight.main_grad'
         )
-        torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
+        handle = torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group(), async_op=async_op)
+        handles.append(handle)
+    return handles
 
 
-def _allreduce_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+def _allreduce_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig, async_op=False):
     """
     All-reduce both word and position embeddings.
     """
-    _allreduce_word_embedding_grads(model, config)
-    _allreduce_position_embedding_grads(model, config)
+    handles = _allreduce_word_embedding_grads(model, config, async_op=async_op)
+    handles += _allreduce_position_embedding_grads(model, config, async_op=async_op)
+    return handles
 
 
 def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: TransformerConfig):
@@ -144,7 +158,8 @@ def finalize_model_grads(model: List[torch.nn.Module]):
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_embedding_grads(model, config)
+    # TODO
+    # _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 

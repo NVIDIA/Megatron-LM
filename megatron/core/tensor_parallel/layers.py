@@ -399,13 +399,20 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # reduce scatter is scheduled before the weight gradient computation
 
         if ctx.gradient_accumulation_fusion:
+            from megatron.core.weight_grad_store import WeightGradStore
             if weight.main_grad.dtype == torch.float32:
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                    total_input, grad_output, weight.main_grad
+                WeightGradStore.put(
+                    total_input,
+                    grad_output,
+                    weight,
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
                 )
             elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                    total_input, grad_output, weight.main_grad
+                WeightGradStore.put(
+                    total_input,
+                    grad_output,
+                    weight,
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
                 )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")

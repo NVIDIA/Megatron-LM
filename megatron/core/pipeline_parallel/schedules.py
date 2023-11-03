@@ -6,6 +6,7 @@ from typing import Callable, Iterator, List, Optional, Union
 import torch
 from torch.autograd.variable import Variable
 
+from megatron import core, get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
@@ -89,6 +90,10 @@ def get_forward_backward_func():
     collect_non_loss_data (optional, bool, default=False): TODO
 
     """
+    # TODO: modify condition
+    if get_args().zero_bubble_pipeline_timers_start_iter > 0:
+        from megatron.core.pipeline_parallel.zb_schedules import get_zero_bubble_forward_backward_func
+        return get_zero_bubble_forward_backward_func()
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -180,7 +185,11 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
+            if get_args().profile:
+                torch.cuda.nvtx.range_push('forward_step_func')
             output_tensor, loss_func = forward_step_func(data_iterator, model)
+            if get_args().profile:
+                torch.cuda.nvtx.range_pop()
         else:
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
@@ -213,6 +222,9 @@ def forward_step(
     return [output_tensor]
 
 
+profiler_hacker = None
+
+
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -225,6 +237,14 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
+    # For mysterious reasons ops generated in autograd doesn't conform to the cuda.nvtx.range.
+    # To overcome this we insert a tiny computation in the head & tail of the range
+
+    global profiler_hacker
+    if get_args().profile:
+        if profiler_hacker is None:
+            profiler_hacker = torch.Tensor([0]).cuda()
+        profiler_hacker = torch.abs(profiler_hacker)
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
@@ -276,7 +296,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
-
+    if get_args().profile:
+        profiler_hacker = torch.abs(profiler_hacker)
     return input_tensor_grad
 
 

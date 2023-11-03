@@ -10,7 +10,8 @@ from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_timers
 from megatron import get_tokenizer
-from megatron.core import mpu, tensor_parallel
+
+from megatron.core import parallel_state, mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
@@ -24,6 +25,8 @@ from megatron.utils import (
     get_batch_on_this_cp_rank,
     average_losses_across_data_parallel_group
 )
+from megatron.utils import get_ltor_masks_and_position_ids, get_ltor_masks_and_position_ids_for_non_data_ranks
+from megatron.utils import average_losses_across_data_parallel_group
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -83,7 +86,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
     return model
 
-
+attention_mask = None
 def get_batch(data_iterator):
     """Generate a batch."""
 
@@ -93,6 +96,17 @@ def get_batch(data_iterator):
 
     args = get_args()
     tokenizer = get_tokenizer()
+    if not parallel_state.is_pipeline_first_stage() and not parallel_state.is_pipeline_last_stage() and not args.reset_position_ids and not args.reset_attention_mask and not args.eod_mask_loss:
+        global attention_mask
+        if attention_mask is not None:
+            return None, None, None, attention_mask, None
+        attention_mask, _, _ = get_ltor_masks_and_position_ids_for_non_data_ranks(
+            (args.micro_batch_size, args.seq_length),
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            args.eod_mask_loss)
+        return None, None, None, attention_mask, None
 
     # Items and their type.
     keys = ['text']

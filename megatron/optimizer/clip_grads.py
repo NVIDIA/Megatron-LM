@@ -10,6 +10,7 @@ from torch import inf
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C
 
+from megatron import get_args
 from megatron.model.module import param_is_not_shared
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 
@@ -111,6 +112,8 @@ def clip_grad_norm_fp32(parameters, grads_for_norm,
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
         dummy_overflow_buf = torch.cuda.IntTensor([0])
+        if get_args().enable_exactly_numeric_match:
+            clip_coeff = round(clip_coeff, 4)  # for exactly match
         multi_tensor_applier(amp_C.multi_tensor_scale,
                              dummy_overflow_buf,
                              [grads, grads],

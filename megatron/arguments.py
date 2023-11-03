@@ -31,6 +31,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_checkpointing_args(parser)
     parser = _add_mixed_precision_args(parser)
     parser = _add_distributed_args(parser)
+    parser = _add_zero_bubble_args(parser)
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_autoresume_args(parser)
@@ -166,6 +167,9 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
+
+    # TODO: validate more
+    assert (not args.zero_bubble_interleaved) or args.virtual_pipeline_model_parallel_size == 2
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -1073,6 +1077,35 @@ def _add_mixed_precision_args(parser):
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
 
+    return parser
+
+
+def _add_zero_bubble_args(parser):
+    group = parser.add_argument_group(title='zero bubble')
+    group.add_argument('--zero-bubble-pipeline-start-iter',
+                       type=int, default=1000,
+                       help='The starting iteration that skips all sync cross pipeline parallel groups')
+    group.add_argument('--zero-bubble-pipeline-timers-start-iter',
+                       type=int, default=100,
+                       help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')
+    group.add_argument('--zero-bubble-pipeline-timers-end-iter',
+                       type=int, default=110,
+                       help='The starting iteration that stop timers for auto scheduling of zero-bubble pipeline parallel')
+    group.add_argument('--zero-bubble-max-pending-backward',
+                       type=int, default=10000,
+                       help='Maximum number of pending backward for zero-bubble')
+    group.add_argument('--enable-optimizer-post-validation',
+                       action='store_true',
+                       help='enable post validation for optimizer step',
+                       dest='enable_optimizer_post_validation')
+    group.add_argument('--enable-exactly-numeric-match',
+                       action='store_true',
+                       help='whether to make optimizer post validation exactly numeric match baseline',
+                       dest='enable_exactly_numeric_match')
+    # TODO(wanxy): maybe change name?
+    group.add_argument('--zero-bubble-interleaved', action='store_true',
+                       help='Use interleaved zerobubble pipeline. This method achieves zero-bubble without more memory overhead',
+                       dest='zero_bubble_interleaved')
     return parser
 
 
