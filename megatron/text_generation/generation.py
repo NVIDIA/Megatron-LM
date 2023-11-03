@@ -269,7 +269,7 @@ def generate_tokens_probs_and_return_on_first_stage(
     tokens = tokens[:, :(context_length + 1)]
     if mpu.is_pipeline_last_stage():
         if return_output_log_probs:
-            output_log_probs = output_log_probs[:, :context_length]
+            output_log_probs = output_log_probs[:, :context_length].contiguous()
 
     # ======================================
     # Broadcast to the first pipeline stage.
