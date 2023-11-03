@@ -76,6 +76,10 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --no-gradient-accumulation-fusion \
        --${TRAINING_DTYPE}"
 
+if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+    torch_run_cmd+=" --apply-query-key-layer-scaling"
+fi
+
 command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
 echo "$command"

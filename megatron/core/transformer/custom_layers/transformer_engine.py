@@ -1,3 +1,4 @@
+import os
 from importlib.metadata import version
 from typing import Callable
 
@@ -5,6 +6,7 @@ import torch
 import transformer_engine as te
 from pkg_resources import packaging
 
+from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_context_parallel_global_ranks,
     get_context_parallel_group,
@@ -17,10 +19,9 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
-    extra_transformer_engine_kwargs = {}
-    from importlib.metadata import version
-
-    from pkg_resources import packaging
+    extra_transformer_engine_kwargs = {
+        "params_dtype": config.params_dtype,
+    }
 
     te_version = packaging.version.Version(version("transformer-engine"))
     if te_version >= packaging.version.Version("0.12.0"):
@@ -37,33 +38,27 @@ class TENorm:
     `LayerNorm` or `RMSNorm` based on input
     """
 
+    # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls,
-        config: TransformerConfig,
-        hidden_size: int,
-        eps: float = 1e-5,
-        sequence_parallel: bool = False,
-        normalization: str = "LayerNorm",
-        **kwargs
+        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5,
     ):
-        zero_centered_gamma = kwargs.get('zero_centered_gamma', False)
-        if normalization == "LayerNorm":
+        if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,
-                sequence_parallel=sequence_parallel,
-                zero_centered_gamma=zero_centered_gamma,
+                sequence_parallel=config.sequence_parallel,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
-        elif normalization == "RMSNorm":
+        elif config.normalization == "RMSNorm":
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
                 hidden_size=hidden_size,
                 eps=eps,
-                sequence_parallel=sequence_parallel,
-                zero_centered_gamma=zero_centered_gamma,
+                sequence_parallel=config.sequence_parallel,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         else:
@@ -85,13 +80,13 @@ class TELinear(te.pytorch.Linear):
         self,
         input_size: int,
         output_size: int,
-        config: TransformerConfig,
-        parallel_mode: str,
-        init_method: Callable,
         *,
-        bias: bool = True,
-        skip_bias_add: bool = False,
-        **kwargs
+        parallel_mode: str,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
     ):
         self.config = config
 
@@ -101,6 +96,11 @@ class TELinear(te.pytorch.Linear):
         # ourselves. This way our forward always returns two values
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
+
+        if skip_weight_param_allocation:
+            raise ValueError(
+                'Transformer Engine linear layers do not support skip_weight_param_allocation'
+            )
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
@@ -122,10 +122,9 @@ class TELinear(te.pytorch.Linear):
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             init_method=init_method,
-            params_dtype=self.config.params_dtype,
-            parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
+            parallel_mode=parallel_mode,
             **extra_kwargs,
         )
 
@@ -150,13 +149,28 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self,
         input_size: int,
         output_size: int,
+        *,
         config: TransformerConfig,
         init_method: Callable,
+        gather_output: bool,
         bias: bool,
         skip_bias_add: bool,
-        **kwargs
+        is_expert: bool,
+        skip_weight_param_allocation: bool = False,
     ):
         self.config = config
+
+        if gather_output:
+            raise ValueError('Transformer Engine linear layers do not support gather_output = True')
+
+        if is_expert:
+            raise ValueError('Transformer Engine linear layers do not yet support MoE')
+
+        if skip_weight_param_allocation:
+            raise ValueError(
+                'Transformer Engine linear layers do not support skip_weight_param_allocation'
+            )
+
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
         # tell TE to not return the bias, and return None
@@ -169,7 +183,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.11.0"):
-            kwargs["normalization"] = self.config.normalization
+            extra_kwargs["normalization"] = self.config.normalization
+        elif self.config.normalization != "LayerNorm":
+            raise ValueError(
+                f"Transformer Engine v{te_version} does not support {self.config.normalization}."
+            )
 
         if te_version >= packaging.version.Version("0.8.0"):
             extra_kwargs["ub_bulk_wgrad"] = (
@@ -185,16 +203,17 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         super().__init__(
             in_features=input_size,
             out_features=output_size,
-            bias=bias,
+            eps=self.config.layernorm_epsilon,
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             init_method=init_method,
-            params_dtype=self.config.params_dtype,
-            parallel_mode="column",
+            bias=bias,
             return_bias=self.te_return_bias,
+            parallel_mode="column",
+            return_layernorm_output=False,
             zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
             **extra_kwargs,
         )
@@ -223,14 +242,34 @@ class TEColumnParallelLinear(TELinear):
     to megatron's `ColumnParallelLinear` layer.
     """
 
-    def __init__(self, input_size: int, output_size: int, config: TransformerConfig, **kwargs):
-        self.config = config
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        skip_weight_param_allocation: bool = False,
+    ):
+        if gather_output:
+            raise ValueError('Transformer Engine linear layers do not support gather_output = True')
+
+        if is_expert:
+            raise ValueError('Transformer Engine linear layers do not yet support MoE')
+
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            config=self.config,
             parallel_mode="column",
-            **kwargs,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
         )
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
@@ -247,14 +286,35 @@ class TERowParallelLinear(TELinear):
     to megatron's `RowParallelLinear` layer.
     """
 
-    def __init__(self, input_size: int, output_size: int, config: TransformerConfig, **kwargs):
-        self.config = config
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+    ):
+        if not input_is_parallel:
+            raise ValueError(
+                "Transformer Engine linear layers do not support input_is_parallel = False"
+            )
+
+        if is_expert:
+            raise ValueError('Transformer Engine linear layers do not yet support MoE')
+
         super().__init__(
             input_size=input_size,
             output_size=output_size,
-            config=self.config,
             parallel_mode="row",
-            **kwargs,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers
         )
 
     def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
@@ -280,20 +340,48 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     def __init__(
         self,
         config: TransformerConfig,
-        layer_number: int = 1,
-        attn_mask_type: AttnMaskType = AttnMaskType.padding,
-        **kwargs
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
     ):
         self.config = config
+
+        if self.config.apply_query_key_layer_scaling != bool(
+            int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
+        ):
+            raise ValueError(
+                f"apply_query_key_layer_scaling is {self.config.apply_query_key_layer_scaling} "
+                f"but environment variable NVTE_APPLY_QK_LAYER_SCALING is "
+                f"{os.getenv('NVTE_APPLY_QK_LAYER_SCALING')}. Transformer Engine does not support "
+                f"setting query key layer scaling via argument, so these two must match."
+            )
+
+        extra_kwargs = {}
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version >= packaging.version.Version("0.11.0"):
+            extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
+        elif self.config.num_query_groups != self.config.num_attention_heads:
+            raise ValueError(
+                f"Transformer Engine v{te_version} does not support Grouped Query Attention, "
+                f"use a newer version of Transformer Engine. "
+                f"(num_query_groups ({self.config.num_query_groups}) != "
+                f"num_attention_heads ({self.config.num_attention_heads}))"
+            )
+
+        if te_version >= packaging.version.Version("0.10.0"):
+            extra_kwargs["attention_type"] = attention_type
+            # older version don't need attention_type
 
         # Only Transformer-Engine version > 0.13.0 supports context parallelism
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version > packaging.version.Version("0.13.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
-            kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
-            kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(check_initialized=False)
-            kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
+            extra_kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(
+                check_initialized=False
+            )
+            extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
         else:
             assert (
                 self.config.context_parallel_size == 1
@@ -303,50 +391,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
             attention_dropout=self.config.attention_dropout,
-            layer_number=layer_number,
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=get_cuda_rng_tracker,
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            **kwargs,
+            layer_number=layer_number,
+            **extra_kwargs,
         )
-
-
-class TELayerNormMLP(te.pytorch.LayerNormMLP):
-    """
-    Wrapper for the Transformer-Engine's `LayerNormMLP` layer that combines
-    `LayerNorm` and the MLP (2 x feedforward layers) into a single module which
-    is performance-efficient as it removes the unnecessary FP8 -> FP32 casts.
-    """
-
-    def __init__(self, config: TransformerConfig, **kwargs):
-        self.config = config
-
-        # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version >= packaging.version.Version("0.11.0"):
-            kwargs["normalization"] = self.config.normalization
-
-        super().__init__(
-            self.config.hidden_size,
-            self.config.ffn_hidden_size,
-            self.config.layernorm_epsilon,
-            fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=get_tensor_model_parallel_group(check_initialized=False),
-            tp_size=self.config.tensor_model_parallel_size,
-            get_rng_state_tracker=get_cuda_rng_tracker,
-            init_method=self.config.init_method,
-            params_dtype=self.config.params_dtype,
-            return_bias=not self.config.add_bias_linear,
-        )
-
-    def forward(self, x):
-        out = super().forward(x)
-
-        # TE only returns a tuple when return_bias is True, otherwise
-        # it returns a single Tensor, we always want to return two
-        # values regardless of the arguments.
-        if isinstance(out, (list, tuple)):
-            return out
-        return out, None
