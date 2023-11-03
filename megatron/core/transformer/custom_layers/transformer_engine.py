@@ -116,7 +116,6 @@ class TELinear(te.pytorch.Linear):
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
-
         super().__init__(
             in_features=input_size,
             out_features=output_size,
