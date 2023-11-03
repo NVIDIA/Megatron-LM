@@ -21,7 +21,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
     sync. This should only run for models that support pipelined model parallelism (BERT and GPT).
     """
     handles = []
-    ignore_virtual = not get_args().zero_bubble_interleaved
+    ignore_virtual = not get_args().zero_bubble_v_schedule
     if parallel_state.is_rank_in_embedding_group(ignore_virtual=ignore_virtual):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=ignore_virtual):
             model_module = model[0]
@@ -40,7 +40,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
             grad = weight.main_grad
-            if get_args().zero_bubble_interleaved:
+            if get_args().zero_bubble_v_schedule:
                 from megatron.model.module import local_binary_reduction
                 global embedding_grad_counter
                 local_binary_reduction(grad.data, key=f"embedding_grads_{int(embedding_grad_counter // 2)}")
@@ -158,8 +158,10 @@ def finalize_model_grads(model: List[torch.nn.Module]):
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    # TODO
-    # _allreduce_embedding_grads(model, config)
+    if not get_args().enable_zero_bubble:
+        # For zero bubble schedules, we do async all-reduce for embedding grads
+        # in WeightGradStore.clear() so that it won't generate bubbles
+        _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 

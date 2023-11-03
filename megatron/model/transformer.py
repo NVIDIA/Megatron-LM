@@ -1534,7 +1534,7 @@ class ParallelTransformer(MegatronModule):
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
-            if args.zero_bubble_interleaved:
+            if args.zero_bubble_v_schedule:
                 assert config.virtual_pipeline_model_parallel_size == 2
                 if mpu.get_virtual_pipeline_model_parallel_rank() == 0:
                     offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers

@@ -388,10 +388,10 @@ def initialize_model_parallel(
         if len(ranks) > 1:
             embedding_ranks = [ranks[0], ranks[-1]]
             position_embedding_ranks = [ranks[0]]
-            if get_args().zero_bubble_interleaved:
+            if get_args().zero_bubble_v_schedule:
                 embedding_ranks = [ranks[0]]
             if pipeline_model_parallel_split_rank is not None:
-                assert not get_args().zero_bubble_interleaved
+                assert not get_args().zero_bubble_v_schedule
                 if ranks[pipeline_model_parallel_split_rank] not in embedding_ranks:
                     embedding_ranks = [
                         ranks[0],
@@ -735,7 +735,7 @@ def is_pipeline_last_stage(ignore_virtual=False):
         virtual_pipeline_model_parallel_world_size = (
             get_virtual_pipeline_model_parallel_world_size()
         )
-        if get_args().zero_bubble_interleaved:
+        if get_args().zero_bubble_v_schedule:
             assert virtual_pipeline_model_parallel_world_size == 2
             return get_pipeline_model_parallel_rank() == 0 and get_virtual_pipeline_model_parallel_rank() == virtual_pipeline_model_parallel_world_size - 1
         if virtual_pipeline_model_parallel_world_size is not None and get_virtual_pipeline_model_parallel_rank() != (
@@ -751,7 +751,7 @@ def is_rank_in_embedding_group(ignore_virtual=False):
     global _EMBEDDING_GLOBAL_RANKS
     if ignore_virtual:
         return rank in _EMBEDDING_GLOBAL_RANKS
-    if get_args().zero_bubble_interleaved:
+    if get_args().zero_bubble_v_schedule:
         return is_pipeline_first_stage(ignore_virtual=False) or is_pipeline_last_stage(ignore_virtual=False)
     if rank in _EMBEDDING_GLOBAL_RANKS:
         if rank == _EMBEDDING_GLOBAL_RANKS[0]:

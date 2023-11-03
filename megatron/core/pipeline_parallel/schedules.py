@@ -90,8 +90,7 @@ def get_forward_backward_func():
     collect_non_loss_data (optional, bool, default=False): TODO
 
     """
-    # TODO: modify condition
-    if get_args().zero_bubble_pipeline_timers_start_iter > 0:
+    if get_args().enable_zero_bubble:
         from megatron.core.pipeline_parallel.zb_schedules import get_zero_bubble_forward_backward_func
         return get_zero_bubble_forward_backward_func()
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()

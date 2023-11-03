@@ -169,7 +169,13 @@ def validate_args(args, defaults={}):
                   'schedule does not support overlapping p2p communication')
 
     # TODO: validate more
-    assert (not args.zero_bubble_interleaved) or args.virtual_pipeline_model_parallel_size == 2
+    if args.zero_bubble_v_schedule:
+        assert args.virtual_pipeline_model_parallel_size == 2
+        args.enable_zero_bubble = True
+    if args.enable_zero_bubble:
+        assert not args.overlap_grad_reduce, "not supported yet"
+    else:
+        args.enable_optimizer_post_validation = False
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -1102,10 +1108,12 @@ def _add_zero_bubble_args(parser):
                        action='store_true',
                        help='whether to make optimizer post validation exactly numeric match baseline',
                        dest='enable_exactly_numeric_match')
-    # TODO(wanxy): maybe change name?
-    group.add_argument('--zero-bubble-interleaved', action='store_true',
-                       help='Use interleaved zerobubble pipeline. This method achieves zero-bubble without more memory overhead',
-                       dest='zero_bubble_interleaved')
+    group.add_argument('--enable-zero-bubble', action='store_true',
+                       help='Use zero bubble pipeline.',
+                       dest='enable_zero_bubble')
+    group.add_argument('--zero-bubble-v-schedule', action='store_true',
+                       help='Use zero bubble v schedule pipeline. This method achieves zero-bubble without more memory overhead',
+                       dest='zero_bubble_v_schedule')
     return parser
 
 

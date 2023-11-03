@@ -117,7 +117,7 @@ class MegatronModule(torch.nn.Module):
         # values.
         print(f'rank {torch.distributed.get_rank()} is in embedding group {mpu.is_rank_in_embedding_group()}')
         if mpu.is_rank_in_embedding_group():
-            if get_args().zero_bubble_interleaved:
+            if get_args().zero_bubble_v_schedule:
                 local_binary_reduction(self.shared_embedding_or_output_weight().data, key="embedding_initialization")
             else:
                 torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,

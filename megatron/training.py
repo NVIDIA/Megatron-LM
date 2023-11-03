@@ -27,10 +27,9 @@ from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import get_model_config
-from megatron.timers import Timer
 from megatron import print_rank_0
 from megatron import print_rank_last
-from megatron.utils import print_second_last_pipeline_stage
+from megatron.utils import is_pipeline_stage_containing_loss
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
@@ -49,7 +48,6 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.weight_grad_store import WeightGradStore
-from megatron.core.pipeline_parallel.zb_schedules import ScheduleTimers
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -434,7 +432,8 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
-    WeightGradStore.set_optimizer(optimizer)
+    if args.enable_zero_bubble:
+        WeightGradStore.set_optimizer(optimizer)
 
     def run_forward_backward_func():
         forward_backward_func = get_forward_backward_func()
@@ -463,7 +462,7 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if get_args().profile:
         torch.cuda.nvtx.range_push('Optimizer')
-    if args.enable_optimizer_post_validation:
+    if args.enable_zero_bubble and args.enable_optimizer_post_validation:
         optimizer.pre_step(args, timers)
         from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
         zb_scheduler = get_zb_scheduler_instance()
@@ -494,8 +493,7 @@ def train_step(forward_step_func, data_iterator,
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if (get_args().zero_bubble_interleaved and mpu.is_pipeline_first_stage(ignore_virtual=True)) or \
-        (not get_args().zero_bubble_interleaved and mpu.is_pipeline_last_stage(ignore_virtual=True)):
+    if is_pipeline_stage_containing_loss():
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0]:
@@ -698,7 +696,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
 
-        if get_args().zero_bubble_interleaved:
+        if get_args().zero_bubble_v_schedule:
             print_rank_0(log_string)
             # print_rank_last(log_string)
         else:
@@ -947,8 +945,7 @@ def evaluate(forward_step_func,
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if (get_args().zero_bubble_interleaved and mpu.is_pipeline_first_stage(ignore_virtual=True)) or \
-                (not get_args().zero_bubble_interleaved and mpu.is_pipeline_last_stage(ignore_virtual=True)):
+            if is_pipeline_stage_containing_loss():
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:

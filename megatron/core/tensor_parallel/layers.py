@@ -32,6 +32,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
+from megatron import get_args
 
 _grad_accum_fusion_available = True
 try:
@@ -399,23 +400,33 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             # reduce scatter is scheduled before the weight gradient computation
 
         if ctx.gradient_accumulation_fusion:
-            from megatron.core.weight_grad_store import WeightGradStore
-            if weight.main_grad.dtype == torch.float32:
-                WeightGradStore.put(
-                    total_input,
-                    grad_output,
-                    weight,
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
-                )
-            elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                WeightGradStore.put(
-                    total_input,
-                    grad_output,
-                    weight,
-                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
-                )
+            if get_args().enable_zero_bubble:
+                from megatron.core.weight_grad_store import WeightGradStore
+                if weight.main_grad.dtype == torch.float32:
+                    WeightGradStore.put(
+                        total_input,
+                        grad_output,
+                        weight,
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
+                    )
+                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                    WeightGradStore.put(
+                        total_input,
+                        grad_output,
+                        weight,
+                        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
+                    )
+                else:
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
             else:
-                raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
+                if weight.main_grad.dtype == torch.float32:
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+                        total_input, grad_output, weight.main_grad)
+                elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
+                    fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
+                        total_input, grad_output, weight.main_grad)
+                else:
+                    raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
             if hasattr(weight, 'grad_added_to_main_grad'):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks

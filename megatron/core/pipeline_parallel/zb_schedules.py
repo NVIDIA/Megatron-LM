@@ -62,7 +62,7 @@ def bootstrap_and_profile_p2p_communication(
     if ScheduleTimers.iter_counter == 1 and parallel_state.get_pipeline_model_parallel_world_size() > 1:
         nccl_init_tensor = [torch.Tensor([0]).cuda()]
         shape = [(1,)]
-        if get_args().zero_bubble_interleaved:
+        if get_args().zero_bubble_v_schedule:
             # Make everyone think they are the first chunk, so we still need additional check to prevent rank -1 to send_forward/recv_backward
             parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
@@ -1133,7 +1133,7 @@ zb_v_scheduler = ZeroBubbleVPipeScheduler()
 zb_scheduler = ZeroBubbleScheduler()
 
 def get_zb_scheduler_instance():
-    if get_args().zero_bubble_interleaved:
+    if get_args().zero_bubble_v_schedule:
         global zb_v_scheduler
         return zb_v_scheduler
     else:
@@ -1207,7 +1207,7 @@ def get_zero_bubble_forward_backward_func():
                     max_mem=None
                     # Mem ignored for now
                 ).get_v_schedule()
-            if get_args().zero_bubble_interleaved:
+            if get_args().zero_bubble_v_schedule:
                 global_zb_scheduler = get_zb_scheduler_instance()
                 forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler, scheduler=scheduler)
                 # forward_backward_func = wrapped_auto_schedule_forward_backward_func(forward_backward_pipelining_with_interleaving_auto_schedule,

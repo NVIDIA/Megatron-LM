@@ -83,12 +83,8 @@ options=" \
   --adam-beta2 0.95 \
   --init-method-std 0.006 \
   --no-barrier-with-level-1-timing \
-  --zero-bubble-pipeline-start-iter 100 \
   --profile-step-start 150 \
   --profile-step-end 170 \
-  --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
-  --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
-  --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT \
   --profile-ranks $profile_ranks \
   --fp16"
 
@@ -98,8 +94,17 @@ if [ ! -z "$PROFILED" ]; then
 fi
 
 if [ ! -z "$ZERO_BUBBLE_V_SCHEDULE" ]; then
-  options="$options --zero-bubble-interleaved \
+  ENABLE_ZERO_BUBBLE=1
+  options="$options --zero-bubble-v-schedule \
   --num-layers-per-virtual-pipeline-stage $(( $LAYERS / $PIPELINE_SIZE / 2 ))"
+fi
+
+if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
+  options="$options --enable-zero-bubble \
+  --zero-bubble-pipeline-start-iter 100 \
+  --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
+  --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
+  --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT"
 fi
 
 if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then
