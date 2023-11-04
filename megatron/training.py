@@ -56,7 +56,7 @@ def print_datetime(string):
     print_rank_0('[' + string + '] datetime: {} '.format(time_str))
 
 
-def pretrain(train_valid_test_dataset_provider,
+def pretrain(train_valid_test_datasets_provider,
              model_provider,
              model_type,
              forward_step_func,
@@ -72,7 +72,7 @@ def pretrain(train_valid_test_dataset_provider,
         4) train the modle using the forward_step_func.
 
     Arguments:
-        train_valid_test_dataset_provider: a function that takes the size of
+        train_valid_test_datasets_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
@@ -132,14 +132,14 @@ def pretrain(train_valid_test_dataset_provider,
         for i in range(len(model)):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
             iterators = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
+                train_valid_test_datasets_provider)
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
             test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
+                train_valid_test_datasets_provider)
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
 
