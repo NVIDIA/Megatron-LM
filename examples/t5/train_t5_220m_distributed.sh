@@ -26,7 +26,8 @@ DISTRIBUTED_ARGS="
 "
 
 T5_ARGS="
-    --num-layers 12 \
+    --encoder-num-layers 12 \
+    --decoder-num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -50,6 +51,7 @@ T5_ARGS="
     --transformer-impl transformer_engine \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
+    --use-mcore-models \
 "
 
 DATA_ARGS="
@@ -67,7 +69,7 @@ OUTPUT_ARGS="
     --eval-iters 10
 "
 
-torchrun $DISTRIBUTED_ARGS pretrain_t5_core.py \
+torchrun $DISTRIBUTED_ARGS pretrain_t5.py \
     $T5_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \

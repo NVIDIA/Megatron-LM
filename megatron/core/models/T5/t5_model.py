@@ -8,8 +8,8 @@ from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -186,7 +186,7 @@ class T5Model(LanguageModule):
         encoder_attn_mask: Tensor,
         decoder_attn_mask: Tensor,
         encoder_decoder_attn_mask: Tensor,
-        labels: Tensor = None,
+        lm_labels: Tensor = None,
         inference_params: InferenceParams = None,
     ) -> Tensor:
         """Forward pass.
@@ -197,7 +197,7 @@ class T5Model(LanguageModule):
             encoder_attn_mask (Tensor): self-attention mask for encoder
             decoder_attn_mask (Tensor): self-attention mask for decoder
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
-            labels (Tensor): labels for decoder output
+            lm_labels (Tensor): labels for decoder output
             inference_params (InferenceParams): relevant arguments for inferencing
 
         Returns:
@@ -278,11 +278,11 @@ class T5Model(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
         logits = self.lm_head(decoder_hidden_states, word_embeddings_weight=output_weight)
 
-        if labels is None:
+        if lm_labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss
 
