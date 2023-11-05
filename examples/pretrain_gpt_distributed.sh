@@ -12,10 +12,14 @@ NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=/workspace/
-VOCAB_FILE=/workspace/Megatron-LM/data/gpt2-vocab.json
-MERGE_FILE=/workspace/Megatron-LM/data/gpt2-merges.txt
-DATA_PATH=/workspace/slimpajama/chunk1_text_sentence
+CHECKPOINT_PATH=/workspace/ckpts
+VOCAB_FILE=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/vocab.json
+MERGE_FILE=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/merges.txt
+DATA_PATH=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
+
+WANDB_PROJECT=moe
+WANDB_EXP_NAME=moe_1p3b_16e_slimpj_test
+WANDB_SAVE_DIR=/workspace/wandb
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -32,7 +36,7 @@ GPT_ARGS="
     --seq-length 2048 \
     --max-position-embeddings 2048 \
     --micro-batch-size 8 \
-    --global-batch-size 512 \
+    --global-batch-size 1024 \
     --lr 0.00015 \
     --train-iters 500 \
     --lr-decay-iters 320000 \
@@ -44,7 +48,6 @@ GPT_ARGS="
     --fp16 \
     --num-experts 16 \
     --expert-model-parallel-size 8 \
-    --use-distributed-optimizer \
     --recompute-granularity selective \
     --use-flash-attn
 "
@@ -59,10 +62,13 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 100 \
-    --save-interval 10000 \
-    --eval-interval 1000 \
-    --eval-iters 10
+    --log-interval 1 \
+    --save-interval 5 \
+    --eval-interval 5 \
+    --eval-iters 10 \
+    --wandb-project $WANDB_PROJECT \
+    --wandb-exp-name $WANDB_EXP_NAME \
+    --wandb-save-dir $WANDB_SAVE_DIR
 "
 
 torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
