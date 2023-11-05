@@ -1,0 +1,113 @@
+# Training job submission via AML CLI v2
+
+# --use-checkpoint-args 
+
+
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+
+command: >-
+  python pretrain_gpt.py
+  --tensor-model-parallel-size 2 
+  --pipeline-model-parallel-size 2 
+  --num-layers 32 
+  --hidden-size 4096 
+  --num-attention-heads 32 
+  --seq-length 2048 
+  --max-position-embeddings 2048 
+  --micro-batch-size 1 
+  --global-batch-size 48
+  --train-iters 35000 
+  --lr 0.0003 
+  --lr-decay-style cosine 
+  --min-lr 0.00003 
+  --lr-warmup-iters 1000 
+  --weight-decay 0.1 
+  --clip-grad 1.0 
+  --tokenizer-type Llama2Tokenizer 
+  --tokenizer-model ${{inputs.tokenizer}} 
+  --exit-on-missing-checkpoint 
+  --bf16 
+  --untie-embeddings-and-output-weights 
+  --use-rotary-position-embeddings 
+  --normalization RMSNorm 
+  --no-position-embedding 
+  --no-masked-softmax-fusion 
+  --no-bias-gelu-fusion
+  --no-bias-dropout-fusion
+  --no-query-key-layer-scaling
+  --no-async-tensor-model-parallel-allreduce
+  --use-cpu-initialization
+  --no-initialization
+  --load ${{outputs.model_dir}} 
+  --no-load-optim 
+  --no-load-rng 
+  --use-checkpoint-args
+  --save ${{outputs.model_dir}} 
+  --data-path 0.015 ${{inputs.wikipedia_en}}/psgs_w100_00.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_01.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_02.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_03.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_04.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_05.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_06.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_07.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_08.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_09.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_10.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_11.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_12.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_13.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_14.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_15.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_16.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_17.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_18.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_19.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_20.jsonl_text_document 0.015 ${{inputs.wikipedia_en}}/psgs_w100_21.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_00.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_01.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_02.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_03.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_04.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_05.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_06.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_07.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_08.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_09.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_10.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_11.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_12.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_13.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_14.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_15.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_16.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_17.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_18.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_19.jsonl_text_document 0.03045 ${{inputs.wikipedia_ar}}/ar_trans_wiki_20.jsonl_text_document 0.03055 ${{inputs.wikipedia_ar}}/ar_trans_wiki_21.jsonl_text_document
+  --data-cache-path ${{outputs.cache}}
+  --split 9998,1,1 
+  --log-interval 100
+  --log-validation-ppl-to-tensorboard 
+  --save-interval 1000 
+  --eval-interval 500 
+  --eval-iters 10
+  --tensorboard-dir ${{outputs.save_model}}/tensorboard
+  --tensorboard-log-interval 100
+
+display_name: MegatronLM-Wikipedia_Ar_En_Experiment_tp2_pp2_mb1_seq2048
+
+experiment_name: MegatronLM-Translation_Evaluation
+code: Megatron-LM/
+environment: azureml:Megatron-LLaMA:4
+environment_variables:
+  HYDRA_FULL_ERROR: '1'
+  UCX_IB_PCI_RELAXED_ORDERING: 'auto'
+  NCCL_IB_PCI_RELAXED_ORDERING: '2'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: WARN
+inputs:
+  load_initial_model:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/srashed/paths/vocab_expansion_assets/megatronlm_models/Llama-2-7b-hf-ExpTok-32K_10M_tp2_pp2_seq4096_gb48/
+  tokenizer:
+    type: uri_file
+    mode: ro_mount
+    path: azureml:Llama-2-7b-hf-ExpTok-32K_10M_Tokenizer:1
+  wikipedia_en:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/srashed/paths/datasets_preprocessed/Llama-2-7b-hf-ExpTok-32K_10M/wikipedia_en/
+  wikipedia_ar:
+    type: uri_folder
+    mode: ro_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/srashed/paths/datasets_preprocessed/Llama-2-7b-hf-ExpTok-32K_10M/wikipedia_ar/
+outputs:
+  cache:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/LLM-Test/workspaces/Provisioning-Test/datastores/srashed/paths/datasets_cache/Llama-2-7b-hf-ExpTok-32K_10M/
+  model_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/srashed/paths/vocab_expansion_assets/experiments/MegatronLM-Wikipedia_Ar_En_Experiment_tp2_pp2_mb1_seq2048/
+
+
+services:
+  my_jupyterlab:
+    type: jupyter_lab
+    nodes: all
+  my_tensorboard:
+    type: tensor_board
+    properties:
+      logDir: ${{outputs.save_model}}/tensorboard
+
+compute: azureml:NCAI-A100-LLMv2
+
+distribution:
+  type: pytorch
+  process_count_per_instance: 8
+
+resources:
+  instance_count: 6
+  shm_size: 800g
