@@ -95,12 +95,12 @@ class DistributedDataParallel(MegatronModule):
 
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
-        data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
+        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
             # Pad so size is divisible by the data parallel size.
             numel = grad_dtype_to_numel[dtype]
             numel_padded = (
-                int(math.ceil(numel / data_parallel_world_size)) * data_parallel_world_size
+                int(math.ceil(numel / self.data_parallel_world_size)) * self.data_parallel_world_size
             )
 
             self.grad_buffers[dtype] = GradBuffer(
@@ -220,6 +220,9 @@ class DistributedDataParallel(MegatronModule):
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.finish_grad_sync()
+
+        for expert_grad in self.expert_grads:
+            expert_grad /= self.data_parallel_world_size
 
     def zero_grad_buffer(self):
         """
