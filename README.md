@@ -18,7 +18,7 @@ pip install wandb
 wandb login
 ```
 
-## Install TransformerEngine
+### Install TransformerEngine
 ```
 git clone https://github.com/NVIDIA/TransformerEngine.git
 cd TransformerEngine
@@ -26,7 +26,7 @@ pip install -e .
 cd ..
 ```
 
-## Install our Megatron-LM
+### Install our Megatron-LM
 ```
 git clone https://github.com/Zyphra/Megatron-LM.git
 cd Megatron-LM
@@ -34,7 +34,7 @@ pip install .
 cd ..
 ```
 
-## Run Training
+### Launch Training
 `bash Megatron-LM/examples/pretrain_gpt_distributed.sh`
 
 
