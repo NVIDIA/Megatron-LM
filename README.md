@@ -1,4 +1,4 @@
-# Zyphra
+# Zyphra Megatron-LM
 
 
 ## Spin up Docker Container
@@ -18,7 +18,7 @@ pip install wandb
 wandb login
 ```
 
-Install TransformerEngine
+## Install TransformerEngine
 ```
 git clone https://github.com/NVIDIA/TransformerEngine.git
 cd TransformerEngine
@@ -26,7 +26,7 @@ pip install -e .
 cd ..
 ```
 
-Install our Megatron-LM
+## Install our Megatron-LM
 ```
 git clone https://github.com/Zyphra/Megatron-LM.git
 cd Megatron-LM
@@ -34,11 +34,11 @@ pip install .
 cd ..
 ```
 
-
-Run Training
+## Run Training
 `bash Megatron-LM/examples/pretrain_gpt_distributed.sh`
 
 
+# NVIDIA Megatron-LM (copied from upstream)
 
 Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) is a large, powerful transformer developed by the Applied Deep Learning Research team at NVIDIA. This repository is for ongoing research on training large transformer language models at scale. We developed efficient, model-parallel ([tensor](https://arxiv.org/pdf/1909.08053.pdf), [sequence](https://arxiv.org/pdf/2205.05198), and [pipeline](https://arxiv.org/pdf/2104.04473.pdf)), and multi-node pre-training of transformer based models such as [GPT](https://arxiv.org/abs/2005.14165), [BERT](https://arxiv.org/pdf/1810.04805.pdf), and [T5](https://arxiv.org/abs/1910.10683) using mixed precision.
 
