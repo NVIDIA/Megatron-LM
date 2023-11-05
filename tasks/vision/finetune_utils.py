@@ -183,6 +183,7 @@ def _train(
                     iteration,
                     process_non_loss_data_func,
                     False,
+                    False,
                 )
 
         # Callback at the end of each epoch.
