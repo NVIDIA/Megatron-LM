@@ -34,7 +34,7 @@ WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
   PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS))
-  LAYERS=$(( $PIPELINE_SIZE * 4))
+  LAYERS=$(( $PIPELINE_SIZE * 4 - 2))
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE ))
   HIDDEN_SIZE=4096
@@ -86,6 +86,7 @@ options=" \
   --profile-step-start 150 \
   --profile-step-end 170 \
   --profile-ranks $profile_ranks \
+  --allow-padding-num-layers \
   --fp16"
 
 
@@ -96,7 +97,7 @@ fi
 if [ ! -z "$ZERO_BUBBLE_V_SCHEDULE" ]; then
   ENABLE_ZERO_BUBBLE=1
   options="$options --zero-bubble-v-schedule \
-  --num-layers-per-virtual-pipeline-stage $(( $LAYERS / $PIPELINE_SIZE / 2 ))"
+  --num-layers-per-virtual-pipeline-stage $(( $(($LAYERS + 2)) / $PIPELINE_SIZE / 2 ))"
 fi
 
 if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then

@@ -1445,12 +1445,12 @@ class ParallelTransformer(MegatronModule):
         self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
         # Number of layers.
-        self.num_layers = _get_num_layers(args, model_type,
-                                          layer_type==LayerType.decoder)
+        num_layers_per_stage_with_padding = _get_num_layers(args, model_type, layer_type==LayerType.decoder)
+        self.num_layers = num_layers_per_stage_with_padding
 
         self.drop_path_rates = [
             rate.item() for rate in
-            torch.linspace(0, self.drop_path_rate, config.num_layers - 2)]
+            torch.linspace(0, self.drop_path_rate, config.num_layers_without_padding)]
 
         self.retro_layer_numbers = None
         if model_type == ModelType.retro_decoder:
@@ -1540,8 +1540,6 @@ class ParallelTransformer(MegatronModule):
                     offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
                 else:
                     offset = config.num_layers - (mpu.get_pipeline_model_parallel_rank() + 1) * self.num_layers
-            if offset != 0:
-                offset -= 1
         else:
             # Each stage gets a contiguous set of layers.
             if args.model_type == ModelType.encoder_and_decoder and \
@@ -1549,20 +1547,13 @@ class ParallelTransformer(MegatronModule):
                 pipeline_rank = mpu.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
                     offset = pipeline_rank * self.num_layers
-                    if offset != 0:
-                        offset -= 1
                 else:
                     num_ranks_in_enc = args.pipeline_model_parallel_split_rank
                     offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
-                if offset != 0:
-                    offset -= 1
-        # TODO
-        if mpu.is_pipeline_last_stage():
-            self.num_layers -= 1
-        if mpu.is_pipeline_first_stage():
-            self.num_layers -= 1
+        if args.allow_padding_num_layers:
+            self.num_layers, offset = self.get_offset(config, args, num_layers_per_stage_with_padding)
         print(f'num layers on rank {torch.distributed.get_rank()}: {self.num_layers} offset: {offset}')
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
@@ -1593,6 +1584,54 @@ class ParallelTransformer(MegatronModule):
         if self.post_process and self.post_norm:
             # Final layer norm before output.
             self.final_norm = get_norm(config)
+
+    @staticmethod
+    def get_offset(config, args, num_layers_per_stage_with_padding):
+        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+        pipeline_world_size = mpu.get_pipeline_model_parallel_world_size()
+        if config.virtual_pipeline_model_parallel_size is not None:
+            assert config.num_layers % config.virtual_pipeline_model_parallel_size == 0, \
+                'num_layers_per_stage must be divisible by ' \
+                'virtual_pipeline_model_parallel_size'
+            assert num_layers_per_stage_with_padding % config.virtual_pipeline_model_parallel_size == 0
+            assert args.model_type != ModelType.encoder_and_decoder
+            # Number of layers in each model chunk is the number of layers in the stage,
+            # divided by the number of model chunks in a stage.
+            num_layers_per_chunk = num_layers_per_stage_with_padding // config.virtual_pipeline_model_parallel_size
+            num_chunk = pipeline_world_size * config.virtual_pipeline_model_parallel_size
+            chunk_sizes = [num_layers_per_chunk] * num_chunk
+            num_padding = args.num_layers - args.num_layers_without_padding
+            for _index in range(-1, num_padding - 1):
+                chunk_sizes[_index] -= 1
+
+            virtual_rank = mpu.get_virtual_pipeline_model_parallel_rank()
+            if args.zero_bubble_v_schedule:
+                assert config.virtual_pipeline_model_parallel_size == 2
+                if virtual_rank == 0:
+                    chunk_index = pipeline_rank
+                else:
+                    chunk_index = 2 * pipeline_world_size - pipeline_rank - 1
+            else:
+                chunk_index = virtual_rank * pipeline_world_size + pipeline_rank
+            num_layers = chunk_sizes[chunk_index]
+            offset = 0
+            for _index in range(chunk_index):
+                offset += chunk_sizes[_index]
+        else:
+            # Each stage gets a contiguous set of layers.
+            rank_sizes = [num_layers_per_stage_with_padding] * pipeline_world_size
+            num_padding = args.num_layers - args.num_layers_without_padding
+            for _index in range(-1, num_padding - 1):
+                rank_sizes[_index] -= 1
+            if args.model_type == ModelType.encoder_and_decoder and \
+                    mpu.get_pipeline_model_parallel_world_size() > 1:
+                assert False, "Not support yet"
+            else:
+                num_layers = rank_sizes[pipeline_rank]
+                offset = 0
+                for _index in range(pipeline_rank):
+                    offset += rank_sizes[_index]
+        return num_layers, offset
 
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
