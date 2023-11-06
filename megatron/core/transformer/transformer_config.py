@@ -111,6 +111,8 @@ class TransformerConfig(ModelParallelConfig):
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"
+    # MoE related
+    moe_grouped_gemm: bool = False
 
     def __post_init__(self):
         """ Python dataclass method that is used to modify attributes after initialization.
