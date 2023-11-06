@@ -22,6 +22,7 @@ wandb login
 ```
 git clone https://github.com/NVIDIA/TransformerEngine.git
 cd TransformerEngine
+git submodule update --init --recursive
 pip install -e .
 cd ..
 ```
