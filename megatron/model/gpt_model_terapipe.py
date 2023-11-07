@@ -87,25 +87,36 @@ class GPTModelTerapipe(MegatronModule):
                 retriever_input_ids=None,
                 retriever_position_ids=None,
                 retriever_attn_mask=None,
-                labels=None, tokentype_ids=None, inference_params=None):
-
-        lm_output = self.language_model(
+                labels=None, tokentype_ids=None, 
+                inference_params=None,
+                cache=None, 
+                cache_seq_len=0):
+        lm_output, cache_outputs = self.language_model(
             input_ids,
             position_ids,
             attention_mask,
             retriever_input_ids=retriever_input_ids,
             retriever_position_ids=retriever_position_ids,
             retriever_attn_mask=retriever_attn_mask,
-            inference_params=inference_params)
+            inference_params=inference_params,
+            cache=cache,
+            cache_seq_len=cache_seq_len)
 
         if self.post_process:
-            return post_language_model_processing(
+            # return post_language_model_processing(
+            #     lm_output, labels,
+            #     self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
+            #     self.parallel_output,
+            #     self.fp16_lm_cross_entropy)
+            loss = post_language_model_processing(
                 lm_output, labels,
                 self.language_model.output_layer.weight if self.untie_embeddings_and_output_weights else self.shared_embedding_or_output_weight(),
                 self.parallel_output,
                 self.fp16_lm_cross_entropy)
+            return loss, cache_outputs
+                
         else:
-            return lm_output
+            return lm_output, cache_outputs
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
 
@@ -130,3 +141,7 @@ class GPTModelTerapipe(MegatronModule):
         if self._language_model_key in state_dict:
             state_dict = state_dict[self._language_model_key]
         self.language_model.load_state_dict(state_dict, strict=strict)
+
+    def create_cache(self):
+        """Create cache for key/value attention."""
+        return self.language_model.create_cache()

@@ -5,6 +5,7 @@
 import sys
 
 import torch
+import inspect
 
 try:
     from apex.multi_tensor_apply import multi_tensor_applier
@@ -226,3 +227,41 @@ def print_rank_last(message):
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+def save_rank_0_log(message):
+    """If distributed is initialized, save only on rank 0."""
+    if torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            with open('log.txt', 'a+') as f:
+                f.write(message + '\n')
+    else:
+        with open('log.txt', 'a+') as f:
+            f.write(message + '\n')
+
+def gpu_logger(message, filename='log.txt', target_rank = -1):
+    '''log gpu information, and save to file'''
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    else:
+        rank = 0
+    
+    calling_frame = inspect.currentframe().f_back
+    frame_info = inspect.getframeinfo(calling_frame)
+    func_name = frame_info.function
+    
+    try:
+        func = calling_frame.f_globals[func_name]
+        func_signature = inspect.signature(func)
+    except KeyError:
+        func_signature = "N/A"
+
+    class_name = ''
+    if 'self' in calling_frame.f_locals:
+        class_name = calling_frame.f_locals['self'].__class__.__name__
+        class_name = f'{class_name}.'
+    
+    del calling_frame
+    
+    if target_rank == -1 or target_rank == rank:
+        with open(filename, 'a+', encoding='utf-8') as f:
+            f.write(f'rank: {rank}, by {class_name}{func_name}{func_signature}\n {message} \n')

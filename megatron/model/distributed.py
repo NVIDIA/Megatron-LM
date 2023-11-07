@@ -411,3 +411,6 @@ class DistributedDataParallel(DistributedDataParallelBase):
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.done()
+
+    def create_cache(self):
+        return self.module.create_cache()

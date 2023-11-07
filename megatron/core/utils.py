@@ -7,6 +7,7 @@ from functools import reduce
 
 import torch
 
+from megatron import get_args
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
@@ -205,3 +206,12 @@ def make_sharded_tensor_for_checkpoint(tensor, key, **kwargs):
         + parallel_state.get_tensor_model_parallel_rank(),
         **kwargs,
     )
+
+def terapipe_get_num_microbatch():
+    args = get_args()
+    if args.pipeline_model_parallel_size == 1:
+        return 1
+    else:
+        assert args.seq_length % args.terapipe_slice_len == 0, 'seq_length should be divisible by terapipe_slice_len'
+        num_microbatch = int(args.seq_length / args.terapipe_slice_len)
+        return num_microbatch

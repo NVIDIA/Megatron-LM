@@ -176,12 +176,25 @@ class Float16Module(MegatronModule):
 
 
     def forward(self, *inputs, **kwargs):
-        if mpu.is_pipeline_first_stage():
-            inputs = fp32_to_float16(inputs, self.float16_convertor)
-        outputs = self.module(*inputs, **kwargs)
-        if mpu.is_pipeline_last_stage():
-            outputs = float16_to_fp32(outputs)
-        return outputs
+        if 'cache' in kwargs:
+            # run terapipe process
+            kwargs['cache'] = fp32_to_float16(kwargs['cache'], self.float16_convertor)
+            for e in kwargs['cache']:
+                assert e.dtype == torch.float16
+            if mpu.is_pipeline_first_stage():
+                inputs = fp32_to_float16(inputs, self.float16_convertor)
+            outputs, cache_outputs = self.module(*inputs, **kwargs)
+            if mpu.is_pipeline_last_stage():
+                outputs = float16_to_fp32(outputs)
+            cache_outputs = float16_to_fp32(cache_outputs)
+            return outputs, cache_outputs
+        else:
+            if mpu.is_pipeline_first_stage():
+                inputs = fp32_to_float16(inputs, self.float16_convertor)
+            outputs = self.module(*inputs, **kwargs)
+            if mpu.is_pipeline_last_stage():
+                outputs = float16_to_fp32(outputs)
+            return outputs
 
 
     def state_dict(self, prefix='', keep_vars=False):
@@ -195,3 +208,6 @@ class Float16Module(MegatronModule):
 
     def load_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
+
+    def create_cache(self):
+        return self.module.create_cache()

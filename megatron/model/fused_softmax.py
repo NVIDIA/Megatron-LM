@@ -4,6 +4,7 @@
 import torch
 import torch.nn as nn
 from megatron.model.enums import AttnMaskType
+from megatron import get_args
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
@@ -174,8 +175,15 @@ class FusedScaleMaskSoftmax(nn.Module):
     def forward_fused_softmax(self, input, mask):
         b, np, sq, sk = input.size()
         scale = self.scale if self.scale is not None else 1.0
+        args = get_args()
 
-        if self.attn_mask_type == AttnMaskType.causal:
+        if args.terapipe_slice_len > 0:
+            # input is 4D tensor (b, np, sq, sk)
+            assert mask is not None, "mask must be provided for terapipe"
+            if mask is not None:
+                return ScaledMaskedSoftmax.apply(input, mask, scale)
+
+        elif self.attn_mask_type == AttnMaskType.causal:
             assert sq == sk, "causal mask is only for self attention"
 
             # input is 3D tensor (attn_batches, sq, sk)
@@ -188,7 +196,7 @@ class FusedScaleMaskSoftmax(nn.Module):
                 return ScaledMaskedSoftmax.apply(input, mask, scale)
             else:
                 return ScaledSoftmax.apply(input, scale)
-
+    
     def forward_torch_softmax(self, input, mask):
         if self.input_in_float16 and self.softmax_in_fp32:
             input = input.float()

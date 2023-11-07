@@ -470,8 +470,10 @@ class TransformerLanguageModelWithCache(MegatronModule):
                 enc_dec_attn_mask=None, tokentype_ids=None,
                 inference_params=None,
                 pooling_sequence_index=0,
-                enc_hidden_states=None, output_enc_hidden=False):
-
+                enc_hidden_states=None, 
+                output_enc_hidden=False,
+                cache=None, 
+                cache_seq_len=0):
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
@@ -499,13 +501,15 @@ class TransformerLanguageModelWithCache(MegatronModule):
         # Run encoder.
         if enc_hidden_states is None:
             if self.encoder is not None:
-                encoder_output = self.encoder(
+                encoder_output, cache_outputs = self.encoder(
                     encoder_input,
                     enc_attn_mask,
                     retriever_input=retriever_input,
                     retriever_attn_mask=retriever_attn_mask,
                     inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
+                    rotary_pos_emb=rotary_pos_emb,
+                    cache=cache, 
+                    cache_seq_len=cache_seq_len)
             else:
                 encoder_output = self.encoder_hidden_state
         else:
@@ -515,7 +519,6 @@ class TransformerLanguageModelWithCache(MegatronModule):
             if self.add_pooler:
                 pooled_output = self.pooler(encoder_output,
                                             pooling_sequence_index)
-
         # output_enc_hidden refers to when we just need the encoder's
         # output. For example, it is helpful to compute
         # similarity between two sequences by average pooling
@@ -523,7 +526,7 @@ class TransformerLanguageModelWithCache(MegatronModule):
             if self.add_pooler and self.post_process:
                 return encoder_output, pooled_output
             else:
-                return encoder_output
+                return encoder_output, cache_outputs
 
         # Decoder embedding.
         if self.pre_process:
@@ -633,3 +636,7 @@ class TransformerLanguageModelWithCache(MegatronModule):
                 'could not find data for pooler in the checkpoint'
             self.decoder.load_state_dict(state_dict[self._decoder_key],
                                          strict=strict)
+
+    def create_cache(self):
+        # create cache for encoder
+        return self.encoder.create_cache()

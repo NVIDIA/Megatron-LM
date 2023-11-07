@@ -300,7 +300,6 @@ class CoreAttention(MegatronModule):
         # ===========================
         # Attention probs and dropout
         # ===========================
-
         # attention scores and attention mask [b, np, sq, sk]
         attention_probs = self.scale_mask_softmax(attention_scores,
                                                   attention_mask)
@@ -555,7 +554,7 @@ class ParallelAttentionWithCache(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_params=None,
-                rotary_pos_emb=None, full_cache=None, cache_len=0):
+                rotary_pos_emb=None, cache=None, cache_len=0):
         # hidden_states: [sq, b, h]
 
         # =================================================
@@ -696,34 +695,30 @@ class ParallelAttentionWithCache(MegatronModule):
         # =========================
         # cat cached key and values
         # =========================
-
-
-        from ..utils import print_rank_0
-        # display shape of Q, K, V
-        print_rank_0('\n\n\n\n\n\n@@@debug@@@@')
-        print_rank_0('Q shape: {}'.format(query_layer.shape))
-        print_rank_0('K shape: {}'.format(key_layer.shape))
-        print_rank_0('V shape: {}'.format(value_layer.shape))
-
-        if full_cache is not None:
+        # log k v dtype
+        assert cache is not None, 'cache should not be None'
+        if cache is not None:
             args = get_args()
-            tgt_len, batch_size, embed_dim = hidden_states.size()
-            
-            assert embed_dim == args.hidden_size
-
+            tgt_len = args.terapipe_slice_len
+            src_len = tgt_len + cache_len
 
             # retrive cached K, V
-            cache_k, cache_v = full_cache
-            # cat K, V on seq dimension
+            cache_k, cache_v = cache
+            # cat K, V on seq dimension, assign in allocated cache space
             # [sk, b, ng, hn] -> [sk + cache_len, b, ng, hn]
+            # [sv, b, ng, hn] -> [sv + cache_len, b, ng, hn]
             # create slice
-            cache_slice_idx = [slice(cache_len, tgt_len), slice(None), slice(None), slice(None)]
+            cache_slice_idx = [slice(cache_len, src_len), slice(None), slice(None), slice(None)]
             cache_k = assign_cache_(cache_k, key_layer, cache_slice_idx)
-            cache_v = assign_cache_(cache_v, value_layer, cache_slice_idx)      
-            key_layer = cache_k
-            value_layer = cache_v
-
-
+            cache_v = assign_cache_(cache_v, value_layer, cache_slice_idx)
+            # fetch [sk + cache_len, b, ng, hn]
+            key_layer = cache_k[:src_len, :, :, :]
+            value_layer = cache_v[:src_len, :, :, :]
+            # adjust attention_mask to fit the new key_layer
+            # [1, 1, sq, sk] -> [1, 1, sq, sk + cache_len]
+            cache_mask = torch.full((1, 1, attention_mask.size(2), cache_len), False, dtype=attention_mask.dtype, device=attention_mask.device)
+            # Concatenate the cache mask with the original mask
+            attention_mask = torch.cat([cache_mask, attention_mask], dim=-1)
 
         # ==================================
         # core attention computation
@@ -754,7 +749,7 @@ class ParallelAttentionWithCache(MegatronModule):
             if self.checkpoint_core_attention:
                 context_layer = self._checkpointed_attention_forward(
                     query_layer, key_layer, value_layer, attention_mask)
-            else: # @@@@@@@@@@
+            else:
                 context_layer = self.core_attention(
                     query_layer, key_layer, value_layer, attention_mask)
         else:
@@ -773,7 +768,7 @@ class ParallelAttentionWithCache(MegatronModule):
 
         output, bias = self.dense(context_layer)
 
-        return output, bias, cache_k, cache_v
+        return output, bias, (cache_k, cache_v)
 
     def create_attn_cache(self, batch_size, max_seq_len, device='cuda', dtype=torch.float32):
         args = get_args()
@@ -1111,17 +1106,21 @@ class ParallelTransformerLayerWithCache(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                cache=None,
+                cache_seq_len=0):
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
         norm_output = self.input_norm(hidden_states)
 
         # Self attention.
-        attention_output, attention_bias = \
+        attention_output, attention_bias, cache_output = \
             self.self_attention(
                 norm_output,
                 attention_mask,
+                cache=cache,
+                cache_len=cache_seq_len,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb)
 
@@ -1234,7 +1233,7 @@ class ParallelTransformerLayerWithCache(MegatronModule):
         if self.layer_type == LayerType.retro_decoder_with_retriever:
             return output, retriever_output
         else:
-            return output
+            return output, cache_output
 
 
 
@@ -1348,13 +1347,6 @@ class ParallelTransformerWithCache(MegatronModule):
                  drop_path_rate=0.0):
         super(ParallelTransformerWithCache, self).__init__()
         args = get_args()
-
-        from ..utils import print_rank_0
-        # print debug on rank 0
-        print_rank_0(f'\n\n\n\n @@@debug@@@ ParallelTransformerWithCache \n\n\n ')
-        # show args and config
-        print_rank_0(f'\n\n\n@@@debug@@@ args:{args} \n\n config:{config}\n\n')
-
         self.layer_type = layer_type
         self.model_type = model_type
         self.bf16 = config.bf16
@@ -1655,9 +1647,11 @@ class ParallelTransformerWithCache(MegatronModule):
                 retriever_output=None,
                 retriever_attn_mask=None,
                 inference_params=None,
-                rotary_pos_emb=None):
+                rotary_pos_emb=None,
+                cache=None,
+                cache_seq_len=0
+                ):
         # hidden_states: [s, b, h]
-
         # Checks.
         if inference_params:
             assert self.recompute_granularity is None, \
@@ -1734,15 +1728,20 @@ class ParallelTransformerWithCache(MegatronModule):
                         forward_kwargs['retriever_input'] = retriever_input
                         forward_kwargs['retriever_output'] = retriever_output
                         forward_kwargs['retriever_attn_mask'] = retriever_attn_mask
-
+                    cache_outputs = []
                     for index in range(self.num_layers):
+                        # fetch k,v for this layer
+                        k = cache[index * 2]
+                        v = cache[index * 2 + 1]
+                        forward_kwargs['cache'] = (k, v)
+                        forward_kwargs['cache_seq_len'] = cache_seq_len
                         layer = self._get_layer(index)
 
-                        hidden_states = layer(
+                        hidden_states, (k_output, v_output) = layer(
                             hidden_states,
                             attention_mask,
                             **forward_kwargs)
-
+                        cache_outputs += [k_output,v_output]
                         # First Retro decoder layer returns both hidden_states
                         # and retriever_output. Make retriever_output available
                         # to subsequence Retro layers.
@@ -1759,7 +1758,7 @@ class ParallelTransformerWithCache(MegatronModule):
         if self.post_process and self.post_norm:
             hidden_states = self.final_norm(hidden_states)
 
-        return hidden_states
+        return hidden_states, cache_outputs
 
     def load_state_dict(self, state_dict, strict=True):
         """Customize load."""
@@ -1773,20 +1772,18 @@ class ParallelTransformerWithCache(MegatronModule):
         super().load_state_dict(state_dict_, strict)
 
     def create_cache(self):
+        # print debug on rank 0
         args = get_args()
         self.cache = []
         for layer_id in range(self.num_layers):
             layer = self._get_layer(layer_id)
             # create cache for each layer
-            k, v = layer.self_attention.create_cache(
+            k, v = layer.self_attention.create_attn_cache(
                 batch_size=args.micro_batch_size,
-                sequence_length=args.seq_length,
-                device='cuda',
+                max_seq_len=args.seq_length,
+                device=torch.cuda.current_device(),
                 dtype=args.params_dtype
             )
-
-    def empty_cache(self):
-        # set tensor in cache to zeros
-        for tensor in self.cache:
-           tensor.zero_()
-         
+            self.cache.append(k)
+            self.cache.append(v)
+        return self.cache

@@ -1044,7 +1044,9 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     
     # add terapipe argument
-    group.add_argument('--use-terapipe', action='store_true',
+    # group.add_argument('--use-terapipe', action='store_true',
+    #                    help='Use terapipe.')
+    group.add_argument('--terapipe-slice-len', type=int, default=0,
                        help='Use terapipe.')
     return parser
 

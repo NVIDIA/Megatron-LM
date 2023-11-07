@@ -46,7 +46,6 @@ def _split_along_last_dim(input_):
 def _split_along_first_dim(input_):
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
-
     world_size = get_tensor_model_parallel_world_size()
     # Bypass the function if we are using only 1 GPU.
     if world_size == 1:

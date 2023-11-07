@@ -94,7 +94,7 @@ def loss_func(loss_mask, output_tensor):
     return loss, {'lm loss': averaged_loss[0]}
 
 
-def forward_step(data_iterator, model):
+def forward_step(data_iterator, model, cache, cache_seq_len=0):
     """Forward step."""
     args = get_args()
     timers = get_timers()
@@ -105,10 +105,10 @@ def forward_step(data_iterator, model):
         data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    output_tensor, cache_output = model(tokens, position_ids, attention_mask,
+                          labels=labels, cache=cache, cache_seq_len=cache_seq_len)
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask), cache_output
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
