@@ -432,9 +432,6 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
-    if args.enable_zero_bubble:
-        WeightGradStore.set_optimizer(optimizer)
-
     def run_forward_backward_func():
         forward_backward_func = get_forward_backward_func()
         return forward_backward_func(
@@ -463,11 +460,18 @@ def train_step(forward_step_func, data_iterator,
     if get_args().profile:
         torch.cuda.nvtx.range_push('Optimizer')
     if args.enable_zero_bubble and args.enable_optimizer_post_validation:
-        optimizer.pre_step(args, timers)
         from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
         zb_scheduler = get_zb_scheduler_instance()
-        assert zb_scheduler.do_post_validation
-        update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func()
+        if optimizer.post_validation_enabled:
+            optimizer.pre_step(args, timers)
+            zb_scheduler.optimizer = optimizer
+            assert not zb_scheduler.is_first_run and zb_scheduler.do_post_validation
+            update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func()
+            # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+        else:
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+            zb_scheduler.is_first_run = True
+        optimizer.record_grad_norm(grad_norm)
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     if get_args().profile:
@@ -624,11 +628,16 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
-            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-            writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
+            if args.enable_zero_bubble and args.enable_optimizer_post_validation:
+                scalar_name = "optimizer-rollback"
+                # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+            else:
+                scalar_name = "num-zeros"
+            writer.add_scalar(scalar_name, num_zeros_in_grad, iteration)
+            writer.add_scalar(f'{scalar_name} vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
             if wandb_writer:
-                wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
+                wandb_writer.log({scalar_name: num_zeros_in_grad}, iteration)
         if params_norm is not None:
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
@@ -685,7 +694,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
         if num_zeros_in_grad is not None:
-            log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
+            if args.enable_zero_bubble and args.enable_optimizer_post_validation:
+                log_string += ' optimizer rollback: {:.1f} |'.format(num_zeros_in_grad)
+                # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+            else:
+                log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
             log_string += ' params norm: {:.3f} |'.format(params_norm)
         log_string += ' number of skipped iterations: {:3d} |'.format(

@@ -168,6 +168,7 @@ class ZeroBubbleVPipeScheduler:
         self.it = 0
         self.do_post_validation = False
         self.is_first_run = True
+        self.optimizer = None
 
     def _reset(self):
         # two dim array, first dim is the model chunk, second dim is the microbatch queue
@@ -399,8 +400,8 @@ class ZeroBubbleVPipeScheduler:
                 self.w_clear_run[chunk] = True
 
     def run_until_post_validation(self):
-        optimizer = WeightGradStore.optimizer
-        succeed, grad_norm, updated = None, None, None
+        optimizer = self.optimizer
+        updated, grad_norm, rollback, succeed = None, None, None, None
         it = 0
         if optimizer.do_this_step:
             assert optimizer.do_prev_step
@@ -427,7 +428,7 @@ class ZeroBubbleVPipeScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
-                    succeed, grad_norm, updated = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
@@ -449,7 +450,7 @@ class ZeroBubbleVPipeScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
-                    succeed, grad_norm, updated = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     # print(f"{rank} False post validation done")
                     break
                 else:
@@ -476,7 +477,7 @@ class ZeroBubbleVPipeScheduler:
                 data_iter.clear_buffer()
             data_iter.pop_from_buffer()
         self.it = it
-        return updated, grad_norm, succeed
+        return updated, grad_norm, rollback
 
     def run(self):
         if get_args().profile:
@@ -690,6 +691,7 @@ class ZeroBubbleScheduler:
         self.it = 0
         self.do_post_validation = False
         self.is_first_run = True
+        self.optimizer = None
 
     def _reset(self):
         # Input, output tensors only need to be saved when doing backward passes
@@ -982,8 +984,8 @@ class ZeroBubbleScheduler:
         self.it = 0
 
     def run_until_post_validation(self):
-        optimizer = WeightGradStore.optimizer
-        succeed, grad_norm, updated = None, None, None
+        optimizer = self.optimizer
+        updated, grad_norm, rollback, succeed = None, None, None, None
         it = 0
         if optimizer.do_this_step:
             assert optimizer.do_prev_step
@@ -1005,7 +1007,7 @@ class ZeroBubbleScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
-                    succeed, grad_norm, updated = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
@@ -1026,7 +1028,7 @@ class ZeroBubbleScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
-                    succeed, grad_norm, updated = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     # print(f"{rank} False post validation done")
                     break
                 else:
@@ -1050,7 +1052,7 @@ class ZeroBubbleScheduler:
         if self.data_iterator is not None:
             self.data_iterator.pop_from_buffer()
         self.it = it
-        return updated, grad_norm, succeed
+        return updated, grad_norm, rollback
 
     def run(self):
         if get_args().profile:

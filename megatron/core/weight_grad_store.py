@@ -11,11 +11,6 @@ class WeightGradStore:
 
     cache = []
     weight_grad_queue = [queue.Queue(), queue.Queue()]
-    optimizer = None
-
-    @classmethod
-    def set_optimizer(cls, optimizer):
-        cls.optimizer = optimizer
 
     @classmethod
     def put(cls, total_input, grad_output, weight, func):

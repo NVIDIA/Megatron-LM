@@ -84,6 +84,27 @@ class MegatronOptimizer(ABC):
         self.do_this_step = False
         self.send_next_reqs = []
         self.send_prev_reqs = []
+        self.grad_norm_no_clip_recorder = 0
+        self.post_validation_enabled = False
+
+    def record_grad_norm(self, grad_norm):
+        if self.post_validation_enabled:
+            return
+        if self.clip_grad > 0.0:
+            if grad_norm is None or grad_norm > self.clip_grad:
+                self.grad_norm_no_clip_recorder = 0
+            else:
+                self.grad_norm_no_clip_recorder += 1
+            if self.grad_norm_no_clip_recorder >= 10:
+                rank = parallel_state.get_pipeline_model_parallel_rank()
+                print(f"{rank}: enable optimizer post validation")
+                self.post_validation_enabled = True
+        else:
+            if grad_norm is not None:
+                # optimizer state update successfully
+                rank = parallel_state.get_pipeline_model_parallel_rank()
+                print(f"{rank}: enable optimizer post validation")
+                self.post_validation_enabled = True
 
     @torch.no_grad()
     def save_parameters_backup(self):
@@ -596,9 +617,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.do_this_step:
             self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
-        if this_found_inf_flag:
-            return False, None, int(not self.do_this_step)
-        return True, grad_norm, int(not self.do_this_step)
 
     def prepare_fully_reduced_global_states(self):
         self.fully_reduced_global_states = {}
@@ -639,7 +657,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
                     self._copy_main_params_to_model_params()
-                return False, None, False
+                return False, None, self.do_this_step, False
         succeed = True
         grad_norm = None
         if self.clip_grad > 0.0:
@@ -665,7 +683,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 assert self.do_this_step
         else:
             assert self.do_this_step
-        return succeed, grad_norm, True
+
+        # updated, grad_norm, rollback, succeed
+        return True, grad_norm, not succeed and self.do_this_step, succeed
 
     @torch.no_grad()
     def step(self, args, timers):
