@@ -81,7 +81,7 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
 
 
 def _initialize_affine_weight_gpu(
-    weight, init_method, partition_dim, stride=1, is_expert=False
+    weight, init_method, partition_dim, stride=1, expert_parallel=False
 ):
     """Initialize affine weight for model parallel on GPU."""
 
@@ -89,12 +89,12 @@ def _initialize_affine_weight_gpu(
         tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
     )
 
-    if not is_expert:
+    if not expert_parallel:
         with get_cuda_rng_tracker().fork():
             init_method(weight)
     else:
-       #with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
-        init_method(weight)
+        with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name()):
+            init_method(weight)
 
 
 def _initialize_affine_weight_cpu(
@@ -628,7 +628,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         init_method,
                         partition_dim=0,
                         stride=stride,
-                        is_expert=self.is_expert,
+                        expert_parallel=(self.is_expert and self.expert_parallel),
                     )
 
             setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
@@ -863,7 +863,7 @@ class RowParallelLinear(torch.nn.Module):
                     init_method,
                     partition_dim=1,
                     stride=stride,
-                    is_expert=self.is_expert,
+                    expert_parallel=(self.is_expert and self.expert_parallel),
                 )
         setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
 

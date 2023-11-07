@@ -61,9 +61,9 @@ def _set_cuda_rng_state(new_state, device=-1):
     _lazy_call(cb)
 
 
-def get_expert_parallel_rng_tracker_name(expert_id):
+def get_expert_parallel_rng_tracker_name():
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
-    return _EXPERT_PARALLEL_RNG_TRACKER_NAME + "_" + str(expert_id)
+    return _EXPERT_PARALLEL_RNG_TRACKER_NAME
 
 def get_data_parallel_rng_tracker_name():
     global _DATA_PARALLEL_RNG_TRACKER_NAME
@@ -150,7 +150,7 @@ def get_cuda_rng_tracker():
     return _CUDA_RNG_STATE_TRACKER
 
 
-def model_parallel_cuda_manual_seed(seed, num_experts=1):
+def model_parallel_cuda_manual_seed(seed):
     """Initialize model parallel cuda seed.
 
     This function should be called after the model parallel is
@@ -181,13 +181,10 @@ def model_parallel_cuda_manual_seed(seed, num_experts=1):
     # and model parallel state.
     _CUDA_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    if num_experts > 1:
-        for expert_id in range(num_experts):
-            expert_parallel_seed = (
-                seed + 1024 + 100 * expert_id + get_tensor_model_parallel_rank()
-            )
-            name = _EXPERT_PARALLEL_RNG_TRACKER_NAME + "_" + str(expert_id)
-            _CUDA_RNG_STATE_TRACKER.add(name, expert_parallel_seed)
+    expert_parallel_seed = (
+        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_tensor_model_parallel_rank()
+    )
+    _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
 class CheckpointFunction(torch.autograd.Function):

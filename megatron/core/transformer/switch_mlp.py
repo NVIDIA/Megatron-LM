@@ -11,8 +11,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name,
-    get_expert_parallel_rng_tracker_name
+    get_data_parallel_rng_tracker_name
 )
 from .mlp import MLP, MLPSubmodules
 
@@ -70,11 +69,8 @@ class SwitchMLP(MegatronModule):
         ]
 
         self.local_experts = torch.nn.ModuleList()
-
-        for expert_idx in self.local_expert_indices:
-            name = get_expert_parallel_rng_tracker_name(expert_idx)
-            with get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name(expert_idx)):
-                expert = MLP(self.config, submodules, is_expert=True)
+        for _ in range(self.num_local_experts):
+            expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
 
     def gather_indices(self, local_indices):

@@ -23,8 +23,7 @@ from .random import (
     checkpoint,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
-    get_data_parallel_rng_tracker_name,
-    get_expert_parallel_rng_tracker_name
+    get_data_parallel_rng_tracker_name
 )
 from .utils import (
     gather_split_1d_tensor,
