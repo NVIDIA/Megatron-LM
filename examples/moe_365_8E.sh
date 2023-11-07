@@ -73,11 +73,10 @@ OUTPUT_ARGS="
     --save-interval 5 \
     --eval-interval 5 \
     --eval-iters 10 
+    --wandb-project $WANDB_PROJECT \
+    --wandb-exp-name $WANDB_EXP_NAME \
+    --wandb-save-dir $WANDB_SAVE_DIR
 "
-    #--wandb-project $WANDB_PROJECT \
-    #--wandb-exp-name $WANDB_EXP_NAME \
-    #--wandb-save-dir $WANDB_SAVE_DIR
-#"
 
 torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
