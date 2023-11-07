@@ -18,15 +18,6 @@ pip install wandb
 wandb login
 ```
 
-### Install TransformerEngine
-```
-git clone https://github.com/NVIDIA/TransformerEngine.git
-cd TransformerEngine
-git submodule update --init --recursive
-pip install -e .
-cd ..
-```
-
 ### Install our Megatron-LM
 ```
 git clone https://github.com/Zyphra/Megatron-LM.git
