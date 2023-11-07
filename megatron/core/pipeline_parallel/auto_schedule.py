@@ -685,7 +685,9 @@ def ilp_results(graph, F):
 
 def auto_schedule(nstages, nmb, config):
     graph = Graph.build_graph(nstages, nmb, config)
-    if graph.nnodes < 500:
+    
+    # Disabling ILP for now.
+    if graph.nnodes < 0:
         (prob, P, F, M) = build_ilp(graph)
         solve_ilp(prob)
         return ilp_results(graph, F)

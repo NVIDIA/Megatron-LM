@@ -10,7 +10,7 @@ from megatron import core, get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
-from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
+from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type, reset_random_state
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -169,6 +169,8 @@ def forward_step(
     Returns output tensor."""
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+    if get_args().enable_exactly_numeric_match:
+        reset_random_state()
 
     unwrap_output_tensor = False
     if not isinstance(input_tensor, list):
@@ -247,6 +249,9 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+
+    if get_args().enable_exactly_numeric_match:
+        reset_random_state()
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False

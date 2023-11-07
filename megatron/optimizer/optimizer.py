@@ -112,8 +112,8 @@ class MegatronOptimizer(ABC):
         backups = []
         for param in parameters:
             p = param.detach().clone()
-            s1 = self.optimizer.state[param]["exp_avg"].detach().clone()
-            s2 = self.optimizer.state[param]["exp_avg_sq"].detach().clone()
+            s1 = self.optimizer.state[param]["exp_avg"].detach().clone() if "exp_avg" in self.optimizer.state[param] else torch.zeros_like(param.data).float()
+            s2 = self.optimizer.state[param]["exp_avg_sq"].detach().clone() if "exp_avg_sq" in self.optimizer.state[param] else torch.zeros_like(param.data).float()
             backups.append((p, s1, s2))
         self.parameters_backup = backups
 

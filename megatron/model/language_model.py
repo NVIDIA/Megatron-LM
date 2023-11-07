@@ -9,6 +9,7 @@ from megatron import get_args
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.utils import reset_random_state
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -354,6 +355,9 @@ class TransformerLanguageModel(MegatronModule):
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
 
+        if get_args().enable_exactly_numeric_match:
+            reset_random_state()
+
         # Embeddings.
         if self.pre_process:
             self.embedding = Embedding(self.hidden_size,
@@ -409,6 +413,8 @@ class TransformerLanguageModel(MegatronModule):
             self._decoder_key = 'decoder'
         else:
             self.decoder = None
+        if get_args().enable_exactly_numeric_match:
+            reset_random_state()
 
         if self.post_process:
             # Pooler.

@@ -194,6 +194,7 @@ def validate_args(args, defaults={}):
         args.enable_zero_bubble = True
     if args.enable_zero_bubble:
         assert not args.overlap_grad_reduce, "not supported yet"
+        assert args.pipeline_model_parallel_size > 1, "zero bubble must be enabled with pipeline parallelism"
     else:
         args.enable_optimizer_post_validation = False
 

@@ -72,8 +72,6 @@ options=" \
   --eval-iters 40 \
   --eval-interval 10000 \
   --data-path ${DATASET} \
-  --save-interval 10000 \
-  --save checkpoints \
   --tokenizer-type GPTSentencePieceTokenizer \
   --tokenizer-model /tokenizers/tokenizer.model \
   --split 98,2,0 \
@@ -87,6 +85,7 @@ options=" \
   --profile-step-end 170 \
   --profile-ranks $profile_ranks \
   --allow-padding-num-layers \
+  --enable-optimizer-post-validation \
   --fp16"
 
 
@@ -112,6 +111,10 @@ if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then
   options="$options --enable-exactly-numeric-match \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0"
+fi
+
+if [ ! -z "$INTERLEAVED_1F1B" ]; then
+  options="$options --num-layers-per-virtual-pipeline-stage 1"
 fi
 
 run_cmd="torchrun --nnodes $WORLD_SIZE \

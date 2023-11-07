@@ -12,6 +12,7 @@ from megatron import get_timers, get_args, get_retro_args, core, get_num_microba
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.utils import reset_random_state
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -1467,6 +1468,9 @@ class ParallelTransformer(MegatronModule):
             assert args.transformer_impl == 'local', \
                 "Transformer engine does not support Retro layers."
         def build_layer(layer_number):
+            if get_args().enable_exactly_numeric_match:
+                reset_random_state(layer_number + 43)
+
             if args.transformer_impl == 'local':
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,

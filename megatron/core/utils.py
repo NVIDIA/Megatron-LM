@@ -3,6 +3,8 @@
 """Utility functions used throughout Megatron core"""
 import math
 import operator
+import random
+import numpy as np
 from functools import reduce
 
 import torch
@@ -234,3 +236,10 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+def reset_random_state(seed=43):
+    from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
