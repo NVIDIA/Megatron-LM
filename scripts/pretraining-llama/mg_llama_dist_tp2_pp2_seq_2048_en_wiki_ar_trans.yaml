@@ -23,8 +23,8 @@ command: >-
   --no-position-embedding
   --no-masked-softmax-fusion
   --no-query-key-layer-scaling
-  --micro-batch-size 1 
-  --global-batch-size 1920
+  --micro-batch-size 2 
+  --global-batch-size 960
   --train-iters 3000
   --lr 0.0003 
   --lr-decay-style cosine 
@@ -51,7 +51,7 @@ display_name: MegatronLM-Wikipedia_Ar_En_Experiment_tp2_pp2_seq2048_bs1920
 
 experiment_name: MegatronLM-Vocab-Expansion
 code: ../../
-environment: azureml:Megatron-LM:2
+environment: azureml:Megatron-LLaMA:4
 environment_variables:
   HYDRA_FULL_ERROR: '1'
   UCX_IB_PCI_RELAXED_ORDERING: 'auto'
@@ -80,11 +80,11 @@ outputs:
   cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/Llama-2-7b-hf-ExpTok-32K_10M_tp4_pp2_seq2048_gb1920/dataset_cache/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiment_data/en_wiki__ar_wiki_trans
   model_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/Llama-2-7b-hf-ExpTok-32K_10M_tp4_pp2_seq2048_gb1920/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/Llama-2-7b-hf-ExpTok-32K_10M_tp4_pp2_seq2048_gb960_mbs_2/
 
 
 services:
