@@ -18,7 +18,7 @@ MERGE_FILE=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/merges.txt
 DATA_PATH=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
 
 WANDB_PROJECT=moe
-WANDB_EXP_NAME=moe_125m_8E_slimpj_test
+WANDB_EXP_NAME=moe_125m_8E_slimpj_test_2
 WANDB_SAVE_DIR=/workspace/wandb
 
 DISTRIBUTED_ARGS="
@@ -46,17 +46,17 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --fp16 \
-    --num-experts 8 \
+    --num-experts 32 \
     --expert-model-parallel-size 8 \
     --recompute-granularity selective \
     --use-flash-attn \
-    --accumulate-allreduce-grads-in-fp32  
-    --attention-dropout 0.0 
-    --hidden-dropout 0.0
+    --accumulate-allreduce-grads-in-fp32 \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
     --swiglu
     "
-    #--fp8-format hybrid 
-    #--transformer-impl transformer_engine
+    #--fp8-format hybrid \
+    #--transformer-impl transformer_engine 
 #"
 
 DATA_ARGS="
@@ -72,7 +72,7 @@ OUTPUT_ARGS="
     --log-interval 10 \
     --save-interval 50 \
     --eval-interval 50 \
-    --eval-iters 50 
+    --eval-iters 50 \
     --wandb-project $WANDB_PROJECT \
     --wandb-exp-name $WANDB_EXP_NAME \
     --wandb-save-dir $WANDB_SAVE_DIR
@@ -82,6 +82,6 @@ torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
-    --distributed-backend nccl 
+    --distributed-backend nccl \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH
