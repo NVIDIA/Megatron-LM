@@ -329,12 +329,15 @@ def get_optimizer_param_scheduler(optimizer):
 
     # Iteration-based training.
     if args.train_iters:
+        end_steps = args.train_iters * args.global_batch_size
+        constant_steps = args.constant_fraction * end_steps
+        cooldown_steps = args.inv_sqrt_cooldown_fraction * end_steps
         if args.lr_decay_iters is None:
             args.lr_decay_iters = args.train_iters
         lr_decay_steps = args.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+            lr_warmup_steps = args.lr_warmup_fraction * end_steps
         else:
             lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
     # Sample-based training.
@@ -343,12 +346,15 @@ def get_optimizer_param_scheduler(optimizer):
         # we need to adjust the training samples too (due to last
         # batch being incomplete) but we leave it as is for now.
         update_train_iters(args)
+        end_steps = args.train_samples
+        constant_steps = args.constant_fraction * end_steps
+        cooldown_steps = args.inv_sqrt_cooldown_fraction * end_steps
         if args.lr_decay_samples is None:
             args.lr_decay_samples = args.train_samples
         lr_decay_steps = args.lr_decay_samples
         wd_incr_steps = args.train_samples
         if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
+            lr_warmup_steps = args.lr_warmup_fraction * end_steps
         else:
             lr_warmup_steps = args.lr_warmup_samples
     else:
@@ -360,8 +366,14 @@ def get_optimizer_param_scheduler(optimizer):
         init_lr=args.lr_warmup_init,
         max_lr=args.lr,
         min_lr=args.min_lr,
+        constant_lr=args.constant_lr,
         lr_warmup_steps=lr_warmup_steps,
         lr_decay_steps=lr_decay_steps,
+        num_repeats=args.num_cycles,
+        end_steps=end_steps,
+        constant_steps=constant_steps,
+        cooldown_steps=cooldown_steps,
+        sqrt_scale=args.inv_sqrt_scale,
         lr_decay_style=args.lr_decay_style,
         start_wd=args.start_weight_decay,
         end_wd=args.end_weight_decay,

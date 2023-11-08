@@ -932,9 +932,10 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate. Depending on decay style '
                        'and initial warmup, the learing rate at each '
-                       'iteration would be different.')
+                       'iteration would be different.'
+                       'This is the max lr after warmup.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root','invsqrt-inf'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
@@ -960,6 +961,21 @@ def _add_learning_rate_args(parser):
     group.add_argument('--min-lr', type=float, default=0.0,
                        help='Minumum value for learning rate. The scheduler'
                        'clip values below this threshold.')
+    group.add_argument('--constant-lr', type=float, default=None,
+                       help='Value of lr in constant phase'
+                       'in inverse sqrt infinite schedule.')
+    group.add_argument('--constant-fraction', type=float, default=0.0,
+                       help='Fraction of constant phase: constant/(cycle length)'
+                       'within a given cycle of inverse sqrt infinite schedule.')
+    group.add_argument('--inv-sqrt-cooldown-fraction', type=float, default=0.0,
+                       help='Fraction of inverse sqrt cooldown phase'
+                       '(inv-sqrt/samples) for inverse sqrt infinite schedule.')
+    group.add_argument('--inv-sqrt-scale', type=float, default=30.0,
+                       help='Overall scale of inv-sqrt phase in inv-sqrt infinite schedule.' 
+                       'Reasonable value is 30.')
+    group.add_argument('--num-cycles', type=int, default=1,
+                       help='Number of cycles to split total training into for'
+                       'inverse sqrt infinite schedule.')
     group.add_argument('--override-opt_param-scheduler', action='store_true',
                        help='Reset the values of the scheduler (learning rate,'
                        'warmup iterations, minimum learning rate, maximum '
