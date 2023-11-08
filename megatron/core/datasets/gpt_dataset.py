@@ -8,10 +8,6 @@ from typing import Dict, Tuple
 import numpy
 import torch
 
-from megatron import get_args
-from megatron import get_tokenizer
-from megatron.utils import get_ltor_masks_and_position_ids
-
 from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -82,19 +78,16 @@ class GPTDataset(MegatronDataset):
         text = torch.from_numpy(text)
         document_ids = torch.from_numpy(document_ids)
 
-        args = get_args()
-        tokenizer = get_tokenizer()
-
         tokens_ = text.long()
         labels = tokens_[1:].contiguous()
         tokens = tokens_[:-1].contiguous()
 
-        attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+        attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
          tokens,
-         tokenizer.eod,
-         args.reset_position_ids,
-         args.reset_attention_mask,
-         args.eod_mask_loss)
+         getattr(self.config,"eod_id"),
+         getattr(self.config,"reset_position_ids"),
+         getattr(self.config,"reset_attention_mask"),
+         getattr(self.config,"eod_mask_loss"))
 
         if getattr(self.config, "return_document_ids"):
             return {"tokens": tokens,"labels": labels,"attention_mask": attention_mask,"loss_mask": loss_mask,"position_ids": position_ids,"document_ids": document_ids}
@@ -480,3 +473,52 @@ def _build_shuffle_index(
     numpy_random_state.shuffle(shuffle_idx_last)
 
     return numpy.concatenate((shuffle_idx_first, shuffle_idx_last))
+
+def _get_ltor_masks_and_position_ids(data,
+                                     eod_token,
+                                     reset_position_ids,
+                                     reset_attention_mask,
+                                     eod_mask_loss):
+    """Build masks and position id for left to right model."""
+
+    # Extract batch size and sequence length.
+    seq_length = data.numel()
+
+    attention_mask = torch.tril(torch.ones((seq_length, seq_length),device=data.device)).unsqueeze(0)
+
+    # Loss mask.
+    loss_mask = torch.ones(seq_length, dtype=torch.float, device=data.device)
+    if eod_mask_loss:
+        loss_mask[data == eod_token] = 0.0
+
+    # Position ids.
+    position_ids = torch.arange(seq_length, dtype=torch.long,
+                                device=data.device)
+    # We need to clone as the ids will be modifed based on batch index.
+    if reset_position_ids:
+        position_ids = position_ids.clone()
+
+    if reset_position_ids or reset_attention_mask:
+
+        # Find indecies where EOD token is.
+        eod_index = position_ids[data[b] == eod_token]
+        # Detach indecies from positions if going to modify positions.
+        if reset_position_ids:
+            eod_index = eod_index.clone()
+
+        # Loop through EOD indecies:
+        prev_index = 0
+        for j in range(eod_index.numel()):
+            i = eod_index[j]
+            # Mask attention loss.
+            if reset_attention_mask:
+                attention_mask[ 0, (i + 1):, :(i + 1)] = 0
+            # Reset positions.
+            if reset_position_ids:
+                position_ids[ (i + 1):] -= (i + 1 - prev_index)
+                prev_index = i + 1
+
+    # Convert attention mask to binary:
+    attention_mask = (attention_mask < 0.5)
+
+    return attention_mask, loss_mask, position_ids

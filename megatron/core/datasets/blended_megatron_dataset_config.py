@@ -97,6 +97,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     return_document_ids: bool = False
+    reset_position_ids: bool = False
+    reset_attention_mask: bool = False
+    eod_mask_loss: bool = False
+    eod_id: int = 0
 
 
 def _parse_and_normalize_split(split: str) -> List[float]:

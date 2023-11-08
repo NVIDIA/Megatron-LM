@@ -20,8 +20,8 @@ from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
 from megatron.core.transformer.spec_utils import import_module
 from megatron.utils import (
-    get_ltor_masks_and_position_ids,
     get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
     average_losses_across_data_parallel_group
 )
 from megatron.arguments import core_transformer_config_from_args
@@ -91,18 +91,8 @@ def get_batch(data_iterator):
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    if data_iterator is not None:
-        data = next(data_iterator)
-    else:
-        data = None
-
-    batch = {
-        'tokens': data["tokens"].cuda(non_blocking = True),
-        'labels': data["labels"].cuda(non_blocking = True),
-        'loss_mask': data["loss_mask"].cuda(non_blocking = True),
-        'attention_mask': data["attention_mask"].cuda(non_blocking = True),
-        'position_ids': data["position_ids"].cuda(non_blocking = True)
-    }
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(data_iterator) 
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
@@ -164,7 +154,7 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def is_dataset_built_on_rank():
-    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage())
+    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and mpu.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
@@ -176,7 +166,11 @@ def core_gpt_dataset_config_from_args(args):
         blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         split=args.split,
         path_to_cache=args.data_cache_path,
-        return_document_ids=args.retro_return_doc_ids
+        return_document_ids=args.retro_return_doc_ids,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        eod_id=get_tokenizer().eod
     )
 
 
