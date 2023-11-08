@@ -30,7 +30,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.training import get_model
 from tools.retro.text_generation.retro_api import retro_generate_and_post_process, retro_beam_search_and_post_process
 from tools.retro.sft.sft_retro import get_tasks_args
-from tools.retro.sft.dataset_conv import reformat_prompt_v2, preprocess
+from tools.retro.sft.dataset_conv import reformat_prompt_v2, preprocess, reformat_prompt_short
 import numpy as np
 import time
 import megatron.model
@@ -229,7 +229,12 @@ def generate_samples_conditional(model):
                     # print("neighbours_array", neighbours_array)
                     print("neighbours_array.shape", neighbours_array.shape)
                     tokenizer = get_tokenizer()
-                    input_tokens = reformat_prompt_v2(query, neighbours, args.task, args.ft_neighbours, max_target_len,
+
+                    if args.short_format:
+                        input_tokens = reformat_prompt_short(query, neighbours, args.task, args.ft_neighbours, max_target_len,
+                                                      tokenizer, args.seq_length)
+                    else:
+                        input_tokens = reformat_prompt_v2(query, neighbours, args.task, args.ft_neighbours, max_target_len,
                                                       tokenizer, args.seq_length, template_id=args.template_id)
                     # input_tokens = reformat_prompt_v1(query, neighbours, args.task, args.ft_neighbours, max_target_len, tokenizer, args.seq_length)
                     raw_text = tokenizer.detokenize(input_tokens)

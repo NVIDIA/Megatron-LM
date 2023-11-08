@@ -13,41 +13,32 @@ TASK=none
 train_iters=1000
 
 
-DATA_HOME="<path/to/instruction/tuning/data/directory>"
+DATA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/"
 data_folder="$DATA_HOME"
 
-SFT_HOME="<path/to/megatron/repo>"
+SFT_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
 
-TOKENIZER_MODEL="<path/to/gpt/tokenizer/model>"
-
-RETRO_WORKDIR="<path/to/retro/workdir>"
-
-K=2
-
-PRETRAINED_CHECKPOINT=${ckpt}
-
-SAVENAME="retro-${blend_name}_${model_card}_same_format_ctx${ft_neighbours}_${model_size}_${global_bsz}_${lr}"
-CHECKPOINT_PATH="${SFT_HOME}/checkpoints/applications/${SAVENAME}"
-TENSORBOARD_DIR="${SFT_HOME}/tensorboard/${SAVENAME}"
-mkdir -p ${TENSORBOARD_DIR}
-
-. ./tools/retro/sft/"${blend_name}".sh
+TOKENIZER_MODEL="/lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model"
 
 
 if [[ $model_size == "843m" ]]; then
-    # model param
     mod_par=1
     layers=24
     hid_dim=1024
     heads=16
     pip_par=1
-
-    # node param
-    num_nodes=1
-    lr=5e-6
-    min_lr=5e-6
 fi
 
+if [[ $model_size == "43b" ]]; then
+    mod_par=8
+    layers=48
+    hid_dim=8192
+    heads=64
+    pip_par=4
+    if [[ $model_card == *pp1* ]]; then
+        pip_par=1
+    fi
+fi
 
 GPT_ARGS="--apply-layernorm-1p \
         --untie-embeddings-and-output-weights \
@@ -75,14 +66,39 @@ GPT_ARGS="--apply-layernorm-1p \
         --log-params-norm \
         --log-num-zeros-in-grad \
         --bf16 \
-        --use-distributed-optimizer \
 "
+
+if [[ $model_card == *pp1* ]]; then
+    GPT_ARGS+=" --use-distributed-optimizer"
+fi
 
 FT_ARGS="--eod-mask-loss \
     --answer-loss-only \
     --ft_neighbours ${ft_neighbours} \
     --task $TASK"
 
+num_nodes=1
+num_gpus=8
+
+if [[ $model_size == "843m" ]]; then
+    num_nodes=1
+    lr=5e-6
+    min_lr=5e-6
+fi
+
+
+if [[ $model_size == "43b" ]]; then
+    num_nodes=64
+    lr=5e-6
+    min_lr=5e-6
+fi
+
+PRETRAINED_CHECKPOINT=${ckpt}
+
+SAVENAME="retro-${blend_name}_${model_card}_same_format_ctx${ft_neighbours}_${model_size}_${global_bsz}_${lr}"
+CHECKPOINT_PATH="${SFT_HOME}/checkpoints/applications/${SAVENAME}"
+TENSORBOARD_DIR="${SFT_HOME}/tensorboard/${SAVENAME}"
+mkdir -p ${TENSORBOARD_DIR}
 
 OUTPUT_ARGS="--log-interval 10 \
              --save-interval 500 \
@@ -90,6 +106,11 @@ OUTPUT_ARGS="--log-interval 10 \
              --tensorboard-dir ${TENSORBOARD_DIR} \
              --log-validation-ppl-to-tensorboard \
              --eval-iters 100"
+
+. ./tools/retro/sft/tests/${blend_name}.sh
+
+RETRO_WORKDIR=/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm
+K=2
 
 options=" \
     $GPT_ARGS \

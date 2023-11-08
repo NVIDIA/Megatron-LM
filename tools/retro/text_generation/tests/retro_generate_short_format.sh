@@ -80,6 +80,12 @@ if [[ $TASK == "nq" ]]; then
     DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/NQ"
 fi
 
+if [[ $TASK == "tqa" ]]; then
+    sample_input_file="/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/TQA/${split}.json"
+    fewshot_input_file="${FEWSHOT_INPUT_FOLDER}/single-turn-qa/TQA/fewshot_samples.json"
+    DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/TQA"
+fi
+
 if [[ $TASK == "doc2dial" ]]; then
     DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/$TASK"
     sample_input_file="/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/$TASK/${TASK}_ftdragon_chatgptgen7k_chunk150_QA_test.json"
@@ -96,7 +102,7 @@ if [[ $sampling == "beam" ]]; then
 fi
 
 CHECKPOINT_PATH=${ckpt}
-sample_output_file="${CHECKPOINT_PATH}/retro-generate-${TASK}_${ft_neighbours}_${K}_${model_size}_${split}_${sampling}_${gen_start}_${num_gen}_${ckpt_step}.txt"
+sample_output_file="${CHECKPOINT_PATH}/retro-generate-short-${TASK}_${ft_neighbours}_${K}_${model_size}_${split}_${sampling}_${gen_start}_${num_gen}_${ckpt_step}.txt"
 
 DIR=`pwd`
 
@@ -115,6 +121,7 @@ GEN_ARGS="$SAMPLE_ARGS \
           --retro-num-neighbors ${K} \
           --reuse-top \
           --retro-attention-gate 0 \
+          --short-format \
           "
 
 if [[ $retrieve == 1 ]]; then

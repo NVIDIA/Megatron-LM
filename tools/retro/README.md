@@ -111,43 +111,55 @@ bash tools/retro/examples/pretrain_model.sh
 
 ## Step 4: Instruction tuning
 
-In this step, we fine-tune the pretrained model on the downstream task with instructions. We provide a template instruction tuning script to fine-tune 800M Retro on an open-source blend of instruction tuning datasets. The dataset is available to download through the Google Drive link. The blendable dataset consists of the following open-source instruction tuning datasets:
+In this step, we fine-tune the pretrained model on the downstream task with instructions. We provide a template instruction tuning script to fine-tune 800M Retro.
 
-### Dataset Breakdown
-| Dataset                |Samples|Epochs|Sampling Prob|
-|------------------------|------:|-----:|------------:|
-| soda                   |      2560 |  0.005| 0.020|
-| eli5                   |      1536 |  0.017| 0.012|
-| eli5                   |       604 |  0.019| 0.005|
-| eli5                   |       421 |  0.019| 0.003|
-| self_instruct_short    |      1280 |  0.043| 0.010|
-| self_instruct_long     |      2560 |  0.333| 0.020|
-| unnatural-instructions |      2560 |  0.024| 0.020|
-| flan_cot               |      1280 |  0.093| 0.010|
-| dolly                  |      6400 |  0.938| 0.050|
-| oasst-skip-noncode     |    104558 |  1.839| 0.817|
-| oasst-skip-code        |      4243 |  1.839| 0.033|
+We also provide an open-source blend of instruction tuning datasets. The dataset is available to download through the [Google Drive link](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing). The blendable dataset consists of the following open-source instruction tuning datasets:
+
+### Instruction Tuning Dataset Breakdown
+| Dataset                                                    | Samples | Epochs | Sampling Prob |
+|------------------------------------------------------------|--------:|-------:|--------------:|
+| [soda](https://arxiv.org/abs/2212.10465)                   |    2560 |  0.005 |         0.020 |
+| [eli5](https://arxiv.org/abs/1907.09190)                   |    2561 |  0.055 |         0.020 |
+| [self_instruct_short](https://arxiv.org/abs/2212.10560)    |    1280 |  0.043 |         0.010 |
+| [self_instruct_long](https://arxiv.org/abs/2212.10560)     |    2560 |  0.333 |         0.020 |
+| [unnatural-instructions](https://arxiv.org/abs/2212.09689) |    2560 |  0.024 |         0.020 |
+| [flan_cot](https://arxiv.org/abs/2210.11416)               |    1280 |  0.093 |         0.010 |
+| [dolly](https://arxiv.org/abs/2305.13735)                  |    6400 |  0.938 |         0.050 |
+| [oasst-skip-noncode](https://open-assistant.io/)           |  104558 |  1.839 |         0.817 |
+| [oasst-skip-code](https://open-assistant.io/)              |    4243 |  1.839 |         0.033 |
+
+Refer to the paper links above for more details about each instruction tuning dataset.
+
+*We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus 1-2% accuracy difference in downstream tasks may be expected.*  
+
 ### Instruction tuning script
-Download the blendable dataset in your data home directory `$DATA_HOME` and update our templates in `tools/retro/sft/sft_retro_lm.sh`.
+Download the [blended instruction tuning dataset]((https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing)) in your data home directory `$DATA_HOME` and update our templates in `tools/retro/sft/sft_retro_lm.sh`.
 
 An example command to run instruction tuning on 800M Retro is as follows:
 ```bash
                                       [blend-dataset-name] [model-size] [batch-size]  [lr]    [checkpoints]
-bash tools/retro/sft/sft_retro_lm.sh         sft               843m            128    5e-6  <path/to/pretrained/retro>  
+bash tools/retro/sft/sft_retro_lm.sh       open_inst               843m            128    5e-6  <path/to/pretrained/retro>  
 ```
 
+The `blend_dataset_name` argument will blend all the datasets within the `$DATA_HOME$` following the weights and configurations specified in the `${blend_dataset_name}$.sh` (`open_inst.sh` in the example above).
 The checkpoints will be saved in the `--save` directory. For example, it will be saved to 
-`<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`.
+`<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6`. 
 
 ## Step 5: Downstream task evaluation
 
 In this step, we demonstrate how to run InstructRetro for zero-shot evaluation on downstream question answering (QA) tasks. 
 
+We present an example command to run retro generation given the InstructRetro checkpoints and the Natural Question (NQ) task. The example command is for the 843m InstructRetro obtained in Step 4. Please specify the directory for the NQ dataset and update the command accordingly for other checkpoints.  
 
 ```bash
-bash tools/retro/text_generation/retro_generate.sh nq 43b greedy test  0 20000 1000 5 pp1 /lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM/checkpoints/applications/retro-open_inst_pp1_same_format_ctx1_43b_128_5e-6 2
-bash tools/retro/text_generation/retro_generate.sh nq 43b greedy test  0 20000 1000 5 pp1 /lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM/checkpoints/applications/retro-qc_pp1_same_format_ctx1_43b_128_5e-6 2
-bash tools/retro/text_generation/retro_generate.sh nq 43b greedy test  0 20000 1000 5 pp1 /lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM/checkpoints/applications/retro-sft_pp1_same_format_ctx1_43b_128_5e-6 2
+bash tools/retro/text_generation/retro_generate.sh nq 843m greedy test  0 20000 1000 5 pp1 <SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6 2
+```
 
-bash tools/retro/text_generation/retro_generate.sh nq 843m greedy test  0 20000 500 5 pp1 /lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6 2
+The generated responses will be saved in the corresponding checkpoint directory. For example, for the 843m InstructRetro, it will be saved to 
+`<SFT_HOME>/checkpoints/applications/retro-sft_pp1_same_format_ctx1_843m_128_5e-6/retro-generate-nq_5_2_843m_test_greedy_0_20000_1000.txt`.
+
+To evaluate the F1 / Exact Match (EM) scores of the generated responses, we provide an example script to run the evaluation on the NQ dataset. Please specify the directory for the NQ dataset and update the command accordingly for other checkpoints and downstream tasks.  
+
+```bash
+python3 tools/retro/text_generation/evaluate.py
 ```
