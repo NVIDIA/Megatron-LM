@@ -114,10 +114,6 @@ class TransformerBlock(MegatronModule):
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel,
-                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                normalization=self.config.normalization,
             )
 
     def _get_layer(self, layer_number):

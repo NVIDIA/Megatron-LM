@@ -438,6 +438,11 @@ def core_transformer_config_from_args(args):
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
+    if args.squared_relu:
+        assert not args.swiglu
+        def squared_relu(x):
+            return torch.pow(F.relu(x), 2)
+        kw_args['activation_func'] = squared_relu
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1033,9 +1038,9 @@ def _add_mixed_precision_args(parser):
                        help='hysteresis for dynamic loss scaling')
     group.add_argument('--fp32-residual-connection', action='store_true',
                        help='Move residual connections to fp32.')
-    group.add_argument('--no-query-key-layer-scaling', action='store_false',
-                       help='Do not scale Q * K^T by 1 / layer-number.',
-                       dest='apply_query_key_layer_scaling')
+    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
+                       help='Scale Q * K^T by 1 / layer-number. '
+                       'Useful for fp16 training.')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
                        help='Run attention masking and softmax in fp32. '
                        'This flag is ignored unless '
@@ -1112,6 +1117,11 @@ def _add_distributed_args(parser):
                        help='Degree of expert model parallelism.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
+    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
+                       help='Path to the yaml file with NCCL communicator '
+                       'configurations. The number of min/max thread groups and thread '
+                       'group cluster size of each communicator can be configured by '
+                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     return parser
 
 

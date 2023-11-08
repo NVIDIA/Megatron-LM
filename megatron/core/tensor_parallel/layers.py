@@ -202,6 +202,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        assert not torch.any(
+            (input_ < 0) | (input_ >= self.num_embeddings)
+        ), "An input token is out of bounds of the embedding table"
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
@@ -224,7 +227,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs 
     mathematically-identical forward and DGRAD. 
-    
+
     Conceptually this op is the same as torch.nn.functional.linear with
     weight.requires_grad==False, but in experiments they are not identical 
     mathematically. """
@@ -801,11 +804,11 @@ class RowParallelLinear(torch.nn.Module):
         *,
         config: ModelParallelConfig,
         init_method: Callable,
-        bias: bool = True,
-        input_is_parallel: bool = False,
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
         stride: int = 1,
         keep_master_weight_for_test: bool = False,
-        skip_bias_add: bool = False,
         is_expert: bool = False,
     ):
         super(RowParallelLinear, self).__init__()

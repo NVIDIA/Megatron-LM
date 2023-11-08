@@ -594,6 +594,89 @@ train.bert.345m_tp1_pp4_interleaved_1node_50steps:
     MAX_STEPS: 50
     TEST_LEVEL: MR_TESTS
 
+train.bert_core.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert_core.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert_core.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert_core.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+
+train.bert_core.345m_tp1_pp2_1node_50steps_rope:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: rope_embeddings
+    ADDITIONAL_PARAMS: "--position-embedding-type rope"
+
+train.bert_core.345m_tp1_pp2_1node_50steps_sequence_parallel:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: sequence_parallel
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
 resume.checkpoint.bert.345m_tp1_pp2_1node:
   <<: *selene-test-resume-checkpoint-launcher
   variables:
