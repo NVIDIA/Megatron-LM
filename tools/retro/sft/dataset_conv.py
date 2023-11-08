@@ -401,6 +401,28 @@ def reformat_prompt_v2(query, neighbours, dataset_name, ft_neighbours, \
     return input_tokens
 
 
+def reformat_prompt_short(query, neighbours, dataset_name, ft_neighbours, \
+                       max_output_len, tokenizer, max_seq_length):
+
+    if not query.endswith("?"):
+        query = query + "?"
+    query = "Question: {} Answer: The answer is".format(query)
+
+    if ft_neighbours > 0:
+        context = "\n\n".join(neighbours[0:ft_neighbours]) + "\n\n"
+        context_tokens = tokenizer.tokenize(context)
+        dialogue_tokens = tokenizer.tokenize(query)
+        context_tokens = context_tokens[:max_seq_length - max_output_len - len(dialogue_tokens)]
+        context = tokenizer.detokenize(context_tokens)
+        all_input = context + query
+        input_tokens = tokenizer.tokenize(all_input)
+    else:
+        all_input = query
+        input_tokens = tokenizer.tokenize(all_input)
+
+    return input_tokens
+
+
 def reformat_prompt_with_fewshot_samples(query, neighbours, dataset_name, ft_neighbours, fewshot_list, \
                                          max_output_len, tokenizer, max_seq_length, multiturn_max_fewshot=3):
     # system = "System: This is a chat between a user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n"
