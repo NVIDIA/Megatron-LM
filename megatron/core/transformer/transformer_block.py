@@ -85,14 +85,14 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: Union[TransformerBlockSubmodules, ModuleSpec],
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
         post_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, submodules)
+        self.submodules = _get_block_submodules(config, spec)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process

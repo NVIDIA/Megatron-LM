@@ -53,7 +53,7 @@ class FusedLayerNorm(torch.nn.Module):
 
     def __init__(
         self,
-        config=TransformerConfig,
+        config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
         persist_layer_norm: bool = True,

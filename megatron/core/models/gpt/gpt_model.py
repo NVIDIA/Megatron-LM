@@ -82,7 +82,7 @@ class GPTModel(LanguageModule):
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            submodules=transformer_layer_spec,
+            spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )

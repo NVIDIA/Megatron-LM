@@ -93,8 +93,7 @@ class BertModel(LanguageModule):
         # Transformer.
         self.encoder = TransformerBlock(
             config=self.config,
-            transformer_layer_spec=self.transformer_layer_spec,
-            self_attn_mask_type=AttnMaskType.padding,
+            spec=self.transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )

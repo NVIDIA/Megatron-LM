@@ -80,7 +80,7 @@ def get_retro_decoder_layer_local_spec(encoder_block_spec: ModuleSpec = None) ->
             linear_q=ColumnParallelLinear,
             linear_kv=ColumnParallelLinear,
             core_attention=DotProductAttention,
-            linear_proj=ModuleSpec(module=RowParallelLinear, params={"input_is_parallel": True},),
+            linear_proj=RowParallelLinear,
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroDecoderBiasDropoutAdd)
@@ -149,7 +149,8 @@ def get_retro_decoder_block_spec(
 
     # Block spec.
     block_spec = ModuleSpec(
-        module=TransformerBlock, submodules=TransformerBlockSubmodules(layer_specs=layer_specs),
+        module=TransformerBlock,
+        params={"spec": TransformerBlockSubmodules(layer_specs=layer_specs)},
     )
 
     return block_spec

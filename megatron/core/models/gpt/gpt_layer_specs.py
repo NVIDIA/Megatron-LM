@@ -55,9 +55,7 @@ def get_gpt_layer_local_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=ModuleSpec(
-                        module=RowParallelLinear, params={"input_is_parallel": True},
-                    ),
+                    linear_proj=RowParallelLinear,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
