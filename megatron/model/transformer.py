@@ -1056,7 +1056,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         if self.is_first_layer:
-            hidden_states = drop(hidden_states)
+            hidden_states = drop(hidden_states, batch_dim=1)
         norm_output = self.input_norm(hidden_states)
 
         # Self attention.
@@ -1177,7 +1177,7 @@ class ParallelTransformerLayer(MegatronModule):
             return output, retriever_output
         else:
             if self.is_last_layer:
-                output = gather(output)
+                output = gather(output, batch_dim=1)
             return output
 
 

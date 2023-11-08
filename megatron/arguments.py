@@ -40,6 +40,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
+    parser = _add_amd_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -1301,5 +1302,14 @@ def _add_experimental_args(parser):
                             'layer implementation. For more details, check the'
                             '`transformer_layer.py` file that details the use '
                             'of spec based customization.')
+    return parser
+
+
+def _add_amd_args(parser):
+    group = parser.add_argument_group(title='AMD')
+    group.add_argument('--use-amd',
+                       action='store_true', default=False,
+                       help='Flag to indicate that AMD GPUs are being used.'
+                            'This will disable incompatible CUDA specific features.')
     return parser
 

@@ -89,7 +89,8 @@ def pretrain(train_valid_test_dataset_provider,
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    if not get_args().use_amd:
+        set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
