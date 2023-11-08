@@ -48,7 +48,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Distributed Optimizer](#distributed-optimizer)
       * [FlashAttention](#flashattention)
       * [GPT-3 Example](#gpt-3-example)
-      * [Retro](#retro-and-instructretro)
+      * [Retro and InstructRetro](#retro-and-instructretro)
    * [Evaluation and Tasks](#evaluation-and-tasks)
       * [GPT Text Generation](#gpt-text-generation)
       * [GPT Evaluation](#gpt-evaluation)
