@@ -2,6 +2,7 @@
 
 import numpy as np
 import torch
+from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.parallel_state import (
@@ -9,6 +10,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_data_parallel_rng_tracker_name
+from megatron.core.transformer import grouped_gemm_util as gg
+from megatron.core.tensor_parallel.layers import _initialize_affine_weight_gpu
+from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer import grouped_gemm_util as gg
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -32,6 +36,19 @@ def sinkhorn(cost, tol=0.0001):
         d1_old = d1
     return d1 * cost * d0.unsqueeze(1)
 
+class ScaleGradient(torch.autograd.Function):
+
+    @staticmethod
+    @torch.cuda.amp.custom_fwd
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    @torch.cuda.amp.custom_bwd
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+scale_gradient = ScaleGradient.apply
 
 def get_router_linear_layer(config):
     router = torch.nn.Linear(config.hidden_size, config.num_moe_experts, bias=False)
@@ -68,19 +85,68 @@ class SwitchMLP(MegatronModule):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
 
-        self.local_experts = torch.nn.ModuleList()
-        self.fc1_grouped_weight = []
-        self.fc2_grouped_weight = []
-        for _ in range(self.num_local_experts):
-            expert = MLP(self.config, submodules, is_expert=True)
-            self.fc1_grouped_weight.append(expert.linear_fc1.weight)
-            self.fc2_grouped_weight.append(expert.linear_fc2.weight)
-            self.local_experts.append(expert)
-        # fc1_grouped_weight: [num_local_experts, ffn_hidden_size, hidden_size]
-        # fc2_grouped_weight: [num_local_experts, hidden_size, ffn_hidden_size]
-        self.fc1_grouped_weight = torch.stack(self.fc1_grouped_weight)
-        self.fc2_grouped_weight = torch.stack(self.fc2_grouped_weight)
-        self.activation_func = self.local_experts[0].activation_func
+        if not self.config.moe_grouped_gemm:
+            self.local_experts = torch.nn.ModuleList()
+            for _ in range(self.num_local_experts):
+                expert = MLP(self.config, submodules, is_expert=True)
+                self.local_experts.append(expert)
+        else:
+            self.expert_parallel = config.expert_model_parallel_size > 1
+            self.gradient_scale = 1 / parallel_state.get_tensor_and_expert_parallel_world_size()
+            if self.config.gated_linear_unit:
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                self.activation_func = glu
+            else:
+                self.activation_func = self.config.activation_func
+
+            assert not config.use_cpu_initialization
+            # How many feature each rank holds
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            ffn_hs_per_expert_per_partition = divide(self.config.ffn_hidden_size, tp_size)
+            output_size_per_partition = self.num_local_experts * ffn_hs_per_expert_per_partition
+            fc1_output_size_per_partition = output_size_per_partition
+            if config.gated_linear_unit:
+                fc1_output_size_per_partition *= 2
+
+            self.weight1 = Parameter(
+                torch.empty(
+                    fc1_output_size_per_partition,
+                    self.config.hidden_size,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            )
+            self.weight2 = Parameter(
+                torch.empty(
+                    output_size_per_partition,
+                    self.config.hidden_size,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            )
+            if config.perform_initialization:
+                _initialize_affine_weight_gpu(
+                    self.weight1,
+                    config.init_method,
+                    partition_dim=0,
+                    expert_parallel=self.expert_parallel,
+                )
+                _initialize_affine_weight_gpu(
+                    self.weight2,
+                    config.output_layer_init_method,
+                    partition_dim=0,
+                    expert_parallel=self.expert_parallel,
+                )
+            setattr(self.weight1, 'allreduce', not self.expert_parallel)
+            setattr(self.weight2, 'allreduce', not self.expert_parallel)
+
+    def scale_grad(self, w):
+        if self.gradient_scale is None:
+            return w
+        return scale_gradient(w, self.gradient_scale)
 
     def gather_indices(self, local_indices):
         """ Gather tensors and concatenate along the first dimension."""
@@ -129,35 +195,11 @@ class SwitchMLP(MegatronModule):
             global_hidden_states = hidden_states
             global_indices = max_ind
 
-        if self.config.moe_grouped_gemm:
-            with torch.no_grad():
-                sorted, indices = torch.sort(global_indices, stable=True)
-                # Permutation of tokens
-                sorted_global_hidden_states = global_hidden_states[indices]
-                # Histogram the expert ids to identify the number of tokens routed to each expert
-                # Note that for np.histogram, all but the last (righthand-most) bin is half-open.
-                tokens_per_expert, bin_edges = np.histogram(
-                    sorted.cpu(),
-                    bins=np.arange(self.config.num_moe_experts + 1))
-                tokens_per_expert = torch.tensor(tokens_per_expert)
-                reverse_indices = indices.argsort()
-            fc1_output = gg.ops.gmm(
-                sorted_global_hidden_states,
-                self.fc1_grouped_weight,
-                tokens_per_expert,
-                trans_b=True)
-            intermediate_parallel = self.activation_func(fc1_output)
-            fc2_output = gg.ops.gmm(
-                intermediate_parallel,
-                self.fc2_grouped_weight,
-                tokens_per_expert,
-                trans_b=True)
-            # Un-permutation of tokens
-            output_total = fc2_output[reverse_indices]
-        else:
+        if not self.config.moe_grouped_gemm:
             output_total = torch.zeros_like(global_hidden_states)
             if self.add_bias:
                 output_bias_total = torch.zeros_like(global_hidden_states)
+
 
             for expert_num, expert in enumerate(self.local_experts):
                 local_expert_index = self.local_expert_indices[expert_num]
@@ -169,6 +211,39 @@ class SwitchMLP(MegatronModule):
                 if self.add_bias:
                     output_bias = output_bias.expand_as(output)
                     output_bias_total[local_indices, :] = output_bias
+        else:
+            with torch.no_grad():
+                sorted, indices = torch.sort(global_indices, stable=True)
+                # Permutation of tokens
+                sorted_global_hidden_states = global_hidden_states[indices]
+                # Histogram the expert ids to identify the number of tokens routed to each expert
+                # Note that for np.histogram, all but the last (righthand-most) bin is half-open.
+                tokens_per_expert, bin_edges = np.histogram(
+                    sorted.cpu(),
+                    bins=np.arange(self.config.num_moe_experts + 1))
+                tokens_per_expert = torch.tensor(tokens_per_expert).to(torch.long)
+                reverse_indices = indices.argsort()
+
+            w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
+            # Reshape the weights for the grouped GEMMs.
+            w1 = w1.view(self.num_local_experts, -1, self.config.hidden_size)
+            w2 = w2.view(self.num_local_experts, -1, self.config.hidden_size)
+
+            fc1_output = gg.ops.gmm(
+                sorted_global_hidden_states,
+                w1,
+                tokens_per_expert,
+                trans_b=True)
+
+            intermediate_parallel = self.activation_func(fc1_output)
+
+            fc2_output = gg.ops.gmm(
+                intermediate_parallel,
+                w2,
+                tokens_per_expert,
+                trans_b=False)
+            # Un-permutation of tokens
+            output_total = fc2_output[reverse_indices]
 
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
