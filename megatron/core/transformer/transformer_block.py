@@ -144,10 +144,6 @@ class TransformerBlock(MegatronModule):
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel,
-                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                normalization=self.config.normalization,
             )
 
     def _get_layer(self, layer_number: int):
@@ -300,9 +296,7 @@ class TransformerBlock(MegatronModule):
             )
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=self.config.context_parallel_size > 1
-                )
+                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )

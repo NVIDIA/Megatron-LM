@@ -21,12 +21,12 @@ from megatron.global_vars import set_global_variables
 from megatron.model.transformer import bias_dropout_add_fused_train
 from megatron.model.fused_bias_gelu import bias_gelu
 
-
 def initialize_megatron(
     extra_args_provider=None,
     args_defaults={},
     ignore_unknown_args=False,
     allow_no_cuda=False,
+    skip_mpu_initialization=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -64,6 +64,9 @@ def initialize_megatron(
             print("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init)
 
+    if skip_mpu_initialization:
+        return None
+
     args = get_args()
     if args.lazy_mpu_init:
         # TODO is this still a necessary option?
@@ -84,6 +87,9 @@ def initialize_megatron(
 
         # Compile dependencies.
         _compile_dependencies()
+
+        if args.tp_comm_overlap:
+           _initialize_tp_communicators()
 
         # No continuation function
         return None
@@ -161,6 +167,36 @@ def _compile_dependencies():
             flush=True,
         )
 
+def _initialize_tp_communicators():
+    """ initializing the communicators with user buffers for high-performance tensor-model-parallel 
+        communication overlap """
+
+    try:
+       import yaml
+
+       import transformer_engine
+       from transformer_engine.pytorch import module as te_module
+
+    except ImportError:
+       raise RuntimeError("Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
+             "'transformer_engine' packages") 
+
+    args = get_args()
+
+    if args.tp_comm_overlap_cfg is not None:
+       with open(args.tp_comm_overlap_cfg,"r") as stream:    
+          ub_cfgs = yaml.safe_load(stream)
+    else:
+       ub_cfgs = {}
+
+    input_shape = [args.seq_length * args.micro_batch_size , args.hidden_size]
+
+    #We create a MPI process group, which is needed to bootstrap the pipelined 
+    #tensor-model-parallel communication overlap
+    torch.distributed.new_group(backend='mpi')
+
+    te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size, 
+                                 use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs,)
 
 def _initialize_distributed():
     """Initialize torch.distributed and core model parallel."""
@@ -211,7 +247,9 @@ def _initialize_distributed():
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                context_parallel_size=args.context_parallel_size,
                 expert_model_parallel_size=args.expert_model_parallel_size,
+                nccl_communicator_config_path=args.nccl_communicator_config_path,
             )
             if args.rank == 0:
                 print(

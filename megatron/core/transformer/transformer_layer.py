@@ -53,12 +53,9 @@ class TransformerLayer(MegatronModule):
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             submodules.input_layernorm,
+            config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization,
         )
 
         ## [Module 2: SelfAttention]
@@ -75,10 +72,6 @@ class TransformerLayer(MegatronModule):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization,
         )
 
         ## [Module 5: CrossAttention]
@@ -95,10 +88,6 @@ class TransformerLayer(MegatronModule):
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization,
         )
 
         ## [Module 8: MLP block]

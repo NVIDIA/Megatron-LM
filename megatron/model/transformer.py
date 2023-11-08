@@ -128,8 +128,8 @@ class ParallelMLP(MegatronModule):
             config=config,
             init_method=config.output_layer_init_method,
             bias=self.add_bias,
-            input_is_parallel=True,
             skip_bias_add=True,
+            input_is_parallel=True,
             is_expert=is_expert,
         )
 

@@ -18,22 +18,6 @@ class LanguageModule(MegatronModule):
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config=config)
 
-    def set_input_tensor(self, input_tensor: Tensor) -> None:
-        """Sets input tensor to the model.
-
-        See megatron.model.transformer.set_input_tensor()
-
-        Args:
-            input_tensor (Tensor): Sets the input tensor for the model.
-        """
-        # This is usually handled in schedules.py but some inference code still
-        # gives us non-lists or None
-        if not isinstance(input_tensor, list):
-            input_tensor = [input_tensor]
-
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
-        self.decoder.set_input_tensor(input_tensor[0])
-
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 
@@ -100,3 +84,15 @@ class LanguageModule(MegatronModule):
                 "something is definitely wrong."
             )
             LanguageModule.embedding_warning_printed = True
+
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Gets the emedding weight or output logit weights when share embedding and output weights set to True.
+
+        Returns:
+            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
+        """
+        if self.pre_process:
+            return self.embedding.word_embeddings.weight
+        elif self.post_process:
+            return self.output_layer.weight
+        return None

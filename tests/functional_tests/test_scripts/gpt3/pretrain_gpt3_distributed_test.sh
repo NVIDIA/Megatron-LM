@@ -36,7 +36,6 @@ if [[ $USE_CORE -eq 1 ]]; then
        TRAINING_DTYPE=bf16
        command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
-       export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 fi
 
 if [[ $USE_TE -eq 1 ]]; then
@@ -93,6 +92,10 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
        --no-gradient-accumulation-fusion \
        ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
        --${TRAINING_DTYPE}"
+
+if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
+    torch_run_cmd+=" --apply-query-key-layer-scaling"
+fi
 
 command="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"

@@ -77,16 +77,19 @@ def validate_args(args, defaults={}):
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
-    assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
-        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
-        'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
-                           args.pipeline_model_parallel_size)
-    args.data_parallel_size = args.world_size // model_parallel_size
+    assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
+        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
+        'pipeline parallel size ({}) times context parallel size ({})'.format(
+        args.world_size, args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size, args.context_parallel_size)
+    args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel-size: {}, '
+              'context-parallel-size: {} '
               'tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
+                  args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
     if args.pipeline_model_parallel_size > 1:
@@ -95,6 +98,10 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
+
+    if args.tp_comm_overlap:
+        assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -432,6 +439,11 @@ def core_transformer_config_from_args(args):
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
         kw_args['bias_gelu_fusion'] = False
+    if args.squared_relu:
+        assert not args.swiglu
+        def squared_relu(x):
+            return torch.pow(F.relu(x), 2)
+        kw_args['activation_func'] = squared_relu
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -806,6 +818,22 @@ def _add_training_args(parser):
                        help='Gloable step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
+    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
+                       ' overlap of Tensor parallel communication and GEMM kernels.')
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+                       help = 'Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false', 
+                       help = 'Disables the All-Gather overlap with fprop GEMM.',
+                       dest='tp_comm_split_ag')
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
+                       dest='tp_comm_split_rs')
+    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false', 
+                       help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
+                       dest='tp_comm_bulk_dgrad')
+    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
+                       dest='tp_comm_bulk_wgrad')
 
 
     # deprecated
@@ -877,6 +905,22 @@ def _add_training_args(parser):
                        help='Use the implementation from megatron core')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
+    group.add_argument('--manual-gc', action='store_true',
+                       help='Disable the threshold-based default garbage '
+                       'collector and trigger the garbage collection manually. '
+                       'Manual garbage collection helps to align the timing of '
+                       'the collection across ranks which mitigates the impact '
+                       'of CPU-associated jitters. When the manual gc is enabled, '
+                       'garbage collection is performed only at the start and the '
+                       'end of the validation routine by default.')
+    group.add_argument('--manual-gc-interval', type=int, default=0,
+                       help='Training step interval to trigger manual garbage '
+                       'collection. When the value is set to 0, garbage '
+                       'collection is not triggered between training steps.')
+    group.add_argument('--no-manual-gc-eval', action='store_false',
+                       help='When using manual garbage collection, disable '
+                       'garbage collection at the start and the end of each '
+                       'evaluation run.', dest='manual_gc_eval')
 
     return parser
 
@@ -1006,9 +1050,9 @@ def _add_mixed_precision_args(parser):
                        help='hysteresis for dynamic loss scaling')
     group.add_argument('--fp32-residual-connection', action='store_true',
                        help='Move residual connections to fp32.')
-    group.add_argument('--no-query-key-layer-scaling', action='store_false',
-                       help='Do not scale Q * K^T by 1 / layer-number.',
-                       dest='apply_query_key_layer_scaling')
+    group.add_argument('--apply-query-key-layer-scaling', action='store_true',
+                       help='Scale Q * K^T by 1 / layer-number. '
+                       'Useful for fp16 training.')
     group.add_argument('--attention-softmax-in-fp32', action='store_true',
                        help='Run attention masking and softmax in fp32. '
                        'This flag is ignored unless '
@@ -1083,6 +1127,13 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--context-parallel-size', type=int, default=1,
+                       help='Degree of context parallelism.')
+    group.add_argument('--nccl-communicator-config-path', type=str, default=None,
+                       help='Path to the yaml file with NCCL communicator '
+                       'configurations. The number of min/max thread groups and thread '
+                       'group cluster size of each communicator can be configured by '
+                       'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     return parser
 
 

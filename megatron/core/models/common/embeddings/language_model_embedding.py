@@ -23,7 +23,8 @@ class LanguageModelEmbedding(MegatronModule):
         max_sequence_length (int): maximum size of sequence. This
                              is used for positional embedding
         add_position_embedding (bool): Add a position embedding.
-        embedding_dropout_prob float): dropout probability for embeddings
+        embedding_dropout_prob (float): dropout probability for embeddings
+        num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head . Defaults to 0.
     """
 
     def __init__(
@@ -32,6 +33,7 @@ class LanguageModelEmbedding(MegatronModule):
         vocab_size: int,
         max_sequence_length: int,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        num_tokentypes: int = 0,
     ):
         super().__init__(config=config)
 
@@ -39,6 +41,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
+        self.num_tokentypes = num_tokentypes
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
@@ -58,6 +61,16 @@ class LanguageModelEmbedding(MegatronModule):
             if self.config.perform_initialization:
                 self.config.init_method(self.position_embeddings.weight)
 
+        if self.num_tokentypes > 0:
+            self.tokentype_embeddings = torch.nn.Embedding(
+                self.num_tokentypes, self.config.hidden_size
+            )
+            # Initialize the token-type embeddings.
+            if self.config.perform_initialization:
+                self.config.init_method(self.tokentype_embeddings.weight)
+        else:
+            self.tokentype_embeddings = None
+
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
 
@@ -67,12 +80,16 @@ class LanguageModelEmbedding(MegatronModule):
         self.word_embeddings.weight.shared = True
         self.position_embeddings.weight.data.fill_(0)
         self.position_embeddings.weight.shared = True
+        if self.num_tokentypes > 0:
+            self.tokentype_embeddings.weight.data.fill_(0)
+            self.tokentype_embeddings.weight.shared = True
 
-    def forward(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
         """Forward pass of the embedding module
         Args:
             input_ids (Tensor): The input tokens
             position_ids (Tensor): The position id's used to calculate position embeddings
+            tokentype_ids (int): The token type ids. Used when args.bert_binary_head is set to True. Defaults to None
 
         Returns:
             Tensor: The output embeddings
@@ -86,6 +103,14 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
         embeddings = embeddings.transpose(0, 1).contiguous()
+
+        if tokentype_ids is not None:
+            assert self.tokentype_embeddings is not None
+            # [b s h] -> [s b h] (So that it can be added with embeddings)
+            tokentype_embedding = self.tokentype_embeddings(tokentype_ids).permute(1, 0, 2)
+            embeddings = embeddings + tokentype_embedding
+        else:
+            assert self.tokentype_embeddings is None
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
