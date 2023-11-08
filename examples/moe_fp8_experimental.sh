@@ -18,7 +18,7 @@ MERGE_FILE=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/merges.txt
 DATA_PATH=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
 
 WANDB_PROJECT=moe
-WANDB_EXP_NAME=moe_1p3b_16e_slimpj_test
+WANDB_EXP_NAME=moe_1p3b_16e_fp8_slimpj_test
 WANDB_SAVE_DIR=/workspace/wandb
 
 DISTRIBUTED_ARGS="
@@ -35,11 +35,11 @@ GPT_ARGS="
     --num-attention-heads 16 \
     --seq-length 2048 \
     --max-position-embeddings 2048 \
-    --micro-batch-size 12 \
+    --micro-batch-size 8 \
     --global-batch-size 960 \
     --lr 0.00015 \
-    --train-iters 500 \
-    --lr-decay-iters 320000 \
+    --train-iters 570000 \
+    --lr-decay-iters 450000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \
     --weight-decay 0.0 \
@@ -68,20 +68,19 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 1 \
-    --save-interval 5 \
-    --eval-interval 5 \
-    --eval-iters 10 
+    --log-interval 10 \
+    --save-interval 500 \
+    --eval-interval 500 \
+    --eval-iters 10 \
+    --wandb-project $WANDB_PROJECT \
+    --wandb-exp-name $WANDB_EXP_NAME \
+    --wandb-save-dir $WANDB_SAVE_DIR
 "
-    #--wandb-project $WANDB_PROJECT \
-    #--wandb-exp-name $WANDB_EXP_NAME \
-    #--wandb-save-dir $WANDB_SAVE_DIR
-#"
 
 torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
-    --distributed-backend nccl 
-   # --save $CHECKPOINT_PATH \
-   # --load $CHECKPOINT_PATH
+    --distributed-backend nccl \
+    --save $CHECKPOINT_PATH \
+    --load $CHECKPOINT_PATH
