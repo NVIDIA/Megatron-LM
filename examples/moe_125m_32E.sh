@@ -50,9 +50,9 @@ GPT_ARGS="
     --expert-model-parallel-size 8 \
     --recompute-granularity selective \
     --use-flash-attn \
-    --accumulate-allreduce-grads-in-fp32  
-    --attention-dropout 0.0 
-    --hidden-dropout 0.0
+    --accumulate-allreduce-grads-in-fp32 \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
     --swiglu
     "
     #--fp8-format hybrid 
@@ -82,6 +82,6 @@ torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
-    --distributed-backend nccl 
+    --distributed-backend nccl \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH
