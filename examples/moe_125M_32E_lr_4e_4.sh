@@ -78,7 +78,7 @@ OUTPUT_ARGS="
     --wandb-save-dir $WANDB_SAVE_DIR
 "
 
-torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
+torchrun $DISTRIBUTED_ARGS /opt/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
