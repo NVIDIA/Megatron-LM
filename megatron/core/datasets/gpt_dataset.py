@@ -3,17 +3,26 @@
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy
 import torch
 
-from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.utils import Split, log_single_rank
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(kw_only=True)
+class GPTDatasetConfig(BlendedMegatronDatasetConfig):
+    """Configuration object for Megatron Core blended and megatron GPT datasets
+    """
+
+    pass
 
 
 class GPTDataset(MegatronDataset):
@@ -70,14 +79,10 @@ class GPTDataset(MegatronDataset):
             idx (int): The index into the dataset
 
         Returns:
-            Dict[str, numpy.ndarray]: The text ids and (optionally) the document ids wrapped in a
-            dictionary
+            Dict[str, numpy.ndarray]: The text ids wrapped in a dictionary
         """
-        text, document_ids = self._query_document_sample_shuffle_indices(idx)
-        if getattr(self.config, "return_document_ids"):
-            return {"text": text, "document_ids": document_ids}
-        else:
-            return {"text": text}
+        text, _ = self._query_document_sample_shuffle_indices(idx)
+        return {"text": text}
 
     @staticmethod
     def is_multimodal() -> bool:
@@ -198,11 +203,8 @@ class GPTDataset(MegatronDataset):
             )
         )
 
-        num_tokens_per_epoch = _get_num_tokens_per_epoch(self.indexed_dataset, self.indexed_indices)
-
-        sequence_length = getattr(self.config, "sequence_length")
-
-        num_epochs = _get_num_epochs(num_tokens_per_epoch, sequence_length, self.num_samples)
+        num_tokens_per_epoch = self._get_num_tokens_per_epoch()
+        num_epochs = self._get_num_epochs(num_tokens_per_epoch)
 
         if not cache_hit and torch.distributed.get_rank() == 0:
             log_single_rank(
@@ -210,6 +212,8 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
+
+            sequence_length = getattr(self.config, "sequence_length")
 
             if num_epochs == 1:
                 separate_final_epoch = False
@@ -310,6 +314,13 @@ class GPTDataset(MegatronDataset):
             t_end = time.time()
             log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
+            log_single_rank(
+                logger, logging.INFO, f"> total number of samples: {sample_index.shape[0] - 1}"
+            )
+            log_single_rank(logger, logging.INFO, f"> total number of epochs: {num_epochs}")
+
+            return document_index, sample_index, shuffle_index
+
         log_single_rank(
             logger, logging.INFO, f"Load the {type(self).__name__} {self.index_split.name} indices"
         )
@@ -351,44 +362,31 @@ class GPTDataset(MegatronDataset):
 
         return document_index, sample_index, shuffle_index
 
+    def _get_num_tokens_per_epoch(self) -> int:
+        """Calculate the number of tokens in a single epoch
 
-def _get_num_tokens_per_epoch(indexed_dataset: MMapIndexedDataset, indices: numpy.ndarray) -> int:
-    """Calculate the number of tokens in a single epoch
+        Returns:
+            int: The number of tokens in a single epoch
+        """
+        return int(numpy.sum(self.indexed_dataset.sequence_lengths[self.indexed_indices]))
 
-    Args:
-        indexed_dataset (MMapIndexedDataset): The underlying MMapIndexedDataset
+    def _get_num_epochs(self, num_tokens_per_epoch: int) -> int:
+        """Calculate the number of epochs
 
-        indices (numpy.ndarray): The subset of indices into the underlying MMapIndexedDataset
+        Args:
+            num_tokens_per_epoch (int): The number of tokens in a single epoch
 
-    Returns:
-        int: The number of tokens in a single epoch
-    """
-    return numpy.sum(indexed_dataset.sequence_lengths[indices])
-
-
-def _get_num_epochs(num_tokens_per_epoch: int, seq_length: int, num_samples: int) -> int:
-    """Calculate the number of epochs
-
-    Args:
-        num_tokens_per_epoch (int): The number of tokens in a single epoch
-
-        seq_length (int): The sequence length in tokens
-
-        num_samples (int): The total number of samples
-
-    Returns:
-        int: The number of epochs
-    """
-    num_epochs = 0
-    num_tokens = 0
-    while True:
-        num_epochs += 1
-        num_tokens += num_tokens_per_epoch
-        # -1 is because we need to retrieve seq_length + 1 token each time
-        # but the last token will overlap with the first token of the next
-        # sample except for the last sample.
-        if ((num_tokens - 1) // seq_length) >= num_samples:
-            return num_epochs
+        Returns:
+            int: The number of epochs
+        """
+        num_epochs = 0
+        num_tokens = 0
+        num_tokens_requested = (self.num_samples * getattr(self.config, "sequence_length")) + 1
+        while True:
+            num_epochs += 1
+            num_tokens += num_tokens_per_epoch
+            if num_tokens >= num_tokens_requested:
+                return num_epochs
 
 
 def _build_document_index(

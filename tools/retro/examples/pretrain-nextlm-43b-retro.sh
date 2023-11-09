@@ -118,9 +118,6 @@ ARGS=" \
     --tokenizer-model /lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
     --data-path ${DATA_BLEND} \
     --split 98,2,0 \
-    --retro-split-constraint 99,1,0 \
-    --retro-split-constraint 98,2,0 \
-    --retro-fix-sub-epoch \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \

@@ -535,15 +535,6 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
-    group.add_argument("--retro-fix-sub-epoch", action="store_true",
-                       help="Fix the sub epoch issue for gpt dataset")
-    group.add_argument('--retro-split-constraint', nargs="*", action="extend",
-                       help='A split constraint intersects the document IDs '
-                       'between the primary \'--split\' and a secondary split '
-                       'to constrain which document IDs are available for each '
-                       'data group. The intersection is computed separately '
-                       'for the training, validation, and test datasets. Same '
-                       'format as \'--split\'.')
     group.add_argument("--retro-attention-gate", type=float, default=1,
                        help="Gated cross attention.")
     # Enforce argument naming convention.

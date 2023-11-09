@@ -67,7 +67,7 @@ class BlendedMegatronDatasetBuilder(object):
 
         if getattr(self.config, "blend"):
             blend = getattr(self.config, "blend")
-            split = getattr(self.config, "split_vector")
+            split = getattr(self.config, "split_matrix")
 
             # Blend consists of a single prefix
             if len(blend) == 1:
@@ -97,7 +97,7 @@ class BlendedMegatronDatasetBuilder(object):
             for i in range(len(megatron_datasets)):
                 is_none = map(lambda _: _ is None, megatron_datasets[i])
 
-                if split[i] == 0.0:
+                if split[i] is None:
                     assert all(is_none)
                     blended_datasets.append(None)
                 else:
@@ -124,8 +124,8 @@ class BlendedMegatronDatasetBuilder(object):
                     blended_datasets.append(None)
                     continue
 
-                split_spoof = [0.0] * len(Split)
-                split_spoof[i] = 1.0
+                split_spoof = [None] * len(Split)
+                split_spoof[i] = (0.0, 1.0)
                 sizes_spoof = [0] * len(Split)
                 sizes_spoof[i] = self.sizes[i]
 
@@ -173,7 +173,7 @@ class BlendedMegatronDatasetBuilder(object):
         Args:
             path_prefix (str): The MMapIndexedDataset .bin and .idx file prefix
 
-            split (List[float]): The dataset split ratios (must sum to 1.00)
+            split (List[Tuple[float, float]]): The dataset split matrix
 
             sizes (List[int]): The number of total samples to draw from each split
 
@@ -186,28 +186,26 @@ class BlendedMegatronDatasetBuilder(object):
 
         if indexed_dataset is not None:
             if self.cls.is_split_by_sequence():
-                split_idx_bounds = _get_split_indices(
-                    split, indexed_dataset.sequence_lengths.shape[0]
-                )
+                num_elements = indexed_dataset.sequence_lengths.shape[0]
             else:
-                split_idx_bounds = _get_split_indices(
-                    split, indexed_dataset.document_indices.shape[0] - 1
-                )
-            split_indices = [
-                numpy.arange(
-                    start=split_idx_bounds[i],
-                    stop=split_idx_bounds[i + 1],
-                    step=1,
-                    dtype=numpy.int32,
-                )
-                for i, _ in enumerate(Split)
-            ]
+                num_elements = indexed_dataset.document_indices.shape[0] - 1
+
+            split_indices = []
+            for i, _ in enumerate(Split):
+                if split[i] is not None:
+                    beg = int(round(split[i][0] * float(num_elements)))
+                    end = int(round(split[i][1] * float(num_elements)))
+                    split_indices.append(
+                        numpy.arange(start=beg, stop=end, step=1, dtype=numpy.int32)
+                    )
+                else:
+                    split_indices.append(None)
         else:
             split_indices = [None for _ in Split]
 
         megatron_datasets = []
         for i, _split in enumerate(Split):
-            if split[i] == 0.0:
+            if split_indices[i] is None:
                 megatron_datasets.append(None)
             else:
                 megatron_datasets.append(
@@ -265,32 +263,6 @@ class BlendedMegatronDatasetBuilder(object):
             return dataset
 
         return cls(*args)
-
-
-def _get_split_indices(split: List[float], num_elements: int) -> List[int]:
-    """Determine the document index bounds per split
-
-    Args:
-        split (List[float]): The dataset split ratios (must sum to 1.00)
-
-        num_elements (int): The number of elements, e.g. sequences or documents, available for
-        the split
-
-    Returns:
-        List[int]: The indices for all three splits e.g. [0, 900, 990, 1000] for a 1000-document
-        set and a [90.0, 9.0, 1.0] split
-    """
-    split_indices = [0]
-    for split_pct in split:
-        split_indices.append(split_indices[-1] + int(round(split_pct * float(num_elements))))
-    split_indices[1:] = list(
-        map(lambda _: _ - (split_indices[-1] - num_elements), split_indices[1:])
-    )
-
-    assert len(split_indices) == len(split) + 1
-    assert split_indices[-1] == num_elements
-
-    return split_indices
 
 
 def _get_prefixes_weights_and_sizes_for_blend(

@@ -65,7 +65,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
-    --retro-fix-sub-epoch \
 "
 
 ######## Retro. ########
