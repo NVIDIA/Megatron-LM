@@ -25,6 +25,7 @@ from .random import (
     checkpoint,
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
+    model_parallel_reconfigure_tp_seed,
     init_checkpointed_activations_memory_buffer,
     reset_checkpointed_activations_memory_buffer,
 )

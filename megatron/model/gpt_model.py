@@ -190,8 +190,6 @@ class GPTModel(MegatronModule):
 
             # Parameter slices that should be averaged not concatenated.
             info[TP_REPLICATED_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.word_embeddings.norm.weight",
-                r"tied_modules.embed.word_embeddings.norm.bias",
                 r"tied_modules.embed.position_embeddings.weight",
                 r"\d+.input_layernorm.weight",
                 r"\d+.input_layernorm.bias",
@@ -206,7 +204,7 @@ class GPTModel(MegatronModule):
             # Parameter that are sliced on the row dimension
             info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
                 r"\d+.mlp.dense_4h_to_h.weight",
-                r"\d+.mlp.self_attention.dense.weight",
+                r"\d+.self_attention.dense.weight",
             ]
 
         return info
@@ -356,8 +354,6 @@ class GPTModelPipe(PipelineModule,MegatronModule):
 
             # Parameter slices that should be averaged not concatenated.
             info[TP_REPLICATED_PARAMETER_PATTERNS] = [
-                r"tied_modules.embed.word_embeddings.norm.weight",
-                r"tied_modules.embed.word_embeddings.norm.bias",
                 r"tied_modules.embed.position_embeddings.weight",
                 r"\d+.input_layernorm.weight",
                 r"\d+.input_layernorm.bias",
@@ -372,7 +368,6 @@ class GPTModelPipe(PipelineModule,MegatronModule):
             # Parameter that are sliced on the row dimension
             info[PARAMETER_WITH_ROW_PARALLELISM_PATTERNS] = [
                 r"\d+.mlp.dense_4h_to_h.weight",
-                r"\d+.mlp.self_attention.dense.weight",
+                r"\d+.self_attention.dense.weight",
             ]
-
         return info

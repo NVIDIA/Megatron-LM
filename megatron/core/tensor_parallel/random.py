@@ -219,6 +219,15 @@ def model_parallel_cuda_manual_seed(seed):
                                 tensor_model_parallel_seed)
 
 
+def model_parallel_reconfigure_tp_seed(seed):
+    if deepspeed.checkpointing.is_configured():
+        return deepspeed.checkpointing.model_parallel_reconfigure_tp_seed(seed)
+
+    model_parallel_seed = seed + 2718 + get_tensor_model_parallel_rank()
+    with _CUDA_RNG_STATE_TRACKER.fork():
+        get_accelerator().manual_seed(model_parallel_seed)
+
+
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
        two main changes:
