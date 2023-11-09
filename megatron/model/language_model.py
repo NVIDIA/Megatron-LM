@@ -518,7 +518,7 @@ class TransformerLanguageModel(MegatronModule):
                 inference_params=None,
                 pooling_sequence_index=0,
                 enc_hidden_states=None, output_enc_hidden=False):
-
+        args = get_args()
         # Encoder embedding.
         if self.pre_process:
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
@@ -541,7 +541,10 @@ class TransformerLanguageModel(MegatronModule):
                 rotary_pos_emb = \
                     self.rotary_pos_emb(inference_params.max_sequence_len)
             else:
-                rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
+                if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
+                    rotary_pos_emb = self.rotary_pos_emb(args.curriculum_seqlen)
+                else:
+                    rotary_pos_emb = self.rotary_pos_emb(self.seq_length)
 
         # Run encoder.
         if enc_hidden_states is None:

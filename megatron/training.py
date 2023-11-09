@@ -39,7 +39,7 @@ from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator
+from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 
@@ -1162,8 +1162,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             model[0].set_train_batch_size(global_batch_size)
 
         if args.curriculum_learning_legacy and not args.no_pipeline_parallel:
-            args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
+            curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
                     args.iteration + 1)
+            if iteration == 0 or curriculum_seqlen != args.curriculum_seqlen:
+                if args.use_rotary_position_embeddings:
+                    update_rotary_pos_emb(curriculum_seqlen)
+            args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
@@ -1298,6 +1302,8 @@ def evaluate(forward_step_func,
         # engine.
         if args.curriculum_seqlen < args.seq_length:
             args.curriculum_seqlen = args.seq_length
+            if args.use_rotary_position_embeddings:
+                update_rotary_pos_emb(args.curriculum_seqlen)
             model[0].reset_activation_shape()
 
     total_loss_dict = {}
@@ -1370,6 +1376,8 @@ def evaluate(forward_step_func,
         args.curriculum_seqlen = args.curriculum_scheduler.update_difficulty( \
             args.iteration + 1)
         if args.curriculum_seqlen < args.seq_length:
+            if args.use_rotary_position_embeddings:
+                update_rotary_pos_emb(args.curriculum_seqlen)
             model[0].reset_activation_shape()
 
     return total_loss_dict, collected_non_loss_data

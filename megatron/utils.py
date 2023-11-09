@@ -21,6 +21,23 @@ from megatron import (
 from megatron.core import mpu
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.model.module import param_is_not_shared
+from megatron.model.rotary_pos_embedding import RotaryEmbedding
+
+
+def update_rotary_pos_emb(seq_length):
+    args = get_args()
+    rotary_dim = args.hidden_size // args.num_attention_heads \
+        if args.kv_channels is None else args.kv_channels
+
+    if args.rotary_percent < 1.0:
+        rotary_dim = int(rotary_dim * args.rotary_percent)
+
+    # partial rotary embeddings, which is better than full rotary
+    # Wang and Komatsuzaki et al
+    # https://github.com/kingoflolz/mesh-transformer-jax/
+    rotary_pos_emb = RotaryEmbedding(rotary_dim)(seq_length).to(
+        get_accelerator().current_device_name())
+    args.rotary_pos_emb = rotary_pos_emb
 
 
 def unwrap_model(model, module_instances=(torchDDP)):

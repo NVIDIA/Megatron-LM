@@ -13,10 +13,9 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
 from megatron.model import GPTModel, GPTModelPipe
-from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
 from megatron.arguments import core_transformer_config_from_args
 
 import deepspeed
@@ -71,18 +70,7 @@ def model_provider(pre_process=True, post_process=True):
 
             # For prertaining, since sequence length is fixed, cache rotary embedding in args, to avoid communicating around
             if args.use_rotary_position_embeddings:
-                rotary_dim = args.hidden_size // args.num_attention_heads \
-                    if args.kv_channels is None else args.kv_channels
-
-                if args.rotary_percent < 1.0:
-                    rotary_dim = int(rotary_dim * args.rotary_percent)
-
-                # partial rotary embeddings, which is better than full rotary
-                # Wang and Komatsuzaki et al
-                # https://github.com/kingoflolz/mesh-transformer-jax/
-                rotary_pos_emb = RotaryEmbedding(rotary_dim)(args.seq_length).to(
-                    get_accelerator().current_device_name())
-                args.rotary_pos_emb = rotary_pos_emb
+                update_rotary_pos_emb(args.seq_length)
 
         else:
             model = GPTModel(
