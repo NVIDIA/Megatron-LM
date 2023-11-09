@@ -4,8 +4,9 @@ import os
 import torch
 
 from megatron import get_retro_args, print_rank_0
-from megatron.data.gpt_dataset import build_train_valid_test_datasets \
-    as build_gpt_train_valid_test_datasets
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset
 from megatron.training import (
     build_train_valid_test_datasets as build_pretraining_train_valid_test_datasets,
     update_train_iters,
@@ -14,6 +15,9 @@ from tools.retro.db.utils import get_indexed_dataset_infos
 from tools.retro.utils import get_num_chunks_per_sample
 
 from .utils import get_neighbor_dirname, get_query_workdir
+
+from pretrain_gpt import is_dataset_built_on_rank
+
 
 
 class ChunkDataset(torch.utils.data.Dataset):
@@ -71,13 +75,25 @@ def verify_indexed_dataset_order():
     db_prefixes = [ info["prefix"] for info in db_indexed_dataset_infos ]
 
     # Verify order & prefixes.
-    assert len(args.data_path) >= 2, "blendable dataset supported only."
+    assert len(args.data_path) >= 2, "blended dataset supported only."
     pretraining_prefixes = args.data_path[1:None:2]
 
     if len(db_prefixes) != len(pretraining_prefixes):
         raise Exception("inconsistent dataset count between db & pretraining.")
     if db_prefixes != pretraining_prefixes:
         raise Exception("inconsistent dataset order between db & pretraining.")
+
+
+def core_gpt_dataset_config_from_retro_args(args):
+    return GPTDatasetConfig(
+        is_built_on_rank=is_dataset_built_on_rank,
+        random_seed=args.retro_gpt_seed,
+        sequence_length=args.retro_gpt_seq_length,
+        blend=args.retro_gpt_data_path,
+        split=args.retro_gpt_split,
+        path_to_cache=args.data_cache_path,
+        return_document_ids=args.retro_return_doc_ids
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -87,14 +103,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
-    train_ds, valid_ds, test_ds = build_gpt_train_valid_test_datasets(
-        data_prefix=args.retro_gpt_data_path,
-        splits_string=args.retro_gpt_split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.retro_gpt_seq_length,
-        seed=args.retro_gpt_seed,
-        skip_warmup=(not args.retro_gpt_mmap_warmup),
-        return_doc_ids=args.retro_return_doc_ids)
+    
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        GPTDataset,
+        train_val_test_num_samples,
+        core_gpt_dataset_config_from_retro_args(args)
+    ).build()
     print_rank_0("> finished creating pretrained GPT datasets ...")
 
     return train_ds, valid_ds, test_ds

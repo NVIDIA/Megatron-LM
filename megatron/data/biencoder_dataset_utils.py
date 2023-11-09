@@ -154,8 +154,8 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
               'the indices on rank 0 ...'.format(indexmap_filename))
 
         # Make sure the types match the helpers input types.
-        assert block_dataset.doc_idx.dtype == np.int64
-        assert block_dataset.sizes.dtype == np.int32
+        assert block_dataset.document_indices.dtype == np.int64
+        assert block_dataset.sequence_lengths.dtype == np.int32
 
         # Build samples mapping
         verbose = torch.distributed.get_rank() == 0
@@ -163,11 +163,11 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
         print_rank_0(' > building samples index mapping for {} ...'.format(
             name))
 
-        from megatron.data import helpers
+        from megatron.core.datasets import helpers
         mapping_array = helpers.build_blocks_mapping(
-            block_dataset.doc_idx,
-            block_dataset.sizes,
-            title_dataset.sizes,
+            block_dataset.document_indices,
+            block_dataset.sequence_lengths,
+            title_dataset.sequence_lengths,
             num_epochs,
             max_num_samples,
             max_seq_length - 3,  # account for added tokens

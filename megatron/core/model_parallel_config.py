@@ -64,6 +64,22 @@ class ModelParallelConfig:
     async_tensor_model_parallel_allreduce (bool, default=True): If true, enables asynchronous execution of
         tensor-model-parallel all-reduce with weight gradient compuation of a column-linear layer.  Defaults to False.
 
+    tp_comm_overlap (bool, default=False): If true, allows overlapping of Linear layer execution with tensor parallel
+        communication collectives like AllGather/ReduceScatter. Overlapping is done for the linear layers wherever possible
+        during the forward and the backward pass.  Defaults to False.
+
+    tp_comm_split_ag (bool, default=True): If true, allows All-Gather overlap with Fprop GEMM. Don't care if tp_comm_overlap 
+        is False.
+
+    tp_comm_split_rs (bool, default=True): If true, allows Reduce-Scatter overlap with Fprop GEMM. Don't care if 
+        tp_comm_overlap is False.
+
+    tp_comm_bulk_dgrad (bool, default=True): If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't 
+        care if tp_comm_overlap is False.
+
+    tp_comm_bulk_wgrad (bool, default=True): If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't 
+        care if tp_comm_overlap is False.
+
     Parallelism
     -----------
 
@@ -148,6 +164,13 @@ class ModelParallelConfig:
     # Optimizations
     gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = False
+    tp_comm_overlap: bool = False
+
+    # Debug Options
+    tp_comm_split_ag: bool = True
+    tp_comm_split_rs: bool = True
+    tp_comm_bulk_wgrad: bool = True
+    tp_comm_bulk_dgrad: bool = True
 
     # Parallelism
     finalize_model_grads_func: Callable = None

@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_block import TransformerBlock
 
 import torch
-from torch import Tensor, einsum, nn
+from torch import Tensor, nn
 
 from megatron.core import parallel_state
 
@@ -47,8 +47,13 @@ class RotaryEmbedding(nn.Module):
             dim = int(dim * rotary_percent)
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self.inv_freq = 1.0 / (
+            10000
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
+                / dim
+            )
+        )
 
     def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of RoPE embedding.
@@ -60,11 +65,15 @@ class RotaryEmbedding(nn.Module):
         Returns:
             Tensor: Embeddings after applying RoPE.
         """
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device) + offset
+        seq = (
+            torch.arange(max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+            + offset
+        )
+
         if self.seq_len_interpolation_factor is not None:
-            seq = seq.type_as(self.inv_freq)
             seq *= 1 / self.seq_len_interpolation_factor
-        freqs = einsum('i , j -> i j', seq.type_as(self.inv_freq), self.inv_freq)
+
+        freqs = torch.outer(seq, self.inv_freq)
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -146,5 +155,8 @@ def apply_rotary_pos_emb(t: Tensor, freqs: Tensor) -> Tensor:
 
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
-    t = (t * freqs.cos()) + (_rotate_half(t) * freqs.sin())
+    cos_ = torch.cos(freqs).to(t.dtype)
+    sin_ = torch.sin(freqs).to(t.dtype)
+
+    t = (t * cos_) + (_rotate_half(t) * sin_)
     return torch.cat((t, t_pass), dim=-1)

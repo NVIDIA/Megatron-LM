@@ -183,30 +183,54 @@ def scaled_init_method_normal(sigma, num_layers):
     return init_
 
 
-def make_tp_sharded_tensor_for_checkpoint(tensor, key, tp_axis=0, replica_id=None, **kwargs):
-    """ Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group. """
+def make_tp_sharded_tensor_for_checkpoint(
+    tensor, key, tp_axis=0, replica_id=None, prepend_offsets=(), **kwargs
+):
+    """ Helper for instantiating a ShardedTensor where the `tp_axis` dimension is sharded across TP group.
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+    """
+
+    prepend_axis_num = len(prepend_offsets)
+
+    if replica_id is None:
+        replica_id = (0, 0, parallel_state.get_data_parallel_rank())
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
+        *prepend_offsets,
         (
-            tp_axis,
+            tp_axis + prepend_axis_num,
             parallel_state.get_tensor_model_parallel_rank(),
             parallel_state.get_tensor_model_parallel_world_size(),
         ),
-        replica_id=parallel_state.get_data_parallel_rank() if replica_id is None else replica_id,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
 
 
-def make_sharded_tensor_for_checkpoint(tensor, key, **kwargs):
-    """ Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group). """
+def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
+    """ Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
+
+    Optionally, can provide offsets which prepend new dimensions to the tensor.
+    """
+
+    prepend_axis_num = len(prepend_offsets)
+
+    if replica_id is None:
+        replica_id = (
+            0,
+            parallel_state.get_tensor_model_parallel_rank(),
+            parallel_state.get_data_parallel_rank(),
+        )
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
-        replica_id=parallel_state.get_data_parallel_rank()
-        * parallel_state.get_data_parallel_world_size()
-        + parallel_state.get_tensor_model_parallel_rank(),
+        *prepend_offsets,
+        replica_id=replica_id,
+        prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
