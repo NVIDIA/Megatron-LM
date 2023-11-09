@@ -503,7 +503,7 @@ class ColumnParallelLinear(torch.nn.Module):
                  skip_bias_add=False,
                  skip_weight_param_allocation: bool=False,
                  moe=False, enable_expert_tensor_parallelism=False):
-        super(ColumnParallelLinear, self).__init__()
+        torch.nn.Module.__init__(self)
 
         # Keep input parameters
         self.input_size = input_size
@@ -691,7 +691,7 @@ class RowParallelLinear(torch.nn.Module):
                  keep_master_weight_for_test: bool = False,
                  skip_bias_add: bool = False,
                  moe=False, enable_expert_tensor_parallelism=False):
-        super(RowParallelLinear, self).__init__()
+        torch.nn.Module.__init__(self)
 
         # Keep input parameters
         self.input_size = input_size
