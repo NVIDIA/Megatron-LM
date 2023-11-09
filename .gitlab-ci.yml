@@ -41,12 +41,6 @@ formatting:
     - docker_local_runner
   stage: test
   script:
-    - echo "MR has label $CI_MERGE_REQUEST_LABELS"
-    - |
-      if [[ "$CI_MERGE_REQUEST_LABELS" == "READY FOR REVIEW" ]]
-        then 
-          echo "yes"
-      fi
     - pip install --upgrade black==19.10b0 isort click==8.0.2
     - black megatron/core --check --verbose --diff
     - isort megatron/core --check
@@ -71,6 +65,8 @@ formatting:
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
       when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
+      when: always
   allow_failure: false
   retry: 2
 
@@ -91,6 +87,8 @@ formatting:
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
