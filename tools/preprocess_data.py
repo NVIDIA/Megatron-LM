@@ -200,8 +200,11 @@ def get_args():
     group.add_argument('--tokenizer-type', type=str, required=True,
                        choices=['BertWordPieceLowerCase','BertWordPieceCase',
                                 'GPT2BPETokenizer', 'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer', 'NullTokenizer'],
+                                'GPTSentencePieceTokenizer', 'HFAutoTokenizer',
+                                'NullTokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--hf_autotokenizer_model', type=str, default=None,
+                       help='Name of HF tokenizer model')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='YTTM tokenizer model.')
     group.add_argument('--vocab-file', type=str, default=None,
