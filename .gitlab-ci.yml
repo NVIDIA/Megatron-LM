@@ -42,7 +42,7 @@ formatting:
   stage: test
   script:
     - echo "MR has label $CI_MERGE_REQUEST_LABELS"
-    - if [[ "$CI_MERGE_REQUEST_LABELS" == "READY FOR REVIEW" ]]; then; echo "yes"; fi
+    - if [[ "$CI_MERGE_REQUEST_LABELS" == "READY FOR REVIEW" ]]; then; echo "yes"; fi;
     - pip install --upgrade black==19.10b0 isort click==8.0.2
     - black megatron/core --check --verbose --diff
     - isort megatron/core --check
