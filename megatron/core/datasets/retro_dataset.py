@@ -28,24 +28,20 @@ class RetroDatasetConfig(GPTDatasetConfig):
 
         split_preprocessing (str): The Retro preprocessing split string. It follows the same
         pattern convention as 'split'. Not to be used with 'blend_per_split'.
-
-        split_preprocessing_vector: (Optional[List[float]]): The Retro preprocessing split string,
-        parsed and normalized post-initialization. Not to be passed to the constructor.
     """
 
     return_document_ids: bool
 
     split_preprocessing: str
 
-    split_preprocessing_vector: Optional[List[float]] = field(init=False, default=None)
-
     def __post_init__(self):
         super().__post_init__()
         assert self.split is not None, "the Retro data pipeline does not support 'blend_per_split'"
-        self.split_preprocessing_vector = parse_and_normalize_split(self.split_preprocessing)
-        if not numpy.allclose(self.split_vector, self.split_preprocessing_vector):
+        split_vector = parse_and_normalize_split(self.split)
+        split_preprocessing_vector = parse_and_normalize_split(self.split_preprocessing)
+        if not numpy.allclose(split_vector, split_preprocessing_vector):
             self.split_matrix = convert_split_vector_to_split_matrix(
-                self.split_vector, self.split_preprocessing_vector
+                split_vector, split_preprocessing_vector
             )
             log_single_rank(
                 logger,

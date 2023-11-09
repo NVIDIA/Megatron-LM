@@ -40,12 +40,10 @@ class BlendedMegatronDatasetConfig:
         when drawing samples from a single distribution. Not to be used with 'blend_per_split'.
         Defaults to None.
 
-        split_vector (Optional[List[float]]): The split string, parsed and normalized post-
-        initialization. Not to be passed to the constructor.
-
         split_matrix (Optional[List[Tuple[float, float]]]): The split matrix consisting of
         non-overlapping book-ends of each split in order. For more information, refer to
-        'convert_split_vector_to_split_matrix'.
+        'convert_split_vector_to_split_matrix'. Created automatically from 'split'. Not to be
+        passed in to the constructor.
 
         path_to_cache (str): Where all re-useable dataset indices are to be cached.
     """
@@ -61,8 +59,6 @@ class BlendedMegatronDatasetConfig:
     blend_per_split: Optional[List[Optional[List[str]]]] = None
 
     split: Optional[str] = None
-
-    split_vector: Optional[List[float]] = field(init=False, default=None)
 
     split_matrix: Optional[List[Tuple[float, float]]] = field(init=False, default=None)
 
@@ -88,9 +84,8 @@ class BlendedMegatronDatasetConfig:
         else:
             assert self.blend is not None, "one of either blend or blend_per_split must be provided"
             assert self.split is not None, "both blend and split must be provided"
-            self.split_vector = parse_and_normalize_split(self.split)
-            log_single_rank(logger, logging.INFO, f"Let split_vector = {self.split_vector}")
-            self.split_matrix = convert_split_vector_to_split_matrix(self.split_vector)
+            split_vector = parse_and_normalize_split(self.split)
+            self.split_matrix = convert_split_vector_to_split_matrix(split_vector)
             log_single_rank(logger, logging.INFO, f"Let split_matrix = {self.split_matrix}")
 
 
