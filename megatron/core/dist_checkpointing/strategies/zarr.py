@@ -58,6 +58,17 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 def _create_or_open_zarr_arrays(
     sharded_tensors: List[ShardedTensor], checkpoint_dir: Path
 ) -> List[Optional[zarr.Array]]:
+    """ Returns list of zarr arrays corresponding to given tensors.
+
+    For a sharded tensors that:
+    a) is main replica and represents the first chunk (all offsets 0), creates the Zarr array
+    b) is main replica but not the first chunk, opens the arrays created in (a) (possibly by other process)
+    c) otherwise, sets the corresponding array to None since it won't be used
+
+    Arguments:
+        sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank that will be saved to checkpoint
+        checkpoint_dir (Path): checkpoint in which the arrays will be created
+    """
     arrays = []
     for ten in sharded_tensors:
         arr = _create_zarr_array(ten, checkpoint_dir) if _should_create_array(ten) else None
