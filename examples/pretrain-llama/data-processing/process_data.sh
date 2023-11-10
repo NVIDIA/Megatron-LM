@@ -26,11 +26,10 @@ do
     TEMP_FOLDER=$DUMPED_FOLDER'/temp_bin_idx/temp_'$FILENAME_WITHOUT_EXT
     INDEX_FOLDER=$OUTPUT_PATH'/bin_idx/'$FILENAME_WITHOUT_EXT
     if [ -d $INDEX_FOLDER ]; then
-        echo $INDEX_FOLDER
+        echo '[SKIPPING] Already Folder Exists '$INDEX_FOLDER'!'
         continue
     fi
     mkdir -p $TEMP_FOLDER
-    mkdir -p $INDEX_FOLDER
     
     echo 'Copying file from '$_inp' to '$TEMP_FOLDER
     cp $_inp $TEMP_FOLDER
@@ -45,6 +44,7 @@ do
     --output-prefix $TEMP_FOLDER/$FILENAME_WITHOUT_EXT \
     --keep-sequential-samples
     
+    mkdir -p $INDEX_FOLDER
     mv $TEMP_FOLDER/$FILENAME_WITHOUT_EXT'_text_document.bin' $INDEX_FOLDER
     mv $TEMP_FOLDER/$FILENAME_WITHOUT_EXT'_text_document.idx' $INDEX_FOLDER
     rm -rf $TEMP_FOLDER/
