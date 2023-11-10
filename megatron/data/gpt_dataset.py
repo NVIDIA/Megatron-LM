@@ -335,7 +335,12 @@ class GPTDataset(torch.utils.data.Dataset):
         self.args = get_args()
         self.tokenizer = get_tokenizer()
         self.np_rng = np.random.RandomState(seed=seed) # rng state for FIM
-        
+
+        self.fim_rate = self.args.fim_rate
+        self.fim_spm_rate = self.args.fim_spm_rate
+        self.fragment_fim_rate = self.args.fragment_fim_rate
+        self.fim_split_sample = self.tokenizer.vocab[self.args.fim_split_sample] if self.args.fim_split_sample is not None else None
+
         try:
             self.suffix_tok_id, self.prefix_tok_id, self.middle_tok_id, self.pad_tok_id = (self.tokenizer.special_tokens[tok] for tok in [FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD])
         except KeyError:
@@ -386,38 +391,75 @@ class GPTDataset(torch.utils.data.Dataset):
         # # do FIM here, if enabled
         # TODO: Do we handle the following point from FIM paper?
         # To transform data in the character space for context-level FIM, the tokenized documents have to be decoded back into strings before FIM augmentation. Depending on the vocabulary, some care has to be given to ensure decoding does not introduce any spurious characters into training. For example, utf-8 characters are encoded as multiple tokens with a BPE vocabulary; they can result in fragments from chunking and fail to decode. To prevent unforeseen errors midway through training, we encourage checking for these fragments at the beginning or end of a context and removing them.
-        fim_rate = self.args.fim_rate
+        eod = self.tokenizer.eod
+        segment_breaks = np.argwhere(sample == eod) # split sample by document
 
-        if fim_rate != 0:
-            assert (fim_rate <= 1 and fim_rate >= 0), "FIM rate must be a probability 0 <= rate <= 1"
+        if self.fim_rate == 0:
+            return sample.astype(np.int64)
+    
+        def fim_permute_sequence(sequence, rate):
+            return permute(
+                sequence,
+                self.np_rng,
+                rate,
+                self.fim_spm_rate,
+                self.tokenizer,
+                truncate_or_pad=False,
+                suffix_tok_id=self.suffix_tok_id,
+                prefix_tok_id=self.prefix_tok_id,
+                middle_tok_id=self.middle_tok_id,
+                pad_tok_id=self.pad_tok_id,
+            )
 
-            eod = self.tokenizer.eod
-            segment_breaks = np.argwhere(sample == eod) # split sample by document
+        def fim_split_and_permute_sequence(sequence):
+            """
+            If self.fim_split_sample is not None, split the sequence.
+            Then apply FIM on the fragments, or the whole sequence if self.fim_split_sample is None.
+            """
+            if self.fim_split_sample is None:
+                return fim_permute_sequence(sequence, self.fim_rate)
+            # fim_split_sample is set: split the sample on this token and permute each fragment separately.
+            # Typically, if each sample is a repository, then we split again on the file level.
+            # Each fragment is a file, and we permute the files.
+            fragment_breaks = np.argwhere(sequence == self.fim_split_sample)
+            if fragment_breaks.shape == (0, 1):
+                # no split token in this sample
+                return fim_permute_sequence(sequence, self.fim_rate)
+            if not self.np_rng.binomial(1, self.fim_rate):
+                # don't do FIM preproc
+                return sequence
+            # Do FIM on each fragment
+            curr_start_position = 0
+            new_samples = []
+            for loc in np.nditer(fragment_breaks):
+                if loc - curr_start_position > 0:
+                    permuted = fim_permute_sequence(sequence[curr_start_position:loc], self.fragment_fim_rate)
+                    new_samples += [permuted, [self.fim_split_sample]]
+                curr_start_position = loc + 1  # Jump over the split token
+            # Permute the segment after the last split token
+            permuted = fim_permute_sequence(sequence[curr_start_position:], self.fragment_fim_rate)
+            new_samples.append(permuted)
+            return np.concatenate(new_samples)
 
-            if segment_breaks.shape != (0, 1): # then there is an EOD token in this example
-                curr_start_position = 0
-                new_samples = []
-                for loc in np.nditer(segment_breaks):
-                    # Only permute non-empty segments.
-                    if loc - curr_start_position > 0:
-                        # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                        permuted, self.np_rng = \
-                            permute(sample[curr_start_position:loc], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
-                                    suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
-                        new_samples += [permuted, [eod]]
+        if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
+            curr_start_position = 0
+            new_samples = []
+            for loc in np.nditer(segment_breaks):
+                # Only permute non-empty segments.
+                if loc - curr_start_position > 0:
+                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                    permuted = fim_split_and_permute_sequence(sample[curr_start_position:loc])
+                    new_samples += [permuted, [eod]]
 
-                    curr_start_position = loc + 1 # jump over the EOD token
-                # Permute the segment after the last EOD
-                permuted, self.np_rng = \
-                    permute(sample[curr_start_position:], self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
-                            suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
-                new_samples.append(permuted)
+                curr_start_position = loc + 1  # jump over the EOD token
+            # Permute the segment after the last EOD
+            permuted = fim_split_and_permute_sequence(sample[curr_start_position:])
+            new_samples.append(permuted)
 
-                sample = np.concatenate(new_samples)
-            else:
-                sample, self.np_rng = permute(sample, self.np_rng, self.args, self.tokenizer, truncate_or_pad=False,
-                                              suffix_tok_id=self.suffix_tok_id, prefix_tok_id=self.prefix_tok_id, middle_tok_id=self.middle_tok_id, pad_tok_id=self.pad_tok_id)
-        
+            sample = np.concatenate(new_samples)
+        else:
+            sample = fim_split_and_permute_sequence(sample)
+            
         # Truncate or pad sequence to max-length
         diff = sample.shape[0] - sample_len
         if diff > 0: # too long
@@ -681,14 +723,12 @@ def _build_shuffle_idx(num_samples, total_size, np_rng):
 
 
 # From https://github.com/EleutherAI/gpt-neox/blob/FIM-clean/megatron/data/gpt2_dataset.py#L339
-def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True,
+def permute(sample, np_rng, fim_rate, fim_spm_rate, tokenizer, truncate_or_pad=True,
             suffix_tok_id=None, prefix_tok_id=None, middle_tok_id=None, pad_tok_id=None):
     """
     Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it. 
     Maintain the same sample length (if transform creates a few extra tokens, drop them).
     """
-    fim_rate = args.fim_rate
-
     if np_rng.binomial(1, fim_rate): # sample bernoulli dist
 
         contents = tokenizer.detokenize(sample)
@@ -726,7 +766,7 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True,
             elif diff < 0: # too short
                 suffix = np.concatenate([suffix, np.full((-1 * diff), pad_tok_id)])
         
-        if np_rng.binomial(1, args.fim_spm_rate):
+        if np_rng.binomial(1, fim_spm_rate):
             # SPM (variant 2 from FIM paper)
             new_sample = np.concatenate([
                 [prefix_tok_id, suffix_tok_id], suffix,
@@ -744,4 +784,4 @@ def permute(sample, np_rng, args, tokenizer, truncate_or_pad=True,
         # don't do FIM preproc
         new_sample = sample
 
-    return new_sample, np_rng
+    return new_sample

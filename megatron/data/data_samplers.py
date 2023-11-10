@@ -41,10 +41,52 @@ def build_pretraining_data_loader(dataset, consumed_samples, num_workers=None):
 
     num_workers = args.num_workers if num_workers is None else num_workers
     # Torch dataloader.
-    return torch.utils.data.DataLoader(dataset,
+    dataloader = torch.utils.data.DataLoader(dataset,
                                        batch_sampler=batch_sampler,
                                        num_workers=num_workers,
                                        pin_memory=True)
+    
+    if args.sanity_check_dataloader_interval is not None:
+        from transformers import AutoTokenizer
+        from megatron import is_last_rank
+
+        NUM_BATCHES = 10
+        sanity_check_dataloader_interval = args.sanity_check_dataloader_interval
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_file.split("tokenizer.json")[0])
+
+        if is_last_rank():
+            check_step = -1
+
+            with open("sanity_check.txt", "w") as f:
+                f.write("")
+            for i, batch in enumerate(dataloader):
+                check_step += 1
+                if i % sanity_check_dataloader_interval == 0:
+                    with open("sanity_check.txt", "a") as f:
+                        f.write("\n\n")
+                        f.write("*" * 40)
+                        f.write(f"Sanity check {check_step}")
+                        f.write("*" * 40)
+                    print(batch)
+
+                    import joblib
+
+                    joblib.dump(batch, f"sanity_check_{check_step}.pkl")
+                    texts = tokenizer.batch_decode(
+                        batch["text"], skip_special_tokens=False, clean_up_tokenization_spaces=False
+                    )
+
+                    for j, text in enumerate(texts):
+                        print(f"\n\n>>Batch {i} || Sample {j}<<\n")
+                        print(text[:1000])
+                        with open("sanity_check.txt",  "a", encoding='utf-8') as f:
+                            f.write(f"\n\n>>Batch {i} || Sample {j}<<\n")
+                            f.write(text)
+
+                    if i // sanity_check_dataloader_interval == NUM_BATCHES - 1:
+                        break
+            assert False
+    return dataloader
 
 class MegatronPretrainingSampler:
 

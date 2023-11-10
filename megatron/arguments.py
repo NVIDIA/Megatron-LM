@@ -1276,6 +1276,12 @@ def _add_data_args(parser):
     group.add_argument('--fim-spm-rate', type=float, default=0.5,
                        help='Probability that the a FIM sample uses the SPM format over the PSM format. '
                        'At 1, exclusively train with SPM. At 0, exclusively train with PSM')
+    group.add_argument('--fim-split-sample', type=str, default=None,
+                       help='String around which to split the sample for FIM. If None (default), FIM is applied on the sample-level')
+    group.add_argument('--fragment-fim-rate', type=float, default=0.5,
+                       help='Rate of FIM on each fragment when fim_split_sample is not None.')
+    group.add_argument('--sanity-check-dataloader-interval', type=int, default=0,
+                          help='Optional interval to print dataloader samples.')
 
     return parser
 
