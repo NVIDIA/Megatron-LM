@@ -736,7 +736,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Scatter tensor list.
                         if data_parallel_rank == 0:
-                            world_tensor = loaded_state[model_idx][dtype][key][bucket_idx]
+                            world_tensor_for_all_buckets = loaded_state[model_idx][dtype][key]
+                            if not isinstance(world_tensor_for_all_buckets, list):
+                                world_tensor_for_all_buckets = [world_tensor_for_all_buckets]
+                            assert bucket_idx < len(world_tensor_for_all_buckets), \
+                                (f"Trying to load state for bucket_id {bucket_idx} (out of "
+                                 f"{len(gbuf_range_map_for_all_buckets)} buckets) from checkpoint; "
+                                 f"checkpoint only has {len(world_tensor_for_all_buckets)} bucket(s)")
+                            world_tensor = world_tensor_for_all_buckets[bucket_idx]
                             gbuf_start_idxs = \
                                 list(range(0, gbuf_world_numel, gbuf_local_numel))
                             send_tensors = [world_tensor[i:(i+gbuf_local_numel)]
