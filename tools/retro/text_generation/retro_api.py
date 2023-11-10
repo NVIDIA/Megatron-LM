@@ -1,17 +1,5 @@
-# coding=utf-8
-# Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 
 """Inference API."""
 import numpy as np
@@ -22,8 +10,7 @@ from megatron.text_generation.communication import broadcast_float_list, broadca
 from megatron.text_generation.generation import (
     score_and_return_on_first_stage)
 from tools.retro.text_generation.retro_generation import (
-    retro_generate_tokens_probs_and_return_on_first_stage,
-    retro_beam_search_and_return_on_first_stage)
+    retro_generate_tokens_probs_and_return_on_first_stage)
 from megatron.text_generation.tokenization import (
     detokenize_generations)
 
@@ -240,56 +227,3 @@ def retro_generate(model,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
         logits_mask=logits_mask)
-
-def retro_beam_search_and_post_process(model,
-                                 prompts=None,
-                                 neighbours_array=None,
-                                 tokens_to_generate=0,
-                                 beam_size=0,
-                                 add_BOS=False,
-                                 stop_token=50256,
-                                 num_return_gen=1,
-                                 length_penalty=1):
-    """Run beam search and post-process outputs, i.e., detokenize,
-    move to cpu and convert to list."""
-
-    # Main inference.
-    tokens, scores = retro_beam_search(model,
-                                 prompts=prompts,
-                                 neighbours_array=neighbours_array,
-                                 tokens_to_generate=tokens_to_generate,
-                                 beam_size=beam_size,
-                                 add_BOS=add_BOS,
-                                 stop_token=stop_token,
-                                 num_return_gen=num_return_gen,
-                                 length_penalty=length_penalty)
-    # Only post-process on first stage.
-    if mpu.is_pipeline_first_stage():
-        lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device()) 
-        tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, True)
-        scores = scores.cpu().numpy().tolist()
-        return prompts_plus_generations, prompts_plus_generations_segments, scores
-
-    return None
-
-def retro_beam_search(model, prompts=None, neighbours_array=None, tokens_to_generate=0, beam_size=0, add_BOS=False, stop_token=50256, num_return_gen=1, length_penalty=1):
-    # Make sure input params are avaialble to all ranks.
-    values = [tokens_to_generate,
-              beam_size,
-              add_BOS,
-              stop_token,
-              num_return_gen,
-              length_penalty]
-    values_float_tensor = broadcast_float_list(6, float_list=values)
-    tokens_to_generate = int(values_float_tensor[0].item())
-    beam_size = int(values_float_tensor[1].item())
-    add_BOS = bool(values_float_tensor[2].item())
-    stop_token = int(values_float_tensor[3].item())
-    num_return_gen = int(values_float_tensor[4].item())
-    length_penalty = values_float_tensor[5].item()
-
-    context_tokens_tensor, context_length_tensor = tokenize_prompts(
-        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
-    
-    return retro_beam_search_and_return_on_first_stage(model, neighbours_array, context_tokens_tensor, context_length_tensor, 
-            beam_size, stop_token=stop_token, num_return_gen=num_return_gen, length_penalty=length_penalty)

@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 
 # The following code is adapted from
 # https://github.com/facebookresearch/ParlAI/blob/master/parlai/core/metrics.py, 
@@ -78,4 +80,3 @@ class F1Metric:
             f1_list.append(f1)
 
         return np.mean(precision_list), np.mean(recall_list), np.mean(f1_list)
-

@@ -13,11 +13,11 @@ ckpt=${10}
 K=${11}
 retrieve=${12}
 
-QA_HOME="<path/to/megatron/repo>"
+QA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
 
-TOKENIZER_MODEL="<path/to/gpt/tokenizer/model>"
+TOKENIZER_MODEL="/lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model"
 
-RETRO_WORKDIR="<path/to/retro/workdir>"
+RETRO_WORKDIR=/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm
 
 
 if [[ $model_size == "843m" ]]; then
@@ -26,6 +26,17 @@ if [[ $model_size == "843m" ]]; then
     hid_dim=1024
     heads=16
     pip_par=1
+fi
+
+if [[ $model_size == "43b" ]]; then
+    mod_par=8
+    layers=48
+    hid_dim=8192
+    heads=64
+    pip_par=4
+    if [[ $model_card == *pp1* ]]; then
+        pip_par=1
+    fi
 fi
 
 GPT_ARGS="--apply-layernorm-1p \
@@ -56,12 +67,33 @@ GPT_ARGS="--apply-layernorm-1p \
         --bf16 \
 "
 
+num_nodes=1
+num_gpus=8
 
-sample_input_file="/path/to/instruct_tuning/data/$TASK/${split}.json"
+sample_input_file="/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/$TASK/${split}.json"
+DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/$TASK"
+FEWSHOT_INPUT_FOLDER="/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa"
+
+if [[ $TASK == "nq" ]]; then
+    sample_input_file="/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/NQ/${split}.json"
+    fewshot_input_file="${FEWSHOT_INPUT_FOLDER}/single-turn-qa/NQ/fewshot_samples.json"
+    DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/NQ"
+fi
+
+if [[ $TASK == "doc2dial" ]]; then
+    DATA_FOLDER="/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/$TASK"
+    sample_input_file="/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/$TASK/${TASK}_ftdragon_chatgptgen7k_chunk150_QA_test.json"
+    fewshot_input_file="${FEWSHOT_INPUT_FOLDER}/multi-turn-qa/doc2dial/fewshot_samples.json"
+fi
 
 top_k=1
 micro_bsz=1
 SAMPLE_ARGS="--top_k $top_k"
+
+if [[ $sampling == "beam" ]]; then
+    micro_bsz=1
+    SAMPLE_ARGS="--beam-search"
+fi
 
 CHECKPOINT_PATH=${ckpt}
 sample_output_file="${CHECKPOINT_PATH}/retro-generate-${TASK}_${ft_neighbours}_${K}_${model_size}_${split}_${sampling}_${gen_start}_${num_gen}_${ckpt_step}.txt"

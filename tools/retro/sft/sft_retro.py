@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain GPT"""
 
@@ -15,7 +15,6 @@ from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from tools.retro.sft.sft_gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -99,14 +98,6 @@ def get_batch(data_iterator):
         try:
             data = next(data_iterator)
 
-            # set up the chunk size based on context len
-
-            # print(data.keys())
-            # print(data['context_len'])
-            # print(data['context_len'].shape)
-            # print(data['neighbor_tokens'].shape)
-            # print("chunk_size", args.seq_length - chunk_size)
-            # if data['neighbor_tokens'] is None:
         except BaseException:
             data = data_iterator
             raise ValueError("error with data_iterator")
@@ -129,9 +120,6 @@ def get_batch(data_iterator):
     if args.retro_add_retriever:
         neighbor_tokens = data_b['neighbor_tokens'].view(-1,
                                                          retro_args.retro_gpt_retrieved_length).long()  # [bs * l * k, r]
-        # print("neighbor_tokens.shape", neighbor_tokens.shape)
-        # print("retro_args.retro_gpt_retrieved_length", retro_args.retro_gpt_retrieved_length)
-        # print("retro_args.retro_gpt_chunk_length", retro_args.retro_gpt_chunk_length)
 
     # Get the masks and postition ids.
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(

@@ -1,18 +1,10 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT style dataset."""
 
-import os
-import time
-
-import numpy as np
-import torch
-
 from megatron import print_rank_0, get_args
-from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
-from megatron.data.dataset_utils import get_train_valid_test_split_
 from tools.retro.sft.dataset_conv import FtDataset as SFTDataset
 from tools.retro.sft.dataset_conv import get_processed_dataset
 

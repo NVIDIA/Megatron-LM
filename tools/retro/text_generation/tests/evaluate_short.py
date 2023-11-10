@@ -7,7 +7,7 @@ import regex
 import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(
-    os.path.join(os.path.dirname(__file__), "../../../"))))
+    os.path.join(os.path.dirname(__file__), "../../../../"))))
 from tools.retro.text_generation.metrics import F1Metric
 
 def normalize_answer(s):
@@ -183,8 +183,11 @@ if __name__ == "__main__":
     # model_names += "retro-qc_pp1_same_format_ctx1_43b_128_5e-6",
     # model_names += "retro-sft_full-qc-pp1_same_format_ctx1_43b_128_5e-6",
 
-    model_names += "retro-open_inst_pp1_same_format_ctx1_843m_128_5e-6",
-    model_names += "retro-qc_pp1_same_format_ctx1_843m_128_5e-6",
+    # model_names += "retro-open_inst_pp1_same_format_ctx1_843m_128_5e-6",
+    # model_names += "retro-qc_pp1_same_format_ctx1_843m_128_5e-6",
+
+    model_names += "gpt3-800m-pretraining-retro-fitting",
+    model_names += "gpt3-43b-pretraining-retro-fitting-noseqpar-pp1-distributed",
 
     for model_name in model_names:
         # ckpt_path = "/lustre/fsw/adlr/adlr-nlp/boxinw/sft-megatron-lm/checkpoints/applications/{}/".format(
@@ -195,38 +198,15 @@ if __name__ == "__main__":
         n_ctx = 5
         n_enc = 2
         iter = 1000
-        model_param = "843m" if "843m" in model_name else "43b"
+        model_param = "843m" if "800m" in model_name else "43b"
+        iter = 195312 if "800m" in model_name else 32000
 
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
+        prediction_file = ckpt_path + "/retro-generate-short-nq_{}_{}_{}_test_greedy_0_20000_{}.txt.period.txt".format(
             n_ctx, n_enc, model_param, iter)
-        # prediction_file = ckpt_path + "/retro-generate-nq_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-        #     n_ctx, n_enc, model_param, iter)
         ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/NQ/test.json"
         print(prediction_file)
         print(ground_truth_file)
         evaluate_f1(ground_truth_file, prediction_file)
         evaluate_ems(prediction_file, ground_truth_file)
 
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-            n_ctx, n_enc,model_param,  iter)
-        # prediction_file = ckpt_path + "/retro-generate-ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-        #     n_ctx, n_enc, model_param, iter)
-        ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/pengx/retro/data/ford_tasb_ftmsmarcominilm_chunkbysents150_benzlandroverford_retrieved/test.json"
-        print(prediction_file)
-        print(ground_truth_file)
-        evaluate_f1(ground_truth_file, prediction_file)
-
-
-        n_ctx = 1
-        n_enc = 1
-
-        prediction_file = ckpt_path + "/flex_gate_0_reuse_foundational_qa_doc2dial_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-            n_ctx, n_enc, model_param, iter)
-        # prediction_file = ckpt_path + "/retro-generate-doc2dial_{}_{}_{}_test_greedy_0_20000_{}.txt".format(
-        #     n_ctx, n_enc, model_param, iter)
-        ground_truth_file = "/lustre/fsw/adlr/adlr-nlp/zihanl/datasets/foundational-qa/multi-turn-qa/doc2dial/doc2dial_ftdragon_chatgptgen7k_chunk150_QA_test.json"
-        print(prediction_file)
-        print(ground_truth_file)
-        evaluate_f1(ground_truth_file, prediction_file)
-
-        print("=====================================")
+    print("=====================================")

@@ -40,7 +40,7 @@ In this README, we provide an end-to-end reproduction guide for InstructRetro, c
 
 ## Step 0: Prepare the environment
 
-We recommend using a docker environment  to run the code.
+We recommend using a` docker environment  to run the code.
 
 ### Docker image
 
@@ -80,7 +80,7 @@ pip install -U einops
 
 In this step, we build a large-scale retrieval database for InstructRetro through [Faiss](https://github.com/facebookresearch/faiss) to retrieve from trillions of tokens, and preprocess (and save) the retrieval neighbors for the pretraining step.
 
-Please refer to [build_db.md]() for more details.
+Please refer to `tools/retro/build_db.md` for more details.
 
 ## Step 2: Pretraining
 
@@ -133,7 +133,7 @@ Refer to the paper links above for more details about each instruction tuning da
 *We note that the provided instruction tuning dataset is all from open-source instruction tuning datasets. It is slightly different from what we use in [InstructRetro](https://arxiv.org/abs/2310.07713), which contains private and proprietary datasets. Thus 1-2% accuracy difference in downstream tasks may be expected.*  
 
 ### Instruction tuning script
-Download the [blended instruction tuning dataset]((https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing)) in your data home directory `$DATA_HOME` and update our templates in `tools/retro/sft/sft_retro_lm.sh`.
+Download the [blended instruction tuning dataset](https://drive.google.com/file/d/1nzKwwYf8lYb9gN3P4YO8pFNU_B2nMYe1/view?usp=sharing) in your data home directory `$DATA_HOME` and update our templates in `tools/retro/sft/sft_retro_lm.sh`.
 
 An example command to run instruction tuning on 800M Retro is as follows:
 ```bash
