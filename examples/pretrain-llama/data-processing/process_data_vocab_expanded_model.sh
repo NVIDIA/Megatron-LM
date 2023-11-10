@@ -10,25 +10,26 @@ OUTPUT_PATH="$DUMPED_FOLDER/allam_data_2-1_splits-indexed_data/"
 TOK_PATH="$OUTPUT_PATH/tokenizer/tokenizer.model"
 mkdir -p $OUTPUT_PATH
 
+if [ ! -d $DATA_PATH ]; then
+    azcopy copy  $AZURE_DATA_SAS_TOKEN $DATA_PATH --overwrite=false --recursive
+fi
 if [ ! -f $TOK_PATH ]; then
     mkdir -p $OUTPUT_PATH'/tokenizer'
     azcopy copy  $AZURE_TOK_SAS_TOKEN $TOK_PATH --overwrite=false
 fi
 
-if [ ! -d $DATA_PATH ]; then
-    azcopy copy  $AZURE_DATA_SAS_TOKEN $DATA_PATH --overwrite=false --recursive
-fi
-
 for _inp in $DATA_PATH/*.jsonl;
 do
     echo 'Indexing '$_inp'...'
-
     FILENAME=${_inp##*/}
     FILENAME_WITHOUT_EXT=${FILENAME%.*}
     TEMP_FOLDER=$DUMPED_FOLDER'/temp_bin_idx/temp_'$FILENAME_WITHOUT_EXT
     INDEX_FOLDER=$OUTPUT_PATH'/bin_idx/'$FILENAME_WITHOUT_EXT
+    if [ -d $INDEX_FOLDER ]; then
+        echo '[SKIPPING] Already Folder Exists '$INDEX_FOLDER'!'
+        continue
+    fi
     mkdir -p $TEMP_FOLDER
-    mkdir -p $INDEX_FOLDER
     
     echo 'Copying file from '$_inp' to '$TEMP_FOLDER
     cp $_inp $TEMP_FOLDER
@@ -36,13 +37,14 @@ do
     python tools/preprocess_data.py \
     --input $TEMP_FOLDER/$FILENAME \
     --json-keys 'text' \
-    --partitions 4 \
+    --partitions 16 \
     --tokenizer-type 'Llama2Tokenizer' \
     --tokenizer-model $TOK_PATH \
     --workers 128 \
     --output-prefix $TEMP_FOLDER/$FILENAME_WITHOUT_EXT \
     --keep-sequential-samples
-    
+
+    mkdir -p $INDEX_FOLDER
     mv $TEMP_FOLDER/$FILENAME_WITHOUT_EXT'_text_document.bin' $INDEX_FOLDER
     mv $TEMP_FOLDER/$FILENAME_WITHOUT_EXT'_text_document.idx' $INDEX_FOLDER
     rm -rf $TEMP_FOLDER/

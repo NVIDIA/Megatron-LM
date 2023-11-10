@@ -20,7 +20,7 @@ fi
 
 for _inp in $DATA_PATH/*.jsonl;
 do
-    # echo 'Indexing '$_inp'...'
+    echo 'Indexing '$_inp'...'
     FILENAME=${_inp##*/}
     FILENAME_WITHOUT_EXT=${FILENAME%.*}
     TEMP_FOLDER=$DUMPED_FOLDER'/temp_bin_idx/temp_'$FILENAME_WITHOUT_EXT
