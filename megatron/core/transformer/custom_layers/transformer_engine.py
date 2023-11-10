@@ -13,6 +13,7 @@ from megatron.core.parallel_state import (
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -45,11 +46,13 @@ class TENorm:
         normalization: str = "LayerNorm",
         **kwargs
     ):
+        zero_centered_gamma = kwargs.get('zero_centered_gamma', False)
         if normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
+                zero_centered_gamma=zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         elif normalization == "RMSNorm":
@@ -60,6 +63,7 @@ class TENorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=sequence_parallel,
+                zero_centered_gamma=zero_centered_gamma,
                 **_get_extra_te_kwargs(config),
             )
         else:
@@ -98,6 +102,17 @@ class TELinear(te.pytorch.Linear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
+        te_version = packaging.version.Version(version("transformer-engine"))
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_split_ag"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
+            )
+            extra_kwargs["ub_split_rs"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_rs
+            )
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -111,7 +126,7 @@ class TELinear(te.pytorch.Linear):
             parallel_mode=parallel_mode,
             bias=bias,
             return_bias=self.te_return_bias,
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
 
     def forward(self, x):
@@ -149,10 +164,23 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         # and we don't have to deal with the zero length Tensor.
         self.te_return_bias = skip_bias_add and bias
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         te_version = packaging.version.Version(version("transformer-engine"))
         if te_version >= packaging.version.Version("0.11.0"):
             kwargs["normalization"] = self.config.normalization
+
+        if te_version >= packaging.version.Version("0.8.0"):
+            extra_kwargs["ub_bulk_wgrad"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_bulk_wgrad
+            )
+            extra_kwargs["ub_bulk_dgrad"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_bulk_dgrad
+            )
+            extra_kwargs["ub_split_ag"] = (
+                self.config.tp_comm_overlap and self.config.tp_comm_split_ag
+            )
 
         super().__init__(
             in_features=input_size,
@@ -167,7 +195,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             params_dtype=self.config.params_dtype,
             parallel_mode="column",
             return_bias=self.te_return_bias,
-            **_get_extra_te_kwargs(config),
+            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+            **extra_kwargs,
         )
 
     def forward(self, x):
@@ -179,6 +208,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         if self.te_return_bias:
             return out
         return out, None
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 0, bias sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
 
 
 class TEColumnParallelLinear(TELinear):
@@ -197,6 +233,13 @@ class TEColumnParallelLinear(TELinear):
             **kwargs,
         )
 
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 0, bias sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+        )
+
 
 class TERowParallelLinear(TELinear):
     """
@@ -212,6 +255,13 @@ class TERowParallelLinear(TELinear):
             config=self.config,
             parallel_mode="row",
             **kwargs,
+        )
+
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        """ Sharding along axis 1, bias not sharded """
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_key_prefix, {'weight': 1}, sharded_offsets
         )
 
 

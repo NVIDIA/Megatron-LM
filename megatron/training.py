@@ -2,6 +2,7 @@
 
 """Pretrain utilities."""
 
+import gc
 from datetime import datetime
 import math
 import logging
@@ -31,7 +32,8 @@ from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
 from megatron.model import GPTModel
-from megatron.core import DistributedDataParallel as DDP
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.optimizer import get_megatron_optimizer
 from megatron.initialize import initialize_megatron
@@ -42,7 +44,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
-from megatron.core.pipeline_parallel import finalize_model_grads, get_forward_backward_func
+from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -124,17 +126,16 @@ def pretrain(train_valid_test_dataset_provider,
     timers('train/valid/test-data-iterators-setup', log_level=0).start(
         barrier=True)
     if args.virtual_pipeline_model_parallel_size is not None:
-        all_data_iterators = [
-            build_train_valid_test_data_iterators(
+        train_data_iterator = []
+        valid_data_iterator = []
+        test_data_iterator = []
+        for i in range(len(model)):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            iterators = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
-            for _ in range(len(model))
-        ]
-        train_data_iterator = [data_iterators[0]
-                               for data_iterators in all_data_iterators]
-        valid_data_iterator = [data_iterators[1]
-                               for data_iterators in all_data_iterators]
-        test_data_iterator = [data_iterators[2]
-                              for data_iterators in all_data_iterators]
+            train_data_iterator.append(iterators[0])
+            valid_data_iterator.append(iterators[1])
+            test_data_iterator.append(iterators[2])
     else:
         train_data_iterator, valid_data_iterator, test_data_iterator \
             = build_train_valid_test_data_iterators(
@@ -303,12 +304,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if wrap_with_ddp:
         config = get_model_config(model[0])
         model = [DDP(config,
-                     model_module,
-                     data_parallel_group=mpu.get_data_parallel_group(),
+                     model_chunk,
+                     data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
                      accumulate_allreduce_grads_in_fp32=args.accumulate_allreduce_grads_in_fp32,
                      overlap_grad_reduce=args.overlap_grad_reduce,
-                     use_distributed_optimizer=args.use_distributed_optimizer)
-                 for model_module in model]
+                     use_distributed_optimizer=args.use_distributed_optimizer,
+                     # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                     # model chunks is overlapped with compute anyway.
+                     disable_bucketing=(model_chunk_idx > 0))
+                 for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -705,20 +709,31 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
-    # TODO: Remove this once we move DDP to Core.
-    if len(model) == 1 and isinstance(model[0], DDP) and \
-        args.overlap_grad_reduce:
+    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, \
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
              'a custom no_sync_func is not supported when overlapping grad-reduce')
+        config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
+        if len(model) == 1:
+            config.no_sync_func = config.no_sync_func[0]
         if args.delay_grad_reduce:
-            config.grad_sync_func = model[0].grad_sync
-        config.no_sync_func = model[0].no_sync
+            config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
+            if len(model) == 1:
+                config.grad_sync_func = config.grad_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
     report_memory_flag = True
+    exit = False
+
+    if args.manual_gc:
+        # Disable the default garbage collector and perform the collection manually.
+        # This is to align the timing of garbage collection across ranks.
+        assert args.manual_gc_interval >= 0, \
+            'Manual garbage collection interval should be laerger than or equal to 0.'
+        gc.disable()
+        gc.collect()
 
     while iteration < args.train_iters:
         if args.profile and \
@@ -761,11 +776,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect all objects.
+                gc.collect()
             prefix = 'iteration {}'.format(iteration)
             evaluate_and_print_results(prefix, forward_step_func,
                                        valid_data_iterator, model,
                                        iteration, process_non_loss_data_func,
                                        config, False)
+            if args.manual_gc and args.manual_gc_eval:
+                # Collect only the objects created and used in evaluation.
+                gc.collect(generation=0)
 
         # Checkpointing
         saved_checkpoint = False
@@ -775,7 +796,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler)
                 print_datetime('exiting program after receiving SIGTERM.')
-                sys.exit()
+                exit = True
+                break
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
@@ -796,7 +818,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     save_checkpoint_and_time(iteration, model, optimizer,
                                              opt_param_scheduler)
                 print_datetime('exiting program after {} minutes'.format(train_time))
-                sys.exit()
+                exit = True
+                break
 
         # Exiting based on iterations
         if args.exit_interval and iteration % args.exit_interval == 0:
@@ -805,12 +828,29 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          opt_param_scheduler)
             torch.distributed.barrier()
             print_datetime('exiting program at iteration {}'.format(iteration))
-            sys.exit()
+            exit = True
+            break
 
         if args.profile and \
            iteration == args.profile_step_end and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if args.manual_gc:
+            if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
+                gc.collect()
+
+    # Flush TensorBoard and WandB writers.
+    writer = get_tensorboard_writer()
+    if writer:
+        writer.flush()
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
+
+    # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
+    if exit:
+        sys.exit()
 
     return iteration
 
@@ -874,6 +914,17 @@ def evaluate(forward_step_func,
 
             args.consumed_valid_samples += eval_batch_size
 
+            if args.exit_duration_in_mins:
+                train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+                done_cuda = torch.cuda.IntTensor(
+                    [train_time > args.exit_duration_in_mins])
+                torch.distributed.all_reduce(
+                    done_cuda, op=torch.distributed.ReduceOp.MAX)
+                done = done_cuda.item()
+                if done:
+                    print_rank_0('Exiting during evaluation, timelimit reached')
+                    return None, None, True
+
         collected_non_loss_data = None
         if process_non_loss_data_func is not None and is_last_rank():
             collected_non_loss_data = forward_backward_func(
@@ -886,6 +937,9 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
+        
+        
+
 
     # Move model back to the train mode.
     for model_module in model:
@@ -894,7 +948,7 @@ def evaluate(forward_step_func,
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
 
-    return total_loss_dict, collected_non_loss_data
+    return total_loss_dict, collected_non_loss_data, False
 
 def evaluate_and_print_results(prefix, forward_step_func,
                                data_iterator, model,
@@ -909,9 +963,12 @@ def evaluate_and_print_results(prefix, forward_step_func,
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data = evaluate(
+    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
         forward_step_func, data_iterator, model,
         process_non_loss_data_func, config, verbose)
+    # Timelimit hit during evaluation
+    if timelimit:
+        return
     string = ' validation loss at {} | '.format(prefix)
     for key in total_loss_dict:
         string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
@@ -994,8 +1051,11 @@ def build_train_valid_test_data_loaders(
             args.consumed_valid_samples = (args.iteration // args.eval_interval) * \
                 args.eval_iters * args.global_batch_size
 
-    # Data loader only on rank 0 of each model parallel group.
-    if mpu.get_tensor_model_parallel_rank() == 0:
+    # Rely on distributed-aware core datasets, temporary
+    is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
+
+    # Construct the data pipeline
+    if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
@@ -1014,19 +1074,16 @@ def build_train_valid_test_data_loaders(
         do_train = train_dataloader is not None and args.train_iters > 0
         do_valid = valid_dataloader is not None and args.eval_iters > 0
         do_test = test_dataloader is not None and args.eval_iters > 0
-        # Need to broadcast num_tokens and num_type_tokens.
         flags = torch.cuda.LongTensor(
             [int(do_train), int(do_valid), int(do_test)])
     else:
         flags = torch.cuda.LongTensor([0, 0, 0])
 
-    # Broadcast num tokens.
-    torch.distributed.broadcast(flags,
-                                mpu.get_tensor_model_parallel_src_rank(),
-                                group=mpu.get_tensor_model_parallel_group())
-    args.do_train = flags[0].item()
-    args.do_valid = flags[1].item()
-    args.do_test = flags[2].item()
+    torch.distributed.broadcast(flags, 0)
+
+    args.do_train = getattr(args, "do_train", False) or flags[0].item()
+    args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+    args.do_test = getattr(args, "do_test", False) or flags[2].item()
 
     return train_dataloader, valid_dataloader, test_dataloader
 

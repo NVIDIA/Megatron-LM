@@ -12,7 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
 import time
 import torch
 from megatron.tokenizer import build_tokenizer
-from megatron.data import indexed_dataset
+from megatron.core.datasets import indexed_dataset
 
 
 class Encoder(object):

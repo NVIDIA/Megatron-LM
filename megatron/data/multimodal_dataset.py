@@ -32,11 +32,11 @@ class MultiModalDataset(torch.utils.data.Dataset):
 
         self.name = name
         self.indexed_dataset = indexed_dataset
-        self.doc_idx = indexed_dataset.get_doc_idx()
+        self.doc_idx = indexed_dataset.get_document_indices()
         self.visual_transform = _transform(img_h, img_w)
 
     def __len__(self):
-        return self.indexed_dataset.sizes.shape[0]
+        return self.indexed_dataset.sequence_lengths.shape[0]
 
     def __getitem__(self, idx):
         text_sample, mode = self.indexed_dataset.get(self.doc_idx[idx])

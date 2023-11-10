@@ -76,16 +76,19 @@ def validate_args(args, defaults={}):
     # Checks.
     model_parallel_size = args.pipeline_model_parallel_size * \
                           args.tensor_model_parallel_size
-    assert args.world_size % model_parallel_size == 0, 'world size ({}) is not'\
-        ' divisible by tensor parallel size ({}) times pipeline parallel ' \
-        'size ({})'.format(args.world_size, args.tensor_model_parallel_size,
-                           args.pipeline_model_parallel_size)
-    args.data_parallel_size = args.world_size // model_parallel_size
+    assert args.world_size % (model_parallel_size * args.context_parallel_size) == 0, \
+        'world size ({}) is not divisible by tensor parallel size ({}) times ' \
+        'pipeline parallel size ({}) times context parallel size ({})'.format(
+        args.world_size, args.tensor_model_parallel_size,
+        args.pipeline_model_parallel_size, args.context_parallel_size)
+    args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel-size: {}, '
+              'context-parallel-size: {} '
               'tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
+                  args.context_parallel_size,
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
     if args.pipeline_model_parallel_size > 1:
@@ -94,6 +97,10 @@ def validate_args(args, defaults={}):
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
                             args.pipeline_model_parallel_size)
+
+    if args.tp_comm_overlap:
+        assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+
 
     # Deprecated arguments
     assert args.batch_size is None, '--batch-size argument is no longer ' \
@@ -153,6 +160,11 @@ def validate_args(args, defaults={}):
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.virtual_pipeline_model_parallel_size = None
+        # Overlap P2P communication is disabled if not using the interleaved schedule.
+        args.overlap_p2p_comm = False
+        if args.rank == 0:
+            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
+                  'schedule does not support overlapping p2p communication')
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -173,10 +185,6 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
-
-    # Overlapping grad reduce not supported with interleaved PP right now.
-    if args.overlap_grad_reduce:
-        assert args.virtual_pipeline_model_parallel_size is None
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
@@ -527,15 +535,6 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
-    group.add_argument("--retro-fix-sub-epoch", action="store_true",
-                       help="Fix the sub epoch issue for gpt dataset")
-    group.add_argument('--retro-split-constraint', nargs="*", action="extend",
-                       help='A split constraint intersects the document IDs '
-                       'between the primary \'--split\' and a secondary split '
-                       'to constrain which document IDs are available for each '
-                       'data group. The intersection is computed separately '
-                       'for the training, validation, and test datasets. Same '
-                       'format as \'--split\'.')
     group.add_argument("--retro-attention-gate", type=float, default=1,
                        help="Gated cross attention.")
     # Enforce argument naming convention.
@@ -802,6 +801,22 @@ def _add_training_args(parser):
                        help='Gloable step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
+    group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
+                       ' overlap of Tensor parallel communication and GEMM kernels.')
+    group.add_argument('--tp-comm-overlap-cfg', type=str, default=None, 
+                       help = 'Config file when tp_comm_overlap is enabled.')
+    group.add_argument('--disable-tp-comm-split-ag', action='store_false', 
+                       help = 'Disables the All-Gather overlap with fprop GEMM.',
+                       dest='tp_comm_split_ag')
+    group.add_argument('--disable-tp-comm-split-rs', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with fprop GEMM.',
+                       dest='tp_comm_split_rs')
+    group.add_argument('--disable-tp-comm-bulk-dgrad', action='store_false', 
+                       help = 'Disables the All-Gather overlap with bprop activation gradient GEMM.',
+                       dest='tp_comm_bulk_dgrad')
+    group.add_argument('--disable-tp-comm-bulk-wgrad', action='store_false', 
+                       help = 'Disables the Reduce-Scatter overlap with bprop weight gradient GEMM.',
+                       dest='tp_comm_bulk_wgrad')
 
 
     # deprecated
@@ -874,6 +889,22 @@ def _add_training_args(parser):
                        dest='use_mcore_models')
     group.add_argument('--expert-parallel', action='store_true',
                        help='Enable expert parallel optimization.')
+    group.add_argument('--manual-gc', action='store_true',
+                       help='Disable the threshold-based default garbage '
+                       'collector and trigger the garbage collection manually. '
+                       'Manual garbage collection helps to align the timing of '
+                       'the collection across ranks which mitigates the impact '
+                       'of CPU-associated jitters. When the manual gc is enabled, '
+                       'garbage collection is performed only at the start and the '
+                       'end of the validation routine by default.')
+    group.add_argument('--manual-gc-interval', type=int, default=0,
+                       help='Training step interval to trigger manual garbage '
+                       'collection. When the value is set to 0, garbage '
+                       'collection is not triggered between training steps.')
+    group.add_argument('--no-manual-gc-eval', action='store_false',
+                       help='When using manual garbage collection, disable '
+                       'garbage collection at the start and the end of each '
+                       'evaluation run.', dest='manual_gc_eval')
 
     return parser
 
@@ -1035,8 +1066,7 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
-    group.add_argument('--overlap-p2p-communication',
-                       action='store_true',
+    group.add_argument('--no-overlap-p2p-communication', action='store_false',
                        help='overlap pipeline parallel communication with forward and backward chunks',
                        dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
@@ -1081,6 +1111,8 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
+    group.add_argument('--context-parallel-size', type=int, default=1,
+                       help='Degree of context parallelism.')
     return parser
 
 
@@ -1160,8 +1192,6 @@ def _add_data_args(parser):
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
                        help='Probability of producing a short sequence.')
-    group.add_argument('--mmap-warmup', action='store_true',
-                       help='Warm up mmap files.')
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--tokenizer-type', type=str,

@@ -124,9 +124,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
-    --retro-split-constraint 99,1,0 \
-    --retro-split-constraint 98,2,0 \
-    --retro-fix-sub-epoch \
 "
 
 ######## retro. ########
