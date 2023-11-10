@@ -20,12 +20,15 @@ fi
 
 for _inp in $DATA_PATH/*.jsonl;
 do
-    echo 'Indexing '$_inp'...'
-
+    # echo 'Indexing '$_inp'...'
     FILENAME=${_inp##*/}
     FILENAME_WITHOUT_EXT=${FILENAME%.*}
     TEMP_FOLDER=$DUMPED_FOLDER'/temp_bin_idx/temp_'$FILENAME_WITHOUT_EXT
     INDEX_FOLDER=$OUTPUT_PATH'/bin_idx/'$FILENAME_WITHOUT_EXT
+    if [ -d $INDEX_FOLDER ]; then
+        echo $INDEX_FOLDER
+        continue
+    fi
     mkdir -p $TEMP_FOLDER
     mkdir -p $INDEX_FOLDER
     
@@ -35,7 +38,7 @@ do
     python tools/preprocess_data.py \
     --input $TEMP_FOLDER/$FILENAME \
     --json-keys 'text' \
-    --partitions 4 \
+    --partitions 16 \
     --tokenizer-type 'Llama2Tokenizer' \
     --tokenizer-model $TOK_PATH \
     --workers 128 \
