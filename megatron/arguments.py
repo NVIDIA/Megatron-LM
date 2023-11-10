@@ -1184,6 +1184,9 @@ def _add_data_args(parser):
 
             with open(values, "r") as fi:
                 lines = fi.readlines()
+                print(f"Loading {option_string} from {values}")
+                print(f"nb lines {len(lines)}")
+                print(f"first line {lines[0]}")
                 assert len(lines) == 1, f"Got multiple lines {len(lines)} instead of 1 expected"
                 assert lines[0][-2:] == "\"\n" and lines[0][0] == "\"", f"Invalid input format, got {lines}"
                 values = lines[0][1:-2].split("\" \"")
@@ -1280,7 +1283,7 @@ def _add_data_args(parser):
                        help='String around which to split the sample for FIM. If None (default), FIM is applied on the sample-level')
     group.add_argument('--fragment-fim-rate', type=float, default=0.5,
                        help='Rate of FIM on each fragment when fim_split_sample is not None.')
-    group.add_argument('--sanity-check-dataloader-interval', type=int, default=0,
+    group.add_argument('--sanity-check-dataloader-interval', type=int, default=None,
                           help='Optional interval to print dataloader samples.')
 
     return parser
