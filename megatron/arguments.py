@@ -1184,9 +1184,6 @@ def _add_data_args(parser):
 
             with open(values, "r") as fi:
                 lines = fi.readlines()
-                print(f"Loading {option_string} from {values}")
-                print(f"nb lines {len(lines)}")
-                print(f"first line {lines[0]}")
                 assert len(lines) == 1, f"Got multiple lines {len(lines)} instead of 1 expected"
                 assert lines[0][-2:] == "\"\n" and lines[0][0] == "\"", f"Invalid input format, got {lines}"
                 values = lines[0][1:-2].split("\" \"")
