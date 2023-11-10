@@ -10,8 +10,6 @@ from abc import abstractmethod
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
-from transformers import AutoTokenizer
-
 def build_tokenizer(args):
     """Initialize tokenizer."""
     if args.rank == 0:
@@ -141,6 +139,7 @@ class _HFAutoTokenizer(AbstractTokenizer):
     def __init__(self, pretrained_model_name_or_path: str):
         name = "HFAutoTokenizer"
         super().__init__(name)
+        from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         self.tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
         self.eod_id = self.tokenizer.eos_token_id
