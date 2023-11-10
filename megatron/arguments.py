@@ -1219,8 +1219,11 @@ def _add_data_args(parser):
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'Llama2Tokenizer',
+                                'HFAutoTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
+    group.add_argument('--hf_autotokenizer_model', type=str, default=None,
+                       help='Name of HF tokenizer model')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
     group.add_argument('--reset-position-ids', action='store_true',

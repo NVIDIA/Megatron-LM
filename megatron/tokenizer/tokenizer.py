@@ -2,6 +2,8 @@
 
 """Megatron tokenizers."""
 
+from typing import List
+
 from abc import ABC
 from abc import abstractmethod
 
@@ -38,6 +40,10 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'HFAutoTokenizer':
+        assert args.hf_autotokenizer_model is not None
+        print(f"Initializing {args.hf_autotokenizer_model} tokenizer from HuggingFace")
+        tokenizer = _HFAutoTokenizer(args.hf_autotokenizer_model)        
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
@@ -125,6 +131,45 @@ class AbstractTokenizer(ABC):
     def mask(self):
         raise NotImplementedError('MASK is not provided for {} '
                                   'tokenizer'.format(self.name))
+
+
+class _HFAutoTokenizer(AbstractTokenizer):
+    """Designed to Integrate HF's AutoTokenizer from transformers."""
+
+    def __init__(self, pretrained_model_name_or_path: str):
+        name = "HFAutoTokenizer"
+        super().__init__(name)
+        from transformers import AutoTokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
+        self.tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
+        self.eod_id = self.tokenizer.eos_token_id
+        self.pad_id = self.tokenizer.pad_token_id
+
+    @property
+    def vocab_size(self):
+        return self.tokenizer.vocab_size
+
+    @property
+    def vocab(self):
+        return self.tokenizer.get_vocab()
+
+    @property
+    def inv_vocab(self):
+        return {v: k for k, v in self.tokenizer.get_vocab().items()}
+
+    def tokenize(self, text: str):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids: List[int]):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.eod_id
+    
+    @property
+    def pad(self):
+        return self.pad_id
 
 
 class _BertWordPieceTokenizer(AbstractTokenizer):
