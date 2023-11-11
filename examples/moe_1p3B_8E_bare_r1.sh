@@ -21,7 +21,7 @@ MERGE_FILE=/mnt/shared/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/
 DATA_PATH=/mnt/shared/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
 
 WANDB_PROJECT=moe
-WANDB_EXP_NAME=moe_1p3b_8e_600B_slimpj
+WANDB_EXP_NAME=final_moe_1p3b_8e_600B_slimpj
 WANDB_SAVE_DIR=/media/16TBNVME/qanthony/wandb
 
 DISTRIBUTED_ARGS="
@@ -57,6 +57,9 @@ GPT_ARGS="
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --swiglu \
+    --position-embedding-type rope \
+    --use-rotary-position-embeddings \
+    --adam-beta2 0.95
     "
     #--fp8-format hybrid \
     #--transformer-impl transformer_engine 
@@ -73,7 +76,7 @@ DATA_ARGS="
 
 OUTPUT_ARGS="
     --log-interval 1 \
-    --save-interval 20000 \
+    --save-interval 5000 \
     --eval-interval 500 \
     --eval-iters 50 \
     --wandb-project $WANDB_PROJECT \
