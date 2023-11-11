@@ -43,8 +43,8 @@ GPT_ARGS="
     --micro-batch-size 8 \
     --global-batch-size 1024 \
     --lr 0.00025 \
-    --train-iters 570000 \
-    --lr-decay-iters 570000 \
+    --train-iters 290000 \
+    --lr-decay-iters 290000 \
     --lr-decay-style cosine \
     --min-lr 1.0e-5 \
     --weight-decay 0.0 \
@@ -59,8 +59,6 @@ GPT_ARGS="
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --swiglu \
-    --position-embedding-type rope \
-    --use-rotary-position-embeddings \
     --adam-beta2 0.95
     "
     #--fp8-format hybrid \
