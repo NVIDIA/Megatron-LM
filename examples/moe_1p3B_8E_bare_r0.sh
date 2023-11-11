@@ -56,11 +56,7 @@ GPT_ARGS="
     --accumulate-allreduce-grads-in-fp32 \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
-    --swiglu\
-    --profile \
-    --profile-step-start 1 \
-    --profile-step-end 2 \
-    --profile-ranks 0 1 2 3 4 5 6 7 8
+    --swiglu \
     "
     #--fp8-format hybrid \
     #--transformer-impl transformer_engine 
@@ -85,13 +81,11 @@ OUTPUT_ARGS="
     --wandb-save-dir $WANDB_SAVE_DIR
 "
 
-torchrun $DISTRIBUTED_ARGS /home/cirrascale/beren/torchrun_env/Megatron-LM/pretrain_gpt.py \
+torchrun $DISTRIBUTED_ARGS /opt/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
     --distributed-backend nccl \
     --save $CHECKPOINT_PATH \
     --load $CHECKPOINT_PATH
-
-
-#mpirun -np 8 --mca btl smcuda,^lo,^openib --mca coll smcuda -mca btl_base_verbose 10 --mca mtl_base_verbose 99 --mca btl_tcp_if_include eth0 -x CONDA_PREFIX -x LIBRARY_PATH -x CUDNN_LIBRARY -x CUDNN_INCLUDE_DIR -x CONDA_DEFAULT_ENV -x WANDB_API_KEY -x CUDA_DEVICE_MAX_CONNECTIONS -x PATH -x LD_LIBRARY_PATH -x CPATH --hostfile hosts nsys profile -t nvtx,cuda -o nsys_mpi/nsys_output_mpi-%q{OMPI_COMM_WORLD_RANK} --force-overwrite true --capture-range=cudaProfilerApi /mnt/shared/qanthony/miniconda3/envs/deepspeed/bin/python /mnt/shared/qanthony/Megatron-LM/pretrain_gpt.py \
+    
