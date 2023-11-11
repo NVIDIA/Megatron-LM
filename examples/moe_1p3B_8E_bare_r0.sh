@@ -61,6 +61,8 @@ GPT_ARGS="
     --hidden-dropout 0.0 \
     --swiglu \
     --adam-beta2 0.95
+    --position-embedding-type rope \	
+    --use-rotary-position-embeddings \
     "
     #--fp8-format hybrid \
     #--transformer-impl transformer_engine 

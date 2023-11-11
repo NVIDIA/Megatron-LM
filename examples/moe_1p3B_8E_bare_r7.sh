@@ -40,7 +40,7 @@ GPT_ARGS="
     --num-attention-heads 16 \
     --seq-length 2048 \
     --max-position-embeddings 2048 \
-    --micro-batch-size 8 \
+    --micro-batch-size 4 \
     --global-batch-size 1024 \
     --lr 0.00025 \
     --train-iters 290000 \
@@ -59,6 +59,8 @@ GPT_ARGS="
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --swiglu \
+    --position-embedding-type rope \	
+    --use-rotary-position-embeddings \
     --adam-beta2 0.95
     "
     #--fp8-format hybrid \
