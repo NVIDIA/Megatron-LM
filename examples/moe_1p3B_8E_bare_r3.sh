@@ -59,7 +59,7 @@ GPT_ARGS="
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
     --swiglu \
-    --position-embedding-type rope \	
+    --position-embedding-type rope \
     --use-rotary-position-embeddings \
     --adam-beta2 0.95
     "
