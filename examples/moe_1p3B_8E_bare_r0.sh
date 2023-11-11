@@ -9,19 +9,19 @@ export WANDB_API_KEY=6f0443d34d41df289b878635a247d89381c06271
 
 GPUS_PER_NODE=8
 # Change for multinode config
-export MASTER_ADDR="64.156.70.215"
+export MASTER_ADDR="172.18.135.11"
 export MASTER_PORT=6000
 NNODES=8
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-CHECKPOINT_PATH=/media/16TBNVME/qanthony/ckpts
+CHECKPOINT_PATH=/media/16TBNVME/qanthony/ckpts_1p3b
 VOCAB_FILE=/mnt/shared/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/vocab.json
 MERGE_FILE=/mnt/shared/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/merges.txt
 DATA_PATH=/mnt/shared/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
 
 WANDB_PROJECT=moe
-WANDB_EXP_NAME=moe_1p3b_16e_slimpj_test
+WANDB_EXP_NAME=moe_1p3b_8e_600B_slimpj
 WANDB_SAVE_DIR=/media/16TBNVME/qanthony/wandb
 
 DISTRIBUTED_ARGS="
