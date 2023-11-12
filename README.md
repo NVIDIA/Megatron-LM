@@ -2,32 +2,21 @@
 
 
 ## Spin up Docker Container
-```
-# Set up your user folder on the node
-mkdir ~/<your-user-folder>
-# Pull the container (only necessary once per node)
-docker pull nvcr.io/nvidia/pytorch:23.10-py3
-# Spin up the container with 1.8TB RAM, all GPUs, and two mounted folders. One for node-local work in ~/<your-user-folder>/workspace and one to load shared datasets at /mnt/shared/datasets
-docker run --privileged --shm-size=1800gb --gpus all -it --rm -v ~/<your-user-folder>/workspace:/workspace -v /mnt/shared/datasets:/datasets  nvcr.io/nvidia/pytorch:23.10-py3
-```
 
-## Run Training
-Log in to wandb (must create an account first at wandb.ai)
-```
-pip install wandb
-wandb login
-```
+ Set up your user folder on the node
+```mkdir ~/<your-user-folder>```
+ Pull our container (only necessary once per node)
+```docker pull zyphra/megatron:latest```
+ Spin up the container with 1.8TB RAM, all GPUs, and two mounted folders. One for node-local work in ```~/<your-user-folder>/workspace``` and one to load shared datasets at ```/mnt/shared/datasets```
+ 
+```docker run --privileged --shm-size=1000gb --gpus all -it --rm -v <path to your local workspace folder>:/workspace -v /mnt/shared/datasets:/datasets zyphra/megatron:latest```
 
-### Install our Megatron-LM
-```
-git clone https://github.com/Zyphra/Megatron-LM.git
-cd Megatron-LM
-pip install .
-cd ..
-```
+ Where you need to point ```<path to your local workspace folder>``` to your user folder.
+
+ The Megatron LM installation will be installed in ```/opt/Megatron-LM```
 
 ### Launch Training
-`bash Megatron-LM/examples/pretrain_gpt_distributed.sh`
+`bash /opt/Megatron-LM/examples/pretrain_gpt_distributed.sh`
 
 
 # NVIDIA Megatron-LM (copied from upstream)
