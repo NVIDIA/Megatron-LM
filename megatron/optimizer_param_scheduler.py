@@ -98,9 +98,9 @@ class OptimizerParamScheduler(object):
         if self.lr_decay_style != 'invsqrt-inf':
             self.num_repeats = 1
 
-        if self.lr_decay_style == "invsqrt-inf":
-            warmup = self.lr_warmup_steps / self.end_steps
-            lr_warmup_steps = warmup * int(self.end_steps / self.num_repeats)
+        warmup = self.lr_warmup_steps / self.end_steps
+        
+        lr_warmup_steps = warmup * int(self.end_steps / self.num_repeats)
 
         repeat_step_interval = int(self.end_steps / self.num_repeats)
 
@@ -172,7 +172,7 @@ class OptimizerParamScheduler(object):
 
             # All other decay styles:
             else:  
-    
+
                 # If the learning rate is constant, just return the initial value.
                 if self.lr_decay_style == 'constant':
                     return self.max_lr
@@ -187,14 +187,14 @@ class OptimizerParamScheduler(object):
                     num_steps = max(self.num_steps, 1)
                     lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
                     return max(self.min_lr, lr)
-    
+
                 num_steps_ = self.num_steps - self.lr_warmup_steps
                 decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
                 decay_ratio = float(num_steps_) / float(decay_steps_)
                 assert decay_ratio >= 0.0
                 assert decay_ratio <= 1.0
                 delta_lr = self.max_lr - self.min_lr
-    
+
                 if self.lr_decay_style == 'linear':
                     coeff = (1.0 - decay_ratio)
                 elif self.lr_decay_style == 'cosine':
@@ -202,7 +202,7 @@ class OptimizerParamScheduler(object):
                 else:       
                     raise Exception('{} decay style is not supported.'.format(
                         self.lr_decay_style))
-    
+
                 return self.min_lr + coeff * delta_lr
 
 
