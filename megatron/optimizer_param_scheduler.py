@@ -170,40 +170,40 @@ class OptimizerParamScheduler(object):
                     return lr
 
 
-        # All other decay styles:
-        else:  
-
-            # If the learning rate is constant, just return the initial value.
-            if self.lr_decay_style == 'constant':
-                return self.max_lr
-            
-            # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
-            if self.num_steps > self.lr_decay_steps:
-                    return self.min_lr
+            # All other decay styles:
+            else:  
+    
+                # If the learning rate is constant, just return the initial value.
+                if self.lr_decay_style == 'constant':
+                    return self.max_lr
                 
-            # If we are done with the warmup period, use the decay style.
-            if self.lr_decay_style == 'inverse-square-root':
-                warmup_steps = max(self.lr_warmup_steps, 1)
-                num_steps = max(self.num_steps, 1)
-                lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
-                return max(self.min_lr, lr)
-
-            num_steps_ = self.num_steps - self.lr_warmup_steps
-            decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
-            decay_ratio = float(num_steps_) / float(decay_steps_)
-            assert decay_ratio >= 0.0
-            assert decay_ratio <= 1.0
-            delta_lr = self.max_lr - self.min_lr
-
-            if self.lr_decay_style == 'linear':
-                coeff = (1.0 - decay_ratio)
-            elif self.lr_decay_style == 'cosine':
-                coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
-            else:       
-                raise Exception('{} decay style is not supported.'.format(
-                    self.lr_decay_style))
-
-            return self.min_lr + coeff * delta_lr
+                # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
+                if self.num_steps > self.lr_decay_steps:
+                        return self.min_lr
+                    
+                # If we are done with the warmup period, use the decay style.
+                if self.lr_decay_style == 'inverse-square-root':
+                    warmup_steps = max(self.lr_warmup_steps, 1)
+                    num_steps = max(self.num_steps, 1)
+                    lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
+                    return max(self.min_lr, lr)
+    
+                num_steps_ = self.num_steps - self.lr_warmup_steps
+                decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
+                decay_ratio = float(num_steps_) / float(decay_steps_)
+                assert decay_ratio >= 0.0
+                assert decay_ratio <= 1.0
+                delta_lr = self.max_lr - self.min_lr
+    
+                if self.lr_decay_style == 'linear':
+                    coeff = (1.0 - decay_ratio)
+                elif self.lr_decay_style == 'cosine':
+                    coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
+                else:       
+                    raise Exception('{} decay style is not supported.'.format(
+                        self.lr_decay_style))
+    
+                return self.min_lr + coeff * delta_lr
 
 
     def step(self, increment):
