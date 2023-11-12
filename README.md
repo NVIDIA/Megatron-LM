@@ -5,15 +5,18 @@
 
  Set up your user folder on the node
 ```mkdir ~/<your-user-folder>```
+
  Pull our container (only necessary once per node)
+ 
 ```docker pull zyphra/megatron:latest```
- Spin up the container with 1.8TB RAM, all GPUs, and two mounted folders. One for node-local work in ```~/<your-user-folder>/workspace``` and one to load shared datasets at ```/mnt/shared/datasets```
+
+ Spin up the container with 1.8TB RAM, all GPUs, and two mounted folders. One for node-local work in ```~/<your-user-folder>/workspace``` and one to load shared datasets at ```/mnt/shared/datasets```:
  
 ```docker run --privileged --shm-size=1000gb --gpus all -it --rm -v <path to your local workspace folder>:/workspace -v /mnt/shared/datasets:/datasets zyphra/megatron:latest```
 
- Where you need to point ```<path to your local workspace folder>``` to your user folder.
+Where you need to point ```<path to your local workspace folder>``` to your user folder.
 
- The Megatron LM installation will be installed in ```/opt/Megatron-LM```
+The Megatron LM installation will be installed in ```/opt/Megatron-LM```
 
 ### Launch Training
 `bash /opt/Megatron-LM/examples/pretrain_gpt_distributed.sh`
