@@ -38,6 +38,8 @@ class MegatronDataset(ABC, torch.utils.data.Dataset):
         index_split: Split,
         config: BlendedMegatronDatasetConfig,
     ) -> None:
+        print("indexed_indices:", indexed_indices)
+        print("Size of indexed_indices:", indexed_indices.size)
         assert indexed_indices.size > 0
         assert num_samples > 0
         assert self.is_multimodal() == indexed_dataset.multimodal
