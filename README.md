@@ -6,7 +6,13 @@
  Set up your user folder on the node
 ```mkdir ~/<your-user-folder>```
 
- Pull our container (only necessary once per node)
+# Login to dockerhub
+
+```docker login```
+
+Input the username and password.
+
+ # Pull our container (only necessary once per node)
  
 ```docker pull zyphra/megatron:latest```
 
