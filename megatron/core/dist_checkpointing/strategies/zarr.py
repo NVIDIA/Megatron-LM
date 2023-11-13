@@ -65,7 +65,7 @@ def _create_or_open_zarr_arrays(
     b) is main replica but not the first chunk, opens the arrays created in (a) (possibly by other process)
     c) otherwise, sets the corresponding array to None since it won't be used
 
-    Arguments:
+    Args:
         sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank that will be saved to checkpoint
         checkpoint_dir (Path): checkpoint in which the arrays will be created
     """
