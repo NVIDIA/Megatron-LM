@@ -301,8 +301,13 @@ class OptimizerParamScheduler(object):
 
         if 'decay_style' in sd:
             lr_decay_style_ = sd['decay_style']
-
-            if sd['decay_style'] == 'invsqrt-inf':
+        else:
+            lr_decay_style_ = sd['lr_decay_style']
+            
+        self.lr_decay_style = self._check_and_set(self.lr_decay_style,
+                                               lr_decay_style_,
+                                               'learning rate decay style')
+        if lr_decay_style_ == 'invsqrt-inf':
 
                 self.constant_lr = self._check_and_set(self.constant_lr,
                                                sd['constant_lr'],
@@ -323,11 +328,6 @@ class OptimizerParamScheduler(object):
                                                sd['end_steps'],
                                                'total number of steps')
 
-        else:
-            lr_decay_style_ = sd['lr_decay_style']
-        self.lr_decay_style = self._check_and_set(self.lr_decay_style,
-                                               lr_decay_style_,
-                                               'learning rate decay style')
 
         if 'num_iters' in sd:
             num_steps = sd['num_iters']
