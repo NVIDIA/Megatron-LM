@@ -27,6 +27,7 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
+
 def _set_cuda_rng_state(new_state, device=-1):
     """Sets the random number generator state of the current GPU.
 
@@ -64,6 +65,7 @@ def _set_cuda_rng_state(new_state, device=-1):
 def get_expert_parallel_rng_tracker_name():
     global _EXPERT_PARALLEL_RNG_TRACKER_NAME
     return _EXPERT_PARALLEL_RNG_TRACKER_NAME
+
 
 def get_data_parallel_rng_tracker_name():
     global _DATA_PARALLEL_RNG_TRACKER_NAME

@@ -7,12 +7,10 @@ from megatron.core.parallel_state import (
     get_tensor_and_expert_parallel_group,
     get_tensor_model_parallel_group,
 )
+from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_data_parallel_rng_tracker_name
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.tensor_parallel import (
-    get_cuda_rng_tracker,
-    get_data_parallel_rng_tracker_name
-)
+
 from .mlp import MLP, MLPSubmodules
 
 

@@ -100,7 +100,8 @@ class DistributedDataParallel(MegatronModule):
             # Pad so size is divisible by the data parallel size.
             numel = grad_dtype_to_numel[dtype]
             numel_padded = (
-                int(math.ceil(numel / self.data_parallel_world_size)) * self.data_parallel_world_size
+                int(math.ceil(numel / self.data_parallel_world_size))
+                * self.data_parallel_world_size
             )
 
             self.grad_buffers[dtype] = GradBuffer(

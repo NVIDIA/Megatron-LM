@@ -22,8 +22,8 @@ from .mappings import (
 from .random import (
     checkpoint,
     get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
     model_parallel_cuda_manual_seed,
-    get_data_parallel_rng_tracker_name
 )
 from .utils import (
     gather_split_1d_tensor,
