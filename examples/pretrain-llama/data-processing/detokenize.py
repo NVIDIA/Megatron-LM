@@ -1,4 +1,4 @@
-import sentencepiece as sp
+import sentencepiece as spm
 import argparse
 import struct
 
