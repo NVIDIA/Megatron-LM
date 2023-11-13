@@ -231,6 +231,14 @@ def validate_args(args, defaults={}):
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
 
+    if args.lr_decay_style == 'invsqrt-inf':
+        assert args.constant_lr is not None, \
+            'invsqrt-inf lr schedule requires --constant-lr'
+        assert not (args.rampup_batch_size or (args.dataloader_type == 'cyclic' and args.retro_add_retriever)), \
+            'We currently don't support retro and cyclic data loader with invsqrt-inf lr scheduler'
+            
+
+
     if args.num_layers is not None:
         assert args.encoder_num_layers is None, \
             'cannot have both num-layers and encoder-num-layers specified'
