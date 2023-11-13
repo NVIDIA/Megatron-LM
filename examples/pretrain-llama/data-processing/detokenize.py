@@ -34,7 +34,7 @@ def write_jsonl(output_path, detokenized_data):
 if __name__ == "__main__":
     args = get_args()
     bin_path = args.file_path+'.bin'
-    idx_path = args.file_path+'file.idx'
+    idx_path = args.file_path+'.idx'
 
     detokenized_data = detokenize_data(args.tokenizer_model, bin_path, idx_path)
     write_jsonl(args.output, detokenized_data)
