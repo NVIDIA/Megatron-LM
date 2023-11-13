@@ -226,7 +226,6 @@ class SwitchMLP(MegatronModule):
         # else:
         route = torch.sigmoid(route)
         max_prob, max_ind = torch.max(route, dim=1)
-        input("Press Enter to continue...")
 
         max_prob = torch.unsqueeze(max_prob, 1)
         hidden_states = hidden_states.view(-1, hidden_states.size(2))
