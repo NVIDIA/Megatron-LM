@@ -229,6 +229,26 @@ class OptimizerParamScheduler(object):
             'wd_incr_style': self.wd_incr_style,
             'wd_incr_steps': self.wd_incr_steps
         }
+
+        if self.lr_decay_style == 'invsqrt-inf':
+            state_dict = {
+            'max_lr': self.max_lr,
+            'lr_warmup_steps': self.lr_warmup_steps,
+            'num_steps': self.num_steps,
+            'lr_decay_style': self.lr_decay_style,
+            'lr_decay_steps': self.lr_decay_steps,
+            'min_lr': self.min_lr,
+            'start_wd': self.start_wd,
+            'end_wd': self.end_wd,
+            'wd_incr_style': self.wd_incr_style,
+            'wd_incr_steps': self.wd_incr_steps,
+            'constant_lr': self.constant_lr,
+            'num_repeats': self.num_repeats,
+            'constant_steps': self.constant_steps,
+            'cooldown_steps': self.cooldown_steps,
+            'sqrt_scale': self.sqrt_scale,
+            'end_steps': self.end_steps
+        }
         return state_dict
 
 
@@ -281,6 +301,28 @@ class OptimizerParamScheduler(object):
 
         if 'decay_style' in sd:
             lr_decay_style_ = sd['decay_style']
+
+            if sd['decay_style'] == 'invsqrt-inf':
+
+                self.constant_lr = self._check_and_set(self.constant_lr,
+                                               sd['constant_lr'],
+                                               'value of learning rate in constant phase')
+                self.num_repeats = self._check_and_set(self.num_repeats,
+                                               sd['num_repeats'],
+                                               'number of cycles')
+                self.constant_steps = self._check_and_set(self.constant_steps,
+                                               sd['constant_steps'],
+                                               'number of steps of constant learning rate phase')
+                self.cooldown_steps = self._check_and_set(self.cooldown_steps,
+                                               sd['cooldown_steps'],
+                                               'number of steps of inverse sqrt cooldown phase')
+                self.sqrt_scale = self._check_and_set(self.sqrt_scale,
+                                               sd['sqrt_scale'],
+                                               'rate of decay in inverse sqrt phase')
+                self.end_steps = self._check_and_set(self.end_steps,
+                                               sd['end_steps'],
+                                               'total number of steps')
+
         else:
             lr_decay_style_ = sd['lr_decay_style']
         self.lr_decay_style = self._check_and_set(self.lr_decay_style,
