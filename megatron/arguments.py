@@ -235,7 +235,7 @@ def validate_args(args, defaults={}):
         assert args.constant_lr is not None, \
             'invsqrt-inf lr schedule requires --constant-lr'
         assert not (args.rampup_batch_size or (args.dataloader_type == 'cyclic' and args.retro_add_retriever)), \
-            'We currently don't support retro and cyclic data loader with invsqrt-inf lr scheduler'
+            'We currently do not support retro and cyclic data loader with invsqrt-inf lr scheduler'
             
 
 
