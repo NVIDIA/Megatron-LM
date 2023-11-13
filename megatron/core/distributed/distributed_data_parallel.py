@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import math
 from contextlib import contextmanager
 from typing import Dict
 
@@ -76,7 +75,6 @@ class DistributedDataParallel(MegatronModule):
 
         # Group parameters by their gradient type.
         grad_dtype_to_params = {}
-        grad_dtype_to_numel = {}
         param_to_name = {}
         for name, param in self.module.named_parameters():
             if param.requires_grad and getattr(param, 'allreduce', True):
@@ -88,25 +86,11 @@ class DistributedDataParallel(MegatronModule):
                 params.append(param)
                 grad_dtype_to_params[dtype] = params
 
-                # Calculate number of elements per dtype.
-                grad_dtype_to_numel[dtype] = (
-                    grad_dtype_to_numel.get(dtype, 0) + param.data.nelement()
-                )
-
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
         self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
-            # Pad so size is divisible by the data parallel size.
-            numel = grad_dtype_to_numel[dtype]
-            numel_padded = (
-                int(math.ceil(numel / self.data_parallel_world_size))
-                * self.data_parallel_world_size
-            )
-
             self.grad_buffers[dtype] = GradBuffer(
-                numel,
-                numel_padded,
                 dtype,
                 params,
                 data_parallel_group,
@@ -115,22 +99,9 @@ class DistributedDataParallel(MegatronModule):
                 self.overlap_grad_reduce,
                 self.use_distributed_optimizer,
             )
-
-            # Parameters are laid out in the corresponding grad_buffer in reverse
-            # order, so count indices from the back.
-            index = grad_dtype_to_numel[dtype]
+            self.grad_buffer_param_index_map[dtype] = self.grad_buffers[dtype].param_index_map
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
-                if dtype not in self.grad_buffer_param_index_map:
-                    self.grad_buffer_param_index_map[dtype] = {}
-
-                index -= param.data.nelement()
-                # Store the indices / bucket of each param.
-                self.grad_buffer_param_index_map[dtype][param] = (
-                    index,
-                    index + param.data.nelement(),
-                    self.grad_buffers[dtype].param_to_bucket_index[param],
-                )
 
         # Allocate discreate buffer for MoE params' grads
         for param in self.module.parameters():
@@ -245,8 +216,8 @@ class DistributedDataParallel(MegatronModule):
         for param in self.module.parameters():
             torch.distributed.broadcast(
                 param.data,
-                src=parallel_state.get_data_parallel_src_rank(),
-                group=parallel_state.get_data_parallel_group(),
+                src=parallel_state.get_data_parallel_src_rank(with_context_parallel=True),
+                group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
 
     def state_dict(self, prefix='', keep_vars=False):

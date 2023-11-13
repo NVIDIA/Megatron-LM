@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from logging import getLogger
 from typing import Dict, List
 
@@ -10,11 +11,10 @@ from .. import parallel_state
 logger = getLogger(__name__)
 
 
-def shard_buffer(buffer: torch.Tensor):
+def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     """
-    Shard buffer into dp_size chunks of equal size.
+    Shard buffer into data_parallel_world_size chunks of equal size.
     """
-    data_parallel_world_size = parallel_state.get_data_parallel_world_size()
     assert buffer.numel() % data_parallel_world_size == 0
     shard_size = buffer.numel() // data_parallel_world_size
     sharded_buffer = [
@@ -34,6 +34,7 @@ class Bucket:
         data: View in larger GradBuffer that this bucket is responsible for.
         offset: Offset of this bucket's view in the larger GradBuffer.
         data_parallel_group: Data-parallel process group.
+        data_parallel_world_size: World size using the data-parallel group group.
         overlap_grad_reduce: If true, overlap communication with backprop computation by
             breaking up grads into buckets. If false, single synchronous communication call
             is used instead.
@@ -47,6 +48,7 @@ class Bucket:
         data: torch.Tensor,
         offset: int,
         data_parallel_group: torch.distributed.ProcessGroup,
+        data_parallel_world_size: int,
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
     ):
@@ -62,11 +64,10 @@ class Bucket:
         # within the full grad_buffer.
         self.offset = offset
         self.data_parallel_group = data_parallel_group
+        self.data_parallel_world_size = data_parallel_world_size
+        self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
         self.overlap_grad_reduce = overlap_grad_reduce
         self.use_distributed_optimizer = use_distributed_optimizer
-
-        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
-        self.data_parallel_rank = torch.distributed.get_rank(group=data_parallel_group)
 
         self.reset()
 
@@ -94,7 +95,9 @@ class Bucket:
         self.data /= self.data_parallel_world_size
         # Use async_op only when overlap_grad_reduce is True.
         if self.use_distributed_optimizer:
-            local_data_view = shard_buffer(self.data)[self.data_parallel_rank]
+            local_data_view = shard_buffer(self.data, self.data_parallel_world_size)[
+                self.data_parallel_rank
+            ]
             self.communication_handle = torch.distributed._reduce_scatter_base(
                 local_data_view,
                 self.data,
@@ -149,8 +152,6 @@ class GradBuffer:
     roughly `bucket_size` parameters each.
 
     Arguments:
-        numel: True number of elements.
-        numel_padded: Number of elements in underlying tensor.
         dtype: Type of underlying tensor.
         params: List of parameters whose gradients are collated in the underlying tensor.
         data_parallel_group: Data-parallel process group.
@@ -165,8 +166,6 @@ class GradBuffer:
 
     def __init__(
         self,
-        numel: int,
-        numel_padded: int,
         dtype: torch.dtype,
         params: List[torch.nn.Parameter],
         data_parallel_group: torch.distributed.ProcessGroup,
@@ -175,23 +174,6 @@ class GradBuffer:
         overlap_grad_reduce: bool,
         use_distributed_optimizer: bool,
     ):
-        self.numel = numel
-        self.numel_padded = numel_padded
-        self.dtype = dtype
-        self.data = torch.zeros(
-            self.numel_padded,
-            dtype=self.dtype,
-            device=torch.cuda.current_device(),
-            requires_grad=False,
-        )
-
-        self.buckets = []
-        self.param_to_bucket = {}
-        self.param_to_bucket_index = {}
-        self.overlap_grad_reduce = overlap_grad_reduce
-        self.use_distributed_optimizer = use_distributed_optimizer
-
-        self.is_last_microbatch = True
 
         # Check that params are unique.
         unique_params = set()
@@ -200,67 +182,113 @@ class GradBuffer:
             unique_params.add(param)
         del unique_params
 
-        # Helper function to create new bucket, add it to list of buckets, and
-        # also update param->bucket mapping.
-        def _set_bucket(
-            bucket_params: List[torch.nn.Parameter], data_start_index: int, data_end_index: int
-        ):
+        # Store attributes that will be needed later.
+        self.dtype = dtype
+        self.data_parallel_group = data_parallel_group
+        self.data_parallel_world_size = torch.distributed.get_world_size(
+            group=self.data_parallel_group
+        )
+        self.overlap_grad_reduce = overlap_grad_reduce
+        self.use_distributed_optimizer = use_distributed_optimizer
+        self.is_last_microbatch = True
 
-            # Get appropriate view into global GradBuffer.
-            bucket_data = self._get(
-                torch.Size([data_end_index - data_start_index]), data_start_index
-            )
-            bucket = Bucket(
-                bucket_params,
-                bucket_data,
-                data_start_index,
-                data_parallel_group,
-                self.overlap_grad_reduce,
-                self.use_distributed_optimizer,
-            )
-            self.buckets.append(bucket)
-            for bucket_param in bucket_params:
-                assert bucket_param not in self.param_to_bucket
-                assert bucket_param not in self.param_to_bucket_index
-                self.param_to_bucket[bucket_param] = bucket
-                self.param_to_bucket_index[bucket_param] = len(self.buckets) - 1
+        # Data structures to store underlying buckets and relevant indexing data.
+        self.buckets = []
+        self.param_to_bucket = {}  # Param -> bucket mapping.
+        self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
-        # Map the grads to the buffer and bucket them.
+        def _pad_if_needed(data_index: int):
+            """Pads data indices if using distributed optimizer (to ensure uniform sharding)."""
+            if use_distributed_optimizer:
+                return (
+                    int(math.ceil(data_index / self.data_parallel_world_size))
+                    * self.data_parallel_world_size
+                )
+            return data_index
+
+        # First, figure out how many elements should be in the underlying buffer storage.
+        # Note that if we need to split the buffer into smaller buckets, each of these
+        # might need to be padded as well (if using the distributed optimizer).
         data_start_index = 0
         bucket_data_start_index = data_start_index
         bucket_params = set()
-
-        # Iterate through parameters in reverse order to roughly follow backprop order.
+        self.bucket_indices = []
+        bucket_id = 0
         for param in params[::-1]:
-            # Skip parameters that don't require gradients.
+            # Iterate through parameters in reverse order to roughly follow backprop order,
+            # and skip parameters that don't require gradients.
             if not param.requires_grad:
                 continue
             this_numel = param.data.nelement()
             data_end_index = data_start_index + this_numel
-            param.main_grad = self._get(param.data.shape, data_start_index)
+            self.param_index_map[param] = (
+                data_start_index,
+                data_end_index,
+                bucket_id,
+            )
             bucket_params.add(param)
 
-            # If we have enough elements already, form a new buffer.
+            # If we have enough elements already, form a new bucket.
             # If bucket_size is None, accumulate everything into a single bucket.
             if bucket_size is not None:
                 if (data_end_index - bucket_data_start_index) >= bucket_size:
-                    _set_bucket(bucket_params, bucket_data_start_index, data_end_index)
+                    data_end_index = _pad_if_needed(data_end_index)
+                    self.bucket_indices.append((bucket_data_start_index, data_end_index))
                     bucket_data_start_index = data_end_index
                     bucket_params = set()
+                    bucket_id += 1
             data_start_index = data_end_index
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            _set_bucket(bucket_params, bucket_data_start_index, data_end_index)
+            data_end_index = _pad_if_needed(data_end_index)
+            self.bucket_indices.append((bucket_data_start_index, data_end_index))
+
+        # Next, create underlying storage for buffer (with numel elements that includes
+        # padding as necessary).
+        self.numel = data_end_index
+        if use_distributed_optimizer:
+            assert self.numel % self.data_parallel_world_size == 0
+        self.data = torch.zeros(
+            self.numel, dtype=self.dtype, device=torch.cuda.current_device(), requires_grad=False,
+        )
+
+        # Finally, map main_grad fields for each parameter with a .grad field.
+        bucket_params = set()
+        bucket_data_start_index = 0
+        cur_bucket_id = 0
+        for param in params[::-1]:
+            if not param.requires_grad:
+                continue
+            data_start_index, data_end_index, bucket_id = self.param_index_map[param]
+            param.main_grad = self._get(param.data.shape, data_start_index)
+            if bucket_id != cur_bucket_id:
+                bucket_data_end_index = _pad_if_needed(data_start_index)
+                self._set_bucket(
+                    bucket_params, bucket_data_start_index, bucket_data_end_index, cur_bucket_id
+                )
+                bucket_data_start_index = bucket_data_end_index
+                bucket_params = set()
+                assert cur_bucket_id + 1 == len(self.buckets)
+                assert bucket_id == cur_bucket_id + 1
+                cur_bucket_id = bucket_id
+            bucket_params.add(param)
+
+        # Add remaining params to a new bucket.
+        if len(bucket_params) > 0:
+            bucket_data_end_index = _pad_if_needed(data_end_index)
+            self._set_bucket(
+                bucket_params, bucket_data_start_index, bucket_data_end_index, cur_bucket_id
+            )
 
         if not overlap_grad_reduce:
             assert len(bucket_params) == len(
                 params
             ), 'All params should be in one bucket when overlap_grad_reduce is False'
 
-        # Print buckets for all PP stages.
+        # Log buckets for all PP stages.
         if (
-            parallel_state.get_data_parallel_rank() == 0
+            parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
             and parallel_state.get_tensor_model_parallel_rank() == 0
         ):
             logger.info(
@@ -284,6 +312,41 @@ class GradBuffer:
         buffer_tensor = self.data[start_index:end_index]
         buffer_tensor = buffer_tensor.view(shape)
         return buffer_tensor
+
+    def _set_bucket(
+        self,
+        bucket_params: List[torch.nn.Parameter],
+        start_index: int,
+        end_index: int,
+        bucket_id: int,
+    ):
+        """
+        Helper function to create new bucket, add it to list of buckets, and
+        also update param->bucket mapping.
+        """
+
+        # Assert that indices are correctly padded (if needed), and that bucket
+        # position is same as originally computed.
+        if self.use_distributed_optimizer:
+            assert start_index % self.data_parallel_world_size == 0
+            assert end_index % self.data_parallel_world_size == 0
+        assert (start_index, end_index) == self.bucket_indices[bucket_id]
+
+        # Get appropriate view into global GradBuffer.
+        bucket_data = self._get(torch.Size([end_index - start_index]), start_index)
+        bucket = Bucket(
+            params=bucket_params,
+            data=bucket_data,
+            offset=start_index,
+            data_parallel_group=self.data_parallel_group,
+            data_parallel_world_size=self.data_parallel_world_size,
+            overlap_grad_reduce=self.overlap_grad_reduce,
+            use_distributed_optimizer=self.use_distributed_optimizer,
+        )
+        self.buckets.append(bucket)
+        for bucket_param in bucket_params:
+            assert bucket_param not in self.param_to_bucket
+            self.param_to_bucket[bucket_param] = bucket
 
     def reset(self):
         """

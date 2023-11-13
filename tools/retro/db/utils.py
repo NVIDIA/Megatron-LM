@@ -8,7 +8,7 @@ import os
 from tqdm import tqdm
 
 from megatron import get_retro_args, print_rank_0
-from megatron.data.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from tools.retro.external_libs import h5py
 
 from .dataset import DBDataset
@@ -50,7 +50,7 @@ def get_indexed_dataset_infos():
 
     # Add indexed datasets.
     for info in infos:
-        info["dataset"] = MMapIndexedDataset(info["prefix"], skip_warmup=True)
+        info["dataset"] = MMapIndexedDataset(info["prefix"])
 
     return infos
 
