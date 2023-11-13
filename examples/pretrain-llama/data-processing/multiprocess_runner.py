@@ -1,10 +1,10 @@
-import argparse
 import os
 import tqdm
+import argparse
 import concurrent.futures
 import subprocess
 from glob import glob
-import time
+
 
 if __name__ == "__main__":
     
@@ -15,6 +15,8 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer-model", type = str, help="Path to the tokenizer model", required=True)
     parser.add_argument("--per-file-workers", type = int, help="Number of workers per file", required=True)
     parser.add_argument("--num-file-workers", type = int, help="Number of file to be processed at the same time", required=True)
+    parser.add_argument('--log-interval', type=int, default=1000, help='Interval between progress updates')
+    
     args = parser.parse_args()
 
     def process(file):
@@ -25,6 +27,7 @@ if __name__ == "__main__":
         cmd = cmd + f' --tokenizer-model {args.tokenizer_model}'
         cmd = cmd + f' --workers {args.per_file_workers}'
         cmd = cmd + f' --append-eod'
+        cmd = cmd + f' --log-interval {args.log_interval}'
         subprocess.check_output(cmd, shell=True)
         return file
 
