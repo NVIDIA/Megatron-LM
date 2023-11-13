@@ -217,15 +217,16 @@ class SwitchMLP(MegatronModule):
         # TODO (rprenger) Right now we're just using the sinkhorn algorithm
         # for load balancing. There should be an option to do no load balancing
         # and the algorithm and parametets should be further tested
-        if self.training:
-            with torch.no_grad():
-                sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
-                _, max_ind = torch.max(sinkroute, dim=1)
-            route = torch.sigmoid(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
-        else:
-            route = torch.sigmoid(route)
-            max_prob, max_ind = torch.max(route, dim=1)
+        # if self.training:
+        #     with torch.no_grad():
+        #         sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
+        #         _, max_ind = torch.max(sinkroute, dim=1)
+        #     route = torch.sigmoid(route)
+        #     max_prob = route[torch.arange(route.size(0)), max_ind]
+        # else:
+        route = torch.sigmoid(route)
+        max_prob, max_ind = torch.max(route, dim=1)
+        input("Press Enter to continue...")
 
         max_prob = torch.unsqueeze(max_prob, 1)
         hidden_states = hidden_states.view(-1, hidden_states.size(2))
