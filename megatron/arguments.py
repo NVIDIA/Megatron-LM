@@ -891,8 +891,6 @@ def _add_training_args(parser):
     group.add_argument('--use-mcore-models', action='store_true',
                        help='Use the implementation from megatron core',
                        dest='use_mcore_models')
-    group.add_argument('--expert-parallel', action='store_true',
-                       help='Enable expert parallel optimization.')
     group.add_argument('--manual-gc', action='store_true',
                        help='Disable the threshold-based default garbage '
                        'collector and trigger the garbage collection manually. '
