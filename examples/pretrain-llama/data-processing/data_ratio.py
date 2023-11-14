@@ -336,7 +336,19 @@ llama_metadata = """46771080        ar_books_split_00_text_document.bin
 24546432        en_web_cc_split_80_text_document.bin
 16426136        en_web_cc_split_81_text_document.bin"""
 
-domain = {'books': 3, 'encyclopedias': 3, 'news': 1.5, 'others': 2, 'transcribed': 3, 'translated': 1, 'web': 1, 'code': 2.5, 'encyclopedia': 13, 'reasoning': 3, 'scientific': 3}
+domain = {
+    'books': 3, 
+    'encyclopedias': 3, 
+    'news': 1.5, 
+    'others': 2, 
+    'transcribed': 3, 
+    'translated': 1, 
+    'web': 1, 
+    'code': 2.5, 
+    'encyclopedia': 3, 
+    'reasoning': 3, 
+    'scientific': 3
+}
 metadata = llama_ve_metadata.split("\n")
 weight_list = []
 for line in metadata:
@@ -353,4 +365,4 @@ for line in metadata:
 _tot = sum([ w for w, n in weight_list])
 norm_weight_list = [ (weight/_tot, name) for weight, name in weight_list]
 for weight, name in norm_weight_list:
-    print(weight, name)
+    print("{} ${}/{}".format(weight, '{{' + 'inputs.data' + '}}', name), end=" ")
