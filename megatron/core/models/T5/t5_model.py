@@ -36,7 +36,7 @@ class T5LMHead(MegatronModule):
         parallel_output: bool,
         vocab_size: int,
         pre_process: bool = True,
-        share_embeddings_and_output_weights: bool = True,
+        share_embeddings_and_output_weights: bool = False,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -47,8 +47,8 @@ class T5LMHead(MegatronModule):
             vocab_size,
             config=config,
             init_method=config.init_method,
-            bias=True,
-            skip_bias_add=False,
+            bias=share_embeddings_and_output_weights,
+            skip_bias_add=not share_embeddings_and_output_weights,
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
         )
@@ -315,7 +315,8 @@ class T5Model(LanguageModule):
 
         if self.post_process:
             output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_key = f'{output_layer_prefix}weight'
+            output_layer_weight_key = f'{output_layer_prefix}weight'
+            output_layer_bias_key = f'{output_layer_prefix}bias'
             if self.share_embeddings_and_output_weights:
                 if not self.pre_process:
                     # when sharing embeddings with last stage, we need to use the weights from the first stage
@@ -335,22 +336,28 @@ class T5Model(LanguageModule):
                         allow_shape_mismatch=True,
                     )
 
-                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
-
+                    sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
+                # output_layer.weight is shared, but we still need to process output_layer.bias
+                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
+                    tensor=self.lm_head.output_layer.bias,
+                    key=output_layer_bias_key,
+                    allow_shape_mismatch=True,
+                )
+                sharded_state_dict[output_layer_bias_key] = sharded_output_layer_tensor
             else:
                 output_layer_state_dict = self.output_layer.state_dict(
                     prefix=output_layer_prefix, keep_vars=True
                 )
-                output_layer_tensor = output_layer_state_dict[output_layer_key]
+                output_layer_tensor = output_layer_state_dict[output_layer_weight_key]
                 # independent output layer
                 sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
                     tensor=output_layer_tensor,
-                    key=output_layer_key,
+                    key=output_layer_weight_key,
                     replica_id=parallel_state.get_data_parallel_rank(),
                     allow_shape_mismatch=True,
                 )
 
-                sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
+                sharded_state_dict[output_layer_weight_key] = sharded_output_layer_tensor
 
         return sharded_state_dict
 
