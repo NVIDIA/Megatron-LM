@@ -216,12 +216,17 @@ class SwitchMLP(MegatronModule):
         route = self.router(hidden_states).view(-1, args.num_experts)
         
 
-        if self.training and self.routing == 'sinkhorn':
-            with torch.no_grad():
-                sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
-                _, max_ind = torch.max(sinkroute, dim=1)
-            route = torch.sigmoid(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
+        if self.routing == 'sinkhorn':
+            if self.training:
+                with torch.no_grad():
+                    sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
+                    _, max_ind = torch.max(sinkroute, dim=1)
+                route = torch.sigmoid(route)
+                max_prob = route[torch.arange(route.size(0)), max_ind]
+            else:
+               route = torch.sigmoid(route)
+               max_prob, max_ind = torch.max(route, dim=1)
+
         else:
            route = torch.softmax(route, dim=1)
            max_prob, max_ind = torch.max(route, dim=1)
