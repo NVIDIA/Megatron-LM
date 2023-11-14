@@ -6,3 +6,8 @@ build
 *~
 slurm*
 logs
+*.yaml
+*.json
+*.wandb
+*.pkl
+*.log
