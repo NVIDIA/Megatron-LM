@@ -7,8 +7,8 @@ DISTRIBUTED_ARGS="--nproc_per_node 1 \
                   --master_port 6000"
 
 CHECKPOINT=/workspace
-VOCAB_FILE=</workspace/vocab.json
-MERGE_FILE=</workspace/merges.txt
+VOCAB_FILE=/workspace/vocab.json
+MERGE_FILE=/workspace/merges.txt
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
