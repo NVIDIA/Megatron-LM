@@ -301,14 +301,21 @@ class GPTDataset(torch.utils.data.Dataset):
                 self.doc_idx[doc_index_l],
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
+
+        text_name = 'text'
+        if args.use_dataset_only:
+            text_name = 'input_ids'
+        sample_dict = {text_name: np.array(sample, dtype=np.int64)}
         if args.return_data_index:
-            return {'text': np.array(sample, dtype=np.int64),
-                    'index': np.array([orig_idx], dtype=np.int64)}
-        elif self.return_doc_ids: # for retro preprocessing
-            return {'text': np.array(sample, dtype=np.int64),
-                    'doc_ids': np.array(doc_ids, dtype=np.int64)}
-        else:
-            return {'text': np.array(sample, dtype=np.int64)}
+            sample_dict.update({'index': np.array([orig_idx], dtype=np.int64)})
+
+        if self.return_doc_ids: # for retro preprocessing
+            sample_dict.update({'doc_ids': np.array(doc_ids, dtype=np.int64)})
+
+        if args.use_dataset_only:
+            sample_dict.update({'labels': np.array(sample, dtype=np.int64)})
+
+        return sample_dict
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
