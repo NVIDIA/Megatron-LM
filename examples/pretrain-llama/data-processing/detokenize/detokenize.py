@@ -26,16 +26,21 @@ def read_from_idx_file(idx_map):
         positions.append(position)
     return positions
 
-def read_tokens_from_bin(bin_map, start, end):
+def read_tokens_from_bin(bin_map, start, end, tokenizer):
     if start >= bin_map.size() or end > bin_map.size() or start >= end:
         print(f"Invalid range: start={start}, end={end}, bin_map size={bin_map.size()}")
         return []
     bin_map.seek(start)
     token_ids = []
+    max_token_id = tokenizer.GetPieceSize()
     while bin_map.tell() < end:
         try:
             token_id = struct.unpack('<I', bin_map.read(4))[0]
             token_ids.append(token_id)
+            if token_id < max_token_id:
+                token_ids.append(token_id)
+            else:
+                print(f"Warning: Token ID {token_id} is out of range and will be skipped")
         except struct.error:
             break
     return token_ids
@@ -57,7 +62,7 @@ def main(bin_file, idx_file, sp_model, output_file):
                 break
             if end is None:
                 break
-            token_ids = read_tokens_from_bin(bin_map, start, end)
+            token_ids = read_tokens_from_bin(bin_map, start, end, tokenizer)
             text = detokenize_tokens(tokenizer, token_ids)
             json_line = json.dumps({"text": text})
             out.write(json_line + '\n')
