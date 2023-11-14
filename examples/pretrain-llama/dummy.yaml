@@ -3,13 +3,13 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  sleep infinity
+  bash run.sh
   
 
 display_name: MegatronLM-Debug
 
 experiment_name: MegatronLM-Vocab-Expansion
-code: ../../../
+code: ../../
 environment: azureml:Megatron-LLaMA:4
 environment_variables:
   HYDRA_FULL_ERROR: '1'
@@ -54,5 +54,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 1
+  instance_count: 26
   shm_size: 800g

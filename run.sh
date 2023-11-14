@@ -1,10 +1,12 @@
-DISTRIBUTED_ARGS=(
-    --nproc_per_node 8
-    --nnodes 1
-    --master_addr "localhost"
-    --master_port "12345"
-)
-torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+# DISTRIBUTED_ARGS=(
+#     --nproc_per_node 8
+#     --nnodes 1
+#     --master_addr "localhost"
+#     --master_port "12345"
+# )
+# torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
+
+python pretrain_gpt.py \
 --tensor-model-parallel-size 2 \
 --pipeline-model-parallel-size 2 \
 --seq-length 2048 \
@@ -24,8 +26,8 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 --no-position-embedding \
 --no-masked-softmax-fusion \
 --no-query-key-layer-scaling \
---micro-batch-size 1 \
---global-batch-size 2 \
+--micro-batch-size 2 \
+--global-batch-size 1976 \
 --train-iters 3000 \
 --lr 0.0003 \
 --lr-decay-style "cosine" \
