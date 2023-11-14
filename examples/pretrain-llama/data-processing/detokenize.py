@@ -1,7 +1,7 @@
 import sentencepiece as spm
 import argparse
 import struct
-
+from megatron.core.datasets.indexed_dataset import _IndexReader
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file_path")
@@ -36,5 +36,9 @@ if __name__ == "__main__":
     bin_path = args.file_path+'.bin'
     idx_path = args.file_path+'.idx'
 
+   
     detokenized_data = detokenize_data(args.tokenizer_model, bin_path, idx_path)
     write_jsonl(args.output, detokenized_data)
+    # TODO: TEST RUNS
+    # test = _IndexReader(idx_path, multimodal=False)
+    # print(test.document_indices.shape)
