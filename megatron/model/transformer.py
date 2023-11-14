@@ -177,6 +177,7 @@ class SwitchMLP(MegatronModule):
         self.expert_parallel_size = mpu.get_expert_model_parallel_world_size()
         self.sequence_parallel = config.sequence_parallel
         self.add_bias = config.add_bias_linear
+        self.routing = args.routing_mode # sinkhorn, top1, top2
 
         assert args.num_experts % self.expert_parallel_size == 0
         self.num_local_experts = args.num_experts // self.expert_parallel_size
@@ -214,20 +215,25 @@ class SwitchMLP(MegatronModule):
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
         
-        # TODO (rprenger) Right now we're just using the sinkhorn algorithm
-        # for load balancing. There should be an option to do no load balancing
-        # and the algorithm and parametets should be further tested
-        # if self.training:
-        #     with torch.no_grad():
-        #         sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
-        #         _, max_ind = torch.max(sinkroute, dim=1)
-        #     route = torch.sigmoid(route)
-        #     max_prob = route[torch.arange(route.size(0)), max_ind]
-        # else:
-        route = torch.sigmoid(route)
-        max_prob, max_ind = torch.max(route, dim=1)
 
+        if self.training and self.routing == 'sinkhorn':
+            with torch.no_grad():
+                sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
+                _, max_ind = torch.max(sinkroute, dim=1)
+            route = torch.sigmoid(route)
+            max_prob = route[torch.arange(route.size(0)), max_ind]
+        else:
+           route = torch.softmax(route, dim=1)
+           max_prob, max_ind = torch.max(route, dim=1)
+           if self.routing == 'top2':
+               route_tmp = route - max_prob * torch.ones_like(route)
+               max_tmp, max_ind_2 = torch.max(route_tmp, dim=1)
+               max_prob_2 = max_tmp + max_prob
+                     
+        
         max_prob = torch.unsqueeze(max_prob, 1)
+        if self.routing == 'top2':
+            max_prob_2 = torch.unsqueeze(max_prob_2, 1)
         hidden_states = hidden_states.view(-1, hidden_states.size(2))
 
         # TODO (rprenger) TODO this could be made easier to read
@@ -237,9 +243,13 @@ class SwitchMLP(MegatronModule):
             global_hidden_states = \
                 gather_from_sequence_parallel_region_to_moe(hidden_states)
             global_indices = self.gather_indices(max_ind)
+            if self.routing == 'top2':
+                global_indices_2 = self.gather_indices(max_ind_2)
         else:
             global_hidden_states = hidden_states
             global_indices = max_ind
+            if self.routing == 'top2':
+                global_indices_2 = max_ind_2
 
         output_total = torch.zeros_like(global_hidden_states)
         if self.add_bias:
