@@ -4,6 +4,14 @@ import pytest
 
 import torch
 
+from megatron.core.transformer.switch_mlp import SwitchMLP
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
+
+
+
 import os
 from torch import Tensor
 from functools import partial
@@ -32,11 +40,74 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     gpt_layer_with_transformer_engine_spec_moe
 )
 
-from megatron.core.transformer.switch_mlp import SwitchMLP
-from tests.unit_tests.test_utilities import Utils
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
+
+import gc
+from datetime import datetime
+import math
+import logging
+import sys
+from .log_handler import CustomHandler
+# Make default logging level INFO, but filter out all log messages not from MCore.
+logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+import time
+# The earliest we can measure the start time.
+_TRAIN_START_TIME = time.time()
+import torch
+
+from megatron import get_args
+from megatron import get_signal_handler
+from megatron import get_timers
+from megatron import get_tensorboard_writer
+from megatron import get_wandb_writer
+from megatron import get_current_global_batch_size
+from megatron import get_num_microbatches
+from megatron import is_last_rank
+from megatron import update_num_microbatches
+from megatron.core import mpu, tensor_parallel
+from megatron.core.utils import get_model_config
+from megatron import print_rank_0
+from megatron import print_rank_last
+from megatron.checkpointing import load_checkpoint
+from megatron.checkpointing import save_checkpoint
+from megatron.model import Float16Module
+from megatron.model import GPTModel
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import finalize_model_grads
+from megatron.core.enums import ModelType
+from megatron.optimizer import get_megatron_optimizer
+from megatron.initialize import initialize_megatron
+from megatron.initialize import write_args_to_tensorboard
+from megatron.initialize import set_jit_fusion_options
+from megatron.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.utils import check_adlr_autoresume_termination
+from megatron.utils import unwrap_model
+from megatron.data.data_samplers import build_pretraining_data_loader
+from megatron.utils import calc_params_l2_norm
+from megatron.utils import throughput_calculator
+from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.utils import report_memory
+from megatron.model.vision.knn_monitor import compute_feature_bank
+
+
+train_valid_test_datasets_provider.is_distributed = True
+
+initialize_megatron(extra_args_provider=extra_args_provider,
+                    args_defaults=args_defaults)
+# Set pytorch JIT layer fusion options and warmup JIT functions.
+set_jit_fusion_options()
+
+# Adjust the startup time so it reflects the largest value.
+# This will be closer to what scheduler will see (outside of
+# image ... launches.
+global _TRAIN_START_TIME
+start_time_tensor = torch.cuda.DoubleTensor([_TRAIN_START_TIME])
+torch.distributed.all_reduce(start_time_tensor,
+                             op=torch.distributed.ReduceOp.MIN)
+_TRAIN_START_TIME = start_time_tensor.item()
+print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
+    time.time() - _TRAIN_START_TIME))
+print_datetime('after megatron is initialized')
+
 
 Utils.initialize_model_parallel(1,1)
 model_parallel_cuda_manual_seed(123)
