@@ -46,9 +46,6 @@ from datetime import datetime
 import math
 import logging
 import sys
-from .log_handler import CustomHandler
-# Make default logging level INFO, but filter out all log messages not from MCore.
-logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -89,28 +86,13 @@ from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
-train_valid_test_datasets_provider.is_distributed = True
 
-initialize_megatron(extra_args_provider=extra_args_provider,
-                    args_defaults=args_defaults)
-# Set pytorch JIT layer fusion options and warmup JIT functions.
-set_jit_fusion_options()
-
-# Adjust the startup time so it reflects the largest value.
-# This will be closer to what scheduler will see (outside of
-# image ... launches.
-global _TRAIN_START_TIME
-start_time_tensor = torch.cuda.DoubleTensor([_TRAIN_START_TIME])
-torch.distributed.all_reduce(start_time_tensor,
-                             op=torch.distributed.ReduceOp.MIN)
-_TRAIN_START_TIME = start_time_tensor.item()
-print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
-    time.time() - _TRAIN_START_TIME))
-print_datetime('after megatron is initialized')
 
 
 Utils.initialize_model_parallel(1,1)
+print('cucu1')
 model_parallel_cuda_manual_seed(123)
+print('cucu2')
 print("done intializing")
 transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts= 2, use_cpu_initialization=True)
 switch_mlp = SwitchMLP(transformer_config,
