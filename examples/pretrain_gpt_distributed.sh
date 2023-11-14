@@ -40,7 +40,7 @@ GPT_ARGS="
     --lr 0.00015 \
     --train-iters 500 \
     --lr-decay-iters 320000 \
-    --lr-decay-style invsqrt-inf \
+    --lr-decay-style cosine \
     --min-lr 1.0e-5 \
     --constant-lr 0.00008 \
     --constant-fraction 0.4 \
@@ -51,8 +51,8 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --fp16 \
-    --num-experts 1 \
-    --expert-model-parallel-size 1 \
+    --num-experts 16 \
+    --expert-model-parallel-size 8 \
     --recompute-granularity selective \
     --use-flash-attn
 "
