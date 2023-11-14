@@ -1035,6 +1035,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         samples_per_sec_per_replica = samples_per_sec / args.data_parallel_size
         tokens_per_sec = samples_per_sec * seq_len
         tokens_per_sec_per_replica = tokens_per_sec / args.data_parallel_size
+        tokens_per_gpu_per_second = tokens_per_sec / args.world_size
+        tokens_per_gpu_per_second_per_replica = tokens_per_gpu_per_second / args.data_parallel_size
         if wandb is not None and getattr(wandb, 'run', None) is not None:
             tput = {
                 'throughput/iteration-time': elapsed_time_per_iteration,  # 1000 ms / s
@@ -1042,6 +1044,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 'throughput/samples_per_sec_per_replica': samples_per_sec_per_replica,
                 'throughput/tokens_per_sec': tokens_per_sec,
                 'throughput/tokens_per_sec_per_replica': tokens_per_sec_per_replica,
+                'throughput/tokens_per_gpu_per_sec': tokens_per_gpu_per_second,
+                'throughput/tokens_per_gpu_per_sec_per_replica': tokens_per_gpu_per_second_per_replica,
                 'throughput/tflops': tflops,
                 'throughput/approx_params_in_billions': approx_parameters_in_billions,
                 'throughput/elapsed_ms_per_iteration': elapsed_time_per_iteration,
@@ -1091,6 +1095,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
         log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
+        log_string += ' tokens per gpu per second (tgs): {:.3f} |'.format(tokens_per_gpu_per_second)
         log_string += ' TFLOPs: {:.2f} |'.format(tflops)
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0

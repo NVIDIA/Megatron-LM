@@ -268,10 +268,7 @@ def get_parameters_in_billions(model):
     return approx_parameters_in_billions*gpus_per_model/(1e9)
 
 def throughput_calculator(model, args, iteration_time, total_iterations):
-    gpus_per_model = torch.distributed.get_world_size(group = mpu.get_model_parallel_group())
     batch_size = args.micro_batch_size * get_num_microbatches() * args.data_parallel_size
-    samples_per_model = batch_size * args.seq_length
-    model_replica_count = torch.distributed.get_world_size() / gpus_per_model
     approx_parameters_in_billions = None if (model is None) else get_parameters_in_billions(model)
     elapsed_time_per_iter = iteration_time/total_iterations
     samples_per_second = batch_size / elapsed_time_per_iter
