@@ -33,5 +33,6 @@ class Utils:
         if not torch.distributed.is_initialized():
             Utils.initialize_distributed()
         print('step 5')
+        print(tensor_model_parallel_size, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
         ps.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
         print('step 6')
