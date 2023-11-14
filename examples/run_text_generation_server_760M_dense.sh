@@ -14,7 +14,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 pip install flask-restful
 
-torchrun $DISTRIBUTED_ARGS tools/run_text_generation_server.py   \
+torchrun $DISTRIBUTED_ARGS /opt/Megatron-LM/tools/run_text_generation_server.py   \
        --num-layers 24  \
        --hidden-size 1536  \
        --load ${CHECKPOINT}  \
