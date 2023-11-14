@@ -69,9 +69,12 @@ So, we use ds_config dict which is the more flexible option.
 '''
 def _create_ds_config_dict():
     args = get_args()
-    with open(args.deepspeed_config, 'r', encoding='utf-8') as config_file:
-        ds_config_dict = json.load(config_file)
-    
+    if isinstance(args.deepspeed_config, dict) :
+        ds_config_dict = args.deepspeed_config
+    else:
+        with open(args.deepspeed_config, 'r', encoding='utf-8') as config_file:
+            ds_config_dict = json.load(config_file)
+
     if args.universal_checkpoint:
         ds_config_dict["checkpoint"] = {"load_universal": True}
 
