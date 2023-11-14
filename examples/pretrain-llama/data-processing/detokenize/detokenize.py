@@ -15,13 +15,16 @@ def load_memory_mapped_file(filename):
     with open(filename, 'rb') as f:
         return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
-def read_from_idx_file(idx_map, offset):
-    idx_map.seek(offset)
-    try:
-        position = struct.unpack('<Q', idx_map.read(8))[0]
-        return position
-    except struct.error:
-        return None
+def read_from_idx_file(idx_map):
+    positions = []
+    while True:
+        bytes = idx_map.read(8)
+        if not bytes or len(bytes) < 8:
+            break
+
+        position = struct.unpack('<Q', bytes)[0]
+        positions.append(position)
+    return positions
 
 def read_tokens_from_bin(bin_map, start, end):
     if start >= bin_map.size() or end > bin_map.size() or start >= end:
@@ -46,21 +49,21 @@ def main(bin_file, idx_file, sp_model, output_file):
 
     tokenizer = spm.SentencePieceProcessor(model_file=sp_model)
 
+    document_positions = read_from_idx_file(idx_map)
     with open(output_file, 'w') as out:
-        offset = 0
-        while offset < idx_map.size():
-            start = read_from_idx_file(idx_map, offset)
+        for i in range(len(document_positions) - 1):
+            start, end = document_positions[i], document_positions[i + 1]
             if start is None:
                 break
-            end = read_from_idx_file(idx_map, offset + 8)
             if end is None:
                 break
-            
             token_ids = read_tokens_from_bin(bin_map, start, end)
             text = detokenize_tokens(tokenizer, token_ids)
             json_line = json.dumps({"text": text})
             out.write(json_line + '\n')
-            offset += 16
+
+    bin_map.close()
+    idx_map.close()
 
 if __name__ == "__main__":
     args = get_args()
