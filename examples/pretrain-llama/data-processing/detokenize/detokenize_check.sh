@@ -5,7 +5,7 @@ AR_FILE="allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/ar_encyclopedi
 AR_BIN="${AR_FILE}.bin"
 AR_IDX="${AR_FILE}.idx"
 
-EN_FILE="allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/en_books_books_split_02_text_document.bin"
+EN_FILE="allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/en_books_books_split_02_text_document"
 EN_BIN="${EN_FILE}.bin"
 EN_IDX="${EN_FILE}.idx"
 
