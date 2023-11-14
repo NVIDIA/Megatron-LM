@@ -24,11 +24,11 @@ command: >-
   --no-masked-softmax-fusion
   --no-query-key-layer-scaling
   --micro-batch-size 2 
-  --global-batch-size 960
+  --global-batch-size 1920
   --train-iters 3000
-  --lr 0.0003 
+  --lr 1e-6
   --lr-decay-style cosine 
-  --min-lr 0.00003 
+  --min-lr 1e-6 
   --lr-warmup-iters 20 
   --weight-decay 0.1 
   --clip-grad 1.0 
@@ -84,7 +84,7 @@ outputs:
   model_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/Llama-2-7b-hf-ExpTok-32K_10M_tp4_pp2_seq2048_gb960_mbs_2/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/Llama-2-7b-hf-ExpTok-32K_10M_tp4_pp2_seq2048_gb960_mbs_2_low_lr/
 
 
 services:
