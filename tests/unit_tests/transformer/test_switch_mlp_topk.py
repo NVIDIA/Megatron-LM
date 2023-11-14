@@ -90,9 +90,9 @@ from megatron.model.vision.knn_monitor import compute_feature_bank
 
 
 Utils.initialize_model_parallel(1,1)
-print('cucu1')
+
 model_parallel_cuda_manual_seed(123)
-print('cucu2')
+
 print("done intializing")
 transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, num_moe_experts= 2, use_cpu_initialization=True)
 switch_mlp = SwitchMLP(transformer_config,
