@@ -91,6 +91,7 @@ class SwitchMLP(MegatronModule):
                 expert = MLP(self.config, submodules, is_expert=True)
                 self.local_experts.append(expert)
         else:
+            gg.assert_grouped_gemm_is_available()
             self.expert_parallel = config.expert_model_parallel_size > 1
             self.gradient_scale = 1 / parallel_state.get_tensor_and_expert_parallel_world_size()
             if self.config.gated_linear_unit:
@@ -121,8 +122,8 @@ class SwitchMLP(MegatronModule):
             )
             self.weight2 = Parameter(
                 torch.empty(
-                    output_size_per_partition,
                     self.config.hidden_size,
+                    output_size_per_partition,
                     device=torch.cuda.current_device(),
                     dtype=config.params_dtype,
                 )
@@ -137,7 +138,7 @@ class SwitchMLP(MegatronModule):
                 _initialize_affine_weight_gpu(
                     self.weight2,
                     config.output_layer_init_method,
-                    partition_dim=0,
+                    partition_dim=1,
                     expert_parallel=self.expert_parallel,
                 )
             setattr(self.weight1, 'allreduce', not self.expert_parallel)
@@ -227,7 +228,7 @@ class SwitchMLP(MegatronModule):
             w1, w2 = (self.scale_grad(self.weight1), self.scale_grad(self.weight2))
             # Reshape the weights for the grouped GEMMs.
             w1 = w1.view(self.num_local_experts, -1, self.config.hidden_size)
-            w2 = w2.view(self.num_local_experts, -1, self.config.hidden_size)
+            w2 = w2.view(self.num_local_experts, self.config.hidden_size, -1)
 
             fc1_output = gg.ops.gmm(
                 sorted_global_hidden_states,
@@ -241,7 +242,7 @@ class SwitchMLP(MegatronModule):
                 intermediate_parallel,
                 w2,
                 tokens_per_expert,
-                trans_b=False)
+                trans_b=True)
             # Un-permutation of tokens
             output_total = fc2_output[reverse_indices]
 
