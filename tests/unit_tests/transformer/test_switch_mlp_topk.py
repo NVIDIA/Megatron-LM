@@ -4,6 +4,34 @@ import pytest
 
 import torch
 
+import os
+from torch import Tensor
+from functools import partial
+from typing import Union
+from megatron import get_args
+from megatron import print_rank_0
+from megatron import get_timers
+from megatron import get_tokenizer
+from megatron.core import mpu, tensor_parallel
+from megatron.core.enums import ModelType
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import GPTDataset
+import megatron.model
+from megatron.core.models.gpt import GPTModel
+from megatron.training import pretrain
+from megatron.core.transformer.spec_utils import import_module
+from megatron.utils import (
+    get_ltor_masks_and_position_ids,
+    get_batch_on_this_cp_rank,
+    average_losses_across_data_parallel_group
+)
+from megatron.arguments import core_transformer_config_from_args
+from megatron.core.models.gpt.gpt_layer_specs import (
+    gpt_layer_with_transformer_engine_spec,
+    gpt_layer_with_transformer_engine_spec_moe
+)
+
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
