@@ -11,7 +11,7 @@ def read_and_print(file_path, byte_size, read_format, num_reads=10):
             print(f"Position {position}: {data.hex()} - Output: {struct.unpack(read_format, data)}")
 
 if __name__ == "__main__":
-    file_path = 'outputs/data/allam_data_2-1_splits-llama2-VE-indexed_data/bin_idx/en_books_books_split_02_text_document.bin'
+    file_path = 'ALLaM-Megatron-LM/examples/pretrain-llama/data-processing/detokenize/outputs/data/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/ar_encyclopedias_split_00_text_document.bin'
     byte_size = 8
     read_format = '<Q'
 
