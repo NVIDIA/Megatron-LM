@@ -291,11 +291,11 @@ class SwitchMLP(MegatronModule):
         
         print('\n\n Checking if expert choice for top1 works \n\n')
         for kk in range(4):
-            print(output_total[kk]-self.local_experts[max_ind[kk]](hidden[kk])[0])
+            print(output_total[kk], self.local_experts[max_ind[kk]](hidden[kk])[0])
 
         print('\n\n Checking if expert choice for top2 works \n\n')
         for kk in range(4):
-            print(output_total_2[kk]-self.local_experts[max_ind_2[kk]](hidden[kk])[0])
+            print(output_total_2[kk], self.local_experts[max_ind_2[kk]](hidden[kk])[0])
 
 
 
