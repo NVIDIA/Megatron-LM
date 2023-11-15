@@ -289,13 +289,13 @@ class SwitchMLP(MegatronModule):
                     output_bias_total_2[local_indices, :] = output_bias
 
         
-        # print('\n\n Checking if expert choice for top1 works \n\n')
-        # for kk in range(4):
-        #     print(output_total[kk], self.local_experts[max_ind[kk]](hidden[kk])[0])
+        print('\n\n Checking if expert choice for top1 works \n\n')
+        for kk in range(10):
+            print(output_total[kk], self.local_experts[global_indices[kk]](hidden[kk])[0])
 
-        # print('\n\n Checking if expert choice for top2 works \n\n')
-        # for kk in range(4):
-        #     print(output_total_2[kk], self.local_experts[max_ind_2[kk]](hidden[kk])[0])
+        print('\n\n Checking if expert choice for top2 works \n\n')
+        for kk in range(10):
+            print(output_total_2[kk], self.local_experts[global_indices_2[kk]](hidden[kk])[0])
 
 
 
@@ -346,6 +346,7 @@ class SwitchMLP(MegatronModule):
             print(output_total[kk], 
                   max_prob[kk] * self.local_experts[global_indices[kk]](hidden[kk])[0] +
                   max_prob_2[kk] * self.local_experts[global_indices_2[kk]](hidden[kk])[0])
+        print('End of prints for this step ===============================================')
                 
 
         return output_total, output_bias_total
