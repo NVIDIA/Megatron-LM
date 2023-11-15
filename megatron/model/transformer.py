@@ -231,9 +231,8 @@ class SwitchMLP(MegatronModule):
            route = torch.softmax(route, dim=1)
            max_prob, max_ind = torch.max(route, dim=1)
            if self.routing == 'top2':
-               row_ind = torch.arange(route.shape[0], device=torch.cuda.current_device())
-               route[row_ind, max_ind] = 0
-               max_prob_2, max_ind_2 = torch.max(route, dim=1)
+               masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
+               max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
 
         #print('route', route)
         #print('max_prob', max_prob)
