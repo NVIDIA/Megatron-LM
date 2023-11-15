@@ -98,7 +98,7 @@ class MLP(MegatronModule):
             if self.activation_func == F.gelu:
                 assert self.config.add_bias_linear is True
                 intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == glu:
+            else:
                 x = torch.chunk(intermediate_parallel, 2, dim=-1)
                 if bias_parallel is not None:
                     bias = torch.chunk(bias_parallel, 2, dim=-1)
