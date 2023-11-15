@@ -6,9 +6,9 @@ import torch
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
@@ -21,7 +21,8 @@ class TestParallelSwitchMLP:
         self.num_experts = 2
 
         # Vanilla sequential GEMM
-        model_parallel_cuda_manual_seed(123)
+        # Set random seed for reproducability
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config_smm = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=False, add_bias_linear=False,
@@ -39,7 +40,7 @@ class TestParallelSwitchMLP:
         print("done intializing for sequential gemm")
 
         # Grouped GEMM
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config_gmm = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=False, add_bias_linear=False,
@@ -64,13 +65,16 @@ class TestParallelSwitchMLP:
         # For the same hyper-parm model configs except the `moe_grouped_gemm`,
         # GroupedGEMM and sequential GEMMs should hold the same number of parms.
         assert num_weights_smm == num_weights_gmm
+        # expected num weights: router linear weights+bias + MLP weights(no bias) of all experts
+        expected_num_weights = \
+            self.hidden_size * self.num_experts + self.num_experts + \
+            self.hidden_size * (4*self.hidden_size) * 2 * self.num_experts
+        assert num_weights_smm == expected_num_weights
 
-        # TODO: The param init value is not exactly the same between gmm and smm
-        # assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
-        # assert num_weights_smm == 2330, 'num_weights_sm=', num_weights_smm
+        assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
 
         # weight1: [num_experts*4h, h]
-        # weight2: [num_experts, h, 4h]
+        # weight2: [h, num_experts*4h]
         assert self.switch_mlp_gmm.weight1.shape[0] == self.num_experts * 4 * self.hidden_size
         assert self.switch_mlp_gmm.weight1.shape[1] == self.hidden_size
         assert self.switch_mlp_gmm.weight1.shape == \
@@ -110,9 +114,8 @@ class TestParallelSwitchMLP:
         output_smm, _ = self.switch_mlp_smm(hidden_states)
         output_gmm, _ = self.switch_mlp_gmm(hidden_states)
 
-        # The following assert fails due to two reasons:
-        #   (i) the param init value is not exactly the same between gmm and smm (refer to test_weight_init_value_the_same.)
-        #   (ii) the router weight init value is not fixed in this UT.
+        # The following assert fails due to the param init value is not exactly
+        # the same between gmm and smm (refer to test_weight_init_value_the_same.)
         # assert torch.equal(output_smm, output_gmm),print(output_smm, output_gmm)
 
 if __name__ == "__main__":
