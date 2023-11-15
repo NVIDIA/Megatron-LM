@@ -214,7 +214,6 @@ class SwitchMLP(MegatronModule):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
-        print('Routing mode: ', self.routing)
         
 
         if self.routing == 'sinkhorn':
