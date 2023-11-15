@@ -85,17 +85,17 @@ class SwitchMLP(MegatronModule):
         route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)
 
-        # if self.training:
-        #     with torch.no_grad():
-        #         norm_route = self.route_algo(
-        #             route.detach().to(dtype=torch.float32)
-        #         )  # explicit fp32 conversion for stability
-        #         _, max_ind = torch.max(norm_route, dim=1)
-        #     route = self.router_activation(route)
-        #     max_prob = route[torch.arange(route.size(0)), max_ind]
-        # else:
-        route = self.router_activation(route)
-        max_prob, max_ind = torch.max(route, dim=1)
+        if self.training:
+            with torch.no_grad():
+                norm_route = self.route_algo(
+                    route.detach().to(dtype=torch.float32)
+                )  # explicit fp32 conversion for stability
+                _, max_ind = torch.max(norm_route, dim=1)
+            route = self.router_activation(route)
+            max_prob = route[torch.arange(route.size(0)), max_ind]
+        else:
+            route = self.router_activation(route)
+            max_prob, max_ind = torch.max(route, dim=1)
 
 
         max_prob = torch.unsqueeze(max_prob, 1)
