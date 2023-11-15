@@ -234,11 +234,11 @@ class SwitchMLP(MegatronModule):
                masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
                max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
 
-        #print('route', route)
-        #print('max_prob', max_prob)
-        #print('max_ind', max_ind)
-        #print('max_prob_2', max_prob_2)
-        #print('max_ind_2', max_ind_2)
+        print('route', route)
+        print('max_prob', max_prob)
+        print('max_ind', max_ind)
+        print('max_prob_2', max_prob_2)
+        print('max_ind_2', max_ind_2)
                      
         
         max_prob = torch.unsqueeze(max_prob, 1)
