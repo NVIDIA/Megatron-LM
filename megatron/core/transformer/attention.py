@@ -236,10 +236,15 @@ class Attention(MegatronModule, ABC):
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            #query = apply_rotary_pos_emb(query, q_pos_emb)
-            #key = apply_rotary_pos_emb(key, k_pos_emb)
-            query = fused_apply_rotary_pos_emb(query, q_pos_emb)
-            key = fused_apply_rotary_pos_emb(key, k_pos_emb)
+            # use bias_activation_fusion to control the knob here
+            # just for debug
+            # the if-else block is not needed in normal PR
+            if self.config.bias_activation_fusion:
+                query = fused_apply_rotary_pos_emb(query, q_pos_emb)
+                key = fused_apply_rotary_pos_emb(key, k_pos_emb)
+            else:
+                query = apply_rotary_pos_emb(query, q_pos_emb)
+                key = apply_rotary_pos_emb(key, k_pos_emb)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
