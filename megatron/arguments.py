@@ -619,7 +619,7 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in Switch Transformer (None means no Switch)')
-    group.add_argument('--routing-mode', type=int, default='sinkhorn',
+    group.add_argument('--routing-mode', type=str, default='sinkhorn',
                        choices=['sinkhorn', 'top1', 'top2'],
                        help='Mode of the expert routing.')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
