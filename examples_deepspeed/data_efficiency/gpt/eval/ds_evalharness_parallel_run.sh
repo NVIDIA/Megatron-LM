@@ -48,6 +48,7 @@ num_fewshot=0
 num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 cuda_id=-1
 total_mem=$(nvidia-smi --query-gpu=memory.total --format=csv -i 0 | grep -Eo [0-9]+)
+total_mem=$(( ${total_mem}*99/100 )) # somehow there could exist tiny (4MB or so) gpu memory leak
 
 ## Code below only works when you run each evalharness task on a single GPU.
 ## For multi-GPU evalharness, check Megatron-DeepSpeed/blob/main/examples_deepspeed/MoE/ds_evalharness.sh

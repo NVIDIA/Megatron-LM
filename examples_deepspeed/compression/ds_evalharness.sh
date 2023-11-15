@@ -1,4 +1,4 @@
-# This is an example zero-shot eval script. Please first read the readme_evalharness.md under the same directory.
+# This is an example zero-shot eval script. Please first read the readme_evalharness.md under the ../MoE directory.
 
 # CHECKPOINT_PATH=/blob/users/minjiaz/compression_library/checkpoint/125M10L_Compression_Test_INT8_64gpu_lr6e-5_tokens5.25B_nocl_alpha-no_pp/global_step2000/
 # CHECKPOINT_PATH=/blob/users/conglli/project/gpt3_with_pile/checkpoint/gpt3-with-pile-0.125B-lr-2.4e-3-minlr-6.0e-5-bs-2048-gpus-64-zero-0-mp-1-pp-1-no_pp-cl-startseqlen-72-step-27638-token-60B/global_step71000/
@@ -31,7 +31,7 @@ TASKS="lambada,wikitext"
 VOCAB_FILE=/blob/data/the_pile_public_merged_nopreprocessing/gpt2-vocab.json
 MERGE_FILE=/blob/data/the_pile_public_merged_nopreprocessing/gpt2-merges.txt
 
-export HF_DATASETS_OFFLINE=1
+# export HF_DATASETS_OFFLINE=1
 
 # Dummy arguments to make megatron happy. No need to configure them.
 # The reason we don't need to configure them and many other arguments is
@@ -56,6 +56,7 @@ CMD="../../tasks/eval_harness/evaluate.py \
     --no-load-rng \
     --inference \
     --disable-moe-token-dropping \
+    --tokenizer-type GPT2BPETokenizer \
     --adaptive_seq_len\
     --eval_fp32\
     --task_list $TASKS\

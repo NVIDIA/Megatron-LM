@@ -27,7 +27,7 @@ if [ ! -f "$merge_file" ]; then
     wget https://s3.amazonaws.com/models.huggingface.co/bert/gpt2-merges.txt
 fi
 
-export HF_DATASETS_OFFLINE=1
+# export HF_DATASETS_OFFLINE=1
 
 dir2=$(dirname "$checkpoint_path")
 dirname=$(basename "$dir2")/$(basename "$checkpoint_path")
@@ -58,6 +58,7 @@ command="../../../../tasks/eval_harness/evaluate.py \
     --no-load-rng \
     --inference \
     --disable-moe-token-dropping \
+    --tokenizer-type GPT2BPETokenizer \
     --adaptive_seq_len \
     --eval_fp32 \
     --num_fewshot ${num_fewshot} \

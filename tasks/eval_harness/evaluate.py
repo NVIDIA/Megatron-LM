@@ -23,9 +23,10 @@ import torch
 from megatron import get_args
 from megatron import print_rank_0
 from megatron import get_tokenizer
+from megatron.core.enums import ModelType
 from megatron.core import mpu
 from megatron.training import setup_model_and_optimizer, get_model
-from megatron.mpu.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 
 from megatron.utils import get_ltor_masks_and_position_ids, unwrap_model
 from megatron.p2p_communication import recv_forward, send_forward
@@ -222,8 +223,7 @@ class EvalHarnessAdaptor(GPT2LM):
                     a_output, *other_losses = self.model(tokens,
                         position_ids,
                         attention_mask,
-                        tokentype_ids=None,
-                        forward_method_parallel_output=False)
+                        tokentype_ids=None)
                     output.append(a_output)
 
                 if output is not None:
@@ -320,7 +320,7 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
     # avoid printing the arguments, since they will later be overridden.
     _print_args = megatron.arguments._print_args
     megatron.arguments._print_args = lambda *_args, **kwarg: None
-    args = _parse_args(extra_args_provider)
+    args = parse_args(extra_args_provider=extra_args_provider)
 
     ds_checkpoint = DeepSpeedCheckpoint(args.load,
                                         tp_degree=args.tensor_model_parallel_size,
@@ -340,20 +340,24 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
         cp_args.bf16 = False
         cp_args.params_dtype = torch.float32
 
+    cp_args.tokenizer_type = 'GPT2BPETokenizer'
+
     override_args(args, cp_args, skip_keys, skip_if_specified)
 
     # stop megatron from reparsing the arguments.
-    megatron.global_vars._parse_args = lambda *_args, **kwarg: args
+    megatron.arguments.parse_args = lambda *_args, **kwarg: args
+    megatron.global_vars._ensure_var_is_not_initialized = lambda *_args, **kwarg: None
     megatron.global_vars._GLOBAL_ARGS = args
 
-    initialize_megatron()
+    initialize_megatron(extra_args_provider=extra_args_provider)
+    megatron.global_vars._GLOBAL_ARGS = args
     torch.distributed.barrier()
 
     # Initializing megatron will update eg. tokenizer size. Override again.
     override_args(args, cp_args, skip_keys, skip_if_specified)
 
     # print final arguments.
-    _print_args(args)
+    _print_args("eval_harness arguments", args)
     if args.deepspeed:
 
         # Hack #3:
@@ -369,7 +373,7 @@ def load_ds_checkpoint_and_setup_megatron(extra_args_provider):
 
         cp_path = args.load
         args.load = None
-        model, _, _ = setup_model_and_optimizer(model_provider)
+        model, _, _ = setup_model_and_optimizer(model_provider, ModelType.encoder_or_decoder)
         model = model[0]
         zero_enabled = model._config.zero_enabled
         model._config.zero_enabled = False
@@ -399,7 +403,7 @@ def tasks_args(parser):
     group.add_argument('--eval_fp32',  default = False, action='store_true', help='Should the evaluation run in fp32')
     return parser
 
-from megatron.global_vars import _parse_args
+from megatron.arguments import parse_args
 
 def main():
     start = time.time()

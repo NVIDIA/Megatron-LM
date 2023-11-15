@@ -11,11 +11,10 @@ This particular setup uses the normal deepspeed checkpoint and requires no conve
 On login console with external network
 
 Get lm-eval harness (https://github.com/EleutherAI/lm-evaluation-harness) and `best-download==0.0.7` needed to download some tasks.
+Below package version numbers are what we tested that work.
 ```
 (maybe need pip install --upgrade pip)
-pip install best-download==0.0.7
-pip install lm-eval
-(previously we used "pip install git+https://github.com/EleutherAI/lm-evaluation-harness" to install, but later found the command above has less dependency issues)
+pip install best-download==0.0.7 lm-eval==0.2.0 datasets==1.15.1 transformers==4.20.1 huggingface-hub==0.8.1
 ```
 
 2. Pre-download needed datasets
@@ -33,7 +32,8 @@ Then install datasets for the tasks:
 ```
 python ../../tasks/eval_harness/download.py --task_list hellaswag,lambada,triviaqa,webqs,winogrande,piqa,arc_challenge,arc_easy,openbookqa,race,boolq,cb,copa,rte,wic,wsc,multirc,record,anli_r1,anli_r2,anli_r3,wikitext,logiqa,mathqa,mc_taco,mrpc,prost,pubmedqa,qnli,qqp,sciq,sst,wnli
 ```
-and make sure that `export HF_DATASETS_OFFLINE=1`
+
+Previously we set `export HF_DATASETS_OFFLINE=1` to make the dataset offline after the above manual download. But somehow now this could trigger error on some kind of online verification for some of the datasets, so it's recommended to only set offline mode when necessary.
 
 <!-- If there are things like custom tokenizers, pre-download those too, e.g.:
 

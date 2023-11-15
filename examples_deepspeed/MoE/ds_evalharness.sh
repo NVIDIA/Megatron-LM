@@ -28,7 +28,7 @@ TASKS="lambada"
 VOCAB_FILE=/data/Megatron-LM/data/gpt2-vocab.json
 MERGE_FILE=/data/Megatron-LM/data/gpt2-merges.txt
 
-export HF_DATASETS_OFFLINE=1
+# export HF_DATASETS_OFFLINE=1
 
 # Dummy arguments to make megatron happy. No need to configure them.
 # The reason we don't need to configure them and many other arguments is
@@ -53,6 +53,7 @@ CMD="../../tasks/eval_harness/evaluate.py \
     --no-load-rng \
     --inference \
     --disable-moe-token-dropping \
+    --tokenizer-type GPT2BPETokenizer \
     --adaptive_seq_len\
     --eval_fp32\
     --task_list $TASKS\
