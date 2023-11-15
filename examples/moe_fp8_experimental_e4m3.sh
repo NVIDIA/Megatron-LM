@@ -18,7 +18,7 @@ MERGE_FILE=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/merges.txt
 DATA_PATH=/datasets/SlimPajama-627B_megatron/gpt-neox-20b-tokenizer/train_text_document
 
 WANDB_PROJECT=moe
-WANDB_EXP_NAME=moe_1p3b_16e_slimpj_test
+WANDB_EXP_NAME=moe_1p3b_16e_fp8_e4mc
 WANDB_SAVE_DIR=/workspace/wandb
 
 DISTRIBUTED_ARGS="
@@ -30,32 +30,33 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --num-layers 2 \
-    --hidden-size 64 \
-    --num-attention-heads 1 \
-    --seq-length 64 \
-    --max-position-embeddings 64 \
+    --num-layers 24 \
+    --hidden-size 2048 \
+    --num-attention-heads 16 \
+    --seq-length 2048 \
+    --max-position-embeddings 2048 \
     --micro-batch-size 8 \
-    --global-batch-size 1024 \
+    --global-batch-size 960 \
     --lr 0.00015 \
-    --train-iters 500 \
-    --lr-decay-iters 500 \
+    --train-iters 570000 \
+    --lr-decay-iters 450000 \
     --lr-decay-style cosine \
-    --min-lr 0.001 \
-    --constant-lr 0.05 \
-    --constant-fraction 0.4 \
-    --inv-sqrt-cooldown-fraction 0.3 \
-    --inv-sqrt-scale 30.0 \
-    --num-cycles 1 \
-    --weight-decay 1e-2 \
+    --min-lr 1.0e-5 \
+    --weight-decay 0.0 \
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --fp16 \
     --num-experts 16 \
     --expert-model-parallel-size 8 \
     --recompute-granularity selective \
-    --use-flash-attn
-"
+    --use-flash-attn \
+    --accumulate-allreduce-grads-in-fp32 \
+    --fp8-format e4m3 \
+    --transformer-impl transformer_engine 
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0
+    
+    "
 
 DATA_ARGS="
     --data-path $DATA_PATH \
@@ -67,16 +68,16 @@ DATA_ARGS="
 "
 
 OUTPUT_ARGS="
-    --log-interval 1 \
-    --save-interval 5 \
-    --eval-interval 5 \
+    --log-interval 10 \
+    --save-interval 500 \
+    --eval-interval 500 \
     --eval-iters 10 \
     --wandb-project $WANDB_PROJECT \
     --wandb-exp-name $WANDB_EXP_NAME \
     --wandb-save-dir $WANDB_SAVE_DIR
 "
 
-torchrun $DISTRIBUTED_ARGS /workspace/Megatron-LM/pretrain_gpt.py \
+torchrun $DISTRIBUTED_ARGS /opt/Megatron-LM/pretrain_gpt.py \
     $GPT_ARGS \
     $DATA_ARGS \
     $OUTPUT_ARGS \
