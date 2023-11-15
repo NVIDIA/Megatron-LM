@@ -13,7 +13,6 @@ from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_
 class TestParallelSwitchMLP:
 
     def setup_method(self, method):
-        print('step 0 in setup_method')
         Utils.initialize_model_parallel(1,1)
         model_parallel_cuda_manual_seed(123)
         print("done intializing")
