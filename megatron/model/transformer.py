@@ -177,7 +177,7 @@ class SwitchMLP(MegatronModule):
         self.expert_parallel_size = mpu.get_expert_model_parallel_world_size()
         self.sequence_parallel = config.sequence_parallel
         self.add_bias = config.add_bias_linear
-        self.routing = 'top1' # args.routing_mode # 'sinkhorn', 'top1', 'top2'
+        self.routing = 'top2' # args.routing_mode # 'sinkhorn', 'top1', 'top2'
 
         assert args.num_experts % self.expert_parallel_size == 0
         self.num_local_experts = args.num_experts // self.expert_parallel_size
@@ -235,11 +235,11 @@ class SwitchMLP(MegatronModule):
                route[row_ind, max_ind] = 0
                max_prob_2, max_ind_2 = torch.max(route, dim=1)
 
-        print('route', route)
-        print('max_prob', max_prob)
-        print('max_ind', max_ind)
-        print('max_prob_2', max_prob_2)
-        print('max_ind_2', max_ind_2)
+        #print('route', route)
+        #print('max_prob', max_prob)
+        #print('max_ind', max_ind)
+        #print('max_prob_2', max_prob_2)
+        #print('max_ind_2', max_ind_2)
                      
         
         max_prob = torch.unsqueeze(max_prob, 1)
