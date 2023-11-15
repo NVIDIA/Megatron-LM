@@ -177,7 +177,7 @@ class SwitchMLP(MegatronModule):
         self.expert_parallel_size = mpu.get_expert_model_parallel_world_size()
         self.sequence_parallel = config.sequence_parallel
         self.add_bias = config.add_bias_linear
-        self.routing = 'top2' # args.routing_mode # 'sinkhorn', 'top1', 'top2'
+        self.routing = args.routing_mode # 'sinkhorn', 'top1', 'top2'
 
         assert args.num_experts % self.expert_parallel_size == 0
         self.num_local_experts = args.num_experts // self.expert_parallel_size
