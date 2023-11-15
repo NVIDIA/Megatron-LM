@@ -27,7 +27,7 @@ python pretrain_gpt.py \
 --no-masked-softmax-fusion \
 --no-query-key-layer-scaling \
 --micro-batch-size 2 \
---global-batch-size 32 \
+--global-batch-size 1920 \
 --train-iters 3000 \
 --lr 0.0003 \
 --lr-decay-style "cosine" \

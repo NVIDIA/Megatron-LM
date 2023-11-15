@@ -24,7 +24,7 @@ command: >-
   --no-masked-softmax-fusion
   --no-query-key-layer-scaling
   --micro-batch-size 2 
-  --global-batch-size 1920
+  --global-batch-size 1976
   --train-iters 3000
   --lr 0.0003 
   --lr-decay-style cosine 
@@ -33,7 +33,6 @@ command: >-
   --weight-decay 0.1 
   --clip-grad 1.0 
   --save ${{outputs.model_dir}} 
-  --data-path 1.0 ${{inputs.data}}/ar_books_split_00_text_document
   --data-cache-path ${{outputs.cache}}
   --split 9998,1,1 
   --log-interval 10
@@ -45,6 +44,7 @@ command: >-
   --tensorboard-log-interval 100
   --no-async-tensor-model-parallel-allreduce
   --use-flash-attn
+  --data-path 1.0 ${{inputs.data}}/ar_books_split_00_text_document
   
 
 display_name: MegatronLM-Wikipedia_Ar_En_Experiment_tp2_pp2_seq2048_bs1976
@@ -95,5 +95,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 24
+  instance_count: 26
   shm_size: 800g
