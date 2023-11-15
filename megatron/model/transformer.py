@@ -235,11 +235,6 @@ class SwitchMLP(MegatronModule):
                masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
                max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
 
-        print('route', route[:10])
-        print('max_prob', max_prob[:10])
-        print('max_ind', max_ind[:10])
-        print('max_prob_2', max_prob_2[:10])
-        print('max_ind_2', max_ind_2[:10])
                      
         
         max_prob = torch.unsqueeze(max_prob, 1)
@@ -289,19 +284,6 @@ class SwitchMLP(MegatronModule):
                     output_bias = output_bias.expand_as(output)
                     output_bias_total_2[local_indices, :] = output_bias
 
-        
-        print('\n\n Checking if expert choice for top1 works \n\n')
-        for kk in range(10):
-            print(output_total[kk].data, self.local_experts[global_indices[kk]](hidden[kk])[0].data)
-            print('diff:')
-            print(output_total[kk].data - self.local_experts[global_indices[kk]](hidden[kk])[0].data, '\n')
-
-        print('\n\n Checking if expert choice for top2 works \n\n')
-        for kk in range(10):
-            print(output_total_2[kk].data, self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
-            print('diff:')
-            print(output_total_2[kk].data - self.local_experts[global_indices_2[kk]](hidden[kk])[0].data, '\n')
-
 
 
       
@@ -345,18 +327,6 @@ class SwitchMLP(MegatronModule):
         else:
             output_bias_total = None
 
-
-        print('\n\n Checking final output_total \n\n')
-        for kk in range(10):
-            print(output_total[kk].data, 
-                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
-                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
-            print('diff:')
-            print(output_total[kk].data - 
-                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
-                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data, '\n')
-        print('End of prints for this step ===============================================')
-                
 
         return output_total, output_bias_total
 
