@@ -287,6 +287,12 @@ class SwitchMLP(MegatronModule):
                 if self.add_bias:
                     output_bias = output_bias.expand_as(output)
                     output_bias_total_2[local_indices, :] = output_bias
+
+
+        print('\n\n Checking if expert choice works', output_total[0]-self.local_experts[max_ind[0]](hidden[0]])
+
+
+      
                     
 
 
