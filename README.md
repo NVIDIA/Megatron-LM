@@ -10,23 +10,24 @@ Guide for doing experimental/development run on a single node inside Docker cont
  Set up your user folder on the node
 ```mkdir ~/<your-user-folder>```
 
-# Login to dockerhub
+### Login to dockerhub
 
 ```docker login```
 
 Input the username and password.
 
- # Pull our container (only necessary once per node)
+### Pull our image (only necessary once per node)
  
 ```docker pull zyphra/megatron:latest```
 
- Spin up the container with 1.8TB RAM, all GPUs, and two mounted folders. One for node-local work in ```~/<your-user-folder>/workspace``` and one to load shared datasets at ```/mnt/shared/datasets```:
+### Start the container
+Spin up the container with 1.8TB of shared memory, all GPUs, and two mounted folders. One for node-local work in ```~/<your-user-folder>/workspace``` and one to load shared datasets at ```/mnt/shared/datasets```:
  
-```docker run --privileged --shm-size=1000gb --gpus all -it --rm -v <path to your local workspace folder>:/workspace -v /mnt/shared/datasets:/datasets zyphra/megatron:latest```
+```docker run --privileged --shm-size=1800gb --gpus all -it --rm -v <path to your local workspace folder>:/workspace -v /mnt/shared/datasets:/datasets zyphra/megatron:latest```
 
 Where you need to point ```<path to your local workspace folder>``` to your user folder.
 
-The Megatron LM installation will be installed in ```/opt/Megatron-LM```
+The Megatron LM installation will be installed in ```/opt/Megatron-LM``` inside the container.
 
 ### Launch Training
 `bash /opt/Megatron-LM/examples/pretrain_gpt_distributed.sh`
