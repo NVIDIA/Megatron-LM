@@ -343,7 +343,7 @@ class SwitchMLP(MegatronModule):
 
         print('\n\n Checking final output_total \n\n')
         for kk in range(4):
-            print(output_total[kk], max_prob[kk]*self.local_experts[max_ind[kk]](hidden[kk])[0]+max_prob_2[kk]*self.local_experts[max_ind_2[kk]](hidden[kk])[0])
+            print(output_total[kk], max_prob[kk]*self.local_experts[global_indices[kk]](hidden[kk])[0]+max_prob_2[kk]*self.local_experts[global_indices_2[kk]](hidden[kk])[0])
                 
 
         return output_total, output_bias_total
