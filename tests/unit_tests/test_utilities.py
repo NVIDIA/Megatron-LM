@@ -11,16 +11,11 @@ class Utils:
     def initialize_distributed():
         print(f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}')
         torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
-        print('step 0')
         init_method = 'tcp://'
         master_ip = os.getenv('MASTER_ADDR', 'localhost')
-        print('step 1')
         master_port = os.getenv('MASTER_PORT', '6000')
-        print('step 2')
         init_method += master_ip + ':' + master_port
-        print('step 3')
         torch.distributed.init_process_group(backend='nccl', world_size=Utils.world_size, rank=Utils.rank, init_method=init_method)
-        print('step 4')
         
     @staticmethod
     def destroy_model_parallel():
@@ -32,7 +27,4 @@ class Utils:
         ps.destroy_model_parallel()
         if not torch.distributed.is_initialized():
             Utils.initialize_distributed()
-        print('step 5')
-        print(tensor_model_parallel_size, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
         ps.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, pipeline_model_parallel_split_rank)
-        print('step 6')
