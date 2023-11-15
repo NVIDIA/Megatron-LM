@@ -59,11 +59,13 @@ formatting:
     - ${run_cmd}
     - echo "Completed the job"
   rules:
-    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
+    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT 
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -85,6 +87,8 @@ formatting:
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -605,7 +609,7 @@ train.bert_core.345m_tp4_pp1_1node_50steps:
     USE_CORE: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert_core.345m_tp2_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -618,7 +622,7 @@ train.bert_core.345m_tp2_pp2_1node_50steps:
     USE_CORE: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 train.bert_core.345m_tp1_pp2_1node_50steps:
   <<: *selene-test-launcher
@@ -631,7 +635,7 @@ train.bert_core.345m_tp1_pp2_1node_50steps:
     USE_CORE: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert_core.345m_tp1_pp4_1node_50steps:
   <<: *selene-test-launcher
@@ -645,7 +649,7 @@ train.bert_core.345m_tp1_pp4_1node_50steps:
     USE_CORE: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: NIGHTLY_TESTS
 
 train.bert_core.345m_tp1_pp2_1node_50steps_rope:
   <<: *selene-test-launcher

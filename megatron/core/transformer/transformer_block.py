@@ -154,8 +154,8 @@ class TransformerBlock(MegatronModule):
         hidden_states: Tensor,
         attention_mask: Tensor,
         rotary_pos_emb: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
+        context: Tensor,
+        context_mask: Tensor,
     ):
         """Forward method with activation checkpointing."""
 
@@ -166,8 +166,6 @@ class TransformerBlock(MegatronModule):
                 context,
                 context_mask,
                 rotary_pos_emb,
-                *args,
-                **kwargs,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -176,9 +174,8 @@ class TransformerBlock(MegatronModule):
                         attention_mask=attention_mask,
                         context=context,
                         context_mask=context_mask,
+                        inference_params=None,
                         rotary_pos_emb=rotary_pos_emb,
-                        *args,
-                        **kwargs,
                     )
                 return hidden_states, context
 

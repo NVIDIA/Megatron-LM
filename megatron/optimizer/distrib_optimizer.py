@@ -388,10 +388,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Model grad buffer ranges.
         self.model_gbuf_ranges = []
-        self.bucket_sizes = []
-        for model_index, model in enumerate(self.models):
-            self.bucket_sizes.append(model.bucket_size)
-            self.model_gbuf_ranges.append(self.build_model_gbuf_range_map(model))
+        self.per_bucket_numel = []
+        for _, model_chunk in enumerate(self.models):
+            self.per_bucket_numel.append(
+                {dtype: [bucket.data.numel() for bucket in model_chunk.grad_buffers[dtype].buckets]
+                 for dtype in model_chunk.grad_buffers})
+            self.model_gbuf_ranges.append(self.build_model_gbuf_range_map(model_chunk))
         self.model_param_gbuf_map = \
             self.build_model_param_gbuf_map(self.model_gbuf_ranges)
 
@@ -607,7 +609,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_global_ranks = list(mpu._DATA_PARALLEL_GLOBAL_RANKS_WITH_CP)
 
         # Collect param states.
-        state = {"bucket_sizes": self.bucket_sizes}
+        state = {"per_bucket_numel": self.per_bucket_numel}
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
 
             # Iterate grad buffers (by data type).
@@ -706,10 +708,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Load on DP rank 0.
         if data_parallel_rank == 0:
             loaded_state = torch.load(filename)
-            if "bucket_sizes" in loaded_state:
-                bucket_sizes_in_checkpoint = loaded_state["bucket_sizes"]
-                assert self.bucket_sizes == bucket_sizes_in_checkpoint, \
-                    f"Bucket sizes need to be the same in current run ({self.bucket_sizes}) and checkpoint ({bucket_sizes_in_checkpoint})"
+            if "per_bucket_numel" in loaded_state:
+                per_bucket_numel_in_checkpoint = loaded_state["per_bucket_numel"]
+                assert self.per_bucket_numel == per_bucket_numel_in_checkpoint, \
+                    (f"Number of elements in each bucket need to be the same in current run "
+                     f"({self.per_bucket_numel}) and checkpoint ({per_bucket_numel_in_checkpoint})")
 
         # Scatter tensors to all DP ranks.
         for model_idx, gbuf_range_maps in enumerate(self.model_gbuf_ranges):
