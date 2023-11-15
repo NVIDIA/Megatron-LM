@@ -291,11 +291,15 @@ class SwitchMLP(MegatronModule):
         
         print('\n\n Checking if expert choice for top1 works \n\n')
         for kk in range(10):
-            print(output_total[kk], self.local_experts[global_indices[kk]](hidden[kk])[0])
+            print(output_total[kk].data, self.local_experts[global_indices[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total[kk].data - self.local_experts[global_indices[kk]](hidden[kk])[0].data)
 
         print('\n\n Checking if expert choice for top2 works \n\n')
         for kk in range(10):
-            print(output_total_2[kk], self.local_experts[global_indices_2[kk]](hidden[kk])[0])
+            print(output_total_2[kk].data, self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total_2[kk].data - self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
 
 
 
@@ -343,9 +347,13 @@ class SwitchMLP(MegatronModule):
 
         print('\n\n Checking final output_total \n\n')
         for kk in range(10):
-            print(output_total[kk], 
-                  max_prob[kk] * self.local_experts[global_indices[kk]](hidden[kk])[0] +
-                  max_prob_2[kk] * self.local_experts[global_indices_2[kk]](hidden[kk])[0])
+            print(output_total[kk].data, 
+                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
+                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total[kk].data - 
+                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
+                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
         print('End of prints for this step ===============================================')
                 
 
