@@ -1,5 +1,9 @@
 # Zyphra Megatron-LM
 
+Guide for running multi-node training using our Docker image: https://zyphra.atlassian.net/l/cp/NbwsaejA
+
+
+Guide for doing experimental/development run on a single node inside Docker container:
 
 ## Spin up Docker Container
 
