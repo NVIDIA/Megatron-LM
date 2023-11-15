@@ -234,6 +234,12 @@ class SwitchMLP(MegatronModule):
                row_ind = torch.arange(route.shape[0], device=torch.cuda.current_device())
                route[row_ind, max_ind] = 0
                max_prob_2, max_ind_2 = torch.max(route, dim=1)
+
+        print('route', route)
+        print('max_prob', max_prob)
+        print('max_ind', max_ind)
+        print('max_prob_2', max_prob_2)
+        print('max_ind_2', max_ind_2)
                      
         
         max_prob = torch.unsqueeze(max_prob, 1)
