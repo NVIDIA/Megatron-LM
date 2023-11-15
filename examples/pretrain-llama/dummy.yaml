@@ -3,7 +3,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash run.sh
+  sleep infinity
   
 
 display_name: MegatronLM-Debug
@@ -47,12 +47,12 @@ services:
     type: jupyter_lab
     nodes: all
 
-compute: azureml:A100-SSH
+compute: azureml:NCAI-A100-LLMv2
 
 distribution:
   type: pytorch
   process_count_per_instance: 8
 
 resources:
-  instance_count: 26
+  instance_count: 1
   shm_size: 800g

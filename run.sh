@@ -27,7 +27,7 @@ python pretrain_gpt.py \
 --no-masked-softmax-fusion \
 --no-query-key-layer-scaling \
 --micro-batch-size 2 \
---global-batch-size 1976 \
+--global-batch-size 32 \
 --train-iters 3000 \
 --lr 0.0003 \
 --lr-decay-style "cosine" \
@@ -35,16 +35,16 @@ python pretrain_gpt.py \
 --lr-warmup-iters 20 \
 --weight-decay 0.1 \
 --clip-grad 1.0 \
---save "../DUMPED/save" \
+--save "../../cap/data-capability/wd/model_dir" \
 --data-path 1.0 "../../cap/data-capability/wd/INPUT_data/ar_books_split_00_text_document" \
---data-cache-path "../DUMPED/cache" \
+--data-cache-path "../../cap/data-capability/wd/cache/" \
 --split "9998,1,1" \
 --log-interval 10 \
 --log-validation-ppl-to-tensorboard \
 --save-interval 200 \
 --eval-interval 200 \
 --eval-iters 100 \
---tensorboard-dir "../DUMPED/save" \
+--tensorboard-dir "../../cap/data-capability/wd/model_dir/tensorboard" \
 --tensorboard-log-interval 100 \
 --no-async-tensor-model-parallel-allreduce \
 --use-flash-attn
