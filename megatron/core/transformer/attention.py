@@ -17,6 +17,7 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+from .utils import make_sharded_tensors_for_checkpoint
 
 
 @dataclass
@@ -45,15 +46,16 @@ class Attention(MegatronModule, ABC):
         self,
         config: TransformerConfig,
         submodules: Union[SelfAttentionSubmodules, CrossAttentionSubmodules],
-        layer_number: int = 1,
-        attn_mask_type=AttnMaskType.padding,
-        **kwargs,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -73,6 +75,7 @@ class Attention(MegatronModule, ABC):
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -85,7 +88,9 @@ class Attention(MegatronModule, ABC):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
+            input_is_parallel=True,
             skip_bias_add=True,
+            is_expert=False,
         )
 
     def _checkpointed_attention_forward(
@@ -240,18 +245,6 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
-        # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        # This is a noop for normal attention where ng == np. When using group query attention this
-        # creates a view that has the keys and values virtually repeated along their dimension to
-        # match the number of queries.
-        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
-            key = key.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
-            )
-            value = value.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
-            )
-
         if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
@@ -277,16 +270,15 @@ class SelfAttention(Attention):
         self,
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
-        layer_number: int = 1,
+        layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
+            attention_type="self",
         )
 
         self.linear_qkv = build_module(
@@ -295,8 +287,10 @@ class SelfAttention(Attention):
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -335,6 +329,21 @@ class SelfAttention(Attention):
 
         return query, key, value
 
+    def sharded_state_dict(self, prefix='', sharded_key_prefix=None, sharded_offsets=()):
+        sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
+        sharded_state_dict = {}
+        for name, module in (
+            ('linear_qkv', self.linear_qkv),
+            ('linear_proj', self.linear_proj),
+        ):
+            sub_sd = module.sharded_state_dict(
+                prefix=f'{prefix}{name}.',
+                sharded_key_prefix=f'{sharded_key_prefix}{name}.',
+                sharded_offsets=sharded_offsets,
+            )
+            sharded_state_dict.update(sub_sd)
+        return sharded_state_dict
+
 
 class CrossAttention(Attention):
     """Cross-attention layer class
@@ -347,16 +356,15 @@ class CrossAttention(Attention):
         self,
         config: TransformerConfig,
         submodules: CrossAttentionSubmodules,
-        layer_number: int = 1,
+        layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
+            attention_type="cross",
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -371,8 +379,10 @@ class CrossAttention(Attention):
             self.query_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
         )
 
         self.linear_kv = build_module(
@@ -381,8 +391,10 @@ class CrossAttention(Attention):
             2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):

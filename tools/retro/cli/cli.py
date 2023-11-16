@@ -115,7 +115,7 @@ class retro:
 
     @classmethod
     def get_db_num_indexed_datasets(cls):
-        '''Number of indexed datasets within blendable dataset.'''
+        '''Number of indexed datasets within blended dataset.'''
         return len(cls.db_indexed_dataset_infos)
 
     @classmethod

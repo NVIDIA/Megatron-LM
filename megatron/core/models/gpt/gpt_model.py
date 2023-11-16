@@ -82,7 +82,7 @@ class GPTModel(LanguageModule):
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            submodules=transformer_layer_spec,
+            spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -103,6 +103,22 @@ class GPTModel(LanguageModule):
 
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
+
+    def set_input_tensor(self, input_tensor: Tensor) -> None:
+        """Sets input tensor to the model.
+
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model.
+        """
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor[0])
 
     def forward(
         self,
@@ -166,18 +182,6 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    def shared_embedding_or_output_weight(self) -> Tensor:
-        """Function to share the input embeddings and output logit weights.
-
-        Returns:
-            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
-        """
-        if self.pre_process:
-            return self.embedding.word_embeddings.weight
-        elif self.post_process:
-            return self.output_layer.weight
-        return None
 
     def sharded_state_dict(self, prefix: str = '') -> dict:
         sharded_state_dict = {}

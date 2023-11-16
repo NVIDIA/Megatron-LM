@@ -1,5 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+[build-system]
+requires = [
+    "setuptools",
+    "pybind11",
+]
+
 [tool.isort]
 profile = "black"  # black-compatible
 line_length = 100  # should match black parameters

@@ -28,7 +28,7 @@ def core_model_provider(pre_process=True, post_process=True):
     args = get_args()
     config = core_transformer_config_from_args(args)
 
-    # NOTE: Experimental customization featuress
+    # NOTE: Experimental customization feature
     if args.spec is not None:
         block_spec = import_module(args.spec)()
     else:

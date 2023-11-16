@@ -7,7 +7,9 @@ from typing import List, Union
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from torch import Tensor
+
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from megatron.core.transformer.enums import AttnMaskType
@@ -18,7 +20,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
 
-def get_num_layers_to_build(config) -> int:
+def get_num_layers_to_build(config: TransformerConfig) -> int:
 
     num_layers_per_pipeline_rank = (
         config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
@@ -57,7 +59,9 @@ class TransformerBlockSubmodules:
     layer_specs: List[ModuleSpec] = None
 
 
-def _get_block_submodules(config, spec) -> TransformerBlockSubmodules:
+def _get_block_submodules(
+    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec],
+) -> TransformerBlockSubmodules:
 
     # Transformer block submodules.
     if isinstance(spec, TransformerBlockSubmodules):
@@ -82,14 +86,14 @@ class TransformerBlock(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: Union[TransformerBlockSubmodules, ModuleSpec],
-        post_layer_norm=True,
-        pre_process=True,
-        post_process=True,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, submodules)
+        self.submodules = _get_block_submodules(config, spec)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -100,6 +104,7 @@ class TransformerBlock(MegatronModule):
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
         self._build_layers()
+        self.num_layers_per_pipeline_rank = len(self.layers)
 
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -142,25 +147,36 @@ class TransformerBlock(MegatronModule):
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
-                persist_layer_norm=self.config.persist_layer_norm,
-                sequence_parallel=self.config.sequence_parallel,
-                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-                normalization=self.config.normalization,
             )
 
-    def _get_layer(self, layer_number):
+    def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
-    def _checkpointed_forward(self, hidden_states, attention_mask, rotary_pos_emb):
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        rotary_pos_emb: Tensor,
+    ):
         """Forward method with activation checkpointing."""
 
-        def custom(start, end):
-            def custom_forward(*args, **kwargs):
-                x_, *args = args
+        def custom(start: int, end: int):
+            def custom_forward(
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+            ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    x_ = layer(x_, *args, **kwargs)
-                return x_
+                    hidden_states, context = layer(
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        context=context,
+                        context_mask=context_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        inference_params=None,
+                    )
+                return hidden_states, context
 
             return custom_forward
 
@@ -170,11 +186,13 @@ class TransformerBlock(MegatronModule):
             # A method to further reduce memory usage reducing checkpoints.
             l = 0
             while l < self.num_layers_per_pipeline_rank:
-                hidden_states = tensor_parallel.checkpoint(
+                hidden_states, context = tensor_parallel.checkpoint(
                     custom(l, l + self.config.recompute_num_layers),
                     self.config.distribute_saved_activations,
                     hidden_states,
                     attention_mask,
+                    context,
+                    context_mask,
                     rotary_pos_emb,
                 )
 
@@ -186,21 +204,25 @@ class TransformerBlock(MegatronModule):
             # A method fully use the device memory removing redundant re-computation.
             for l in range(self.num_layers_per_pipeline_rank):
                 if l < self.config.recompute_num_layers:
-                    hidden_states = tensor_parallel.checkpoint(
+                    hidden_states, context = tensor_parallel.checkpoint(
                         custom(l, l + 1),
                         self.config.distribute_saved_activations,
                         hidden_states,
                         attention_mask,
+                        context,
+                        context_mask,
                         rotary_pos_emb,
                     )
                 else:
-                    hidden_states = custom(l, l + 1)(hidden_states, attention_mask, rotary_pos_emb)
+                    hidden_states, context = custom(l, l + 1)(
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
+                    )
         else:
             raise ValueError("Invalid activation recompute method.")
 
         return hidden_states
 
-    def set_input_tensor(self, input_tensor):
+    def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
         When doing pipeline parallelism the input from the previous
@@ -212,12 +234,12 @@ class TransformerBlock(MegatronModule):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask,
-        context=None,
-        context_mask=None,
-        inference_params=None,
-        rotary_pos_emb=None,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        context: Tensor = None,
+        context_mask: Tensor = None,
+        rotary_pos_emb: Tensor = None,
+        inference_params: InferenceParams = None,
     ):
         # hidden_states (float): [s, b, h]
         # attention_mask (bool): [1, 1, s, s]
@@ -270,9 +292,7 @@ class TransformerBlock(MegatronModule):
             )
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=self.config.context_parallel_size > 1
-                )
+                fp8_group = parallel_state.get_amax_reduction_group(with_context_parallel=True)
             fp8_context = transformer_engine.pytorch.fp8_autocast(
                 enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
             )
@@ -285,6 +305,8 @@ class TransformerBlock(MegatronModule):
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
                     rotary_pos_emb=rotary_pos_emb,
                 )
             else:
@@ -304,7 +326,7 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-    def sharded_state_dict(self, prefix=''):
+    def sharded_state_dict(self, prefix: str = ''):
 
         sharded_state_dict = {}
 

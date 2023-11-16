@@ -33,8 +33,9 @@ class DotProductAttention(MegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        layer_number: int = 1,
-        attn_mask_type: AttnMaskType = AttnMaskType.padding,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
         attention_dropout: float = None,
     ):
         super().__init__(config=config)
@@ -47,14 +48,16 @@ class DotProductAttention(MegatronModule):
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type  # unused for now
 
-        projection_size = self.config.kv_channels * config.num_attention_heads
+        projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
-        self.num_attention_heads_per_partition = divide(config.num_attention_heads, world_size)
+        self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
+        self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
@@ -79,42 +82,50 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
-    def forward(
-        self, query_layer: Tensor, key_layer: Tensor, value_layer: Tensor, attention_mask: Tensor
-    ):
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, attention_mask: Tensor):
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
         # ===================================
 
+        # expand the key and value [sk, b, ng, hn] -> [sk, b, np, hn]
+        # This is a noop for normal attention where ng == np. When using group query attention this
+        # creates a view that has the keys and values virtually repeated along their dimension to
+        # match the number of queries.
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            key = key.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+            value = value.repeat_interleave(
+                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+            )
+
         # [b, np, sq, sk]
         output_size = (
-            query_layer.size(1),
-            query_layer.size(2),
-            query_layer.size(0),
-            key_layer.size(0),
+            query.size(1),
+            query.size(2),
+            query.size(0),
+            key.size(0),
         )
 
         # [sq, b, np, hn] -> [sq, b * np, hn]
         # This will be a simple view when doing normal attention, but in group query attention
         # the key and value tensors are repeated to match the queries so you can't use simple strides
         # to extract the queries.
-        query_layer = query_layer.reshape(output_size[2], output_size[0] * output_size[1], -1)
+        query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
         # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
+        key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
         matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype,
-            "mpu",
+            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
         )
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
             matmul_input_buffer,
-            query_layer.transpose(0, 1),  # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            query.transpose(0, 1),  # [b * np, sq, hn]
+            key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0,
             alpha=(1.0 / self.norm_factor),
         )
@@ -142,34 +153,34 @@ class DotProductAttention(MegatronModule):
         # Context layer. [sq, b, hp]
         # =========================
 
-        # value_layer -> context layer.
+        # value -> context layer.
         # [sk, b, np, hn] --> [b, np, sq, hn]
 
         # context layer shape: [b, np, sq, hn]
         output_size = (
-            value_layer.size(1),
-            value_layer.size(2),
-            query_layer.size(0),
-            value_layer.size(3),
+            value.size(1),
+            value.size(2),
+            query.size(0),
+            value.size(3),
         )
 
         # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
+        value = value.view(value.size(0), output_size[0] * output_size[1], -1)
 
         # change view [b * np, sq, sk]
         attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
 
         # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+        context = torch.bmm(attention_probs, value.transpose(0, 1))
 
         # change view [b, np, sq, hn]
-        context_layer = context_layer.view(*output_size)
+        context = context.view(*output_size)
 
         # [b, np, sq, hn] --> [sq, b, np, hn]
-        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+        context = context.permute(2, 0, 1, 3).contiguous()
 
         # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size_per_partition,)
-        context_layer = context_layer.view(*new_context_layer_shape)
+        new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+        context = context.view(*new_context_shape)
 
-        return context_layer
+        return context

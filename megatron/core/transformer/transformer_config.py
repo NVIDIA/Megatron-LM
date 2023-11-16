@@ -156,7 +156,7 @@ class TransformerConfig(ModelParallelConfig):
     init_method_std: float = 0.02
 
     # mixed-precision
-    apply_query_key_layer_scaling: bool = True
+    apply_query_key_layer_scaling: bool = False
     attention_softmax_in_fp32: bool = True
 
     # communication

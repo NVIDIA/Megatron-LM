@@ -100,4 +100,10 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
             *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
         )
     except Exception as e:
-        raise Exception(f"Error building '{module.__name__}' ... {e}")
+        # improve the error message since we hide the module name in the line above
+        import sys
+
+        tb = sys.exc_info()[2]
+        raise type(e)(f"{str(e)} when instantiating {module.__name__}").with_traceback(
+            sys.exc_info()[2]
+        )

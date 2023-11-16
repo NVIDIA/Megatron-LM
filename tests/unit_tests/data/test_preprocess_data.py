@@ -8,7 +8,7 @@ import tempfile
 import nltk
 import requests
 
-from megatron.data.indexed_dataset import MMapIndexedDataset
+from megatron.core.datasets.indexed_dataset import MMapIndexedDataset
 from megatron.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
@@ -116,16 +116,16 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
         dataset_index = 0
         dataset = MMapIndexedDataset(realpath_doc)
 
-        merged_doc_idx = merged_dataset.doc_idx[
-            merged_doc_index_index : merged_doc_index_index + len(dataset.doc_idx)
+        merged_doc_idx = merged_dataset.document_indices[
+            merged_doc_index_index : merged_doc_index_index + len(dataset.document_indices)
         ]
         merged_doc_idx = merged_doc_idx - merged_doc_idx[0]
 
         assert (
-            dataset.doc_idx == merged_doc_idx
+            dataset.document_indices == merged_doc_idx
         ).all(), f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
 
-        merged_doc_index_index += len(dataset.doc_idx) - 1
+        merged_doc_index_index += len(dataset.document_indices) - 1
 
         with open(realpath_raw, "rt") as reader:
             for json_line in reader:
@@ -160,22 +160,22 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     print("INFO: Success!")
 
 
+def gpt2_vocab(odir):
+    path = os.path.join(odir, "vocab.json")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
+    return path
+
+
+def gpt2_merge(odir):
+    path = os.path.join(odir, "merge.txt")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
+    return path
+
+
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
-
-        # grab gpt2_vocab.json
-        def gpt2_vocab(odir):
-            path = os.path.join(odir, "vocab.json")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
-            return path
-
-        # grab gpt2_merge.txt
-        def gpt2_merge(odir):
-            path = os.path.join(odir, "merge.txt")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
-            return path
 
         # gpt specific args
         gpt_args = [
@@ -195,15 +195,15 @@ def test_preprocess_data_gpt():
         do_test_preprocess_data(temp_dir, extra_args=gpt_args)
 
 
+def bert_vocab(odir):
+    path = os.path.join(odir, "vocab.txt")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
+    return path
+
+
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
-
-        # grab gpt2_vocab.json
-        def bert_vocab(odir):
-            path = os.path.join(odir, "vocab.txt")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
-            return path
 
         # bert specific args
         bert_args = [
