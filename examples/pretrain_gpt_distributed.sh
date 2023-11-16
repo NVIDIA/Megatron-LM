@@ -53,6 +53,7 @@ GPT_ARGS="
     --fp16 \
     --num-experts 16 \
     --expert-model-parallel-size 8 \
+    --routing-mode sinkhorn \
     --recompute-granularity selective \
     --use-flash-attn
 "

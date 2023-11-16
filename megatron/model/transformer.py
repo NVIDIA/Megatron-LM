@@ -177,6 +177,7 @@ class SwitchMLP(MegatronModule):
         self.expert_parallel_size = mpu.get_expert_model_parallel_world_size()
         self.sequence_parallel = config.sequence_parallel
         self.add_bias = config.add_bias_linear
+        self.routing = args.routing_mode # 'sinkhorn', 'top1', 'top2'
 
         assert args.num_experts % self.expert_parallel_size == 0
         self.num_local_experts = args.num_experts // self.expert_parallel_size
@@ -214,20 +215,30 @@ class SwitchMLP(MegatronModule):
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
         
-        # TODO (rprenger) Right now we're just using the sinkhorn algorithm
-        # for load balancing. There should be an option to do no load balancing
-        # and the algorithm and parametets should be further tested
-        if self.training:
-            with torch.no_grad():
-                sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
-                _, max_ind = torch.max(sinkroute, dim=1)
-            route = torch.sigmoid(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
-        else:
-            route = torch.sigmoid(route)
-            max_prob, max_ind = torch.max(route, dim=1)
 
+        if self.routing == 'sinkhorn':
+            if self.training:
+                with torch.no_grad():
+                    sinkroute = sinkhorn(route.detach().to(dtype=torch.float32))
+                    _, max_ind = torch.max(sinkroute, dim=1)
+                route = torch.sigmoid(route)
+                max_prob = route[torch.arange(route.size(0)), max_ind]
+            else:
+               route = torch.sigmoid(route)
+               max_prob, max_ind = torch.max(route, dim=1)
+
+        else:
+           route = torch.softmax(route, dim=1)
+           max_prob, max_ind = torch.max(route, dim=1)
+           if self.routing == 'top2':
+               masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
+               max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
+
+                     
+        
         max_prob = torch.unsqueeze(max_prob, 1)
+        if self.routing == 'top2':
+            max_prob_2 = torch.unsqueeze(max_prob_2, 1)
         hidden_states = hidden_states.view(-1, hidden_states.size(2))
 
         # TODO (rprenger) TODO this could be made easier to read
@@ -237,13 +248,21 @@ class SwitchMLP(MegatronModule):
             global_hidden_states = \
                 gather_from_sequence_parallel_region_to_moe(hidden_states)
             global_indices = self.gather_indices(max_ind)
+            if self.routing == 'top2':
+                global_indices_2 = self.gather_indices(max_ind_2)
         else:
             global_hidden_states = hidden_states
             global_indices = max_ind
+            if self.routing == 'top2':
+                global_indices_2 = max_ind_2
 
         output_total = torch.zeros_like(global_hidden_states)
+        if self.routing == 'top2':
+            output_total_2 = torch.zeros_like(global_hidden_states)
         if self.add_bias:
             output_bias_total = torch.zeros_like(global_hidden_states)
+            if self.routing == 'top2':
+                output_bias_total_2 = torch.zeros_like(global_hidden_states)
 
         for expert_num, expert in enumerate(self.local_experts):
             local_expert_index = self.local_expert_indices[expert_num]
@@ -255,25 +274,58 @@ class SwitchMLP(MegatronModule):
                 output_bias = output_bias.expand_as(output)
                 output_bias_total[local_indices, :] = output_bias
 
+            if self.routing == 'top2':
+                local_indices = (global_indices_2 == local_expert_index).nonzero()
+                hidden = global_hidden_states[local_indices, :]
+                output, output_bias = expert(hidden)
+                output_total_2[local_indices, :] = output
+                if self.add_bias:
+                    output_bias = output_bias.expand_as(output)
+                    output_bias_total_2[local_indices, :] = output_bias
+
+
+
+      
+                    
+
+
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             output_total = \
                 reduce_scatter_to_sequence_parallel_region_from_moe(output_total)
+            if self.routing == 'top2':
+                output_total_2 = \
+                    reduce_scatter_to_sequence_parallel_region_from_moe(output_total_2)
             if self.add_bias:
                 output_bias_total = \
                     reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total)
+                if self.routing == 'top2':
+                    output_bias_total_2 = \
+                        reduce_scatter_to_sequence_parallel_region_from_moe(output_bias_total_2)
+                    
 
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks
                 output_bias_total = \
                     output_bias_total/mpu.get_tensor_model_parallel_world_size()
+                if self.routing == 'top2':
+                    output_bias_total_2 = \
+                        output_bias_total_2/mpu.get_tensor_model_parallel_world_size()
 
         output_total = output_total*max_prob
+        if self.routing == 'top2':
+            output_total_2 = output_total_2*max_prob_2
+            output_total = output_total + output_total_2
         output_total = output_total.view(s, b, h)
         if self.add_bias:
             output_bias_total = output_bias_total*max_prob
+            if self.routing == 'top2':
+                output_bias_total_2 = output_bias_total_2*max_prob_2
+                output_bias_total = output_bias_total + output_bias_total_2
             output_bias_total = output_bias_total.view(s, b, h)
+
         else:
             output_bias_total = None
+
 
         return output_total, output_bias_total
 
