@@ -84,7 +84,7 @@ for file_without_ext in "${bin_idx_filenames[@]}"; do
     for original_file in "${original_filenames[@]}"; do
         if [[ $original_file == $pattern* ]]; then
             echo "Match found for $file_without_ext: $original_file"
-            echo "Detokenizing and comparing files..."
+            echo "Downloading files..."
 
             original_jsonl_file="${original_file}.jsonl"
             original_jsonl_file_output="${output_data}/${original_jsonl_file}"
@@ -108,6 +108,8 @@ for file_without_ext in "${bin_idx_filenames[@]}"; do
 
             detokenized="${output_data}/${file_without_ext}"
 
+            echo "Detokenizing ${file_without_ext} and comparing against ${original_jsonl_file}..."
+
             python yz_detokenize.py --tokenizer_path "${tok_file}" --source_prefix_path "${detokenized}"
             
             if ! cmp -s <(sort_jsonl "${detokenized}.jsonl") <(sort_jsonl "${original_jsonl_file_output}"); then
@@ -119,8 +121,8 @@ for file_without_ext in "${bin_idx_filenames[@]}"; do
                 echo "No difference"
             fi
 
-            rm -rf "${output_data}/${bin_file}"
-            rm -rf "${output_data}/${idx_file}"
+            rm -rf "${bin_file_output}"
+            rm -rf "${idx_file_output}"
             rm -rf "${original_jsonl_file_output}"
 
         fi
