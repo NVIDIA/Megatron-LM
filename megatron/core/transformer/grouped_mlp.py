@@ -12,7 +12,7 @@ from megatron.core.transformer import grouped_gemm_util as gg
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from .base_moe_layer import BaseMoELayer
-from .mlp import MLPSubmodules
+
 
 class ScaleGradient(torch.autograd.Function):
 
@@ -34,7 +34,7 @@ class GroupedMLP(BaseMoELayer):
     Curently supports Sinkhorn based expert routing.
     """
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
+    def __init__(self, config: TransformerConfig):
         super().__init__(config=config)
         self.config: TransformerConfig = config
 

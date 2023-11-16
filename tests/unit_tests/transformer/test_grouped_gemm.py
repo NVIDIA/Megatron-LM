@@ -21,15 +21,15 @@ class TestParallelGroupedMLP:
         self.hidden_size=2 # 12
         self.num_experts = 2
 
-        # Vanilla sequential GEMM
-        # Set random seed for reproducability
-        _set_random_seed(seed_=123, data_parallel_random_init=False)
-        tf_config_smm = TransformerConfig(
+        tf_config = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
             num_moe_experts=self.num_experts, use_cpu_initialization=False, add_bias_linear=False,
-            bf16=True, params_dtype=torch.bfloat16,
-            moe_grouped_gemm=False)
-        self.switch_mlp_smm = SwitchMLP(tf_config_smm,
+            bf16=True, params_dtype=torch.bfloat16)
+
+        ## Vanilla sequential GEMM
+        # Set random seed for reproducability
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        self.switch_mlp_smm = SwitchMLP(tf_config,
             gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
 
         self.args = parse_args(extra_args_provider=None, ignore_unknown_args=False)
@@ -40,16 +40,9 @@ class TestParallelGroupedMLP:
         self.switch_mlp_smm = Float16Module(self.switch_mlp_smm, self.args).module
         print("done intializing for sequential gemm")
 
-        # Grouped GEMM
+        ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        tf_config_gmm = TransformerConfig(
-            num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
-            num_moe_experts=self.num_experts, use_cpu_initialization=False, add_bias_linear=False,
-            bf16=True, # Currently GroupedGEMM only supports bf16.
-            params_dtype=torch.bfloat16,
-            moe_grouped_gemm=True)
-        self.switch_mlp_gmm = GroupedMLP(tf_config_gmm,
-            gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
+        self.switch_mlp_gmm = GroupedMLP(tf_config)
         self.switch_mlp_gmm = Float16Module(self.switch_mlp_gmm, self.args).module
         print("done intializing for grouped gemm")
 
