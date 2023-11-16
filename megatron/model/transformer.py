@@ -841,7 +841,6 @@ class ParallelTransformerLayer(MegatronModule):
                  layer_number, layer_type=LayerType.encoder,
                  self_attn_mask_type=AttnMaskType.padding,
                  drop_path_rate=0.):
-                 # retriever=None):
         args = get_args()
 
         super(ParallelTransformerLayer, self).__init__()

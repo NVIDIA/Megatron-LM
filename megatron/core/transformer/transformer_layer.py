@@ -42,14 +42,12 @@ class TransformerLayer(MegatronModule):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
-        self_attn_mask_type=AttnMaskType.padding,
+        hidden_dropout: float = None,
     ):
         super().__init__(config=config)
-        self.config: TransformerConfig = config
 
         self.layer_number = layer_number + self._get_layer_offset()
-
-        self.self_attn_mask_type = self_attn_mask_type
+        self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         ## [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -82,9 +80,9 @@ class TransformerLayer(MegatronModule):
         )
 
         ## [Module 6: BiasDropoutFusion]
-        self.cross_attn_bda = build_module(submodules.cross_attn_bda)
+        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config,)
 
-        ## [Module 7: Post Cross Attention] Optional Layernorm after cross-attn
+        ## [Module 7: Pre MLP] Optional Layernorm before MLP
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
@@ -140,8 +138,8 @@ class TransformerLayer(MegatronModule):
         attention_mask,
         context=None,
         context_mask=None,
-        inference_params=None,
         rotary_pos_emb=None,
+        inference_params=None,
     ):
         # hidden_states: [s, b, h]
 
@@ -163,7 +161,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -175,16 +173,19 @@ class TransformerLayer(MegatronModule):
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
-            attention_mask=attention_mask,
-            context=context,
+            attention_mask=context_mask,
+            key_value_states=context,
             inference_params=inference_params,
         )
+
+        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
+            context = attention_output_with_bias["context"]
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.config.hidden_dropout
+                attention_output_with_bias, residual, self.hidden_dropout
             )
 
         # Residual connection.
@@ -200,7 +201,7 @@ class TransformerLayer(MegatronModule):
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                mlp_output_with_bias, residual, self.config.hidden_dropout
+                mlp_output_with_bias, residual, self.hidden_dropout
             )
 
         # Jit compiled function creates 'view' tensor. This tensor
@@ -213,7 +214,7 @@ class TransformerLayer(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
-        return output
+        return output, context
 
     def sharded_state_dict(self, prefix=''):
         offset = self._get_layer_offset()

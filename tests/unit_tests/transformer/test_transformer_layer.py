@@ -10,9 +10,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from tests.unit_tests.test_utilities import Utils
-
 
 
 class TestParallelTransformerLayer:
@@ -22,7 +21,7 @@ class TestParallelTransformerLayer:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                           gpt_layer_with_transformer_engine_spec.submodules)
+                                                           get_gpt_layer_with_transformer_engine_spec().submodules)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -48,7 +47,7 @@ class TestParallelTransformerLayer:
 
         attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
 
-        hidden_states = parallel_transformer_layer(hidden_states=hidden_states, attention_mask=attention_mask)
+        hidden_states, context = parallel_transformer_layer(hidden_states=hidden_states, attention_mask=attention_mask)
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
@@ -61,7 +60,7 @@ class TestParallelTransformerLayer:
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=8, use_cpu_initialization=True)
         parallel_transformer_layer = TransformerLayer(transformer_config,
-                                                      gpt_layer_with_transformer_engine_spec.submodules)
+                                                      get_gpt_layer_with_transformer_engine_spec().submodules)
 
         sharded_state_dict = parallel_transformer_layer.sharded_state_dict()
 

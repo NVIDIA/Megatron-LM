@@ -351,6 +351,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
+        attention_dropout: float = None,
     ):
         self.config = config
 
@@ -397,7 +398,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=self.config.kv_channels,
-            attention_dropout=self.config.attention_dropout,
+            attention_dropout=self.config.attention_dropout
+            if attention_dropout is None
+            else attention_dropout,
             attn_mask_type=attn_mask_type.name,
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
