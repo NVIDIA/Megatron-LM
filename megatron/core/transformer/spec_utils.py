@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union

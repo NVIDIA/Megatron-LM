@@ -4,6 +4,7 @@ import importlib
 import numbers
 
 import torch
+from torch import Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
@@ -26,8 +27,39 @@ except:
 
 
 class FusedLayerNorm(torch.nn.Module):
+
+    """Layer Norm, fused into a single CUDA kernel.
+
+    Arguments:
+      hidden_size (int): Transformer hidden dimension.
+
+      eps (float): Epsilon added to denominator, for numerical stability.
+
+      persist_layer_norm (bool): Use persistent fused layer norm kernel.
+      This kernel supports only a set of hidden sizes. Please
+      check persist_ln_hidden_sizes if your hidden size is supported.
+
+      sequence parallel (bool): Apply sequence parallelism optimization.
+
+      zero_centered_gamma (bool): Adjust LayerNorm weights such that they are
+      centered around zero. This improves numerical stability.
+
+      config (TransformerConfig): Transformer config. Include to match custom
+      layer norm interfaces.
+
+      normalization (str): Normalization type, used for Transformer Engine.
+      Must equal 'LayerNorm' here.
+    """
+
     def __init__(
-        self, config: TransformerConfig, hidden_size: int, eps: float = 1e-5,
+        self,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        persist_layer_norm: bool = True,
+        sequence_parallel: bool = False,
+        zero_centered_gamma: bool = False,
+        normalization: str = "LayerNorm",  # included to match TE interface
     ):
         super().__init__()
 
@@ -96,7 +128,7 @@ class FusedLayerNorm(torch.nn.Module):
             init.ones_(self.weight)
             init.zeros_(self.bias)
 
-    def forward(self, input):
+    def forward(self, input: Tensor) -> Tensor:
 
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 

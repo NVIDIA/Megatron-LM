@@ -691,6 +691,20 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     NUM_NODES: 1
     TEST_LEVEL: MR_TESTS
 
+train.retro_core.tp1_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: retro
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+
 cleanup.selene:
   tags:
     - ssh_selene_runner
