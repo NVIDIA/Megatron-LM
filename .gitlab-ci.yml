@@ -703,7 +703,7 @@ train.retro_core.tp1_pp1_1node_50steps:
     NUM_NODES: 1
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
-    TEST_LEVEL: L0
+    TEST_LEVEL: MR_TESTS
 
 cleanup.selene:
   tags:
