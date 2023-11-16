@@ -223,7 +223,7 @@ class Graph:
                             break
                     last_t = max(cost, last_t + comm) + self.get_cost(self.get_id(1, j, i))
                 for j in range(self.nstages):
-                    while j > 0 and f_required[j] > 0 and f_required[j] >= f_required[j - 1]:
+                    while j > 0 and f_required[j] > 0 and f_required[j] >= f_required[j - 1] and f[j] + f_required[j] < self.nmb:
                         f_required[j] -= 1
                 for j in range(self.nstages - 1, -1, -1):
                     for _ in range(f_required[j]):
