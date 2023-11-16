@@ -562,7 +562,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                       bias is True. Defaults to False.
         is_expert: If True, the layer is treated as an MoE expert layer.
         config: ModelParallelConfig object
-        tp_comm_buffer_name: Communication buffer name. Not used in
+        tp_comm_buffer_name: Communication buffer name is not used in
                              non-Transformer-Engine modules.
 
     """
