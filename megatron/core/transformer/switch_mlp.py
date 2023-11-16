@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron import get_args
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.parallel_state import (
     get_tensor_and_expert_parallel_group,
