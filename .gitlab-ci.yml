@@ -714,6 +714,7 @@ train.t5_core.220m_tp1_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -729,6 +730,7 @@ train.t5_core.220m_tp2_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 2
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -744,6 +746,7 @@ train.t5_core.220m_tp4_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 4
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -759,6 +762,7 @@ train.t5_core.220m_te_tp1_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -774,6 +778,7 @@ train.t5_core.220m_te_tp2_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 2
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -789,6 +794,7 @@ train.t5_core.220m_te_tp4_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 4
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -805,6 +811,7 @@ train.t5_core.220m_te_nofa_tp1_pp1_1node_100steps:
     NO_FA: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -820,6 +827,7 @@ train.t5_core.220m_tp4_pp1_sp_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 4
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -836,6 +844,7 @@ train.t5_core.220m_te_tp4_pp1_sp_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 4
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -852,6 +861,7 @@ train.t5_core.220m_do_tp1_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -868,6 +878,7 @@ train.t5_core.220m_te_do_tp1_pp1_1node_100steps:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -884,6 +895,7 @@ train.t5_core.220m_tp1_pp1_2nodes_100steps:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 2
     MAX_STEPS: 100
     TIME_LIMIT: 30:00"
@@ -899,6 +911,7 @@ resume.checkpoint.t5_core.220m_tp1_pp1_1node:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
@@ -913,6 +926,7 @@ resume.checkpoint.t5_core.220m_te_tp1_pp1_1node:
     USE_CORE: 1
     TP_SIZE: 1
     PP_SIZE: 1
+    VP_SIZE: 1
     NUM_NODES: 1
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0

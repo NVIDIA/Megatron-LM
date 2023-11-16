@@ -12,11 +12,6 @@ CHECKPOINT_PATH=/workspace/checkpoints
 TENSORBOARD_DIR=/workspace/tensorboard_logs
 SCRIPTS_DIR=/workspace/debug
 
-if [[ -n $MBS ]]; then MBS=4; fi
-if [[ -n $GBS ]]; then GBS=32; fi
-
-if [[ -n $VP_SIZE ]]; then VP_SIZE="" ; fi
-
 echo 'Running tests using $PYTORCH_IMAGE image'
 
 srun --output $BASE_DIR/results/slurm-%j.out --error $BASE_DIR/results/error-%j.out --container-image $PYTORCH_IMAGE --container-mounts $BASE_DIR/tensorboard_logs:/workspace/tensorboard_logs,$BASE_DIR/debug:/workspace/debug,$BASE_DIR/checkpoints:/workspace/checkpoints,$BUILD_DIR:/workspace/megatron-lm,$DATA_DIR:/workspace/data,$EXTRA_DATA_PATH:$EXTRA_DATA_PATH --no-container-mount-home bash -c "
