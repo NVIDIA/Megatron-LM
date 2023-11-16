@@ -161,11 +161,7 @@ class TransformerBlock(MegatronModule):
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states,
-                attention_mask,
-                context,
-                context_mask,
-                rotary_pos_emb,
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb,
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
