@@ -380,9 +380,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
 
-        # Only Transformer-Engine version > 0.13.0 supports context parallelism
-        te_version = packaging.version.Version(version("transformer-engine"))
-        if te_version > packaging.version.Version("0.13.0"):
+        # Only Transformer-Engine version >= 1.0.0 supports context parallelism
+        if te_version >= packaging.version.Version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
@@ -393,7 +392,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         else:
             assert (
                 self.config.context_parallel_size == 1
-            ), "Only Transformer-Engine version > 0.13.0 supports context parallelism"
+            ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
