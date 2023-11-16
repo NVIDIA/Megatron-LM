@@ -89,13 +89,22 @@ for file_without_ext in "${bin_idx_filenames[@]}"; do
             original_jsonl_file="${original_file}.jsonl"
             original_jsonl_file_output="${output_data}/${original_jsonl_file}"
 
-            azure_path="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/${base_azure_data_dir}/${bin_file}?sp=racwdl&st=2023-11-13T10:57:16Z&se=2025-04-17T18:57:16Z&spr=https&sv=2022-11-02&sr=c&sig=Gg2nHVydrJozaXGrcst0iF3mVgKkhRWO05Mt%2Bfp%2F69Y%3D"
-            azcopy copy "${azure_path}" "${output_data}/${bin_file}"
-            azure_path="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/${base_azure_data_dir}/${idx_file}?sp=racwdl&st=2023-11-13T10:57:16Z&se=2025-04-17T18:57:16Z&spr=https&sv=2022-11-02&sr=c&sig=Gg2nHVydrJozaXGrcst0iF3mVgKkhRWO05Mt%2Bfp%2F69Y%3D"
-            azcopy copy "${azure_path}" "${output_data}/${idx_file}"
+            bin_file_output="${output_data}/${bin_file}"
+            if [ ! -f $bin_file_output ]; then
+                azure_path="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/${base_azure_data_dir}/${bin_file}?sp=racwdl&st=2023-11-13T10:57:16Z&se=2025-04-17T18:57:16Z&spr=https&sv=2022-11-02&sr=c&sig=Gg2nHVydrJozaXGrcst0iF3mVgKkhRWO05Mt%2Bfp%2F69Y%3D"
+                azcopy copy "${azure_path}" "${bin_file_output}"
+            fi
+            
+            idx_file_output="${output_data}/${idx_file}"
+            if [ ! -f $idx_file_output ]; then
+                azure_path="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/${base_azure_data_dir}/${idx_file}?sp=racwdl&st=2023-11-13T10:57:16Z&se=2025-04-17T18:57:16Z&spr=https&sv=2022-11-02&sr=c&sig=Gg2nHVydrJozaXGrcst0iF3mVgKkhRWO05Mt%2Bfp%2F69Y%3D"
+                azcopy copy "${azure_path}" "${idx_file_output}"
+            fi
 
-            azure_path="https://provisioningte0256624006.blob.core.windows.net/noufs/allam_data_2-1_splits/${original_jsonl_file}?sp=racwdl&st=2023-11-16T09:08:26Z&se=2025-04-28T17:08:26Z&spr=https&sv=2022-11-02&sr=c&sig=02JMB0Kku5GH542GWKkirzToMeEg%2FCF16PBf9Tfnei4%3D"
-            azcopy copy "${azure_path}" "${original_jsonl_file_output}"
+            if [ ! -f $original_jsonl_file_output ]; then
+                azure_path="https://provisioningte0256624006.blob.core.windows.net/noufs/allam_data_2-1_splits/${original_jsonl_file}?sp=racwdl&st=2023-11-16T09:08:26Z&se=2025-04-28T17:08:26Z&spr=https&sv=2022-11-02&sr=c&sig=02JMB0Kku5GH542GWKkirzToMeEg%2FCF16PBf9Tfnei4%3D"
+                azcopy copy "${azure_path}" "${original_jsonl_file_output}"
+            fi
 
             detokenized="${output_data}/${file_without_ext}"
 
@@ -112,7 +121,7 @@ for file_without_ext in "${bin_idx_filenames[@]}"; do
 
             rm -rf "${output_data}/${bin_file}"
             rm -rf "${output_data}/${idx_file}"
-            rm -rf "${output_path}/${original_jsonl_file}"
+            rm -rf "${original_jsonl_file_output}"
 
         fi
     done
