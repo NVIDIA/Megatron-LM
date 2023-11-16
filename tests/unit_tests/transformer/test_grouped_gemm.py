@@ -6,13 +6,14 @@ import torch
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
+from megatron.core.transformer.grouped_mlp import GroupedMLP
 from megatron.core.transformer.switch_mlp import SwitchMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.initialize import _set_random_seed
 from megatron.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
-class TestParallelSwitchMLP:
+class TestParallelGroupedMLP:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1,1)
@@ -47,7 +48,7 @@ class TestParallelSwitchMLP:
             bf16=True, # Currently GroupedGEMM only supports bf16.
             params_dtype=torch.bfloat16,
             moe_grouped_gemm=True)
-        self.switch_mlp_gmm = SwitchMLP(tf_config_gmm,
+        self.switch_mlp_gmm = GroupedMLP(tf_config_gmm,
             gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
         self.switch_mlp_gmm = Float16Module(self.switch_mlp_gmm, self.args).module
         print("done intializing for grouped gemm")
@@ -57,7 +58,7 @@ class TestParallelSwitchMLP:
 
     def test_constructor(self):
         assert isinstance(self.switch_mlp_smm, SwitchMLP)
-        assert isinstance(self.switch_mlp_gmm, SwitchMLP)
+        assert isinstance(self.switch_mlp_gmm, GroupedMLP)
 
         num_weights_smm = sum([p.numel() for p in self.switch_mlp_smm.parameters()])
         num_weights_gmm = sum([p.numel() for p in self.switch_mlp_gmm.parameters()])
@@ -116,10 +117,10 @@ class TestParallelSwitchMLP:
 
         # The following assert fails due to the param init value is not exactly
         # the same between gmm and smm (refer to test_weight_init_value_the_same.)
-        # assert torch.equal(output_smm, output_gmm),print(output_smm, output_gmm)
+        # assert torch.equal(output_smm, output_gmm)
 
 if __name__ == "__main__":
-    SMLP_test = TestParallelSwitchMLP()
+    SMLP_test = TestParallelGroupedMLP()
     SMLP_test.setup_method(method=None)
     SMLP_test.test_constructor()
     SMLP_test.test_weight_init_value_the_same()
