@@ -3,6 +3,7 @@
 import pytest
 
 import torch
+import torch.nn.functional as F
 
 from megatron.arguments import parse_args
 from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec_moe
@@ -15,16 +16,32 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestParallelGroupedMLP:
 
-    def setup_method(self, method):
+    def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
+        print("============")
+        print("Test for use_cpu_initilization={} and swiglu={}.".format(use_cpu_initialization, swiglu))
+        print("============")
         Utils.initialize_model_parallel(1,1)
         num_layers=1 # 2
         self.hidden_size=2 # 12
         self.num_experts = 2
+        self.gated_linear_unit = True
+        self.use_cpu_initialization = use_cpu_initialization
+        self.gated_linear_unit = False
+        if swiglu:
+            self.gated_linear_unit = True
 
         tf_config = TransformerConfig(
             num_layers=num_layers, hidden_size=self.hidden_size, num_attention_heads=4,
-            num_moe_experts=self.num_experts, use_cpu_initialization=False, add_bias_linear=False,
+            num_moe_experts=self.num_experts, use_cpu_initialization=self.use_cpu_initialization,
+            add_bias_linear=False, gated_linear_unit=self.gated_linear_unit,
+            bias_gelu_fusion=False,
             bf16=True, params_dtype=torch.bfloat16)
+
+        self.fc1_ffn_hidden_size = tf_config.ffn_hidden_size
+        self.fc2_ffn_hidden_size = tf_config.ffn_hidden_size
+        # If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        if self.gated_linear_unit:
+            self.fc1_ffn_hidden_size *= 2
 
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
@@ -62,37 +79,42 @@ class TestParallelGroupedMLP:
         # expected num weights: router linear weights+bias + MLP weights(no bias) of all experts
         expected_num_weights = \
             self.hidden_size * self.num_experts + self.num_experts + \
-            self.hidden_size * (4*self.hidden_size) * 2 * self.num_experts
+            self.hidden_size * (self.fc1_ffn_hidden_size + self.fc2_ffn_hidden_size) * self.num_experts
         assert num_weights_smm == expected_num_weights
 
         assert torch.equal(self.switch_mlp_smm.router.weight, self.switch_mlp_gmm.router.weight)
 
         # weight1: [num_experts*4h, h]
         # weight2: [h, num_experts*4h]
-        assert self.switch_mlp_gmm.weight1.shape[0] == self.num_experts * 4 * self.hidden_size
+        assert self.switch_mlp_gmm.weight1.shape[0] == self.num_experts * self.fc1_ffn_hidden_size
         assert self.switch_mlp_gmm.weight1.shape[1] == self.hidden_size
-        assert self.switch_mlp_gmm.weight1.shape == \
-            self.switch_mlp_gmm.weight2.t().shape
+        if self.gated_linear_unit:
+            assert self.switch_mlp_gmm.weight2.shape[0] == self.hidden_size
+            assert self.switch_mlp_gmm.weight2.shape[1] == self.num_experts * self.fc2_ffn_hidden_size
+        else:
+            assert self.switch_mlp_gmm.weight1.shape == self.switch_mlp_gmm.weight2.t().shape
 
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.switch_mlp_gmm.weight1.view(self.num_experts, -1, self.hidden_size)
         gmm_w2 = self.switch_mlp_gmm.weight2.view(self.num_experts, self.hidden_size, -1)
-        gmm_expert0_fc1 = gmm_w1[0]
-        gmm_expert0_fc2 = gmm_w2[0]
-        gmm_expert1_fc1 = gmm_w1[1]
-        gmm_expert1_fc2 = gmm_w2[1]
+        gmm_expert1_fc1 = gmm_w1[0]
+        gmm_expert1_fc2 = gmm_w2[0]
+        gmm_expert2_fc1 = gmm_w1[1]
+        gmm_expert2_fc2 = gmm_w2[1]
 
-        smm_expert0_fc1 = self.switch_mlp_smm.local_experts[0].linear_fc1.weight
-        smm_expert0_fc2 = self.switch_mlp_smm.local_experts[0].linear_fc2.weight
-        smm_expert1_fc1 = self.switch_mlp_smm.local_experts[1].linear_fc1.weight
-        smm_expert1_fc2 = self.switch_mlp_smm.local_experts[1].linear_fc2.weight
+        smm_expert1_fc1 = self.switch_mlp_smm.local_experts[0].linear_fc1.weight
+        smm_expert1_fc2 = self.switch_mlp_smm.local_experts[0].linear_fc2.weight
+        smm_expert2_fc1 = self.switch_mlp_smm.local_experts[1].linear_fc1.weight
+        smm_expert2_fc2 = self.switch_mlp_smm.local_experts[1].linear_fc2.weight
 
-        assert torch.equal(gmm_expert0_fc1, smm_expert0_fc1)
-        assert torch.equal(gmm_expert0_fc2, smm_expert0_fc2)
+        assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
+        if not self.use_cpu_initialization:
+            assert torch.equal(gmm_expert1_fc2, smm_expert1_fc2)
         # the param init value is not exactly the same between gmm and smm (refer to test_weight_init_value_the_same.)
         # TODO: is it necessary to keep smm and gmm share exactly the same init params?
-        # assert torch.equal(gmm_expert1_fc1, smm_expert1_fc1)
-        # assert torch.equal(gmm_expert1_fc2, smm_expert1_fc2)
+        # assert torch.equal(gmm_expert2_fc1, smm_expert2_fc1)
+        if self.use_cpu_initialization:
+            assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_gpu_forward(self):
@@ -113,9 +135,14 @@ class TestParallelGroupedMLP:
         # assert torch.equal(output_smm, output_gmm)
 
 if __name__ == "__main__":
-    SMLP_test = TestParallelGroupedMLP()
-    SMLP_test.setup_method(method=None)
-    SMLP_test.test_constructor()
-    SMLP_test.test_weight_init_value_the_same()
-    SMLP_test.test_gpu_forward()
-    SMLP_test.teardown_method(method=None)
+    for use_cpu_unitilization in [True, False]:
+        for swiglu in [True, False]:
+            SMLP_test = TestParallelGroupedMLP()
+            SMLP_test.setup_method(
+                method=None,
+                use_cpu_initialization=use_cpu_unitilization,
+                swiglu=swiglu)
+            SMLP_test.test_constructor()
+            SMLP_test.test_weight_init_value_the_same()
+            SMLP_test.test_gpu_forward()
+            SMLP_test.teardown_method(method=None)
