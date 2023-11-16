@@ -43,6 +43,7 @@ class SwitchMLP(MegatronModule):
 
         self.router = torch.nn.Linear(self.config.hidden_size, self.config.num_moe_experts)
         self.add_bias = config.add_bias_linear
+        self.routing = args.routing_mode # 'sinkhorn', 'top1', 'top2'
         self.sequence_parallel = config.sequence_parallel
         self.route_algo = sinkhorn
         self.router_activation = torch.sigmoid
@@ -85,20 +86,32 @@ class SwitchMLP(MegatronModule):
         route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)
 
-        if self.training:
-            with torch.no_grad():
-                norm_route = self.route_algo(
-                    route.detach().to(dtype=torch.float32)
-                )  # explicit fp32 conversion for stability
-                _, max_ind = torch.max(norm_route, dim=1)
-            route = self.router_activation(route)
-            max_prob = route[torch.arange(route.size(0)), max_ind]
-        else:
-            route = self.router_activation(route)
-            max_prob, max_ind = torch.max(route, dim=1)
+        print('USING SWITCH_MLP.PY')
 
+        if self.routing == 'sinkhorn':
+            if self.training:
+                with torch.no_grad():
+                    norm_route = self.route_algo(
+                        route.detach().to(dtype=torch.float32)
+                    )  # explicit fp32 conversion for stability
+                    _, max_ind = torch.max(norm_route, dim=1)
+                route = self.router_activation(route)
+                max_prob = route[torch.arange(route.size(0)), max_ind]
+            else:
+                route = self.router_activation(route)
+                max_prob, max_ind = torch.max(route, dim=1)
+
+        else:
+            route = torch.softmax(route, dim=1)
+            max_prob, max_ind = torch.max(route, dim=1)
+            if self.routing == 'top2':
+                masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
+                max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
+            
 
         max_prob = torch.unsqueeze(max_prob, 1)
+        if self.routing == 'top2':
+            max_prob_2 = torch.unsqueeze(max_prob_2, 1)
         hidden_states = hidden_states.view(-1, hidden_shape[-1])
 
         if self.sequence_parallel or (self.expert_parallel_size > 1):
@@ -106,43 +119,79 @@ class SwitchMLP(MegatronModule):
                 hidden_states
             )
             global_indices = self.gather_indices(max_ind)
+            if self.routing == 'top2':
+                global_indices_2 = self.gather_indices(max_ind_2)
         else:
             global_hidden_states = hidden_states
             global_indices = max_ind
+            if self.routing == 'top2':
+                global_indices_2 = max_ind_2
 
         output_total = torch.zeros_like(global_hidden_states)
+        if self.routing == 'top2':
+            output_total_2 = torch.zeros_like(global_hidden_states)
         if self.add_bias:
             output_bias_total = torch.zeros_like(global_hidden_states)
+            if self.routing == 'top2':
+                output_bias_total_2 = torch.zeros_like(global_hidden_states)
 
         for expert_num, expert in enumerate(self.local_experts):
             local_expert_index = self.local_expert_indices[expert_num]
             local_indices = (global_indices == local_expert_index).nonzero()
             hidden = global_hidden_states[local_indices, :]
             output, output_bias = expert(hidden)
-
             output_total[local_indices, :] = output
             if self.add_bias:
                 output_bias = output_bias.expand_as(output)
                 output_bias_total[local_indices, :] = output_bias
 
+            if self.routing == 'top2':
+                local_indices = (global_indices_2 == local_expert_index).nonzero()
+                hidden = global_hidden_states[local_indices, :]
+                output, output_bias = expert(hidden)
+                output_total_2[local_indices, :] = output
+                if self.add_bias:
+                    output_bias = output_bias.expand_as(output)
+                    output_bias_total_2[local_indices, :] = output_bias
+
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                 output_total
             )
+            if self.routing == 'top2':
+                output_total_2 = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                output_total_2
+            )
+                
             if self.add_bias:
                 output_bias_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                     output_bias_total
                 )
+                if self.routing == 'top2':
+                    output_bias_total_2 = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
+                    output_bias_total_2
+                )
+                
                 # bias is duplicated across tensor parallelism ranks;
                 # reduce scatter reduces bias across tensor parallel_ranks
                 output_bias_total = (
                     output_bias_total / parallel_state.get_tensor_model_parallel_world_size()
                 )
+                if self.routing == 'top2':
+                    output_bias_total_2 = (
+                    output_bias_total_2 / parallel_state.get_tensor_model_parallel_world_size()
+                )
 
         output_total = output_total * max_prob
+        if self.routing == 'top2':
+            output_total_2 = output_total_2*max_prob_2
+            output_total = output_total + output_total_2
         output_total = output_total.view(hidden_shape)
         if self.add_bias:
             output_bias_total = output_bias_total * max_prob
+            if self.routing == 'top2':
+                output_bias_total_2 = output_bias_total_2*max_prob_2
+                output_bias_total = output_bias_total + output_bias_total_2
             output_bias_total = output_bias_total.view(hidden_shape)
         else:
             output_bias_total = None
