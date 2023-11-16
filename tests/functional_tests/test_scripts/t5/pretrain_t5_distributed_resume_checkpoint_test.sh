@@ -60,8 +60,9 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 # Run for 1000 iterations and save checkpoint at 500
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
-    pretrain_t5_core.py \
-    --num-layers 12 \
+    pretrain_t5.py \
+    --encoder-num-layers 12 \
+    --decoder-num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -85,6 +86,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --vocab-extra-ids 100 \
     --init-method-std 0.015 \
     --transformer-impl $TRANSFORMER_IMPL \
+    --use-mcore-models \
     --data-path $DATA_PATH \
     --vocab-file /workspace/data/bert-large-cased-vocab.txt \
     --tokenizer-type BertWordPieceCase \
@@ -103,8 +105,9 @@ echo 500 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
 # Resume from 50th iteration ckpt and continue to 100 iterations
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
-    pretrain_t5_core.py \
-    --num-layers 12 \
+    pretrain_t5.py \
+    --encoder-num-layers 12 \
+    --decoder-num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -128,6 +131,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --vocab-extra-ids 100 \
     --init-method-std 0.015 \
     --transformer-impl $TRANSFORMER_IMPL \
+    --use-mcore-models \
     --data-path $DATA_PATH \
     --vocab-file /workspace/data/bert-large-cased-vocab.txt \
     --tokenizer-type BertWordPieceCase \

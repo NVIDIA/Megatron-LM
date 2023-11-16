@@ -153,14 +153,14 @@ class T5Model(LanguageModule):
         encoder_spec, decoder_spec = self.transformer_layer_spec
         self.encoder = TransformerBlock(
             config=self.config,
-            submodules=encoder_spec,
+            spec=encoder_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
         # Transformer decoder
         self.decoder = TransformerBlock(
             config=self.config,
-            submodules=decoder_spec,
+            spec=decoder_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -285,6 +285,36 @@ class T5Model(LanguageModule):
         loss = self.compute_language_model_loss(lm_labels, logits)
 
         return loss
+
+    def set_input_tensor(self, input_tensor):
+        """ See megatron.model.transformer.set_input_tensor()"""
+
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+
+        if self.add_encoder and self.add_decoder:
+            assert (
+                len(input_tensor) == 1
+            ), 'input_tensor should only be length 1 for stage with both encoder and decoder'
+            self.encoder.set_input_tensor(input_tensor[0])
+        elif self.add_encoder:
+            assert (
+                len(input_tensor) == 1
+            ), 'input_tensor should only be length 1 for stage with only encoder'
+            self.encoder.set_input_tensor(input_tensor[0])
+        elif self.add_decoder:
+            if len(input_tensor) == 2:
+                self.decoder.set_input_tensor(input_tensor[0])
+                self.encoder_hidden_state = input_tensor[1]
+            elif len(input_tensor) == 1:
+                self.decoder.set_input_tensor(None)
+                self.encoder_hidden_state = input_tensor[0]
+            else:
+                raise Exception('input_tensor must have either length 1 or 2')
+        else:
+            raise Exception('Stage must have at least either encoder or decoder')
 
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Function to share the input embeddings and output logit weights."""

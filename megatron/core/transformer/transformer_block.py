@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import List, Union
 
 import torch
-
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel

@@ -59,8 +59,9 @@ pip install pydantic==2.2.1
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
-    pretrain_t5_core.py \
-    --num-layers 12 \
+    pretrain_t5.py \
+    --encoder-num-layers 12 \
+    --decoder-num-layers 12 \
     --hidden-size 768 \
     --num-attention-heads 12 \
     --kv-channels 64 \
@@ -84,6 +85,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --vocab-extra-ids 100 \
     --init-method-std 0.015 \
     --transformer-impl $TRANSFORMER_IMPL \
+    --use-mcore-models \
     --data-path $DATA_PATH \
     --vocab-file /workspace/data/bert-large-cased-vocab.txt \
     --tokenizer-type BertWordPieceCase \

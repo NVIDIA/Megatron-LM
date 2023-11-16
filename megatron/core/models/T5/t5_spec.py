@@ -166,7 +166,9 @@ def decoder_model_with_local_spec() -> ModuleSpec:
     )
 
 
-def get_t5_encoder_with_transformer_engine_block_spec(num_layers: int) -> TransformerBlockSubmodules:
+def get_t5_encoder_with_transformer_engine_block_spec(
+    num_layers: int,
+) -> TransformerBlockSubmodules:
     """T5 encoder block spec for Transformer Engine
 
     Arguments:
@@ -178,7 +180,9 @@ def get_t5_encoder_with_transformer_engine_block_spec(num_layers: int) -> Transf
     return block_spec
 
 
-def get_t5_decoder_with_transformer_engine_block_spec(num_layers: int) -> TransformerBlockSubmodules:
+def get_t5_decoder_with_transformer_engine_block_spec(
+    num_layers: int,
+) -> TransformerBlockSubmodules:
     """T5 decoder block spec for Transformer Engine
 
     Arguments:
