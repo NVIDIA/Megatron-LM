@@ -23,7 +23,7 @@ from megatron.core.transformer.custom_layers.transformer_engine import (
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:
@@ -87,8 +87,9 @@ def get_retro_encoder_layer_local_spec() -> ModuleSpec:
     )
     return spec
 
-
-def get_retro_encoder_block_spec(config: RetroConfig, use_transformer_engine: bool) -> ModuleSpec:
+def get_retro_encoder_block_spec(
+    config: RetroConfig, use_transformer_engine: bool
+) -> TransformerBlockSubmodules:
 
     """Retro encoder block spec.
 
@@ -134,9 +135,6 @@ def get_retro_encoder_block_spec(config: RetroConfig, use_transformer_engine: bo
             layer_specs.append(gpt_layer_spec)
 
     # Block spec.
-    block_spec = ModuleSpec(
-        module=TransformerBlock,
-        params={"spec": TransformerBlockSubmodules(layer_specs=layer_specs)},
-    )
+    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs)
 
     return block_spec

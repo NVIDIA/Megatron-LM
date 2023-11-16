@@ -105,8 +105,6 @@ class TransformerBlock(MegatronModule):
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        self.num_layers_per_pipeline_rank = len(self.layers)
-
     def _build_layers(self):
         # Transformer layers.
         # @jcasper can we improve how we deal with layer_number?

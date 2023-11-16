@@ -14,7 +14,7 @@ from megatron.core.models.retro.encoder_attention import (
     RetroEncoderLayerNorm,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import build_module
+from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -40,7 +40,7 @@ class TestRetroAttention:
         # Retro decoder layer.
         decoder_block_spec = get_retro_decoder_block_spec(
             config, use_transformer_engine=use_transformer_engine)
-        decoder_block = build_module(decoder_block_spec, config=config)
+        decoder_block = TransformerBlock(config=config, spec=decoder_block_spec)
         decoder_layers = [ layer for layer in decoder_block.layers if isinstance(layer.cross_attention, RetroDecoderCrossAttention) ]
         decoder_layer = decoder_layers[0]
 

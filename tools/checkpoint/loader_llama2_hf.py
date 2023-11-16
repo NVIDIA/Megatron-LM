@@ -51,7 +51,6 @@ def load_args_from_checkpoint(args):
     args.fp16 = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
-    args.apply_query_key_layer_scaling = False
     args.untie_embeddings_and_output_weights = True
     args.vocab_size = llama_args["vocab_size"]
     args.padded_vocab_size = llama_args["vocab_size"]

@@ -58,6 +58,7 @@ class MLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
+            tp_comm_buffer_name='fc1',
         )
 
         if self.config.gated_linear_unit:
@@ -80,6 +81,7 @@ class MLP(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
+            tp_comm_buffer_name='fc2',
         )
 
     def forward(self, hidden_states):

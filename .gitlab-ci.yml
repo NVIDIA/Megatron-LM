@@ -705,7 +705,6 @@ train.retro_core.tp1_pp1_1node_50steps:
     TIME_LIMIT: "20:00"
     TEST_LEVEL: NIGHTLY_TESTS
 
-
 train.t5_core.220m_tp1_pp1_1node_100steps:
   <<: *selene-test-launcher
   variables:
@@ -918,7 +917,6 @@ resume.checkpoint.t5_core.220m_te_tp1_pp1_1node:
     TIME_LIMIT: "30:00"
     TEST_LEVEL: L0
     PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
-
 
 cleanup.selene:
   tags:
