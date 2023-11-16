@@ -30,19 +30,19 @@ DISTRIBUTED_ARGS="
 "
 
 GPT_ARGS="
-    --num-layers 2 \
-    --hidden-size 64 \
-    --num-attention-heads 1 \
-    --seq-length 64 \
-    --max-position-embeddings 64 \
+    --num-layers 24 \
+    --hidden-size 2048 \
+    --num-attention-heads 16 \
+    --seq-length 2048 \
+    --max-position-embeddings 2048 \
     --micro-batch-size 8 \
     --global-batch-size 1024 \
     --lr 0.00015 \
     --train-iters 500 \
-    --lr-decay-iters 500 \
+    --lr-decay-iters 320000 \
     --lr-decay-style cosine \
-    --min-lr 0.001 \
-    --constant-lr 0.05 \
+    --min-lr 1.0e-5 \
+    --constant-lr 0.00008 \
     --constant-fraction 0.4 \
     --inv-sqrt-cooldown-fraction 0.3 \
     --inv-sqrt-scale 30.0 \

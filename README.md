@@ -32,6 +32,39 @@ The Megatron LM installation will be installed in ```/opt/Megatron-LM``` inside 
 ### Launch Training
 `bash /opt/Megatron-LM/examples/pretrain_gpt_distributed.sh`
 
+# Infinite learning rate schedule
+
+We have implemented an 'infinite learning rate schedule' that integrates warm-up, followed by an inverse square root cooldown, a constant phase, and finally an exponential decay. To configure this schedule, modify the script located at ```/opt/Megatron-LM/examples/pretrain_gpt_distributed.sh```. Example values for the relevant flags that you need to set are:
+
+<pre>
+    --lr-decay-style invsqrt-inf \
+    --train-iters 500 \
+    --lr-warmup-fraction 0.01 \
+    --lr 0.00015 \
+    --min-lr 1.0e-5 \
+    --inv-sqrt-cooldown-fraction 0.3 \
+    --inv-sqrt-scale 30.0 \
+    --constant-fraction 0.4 \
+    --constant-lr 0.00008 \
+    --num-cycles 4 \
+</pre>
+
+where
+* ```--train-iters```: total number of iterations
+* ```--lr-warmup-fraction```: fraction of iterations for the LR warmup
+* ```--lr```: maximum LR (right after warmup)
+* ```--min-lr```: minimum possible LR in the iterations following warmup (note the LR starts initially at zero, unless ```--lr-warmup-init``` is specified)
+* ```--inv-sqrt-cooldown-fraction```: fraction of timesteps for the inverse sqrt decay
+* ```--inv-sqrt-scale```: dimensionless decay rate of the inverse sqrt, with 30 being a reasonable value (not too sharp and not too flat)
+* ```--constant-fraction```: fraction of timesteps for the constant LR phase
+* ```--constant--lr```: value of the LR during the constant phase
+* ```--num-cycles```: number of repetitions of this schedule within the total iterations.
+
+Note: The last five flags are necessary only when ```--lr-decay-style invsqrt-inf``` is set. The schedule concludes with an exponential decay phase for the remaining iterations.
+
+The schedule looks like this:
+
+<img src="images/lr_sched.png" alt="Infinite LR schedule" width="50%">
 
 # NVIDIA Megatron-LM (copied from upstream)
 

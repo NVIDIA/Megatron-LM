@@ -98,120 +98,112 @@ class OptimizerParamScheduler(object):
         if self.lr_decay_style != 'invsqrt-inf':
             self.num_repeats = 1
 
-        if self.lr_decay_style == "invsqrt-inf":
-            warmup = self.lr_warmup_steps / self.end_steps
-            self.lr_warmup_steps = warmup * int(self.end_steps / self.num_repeats)    
+        warmup = self.lr_warmup_steps / self.end_steps
+        
+        lr_warmup_steps = warmup * int(self.end_steps / self.num_repeats)
 
         repeat_step_interval = int(self.end_steps / self.num_repeats)
 
-        """
-        Note that in the warmup below, init_lr is different from the very final lr min_lr.
-        So when there are cycles, you need to account for this for continuity
-        by setting the initial lr of following cycles equal to min_lr.
-        This is done by introducing two different warmup phases.
-        """
 
         # Use linear warmup for the initial part.
-        if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
+        if lr_warmup_steps > 0 and self.num_steps <= lr_warmup_steps:
             return (
                 self.init_lr
                 + (
                     (self.max_lr - self.init_lr)
                     * float(self.num_steps)
-                    / float(self.lr_warmup_steps)
+                    / float(lr_warmup_steps)
                 )
             )
         
         elif self.lr_decay_style == "invsqrt-inf" \
-            and self.lr_warmup_steps > 0 and (self.num_steps % repeat_step_interval) <= self.lr_warmup_steps:
+            and lr_warmup_steps > 0 and (self.num_steps % repeat_step_interval) <= lr_warmup_steps:
             return (
                 self.min_lr
                 + (
                     (self.max_lr - self.min_lr)
                     * float(self.num_steps % repeat_step_interval)
-                    / float(self.lr_warmup_steps)
+                    / float(lr_warmup_steps)
                 )
             )
            
+        else:
+            # If decay stile is inverse sqrt infinite:
+            if self.lr_decay_style == 'invsqrt-inf':    
+                # stuff
 
-        # If decay stile is inverse sqrt infinite:
-        if self.lr_decay_style == 'invsqrt-inf':    
-            # stuff
+                num_steps = (self.num_steps % repeat_step_interval) - lr_warmup_steps
 
-            num_steps = (self.num_steps % repeat_step_interval) - self.lr_warmup_steps
+                end_steps_ = repeat_step_interval - lr_warmup_steps
+                constant_steps_ = ((self.constant_steps + self.cooldown_steps) / self.end_steps) * int(self.end_steps / self.num_repeats)
+                cooldown_steps_ = (self.cooldown_steps / self.end_steps) * int(self.end_steps / self.num_repeats)
+                # sqrt_scale_ = (self.sqrt_scale / self.end_steps) * int(self.end_steps / self.num_repeats)
 
-            end_steps_ = repeat_step_interval - self.lr_warmup_steps
-            constant_steps_ = ((self.constant_steps + self.cooldown_steps) / self.end_steps) * int(self.end_steps / self.num_repeats)
-            cooldown_steps_ = (self.cooldown_steps / self.end_steps) * int(self.end_steps / self.num_repeats)
-            # sqrt_scale_ = (self.sqrt_scale / self.end_steps) * int(self.end_steps / self.num_repeats)
-            
 
-            if num_steps <= constant_steps_:
-                if num_steps <= cooldown_steps_:
+                if num_steps <= constant_steps_:
+                    if num_steps <= cooldown_steps_:
 
-                    def inv_sqrt(x):
-                        return self.max_lr/math.sqrt((x + 1)/1)
+                        def inv_sqrt(x):
+                            return self.max_lr/math.sqrt((x + 1)/1)
 
-                    def y_shifted(x, func, A, B_new, x_start, x_end):
-                        return ((B_new - A) / (func(x_end) - func(x_start))) * func(x) + A - ((B_new - A) / (func(x_end) - func(x_start))) * func(x_start)
+                        def y_shifted(x, func, A, B_new, x_start, x_end):
+                            return ((B_new - A) / (func(x_end) - func(x_start))) * func(x) + A - ((B_new - A) / (func(x_end) - func(x_start))) * func(x_start)
 
-                    def x_shifted(x, func, x_start, x_end, x_end_new):
-                        k = (x_end_new - x_start) / (x_end - x_start)
-                        return func(((x - x_start) / k) + x_start)
+                        def x_shifted(x, func, x_start, x_end, x_end_new):
+                            k = (x_end_new - x_start) / (x_end - x_start)
+                            return func(((x - x_start) / k) + x_start)
 
-                    y_shifted_func = lambda x: y_shifted(x, inv_sqrt, self.max_lr, self.constant_lr, 0, self.sqrt_scale)
-                    x_shifted_func = lambda x: x_shifted(x, y_shifted_func, 0, self.sqrt_scale, cooldown_steps_)
-                    lr = x_shifted_func(num_steps)
+                        y_shifted_func = lambda x: y_shifted(x, inv_sqrt, self.max_lr, self.constant_lr, 0, self.sqrt_scale)
+                        x_shifted_func = lambda x: x_shifted(x, y_shifted_func, 0, self.sqrt_scale, cooldown_steps_)
+                        lr = x_shifted_func(num_steps)
+                        return lr
+                    else:
+                    # Stay at constant LR
+                        lr = self.constant_lr
                     return lr
                 else:
-                # Stay at constant LR
-                    lr = self.constant_lr
-                return lr
-            else:
-                # Go from constant iters to min LR in remaining iters
-                end_steps__ = end_steps_ - constant_steps_
-                num_steps = num_steps - constant_steps_
-                exp_factor = -math.log(self.min_lr/self.constant_lr) / end_steps__
-                lr = self.constant_lr * math.exp(-1* exp_factor * num_steps)
-                return lr
+                    # Go from constant iters to min LR in remaining iters
+                    end_steps__ = end_steps_ - constant_steps_
+                    num_steps = num_steps - constant_steps_
+                    exp_factor = -math.log(self.min_lr/self.constant_lr) / end_steps__
+                    lr = self.constant_lr * math.exp(-1* exp_factor * num_steps)
+                    return lr
 
 
+            # All other decay styles:
+            else:  
 
+                # If the learning rate is constant, just return the initial value.
+                if self.lr_decay_style == 'constant':
+                    return self.max_lr
+                
+                # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
+                if self.num_steps > self.lr_decay_steps:
+                        return self.min_lr
+                    
+                # If we are done with the warmup period, use the decay style.
+                if self.lr_decay_style == 'inverse-square-root':
+                    warmup_steps = max(self.lr_warmup_steps, 1)
+                    num_steps = max(self.num_steps, 1)
+                    lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
+                    return max(self.min_lr, lr)
 
-        # All other decay styles:
-        else:  
+                num_steps_ = self.num_steps - self.lr_warmup_steps
+                decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
+                decay_ratio = float(num_steps_) / float(decay_steps_)
+                assert decay_ratio >= 0.0
+                assert decay_ratio <= 1.0
+                delta_lr = self.max_lr - self.min_lr
 
-            # If the learning rate is constant, just return the initial value.
-            if self.lr_decay_style == 'constant':
-                return self.max_lr
+                if self.lr_decay_style == 'linear':
+                    coeff = (1.0 - decay_ratio)
+                elif self.lr_decay_style == 'cosine':
+                    coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
+                else:       
+                    raise Exception('{} decay style is not supported.'.format(
+                        self.lr_decay_style))
 
-            # For any steps larger than `self.lr_decay_steps`, use `self.min_lr`.
-            if self.num_steps > self.lr_decay_steps:
-                return self.min_lr
-
-            # If we are done with the warmup period, use the decay style.
-            if self.lr_decay_style == 'inverse-square-root':
-                warmup_steps = max(self.lr_warmup_steps, 1)
-                num_steps = max(self.num_steps, 1)
-                lr = self.max_lr * warmup_steps ** 0.5 / (num_steps ** 0.5)
-                return max(self.min_lr, lr)
-
-            num_steps_ = self.num_steps - self.lr_warmup_steps
-            decay_steps_ = self.lr_decay_steps - self.lr_warmup_steps
-            decay_ratio = float(num_steps_) / float(decay_steps_)
-            assert decay_ratio >= 0.0
-            assert decay_ratio <= 1.0
-            delta_lr = self.max_lr - self.min_lr
-
-            if self.lr_decay_style == 'linear':
-                coeff = (1.0 - decay_ratio)
-            elif self.lr_decay_style == 'cosine':
-                coeff = 0.5 * (math.cos(math.pi * decay_ratio) + 1.0)
-            else:
-                raise Exception('{} decay style is not supported.'.format(
-                    self.lr_decay_style))
-
-            return self.min_lr + coeff * delta_lr
+                return self.min_lr + coeff * delta_lr
 
 
     def step(self, increment):
@@ -236,6 +228,26 @@ class OptimizerParamScheduler(object):
             'end_wd': self.end_wd,
             'wd_incr_style': self.wd_incr_style,
             'wd_incr_steps': self.wd_incr_steps
+        }
+
+        if self.lr_decay_style == 'invsqrt-inf':
+            state_dict = {
+            'max_lr': self.max_lr,
+            'lr_warmup_steps': self.lr_warmup_steps,
+            'num_steps': self.num_steps,
+            'lr_decay_style': self.lr_decay_style,
+            'lr_decay_steps': self.lr_decay_steps,
+            'min_lr': self.min_lr,
+            'start_wd': self.start_wd,
+            'end_wd': self.end_wd,
+            'wd_incr_style': self.wd_incr_style,
+            'wd_incr_steps': self.wd_incr_steps,
+            'constant_lr': self.constant_lr,
+            'num_repeats': self.num_repeats,
+            'constant_steps': self.constant_steps,
+            'cooldown_steps': self.cooldown_steps,
+            'sqrt_scale': self.sqrt_scale,
+            'end_steps': self.end_steps
         }
         return state_dict
 
@@ -291,9 +303,31 @@ class OptimizerParamScheduler(object):
             lr_decay_style_ = sd['decay_style']
         else:
             lr_decay_style_ = sd['lr_decay_style']
+            
         self.lr_decay_style = self._check_and_set(self.lr_decay_style,
                                                lr_decay_style_,
                                                'learning rate decay style')
+        if lr_decay_style_ == 'invsqrt-inf':
+
+                self.constant_lr = self._check_and_set(self.constant_lr,
+                                               sd['constant_lr'],
+                                               'value of learning rate in constant phase')
+                self.num_repeats = self._check_and_set(self.num_repeats,
+                                               sd['num_repeats'],
+                                               'number of cycles')
+                self.constant_steps = self._check_and_set(self.constant_steps,
+                                               sd['constant_steps'],
+                                               'number of steps of constant learning rate phase')
+                self.cooldown_steps = self._check_and_set(self.cooldown_steps,
+                                               sd['cooldown_steps'],
+                                               'number of steps of inverse sqrt cooldown phase')
+                self.sqrt_scale = self._check_and_set(self.sqrt_scale,
+                                               sd['sqrt_scale'],
+                                               'rate of decay in inverse sqrt phase')
+                self.end_steps = self._check_and_set(self.end_steps,
+                                               sd['end_steps'],
+                                               'total number of steps')
+
 
         if 'num_iters' in sd:
             num_steps = sd['num_iters']
