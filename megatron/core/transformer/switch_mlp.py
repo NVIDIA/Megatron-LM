@@ -87,7 +87,6 @@ class SwitchMLP(MegatronModule):
         route = self.router(hidden_states)
         route = route.view(-1, self.config.num_moe_experts)
 
-        print('USING SWITCH_MLP.PY')
 
         if self.routing == 'sinkhorn':
             if self.training:
@@ -108,6 +107,12 @@ class SwitchMLP(MegatronModule):
             if self.routing == 'top2':
                 masked_route = route.masked_fill(route == max_prob.unsqueeze(1), -float('inf'))
                 max_prob_2, max_ind_2 = torch.max(masked_route, dim=1)
+
+        print('route', route[:10])
+        print('max_prob', max_prob[:10])
+        print('max_ind', max_ind[:10])
+        print('max_prob_2', max_prob_2[:10])
+        print('max_ind_2', max_ind_2[:10])
             
 
         max_prob = torch.unsqueeze(max_prob, 1)
@@ -155,6 +160,19 @@ class SwitchMLP(MegatronModule):
                     output_bias = output_bias.expand_as(output)
                     output_bias_total_2[local_indices, :] = output_bias
 
+        print('\n\n Checking if expert choice for top1 works \n\n')
+        for kk in range(10):
+            print(output_total[kk].data, self.local_experts[global_indices[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total[kk].data - self.local_experts[global_indices[kk]](hidden[kk])[0].data, '\n')
+
+        print('\n\n Checking if expert choice for top2 works \n\n')
+        for kk in range(10):
+            print(output_total_2[kk].data, self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total_2[kk].data - self.local_experts[global_indices_2[kk]](hidden[kk])[0].data, '\n')
+            
+
         if self.sequence_parallel or (self.expert_parallel_size > 1):
             output_total = tensor_parallel.reduce_scatter_to_sequence_parallel_region_from_moe(
                 output_total
@@ -196,5 +214,17 @@ class SwitchMLP(MegatronModule):
             output_bias_total = output_bias_total.view(hidden_shape)
         else:
             output_bias_total = None
+
+
+        print('\n\n Checking final output_total \n\n')
+        for kk in range(10):
+            print(output_total[kk].data, 
+                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
+                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data)
+            print('diff:')
+            print(output_total[kk].data - 
+                  max_prob[kk].data * self.local_experts[global_indices[kk]](hidden[kk])[0].data +
+                  max_prob_2[kk].data * self.local_experts[global_indices_2[kk]](hidden[kk])[0].data, '\n')
+        print('End of prints for this step ===============================================')
 
         return output_total, output_bias_total
