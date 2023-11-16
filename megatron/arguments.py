@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron.global_vars import set_retro_args, get_retro_args
 from tools.retro.utils import get_args_path as get_retro_args_path
 
+from megatron.core.models.retro import RetroConfig
 from megatron.core.transformer import TransformerConfig
 
 
@@ -382,7 +383,7 @@ def validate_args(args, defaults={}):
 
     # MoE Spec check
     if args.num_experts is not None:
-        assert args.model_spec is None, "Model Spec must be None when using MoEs"
+        assert args.spec is None, "Model Spec must be None when using MoEs"
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:
@@ -455,7 +456,15 @@ def core_transformer_config_from_args(args):
     else:
         kw_args['num_query_groups'] = None
 
+    # If using Retro, return Retro config.
+    retro_args = get_retro_args()
+    if retro_args:
+        kw_args['retro_preprocess'] = retro_args
+        return RetroConfig(**kw_args)
+
+    # Return Transformer config.
     return TransformerConfig(**kw_args)
+
 
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
@@ -544,6 +553,10 @@ def _add_retro_args(parser):
                        'database.')
     group.add_argument("--retro-return-doc-ids", action="store_true",
                        help="Turn this on when preprocessing retro data.")
+    group.add_argument("--retro-no-verify-neighbor-count", action="store_false",
+                       dest="retro_verify_neighbor_count",
+                       help="Skip verifying that len(GPT dataset) == len(saved "
+                       "neighbors).")
 
     # Enforce argument naming convention.
     for action in group._group_actions:
@@ -893,8 +906,7 @@ def _add_training_args(parser):
                        'gradient computation of linear layers',
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
-                       help='Use the implementation from megatron core',
-                       dest='use_mcore_models')
+                       help='Use the implementation from megatron core')
     group.add_argument('--manual-gc', action='store_true',
                        help='Disable the threshold-based default garbage '
                        'collector and trigger the garbage collection manually. '
@@ -1368,11 +1380,11 @@ def _add_vision_args(parser):
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
-    group.add_argument('--model-spec',
-                       type=str, default=None, nargs=2,
+    group.add_argument('--spec', type=str, default=None, nargs=2,
                        help='Specify the <module_location function_name> pair '
-                            'that returns a spec to customize the transformer '
-                            'layer implementation. For more details, check the'
-                            '`transformer_layer.py` file that details the use '
-                            'of spec based customization.')
+                       'that returns a spec to customize a model, transformer '
+                       'block, or transformer layer, depending on the use case. '
+                       'For more details, see the model class, '
+                       '`transformer_block.py`, or `transformer_layer.py`')
+
     return parser

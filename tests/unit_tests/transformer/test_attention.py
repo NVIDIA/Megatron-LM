@@ -8,7 +8,7 @@ from megatron.core.transformer.attention import SelfAttention
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_layer_specs import gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
 class TestParallelAttention:
 
@@ -17,7 +17,7 @@ class TestParallelAttention:
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
         self.parallel_attention = SelfAttention(self.transformer_config,
-                                                gpt_layer_with_transformer_engine_spec.submodules.self_attention.submodules,
+                                                get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
                                                 layer_number=1)
 
 
@@ -61,7 +61,7 @@ class TestParallelAttention:
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity='selective'
         checkpointed_parallel_attention = SelfAttention(transformer_config,
-                                                        gpt_layer_with_transformer_engine_spec.submodules.self_attention.submodules,
+                                                        get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
                                                         layer_number=1)
         config = checkpointed_parallel_attention.config
 

@@ -91,7 +91,6 @@ If loading for either inference or finetuning, use the following arguments:
 --normalization RMSNorm \
 --no-position-embedding \
 --no-masked-softmax-fusion \
---no-query-key-layer-scaling \
 ```
 
 ### Launch Meta

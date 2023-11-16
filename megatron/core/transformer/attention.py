@@ -23,7 +23,7 @@ from .utils import make_sharded_tensors_for_checkpoint
 @dataclass
 class SelfAttentionSubmodules:
     linear_qkv: Union[ModuleSpec, type] = None
-    dot_product_attention: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -70,15 +70,15 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = build_module(
-            submodules.dot_product_attention,
+        self.core_attention = build_module(
+            submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
         )
 
-        self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
         self.linear_proj = build_module(
@@ -91,6 +91,7 @@ class Attention(MegatronModule, ABC):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
+            tp_comm_buffer_name='proj',
         )
 
     def _checkpointed_attention_forward(
@@ -103,7 +104,7 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.dot_product_attention(query, key, value, attention_mask)
+            output_ = self.core_attention(query, key, value, attention_mask)
             return output_
 
         hidden_states = tensor_parallel.checkpoint(
@@ -245,10 +246,10 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
-        if self.checkpoint_dot_product_attention:
+        if self.checkpoint_core_attention:
             core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
-            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+            core_attn_out = self.core_attention(query, key, value, attention_mask)
 
         # =================
         # Output. [sq, b, h]
@@ -291,6 +292,7 @@ class SelfAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name='qkv',
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
