@@ -91,6 +91,7 @@ class Attention(MegatronModule, ABC):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
+            tp_comm_buffer_name='proj',
         )
 
     def _checkpointed_attention_forward(
@@ -291,6 +292,7 @@ class SelfAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name='qkv',
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
