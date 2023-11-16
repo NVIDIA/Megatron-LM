@@ -38,6 +38,7 @@ class SwitchMLP(MegatronModule):
 
     def __init__(self, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
+        args = get_args()
 
         self.config: TransformerConfig = config
 
