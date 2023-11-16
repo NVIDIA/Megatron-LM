@@ -75,13 +75,13 @@ sort_jsonl() {
     jq -S . $1 | sort
 }
 
-for file_without_ext in "${array1[@]}"; do
+for file_without_ext in "${bin_idx_filenames[@]}"; do
     pattern=$(extract_pattern "$file_without_ext")
 
     bin_file="${file_without_ext}.bin"
     idx_file="${file_without_ext}.idx"
     echo "Searching for original jsonl file for $file_without_ext"
-    for original_file in "${array2[@]}"; do
+    for original_file in "${original_filenames[@]}"; do
         if [[ $original_file == $pattern* ]]; then
             echo "Match found for $file_without_ext: $original_file"
             echo "Detokenizing and comparing files..."
