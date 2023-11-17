@@ -23,3 +23,4 @@ class AttnType(enum.Enum):
 class AttnMaskType(enum.Enum):
     padding = 1
     causal = 2
+    no_mask = 3  # only used for TE
