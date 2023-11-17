@@ -5,7 +5,7 @@ import os
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -57,24 +57,39 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
 
 def _create_or_open_zarr_arrays(
     sharded_tensors: List[ShardedTensor], checkpoint_dir: Path
-) -> List[zarr.Array]:
+) -> List[Optional[zarr.Array]]:
+    """ Returns list of zarr arrays corresponding to given tensors.
+
+    For a sharded tensors that:
+    a) is main replica and represents the first chunk (all offsets 0), creates the Zarr array
+    b) is main replica but not the first chunk, opens the arrays created in (a) (possibly by other process)
+    c) otherwise, sets the corresponding array to None since it won't be used
+
+    Args:
+        sharded_tensors (List[ShardedTensor]): sharded tensors from a given rank that will be saved to checkpoint
+        checkpoint_dir (Path): checkpoint in which the arrays will be created
+    """
     arrays = []
     for ten in sharded_tensors:
-        if _should_create_array(ten):
-            _create_zarr_array(ten, checkpoint_dir)
-            # TODO: maybe reuse the opened arrays
+        arr = _create_zarr_array(ten, checkpoint_dir) if _should_create_array(ten) else None
+        arrays.append(arr)
 
     torch.distributed.barrier()
-    for ten in sharded_tensors:
-        # if is_main_replica(ten.replica_id) and set(ten.global_offset) == {0}:
-        #     continue
+    # Open arrays created above by other processes
+    for arr_idx, ten in enumerate(sharded_tensors):
+        if arrays[arr_idx] is not None:
+            # array created by this process
+            assert _should_create_array(ten), ten
+            continue
+        if not is_main_replica(ten.replica_id):
+            # this array won't be needed for saving and can stay None
+            continue
         open_kwargs = {}
         if ten.flattened_range is not None:
             open_kwargs['synchronizer'] = zarr.ProcessSynchronizer(
                 str(checkpoint_dir / f'{ten.key}.sync')
             )
-        arr = zarr.open(checkpoint_dir / ten.key, 'r+', **open_kwargs)
-        arrays.append(arr)
+        arrays[arr_idx] = zarr.open(checkpoint_dir / ten.key, 'r+', **open_kwargs)
     return arrays
 
 
@@ -86,9 +101,10 @@ def _should_create_array(ten: ShardedTensor):
     )
 
 
-def _save_to_existing_array(sharded_tensor: ShardedTensor, arr: zarr.Array):
+def _save_to_existing_array(sharded_tensor: ShardedTensor, arr: Optional[zarr.Array]):
     if not is_main_replica(sharded_tensor.replica_id):
         return
+    assert arr is not None
     x = sharded_tensor.data
     x = x.detach().cpu()
     torch.cuda.synchronize()

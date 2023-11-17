@@ -7,6 +7,9 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, save, load
 from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory, \
+    ShardedObject
 from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -181,5 +184,41 @@ class TestSerialization:
             # metadata dict can be loaded. We don't validate access because there are multiple replica_id=0
             state_dict = load(sharded_state_dict, ckpt_dir, validate_access_integrity=False)
             assert torch.all(state_dict['keyA'] == torch.arange(10 * Utils.world_size))
+
+        Utils.destroy_model_parallel()
+
+    def test_can_mix_sharded_tensors_and_factories(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(1, 1)
+
+        def _build_fn(key, tensor):
+            return [
+                ShardedTensor.from_rank_offsets(key + 'part1', tensor, replica_id=Utils.rank),
+                ShardedTensor.from_rank_offsets(key + 'part2', tensor, replica_id=Utils.rank),
+                ShardedTensor.from_rank_offsets(key + 'part3', tensor, replica_id=Utils.rank),
+            ]
+
+        # state dict can be modified by dist_checkpointing.save, so two copies
+        def get_sharded_state_dict(base=0):
+            return {'all': [
+                ShardedTensor.from_rank_offsets('A', torch.arange(2) + base, replica_id=Utils.rank),
+                ShardedTensor.from_rank_offsets('B', torch.arange(3) + base, replica_id=Utils.rank),
+                ShardedTensor.from_rank_offsets('C', torch.arange(4) + base, replica_id=Utils.rank),
+                ShardedTensorFactory('D', torch.arange(5) + base, _build_fn, sum),
+            ]}
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_can_mix_sharded_tensors_and_factories') as ckpt_dir:
+            save(get_sharded_state_dict(0), ckpt_dir)
+            loaded_state_dict = load(get_sharded_state_dict(10), ckpt_dir)
+
+        expected_sd = {
+            'all': [
+                torch.arange(2),
+                torch.arange(3),
+                torch.arange(4),
+                torch.arange(5) * 3,  # sum of three parts, as specified in merge_fn
+            ]
+        }
+        diffs = diff(loaded_state_dict, expected_sd)
+        assert not any(map(bool, diffs)), diffs
 
         Utils.destroy_model_parallel()

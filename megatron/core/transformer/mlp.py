@@ -1,11 +1,14 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Union
+from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
+from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -107,10 +110,75 @@ class MLP(MegatronModule):
         sharded_key_prefix = prefix if sharded_key_prefix is None else sharded_key_prefix
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(
-                prefix=f'{prefix}{name}.',
-                sharded_key_prefix=f'{sharded_key_prefix}{name}.',
-                sharded_offsets=sharded_offsets,
-            )
+            if name == 'linear_fc1' and self.config.gated_linear_unit:
+                sub_sd = self._sharded_state_dict_for_glu(
+                    name, module, prefix, sharded_key_prefix, sharded_offsets
+                )
+            else:
+                sub_sd = module.sharded_state_dict(
+                    prefix=f'{prefix}{name}.',
+                    sharded_key_prefix=f'{sharded_key_prefix}{name}.',
+                    sharded_offsets=sharded_offsets,
+                )
             sharded_state_dict.update(sub_sd)
+        return sharded_state_dict
+
+    def _sharded_state_dict_for_glu(
+        self,
+        module_name: str,
+        module: torch.nn.Module,
+        prefix: str,
+        sharded_key_prefix: str,
+        sharded_offsets: Tuple[Tuple[int, int, int]],
+    ):
+        assert module_name == 'linear_fc1', module_name
+        sharded_state_dict = module.sharded_state_dict(
+            prefix=f'{prefix}{module_name}.',
+            sharded_key_prefix=f'{sharded_key_prefix}{module_name}.',
+            sharded_offsets=sharded_offsets,
+        )
+        weight_key = f'{prefix}{module_name}.weight'
+        prev_sh_ten = sharded_state_dict[weight_key]
+
+        # We must split the tensor into 2 parts, each sharded separately.
+        # This requires a ShardedTensorFactory which `chunk`s during saving
+        # and `cat`s during loading
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+
+        tp_shard_axis = 0
+        replica_id = prev_sh_ten.replica_id
+        prepend_axis_num = len(sharded_offsets)
+
+        def sh_ten_build_fn(key: str, t: torch.Tensor):
+            offset_w = (tp_shard_axis + prepend_axis_num, tp_rank, tp_size * 2)
+            offset_v = (tp_shard_axis + prepend_axis_num, tp_size + tp_rank, tp_size * 2)
+            with torch.no_grad():
+                tensor_w, tensor_v = torch.chunk(t, 2, dim=tp_shard_axis)
+            return [
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    tensor_w,
+                    *sharded_offsets,
+                    offset_w,
+                    replica_id=replica_id,
+                    prepend_axis_num=1,
+                ),
+                ShardedTensor.from_rank_offsets(
+                    key,
+                    tensor_v,
+                    *sharded_offsets,
+                    offset_v,
+                    replica_id=replica_id,
+                    prepend_axis_num=1,
+                ),
+            ]
+
+        def sh_ten_merge_fn(sub_state_dict):
+            with torch.no_grad():
+                return torch.cat(sub_state_dict)
+
+        sharded_state_dict[weight_key] = ShardedTensorFactory(
+            prev_sh_ten.key, prev_sh_ten.data, sh_ten_build_fn, sh_ten_merge_fn
+        )
         return sharded_state_dict

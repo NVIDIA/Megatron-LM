@@ -84,8 +84,8 @@ def validate_args(args, defaults={}):
         args.pipeline_model_parallel_size, args.context_parallel_size)
     args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
-        print('using world size: {}, data-parallel-size: {}, '
-              'context-parallel-size: {} '
+        print('using world size: {}, data-parallel size: {}, '
+              'context-parallel size: {} '
               'tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
@@ -166,6 +166,10 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
+
+    if args.overlap_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather only supported with distributed optimizer'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1095,8 +1099,12 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--no-delay-grad-reduce', action='store_false',
-                       help='If not set, delay grad reduction in all but first PP stage.',
+                       help='If not set, delay / synchronize grad reductions in all but first PP stage.',
                        dest='delay_grad_reduce')
+    group.add_argument('--overlap-param-gather', action='store_true',
+                       default=False, help='If set, overlap param all-gather in distributed optimizer.')
+    group.add_argument('--delay-param-gather', action='store_true',
+                       default=False, help='If set, delay / synchronize param all-gathers in all but first PP stage.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')

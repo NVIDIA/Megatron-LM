@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import is_main_replica
+from megatron.core.dist_checkpointing.mapping import is_main_replica, \
+    ShardedTensorFactory, ShardedObject, apply_factories, apply_factory_merges
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -34,6 +35,31 @@ class TestShardedTensor:
         assert sh_ten.global_shape == (shape[0] * 10, shape[1], shape[2] * 6, shape[3])
         assert sh_ten.global_offset == (0, 0, shape[2] * 3, 0)
         assert sh_ten.axis_fragmentations == (10, 1, 6, 1)
+
+class TestShardedTensorFactory:
+    def test_build_and_merge(self):
+        def build_fn(key, tensor):
+            return {
+                'level2_a': ShardedTensor.from_rank_offsets(key + 'part1', tensor + 1),
+                'level2_b': ShardedTensor.from_rank_offsets(key + 'part2', tensor + 2)
+            }
+
+        # state_dict will be modified in-place
+        def get_state_dict():
+            return {
+                'level1': ShardedTensorFactory('a', torch.arange(3), build_fn, lambda x: x['level2_b'])
+            }
+        state_dict = get_state_dict()
+        apply_factories(state_dict)
+        assert torch.allclose(state_dict['level1']['level2_a'].data, torch.tensor([1, 2, 3]))
+        assert torch.allclose(state_dict['level1']['level2_b'].data, torch.tensor([2, 3, 4]))
+
+        # Simulate loading
+        state_dict['level1']['level2_a'] = state_dict['level1']['level2_a'].data
+        state_dict['level1']['level2_b'] = state_dict['level1']['level2_b'].data
+
+        loaded_state_dict = apply_factory_merges(state_dict, get_state_dict())
+        assert torch.allclose(loaded_state_dict['level1'], torch.tensor([2, 3, 4]))
 
 
 def test_is_main_replica():
