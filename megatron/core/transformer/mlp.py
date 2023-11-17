@@ -10,8 +10,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
-from megatron.core.fusions.fused_bias_swiglu import swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -66,16 +65,6 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        if self.config.gated_linear_unit:
-
-            def glu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return self.config.activation_func(x[0]) * x[1]
-
-            self.activation_func = glu
-        else:
-            self.activation_func = self.config.activation_func
-
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
@@ -98,17 +87,28 @@ class MLP(MegatronModule):
             if self.activation_func == F.gelu:
                 assert self.config.add_bias_linear is True
                 intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            else:
-                x = torch.chunk(intermediate_parallel, 2, dim=-1)
+            elif self.activation_func == F.silu:
+                shape = intermediate_parallel.shape
+                intermediate_parallel = intermediate_parallel.view(-1, shape[2])
                 if bias_parallel is not None:
-                    bias = torch.chunk(bias_parallel, 2, dim=-1)
-                    intermediate_parallel = bias_swiglu_impl(x[0], bias[0], x[1], bias[1])
+                    intermediate_parallel = bias_swiglu_impl(intermediate_parallel, bias_parallel)
                 else:
-                    intermediate_parallel = swiglu_impl(x[0], x[1])
+                    intermediate_parallel = swiglu_impl(intermediate_parallel)
+                intermediate_parallel = intermediate_parallel.view(shape[0], shape[1], -1)
+            else:
+                raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
-            intermediate_parallel = self.activation_func(intermediate_parallel)
+            if self.config.gated_linear_unit:
+
+                def glu(x):
+                    x = torch.chunk(x, 2, dim=-1)
+                    return self.config.activation_func(x[0]) * x[1]
+
+                intermediate_parallel = glu(intermediate_parallel)
+            else:
+                intermediate_parallel = self.activation_func(intermediate_parallel)
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
