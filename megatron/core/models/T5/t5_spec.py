@@ -104,9 +104,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=ModuleSpec(
-                        module=RowParallelLinear, params={"input_is_parallel": True},
-                    ),
+                    linear_proj=RowParallelLinear,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -135,9 +133,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=ModuleSpec(
-                        module=RowParallelLinear, params={"input_is_parallel": True},
-                    ),
+                    linear_proj=RowParallelLinear,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -148,9 +144,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
                     linear_q=ColumnParallelLinear,
                     linear_kv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
-                    linear_proj=ModuleSpec(
-                        module=RowParallelLinear, params={"input_is_parallel": True},
-                    ),
+                    linear_proj=RowParallelLinear,
                 ),
             ),
             cross_attn_bda=get_bias_dropout_add,
