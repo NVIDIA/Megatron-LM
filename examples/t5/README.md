@@ -51,5 +51,5 @@ Below is the training curve for the 220M model on Pile dataset. The training tak
 
 Finetuning on SQUAD dataset, the validation result is: 63.44\%
 <p align="center">
-<img src="./t5_mcore_train_curve.png"  width="1000" height="350">
+<img src="./t5_mcore_train_curve.png"  width="800" height="400">
 </p>
