@@ -1,0 +1,13 @@
+{
+    "books": 3, 
+    "encyclopedias": 3, 
+    "news": 1.5, 
+    "others": 2, 
+    "transcribed": 3, 
+    "translated": 1, 
+    "web": 1, 
+    "code": 2.5, 
+    "encyclopedia": 3, 
+    "reasoning": 3, 
+    "scientific": 3
+}
