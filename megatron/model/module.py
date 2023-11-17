@@ -24,7 +24,7 @@ used_key = set()
 def local_binary_reduction(param: torch.nn.parameter.Parameter, key):
     assert param.grad is None
     if key in cache:
-        #cache[key].add_(param)
+        cache[key].add_(param)
         param.copy_(cache[key])
         a = cache[key]
         del cache[key]

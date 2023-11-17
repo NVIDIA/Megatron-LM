@@ -8,9 +8,12 @@ export GLOBAL_BATCH_SIZE=24
 export PIPELINE_SIZE=8
 export ZERO_BUBBLE_MEM_LIMIT=$((2 * $PIPELINE_SIZE))
 export ENABLE_ZERO_BUBBLE=1
+export ZERO_BUBBLE_V_SCHEDULE=1
+export EVAL_INTERVAL=100
 
 export AIP_RUN_NAME=$(basename $0 | cut -d '.' -f 1)
 export ENABLE_EXACTLY_NUMERIC_MATCH=1
 launch
 
-check_loss "$(loss_of test_pp_1f1b_exact)"
+check_loss "$(loss_of 0_test_pp_1f1b_exact)"
+check_validation_same 0_test_pp_1f1b_eval_exact

@@ -14,4 +14,4 @@ export ENABLE_EXACTLY_NUMERIC_MATCH=1
 
 launch
 
-check_loss "$(loss_of test_pp_1f1b_exact)"
+check_loss "7.073670E+00"

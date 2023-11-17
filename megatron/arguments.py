@@ -190,11 +190,22 @@ def validate_args(args, defaults={}):
 
     # TODO: validate more
     if args.zero_bubble_v_schedule:
+        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+            'number of layers should be divisible by the pipeline parallel size'
+        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
+        assert num_layers_per_pipeline_stage % 2 == 0, \
+            'zero bubble v schedule requires number of layers per pipeline stage to be even'
+        assert args.num_layers_per_virtual_pipeline_stage is None, \
+            'num_layers_per_virtual_pipeline_stage should not be set with zero bubble v schedule'
+        args.virtual_pipeline_model_parallel_size = 2
+        args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage // 2
         assert args.virtual_pipeline_model_parallel_size == 2
         args.enable_zero_bubble = True
     if args.enable_zero_bubble:
         assert not args.overlap_grad_reduce, "not supported yet"
         assert args.pipeline_model_parallel_size > 1, "zero bubble must be enabled with pipeline parallelism"
+        if args.enable_optimizer_post_validation:
+            assert args.fp16, "zero bubble post validation"
     else:
         args.enable_optimizer_post_validation = False
 
@@ -1100,9 +1111,6 @@ def _add_mixed_precision_args(parser):
 
 def _add_zero_bubble_args(parser):
     group = parser.add_argument_group(title='zero bubble')
-    group.add_argument('--zero-bubble-pipeline-start-iter',
-                       type=int, default=1000,
-                       help='The starting iteration that skips all sync cross pipeline parallel groups')
     group.add_argument('--zero-bubble-pipeline-timers-start-iter',
                        type=int, default=100,
                        help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')

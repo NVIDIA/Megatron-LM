@@ -18,7 +18,7 @@ function log() {
 }
 function launch() {
   if [ -z "$NO_RUN" ]; then
-    bash examples/pretrain_llama_7b.sh $@ 2>&1 | tee test_logs/$AIP_RUN_NAME
+    bash examples/pretrain_zero_bubble.sh $@ 2>&1 | tee test_logs/$AIP_RUN_NAME
   fi
   # echo ''
 }
@@ -45,23 +45,21 @@ function loss_of() {
   cat test_logs/$1 | grep ' 300/' | awk '{print $27}'
 }
 function check_loss() {
-  # fbw="$(cat $logsecondlast| grep ILP | tail -n 1 | cut -d ' ' -f 6,7,8 --output-delimiter=',')"
-  # o="$(cat $logsecondlast | grep 'optimizer time' | cut -d ' ' -f 12 | bash median.sh)"
-  # t="$(cat $loglast  | grep 'elapsed time per itera' | tail -n 10 | awk '{print $14}' | bash median.sh)"
-  # l="$(cat $loglast | grep ' 100/' | awk '{print $27}')"
   check_eq "$(loss_of $AIP_RUN_NAME)" "$1"
-  # l100="$(cat $loglast | grep  ' [1-9]0/ .*lm loss' | awk '{print $27}' | md5sum | cut -d ' ' -f 1)"
-  # mmin="$(cat $logall | grep 'max allocated' | awk '{print $14}' | sort -n | tail -n 1)"
-  # mmax="$(cat $logall | grep 'max allocated' | awk '{print $14}' | sort -n | head -n 1)"
 }
 
+function check_validation_same() {
+  a=$(cat test_logs/$1 | grep 'validation loss' | md5sum)
+  b=$(cat test_logs/$AIP_RUN_NAME | grep 'validation loss' | md5sum)
+  check_eq "$a" "$b"
+}
 function check_loss_near() {
-  # fbw="$(cat $logsecondlast| grep ILP | tail -n 1 | cut -d ' ' -f 6,7,8 --output-delimiter=',')"
-  # o="$(cat $logsecondlast | grep 'optimizer time' | cut -d ' ' -f 12 | bash median.sh)"
-  # t="$(cat $loglast  | grep 'elapsed time per itera' | tail -n 10 | awk '{print $14}' | bash median.sh)"
-  # l="$(cat $loglast | grep ' 100/' | awk '{print $27}')"
   check_near "$(loss_of $AIP_RUN_NAME)" "$1"
-  # l100="$(cat $loglast | grep  ' [1-9]0/ .*lm loss' | awk '{print $27}' | md5sum | cut -d ' ' -f 1)"
-  # mmin="$(cat $logall | grep 'max allocated' | awk '{print $14}' | sort -n | tail -n 1)"
-  # mmax="$(cat $logall | grep 'max allocated' | awk '{print $14}' | sort -n | head -n 1)"
+}
+
+function check_loss_exists() {
+  if [ -z "$(loss_of $AIP_RUN_NAME)" ]; then
+    echo "Error: loss not found"
+    exit 1
+  fi
 }

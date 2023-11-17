@@ -700,11 +700,18 @@ if __name__ == "__main__":
     # auto_schedule(4, 12, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=10))
     # auto_schedule(4, 12, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=14))
     auto_schedule(24, 72, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=100))
-    auto_schedule(8, 24, GraphConfig(
+    auto_schedule(4, 12, GraphConfig(
         cost_f=5478,
         cost_b=5806,
         cost_w=3534,
         cost_comm=200,
         max_mem=32,
         print_scaling=1000
+    ))
+    auto_schedule(32, 16, GraphConfig(
+        cost_f=1,
+        cost_b=1,
+        cost_w=1,
+        cost_comm=0,
+        max_mem=64,
     ))

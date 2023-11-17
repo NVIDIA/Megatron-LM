@@ -412,7 +412,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, next_is_eval=False):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -462,7 +462,7 @@ def train_step(forward_step_func, data_iterator,
     if args.enable_zero_bubble and args.enable_optimizer_post_validation:
         from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
         zb_scheduler = get_zb_scheduler_instance()
-        if optimizer.post_validation_enabled:
+        if optimizer.post_validation_enabled and not next_is_eval:
             optimizer.pre_step(args, timers)
             zb_scheduler.optimizer = optimizer
             assert not zb_scheduler.is_first_run and zb_scheduler.do_post_validation
@@ -797,14 +797,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
+        
+        iteration += 1
+        do_eval = args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
-        iteration += 1
+                       config, do_eval)
+        
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
@@ -827,8 +830,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                               opt_param_scheduler)
 
         # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
-           args.do_valid:
+        if do_eval:
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -930,7 +932,6 @@ def evaluate(forward_step_func,
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // \
         (args.micro_batch_size * args.data_parallel_size)
-
     with torch.no_grad():
         iteration = 0
         if verbose:
@@ -1048,9 +1049,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+    pfunc=print_rank_0 if get_args().zero_bubble_v_schedule else print_rank_last
+
+    pfunc('-' * length)
+    pfunc(string)
+    pfunc('-' * length)
 
 
 def cyclic_iter(iter):

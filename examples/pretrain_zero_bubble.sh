@@ -51,8 +51,16 @@ if [ -z "$ZERO_BUBBLE_TIMER_START" ]; then
   ZERO_BUBBLE_TIMER_END=110
 fi
 
+if [ -z "$EVAL_INTERVAL" ]; then
+  EVAL_INTERVAL=10000
+fi
+
+if [ -z "$TP_SIZE" ]; then
+  TP_SIZE=1
+fi
+
 options=" \
-  --tensor-model-parallel-size 1 \
+  --tensor-model-parallel-size $TP_SIZE \
   --pipeline-model-parallel-size $PIPELINE_SIZE \
   --num-layers $LAYERS \
   --hidden-size $HIDDEN_SIZE \
@@ -70,7 +78,7 @@ options=" \
   --lr-decay-style cosine \
   --log-interval 10 \
   --eval-iters 40 \
-  --eval-interval 10000 \
+  --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
   --tokenizer-model /tokenizers/tokenizer.model \
@@ -84,10 +92,12 @@ options=" \
   --profile-step-start 150 \
   --profile-step-end 170 \
   --profile-ranks $profile_ranks \
-  --allow-padding-num-layers \
-  --enable-optimizer-post-validation \
-  --fp16"
+  --allow-padding-num-layers"
 
+if [ -z "$FP32" ]; then
+  options="$options --fp16 \
+  --enable-optimizer-post-validation "
+fi
 
 if [ ! -z "$PROFILED" ]; then
   options="$options --profile"
@@ -95,13 +105,11 @@ fi
 
 if [ ! -z "$ZERO_BUBBLE_V_SCHEDULE" ]; then
   ENABLE_ZERO_BUBBLE=1
-  options="$options --zero-bubble-v-schedule \
-  --num-layers-per-virtual-pipeline-stage $(( $(($LAYERS + 2)) / $PIPELINE_SIZE / 2 ))"
+  options="$options --zero-bubble-v-schedule "
 fi
 
 if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
   options="$options --enable-zero-bubble \
-  --zero-bubble-pipeline-start-iter 100 \
   --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
   --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
   --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT"

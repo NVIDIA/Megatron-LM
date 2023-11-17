@@ -277,6 +277,8 @@ class ZeroBubbleVPipeScheduler:
         next_is_comm: bool,
         next_compute: auto_schedule.ScheduledNode
     ):
+        if self.forward_only and 'BACKWARD' in scheduled_node.type:
+            return
         self.communication_batch[self.direction_map(scheduled_node)].append(
             (scheduled_node, self.tensor_shape))
         def is_consumer(scheduled_node, next_compute):
@@ -286,7 +288,7 @@ class ZeroBubbleVPipeScheduler:
                 if scheduled_node.type == 'RECV_BACKWARD' and next_compute.type == 'B':
                     return True
             return False
-        if (next_compute is not None and is_consumer(scheduled_node, next_compute)) or not next_is_comm:
+        if (next_compute is not None and is_consumer(scheduled_node, next_compute)) or not next_is_comm or self.forward_only:
             self.flush()
 
     def schedule_f(self, scheduled_node):
@@ -528,8 +530,8 @@ class ZeroBubbleVPipeScheduler:
                 # embedding all-reduce for pipeline parallelism).
                 self.config.finalize_model_grads_func(self.model)
 
-        if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
-            ScheduleTimers.concluded = True
+            if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
+                ScheduleTimers.concluded = True
 
         return self.forward_data_store
 
@@ -626,8 +628,8 @@ class ZeroBubbleVPipeScheduler:
             decoder_seq_length=decoder_seq_length,
             config=config,
         )[0] == tensor_shape
-
-        ScheduleTimers.iter_counter += 1
+        if not forward_only:
+            ScheduleTimers.iter_counter += 1
         run_timer = (
             get_args().zero_bubble_pipeline_timers_end_iter
             >= ScheduleTimers.iter_counter
@@ -648,6 +650,12 @@ class ZeroBubbleVPipeScheduler:
         self.it = 0
 
     def __call__(self, *args, **kwargs):
+        if kwargs['forward_only']:
+            self.prepare(*args, **kwargs)
+            assert self.do_post_validation
+            self.do_post_validation = True
+            self.is_first_run = True
+            return self.run()
         if not get_args().enable_optimizer_post_validation:
             self.prepare(*args, **kwargs)
             self.is_first_run = False
@@ -790,6 +798,8 @@ class ZeroBubbleScheduler:
         next_is_comm: bool,
         next_compute: auto_schedule.ScheduledNode
     ):
+        if self.forward_only and 'BACKWARD' in scheduled_node.type:
+            return
         self.communication_batch[self.direction_map(scheduled_node)].append(
             (scheduled_node, None))
         def is_consumer(scheduled_node, next_compute):
@@ -799,7 +809,7 @@ class ZeroBubbleScheduler:
                 if scheduled_node.type == 'RECV_BACKWARD' and next_compute.type == 'B':
                     return True
             return False
-        if (next_compute is not None and is_consumer(scheduled_node, next_compute)) or not next_is_comm:
+        if (next_compute is not None and is_consumer(scheduled_node, next_compute)) or not next_is_comm or self.forward_only:
             self.flush()
 
     def schedule_f(self, scheduled_node):
@@ -926,7 +936,8 @@ class ZeroBubbleScheduler:
             no_sync_func = contextlib.nullcontext
         self.no_sync_func = no_sync_func
         self.no_sync_context = None
-        ScheduleTimers.iter_counter += 1
+        if not forward_only:
+            ScheduleTimers.iter_counter += 1
 
         self.disable_grad_sync()
 
@@ -1061,6 +1072,7 @@ class ZeroBubbleScheduler:
         it = self.it
         while it < len(self.schedules):
             scheduled_node = self.schedules[it]
+            # print(f"iter {torch.distributed.get_rank()}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
             if "POST_VALIDATION" in scheduled_node.type:
                 pass
             elif scheduled_node.type in AUTO_SCHEDULE_COMMUNICATION_TYPES:
@@ -1107,11 +1119,17 @@ class ZeroBubbleScheduler:
                 # embedding all-reduce for pipeline parallelism).
                 self.config.finalize_model_grads_func([self.model])
 
-        if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
-            ScheduleTimers.concluded = True
+            if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
+                ScheduleTimers.concluded = True
         return self.forward_data_store
 
     def __call__(self, *args, **kwargs):
+        if kwargs['forward_only']:
+            self.prepare(*args, **kwargs)
+            assert self.do_post_validation
+            self.do_post_validation = True
+            self.is_first_run = True
+            return self.run()
         if not get_args().enable_optimizer_post_validation:
             self.prepare(*args, **kwargs)
             self.is_first_run = False
