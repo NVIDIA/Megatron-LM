@@ -1,6 +1,8 @@
 # Zyphra Megatron-LM
 
-Guide for running multi-node training using our Docker image: https://zyphra.atlassian.net/l/cp/NbwsaejA
+Guide for starting an example MOE training job on all nodes of our cluster: https://zyphra.atlassian.net/l/cp/QWmK6hRv
+
+Guide for manually running multi-node training using our Docker image (contains also details about how image was created): https://zyphra.atlassian.net/l/cp/NbwsaejA
 
 
 Guide for doing experimental/development run on a single node inside Docker container:
