@@ -165,7 +165,7 @@ def get_t5_encoder_with_transformer_engine_block_spec(
 ) -> TransformerBlockSubmodules:
     """T5 encoder block spec for Transformer Engine
 
-    Arguments:
+    Args:
       config (TransformerConfig): config, containing number of layers for encoder
     """
 
@@ -179,7 +179,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
 ) -> TransformerBlockSubmodules:
     """T5 decoder block spec for Transformer Engine
 
-    Arguments:
+    Args:
       config (TransformerConfig): config, containing number of layers for decoder
     """
 
@@ -191,7 +191,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
 def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSubmodules:
     """T5 encoder block spec for local (uses Megatron-Core components)
 
-    Arguments:
+    Args:
       num_layers (int): number of encoder layers
     """
 
@@ -203,7 +203,7 @@ def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
 def get_t5_decoder_with_local_block_spec(num_layers: int) -> TransformerBlockSubmodules:
     """T5 decoder block spec for local (uses Megatron-Core components)
 
-    Arguments:
+    Args:
       num_layers (int): number of decoder layers
     """
 

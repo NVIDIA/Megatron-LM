@@ -21,7 +21,7 @@ from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 class T5LMHead(MegatronModule):
     """Masked LM head for T5
 
-    Arguments:
+    Args:
         config (TransformerConfig): transformer config
         parallel_output (bool): wether output logits being distributed or not.
         vocab_size (int): vocabulary size
@@ -56,7 +56,7 @@ class T5LMHead(MegatronModule):
     def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
         """Forward pass.
 
-        Arguments:
+        Args:
             hidden_states (Tensor): output hidden states from decoder
             word_embeddings_weight (Tensor): word embedding weight
 
@@ -71,7 +71,7 @@ class T5LMHead(MegatronModule):
 class T5Model(LanguageModule):
     """T5 Language model.
 
-    Arguments:
+    Args:
         config (TransformerConfig): transformer config
 
         transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
@@ -198,7 +198,7 @@ class T5Model(LanguageModule):
     ) -> Tensor:
         """Forward pass.
 
-        Arguments:
+        Args:
             encoder_input_ids (Tensor): input ids for encoder
             decoder_input_ids (Tensor): input ids for decoder
             encoder_attn_mask (Tensor): self-attention mask for encoder
