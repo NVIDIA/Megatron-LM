@@ -75,7 +75,7 @@ def _create_or_open_zarr_arrays(
         arrays.append(arr)
 
     torch.distributed.barrier()
-    # Open arrays crated above by other processes
+    # Open arrays created above by other processes
     for arr_idx, ten in enumerate(sharded_tensors):
         if arrays[arr_idx] is not None:
             # array created by this process
