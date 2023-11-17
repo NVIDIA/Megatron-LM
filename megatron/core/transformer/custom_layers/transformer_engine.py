@@ -5,6 +5,7 @@ from typing import Callable
 import torch
 import transformer_engine as te
 from pkg_resources import packaging
+from torch import Tensor
 
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -354,6 +355,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attention_dropout: float = None,
     ):
         self.config = config
+        self.te_forward_mask_type = False
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv('NVTE_APPLY_QK_LAYER_SCALING', '0'))
@@ -380,6 +382,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if te_version >= packaging.version.Version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
+
+        if te_version > packaging.version.Version("0.12.0"):
+            self.te_forward_mask_type = True
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
         if te_version >= packaging.version.Version("1.0.0"):
@@ -409,3 +414,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             layer_number=layer_number,
             **extra_kwargs,
         )
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType,
+    ):
+        if self.te_forward_mask_type:
+            return super().forward(
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type.name
+            )
+        else:
+            return super().forward(query, key, value, attention_mask)
