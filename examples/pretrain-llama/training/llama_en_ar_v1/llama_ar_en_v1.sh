@@ -14,8 +14,6 @@ TENSORBOARD_LOGS_PATH=$6
 # )
 
 GPT_MODEL_ARGS=(
-    --load MODEL_PATH $MODEL_PATH
-    --tokenizer-model $TOKENIZER_MODEL
     --seq-length 4096 
     --max-position-embeddings 4096 
     --tokenizer-type Llama2Tokenizer
@@ -32,6 +30,7 @@ GPT_MODEL_ARGS=(
 LOGISTICS_ARGS=(
     --save $CHECKPOINT_DIR 
     --load $PRETRAINED_LLAMA_MODEL_PATH 
+    --tokenizer-model $TOKENIZER_MODEL
     --split 9998,1,1 
     --log-interval 100
     --save-interval 10000 
@@ -65,8 +64,8 @@ TRAINING_ARGS=(
 
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 2
-  --pipeline-model-parallel-size 2
-  --no-async-tensor-model-parallel-allreduce
+    --pipeline-model-parallel-size 2
+    --no-async-tensor-model-parallel-allreduce
 )
 
 DATA_PATH=(
@@ -189,12 +188,12 @@ DATA_PATH=(
 )
 
 # torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
-torchrun pretrain_gpt.py \
+python pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${LOGISTICS_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
-    ${DATA_ARGS[@]}
+    ${DATA_PATH[@]}
   
   
   

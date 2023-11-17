@@ -4,10 +4,10 @@ $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
   bash examples/pretrain-llama/training/llama_en_ar_v1/llama_ar_en_v1.sh \
-   ${{inputs.pretrained_llama_model}}
+   ${{inputs.pretrained_llama_model}} \
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
-   ${{outputs.data_cache}}
+   ${{outputs.data_cache}} \
    ${{outputs.checkpoint_dir}} \
    ${{outputs.tensorboard_dir}}
 
@@ -56,7 +56,7 @@ services:
     type: jupyter_lab
   my_tensorboard:
     type: tensor_board
-    log_dir: ${{output.tensorboard_dir}}
+    log_dir: ${{outputs.tensorboard_dir}}
 
 compute: azureml:NCAI-A100-LLMv2
 
@@ -65,5 +65,5 @@ distribution:
   process_count_per_instance: 8
 
 resources:
-  instance_count: 32
+  instance_count: 12
   shm_size: 1250g
