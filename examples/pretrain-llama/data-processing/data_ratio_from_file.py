@@ -55,9 +55,10 @@ if __name__ == "__main__":
     for lang, iterator_list in  data_dist_by_lang.items():
         tot_prob_covered = 0.0
         for (iterator_tok_cnt, iterators_name) in iterator_list:
+            domain = iterators_name.split("_")[1]
             prob = iterator_tok_cnt/tot_sampled_token_by_lang[lang] * lang_prob_dict[lang]
             iterator_selection_prob.append(
-                [prob, iterators_name, int(prob*args.total_token), iterator_tok_cnt]
+                [prob, iterators_name, int(prob*args.total_token), iterator_tok_cnt//domain_dict[domain]]
             )
             tot_prob_covered += prob
         assert abs(lang_prob_dict[lang] - tot_prob_covered) < 1e-6
