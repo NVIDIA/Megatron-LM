@@ -19,7 +19,7 @@
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 ADD_RETRIEVER=1
-REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
+REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/open-instructretro-megatron"
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm/pretrain-checkpoint"
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -46,7 +46,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 LOG_DIR=$DIR/logs
 mkdir -p $LOG_DIR
 
-NAME="gpt3-800m-pretraining-retro-fitting-github"
+NAME="gpt3-800m-pretraining-retro-fitting-github-mr"
 
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/checkpoints/retro-nvllm/${NAME}"
 
@@ -124,6 +124,7 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
+    --retro-fix-sub-epoch \
 "
 
 ######## retro. ########

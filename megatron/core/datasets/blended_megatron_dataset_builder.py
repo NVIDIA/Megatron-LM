@@ -205,7 +205,7 @@ class BlendedMegatronDatasetBuilder(object):
 
         megatron_datasets = []
         for i, _split in enumerate(Split):
-            if split_indices[i] is None:
+            if split[i] is None:
                 megatron_datasets.append(None)
             else:
                 megatron_datasets.append(

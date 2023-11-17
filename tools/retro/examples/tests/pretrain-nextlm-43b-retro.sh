@@ -2,10 +2,10 @@
 
 #SBATCH -p luna
 #SBATCH --nodes=64
-#SBATCH -A llmservice_nlp_retro
+#SBATCH -A llmservice_nlp_fm
 #SBATCH -t 4:00:00
 #SBATCH --exclusive
-#SBATCH --job-name=llmservice_nlp_retro-retro:retro-nextlm-43b-test
+#SBATCH --job-name=llmservice_nlp_fm-retro:retro-nextlm-43b-test-mr
 #SBATCH --ntasks-per-node=8
 #SBATCH --dependency=singleton
 
@@ -20,7 +20,7 @@
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 ADD_RETRIEVER=1
-REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
+REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/open-instructretro-megatron"
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm/pretrain-checkpoint"
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -48,7 +48,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 LOG_DIR=$DIR/logs
 mkdir -p $LOG_DIR
 
-NAME="gpt3-43b-pretraining-retro-fitting-github"
+NAME="gpt3-43b-pretraining-retro-fitting-github-mr"
 
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/checkpoints/retro-nvllm/${NAME}"
 
@@ -127,6 +127,7 @@ ARGS=" \
     --log-num-zeros-in-grad \
     --bf16 \
     --use-distributed-optimizer \
+    --retro-fix-sub-epoch \
 "
 
 ######## retro. ########

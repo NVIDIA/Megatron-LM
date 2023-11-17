@@ -51,18 +51,18 @@ We recommend using a` docker environment  to run the code.
 
 [//]: # (```)
 
-We provide a [docker build file](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.04-py3`.
+We provide a [docker build file](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/retro/examples/Dockerfile) for the reproduction. The docker image is based on `nvcr.io/nvidia/pytorch:23.09-py3`.
 
 
 ### Install dependencies
 
 If docker is not available, we recommend start from a clean conda environment, including:
-- Python 3.8
-- NVIDIA CUDA® 12.1.0
-- NVIDIA cuBLAS 12.1.3
-- NVIDIA cuDNN 8.9.0
-- NVIDIA NCCL 2.17.1 
-- PyTorch 2.1.0a0+fe05266f
+- Python 3.10
+- NVIDIA CUDA® 12.2.1
+- NVIDIA cuBLAS 12.2.5.6
+- NVIDIA cuDNN 8.9.5
+- NVIDIA NCCL 2.18.5
+- 2.1.0a0+32f93b1
 
 Then install Retro-specific dependencies, including:
 ```bash

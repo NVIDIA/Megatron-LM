@@ -86,6 +86,10 @@ class RetroDataset(GPTDataset):
             Dict[str, numpy.ndarray]: The text ids and (optionally) the document ids wrapped in a
             dictionary
         """
+        from megatron import get_args
+        args = get_args()
+        if args.retro_fix_sub_epoch:
+            idx = idx % len(self)
         text, document_ids = self._query_document_sample_shuffle_indices(idx)
         if getattr(self.config, "return_document_ids"):
             return {"text": text, "document_ids": document_ids}

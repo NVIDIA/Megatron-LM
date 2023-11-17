@@ -2,10 +2,10 @@
 
 #SBATCH -p luna,interactive
 #SBATCH --nodes=1
-#SBATCH -A llmservice_nlp_retro
+#SBATCH -A llmservice_nlp_fm
 #SBATCH -t 0:30:00
 #SBATCH --exclusive
-#SBATCH --job-name=llmservice_nlp_retro-retro:gpt-nextlm-800m-test
+#SBATCH --job-name=llmservice_nlp_fm-retro:gpt-nextlm-800m-test
 #SBATCH --ntasks-per-node=8
 #SBATCH --dependency=singleton
 
@@ -19,7 +19,7 @@
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 ADD_RETRIEVER=0
-REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/megatron-lm-pretrain"
+REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/open-instructretro-megatron"
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm/pretrain-checkpoint"
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -46,7 +46,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 LOG_DIR=$DIR/logs
 mkdir -p $LOG_DIR
 
-NAME="gpt3-800m-pretraining-gpt-fitting"
+NAME="gpt3-800m-pretraining-gpt-fitting-github-mr"
 
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/checkpoints/retro-nvllm/${NAME}"
 
@@ -149,8 +149,7 @@ echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo $CMD
 echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 
-IMAGE="gitlab-master.nvidia.com/adlr/megatron-lm/lmcafee/retro-process-22.12"
-IMAGE="/lustre/fsw/adlr/adlr-nlp/boxinw/images/retrov2.sqsh"
+IMAGE="/lustre/fsw/adlr/adlr-nlp/boxinw/images/retro.23.09.sqsh"
 MOUNTS="/lustre/fsw/adlr:/lustre/fsw/adlr"
 srun -l \
      --container-image $IMAGE \
