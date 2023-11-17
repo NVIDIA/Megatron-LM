@@ -230,8 +230,18 @@ class GradBuffer:
 
             # If we have enough elements already, form a new bucket.
             # If bucket_size is None, accumulate everything into a single bucket.
+
+            # TODO: Remove len(bucket_params) > 1 when the final head that transforms token
+            # representations from hidden space to vocabulary space is in a PyTorch module
+            # whose forward method is called. If it is not and a bucket contains only this
+            # one parameter, we get incorrect behavior (i.e., higher losses) since we do not
+            # call the wait function on the bucket's all_gather_handle (we use forward pre-
+            # hooks on PyTorch modules to do this when --overlap-param-gather is used).
+            # As a temporary workaround, we make sure that no bucket has only one parameter.
             if bucket_size is not None:
-                if (data_end_index - bucket_data_start_index) >= bucket_size:
+                if (data_end_index - bucket_data_start_index) >= bucket_size and len(
+                    bucket_params
+                ) > 1:
                     data_end_index = _pad_if_needed(data_end_index)
                     self.bucket_indices.append((bucket_data_start_index, data_end_index))
                     bucket_data_start_index = data_end_index
@@ -348,12 +358,15 @@ class GradBuffer:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
 
-    def reset(self):
+    def reset(self, zero_buffer):
         """
         Zero out the underlying buffer and reset all buckets in preparation for the next
         iteration of training.
+
+        When zero_buffer is set to True, the underlying buffer is zeroed out.
         """
-        self.data.zero_()
+        if zero_buffer:
+            self.data.zero_()
         for bucket in self.buckets:
             bucket.reset()
         self.is_last_microbatch = True
