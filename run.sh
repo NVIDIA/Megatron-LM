@@ -9,8 +9,8 @@
 python pretrain_gpt.py \
 --tensor-model-parallel-size 2 \
 --pipeline-model-parallel-size 2 \
---seq-length 2048 \
---max-position-embeddings 2048 \
+--seq-length 4096 \
+--max-position-embeddings 4096 \
 --tokenizer-type "Llama2Tokenizer" \
 --tokenizer-model "../../cap/data-capability/wd/INPUT_tokenizer/tokenizer.model" \
 --load "../../cap/data-capability/wd/INPUT_load_initial_model/" \
@@ -27,7 +27,7 @@ python pretrain_gpt.py \
 --no-masked-softmax-fusion \
 --no-query-key-layer-scaling \
 --micro-batch-size 2 \
---global-batch-size 1920 \
+--global-batch-size 32 \
 --train-iters 3000 \
 --lr 0.0003 \
 --lr-decay-style "cosine" \
@@ -47,4 +47,5 @@ python pretrain_gpt.py \
 --tensorboard-dir "../../cap/data-capability/wd/model_dir/tensorboard" \
 --tensorboard-log-interval 100 \
 --no-async-tensor-model-parallel-allreduce \
---use-flash-attn
+--use-flash-attn 
+
