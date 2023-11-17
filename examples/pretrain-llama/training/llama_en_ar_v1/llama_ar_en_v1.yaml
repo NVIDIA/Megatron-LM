@@ -7,9 +7,9 @@ command: >-
    ${{inputs.pretrained_llama_model}}
    ${{inputs.tokenizer_model_path}} \
    ${{inputs.bin_idx_data_dir}} \
-   ${{output.data_cache}}
-   ${{output.checkpoint_dir}} \
-   ${{output.tensorboard_dir}}
+   ${{outputs.data_cache}}
+   ${{outputs.checkpoint_dir}} \
+   ${{outputs.tensorboard_dir}}
 
 display_name: LLaMa-Allam-V2-data
 
