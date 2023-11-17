@@ -46,8 +46,8 @@ TRAINING_ARGS=(
     --no-initialization
     --no-load-optim
     --no-load-rng
-    --micro-batch-size 2 
-    --global-batch-size 960
+    --micro-batch-size 1 
+    --global-batch-size 1024
     --train-iters 250000
     --lr 0.000001 
     --lr-decay-style cosine 
@@ -58,7 +58,9 @@ TRAINING_ARGS=(
     --clip-grad 1.0 
     --lr 1.0e-6 
     --min-lr 1.0e-6
+    --lr-warmup-iters 10000
     --use-flash-attn
+    --bf16
 )
 # --use-mcore-models
 
