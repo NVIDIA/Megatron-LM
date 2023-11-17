@@ -137,12 +137,12 @@ class TestParallelGroupedMLP:
 if __name__ == "__main__":
     for use_cpu_unitilization in [True, False]:
         for swiglu in [True, False]:
-            SMLP_test = TestParallelGroupedMLP()
-            SMLP_test.setup_method(
+            GMLP_test = TestParallelGroupedMLP()
+            GMLP_test.setup_method(
                 method=None,
                 use_cpu_initialization=use_cpu_unitilization,
                 swiglu=swiglu)
-            SMLP_test.test_constructor()
-            SMLP_test.test_weight_init_value_the_same()
-            SMLP_test.test_gpu_forward()
-            SMLP_test.teardown_method(method=None)
+            GMLP_test.test_constructor()
+            GMLP_test.test_weight_init_value_the_same()
+            GMLP_test.test_gpu_forward()
+            GMLP_test.teardown_method(method=None)
