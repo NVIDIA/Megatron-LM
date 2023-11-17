@@ -3,11 +3,17 @@
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 command: >-
-  bash examples/pretrain-llama/training/llama_en_ar_v1/llama_ar_en_v1.sh
+  bash examples/pretrain-llama/training/llama_en_ar_v1/llama_ar_en_v1.sh \
+   ${{inputs.pretrained_llama_model}}
+   ${{inputs.tokenizer_model_path}} \
+   ${{inputs.bin_idx_data_dir}} \
+   ${{output.data_cache}}
+   ${{output.checkpoint_dir}} \
+   ${{output.tensorboard_dir}}
 
-display_name: MegatronLM-Allam-V2-data
+display_name: LLaMa-Allam-V2-data
 
-experiment_name: MegatronLM-Vocab-Expansion
+experiment_name: Vocab-Expansion
 code: ../../../../
 environment: azureml:Megatron-LLaMA:7
 environment_variables:
@@ -18,24 +24,28 @@ environment_variables:
   NCCL_DEBUG: WARN
   CUDA_DEVICE_MAX_CONNECTIONS: '1'
 inputs:
-  load_initial_model:
+  pretrained_llama_model:
     type: uri_folder
     mode: ro_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Llama-2-7b-hf-ExpTok-32K_10M_tp2_pp1_seq128/
-  tokenizer:
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/megatronlm_models/Llama-2-7b-hf-default-tp2_pp2/
+  tokenizer_model_path:
     type: uri_file
     mode: ro_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model
-  data:
+  bin_idx_data_dir:
     type: uri_folder
     mode: ro_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx/
 outputs:
-  cache:
+  data_cache:
     type: uri_folder
     mode: rw_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/clean/llama_ar_en_v1_index_cache
-  model_dir:
+  checkpoint_dir:
+    type: uri_folder
+    mode: rw_mount
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/clean/llama_ar_en_v1
+  tensorboard_dir:
     type: uri_folder
     mode: rw_mount
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/sbmaruf/paths/vocab_expansion_assets/experiments/clean/llama_ar_en_v1
@@ -44,7 +54,9 @@ outputs:
 services:
   my_jupyterlab:
     type: jupyter_lab
-    nodes: all
+  my_tensorboard:
+    type: tensor_board
+    log_dir: ${{output.tensorboard_dir}}
 
 compute: azureml:NCAI-A100-LLMv2
 

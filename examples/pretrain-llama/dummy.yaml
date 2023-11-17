@@ -46,6 +46,13 @@ services:
   my_jupyterlab:
     type: jupyter_lab
     nodes: all
+  my_tensorboard:
+    type: tensor_board
+    log_dir: "outputs/runs/" #default is working directory on job container
+    nodes: all
+  my_vscode:
+    type: vs_code
+    nodes: all
 
 compute: azureml:A100-SSH
 
