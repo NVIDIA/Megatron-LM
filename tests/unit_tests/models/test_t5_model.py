@@ -21,7 +21,7 @@ class TestT5Model:
         transformer_config = TransformerConfig(num_layers=12, hidden_size=768, num_attention_heads=12, kv_channels=64, ffn_hidden_size=3072, use_cpu_initialization=True)
         en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(12)
         de_block_spec = get_t5_decoder_with_transformer_engine_block_spec(12)
-        self.t5_model = T5Model(config=transformer_config, transformer_layer_spec=[en_block_spec, de_block_spec], vocab_size=29184, max_sequence_length=4)
+        self.t5_model = T5Model(config=transformer_config, transformer_encoder_layer_spec=en_block_spec, transformer_decoder_layer_spec=de_block_spec,  vocab_size=29184, max_sequence_length=4)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

@@ -74,8 +74,10 @@ class T5Model(LanguageModule):
     Arguments:
         config (TransformerConfig): transformer config
 
-        transformer_layer_spec (List[ModuleSpec]): transformer layer customization specs for encoder and decoder
-        
+        transformer_encoder_layer_spec (ModuleSpec): transformer layer customization specs for encoder
+
+        transformer_decoder_layer_spec (ModuleSpec): transformer layer customization specs for decoder
+                
         vocab_size (int): vocabulary size
 
         max_sequence_length (int): maximum size of sequence. This is used for positional embedding
@@ -103,7 +105,8 @@ class T5Model(LanguageModule):
     def __init__(
         self,
         config: TransformerConfig,
-        transformer_layer_spec: List[ModuleSpec],
+        transformer_encoder_layer_spec: ModuleSpec,
+        transformer_decoder_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -119,7 +122,8 @@ class T5Model(LanguageModule):
         super(T5Model, self).__init__(config=config)
 
         self.config: TransformerConfig = config
-        self.transformer_layer_spec: List[ModuleSpec] = transformer_layer_spec
+        self.transformer_encoder_layer_spec: ModuleSpec = transformer_encoder_layer_spec
+        self.transformer_decoder_layer_spec: ModuleSpec = transformer_decoder_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -135,7 +139,7 @@ class T5Model(LanguageModule):
         self.model_type = ModelType.encoder_and_decoder
 
         # Embeddings.
-        if self.pre_process:  # lOOK INTO transformer.py in nemo (GPT/ BERT model)
+        if self.pre_process:
             self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
@@ -150,7 +154,10 @@ class T5Model(LanguageModule):
             )
 
         # Transformer encoder
-        encoder_spec, decoder_spec = self.transformer_layer_spec
+        encoder_spec, decoder_spec = (
+            self.transformer_encoder_layer_spec,
+            self.transformer_decoder_layer_spec,
+        )
         self.encoder = TransformerBlock(
             config=self.config,
             spec=encoder_spec,

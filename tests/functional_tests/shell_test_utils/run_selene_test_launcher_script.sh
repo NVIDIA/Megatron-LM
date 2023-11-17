@@ -32,11 +32,9 @@ echo "----------------------------------------------------------------------"
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/tensorboard_logs
 mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug
-mkdir -p $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results
 rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/checkpoints/*
 rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/tensorboard_logs/*
 rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/*
-# rm -rf $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/*
 
 # step 4 : EXPORTING SOME ENV VARIABLES 
 export BASE_DIR=$SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME
@@ -62,7 +60,7 @@ echo -e "\e[0Ksection_end:`date +%s`:slurm_setup\r\e[0K"
 # Follow output of the job
 echo "Finished job"
 echo "Slurm log dump start ------------------------------------------------------------"
-cat $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/results/slurm*
+cat $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/slurm*
 echo "Slurm log dump end --------------------------------------------------------------"
 python3 $BUILD_DIR/tests/functional_tests/python_test_utils/check_slurm_job_completion.py $SLURM_JOBID
 if [ $? -ne 0 ]; then echo "Slurm job did not complete. See ${SELENE_ADLR_CI_PATH}/${CI_PIPELINE_ID}/${RUN_NAME}/debug directory for result logs. Skipping pytest."; exit 1; fi

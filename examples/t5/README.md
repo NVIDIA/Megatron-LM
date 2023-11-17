@@ -7,7 +7,7 @@
 
 ## 1. Training setup
 <a id="markdown-training-setup" name="training-setup"></a>
-To run the model on Selene 
+To run the model on a Slurm based cluster  
 ```
 PYTORCH_IMAGE=nvcr.io/nvidia/pytorch:23.09-py3
 ACCOUNT_NAME="" 
@@ -50,19 +50,6 @@ The architecture arguments below shows configuration for T5 220M model.
 Below is the training curve for the 220M model on Pile dataset. The training takes 4 days on 32 GPUs, with batch size of 2048. 
 
 Finetuning on SQUAD dataset, the validation result is: 63.44\%
-<!-- ![Alt text](examples/t5/training_curve.png.png "Training loss curve for T5 220M model on Pile dataset (batch size of 2048)") -->
 <p align="center">
-<img src="/lustre/fsw/joc/huvu/codes/T5_mcore/megatron-lm-updated/megatron-lm/examples/t5/t5_mcore_train_curve.png"  width="800" height="400">
+<img src="./t5_mcore_train_curve.png"  width="1000" height="350">
 </p>
-
-<!-- ## 4. Functional supports
-The table below show current T5 functional supports.
-
-|               | Transformer engine  | Flash-attention | Tensor parallel | Pipeline parallel | Sequence parallel | Distributed optimizer | 
-| ------------- | :---: | :---: | :---: | :---: | :---: | :---: | 
-| **Transformer engine**   | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |
-| **Flash-attention**   | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
-| **Tensor parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
-| **Pipeline parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | 
-| **Sequence parallel**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |
-| **Distributed optimizer**  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  | Content Cell  |  -->

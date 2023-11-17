@@ -86,7 +86,8 @@ def model_provider(pre_process=True, post_process=True, add_encoder=True, add_de
         print_rank_0('building T5 model ...')
         model = T5Model(
             config=config,
-            transformer_layer_spec=[en_block_spec, de_block_spec],
+            transformer_encoder_layer_spec=en_block_spec,
+            transformer_decoder_layer_spec=de_block_spec
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
