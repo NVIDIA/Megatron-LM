@@ -4,9 +4,8 @@ import numpy as np
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.parallel_state import (
-    get_tensor_and_expert_parallel_group,
-)
+
+from megatron.core.parallel_state import get_tensor_and_expert_parallel_group
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_data_parallel_rng_tracker_name
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -41,6 +40,7 @@ class BaseMoELayer(MegatronModule):
     """
     Basic MoE layer.
     """
+
     def __init__(self, config: TransformerConfig):
         super().__init__(config=config)
 

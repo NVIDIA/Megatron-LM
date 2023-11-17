@@ -112,9 +112,7 @@ gpt_layer_with_transformer_engine_spec_moe_grouped_gemm = ModuleSpec(
         ),
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=FusedLayerNorm,
-        mlp=ModuleSpec(
-            module=GroupedMLP,  # MOE
-        ),
+        mlp=ModuleSpec(module=GroupedMLP),  # MOE
         mlp_bda=get_bias_dropout_add,
     ),
 )
@@ -161,9 +159,7 @@ gpt_layer_local_spec_moe_grouped_gemm = ModuleSpec(
         ),
         self_attn_bda=get_bias_dropout_add,
         pre_mlp_layernorm=FusedLayerNorm,
-        mlp=ModuleSpec(
-            module=GroupedMLP,  # MOE
-        ),
+        mlp=ModuleSpec(module=GroupedMLP),  # MOE
         mlp_bda=get_bias_dropout_add,
     ),
 )

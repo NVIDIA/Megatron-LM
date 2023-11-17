@@ -897,6 +897,7 @@ def get_expert_model_parallel_world_size():
     else:
         return 0
 
+
 def get_tensor_and_expert_parallel_world_size():
     """Return my rank for the expert parallel group"""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -906,6 +907,7 @@ def get_tensor_and_expert_parallel_world_size():
         return tensor_and_expert_parallel_world_size
     else:
         return 0
+
 
 def get_expert_model_parallel_rank():
     """Return my rank for the expert parallel group"""

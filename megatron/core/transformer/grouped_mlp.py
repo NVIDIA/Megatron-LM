@@ -5,7 +5,6 @@ import torch
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
-
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -17,8 +16,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from .base_moe_layer import BaseMoELayer
 
 
-class ScaleGradient(torch.autograd.Function):
 
+class ScaleGradient(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd
     def forward(ctx, x, scale):
@@ -29,6 +28,8 @@ class ScaleGradient(torch.autograd.Function):
     @torch.cuda.amp.custom_bwd
     def backward(ctx, grad):
         return grad * ctx.scale, None
+
+
 scale_gradient = ScaleGradient.apply
 
 class GroupedMLP(BaseMoELayer):
@@ -42,12 +43,14 @@ class GroupedMLP(BaseMoELayer):
         self.config: TransformerConfig = config
 
         gg.assert_grouped_gemm_is_available()
-        assert config.add_bias_linear == False, \
-            "bias in the expert layer is not supported in Grouped GEMM yet."
+        assert (
+            config.add_bias_linear == False
+        ), "bias in the expert layer is not supported in Grouped GEMM yet."
 
         self.expert_parallel = config.expert_model_parallel_size > 1
         self.gradient_scale = 1 / parallel_state.get_tensor_and_expert_parallel_world_size()
         if self.config.gated_linear_unit:
+
             def glu(x):
                 x = torch.chunk(x, 2, dim=-1)
                 return self.config.activation_func(x[0]) * x[1]
@@ -55,7 +58,6 @@ class GroupedMLP(BaseMoELayer):
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
-
 
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -152,8 +154,8 @@ class GroupedMLP(BaseMoELayer):
             # Histogram the expert ids to identify the number of tokens routed to each expert
             # Note that for np.histogram, all but the last (righthand-most) bin is half-open.
             tokens_per_expert, bin_edges = np.histogram(
-                sorted.cpu(),
-                bins=np.arange(self.config.num_moe_experts + 1))
+                sorted.cpu(), bins=np.arange(self.config.num_moe_experts + 1)
+            )
             tokens_per_expert = torch.tensor(tokens_per_expert).to(torch.long)
             reverse_indices = indices.argsort()
 
@@ -162,19 +164,11 @@ class GroupedMLP(BaseMoELayer):
         w1 = w1.view(self.num_local_experts, -1, self.config.hidden_size)
         w2 = w2.view(self.num_local_experts, self.config.hidden_size, -1)
 
-        fc1_output = gg.ops.gmm(
-            sorted_global_hidden_states,
-            w1,
-            tokens_per_expert,
-            trans_b=True)
+        fc1_output = gg.ops.gmm(sorted_global_hidden_states, w1, tokens_per_expert, trans_b=True)
 
         intermediate_parallel = self.activation_func(fc1_output)
 
-        fc2_output = gg.ops.gmm(
-            intermediate_parallel,
-            w2,
-            tokens_per_expert,
-            trans_b=True)
+        fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=True)
         # Un-permutation of tokens
         output_total = fc2_output[reverse_indices]
 

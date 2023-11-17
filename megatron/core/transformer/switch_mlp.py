@@ -31,7 +31,6 @@ class SwitchMLP(BaseMoELayer):
         if self.add_bias:
             output_bias_total = torch.zeros_like(global_hidden_states)
 
-
         for expert_num, expert in enumerate(self.local_experts):
             local_expert_index = self.local_expert_indices[expert_num]
             local_indices = (global_indices == local_expert_index).nonzero()
