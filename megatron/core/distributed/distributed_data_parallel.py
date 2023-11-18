@@ -88,6 +88,7 @@ class DistributedDataParallel(MegatronModule):
 
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
+        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
             self.grad_buffers[dtype] = GradBuffer(
                 dtype,
@@ -105,6 +106,7 @@ class DistributedDataParallel(MegatronModule):
         # Allocate separate buffer for MoE params' grads.
         for param in self.module.parameters():
             if param.requires_grad and not getattr(param, 'allreduce', True):
+                param.grad_added_to_main_grad = False
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
                 param.main_grad = torch.zeros(
                     param.data.shape,
@@ -190,6 +192,9 @@ class DistributedDataParallel(MegatronModule):
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.finish_grad_sync()
+
+        for expert_grad in self.expert_grads:
+            expert_grad /= self.data_parallel_world_size
 
     def zero_grad_buffer(self, zero_buffer):
         """

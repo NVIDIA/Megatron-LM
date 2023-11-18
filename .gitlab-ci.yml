@@ -512,7 +512,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     METADATA: "te_4experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
 
-train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
+train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]

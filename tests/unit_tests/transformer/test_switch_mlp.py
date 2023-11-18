@@ -27,7 +27,7 @@ class TestParallelSwitchMLP:
         assert isinstance(self.switch_mlp, SwitchMLP)
 
         num_weights = sum([p.numel() for p in self.switch_mlp.parameters()])
-        assert num_weights == 2450
+        assert num_weights == 2448
 
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
