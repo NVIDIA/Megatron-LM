@@ -4,7 +4,7 @@ $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
 display_name: single_gpu_dev
 experiment_name: sbmaruf_dev
-code: .
+code: ../../../
 environment: NeMo_2308_dev:1
 environment_variables:
   HYDRA_FULL_ERROR: '1'
