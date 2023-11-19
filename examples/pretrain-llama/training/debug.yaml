@@ -10,7 +10,7 @@ environment_variables:
   HYDRA_FULL_ERROR: '1'
 
 inputs:
-  tokenizer_model_file:
+  experiment:
     type: uri_file
     mode: download
     path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/
