@@ -2,7 +2,7 @@
 
 $schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
 
-display_name: single_gpu_dev
+display_name: dual_gpu_dev
 experiment_name: sbmaruf_dev
 code: ../../../
 environment: azureml:NeMo_2308_dev:1
@@ -41,7 +41,7 @@ services:
     log_dir: "outputs/runs/"
     nodes: all
 
-compute: azureml:A100-MULTI-DEV2
+compute: azureml:A100-MULTI-DEV3
 
 resources:
   instance_count: 1
