@@ -124,8 +124,8 @@ DATA_PATH=(
     0.006118047480921474 $BIN_IDX_PATH/en_encyclopedia_m_wikipedia_split_01_text_document_dc\=13560334_sc\=13560334_tc\=8986517485
     0.0007677042219232239 $BIN_IDX_PATH/en_encyclopedia_m_wikipedia_split_02_text_document_dc\=1338817_sc\=1338817_tc\=1127645288
     0.0039365502483162795 $BIN_IDX_PATH/en_encyclopedia_wikipedia_split_00_text_document_dc\=6630656_sc\=6630656_tc\=5782216916
-    0.008196898364554433 $BIN_IDX_PATH/en_reasoning_open\-web\-math_split_00_text_document_dc\=5157493_sc=5157493_tc=12040045571
-    0.0018481050934933208 $BIN_IDX_PATH/en_reasoning_open\-web\-math_split_01_text_document_dc\=1157740_sc=1157740_tc=2714596248
+    0.008196898364554433 $BIN_IDX_PATH/en_reasoning_open-web-math_split_00_text_document_dc\=5157493_sc\=5157493_tc\=12040045571
+    0.0018481050934933208 $BIN_IDX_PATH/en_reasoning_open-web-math_split_01_text_document_dc\=1157740_sc\=1157740_tc\=2714596248
     0.007124504472130942 $BIN_IDX_PATH/en_reasoning_peS2o_split_00_text_document_dc\=34104559_sc\=34104559_tc\=10464855693
     0.007865533817253046 $BIN_IDX_PATH/en_reasoning_peS2o_split_01_text_document_dc\=14452182_sc\=14452182_tc\=11553319486
     0.008343564382198711 $BIN_IDX_PATH/en_reasoning_peS2o_split_02_text_document_dc\=1721917_sc\=1721917_tc\=12255476513
