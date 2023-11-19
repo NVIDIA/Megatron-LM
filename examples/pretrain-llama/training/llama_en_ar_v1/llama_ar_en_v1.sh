@@ -188,9 +188,6 @@ DATA_PATH=(
     0.0028541271802989565 $BIN_IDX_PATH/en_web_cc_split_79_text_document_dc\=6596841_sc\=6596841_tc\=12576886935
     0.00190855527699637 $BIN_IDX_PATH/en_web_cc_split_81_text_document_dc\=4396657_sc\=4396657_tc\=8410166195
 )
-# DATA_PATH=(
-#     --data-path 0.05060197557342783 $BIN_IDX_PATH/ar_books_split_00_text_document_dc\=74697_sc\=74697_tc\=23946784716
-# )
 
 # torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
 python pretrain_gpt.py \

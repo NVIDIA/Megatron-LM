@@ -7,3 +7,10 @@ build
 slurm*
 logs
 .vscode
+.hypothesis/
+## AzureML Runtime - Ignore the following log directories START
+azureml-logs
+logs/azureml
+system_logs
+user_logs
+## AzureML Runtime - Ignore the following log directories END

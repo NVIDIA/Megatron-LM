@@ -95,10 +95,6 @@ DATA_PATH=(
     0.058959318157550435 $BIN_IDX_PATH/en_reasoning_peS2o_split_09_text_document_dc\=1719879_sc\=1719879_tc\=12256869612
     0.02912687817920471 $BIN_IDX_PATH/en_reasoning_peS2o_split_10_text_document_dc\=850041_sc\=850041_tc\=6055096280
 )
-# DATA_PATH=(
-#     --data-path 
-#     0.02320759714533172 $BIN_IDX_PATH/en_books_books_split_00_text_document_dc\=102105_sc\=102105_tc\=14473665967
-# )
 
 # torchrun ${\DISTRIBUTED_ARGS[@]}\ pretrain_gpt.py\ \
 python pretrain_gpt.py \
