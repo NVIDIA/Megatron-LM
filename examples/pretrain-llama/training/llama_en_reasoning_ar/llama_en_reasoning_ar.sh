@@ -49,7 +49,6 @@ TRAINING_ARGS=(
     --micro-batch-size 1 
     --global-batch-size 1024
     --train-iters 160_000
-    --lr 0.000001 
     --lr-decay-style cosine 
     --weight-decay 0.1 
     --adam-beta1 0.9 
