@@ -1,10 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import numpy as np
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-
 from megatron.core.parallel_state import get_tensor_and_expert_parallel_group
 from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_data_parallel_rng_tracker_name
 from megatron.core.transformer.module import MegatronModule

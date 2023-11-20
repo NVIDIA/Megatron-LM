@@ -16,7 +16,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from .base_moe_layer import BaseMoELayer
 
 
-
 class ScaleGradient(torch.autograd.Function):
     @staticmethod
     @torch.cuda.amp.custom_fwd
@@ -31,6 +30,7 @@ class ScaleGradient(torch.autograd.Function):
 
 
 scale_gradient = ScaleGradient.apply
+
 
 class GroupedMLP(BaseMoELayer):
     """

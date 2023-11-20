@@ -78,7 +78,7 @@ class TestParallelGroupedMLP:
         assert num_weights_smm == num_weights_gmm
         # expected num weights: router linear weights+bias + MLP weights(no bias) of all experts
         expected_num_weights = \
-            self.hidden_size * self.num_experts + self.num_experts + \
+            self.hidden_size * self.num_experts + \
             self.hidden_size * (self.fc1_ffn_hidden_size + self.fc2_ffn_hidden_size) * self.num_experts
         assert num_weights_smm == expected_num_weights
 
