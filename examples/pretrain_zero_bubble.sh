@@ -9,11 +9,13 @@ DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-DATASET_1="<PATH TO THE FIRST DATASET>"
-DATASET_2="<PATH TO THE SECOND DATASET>"
-DATASET_3="<PATH TO THE THIRD DATASET>"
-DATASET="0.2 ${DATASET_1} 0.3 ${DATASET_2} 0.5 ${DATASET_3}"
-DATASET="/dataset/c4_text_document"
+DATASET="/tmp/zb_sample_dataset/dataset/c4_text_document"
+
+if [ ! -e "$DATASET"".idx" ]; then
+  wget https://huggingface.co/datasets/ufotalent/zero_bubble_sample_dataset/resolve/main/zb_sample_dataset.tar.gz
+  tar -xvf zb_sample_dataset.tar.gz -C /tmp
+fi
+
 # Running locally
 if [ -z "$WORLD_SIZE" ]; then
   export WORLD_SIZE=1
@@ -81,7 +83,7 @@ options=" \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
-  --tokenizer-model /tokenizers/tokenizer.model \
+  --tokenizer-model /tmp/zb_sample_dataset/tokenizers/tokenizer.model \
   --split 98,2,0 \
   --clip-grad 8.0 \
   --weight-decay 0.1 \

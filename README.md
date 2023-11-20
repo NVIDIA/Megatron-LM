@@ -2,8 +2,9 @@ This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM
 
 # Zero Bubble Pipeline Parallelism
 
-Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero.
+Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero while preserving synchronous semantics.
 
+Our paper is coming soon.
 
 **Quick settings to enable Zero Bubble:**
 ```
@@ -11,8 +12,11 @@ Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able 
   --allow-padding-num-layers
   --enable-optimizer-post-validation
 ```
+Can also try out with
+`ZERO_BUBBLE_V_SCHEDULE=1 examples/pretrain_zero_bubble.sh`
 
 **Acceleration**
+
 Experiments shows zero bubble pipeline parallelism can accelerate training up to 30% with a similar memory comsumption. A detailed table of experiments is coming soon.
 
 **Notices**
@@ -38,7 +42,7 @@ The key of achieving zero bubble is to breaking a backward pass into a $B$ pass 
 
 |                                                       | 1F1B    | ZB1P     | ZB2P | ZBV (Recommended) |
 | ----------------------------------------------------- | ------- | -------- | ---- | --- |
-| Bubble Rate                                           | $p-1/m$ | $p-1/3m$ | 0    | 0   |
+| Bubble Rate                                           | $(p-1)/m$ | $(p-1)/3m$ | 0    | 0   |
 | Activation Memory <br> (Compared to 1F1B)             | 1x       | 1x        | 2x    | 1x   |
 | Pipeline Communication Volume <br> (Compared to 1F1B) | 1x       | 1x        | 1x    | 2x   |
 
