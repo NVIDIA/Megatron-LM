@@ -25,6 +25,7 @@ Experiments shows zero bubble pipeline parallelism can accelerate training up to
 
 ## Zero Bubble Schedules
 The key of achieving zero bubble is to breaking a backward pass into a $B$ pass and $W$ pass. $B$ on one stage will only depend on the $B$ on its next stage, compared to depending on both $B$ and $W$ of in 1F1B.
+
 ![image](https://hackmd.io/_uploads/Bkc7CL7N6.png)
 
 ### Comparision of Schedules
