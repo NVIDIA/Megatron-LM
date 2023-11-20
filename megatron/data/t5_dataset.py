@@ -22,6 +22,7 @@ class T5Dataset(torch.utils.data.Dataset):
 
         # Params to store.
         self.name = name
+        self.desc = name
         self.seed = seed
         self.masked_lm_prob = masked_lm_prob
         self.max_seq_length = max_seq_length

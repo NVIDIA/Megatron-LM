@@ -123,6 +123,10 @@ class TransformerConfig(ModelParallelConfig):
         fp8_wgrad (bool): When set to False, override FP8 config options and do the wgrad computation in higher precision.
                           Defaults to True.
 
+        # Miscellaneous
+        clone_scatter_output_in_embedding (bool): When set to true, clone the output of scatter_to_sequence_parallel_region
+                                                  in embedding layer to facilitate garbage collection of input.
+
         # Experimental
         normalization (str): Swtich b/w `LayerNorm` and `RMSNorm` as normalization layers. For now, these are primarily
                              used by Transformer-Engine's layers like `LayerNormLinear`. Default value is `LayerNorm`.
@@ -181,6 +185,9 @@ class TransformerConfig(ModelParallelConfig):
     fp8_amax_history_len: int = 1
     fp8_amax_compute_algo: str = "most_recent"
     fp8_wgrad: bool = True
+
+    # miscellaneous
+    clone_scatter_output_in_embedding: bool = True
 
     # experimental section (TODO: move to apt. section above once stable)
     normalization: bool = "LayerNorm"  # alt value supported by TE: "RMSNorm"

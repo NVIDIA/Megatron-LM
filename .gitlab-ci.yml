@@ -25,6 +25,7 @@ unit_tests:
     - pip install pytest-cov
     - pip install pytest_mock
     - pip install nltk
+    - pip install wrapt
     - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
@@ -511,7 +512,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     METADATA: "te_4experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
 
-train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
+train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
@@ -704,6 +705,117 @@ train.retro_core.tp1_pp1_1node_50steps:
     MAX_STEPS: 50
     TIME_LIMIT: "20:00"
     TEST_LEVEL: NIGHTLY_TESTS
+
+train.t5_core.220m_tp1_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_tp2_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp1_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp2_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp2_pp1_sp_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
+resume.checkpoint.t5_core.220m_tp1_pp1_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+resume.checkpoint.t5_core.220m_te_tp1_pp1_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 cleanup.selene:
   tags:

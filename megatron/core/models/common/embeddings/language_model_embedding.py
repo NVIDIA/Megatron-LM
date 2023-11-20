@@ -119,6 +119,11 @@ class LanguageModelEmbedding(MegatronModule):
         # Dropout.
         if self.config.sequence_parallel:
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # `scatter_to_sequence_parallel_region` returns a view, which prevents
+            # the original tensor from being garbage collected. Clone to facilitate GC.
+            # Has a small runtime cost (~0.5%).
+            if self.config.clone_scatter_output_in_embedding:
+                embeddings = embeddings.clone()
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:

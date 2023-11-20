@@ -82,7 +82,14 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
-    def forward(self, query: Tensor, key: Tensor, value: Tensor, attention_mask: Tensor):
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Tensor,
+        attn_mask_type: AttnMaskType = None,
+    ):
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
@@ -92,6 +99,8 @@ class DotProductAttention(MegatronModule):
         # This is a noop for normal attention where ng == np. When using group query attention this
         # creates a view that has the keys and values virtually repeated along their dimension to
         # match the number of queries.
+
+        # attn_mask_type is not used.
         if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
             key = key.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2

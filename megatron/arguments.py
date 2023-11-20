@@ -84,8 +84,8 @@ def validate_args(args, defaults={}):
         args.pipeline_model_parallel_size, args.context_parallel_size)
     args.data_parallel_size = args.world_size // (model_parallel_size * args.context_parallel_size)
     if args.rank == 0:
-        print('using world size: {}, data-parallel-size: {}, '
-              'context-parallel-size: {} '
+        print('using world size: {}, data-parallel size: {}, '
+              'context-parallel size: {} '
               'tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {} '.format(
                   args.world_size, args.data_parallel_size,
@@ -166,6 +166,10 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
+
+    if args.overlap_param_gather:
+        assert args.use_distributed_optimizer, \
+            '--overlap-param-gather only supported with distributed optimizer'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -390,6 +394,10 @@ def validate_args(args, defaults={}):
         assert args.num_experts is not None, "num_experts must be non None to use expert model parallelism"
         assert args.num_experts % args.expert_model_parallel_size == 0, \
             "Number of experts should be a multiple of expert model parallel_size."
+        assert not args.use_distributed_optimizer, \
+            "Expert parallelism is not suppored with distributed optimizer."
+        assert not args.fp16, \
+            "Expert parallelism is not supported with fp16 training."
         if args.tensor_model_parallel_size > 1:
             assert args.sequence_parallel, \
                 "When using expert parallelism and tensor parallelism, sequence parallelism must be used."
@@ -805,6 +813,9 @@ def _add_training_args(parser):
                        'uniformly divided recompute unit, '
                        '2) block: the number of individual Transformer layers '
                        'to recompute within each pipeline stage.')
+    group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
+                       help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
+                       dest='clone_scatter_output_in_embedding')
     group.add_argument('--profile', action='store_true',
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline. An example '
@@ -813,9 +824,9 @@ def _add_training_args(parser):
                        '--capture-range=cudaProfilerApi '
                        '--capture-range-end=stop`.')
     group.add_argument('--profile-step-start', type=int, default=10,
-                       help='Gloable step to start profiling.')
+                       help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
-                       help='Gloable step to stop profiling.')
+                       help='Global step to stop profiling.')
     group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
                        help='Global ranks to profile.')
     group.add_argument('--tp-comm-overlap', action='store_true', help = 'Enables the '
@@ -903,8 +914,6 @@ def _add_training_args(parser):
                        dest='gradient_accumulation_fusion')
     group.add_argument('--use-mcore-models', action='store_true',
                        help='Use the implementation from megatron core')
-    group.add_argument('--expert-parallel', action='store_true',
-                       help='Enable expert parallel optimization.')
     group.add_argument('--manual-gc', action='store_true',
                        help='Disable the threshold-based default garbage '
                        'collector and trigger the garbage collection manually. '
@@ -1093,8 +1102,12 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-grad-reduce', action='store_true',
                        default=False, help='If set, overlap DDP grad reduce.')
     group.add_argument('--no-delay-grad-reduce', action='store_false',
-                       help='If not set, delay grad reduction in all but first PP stage.',
+                       help='If not set, delay / synchronize grad reductions in all but first PP stage.',
                        dest='delay_grad_reduce')
+    group.add_argument('--overlap-param-gather', action='store_true',
+                       default=False, help='If set, overlap param all-gather in distributed optimizer.')
+    group.add_argument('--delay-param-gather', action='store_true',
+                       default=False, help='If set, delay / synchronize param all-gathers in all but first PP stage.')
     group.add_argument('--no-scatter-gather-tensors-in-pipeline', action='store_false',
                        help='If not set, use scatter/gather to optimize communication of tensors in pipeline.',
                        dest='scatter_gather_tensors_in_pipeline')

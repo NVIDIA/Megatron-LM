@@ -88,6 +88,7 @@ class DistributedDataParallel(MegatronModule):
 
         # Allocate the grad buffers and map the grads.
         # The grad buffer under the hood creates buckets as appropriate based on bucket_size.
+        self.data_parallel_world_size = torch.distributed.get_world_size(group=data_parallel_group)
         for dtype, params in grad_dtype_to_params.items():
             self.grad_buffers[dtype] = GradBuffer(
                 dtype,
@@ -102,9 +103,10 @@ class DistributedDataParallel(MegatronModule):
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
 
-        # Allocate discreate buffer for MoE params' grads
+        # Allocate separate buffer for MoE params' grads.
         for param in self.module.parameters():
             if param.requires_grad and not getattr(param, 'allreduce', True):
+                param.grad_added_to_main_grad = False
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
                 param.main_grad = torch.zeros(
                     param.data.shape,
@@ -191,16 +193,21 @@ class DistributedDataParallel(MegatronModule):
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.finish_grad_sync()
 
-    def zero_grad_buffer(self):
+        for expert_grad in self.expert_grads:
+            expert_grad /= self.data_parallel_world_size
+
+    def zero_grad_buffer(self, zero_buffer):
         """
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
+
+        When zero_buffer is set to True, the underlying grad buffer is zeroed out.
         """
         for param in self.module.parameters():
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         for grad_buffer in self.grad_buffers.values():
-            grad_buffer.reset()
+            grad_buffer.reset(zero_buffer)
         for expert_grad in self.expert_grads:
             expert_grad.zero_()
 
