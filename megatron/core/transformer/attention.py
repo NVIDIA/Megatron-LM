@@ -5,7 +5,13 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
-from apex.transformer.functional import fused_apply_rotary_pos_emb
+try:
+    from apex.transformer.functional import fused_apply_rotary_pos_emb
+
+    HAVE_APPLY_ROPE_FUSION = True
+except:
+    HAVE_APPLY_ROPE_FUSION = False
+
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
@@ -236,10 +242,7 @@ class Attention(MegatronModule, ABC):
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            # use bias_activation_fusion to control the knob here
-            # just for debug
-            # the if-else block is not needed in normal PR
-            if self.config.bias_activation_fusion:
+            if self.config.apply_rope_fusion and HAVE_ROPE_FUSION:
                 query = fused_apply_rotary_pos_emb(query, q_pos_emb)
                 key = fused_apply_rotary_pos_emb(key, k_pos_emb)
             else:

@@ -62,6 +62,8 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
+        self.activation_func = self.config.activation_func
+
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,

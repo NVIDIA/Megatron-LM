@@ -166,6 +166,7 @@ class TransformerConfig(ModelParallelConfig):
     masked_softmax_fusion: bool = False
     persist_layer_norm: bool = False
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
+    apply_rope_fusion: bool = False
 
     # activation recomputation
     recompute_granularity: str = None
