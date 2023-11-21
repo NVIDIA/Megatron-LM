@@ -768,8 +768,10 @@ class ParallelAttention(MegatronModule):
             assert batch_end <= inference_key_memory.size(1)
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
+            #print("SEQUENCE END: ", sequence_end, " key mem: ", inference_key_memory.size())
+            # I have no understanding of what is happening here -- makes no sense at all to me why this is growing?
             assert sequence_end <= inference_key_memory.size(0)
-            # Copy key and values.
+            ## Copy key and values.
             inference_key_memory[sequence_start:sequence_end,
                                  batch_start:batch_end, ...] = key_layer
             inference_value_memory[sequence_start:sequence_end,
