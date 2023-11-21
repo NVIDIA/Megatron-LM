@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
+
 try:
     from apex.transformer.functional import fused_apply_rotary_pos_emb
 
