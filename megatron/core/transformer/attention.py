@@ -252,8 +252,8 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
             if self.config.apply_rope_fusion and HAVE_APPLY_ROPE_FUSION:
-                query = fused_apply_rotary_pos_emb(query, q_pos_emb)
-                key = fused_apply_rotary_pos_emb(key, k_pos_emb)
+                query = fused_apply_rotary_pos_emb(query, q_pos_emb, transpose_output_memory=True)
+                key = fused_apply_rotary_pos_emb(key, k_pos_emb, transpose_output_memory=True)
             else:
                 query = apply_rotary_pos_emb(query, q_pos_emb)
                 key = apply_rotary_pos_emb(key, k_pos_emb)
