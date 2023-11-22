@@ -40,15 +40,15 @@ outputs:
   data_cache:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning/cache/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning_re/cache/
   checkpoint_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning_re/
   tensorboard_dir:
     type: uri_folder
     mode: rw_mount
-    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning/tensorboard/
+    path: azureml://subscriptions/c7209a17-0d9f-41df-8e45-e0172343698d/resourcegroups/llm-test/workspaces/Provisioning-Test/datastores/llama_pretraining/paths/experiments/llama_en_reasoning_re/tensorboard/
 
 services:
   my_jupyterlab:
@@ -57,12 +57,12 @@ services:
     type: tensor_board
     log_dir: ${{outputs.tensorboard_dir}}
 
-compute: azureml:NCAI-A100-LLMv3
+compute: azureml:A100-SSH
 
 distribution:
   type: pytorch
   process_count_per_instance: 8
 
 resources:
-  instance_count: 32
+  instance_count: 16
   shm_size: 1250g
