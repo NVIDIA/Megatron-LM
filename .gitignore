@@ -14,3 +14,4 @@ logs/azureml
 system_logs
 user_logs
 ## AzureML Runtime - Ignore the following log directories END
+.DS_Store
