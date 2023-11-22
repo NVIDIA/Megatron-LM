@@ -32,12 +32,12 @@ LOGISTICS_ARGS=(
     --load $PRETRAINED_LLAMA_MODEL_PATH 
     --tokenizer-model $TOKENIZER_MODEL
     --split 9998,1,1 
-    --log-interval 100
-    --save-interval 750 
-    --eval-interval 1000
-    --eval-iters 50
+    --log-interval 10
+    --save-interval 500 
+    --eval-interval 500
+    --eval-iters 10
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
-    --tensorboard-log-interval 100
+    --tensorboard-log-interval 10
     --data-cache-path $DATA_CACHE
     --log-validation-ppl-to-tensorboard 
 )
@@ -49,15 +49,15 @@ TRAINING_ARGS=(
     --micro-batch-size 1 
     --global-batch-size 1024
     --train-iters 160_000
-    --lr-decay-style cosine 
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
     --init-method-std 0.006 
     --clip-grad 1.0 
-    --lr 1.0e-6 
-    --min-lr 1.0e-6
-    --lr-warmup-iters 10000
+    --lr 1.0e-5
+    --min-lr 1.0e-5
+    --lr-warmup-iters 1000
+    --lr-decay-style cosine 
     --use-flash-attn
     --bf16
 )
