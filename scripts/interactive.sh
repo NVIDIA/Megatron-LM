@@ -41,7 +41,7 @@ unset NCCL_DEBUG
 
 ######## data blend. ########
 
-. /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/megatrons/retro-mcore-test/scripts/843m/lawrence_blend_oci_soft.sh /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/data/843m/english-custom
+. /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/megatrons/instructretro-test/scripts/retro_custom_blend.sh
 
 ######## args. ########
 

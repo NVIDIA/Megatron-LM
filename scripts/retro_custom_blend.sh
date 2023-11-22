@@ -2,20 +2,8 @@
 
 set -u
 
-if [ "$#" = 0 ]; then
-    ENG_DATA_HOME="/lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/data/843m/english"
-elif [ "$#" = 1 ]; then
-    ENG_DATA_HOME=$1
-else
-    echo "specialize for $# args."
-    exitt 1
-fi
-
-
-#english datasets
-# ENG_DATA_HOME="/lustre/fsw/adlr/adlr-nlp/mpatwary/data/multilingual/multi-1.1t-gtc/english"
-# ENG_DATA_HOME="/lustre/fsw/adlr/adlr-nlp/lmcafee/retro/data"
-# ENG_DATA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/retro/data/english"
+# english datasets
+ENG_DATA_HOME="/lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/data/843m/english-custom"
 B3="${ENG_DATA_HOME}/MTNLG/Books3_shuf_text_document"
 OWT2="${ENG_DATA_HOME}/MTNLG/OpenWebText2_shuf_text_document"
 SE="${ENG_DATA_HOME}/MTNLG/StackExchange_shuf_text_document"
