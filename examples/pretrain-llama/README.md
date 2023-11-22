@@ -30,7 +30,7 @@ Once we are done with creating binary and index files, then we embed some simple
 python examples/pretrain-llama/data-processing/count_token_and_rename_bin_idx.py --source_prefix_path "../DUMPED/*" 
 ```
 
-Here `--source_prefix_path` is the folder where bin and index files are. 
+Here `--source_prefix_path` is the folder where bin and index files are. This will add  `_dc={document_count}_sc={sentence_count}_tc={token_count}` with the file name. 
 
 ## Calculate probability of the shards.
 
