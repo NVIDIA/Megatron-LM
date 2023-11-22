@@ -87,7 +87,7 @@ class ChunkDataset(torch.utils.data.Dataset):
 
 
 def core_retro_dataset_config_from_args(args, retro_args):
-    config = RetroDatasetConfig(
+    return RetroDatasetConfig(
         is_built_on_rank=is_dataset_built_on_rank,
         random_seed=retro_args.retro_gpt_seed,
         sequence_length=retro_args.retro_gpt_seq_length,
@@ -98,16 +98,8 @@ def core_retro_dataset_config_from_args(args, retro_args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         return_document_ids=retro_args.retro_return_doc_ids,
-        # >>>
         split_preprocessing=retro_args.retro_gpt_split,
-        # split_preprocessing=args.retro_split_preprocessing if args.retro_split_preprocessing is not None else retro_args.retro_gpt_split,
-        # <<<
     )
-    # >>>
-    # from lutil import pax
-    # pax("config")
-    # <<<
-    return config
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):

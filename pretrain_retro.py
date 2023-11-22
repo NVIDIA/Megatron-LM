@@ -158,10 +158,6 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-# >>>
-# def train_valid_test_datasets_provider(train_val_test_num_samples):
-#     """Build train, valid, and test datasets."""
-#     return get_retro_datasets()
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
@@ -169,7 +165,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         return get_retro_datasets()
     else:
         return gpt_train_valid_test_datasets_provider(train_val_test_num_samples)
-# <<<
 
 
 if __name__ == "__main__":
@@ -181,8 +176,4 @@ if __name__ == "__main__":
              model_provider,
              ModelType.retro_decoder,
              forward_step,
-             # >>>
-             # args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
-             #                'retro_add_retriever': True})
              args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
-             # <<<

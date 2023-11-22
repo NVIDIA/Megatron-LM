@@ -78,12 +78,6 @@ class RetroDataset(GPTDataset):
         config: RetroDatasetConfig,
     ) -> None:
         super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
-        # >>>
-        # from lutil import pax
-        # pax({
-        #     "path_prefix" : self.indexed_dataset.path_prefix,
-        # })
-        # <<<
 
     def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Abstract method implementation

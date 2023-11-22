@@ -117,18 +117,7 @@ class GPTDataset(MegatronDataset):
             Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
         """
         # Do the shuffle mapping
-        # >>>
-        try:
-            idx = self.shuffle_index[idx]
-        except Exception as e:
-            from lutil import pax
-            pax({
-                "path_prefix" : self.indexed_dataset.path_prefix,
-                "sample_index" : str(self.sample_index.shape),
-                "shuffle_index" : str(self.shuffle_index.shape),
-                "idx" : idx,
-            })
-        # <<<
+        idx = self.shuffle_index[idx]
 
         # Get the beginning and end documents and offsets
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
@@ -228,7 +217,7 @@ class GPTDataset(MegatronDataset):
             )
 
             # >>>
-            raise Exception("hi.")
+            raise Exception("rebuild?")
             # <<<
 
             sequence_length = getattr(self.config, "sequence_length")

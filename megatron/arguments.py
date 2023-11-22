@@ -376,10 +376,6 @@ def validate_args(args, defaults={}):
                 args.retro_num_retrieved_chunks * \
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
-        # >>>
-        # from lutil import pax
-        # pax("retro_args")
-        # <<<
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
