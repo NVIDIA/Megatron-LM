@@ -41,7 +41,10 @@ class TENorm:
 
     # TODO should we ditch normalization config and just use spec to choose LayerNorm vs RMSNorm?
     def __new__(
-        cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5,
+        cls,
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
     ):
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
@@ -353,6 +356,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: float = None,
+        qkv_format: str = 'sbhd',
     ):
         self.config = config
         self.te_forward_mask_type = False
@@ -385,6 +389,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         if te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
+
+        if te_version > packaging.version.Version("0.12.0"):
+            extra_kwargs["qkv_format"] = qkv_format
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
         if te_version >= packaging.version.Version("1.0.0"):

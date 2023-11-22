@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Union
+from importlib.metadata import version
+from pkg_resources import packaging
 
 import torch
 
@@ -78,12 +80,22 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        self.qkv_format = 'sbhd'
+        te_version = packaging.version.Version(version("transformer-engine"))
+        # need Kirthi to confirm the version when bshd is supported
+        if (
+            te_version >= packaging.version.Version("0.12.0")
+            and self.config.apply_rope_fusion
+            and HAVE_APPLY_ROPE_FUSION
+        ):
+            self.qkv_format = 'bshd'
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
+            qkv_format=self.qkv_format,
         )
 
         self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
@@ -246,7 +258,6 @@ class Attention(MegatronModule, ABC):
         key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
             inference_params, key, value, rotary_pos_emb
         )
-
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
@@ -255,6 +266,10 @@ class Attention(MegatronModule, ABC):
             if self.config.apply_rope_fusion and HAVE_APPLY_ROPE_FUSION:
                 query = fused_apply_rotary_pos_emb(query, q_pos_emb, transpose_output_memory=True)
                 key = fused_apply_rotary_pos_emb(key, k_pos_emb, transpose_output_memory=True)
+                if self.qkv_format == 'bshd':
+                    query, key, value = [
+                        x.transpose(0, 1).contiguous() for x in (query, key, value)
+                    ]
             else:
                 query = apply_rotary_pos_emb(query, q_pos_emb)
                 key = apply_rotary_pos_emb(key, k_pos_emb)
@@ -282,6 +297,8 @@ class Attention(MegatronModule, ABC):
 
         output, bias = self.linear_proj(core_attn_out)
 
+        if self.qkv_format == 'bshd':
+            output = output.transpose(0, 1)
         return output, bias
 
 
