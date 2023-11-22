@@ -780,6 +780,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Evaluation
         if args.eval_interval and iteration % args.eval_interval == 0 and \
            args.do_valid:
+            timers('interval-time').stop()
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -791,6 +792,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Checkpointing
         saved_checkpoint = False
@@ -805,9 +807,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.save and args.save_interval and \
            iteration % args.save_interval == 0:
+            timers('interval-time').stop()
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler)
             saved_checkpoint = True
+            timers('interval-time', log_level=0).start(barrier=True)
 
         # Exiting based on duration
         if args.exit_duration_in_mins:
@@ -867,6 +871,9 @@ def evaluate(forward_step_func,
              verbose=False):
     """Evaluation."""
     args = get_args()
+    timers = get_timers()
+
+    timers('evaluate', log_level=0).start(barrier=True)
 
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         compute_feature_bank(model)
@@ -941,9 +948,6 @@ def evaluate(forward_step_func,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True)
-        
-        
-
 
     # Move model back to the train mode.
     for model_module in model:
@@ -951,6 +955,9 @@ def evaluate(forward_step_func,
 
     for key in total_loss_dict:
         total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+
+    timers('evaluate').stop()
+    timers.log(['evaluate'])
 
     return total_loss_dict, collected_non_loss_data, False
 
