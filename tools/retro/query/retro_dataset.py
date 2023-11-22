@@ -110,13 +110,6 @@ def get_retro_datasets():
     # DB dataset.
     db_dataset = get_db_dataset()
 
-    # >>>
-    # from lutil import pax
-    # pax("db_dataset", {
-    #     "indexed_datasets" : db_dataset.indexed_datasets,
-    # })
-    # <<<
-
     # Retro datasets.
     chunk_ds_info_map = get_chunk_dataset_map()
     retro_dataset_map = {}

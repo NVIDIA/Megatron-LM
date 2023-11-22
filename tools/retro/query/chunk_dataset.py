@@ -98,11 +98,14 @@ def core_retro_dataset_config_from_args(args, retro_args):
         split=args.split,
         path_to_cache=args.data_cache_path,
         return_document_ids=retro_args.retro_return_doc_ids,
+        # >>>
         split_preprocessing=retro_args.retro_gpt_split,
+        # split_preprocessing=args.retro_split_preprocessing if args.retro_split_preprocessing is not None else retro_args.retro_gpt_split,
+        # <<<
     )
     # >>>
     # from lutil import pax
-    # pax({"blend": config.blend[1:None:2]})
+    # pax("config")
     # <<<
     return config
 

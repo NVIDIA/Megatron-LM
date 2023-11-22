@@ -365,7 +365,8 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size == 1, \
             "retro currently does not support pipeline parallelism."
 
-        # Load retro args.
+    # Load retro args (used by both Retro & GPT).
+    if args.retro_workdir:
         retro_args_path = get_retro_args_path(args.retro_workdir)
         assert os.path.exists(retro_args_path), "retro workdir missing args.json"
         with open(retro_args_path) as f:
@@ -375,6 +376,10 @@ def validate_args(args, defaults={}):
                 args.retro_num_retrieved_chunks * \
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
+        # >>>
+        # from lutil import pax
+        # pax("retro_args")
+        # <<<
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -566,6 +571,11 @@ def _add_retro_args(parser):
                        dest="retro_verify_neighbor_count",
                        help="Skip verifying that len(GPT dataset) == len(saved "
                        "neighbors).")
+    # group.add_argument("--retro-split-preprocessing",
+    #                    help="Comma-separated list of proportions for training, "
+    #                    "validation, and test split, used during Retro "
+    #                    "preprocessing. The intersection of this value and "
+    #                    "'--split' is used to compute document ranges.")
     # <<<
 
     # Enforce argument naming convention.
