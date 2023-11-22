@@ -17,7 +17,10 @@ from megatron.core.datasets.utils import Split, log_single_rank
 logger = logging.getLogger(__name__)
 
 
-@dataclass(kw_only=True)
+# >>>
+# @dataclass(kw_only=True)
+@dataclass
+# <<<
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core blended and megatron GPT datasets
     """
@@ -114,7 +117,18 @@ class GPTDataset(MegatronDataset):
             Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
         """
         # Do the shuffle mapping
-        idx = self.shuffle_index[idx]
+        # >>>
+        try:
+            idx = self.shuffle_index[idx]
+        except Exception as e:
+            from lutil import pax
+            pax({
+                "path_prefix" : self.indexed_dataset.path_prefix,
+                "sample_index" : str(self.sample_index.shape),
+                "shuffle_index" : str(self.shuffle_index.shape),
+                "idx" : idx,
+            })
+        # <<<
 
         # Get the beginning and end documents and offsets
         doc_index_beg, doc_index_beg_offset = self.sample_index[idx]
@@ -213,17 +227,21 @@ class GPTDataset(MegatronDataset):
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
 
+            # >>>
+            raise Exception("hi.")
+            # <<<
+
             sequence_length = getattr(self.config, "sequence_length")
 
             if num_epochs == 1:
                 separate_final_epoch = False
                 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                # ......... hacky: needs +1 samples .........
-                # Handle case of using less than total available tokens.
-                from megatron import get_args
-                args = get_args()
-                if args.retro_fix_sub_epoch:
-                    num_tokens_per_epoch = type(num_tokens_per_epoch)(self.num_samples * sequence_length)
+                # # ......... hacky: needs +1 samples .........
+                # # Handle case of using less than total available tokens.
+                # from megatron import get_args
+                # args = get_args()
+                # if args.retro_fix_sub_epoch:
+                #     num_tokens_per_epoch = type(num_tokens_per_epoch)(self.num_samples * sequence_length)
                 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
             else:
                 # Get the number of samples for the last epoch

@@ -6,10 +6,10 @@ from typing import Literal, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.language_module.language_module import LanguageModule
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.transformer.enums import AttnMaskType, ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -32,6 +32,7 @@ class GPTModel(LanguageModule):
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and output logit weights are shared. Defaults to False.
         position_embedding_type (Literal[learned_absolute,rope], optional):  Position embedding type.. Defaults to 'learned_absolute'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional): Base period for rotary position embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 10000.
         seq_len_interpolation_factor (Optional[float], optional): scale of linearly interpolating RoPE for longer sequences. The value must be a float larger than 1.0. Defaults to None.
     """
 
@@ -48,11 +49,11 @@ class GPTModel(LanguageModule):
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
         rotary_percent: float = 1.0,
+        rotary_base: int = 10000,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
 
-        self.config: TransformerConfig = config
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
@@ -77,14 +78,16 @@ class GPTModel(LanguageModule):
 
         if self.position_embedding_type == 'rope':
             self.rotary_pos_emb = RotaryEmbedding(
-                self.config.kv_channels, rotary_percent, seq_len_interpolation_factor
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
             )
 
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            transformer_layer_spec=self.transformer_layer_spec,
-            self_attn_mask_type=AttnMaskType.causal,
+            spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
@@ -106,6 +109,22 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
             self.initialize_last_stage_with_word_embeddings()
 
+    def set_input_tensor(self, input_tensor: Tensor) -> None:
+        """Sets input tensor to the model.
+
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model.
+        """
+        # This is usually handled in schedules.py but some inference code still
+        # gives us non-lists or None
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor[0])
+
     def forward(
         self,
         input_ids: Tensor,
@@ -113,7 +132,8 @@ class GPTModel(LanguageModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params=None,
+        inference_params: InferenceParams = None,
+        extra_block_kwargs: dict = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -148,6 +168,7 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            **(extra_block_kwargs or {}),
         )
 
         if not self.post_process:
@@ -166,18 +187,6 @@ class GPTModel(LanguageModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
-
-    def shared_embedding_or_output_weight(self) -> Tensor:
-        """Function to share the input embeddings and output logit weights.
-
-        Returns:
-            Tensor: During pre processing it returns the input embeddings weight while during post processing it returns the final output layers weight
-        """
-        if self.pre_process:
-            return self.embedding.word_embeddings.weight
-        elif self.post_process:
-            return self.output_layer.weight
-        return None
 
     def sharded_state_dict(self, prefix: str = '') -> dict:
         sharded_state_dict = {}

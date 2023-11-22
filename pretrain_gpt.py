@@ -26,7 +26,7 @@ from megatron.utils import (
 )
 from megatron.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import (
-    gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_spec,
     gpt_layer_with_transformer_engine_spec_moe
 )
 
@@ -49,11 +49,11 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     config = core_transformer_config_from_args(get_args())
 
     if args.use_mcore_models:
-        if args.model_spec is not None:
-            transformer_layer_spec = import_module(args.model_spec)
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
         else:
             if args.num_experts is None:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
             else:
                 transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
 

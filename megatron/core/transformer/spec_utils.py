@@ -1,3 +1,5 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
 import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union
@@ -93,6 +95,15 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
     if hasattr(spec_or_module, "submodules") and spec_or_module.submodules is not None:
         kwargs["submodules"] = spec_or_module.submodules
 
-    return module(
-        *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
-    )
+    try:
+        return module(
+            *args, **spec_or_module.params if hasattr(spec_or_module, "params") else {}, **kwargs
+        )
+    except Exception as e:
+        # improve the error message since we hide the module name in the line above
+        import sys
+
+        tb = sys.exc_info()[2]
+        raise type(e)(f"{str(e)} when instantiating {module.__name__}").with_traceback(
+            sys.exc_info()[2]
+        )

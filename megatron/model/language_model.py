@@ -178,6 +178,7 @@ class Embedding(MegatronModule):
 
         self.fp32_residual_connection = args.fp32_residual_connection
         self.sequence_parallel = args.sequence_parallel
+        self.clone_scatter_output_in_embedding = args.clone_scatter_output_in_embedding
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
@@ -234,6 +235,11 @@ class Embedding(MegatronModule):
         # Dropout.
         if self.sequence_parallel:
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            # `scatter_to_sequence_parallel_region` returns a view, which prevents
+            # the original tensor from being garbage collected. Clone to facilitate GC.
+            # Has a small runtime cost (~0.5%).
+            if self.clone_scatter_output_in_embedding:
+                embeddings = embeddings.clone()
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
         else:

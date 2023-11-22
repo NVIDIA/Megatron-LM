@@ -25,6 +25,7 @@ unit_tests:
     - pip install pytest-cov
     - pip install pytest_mock
     - pip install nltk
+    - pip install wrapt
     - pip install zarr "tensorstore==0.1.45"  # for distributed checkpointing tests
     - torchrun --nproc_per_node=8 -m pytest --cov-report=term --cov-report=html --cov=megatron/core tests/unit_tests
   coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
@@ -59,11 +60,13 @@ formatting:
     - ${run_cmd}
     - echo "Completed the job"
   rules:
-    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT
+    - if: $TEST_LEVEL =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TESTS_TO_RUN_ON_THIS_COMMIT || $CI_JOB_NAME =~ $TEST_REGEX_ON_THIS_COMMIT 
       when: always
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -85,6 +88,8 @@ formatting:
     - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGING'
       when: always
     - if: $CI_MERGE_REQUEST_APPROVED && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED
+      when: always
+    - if: '$CI_MERGE_REQUEST_LABELS == "READY FOR REVIEW" && $TEST_LEVEL =~ $TESTS_TO_RUN_AFTER_MERGE_REQ_APPROVED'
       when: always
   allow_failure: false
   retry: 2
@@ -507,7 +512,7 @@ train.te_core_moe_gpt3.345m_tp2_pp2_4experts2parallel_1node_50steps:
     METADATA: "te_4experts2parallel"
     ADDITIONAL_PARAMS: "--sequence-parallel --num-experts 4 --expert-model-parallel-size 2"
 
-train.te_core_moe_gpt3.345m_tp2_pp1_4experts2parallel_1node_50steps:
+train.te_core_moe_gpt3.345m_tp2_pp1_8experts2parallel_1node_50steps:
   <<: *selene-test-launcher
   variables:
     <<: [*VARS]
@@ -594,6 +599,89 @@ train.bert.345m_tp1_pp4_interleaved_1node_50steps:
     MAX_STEPS: 50
     TEST_LEVEL: MR_TESTS
 
+train.bert_core.345m_tp4_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 4
+    PP_SIZE: 1
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+
+train.bert_core.345m_tp2_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 2
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: MR_TESTS
+
+train.bert_core.345m_tp1_pp2_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+
+train.bert_core.345m_tp1_pp4_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 4
+    VP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+
+train.bert_core.345m_tp1_pp2_1node_50steps_rope:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: rope_embeddings
+    ADDITIONAL_PARAMS: "--position-embedding-type rope"
+
+train.bert_core.345m_tp1_pp2_1node_50steps_sequence_parallel:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: bert
+    TP_SIZE: 1
+    PP_SIZE: 2
+    NUM_NODES: 1
+    USE_CORE: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: L0
+    METADATA: sequence_parallel
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
 resume.checkpoint.bert.345m_tp1_pp2_1node:
   <<: *selene-test-resume-checkpoint-launcher
   variables:
@@ -603,6 +691,131 @@ resume.checkpoint.bert.345m_tp1_pp2_1node:
     PP_SIZE: 2
     NUM_NODES: 1
     TEST_LEVEL: MR_TESTS
+
+train.retro_core.tp1_pp1_1node_50steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: retro
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 50
+    TIME_LIMIT: "20:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+
+train.t5_core.220m_tp1_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_tp2_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp1_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: NIGHTLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp2_pp1_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+train.t5_core.220m_te_tp2_pp1_sp_1node_100steps:
+  <<: *selene-test-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 2
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    MAX_STEPS: 100
+    TIME_LIMIT: 30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+    ADDITIONAL_PARAMS: "--sequence-parallel"
+
+resume.checkpoint.t5_core.220m_tp1_pp1_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 0
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
+
+resume.checkpoint.t5_core.220m_te_tp1_pp1_1node:
+  <<: *selene-test-resume-checkpoint-launcher
+  variables:
+    <<: [*VARS]
+    RUN_MODEL: t5
+    USE_TE: 1
+    USE_CORE: 1
+    TP_SIZE: 1
+    PP_SIZE: 1
+    VP_SIZE: 1
+    NUM_NODES: 1
+    TIME_LIMIT: "30:00"
+    TEST_LEVEL: MONTHLY_TESTS
+    PYTORCH_IMAGE: nvcr.io/nvidia/pytorch:23.07-py3
 
 cleanup.selene:
   tags:

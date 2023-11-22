@@ -15,10 +15,6 @@ done
 echo "---------------------------------"
 
 export BUILD_DIR=`pwd` #Path to megatron-lm repo
-if [[ $USE_CORE -eq 1 && $USE_TE -eq 1 ]]; then
-    echo "Cannot run megatron core and transformer engine together"
-    exit 1
-fi
 
 # step 2 : SETTING RUN NAME
 if [[ -n $VP_SIZE ]]; then INTERLEAVED_STR="_interleaved"; else INTERLEAVED_STR=""; fi
@@ -49,6 +45,7 @@ export OPENBLAS_NUM_THREADS=2
 
 # step 5 : CREATING A COPY OF THE SBATCH SCRIPT THAT WILL BE RUN FOR DEBUGGING
 envsubst '$BASE_DIR $PYTORCH_IMAGE $BUILD_DIR $DATA_DIR $MBS $GBS $ADDITIONAL_PARAMS $USE_TE $TP_SIZE $PP_SIZE $VP_SIZE $NUM_NODES $MAX_STEPS $USE_CORE' <$BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh > $SELENE_ADLR_CI_PATH/$CI_PIPELINE_ID/$RUN_NAME/debug/sbatch_${RUN_MODEL}_distributed_test.sh
+
 
 # step 6 : SUBMITTING THE JOB
 sbatch_submission=`sbatch -t $TIME_LIMIT $BUILD_DIR/tests/functional_tests/test_scripts/$RUN_MODEL/sbatch_${RUN_MODEL}_distributed_test.sh --export=BASE_DIR,BUILD_DIR,DATA_DIR,USE_TE,TP_SIZE,PP_SIZE,VP_SIZE,NUM_NODES,MAX_STEPS,MBS,GBS,PYTORCH_IMAGE,ADDITIONAL_PARAMS`

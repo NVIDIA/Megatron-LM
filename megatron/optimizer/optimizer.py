@@ -184,14 +184,6 @@ class MegatronOptimizer(ABC):
         pass
 
 
-    def gather_model_params(self, args, timers):
-        """
-        For the case of a non-distributed-optimizer, there is nothing to
-        do here.
-        """
-        pass
-
-
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
     """Base class for both the float-16 and the distributed optimizer.

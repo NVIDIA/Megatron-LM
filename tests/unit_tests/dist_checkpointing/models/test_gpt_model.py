@@ -14,7 +14,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import \
-    gpt_layer_with_transformer_engine_spec, gpt_layer_local_spec
+    get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 
 
 def initialize_gpt_model(seed, use_te=True, **config_kwargs):
@@ -26,7 +26,7 @@ def initialize_gpt_model(seed, use_te=True, **config_kwargs):
     transformer_config = TransformerConfig(**default_config_kwargs)
     pre_process = ps.is_pipeline_first_stage()
     post_process = ps.is_pipeline_last_stage()
-    layer_spec = gpt_layer_with_transformer_engine_spec if use_te else gpt_layer_local_spec
+    layer_spec = get_gpt_layer_with_transformer_engine_spec() if use_te else get_gpt_layer_local_spec()
     model = GPTModel(config=transformer_config, transformer_layer_spec=layer_spec, vocab_size=128, max_sequence_length=4,
                      pre_process=pre_process, post_process=post_process)
 

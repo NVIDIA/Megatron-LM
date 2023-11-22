@@ -40,7 +40,7 @@ class TestSpecCustomization:
             params={"attn_mask_type": AttnMaskType.causal},
             submodules=SelfAttentionSubmodules(
                 linear_qkv=TELayerNormColumnParallelLinear,
-                dot_product_attention=TEDotProductAttention,
+                core_attention=TEDotProductAttention,
                 linear_proj=TERowParallelLinear
             ),
         )
@@ -89,7 +89,7 @@ class TestSpecCustomization:
 
         # Check SelfAttention
         self_attention = build_module(
-            self.attention_spec, config=self.config, spec=self.attention_spec,
+            self.attention_spec, config=self.config, layer_number=1,
         )
         assert isinstance(self_attention, SelfAttention)
         assert self_attention.layer_number == 1
@@ -119,10 +119,6 @@ class TestSpecCustomization:
             config=self.config,
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
-            persist_layer_norm=self.config.persist_layer_norm,
-            sequence_parallel=self.config.sequence_parallel,
-            zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
-            normalization=self.config.normalization,
         )
         assert isinstance(layernorm, te.pytorch.LayerNorm)
 

@@ -18,7 +18,10 @@ from megatron.core.datasets.utils import Split, log_single_rank
 logger = logging.getLogger(__name__)
 
 
-@dataclass(kw_only=True)
+# >>>
+# @dataclass(kw_only=True)
+@dataclass
+# <<<
 class RetroDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core blended and megatron Retro datasets
 
@@ -30,9 +33,9 @@ class RetroDatasetConfig(GPTDatasetConfig):
         pattern convention as 'split'. Not to be used with 'blend_per_split'.
     """
 
-    return_document_ids: bool
+    return_document_ids: bool = None
 
-    split_preprocessing: str
+    split_preprocessing: str = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -75,6 +78,12 @@ class RetroDataset(GPTDataset):
         config: RetroDatasetConfig,
     ) -> None:
         super().__init__(indexed_dataset, indexed_indices, num_samples, index_split, config)
+        # >>>
+        # from lutil import pax
+        # pax({
+        #     "path_prefix" : self.indexed_dataset.path_prefix,
+        # })
+        # <<<
 
     def __getitem__(self, idx: int) -> Dict[str, numpy.ndarray]:
         """Abstract method implementation
@@ -86,10 +95,12 @@ class RetroDataset(GPTDataset):
             Dict[str, numpy.ndarray]: The text ids and (optionally) the document ids wrapped in a
             dictionary
         """
-        from megatron import get_args
-        args = get_args()
-        if args.retro_fix_sub_epoch:
-            idx = idx % len(self)
+        # >>>
+        # from megatron import get_args
+        # args = get_args()
+        # if args.retro_fix_sub_epoch:
+        #     idx = idx % len(self)
+        # <<<
         text, document_ids = self._query_document_sample_shuffle_indices(idx)
         if getattr(self.config, "return_document_ids"):
             return {"text": text, "document_ids": document_ids}

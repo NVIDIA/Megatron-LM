@@ -273,8 +273,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Disallow training and inference with Transformer Engine
     # for non-GPT models
     args.allow_transformer_engine = all([type(m) == GPTModel for m in model])
-    assert args.allow_transformer_engine or args.transformer_impl == 'local', \
-        'Transformer Engine is only approved for GPT models'
+    # assert args.allow_transformer_engine or args.transformer_impl == 'local', \
+    #     'Transformer Engine is only approved for GPT models'
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -415,8 +415,11 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     # Set grad to zero.
-    for partition in model:
-        partition.zero_grad_buffer()
+    for model_chunk in model:
+        # If using distributed optimizer, don't zero buffer here; zeroing of buffer is
+        # handled automatically by the optimizer after all-gathers finish.
+        # Otherwise, zero the buffer.
+        model_chunk.zero_grad_buffer(zero_buffer=(not args.use_distributed_optimizer))
     optimizer.zero_grad()
 
     # Forward pass.
@@ -444,10 +447,6 @@ def train_step(forward_step_func, data_iterator,
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
-
-    # Gather params.
-    if update_successful:
-        optimizer.gather_model_params(args, timers)
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -720,6 +719,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
+    if args.overlap_param_gather and args.delay_param_gather:
+        config.param_sync_func = [lambda x: optimizer.finish_param_sync(model_index, x)
+                                  for model_index in range(len(model))]
+        if len(model) == 1:
+            config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
     timers('interval-time', log_level=0).start(barrier=True)

@@ -23,7 +23,7 @@ from .utils import make_sharded_tensors_for_checkpoint
 @dataclass
 class SelfAttentionSubmodules:
     linear_qkv: Union[ModuleSpec, type] = None
-    dot_product_attention: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -46,15 +46,16 @@ class Attention(MegatronModule, ABC):
         self,
         config: TransformerConfig,
         submodules: Union[SelfAttentionSubmodules, CrossAttentionSubmodules],
-        layer_number: int = 1,
-        attn_mask_type=AttnMaskType.padding,
-        **kwargs,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
     ):
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
+        self.attention_type = attention_type
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -69,14 +70,15 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
-        self.dot_product_attention = build_module(
-            submodules.dot_product_attention,
+        self.core_attention = build_module(
+            submodules.core_attention,
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
+            attention_type=self.attention_type,
         )
 
-        self.checkpoint_dot_product_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
 
         # Output.
         self.linear_proj = build_module(
@@ -86,11 +88,14 @@ class Attention(MegatronModule, ABC):
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
+            input_is_parallel=True,
             skip_bias_add=True,
+            is_expert=False,
+            tp_comm_buffer_name='proj',
         )
 
     def _checkpointed_attention_forward(
-        self, query, key, value, attention_mask, rotary_pos_emb=None
+        self, query, key, value, attention_mask, rotary_pos_emb=None, attn_mask_type=None
     ):
         """Forward method with selective activation checkpointing."""
 
@@ -99,11 +104,18 @@ class Attention(MegatronModule, ABC):
             key = inputs[1]
             value = inputs[2]
             attention_mask = inputs[3]
-            output_ = self.dot_product_attention(query, key, value, attention_mask)
+            attn_mask_type = inputs[5]
+            attn_mask_type = AttnMaskType(attn_mask_type.item())
+            output_ = self.core_attention(
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+            )
             return output_
 
+        if attn_mask_type is None:
+            attn_mask_type = self.attn_mask_type
+        attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
         hidden_states = tensor_parallel.checkpoint(
-            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb
+            custom_forward, False, query, key, value, attention_mask, rotary_pos_emb, attn_mask_type
         )
 
         return hidden_states
@@ -129,8 +141,9 @@ class Attention(MegatronModule, ABC):
         Returns a tuple: (key, value, rotary_pos_emb)
 
         """
+        attn_mask_type = self.attn_mask_type
         if inference_params is None:
-            return key, value, rotary_pos_emb
+            return key, value, rotary_pos_emb, attn_mask_type
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
@@ -155,6 +168,7 @@ class Attention(MegatronModule, ABC):
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number
             ]
+            attn_mask_type = AttnMaskType.no_mask
 
         batch_start = inference_params.batch_size_offset
         batch_end = batch_start + key.size(1)
@@ -188,7 +202,7 @@ class Attention(MegatronModule, ABC):
             k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
             rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
-        return key, value, rotary_pos_emb
+        return key, value, rotary_pos_emb, attn_mask_type
 
     @abstractmethod
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
@@ -221,7 +235,7 @@ class Attention(MegatronModule, ABC):
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
-        key, value, rotary_pos_emb = self._adjust_key_value_for_inference(
+        key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
             inference_params, key, value, rotary_pos_emb
         )
 
@@ -241,22 +255,14 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
-        # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        # This is a noop for normal attention where ng == np. When using group query attention this
-        # creates a view that has the keys and values virtually repeated along their dimension to
-        # match the number of queries.
-        if (self.num_attention_heads_per_partition // self.num_query_groups_per_partition) > 1:
-            key = key.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
+        if self.checkpoint_core_attention:
+            core_attn_out = self._checkpointed_attention_forward(
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type
             )
-            value = value.repeat_interleave(
-                self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
-            )
-
-        if self.checkpoint_dot_product_attention:
-            core_attn_out = self._checkpointed_attention_forward(query, key, value, attention_mask)
         else:
-            core_attn_out = self.dot_product_attention(query, key, value, attention_mask)
+            core_attn_out = self.core_attention(
+                query, key, value, attention_mask, attn_mask_type=attn_mask_type
+            )
 
         # =================
         # Output. [sq, b, h]
@@ -278,16 +284,15 @@ class SelfAttention(Attention):
         self,
         config: TransformerConfig,
         submodules: SelfAttentionSubmodules,
-        layer_number: int = 1,
+        layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
+            attention_type="self",
         )
 
         self.linear_qkv = build_module(
@@ -296,8 +301,11 @@ class SelfAttention(Attention):
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='qkv',
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
@@ -363,16 +371,15 @@ class CrossAttention(Attention):
         self,
         config: TransformerConfig,
         submodules: CrossAttentionSubmodules,
-        layer_number: int = 1,
+        layer_number: int,
         attn_mask_type=AttnMaskType.padding,
-        **kwargs,
     ):
         super().__init__(
             config=config,
             submodules=submodules,
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
-            **kwargs,
+            attention_type="cross",
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -387,8 +394,10 @@ class CrossAttention(Attention):
             self.query_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
         )
 
         self.linear_kv = build_module(
@@ -397,8 +406,10 @@ class CrossAttention(Attention):
             2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
+            gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
+            is_expert=False,
         )
 
     def get_query_key_value_tensors(self, hidden_states, key_value_states):

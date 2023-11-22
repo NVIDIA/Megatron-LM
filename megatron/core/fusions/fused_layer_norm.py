@@ -4,9 +4,11 @@ import importlib
 import numbers
 
 import torch
+from torch import Tensor
 from torch.nn import init
 from torch.nn.parameter import Parameter
 
+from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
 try:
@@ -25,22 +27,46 @@ except:
 
 
 class FusedLayerNorm(torch.nn.Module):
+
+    """Layer Norm, fused into a single CUDA kernel.
+
+    Arguments:
+      hidden_size (int): Transformer hidden dimension.
+
+      eps (float): Epsilon added to denominator, for numerical stability.
+
+      persist_layer_norm (bool): Use persistent fused layer norm kernel.
+      This kernel supports only a set of hidden sizes. Please
+      check persist_ln_hidden_sizes if your hidden size is supported.
+
+      sequence parallel (bool): Apply sequence parallelism optimization.
+
+      zero_centered_gamma (bool): Adjust LayerNorm weights such that they are
+      centered around zero. This improves numerical stability.
+
+      config (TransformerConfig): Transformer config. Include to match custom
+      layer norm interfaces.
+
+      normalization (str): Normalization type, used for Transformer Engine.
+      Must equal 'LayerNorm' here.
+    """
+
     def __init__(
         self,
-        hidden_size,
-        eps=1e-5,
-        persist_layer_norm=True,
-        sequence_parallel=False,
-        zero_centered_gamma=False,
-        normalization="LayerNorm",
+        config: TransformerConfig,
+        hidden_size: int,
+        eps: float = 1e-5,
+        persist_layer_norm: bool = True,
+        sequence_parallel: bool = False,
+        zero_centered_gamma: bool = False,
+        normalization: str = "LayerNorm",  # included to match TE interface
     ):
         super().__init__()
 
-        self.zero_centered_gamma = zero_centered_gamma
-        self.normalization = normalization
-        assert normalization == "LayerNorm", '({}) is not supported in ' 'FusedLayerNorm'.format(
-            normalization
-        )
+        self.zero_centered_gamma = config.layernorm_zero_centered_gamma
+        assert (
+            config.normalization == "LayerNorm"
+        ), f'({config.normalization}) is not supported in FusedLayerNorm'
 
         # List of hiddens sizes supported in the persistent layer norm kernel
         # If the hidden size is not supported, fall back to the non-persistent
@@ -71,6 +97,7 @@ class FusedLayerNorm(torch.nn.Module):
             49152,
             65536,
         ]
+        persist_layer_norm = config.persist_layer_norm
         if hidden_size not in persist_ln_hidden_sizes or not HAVE_PERSIST_LAYER_NORM:
             persist_layer_norm = False
 
@@ -86,7 +113,7 @@ class FusedLayerNorm(torch.nn.Module):
         self.bias = Parameter(torch.Tensor(*hidden_size))
         self.reset_parameters()
         self.persist_layer_norm = persist_layer_norm
-        self.sequence_parallel = sequence_parallel
+        self.sequence_parallel = config.sequence_parallel
 
         # set sequence parallelism flag on weight and bias parameters
         setattr(self.weight, 'sequence_parallel', self.sequence_parallel)
@@ -101,7 +128,7 @@ class FusedLayerNorm(torch.nn.Module):
             init.ones_(self.weight)
             init.zeros_(self.bias)
 
-    def forward(self, input):
+    def forward(self, input: Tensor) -> Tensor:
 
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 
