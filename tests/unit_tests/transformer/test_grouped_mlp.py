@@ -49,7 +49,7 @@ class TestParallelGroupedMLP:
         self.switch_mlp_smm = SwitchMLP(tf_config,
             gpt_layer_with_transformer_engine_spec_moe.submodules.mlp.submodules)
 
-        self.args = parse_args(extra_args_provider=None, ignore_unknown_args=False)
+        self.args = parse_args(ignore_unknown_args=True)
         self.args.bf16=True
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
