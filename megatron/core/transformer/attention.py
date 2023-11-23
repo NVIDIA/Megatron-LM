@@ -291,14 +291,15 @@ class Attention(MegatronModule, ABC):
                 query, key, value, attention_mask, attn_mask_type=attn_mask_type
             )
 
+        if self.qkv_format == 'bshd':
+            core_attn_out = core_attn_out.transpose(0, 1)
+
         # =================
         # Output. [sq, b, h]
         # =================
 
         output, bias = self.linear_proj(core_attn_out)
 
-        if self.qkv_format == 'bshd':
-            output = output.transpose(0, 1)
         return output, bias
 
 
