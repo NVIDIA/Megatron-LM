@@ -255,7 +255,7 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
-        if self.checkpoint_core_attention:
+        if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query, key, value, attention_mask, attn_mask_type=attn_mask_type
             )
