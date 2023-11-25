@@ -4,7 +4,7 @@ AZ_OUTPUT_FOLDER="https://allamllmuksstandard.blob.core.windows.net/vocab-expand
 AZ_SUBS="c7209a17-0d9f-41df-8e45-e0172343698d"
 AZ_RESOURCE_GROUP="LLM-Test"
 AZ_WORKSPACE="Provisioning-Test"
-NUM_TOKEN=96636764160
+NUM_TOKEN=43486543872
 
 python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
 --az-subscription "$AZ_SUBS" \
@@ -32,7 +32,7 @@ python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
 --az-subscription "$AZ_SUBS" \
 --az-resource-group "$AZ_RESOURCE_GROUP" \
 --az-workspace-name "$AZ_WORKSPACE" \
---az-blob-input-folder "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o" \
+--az-blob-input-folder "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o/arabic_text_only" \
 --az-blob-output-folder-path "$AZ_OUTPUT_FOLDER" \
 --az-sas-token "$SAS_TOKEN" \
 --sample-yaml-job-file "$AZJOB_FILE" \
