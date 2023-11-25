@@ -10,7 +10,7 @@ display_name: tokenize
 
 experiment_name: tokenize
 code: ../../
-environment: azureml:Megatron-LLaMA:4
+environment: azureml:Megatron-LLaMA:7
 environment_variables:
   HYDRA_FULL_ERROR: '1'
   UCX_IB_PCI_RELAXED_ORDERING: 'auto'
