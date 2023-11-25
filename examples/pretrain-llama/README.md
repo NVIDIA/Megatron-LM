@@ -1,14 +1,18 @@
 # Continue Pretrain LLaMa
 
+## Convert the checkpoint
+
+At first convert the checkpoint from huggingface to Megatron format with propoer model parallel. Check out the script in `pretrain-llama/checkpointing/convert_checkpoint.sh`. 
+
 ## Sharded data re-naming
 
-Just a simple script to renaming your `jsonl`` shards.
+Just a simple script to renaming your `jsonl` shards.
 
 ```
-python examples/pretrain-llama/data-processing/clean.py
+python pretrain-llama/data-processing/clean.py
 ```
 
-"Please add a domain or sub-domain name to each of the file names, if it's not already included in the shard names. At this stage, you may need to edit the code based on your requirements. This is just an example of the code. This step is important because later on based on domain (not subdomain) we will sample the data. So make sure you plan the shard (`*.jsonl`) file names are correct. Currently we are following the following naming structure. 
+Please add a `domain` and/or `sub-domain` name to each file name, unless it is already included in the shard names. At this stage, you may need to edit the code to fit your requirements. Note that this is only an example of the code. This step is crucial because later on, we will sample the data based on the domain (not `subdomain`). Therefore, ensure that the shard (`*.jsonl`) file names are correctly planned. Currently, we are following this naming structure.
 
 ```
 {language}_{domain}_{subdomain}_split_{split_id}_text_document_dc={document_count}_sc={sentence_count}_tc={token_count}"
@@ -17,17 +21,17 @@ python examples/pretrain-llama/data-processing/clean.py
 ## Data Processing
 
 ```
-bash examples/pretrain-llama/data-processing/process_data.sh
+bash pretrain-llama/data-processing/tokenize/process_data.sh
 ```
 
-The `process_data.sh`` script will run a multi-processor job runner. The objective of this script is to tokenize each dataset as a separate process. Each separate process can utilize multiple CPUs to process that shard of data. Please check the arguments of the 'examples/pretrain-llama/data-processing/multiprocess_runner.py' to become familiar with the options.
+The `process_data.sh` script will run a multi-processor job runner. The objective of this script is to tokenize each dataset as a separate process. Each separate process can utilize multiple CPUs to process that shard of data. Please check the arguments of the `pretrain-llama/data-processing/tokenize/multiprocess_runner.py` to become familiar with the options.
 
 ## `*.bin`, `*.idx` data naming
 
 Once we are done with creating binary and index files, then we embed some simple metadata with the file names.
 
 ```
-python examples/pretrain-llama/data-processing/count_token_and_rename_bin_idx.py --source_prefix_path "../DUMPED/*" 
+python pretrain-llama/data-processing/count_token_and_rename_bin_idx.py --source_prefix_path "../DUMPED/*" 
 ```
 
 Here `--source_prefix_path` is the folder where bin and index files are. This will add  `_dc={document_count}_sc={sentence_count}_tc={token_count}` with the file name. 
@@ -37,14 +41,14 @@ Here `--source_prefix_path` is the folder where bin and index files are. This wi
 Once you have the file names, please create a data signature (a list of name prefixes of the shards) from the names of the `*.bin`/`*.idx` files and save it as a JSON file for future use. Here is an example of two data signatures.
 
 ```
-cat examples/pretrain-llama/data-signatures/allam_data_2-1_splits-llama2-indexed_data.json
-cat examples/pretrain-llama/data-signatures/allam_data_2-1_splits-llama2-VE-indexed_data.json
+cat pretrain-llama/data-signatures/allam_data_2-1_splits-llama2-indexed_data.json
+cat pretrain-llama/data-signatures/allam_data_2-1_splits-llama2-VE-indexed_data.json
 ```
 
-Then, create a training folder (e.g., examples/pretrain-llama/training/llama_en_ar_v1). All the contents of the training folder should be sufficient to reproduce the experiments. Here are the files in the training folder.
+Then, create a training folder (e.g., `pretrain-llama/training/llama_en_ar_v1`). All the contents of the training folder should be sufficient to reproduce the experiments. Here are the files in the training folder.
 
 1. `DockerFile`: For Environment. 
-2. `data_ratio.json`: The format of the data_ration file would be either of the following, 
+2. `data_ratio.json`: The format would be either of the following, 
 
 ```
 {
@@ -76,23 +80,34 @@ or
 ```
 Each of the keys are a domain name. Based on different domain you can set your sampling ratio. The valued of the dictionary keys defines relative sampling rate of that domain. It should be in between, `1 to x`.
 
-3. Data signature file : Your data signature file. Check the example in `examples/pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/en_reasoning_and_arabic_files.json`
+3. Data signature file : Your data signature file. Check the example in `pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/en_reasoning_and_arabic_files.json`
 
-4. Exclude iterator: List of iterator you want to remove from the training. Check the example in `examples/pretrain-llama/training/llama_en_ar_v1/exclude_iterator.json`
+4. Exclude iterator: List of iterator you want to remove from the training. Check the example in `pretrain-llama/training/llama_en_ar_v1/exclude_iterator.json`
 
-5. Language selection probability: Check out the language selection probability. Check the example in `examples/pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/lang_prob.json`
-
-6. Bash script: A bash script to run the experiment. Check the example in `examples/pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/llama_en_reasoning_ar_lr_hyp_tune.sh`
-
-7. Bash script: A bash script to run the experiment. Check the example in `examples/pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/llama_en_reasoning_ar_lr_hyp_tune.sh`
-
-8. Azure job file: An azure job file. Check the example in `examples/pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/llama_en_reasoning_ar_lr_hyp_tune.yaml`
+5. Language selection probability: Check out the language selection probability. Check the example in `pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/lang_prob.json`
 
 Once we have all the files, we can create the iterator probability. To calculate iterator selection probability check, 
 
 
 ```
-python examples/pretrain-llama/data-processing/data_ratio_from_file.py --help
+python pretrain-llama/data-processing/data_ratio_from_file.py --help
 ```
 
+## Training
 
+## Bash script
+
+We run our pretraining job from a bash script. 
+
+Notably, you souldn't use `torchrun` while running your code in azure. `azureml` handles that. Just run your code in python.
+For pretraining you may have to copy-paste the iterator selection probability from the [Calculate probability of the shards.](#calculate-probability-of-the-shards).
+
+Check the example in `pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/llama_en_reasoning_ar_lr_hyp_tune.sh`
+
+
+
+## Azure job file
+
+Check the example in `pretrain-llama/training/llama_en_reasoning_ar_lr_hyp_tune/llama_en_reasoning_ar_lr_hyp_tune.yaml`.  `azureml` job file launch the experiment with the appropiate `input` and `output`.
+
+TODO: tensorboard still doesn't work.
