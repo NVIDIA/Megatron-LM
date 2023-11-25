@@ -71,15 +71,17 @@ def write_jobs(args, groups, script_path):
             command += f" \\\n\"{shard}\""
         # print(command)
         if args.dry_run:
-            print(f"RUN {size}: {command}")
+            # print(f"RUN {size}: {command}")
+            pass
         else:
-            print(json.dumps(data, indent=4))
             data['command'] = command
             az_yaml_file = os.path.join(output_folder, 'output.yaml')
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
             cmd = f"az ml job create --subscription {args.az_subscription} --resource-group {args.az_resource_group} --workspace-name {args.az_workspace_name} --file {az_yaml_file}"
             subprocess.check_output(cmd, shell=True)
+    for idx, (size, _) in enumerate(groups):
+        print(f"[{args.prefix_name}][{idx}] {size/1000000000}GB")
 
 
 if __name__ == "__main__":

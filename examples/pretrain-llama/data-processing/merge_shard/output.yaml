@@ -3,564 +3,452 @@ code: ../../../../
 command: 'bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_shard.sh
   \
 
-  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_books_corpus_formatted"
+  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o"
   \
 
   "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
   \
 
-  "sp=racwdli&st=2023-11-25T01:04:32Z&se=2023-11-25T09:04:32Z&spr=https&sv=2022-11-02&sr=c&sig=htlh%2B5OEmWy0ikTxgrAJny0F7g3PdgXxYFIQwsEHYh0%3D"
+  "sp=racwdli&st=2023-11-25T09:13:18Z&se=2024-04-30T17:13:18Z&spr=https&sv=2022-11-02&sr=c&sig=dcTe10UuDRh1g3Wh1bcYRenmV%2FUqvq%2BKJ7Ufmiw5WfA%3D"
   \
 
-  "ar_translated_books3_000.jsonl" \
+  "ar_translated_peS20_003.jsonl" \
 
-  "books_en2ar_splits_aaaa.jsonl" \
+  "arabic_text_only/peS2o-00779-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaab.jsonl" \
+  "arabic_text_only/peS2o-00780-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaac.jsonl" \
+  "arabic_text_only/peS2o-00781-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaad.jsonl" \
+  "arabic_text_only/peS2o-00782-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaae.jsonl" \
+  "arabic_text_only/peS2o-00783-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaf.jsonl" \
+  "arabic_text_only/peS2o-00784-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaag.jsonl" \
+  "arabic_text_only/peS2o-00785-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaah.jsonl" \
+  "arabic_text_only/peS2o-00786-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaai.jsonl" \
+  "arabic_text_only/peS2o-00787-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaj.jsonl" \
+  "arabic_text_only/peS2o-00788-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaak.jsonl" \
+  "arabic_text_only/peS2o-00789-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaal.jsonl" \
+  "arabic_text_only/peS2o-00790-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaam.jsonl" \
+  "arabic_text_only/peS2o-00791-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaan.jsonl" \
+  "arabic_text_only/peS2o-00792-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaao.jsonl" \
+  "arabic_text_only/peS2o-00793-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaap.jsonl" \
+  "arabic_text_only/peS2o-00794-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaq.jsonl" \
+  "arabic_text_only/peS2o-00795-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaar.jsonl" \
+  "arabic_text_only/peS2o-00796-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaas.jsonl" \
+  "arabic_text_only/peS2o-00797-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaat.jsonl" \
+  "arabic_text_only/peS2o-00798-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaau.jsonl" \
+  "arabic_text_only/peS2o-00799-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaav.jsonl" \
+  "arabic_text_only/peS2o-00800-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaw.jsonl" \
+  "arabic_text_only/peS2o-00801-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaax.jsonl" \
+  "arabic_text_only/peS2o-00802-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaay.jsonl" \
+  "arabic_text_only/peS2o-00803-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaz.jsonl" \
+  "arabic_text_only/peS2o-00804-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaba.jsonl" \
+  "arabic_text_only/peS2o-00805-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabb.jsonl" \
+  "arabic_text_only/peS2o-00806-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabc.jsonl" \
+  "arabic_text_only/peS2o-00807-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabd.jsonl" \
+  "arabic_text_only/peS2o-00808-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabe.jsonl" \
+  "arabic_text_only/peS2o-00809-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabf.jsonl" \
+  "arabic_text_only/peS2o-00810-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabg.jsonl" \
+  "arabic_text_only/peS2o-00811-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabh.jsonl" \
+  "arabic_text_only/peS2o-00812-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabi.jsonl" \
+  "arabic_text_only/peS2o-00813-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabj.jsonl" \
+  "arabic_text_only/peS2o-00814-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabk.jsonl" \
+  "arabic_text_only/peS2o-00815-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabl.jsonl" \
+  "arabic_text_only/peS2o-00816-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabm.jsonl" \
+  "arabic_text_only/peS2o-00817-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabn.jsonl" \
+  "arabic_text_only/peS2o-00818-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabo.jsonl" \
+  "arabic_text_only/peS2o-00819-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabp.jsonl" \
+  "arabic_text_only/peS2o-00820-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabq.jsonl" \
+  "arabic_text_only/peS2o-00821-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabr.jsonl" \
+  "arabic_text_only/peS2o-00822-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabs.jsonl" \
+  "arabic_text_only/peS2o-00823-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabt.jsonl" \
+  "arabic_text_only/peS2o-00824-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabu.jsonl" \
+  "arabic_text_only/peS2o-00825-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabv.jsonl" \
+  "arabic_text_only/peS2o-00826-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabw.jsonl" \
+  "arabic_text_only/peS2o-00827-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabx.jsonl" \
+  "arabic_text_only/peS2o-00828-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaby.jsonl" \
+  "arabic_text_only/peS2o-00829-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabz.jsonl" \
+  "arabic_text_only/peS2o-00830-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaca.jsonl" \
+  "arabic_text_only/peS2o-00831-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacb.jsonl" \
+  "arabic_text_only/peS2o-00832-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacc.jsonl" \
+  "arabic_text_only/peS2o-00833-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacd.jsonl" \
+  "arabic_text_only/peS2o-00834-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aace.jsonl" \
+  "arabic_text_only/peS2o-00835-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacf.jsonl" \
+  "arabic_text_only/peS2o-00836-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacg.jsonl" \
+  "arabic_text_only/peS2o-00837-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aach.jsonl" \
+  "arabic_text_only/peS2o-00838-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaci.jsonl" \
+  "arabic_text_only/peS2o-00839-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacj.jsonl" \
+  "arabic_text_only/peS2o-00840-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aack.jsonl" \
+  "arabic_text_only/peS2o-00841-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacl.jsonl" \
+  "arabic_text_only/peS2o-00842-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacm.jsonl" \
+  "arabic_text_only/peS2o-00843-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacn.jsonl" \
+  "arabic_text_only/peS2o-00844-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaco.jsonl" \
+  "arabic_text_only/peS2o-00845-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacp.jsonl" \
+  "arabic_text_only/peS2o-00846-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacq.jsonl" \
+  "arabic_text_only/peS2o-00847-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacr.jsonl" \
+  "arabic_text_only/peS2o-00848-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacs.jsonl" \
+  "arabic_text_only/peS2o-00849-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aact.jsonl" \
+  "arabic_text_only/peS2o-00850-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacu.jsonl" \
+  "arabic_text_only/peS2o-00851-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacv.jsonl" \
+  "arabic_text_only/peS2o-00852-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacw.jsonl" \
+  "arabic_text_only/peS2o-00853-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacx.jsonl" \
+  "arabic_text_only/peS2o-00854-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacy.jsonl" \
+  "arabic_text_only/peS2o-00855-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacz.jsonl" \
+  "arabic_text_only/peS2o-00856-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aada.jsonl" \
+  "arabic_text_only/peS2o-00857-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadb.jsonl" \
+  "arabic_text_only/peS2o-00858-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadc.jsonl" \
+  "arabic_text_only/peS2o-00859-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadd.jsonl" \
+  "arabic_text_only/peS2o-00860-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aade.jsonl" \
+  "arabic_text_only/peS2o-00861-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadf.jsonl" \
+  "arabic_text_only/peS2o-00862-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadg.jsonl" \
+  "arabic_text_only/peS2o-00863-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadh.jsonl" \
+  "arabic_text_only/peS2o-00864-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadi.jsonl" \
+  "arabic_text_only/peS2o-00865-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadj.jsonl" \
+  "arabic_text_only/peS2o-00866-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadk.jsonl" \
+  "arabic_text_only/peS2o-00867-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadl.jsonl" \
+  "arabic_text_only/peS2o-00868-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadm.jsonl" \
+  "arabic_text_only/peS2o-00869-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadn.jsonl" \
+  "arabic_text_only/peS2o-00870-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aado.jsonl" \
+  "arabic_text_only/peS2o-00871-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadp.jsonl" \
+  "arabic_text_only/peS2o-00872-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadq.jsonl" \
+  "arabic_text_only/peS2o-00873-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadr.jsonl" \
+  "arabic_text_only/peS2o-00874-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aads.jsonl" \
+  "arabic_text_only/peS2o-00875-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadt.jsonl" \
+  "arabic_text_only/peS2o-00876-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadu.jsonl" \
+  "arabic_text_only/peS2o-00877-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadv.jsonl" \
+  "arabic_text_only/peS2o-00878-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadw.jsonl" \
+  "arabic_text_only/peS2o-00879-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadx.jsonl" \
+  "arabic_text_only/peS2o-00880-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aady.jsonl" \
+  "arabic_text_only/peS2o-00881-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aadz.jsonl" \
+  "arabic_text_only/peS2o-00882-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaea.jsonl" \
+  "arabic_text_only/peS2o-00883-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeb.jsonl" \
+  "arabic_text_only/peS2o-00884-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaec.jsonl" \
+  "arabic_text_only/peS2o-00885-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaed.jsonl" \
+  "arabic_text_only/peS2o-00886-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaee.jsonl" \
+  "arabic_text_only/peS2o-00887-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaef.jsonl" \
+  "arabic_text_only/peS2o-00888-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeg.jsonl" \
+  "arabic_text_only/peS2o-00889-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeh.jsonl" \
+  "arabic_text_only/peS2o-00890-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaei.jsonl" \
+  "arabic_text_only/peS2o-00891-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaej.jsonl" \
+  "arabic_text_only/peS2o-00892-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaek.jsonl" \
+  "arabic_text_only/peS2o-00893-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aael.jsonl" \
+  "arabic_text_only/peS2o-00894-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaem.jsonl" \
+  "arabic_text_only/peS2o-00895-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaen.jsonl" \
+  "arabic_text_only/peS2o-00896-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeo.jsonl" \
+  "arabic_text_only/peS2o-00897-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaep.jsonl" \
+  "arabic_text_only/peS2o-00898-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeq.jsonl" \
+  "arabic_text_only/peS2o-00899-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaer.jsonl" \
+  "arabic_text_only/peS2o-00900-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaes.jsonl" \
+  "arabic_text_only/peS2o-00901-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaet.jsonl" \
+  "arabic_text_only/peS2o-00902-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaeu.jsonl" \
+  "arabic_text_only/peS2o-00903-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaev.jsonl" \
+  "arabic_text_only/peS2o-00904-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaew.jsonl" \
+  "arabic_text_only/peS2o-00905-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaex.jsonl" \
+  "arabic_text_only/peS2o-00906-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaey.jsonl" \
+  "arabic_text_only/peS2o-00907-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaez.jsonl" \
+  "arabic_text_only/peS2o-00908-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafa.jsonl" \
+  "arabic_text_only/peS2o-00909-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafb.jsonl" \
+  "arabic_text_only/peS2o-00910-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafc.jsonl" \
+  "arabic_text_only/peS2o-00911-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafd.jsonl" \
+  "arabic_text_only/peS2o-00912-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafe.jsonl" \
+  "arabic_text_only/peS2o-00913-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaff.jsonl" \
+  "arabic_text_only/peS2o-00914-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafg.jsonl" \
+  "arabic_text_only/peS2o-00915-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafh.jsonl" \
+  "arabic_text_only/peS2o-00916-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafi.jsonl" \
+  "arabic_text_only/peS2o-00917-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafj.jsonl" \
+  "arabic_text_only/peS2o-00918-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafk.jsonl" \
+  "arabic_text_only/peS2o-00919-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafl.jsonl" \
+  "arabic_text_only/peS2o-00920-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafm.jsonl" \
+  "arabic_text_only/peS2o-00921-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafn.jsonl" \
+  "arabic_text_only/peS2o-00922-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafo.jsonl" \
+  "arabic_text_only/peS2o-00923-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafp.jsonl" \
+  "arabic_text_only/peS2o-00924-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafq.jsonl" \
+  "arabic_text_only/peS2o-00925-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafr.jsonl" \
+  "arabic_text_only/peS2o-00926-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafs.jsonl" \
+  "arabic_text_only/peS2o-00927-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaft.jsonl" \
+  "arabic_text_only/peS2o-00928-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafu.jsonl" \
+  "arabic_text_only/peS2o-00929-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafv.jsonl" \
+  "arabic_text_only/peS2o-00930-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafw.jsonl" \
+  "arabic_text_only/peS2o-00931-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafx.jsonl" \
+  "arabic_text_only/peS2o-00932-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafy.jsonl" \
+  "arabic_text_only/peS2o-00933-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aafz.jsonl" \
+  "arabic_text_only/peS2o-00934-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaga.jsonl" \
+  "arabic_text_only/peS2o-00935-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagb.jsonl" \
+  "arabic_text_only/peS2o-00936-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagc.jsonl" \
+  "arabic_text_only/peS2o-00937-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagd.jsonl" \
+  "arabic_text_only/peS2o-00938-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aage.jsonl" \
+  "arabic_text_only/peS2o-00939-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagf.jsonl" \
+  "arabic_text_only/peS2o-00940-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagg.jsonl" \
+  "arabic_text_only/peS2o-00941-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagh.jsonl" \
+  "arabic_text_only/peS2o-00942-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagj.jsonl" \
+  "arabic_text_only/peS2o-00943-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagk.jsonl" \
+  "arabic_text_only/peS2o-00944-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagl.jsonl" \
+  "arabic_text_only/peS2o-00945-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagm.jsonl" \
+  "arabic_text_only/peS2o-00946-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagn.jsonl" \
+  "arabic_text_only/peS2o-00947-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aago.jsonl" \
+  "arabic_text_only/peS2o-00948-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagp.jsonl" \
+  "arabic_text_only/peS2o-00949-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagq.jsonl" \
+  "arabic_text_only/peS2o-00950-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagr.jsonl" \
+  "arabic_text_only/peS2o-00951-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aags.jsonl" \
+  "arabic_text_only/peS2o-00952-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagt.jsonl" \
+  "arabic_text_only/peS2o-00953-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagu.jsonl" \
+  "arabic_text_only/peS2o-00954-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagv.jsonl" \
+  "arabic_text_only/peS2o-00955-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagw.jsonl" \
+  "arabic_text_only/peS2o-00956-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagx.jsonl" \
+  "arabic_text_only/peS2o-00957-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagy.jsonl" \
+  "arabic_text_only/peS2o-00958-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aagz.jsonl" \
+  "arabic_text_only/peS2o-00959-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaha.jsonl" \
+  "arabic_text_only/peS2o-00960-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahb.jsonl" \
+  "arabic_text_only/peS2o-00961-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahc.jsonl" \
+  "arabic_text_only/peS2o-00962-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahd.jsonl" \
+  "arabic_text_only/peS2o-00963-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahe.jsonl" \
+  "arabic_text_only/peS2o-00964-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahf.jsonl" \
+  "arabic_text_only/peS2o-00965-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahg.jsonl" \
+  "arabic_text_only/peS2o-00966-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahh.jsonl" \
+  "arabic_text_only/peS2o-00967-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahi.jsonl" \
+  "arabic_text_only/peS2o-00968-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahj.jsonl" \
+  "arabic_text_only/peS2o-00969-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahk.jsonl" \
+  "arabic_text_only/peS2o-00970-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahl.jsonl" \
+  "arabic_text_only/peS2o-00971-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahm.jsonl" \
+  "arabic_text_only/peS2o-00972-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahn.jsonl" \
+  "arabic_text_only/peS2o-00973-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaho.jsonl" \
+  "arabic_text_only/peS2o-00974-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahp.jsonl" \
+  "arabic_text_only/peS2o-00975-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahq.jsonl" \
+  "arabic_text_only/peS2o-00976-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahr.jsonl" \
+  "arabic_text_only/peS2o-00977-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahs.jsonl" \
+  "arabic_text_only/peS2o-00978-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaht.jsonl" \
+  "arabic_text_only/peS2o-00979-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahu.jsonl" \
+  "arabic_text_only/peS2o-00980-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahv.jsonl" \
+  "arabic_text_only/peS2o-00981-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahw.jsonl" \
+  "arabic_text_only/peS2o-00982-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahx.jsonl" \
+  "arabic_text_only/peS2o-00983-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahy.jsonl" \
+  "arabic_text_only/peS2o-00984-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aahz.jsonl" \
+  "arabic_text_only/peS2o-00985-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaia.jsonl" \
+  "arabic_text_only/peS2o-00986-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaib.jsonl" \
+  "arabic_text_only/peS2o-00987-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaic.jsonl" \
+  "arabic_text_only/peS2o-00988-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaid.jsonl" \
+  "arabic_text_only/peS2o-00989-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaie.jsonl" \
+  "arabic_text_only/peS2o-00990-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaif.jsonl" \
+  "arabic_text_only/peS2o-00991-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaig.jsonl" \
+  "arabic_text_only/peS2o-00992-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaih.jsonl" \
+  "arabic_text_only/peS2o-00993-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaio.jsonl" \
+  "arabic_text_only/peS2o-00994-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaip.jsonl" \
+  "arabic_text_only/peS2o-00995-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaiq.jsonl" \
-
-  "books_en2ar_splits_aair.jsonl" \
-
-  "books_en2ar_splits_aais.jsonl" \
-
-  "books_en2ar_splits_aaiu.jsonl" \
-
-  "books_en2ar_splits_aaiv.jsonl" \
-
-  "books_en2ar_splits_aaiw.jsonl" \
-
-  "books_en2ar_splits_aaix.jsonl" \
-
-  "books_en2ar_splits_aaiy.jsonl" \
-
-  "books_en2ar_splits_aaiz.jsonl" \
-
-  "books_en2ar_splits_aaja.jsonl" \
-
-  "books_en2ar_splits_aajb.jsonl" \
-
-  "books_en2ar_splits_aajc.jsonl" \
-
-  "books_en2ar_splits_aajd.jsonl" \
-
-  "books_en2ar_splits_aaje.jsonl" \
-
-  "books_en2ar_splits_aajf.jsonl" \
-
-  "books_en2ar_splits_aajg.jsonl" \
-
-  "books_en2ar_splits_aajh.jsonl" \
-
-  "books_en2ar_splits_aaji.jsonl" \
-
-  "books_en2ar_splits_aajj.jsonl" \
-
-  "books_en2ar_splits_aajk.jsonl" \
-
-  "books_en2ar_splits_aajl.jsonl" \
-
-  "books_en2ar_splits_aajm.jsonl" \
-
-  "books_en2ar_splits_aajn.jsonl" \
-
-  "books_en2ar_splits_aajo.jsonl" \
-
-  "books_en2ar_splits_aajp.jsonl" \
-
-  "books_en2ar_splits_aajq.jsonl" \
-
-  "books_en2ar_splits_aajr.jsonl" \
-
-  "books_en2ar_splits_aajs.jsonl" \
-
-  "books_en2ar_splits_aajt.jsonl" \
-
-  "books_en2ar_splits_aaju.jsonl" \
-
-  "books_en2ar_splits_aajv.jsonl" \
-
-  "books_en2ar_splits_aajw.jsonl" \
-
-  "books_en2ar_splits_aajx.jsonl" \
-
-  "books_en2ar_splits_aajy.jsonl" \
-
-  "books_en2ar_splits_aajz.jsonl" \
-
-  "books_en2ar_splits_aaka.jsonl" \
-
-  "books_en2ar_splits_aakb.jsonl" \
-
-  "books_en2ar_splits_aakc.jsonl" \
-
-  "books_en2ar_splits_aakd.jsonl" \
-
-  "books_en2ar_splits_aake.jsonl" \
-
-  "books_en2ar_splits_aakf.jsonl" \
-
-  "books_en2ar_splits_aakg.jsonl" \
-
-  "books_en2ar_splits_aakh.jsonl" \
-
-  "books_en2ar_splits_aaki.jsonl" \
-
-  "books_en2ar_splits_aakj.jsonl" \
-
-  "books_en2ar_splits_aakl.jsonl" \
-
-  "books_en2ar_splits_aakm.jsonl" \
-
-  "books_en2ar_splits_aakn.jsonl" \
-
-  "books_en2ar_splits_aako.jsonl" \
-
-  "books_en2ar_splits_aakp.jsonl" \
-
-  "books_en2ar_splits_aakq.jsonl" \
-
-  "books_en2ar_splits_aakr.jsonl" \
-
-  "books_en2ar_splits_aaks.jsonl" \
-
-  "books_en2ar_splits_aakt.jsonl" \
-
-  "books_en2ar_splits_aaku.jsonl" \
-
-  "books_en2ar_splits_aakv.jsonl" \
-
-  "books_en2ar_splits_aakw.jsonl"'
+  "arabic_text_only/peS2o-00996-of-00997-translated.jsonl"'
 compute: azureml:LARGE-CPU
 display_name: merge_shard
 distribution:
