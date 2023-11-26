@@ -4,7 +4,7 @@ command: bash examples/pretrain-llama/data-processing/tokenize/remote_az_batch_t
   "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
   "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/llama2_bin_idx_trans/"
   "Llama2Tokenizer" "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-indexed_data/tokenizer/tokenizer.model"
-  "16" "10000" "sp=racwdli&st=2023-11-25T11:38:52Z&se=2023-11-25T19:38:52Z&spr=https&sv=2022-11-02&sr=c&sig=yZQU8wwWZSrZARG8vftWZqfdnTr2HzFCmgKXL05kQow%3D"
+  "16" "10000" "sp=racwdli&st=2023-11-26T15:25:43Z&se=2023-11-26T23:25:43Z&spr=https&sv=2022-11-02&sr=c&sig=GeRcxL%2Bvl%2FCyis3P0Gmu8qFJY8jLdu5zyswbDfNPKb4%3D"
 compute: azureml:LARGE-CPU
 display_name: tokenize
 distribution:

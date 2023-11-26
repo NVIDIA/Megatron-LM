@@ -15,10 +15,11 @@ python examples/pretrain-llama/data-processing/tokenize/az_batch_tokenize.py \
 --az-subscription "$AZ_SUBS" \
 --az-resource-group "$AZ_RESOURCE_GROUP" \
 --az-workspace-name "$AZ_WORKSPACE" \
---az-blob-input-folder-path "$INPUT_FOLDER_PATH" \
---az-blob-bin-idx-folder-path "$BIN_IDX_PATH" \
---az-tokenizer-model "$TOK_MODEL" \
+--input-folder-path "$INPUT_FOLDER_PATH" \
+--bin-idx-folder-path "$BIN_IDX_PATH" \
+--tokenizer-model "$TOK_MODEL" \
 --tokenizer-type $TOK_TYPE \
 --az-sas-token "$SAS_TOKEN" \
---sample-yaml-job-file "$AZJOB_FILE" \
---az-num-proc 16
+--az-sample-yaml-job-file "$AZJOB_FILE" \
+--az-configs "examples/pretrain-llama/data-processing/tokenize/azure_login_configs.json" \
+--num-proc 16

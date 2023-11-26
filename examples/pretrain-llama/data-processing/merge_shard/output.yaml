@@ -3,7 +3,7 @@ code: ../../../../
 command: 'bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_shard.sh
   \
 
-  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_books_corpus_formatted"
+  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o/arabic_text_only"
   \
 
   "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
@@ -12,245 +12,123 @@ command: 'bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_
   "sp=racwdli&st=2023-11-25T09:13:18Z&se=2024-04-30T17:13:18Z&spr=https&sv=2022-11-02&sr=c&sig=dcTe10UuDRh1g3Wh1bcYRenmV%2FUqvq%2BKJ7Ufmiw5WfA%3D"
   \
 
-  "ar_translated_books3_000.jsonl" \
+  "ar_translated_peS20_008.jsonl" \
 
-  "books_en2ar_splits_aaaa.jsonl" \
+  "peS2o-00939-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaab.jsonl" \
+  "peS2o-00940-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaac.jsonl" \
+  "peS2o-00941-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaad.jsonl" \
+  "peS2o-00942-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaae.jsonl" \
+  "peS2o-00943-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaf.jsonl" \
+  "peS2o-00944-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaag.jsonl" \
+  "peS2o-00945-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaah.jsonl" \
+  "peS2o-00946-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaai.jsonl" \
+  "peS2o-00947-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaj.jsonl" \
+  "peS2o-00948-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaak.jsonl" \
+  "peS2o-00949-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaal.jsonl" \
+  "peS2o-00950-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaam.jsonl" \
+  "peS2o-00951-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaan.jsonl" \
+  "peS2o-00952-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaao.jsonl" \
+  "peS2o-00953-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaap.jsonl" \
+  "peS2o-00954-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaq.jsonl" \
+  "peS2o-00955-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaar.jsonl" \
+  "peS2o-00956-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaas.jsonl" \
+  "peS2o-00957-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaat.jsonl" \
+  "peS2o-00958-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaau.jsonl" \
+  "peS2o-00959-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaav.jsonl" \
+  "peS2o-00960-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaw.jsonl" \
+  "peS2o-00961-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaax.jsonl" \
+  "peS2o-00962-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaay.jsonl" \
+  "peS2o-00963-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaaz.jsonl" \
+  "peS2o-00964-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaba.jsonl" \
+  "peS2o-00965-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabb.jsonl" \
+  "peS2o-00966-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabc.jsonl" \
+  "peS2o-00967-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabd.jsonl" \
+  "peS2o-00968-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabe.jsonl" \
+  "peS2o-00969-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabf.jsonl" \
+  "peS2o-00970-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabg.jsonl" \
+  "peS2o-00971-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabh.jsonl" \
+  "peS2o-00972-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabi.jsonl" \
+  "peS2o-00973-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabj.jsonl" \
+  "peS2o-00974-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabk.jsonl" \
+  "peS2o-00975-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabl.jsonl" \
+  "peS2o-00976-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabm.jsonl" \
+  "peS2o-00977-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabn.jsonl" \
+  "peS2o-00978-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabo.jsonl" \
+  "peS2o-00979-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabp.jsonl" \
+  "peS2o-00980-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabq.jsonl" \
+  "peS2o-00981-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabr.jsonl" \
+  "peS2o-00982-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabs.jsonl" \
+  "peS2o-00983-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabt.jsonl" \
+  "peS2o-00984-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabu.jsonl" \
+  "peS2o-00985-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabv.jsonl" \
+  "peS2o-00986-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabw.jsonl" \
+  "peS2o-00987-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabx.jsonl" \
+  "peS2o-00988-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaby.jsonl" \
+  "peS2o-00989-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aabz.jsonl" \
+  "peS2o-00990-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aaca.jsonl" \
+  "peS2o-00991-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacb.jsonl" \
+  "peS2o-00992-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacc.jsonl" \
+  "peS2o-00993-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacd.jsonl" \
+  "peS2o-00994-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aace.jsonl" \
+  "peS2o-00995-of-00997-translated.jsonl" \
 
-  "books_en2ar_splits_aacf.jsonl" \
-
-  "books_en2ar_splits_aacg.jsonl" \
-
-  "books_en2ar_splits_aach.jsonl" \
-
-  "books_en2ar_splits_aaci.jsonl" \
-
-  "books_en2ar_splits_aacj.jsonl" \
-
-  "books_en2ar_splits_aack.jsonl" \
-
-  "books_en2ar_splits_aacl.jsonl" \
-
-  "books_en2ar_splits_aacm.jsonl" \
-
-  "books_en2ar_splits_aacn.jsonl" \
-
-  "books_en2ar_splits_aaco.jsonl" \
-
-  "books_en2ar_splits_aacp.jsonl" \
-
-  "books_en2ar_splits_aacq.jsonl" \
-
-  "books_en2ar_splits_aacr.jsonl" \
-
-  "books_en2ar_splits_aacs.jsonl" \
-
-  "books_en2ar_splits_aact.jsonl" \
-
-  "books_en2ar_splits_aacu.jsonl" \
-
-  "books_en2ar_splits_aacv.jsonl" \
-
-  "books_en2ar_splits_aacw.jsonl" \
-
-  "books_en2ar_splits_aacx.jsonl" \
-
-  "books_en2ar_splits_aacy.jsonl" \
-
-  "books_en2ar_splits_aacz.jsonl" \
-
-  "books_en2ar_splits_aada.jsonl" \
-
-  "books_en2ar_splits_aadb.jsonl" \
-
-  "books_en2ar_splits_aadc.jsonl" \
-
-  "books_en2ar_splits_aadd.jsonl" \
-
-  "books_en2ar_splits_aade.jsonl" \
-
-  "books_en2ar_splits_aadf.jsonl" \
-
-  "books_en2ar_splits_aadg.jsonl" \
-
-  "books_en2ar_splits_aadh.jsonl" \
-
-  "books_en2ar_splits_aadi.jsonl" \
-
-  "books_en2ar_splits_aadj.jsonl" \
-
-  "books_en2ar_splits_aadk.jsonl" \
-
-  "books_en2ar_splits_aadl.jsonl" \
-
-  "books_en2ar_splits_aadm.jsonl" \
-
-  "books_en2ar_splits_aadn.jsonl" \
-
-  "books_en2ar_splits_aado.jsonl" \
-
-  "books_en2ar_splits_aadp.jsonl" \
-
-  "books_en2ar_splits_aadq.jsonl" \
-
-  "books_en2ar_splits_aadr.jsonl" \
-
-  "books_en2ar_splits_aads.jsonl" \
-
-  "books_en2ar_splits_aadt.jsonl" \
-
-  "books_en2ar_splits_aadu.jsonl" \
-
-  "books_en2ar_splits_aadv.jsonl" \
-
-  "books_en2ar_splits_aadw.jsonl" \
-
-  "books_en2ar_splits_aadx.jsonl" \
-
-  "books_en2ar_splits_aady.jsonl" \
-
-  "books_en2ar_splits_aadz.jsonl" \
-
-  "books_en2ar_splits_aaea.jsonl" \
-
-  "books_en2ar_splits_aaeb.jsonl" \
-
-  "books_en2ar_splits_aaec.jsonl" \
-
-  "books_en2ar_splits_aaed.jsonl" \
-
-  "books_en2ar_splits_aaee.jsonl" \
-
-  "books_en2ar_splits_aaef.jsonl" \
-
-  "books_en2ar_splits_aaeg.jsonl" \
-
-  "books_en2ar_splits_aaeh.jsonl" \
-
-  "books_en2ar_splits_aaei.jsonl" \
-
-  "books_en2ar_splits_aaej.jsonl" \
-
-  "books_en2ar_splits_aaek.jsonl" \
-
-  "books_en2ar_splits_aael.jsonl" \
-
-  "books_en2ar_splits_aaem.jsonl" \
-
-  "books_en2ar_splits_aaen.jsonl" \
-
-  "books_en2ar_splits_aaeo.jsonl"'
+  "peS2o-00996-of-00997-translated.jsonl"'
 compute: azureml:LARGE-CPU
 display_name: merge_shard
 distribution:

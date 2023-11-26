@@ -11,7 +11,7 @@ def get_args():
     group.add_argument("--az-resource-group", default=None, type = str, help="Azure subscription id.")
     group.add_argument("--az-workspace-name", default=None, type = str, help="Azure subscription id.")
     group.add_argument("--az-sas-token", default=None, type = str, help="Azure blob SAS token")
-    group.add_argument("--az_sample-yaml-job-file", default=None, type = str, help="Path to a sample job file.")
+    group.add_argument("--az-sample-yaml-job-file", default=None, type = str, help="Path to a sample job file.")
     group.add_argument("--az-configs", default=None, type = str, help="Path to a sample job file.")
 
     group = parser.add_argument_group(title='I/O params.')
@@ -24,7 +24,7 @@ def get_args():
     group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
 
     group = parser.add_argument_group(title='Misc. params.')
-    parser.add_argument("--compute-target", type = str, choices=['local', 'azure'], help="Conpute targets.")
+    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
     
     args = parser.parse_args()
@@ -87,7 +87,7 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
     output_folder = os.path.dirname(script_path)
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
-    
+    sas_token = args.az_configs['az-sas-token']
     prefix_command = f"""bash examples/pretrain-llama/data-processing/tokenize/remote_az_batch_tokenize.sh """
     for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
         cmd= prefix_command
@@ -98,7 +98,7 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
         cmd = cmd + f' \"{args.tokenizer_model}\"'
         cmd = cmd + f' \"{args.num_proc}\"'
         cmd = cmd + f' \"{args.log_interval}\"'
-        cmd = cmd + f' \"{args.az_configs['az-sas-token']}\"'
+        cmd = cmd + f' \"{sas_token}\"'
         
         print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
         if not args.dry_run:
@@ -121,7 +121,7 @@ def list_shard_info(args, shard_folder):
     if args.compute_target == "local":
         raise NotImplementedError()
     elif args.compute_target == "azure":
-        return azcopy_list(shard_folder, args.az_configs['az_sas_token'])
+        return azcopy_list(shard_folder, args.az_configs['az-sas-token'])
     else:
         raise NotImplementedError()
 
