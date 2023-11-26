@@ -6,25 +6,48 @@ import subprocess
 
 def get_args():
     parser = argparse.ArgumentParser(description="Azure batch job submission for tokenization")
-    parser.add_argument("--az-subscription", type = str, help="Azure subscription id.", required=True)
-    parser.add_argument("--az-resource-group", type = str, help="Azure subscription id.", required=True)
-    parser.add_argument("--az-workspace-name", type = str, help="Azure subscription id.", required=True)
-    parser.add_argument("--az-blob-input-folder-path", type = str, help="Azure blob folder path to input jsonl files, each job process a single jsonl file.", required=True)
-    parser.add_argument("--az-blob-bin-idx-folder-path", type = str, help="Azure blob folder path to output folder for bin and idx", required=True)
-    parser.add_argument("--az-tokenizer-model", type = str, help="Azure path to the tokenizer.model file", required=True)
-    parser.add_argument("--tokenizer-type", type = str, help="Type of the tokenizer model", required=True)
-    parser.add_argument("--az-sas-token", type = str, help="Azure blob SAS token", required=True)
-    parser.add_argument("--az-num-proc", type = int, help="Number of workers per node", required=True)
-    parser.add_argument('--az-log-interval', type=int, default=10000, help='Loggin interval between progress updates in azure node')
-    parser.add_argument("--sample-yaml-job-file", type = str, help="Path to a sample job file.", required=True)
-    parser.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
-    parser.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
+    group = parser.add_argument_group(title='Azure login params.')
+    group.add_argument("--az-subscription", default=None, type = str, help="Azure subscription id.")
+    group.add_argument("--az-resource-group", default=None, type = str, help="Azure subscription id.")
+    group.add_argument("--az-workspace-name", default=None, type = str, help="Azure subscription id.")
+    group.add_argument("--az-sas-token", default=None, type = str, help="Azure blob SAS token")
+    group.add_argument("--az_sample-yaml-job-file", default=None, type = str, help="Path to a sample job file.")
+    group.add_argument("--az-configs", default=None, type = str, help="Path to a sample job file.")
+
+    group = parser.add_argument_group(title='I/O params.')
+    group.add_argument("--input-folder-path", type = str, help="Compute target folder path to input jsonl files, each job process a single jsonl file.")
+    group.add_argument("--bin-idx-folder-path", type = str, help="Compute target folder path to output folder for bin and idx")
+    group.add_argument("--tokenizer-model", type = str, help="Compute target path to the tokenizer.model file")
+    group.add_argument("--tokenizer-type", type = str, help="Type of the tokenizer model", required=True)
+    group.add_argument("--num-proc", type = int, help="Compute target number of workers per node", required=True)
+    group.add_argument('--log-interval', type=int, default=10000, help='Loggin interval between tokenizer progress updates.')
+    group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
+
+    group = parser.add_argument_group(title='Misc. params.')
+    parser.add_argument("--compute-target", type = str, choices=['local', 'azure'], help="Conpute targets.")
+    group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
+    
     args = parser.parse_args()
+
+    if args.az_configs is not None:
+        args.az_configs = json.load(open(args.az_configs))
+        if args.az_subscription is not None:
+            print("Overloading config args from  --az-subscription")
+            args.az_configs['az-subscription'] = args.az_subscription
+        if args.az_resource_group is not None:
+            print("Overloading config args from  --az-resource-group")
+            args.az_configs['az-resource-group'] = args.az_resource_group
+        if args.az_workspace_name is not None:
+            print("Overloading config args from  --az-workspace-name")
+            args.az_configs['az-workspace-name'] = args.az_workspace_name
+        if args.az_sas_token is not None:
+            print("Overloading config args from  --az-sas-token")
+            args.az_configs['az-sas-token'] = args.az_sas_token
+        if args.az_sample_yaml_job_file is not None:
+            print("Overloading config args from  --az-sample-yaml-job-file")
+            args.az_configs['az-sample-yaml-job-file'] = args.az_sample_yaml_job_file
+
     return args
-
-
-def write_jobs(args):
-    pass
 
 def azcopy_list(path, sas_token):
     shard_dict = {}
@@ -55,22 +78,27 @@ def match_pre_existing_bin_idx(input_shard_dict, output_shards_dict):
             de_dup_shard_collection[shard_name] = n_byte
     return de_dup_shard_collection
 
-def write_jobs(args, input_shard_dict, script_path):
+def local_submit_job(args):
+    num_file_workers = os.cpu_count()//args.num_proc
+    cmd = f"""python examples/pretrain-llama/data-processing/tokenize/multiprocess_runner.py --glob-input-path {args.input_folder_path} --output-folder {args.bin_idx_folder_path} --tokenizer-model {args.tokenizer_model} --tokenizer-type {args.tokenizer_model} --num-proc {args.num_proc} --num-file-workers {num_file_workers}"""
+    subprocess.check_output(cmd, shell=True)
+
+def azure_submit_jobs(args, input_shard_dict, script_path):
     output_folder = os.path.dirname(script_path)
-    with open(args.sample_yaml_job_file) as fileptr:
+    with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     
     prefix_command = f"""bash examples/pretrain-llama/data-processing/tokenize/remote_az_batch_tokenize.sh """
     for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
         cmd= prefix_command
         cmd = cmd + f' \"{shard_name}\"'
-        cmd = cmd + f' \"{args.az_blob_input_folder_path}\"'
-        cmd = cmd + f' \"{args.az_blob_bin_idx_folder_path}\"'
+        cmd = cmd + f' \"{args.input_folder_path}\"'
+        cmd = cmd + f' \"{args.bin_idx_folder_path}\"'
         cmd = cmd + f' \"{args.tokenizer_type}\"'
-        cmd = cmd + f' \"{args.az_tokenizer_model}\"'
-        cmd = cmd + f' \"{args.az_num_proc}\"'
-        cmd = cmd + f' \"{args.az_log_interval}\"'
-        cmd = cmd + f' \"{args.az_sas_token}\"'
+        cmd = cmd + f' \"{args.tokenizer_model}\"'
+        cmd = cmd + f' \"{args.num_proc}\"'
+        cmd = cmd + f' \"{args.log_interval}\"'
+        cmd = cmd + f' \"{args.az_configs['az-sas-token']}\"'
         
         print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
         if not args.dry_run:
@@ -78,16 +106,31 @@ def write_jobs(args, input_shard_dict, script_path):
             az_yaml_file = os.path.join(output_folder, 'output.yaml')
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
-            # cmd = f"az ml job create --subscription {args.az_subscription} --resource-group {args.az_resource_group} --workspace-name {args.az_workspace_name} --file {az_yaml_file}"
+            cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {args.az_configs['az-sample-yaml-job-file']}"
             subprocess.check_output(cmd, shell=True)
-        break
+
+def submit_jobs(args, input_shard_dict, script_path):
+    if args.compute_target == "local":
+        local_submit_job(args)
+    elif args.compute_target == "azure":
+        return azure_submit_jobs(args, input_shard_dict, script_path)
+    else:
+        raise NotImplementedError()
+
+def list_shard_info(args, shard_folder):
+    if args.compute_target == "local":
+        raise NotImplementedError()
+    elif args.compute_target == "azure":
+        return azcopy_list(shard_folder, args.az_configs['az_sas_token'])
+    else:
+        raise NotImplementedError()
 
 if __name__ == "__main__":
     script_path = os.path.abspath(__file__)
     args =  get_args()
-    input_shard_dict = azcopy_list(args.az_blob_input_folder_path, args.az_sas_token)
-    output_shards_dict = azcopy_list(args.az_blob_bin_idx_folder_path, args.az_sas_token)
+    input_shard_dict = list_shard_info(args, args.input_folder_path)
+    output_shards_dict = list_shard_info(args, args.bin_idx_folder_path)
     if not args.overwrite:
         input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
-    write_jobs(args, input_shard_dict, script_path)
+    submit_jobs(args, input_shard_dict, script_path)
     
