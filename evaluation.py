@@ -200,11 +200,11 @@ class Evaluator():
             assert len(model) == 1, "Above condition should have caught this"
             self.model = model[0]
             
-        
+        print("TASK LIST: ", task_list)
         if task_list is None:
             self.task_list = ["lambada_openai","hellaswag"]
         else:
-            self.task_list = task_list
+            self.task_list = task_list.split(",")
             
         self.task_dict = tasks.get_task_dict(self.task_list)
         self.results_path = results_path
@@ -234,8 +234,8 @@ if __name__ == '__main__':
     #checkpoint_path = "/workspace/ckpts_bf16_125m"
     
     # EXAMPLE COMMAND:
-    # torchrun --nproc_per_node 4 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 6000 evaluate.py --config examples/bf16_125m_8E.sh --checkpoint /workspace/ckpts_bf16_125m
-    
+    # torchrun --nproc_per_node 4 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 6000 evaluation.py --config examples/qanthony_tflops.sh --checkpoint /workspace/ckpts_bf16_125m --task-list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
+    # task list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
     parser = argparse.ArgumentParser(description='Download evaluation harness', allow_abbrev=False)
     parser.add_argument('--config', type=str, help='Path to the model config file.')
     parser.add_argument('--checkpoint', type=str, help='Path to the model config file.')
