@@ -3,132 +3,36 @@ code: ../../../../
 command: 'bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_shard.sh
   \
 
-  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o/arabic_text_only"
+  "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_wikipedia"
   \
 
   "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
   \
 
-  "sp=racwdli&st=2023-11-25T09:13:18Z&se=2024-04-30T17:13:18Z&spr=https&sv=2022-11-02&sr=c&sig=dcTe10UuDRh1g3Wh1bcYRenmV%2FUqvq%2BKJ7Ufmiw5WfA%3D"
+  "sp=racwdli&st=2023-11-26T23:40:14Z&se=2023-11-27T07:40:14Z&spr=https&sv=2022-11-02&sr=c&sig=TPKX%2BtFgVo%2FFGtl0ic%2BOmdi6Txm2Qi191QmOlZclHak%3D"
   \
 
-  "ar_translated_peS20_008.jsonl" \
+  "ar_translated_wiki_000.jsonl" \
 
-  "peS2o-00939-of-00997-translated.jsonl" \
+  "wiki-0-of-10-translated.jsonl" \
 
-  "peS2o-00940-of-00997-translated.jsonl" \
+  "wiki-1-of-10-translated.jsonl" \
 
-  "peS2o-00941-of-00997-translated.jsonl" \
+  "wiki-2-of-10-translated.jsonl" \
 
-  "peS2o-00942-of-00997-translated.jsonl" \
+  "wiki-3-of-10-translated.jsonl" \
 
-  "peS2o-00943-of-00997-translated.jsonl" \
+  "wiki-4-of-10-translated.jsonl" \
 
-  "peS2o-00944-of-00997-translated.jsonl" \
+  "wiki-5-of-10-translated.jsonl" \
 
-  "peS2o-00945-of-00997-translated.jsonl" \
+  "wiki-6-of-10-translated.jsonl" \
 
-  "peS2o-00946-of-00997-translated.jsonl" \
+  "wiki-7-of-10-translated.jsonl" \
 
-  "peS2o-00947-of-00997-translated.jsonl" \
+  "wiki-8-of-10-translated.jsonl" \
 
-  "peS2o-00948-of-00997-translated.jsonl" \
-
-  "peS2o-00949-of-00997-translated.jsonl" \
-
-  "peS2o-00950-of-00997-translated.jsonl" \
-
-  "peS2o-00951-of-00997-translated.jsonl" \
-
-  "peS2o-00952-of-00997-translated.jsonl" \
-
-  "peS2o-00953-of-00997-translated.jsonl" \
-
-  "peS2o-00954-of-00997-translated.jsonl" \
-
-  "peS2o-00955-of-00997-translated.jsonl" \
-
-  "peS2o-00956-of-00997-translated.jsonl" \
-
-  "peS2o-00957-of-00997-translated.jsonl" \
-
-  "peS2o-00958-of-00997-translated.jsonl" \
-
-  "peS2o-00959-of-00997-translated.jsonl" \
-
-  "peS2o-00960-of-00997-translated.jsonl" \
-
-  "peS2o-00961-of-00997-translated.jsonl" \
-
-  "peS2o-00962-of-00997-translated.jsonl" \
-
-  "peS2o-00963-of-00997-translated.jsonl" \
-
-  "peS2o-00964-of-00997-translated.jsonl" \
-
-  "peS2o-00965-of-00997-translated.jsonl" \
-
-  "peS2o-00966-of-00997-translated.jsonl" \
-
-  "peS2o-00967-of-00997-translated.jsonl" \
-
-  "peS2o-00968-of-00997-translated.jsonl" \
-
-  "peS2o-00969-of-00997-translated.jsonl" \
-
-  "peS2o-00970-of-00997-translated.jsonl" \
-
-  "peS2o-00971-of-00997-translated.jsonl" \
-
-  "peS2o-00972-of-00997-translated.jsonl" \
-
-  "peS2o-00973-of-00997-translated.jsonl" \
-
-  "peS2o-00974-of-00997-translated.jsonl" \
-
-  "peS2o-00975-of-00997-translated.jsonl" \
-
-  "peS2o-00976-of-00997-translated.jsonl" \
-
-  "peS2o-00977-of-00997-translated.jsonl" \
-
-  "peS2o-00978-of-00997-translated.jsonl" \
-
-  "peS2o-00979-of-00997-translated.jsonl" \
-
-  "peS2o-00980-of-00997-translated.jsonl" \
-
-  "peS2o-00981-of-00997-translated.jsonl" \
-
-  "peS2o-00982-of-00997-translated.jsonl" \
-
-  "peS2o-00983-of-00997-translated.jsonl" \
-
-  "peS2o-00984-of-00997-translated.jsonl" \
-
-  "peS2o-00985-of-00997-translated.jsonl" \
-
-  "peS2o-00986-of-00997-translated.jsonl" \
-
-  "peS2o-00987-of-00997-translated.jsonl" \
-
-  "peS2o-00988-of-00997-translated.jsonl" \
-
-  "peS2o-00989-of-00997-translated.jsonl" \
-
-  "peS2o-00990-of-00997-translated.jsonl" \
-
-  "peS2o-00991-of-00997-translated.jsonl" \
-
-  "peS2o-00992-of-00997-translated.jsonl" \
-
-  "peS2o-00993-of-00997-translated.jsonl" \
-
-  "peS2o-00994-of-00997-translated.jsonl" \
-
-  "peS2o-00995-of-00997-translated.jsonl" \
-
-  "peS2o-00996-of-00997-translated.jsonl"'
+  "wiki-9-of-10-translated.jsonl"'
 compute: azureml:LARGE-CPU
 display_name: merge_shard
 distribution:

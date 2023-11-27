@@ -106,7 +106,7 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
             az_yaml_file = os.path.join(output_folder, 'output.yaml')
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
-            cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {args.az_configs['az-sample-yaml-job-file']}"
+            cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {az_yaml_file}"
             subprocess.check_output(cmd, shell=True)
 
 def submit_jobs(args, input_shard_dict, script_path):

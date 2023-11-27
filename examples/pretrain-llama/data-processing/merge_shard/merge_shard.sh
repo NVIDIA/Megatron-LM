@@ -6,35 +6,42 @@ AZ_RESOURCE_GROUP="LLM-Test"
 AZ_WORKSPACE="Provisioning-Test"
 NUM_TOKEN=43486543872
 
-python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
---az-subscription "$AZ_SUBS" \
---az-resource-group "$AZ_RESOURCE_GROUP" \
---az-workspace-name "$AZ_WORKSPACE" \
---az-blob-input-folder "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_books_corpus_formatted" \
---az-blob-output-folder-path "$AZ_OUTPUT_FOLDER" \
---az-sas-token "$SAS_TOKEN" \
---sample-yaml-job-file "$AZJOB_FILE" \
---prefix-name "ar_translated_books3_" \
---shard-size $NUM_TOKEN 
+# python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
+# --az-subscription "$AZ_SUBS" \
+# --az-resource-group "$AZ_RESOURCE_GROUP" \
+# --az-workspace-name "$AZ_WORKSPACE" \
+# --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_books_corpus_formatted" \
+# --output-folder-path "$AZ_OUTPUT_FOLDER" \
+# --az-sas-token "$SAS_TOKEN" \
+# --sample-yaml-job-file "$AZJOB_FILE" \
+# --prefix-name "ar_translated_books3_" \
+# --shard-size $NUM_TOKEN 
+
+# python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
+# --az-subscription "$AZ_SUBS" \
+# --az-resource-group "$AZ_RESOURCE_GROUP" \
+# --az-workspace-name "$AZ_WORKSPACE" \
+# --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_c4" \
+# --output-folder-path "$AZ_OUTPUT_FOLDER" \
+# --az-sas-token "$SAS_TOKEN" \
+# --sample-yaml-job-file "$AZJOB_FILE" \
+# --prefix-name "ar_translated_c4_" \
+# --shard-size $NUM_TOKEN 
+
+# python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
+# --az-subscription "$AZ_SUBS" \
+# --az-resource-group "$AZ_RESOURCE_GROUP" \
+# --az-workspace-name "$AZ_WORKSPACE" \
+# --input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o/arabic_text_only" \
+# --output-folder-path "$AZ_OUTPUT_FOLDER" \
+# --az-sas-token "$SAS_TOKEN" \
+# --sample-yaml-job-file "$AZJOB_FILE" \
+# --prefix-name "ar_translated_peS20_" \
+# --shard-size $NUM_TOKEN 
 
 python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
---az-subscription "$AZ_SUBS" \
---az-resource-group "$AZ_RESOURCE_GROUP" \
---az-workspace-name "$AZ_WORKSPACE" \
---az-blob-input-folder "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_c4" \
---az-blob-output-folder-path "$AZ_OUTPUT_FOLDER" \
---az-sas-token "$SAS_TOKEN" \
---sample-yaml-job-file "$AZJOB_FILE" \
---prefix-name "ar_translated_c4_" \
---shard-size $NUM_TOKEN 
-
-python examples/pretrain-llama/data-processing/merge_shard/merge_shard.py \
---az-subscription "$AZ_SUBS" \
---az-resource-group "$AZ_RESOURCE_GROUP" \
---az-workspace-name "$AZ_WORKSPACE" \
---az-blob-input-folder "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_peS2o/arabic_text_only" \
---az-blob-output-folder-path "$AZ_OUTPUT_FOLDER" \
---az-sas-token "$SAS_TOKEN" \
---sample-yaml-job-file "$AZJOB_FILE" \
---prefix-name "ar_translated_peS20_" \
---shard-size $NUM_TOKEN 
+--input-folder-path "https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/ar/translated/en2ar_wikipedia" \
+--output-folder-path "$AZ_OUTPUT_FOLDER" \
+--prefix-name "ar_translated_wiki_" \
+--shard-size $NUM_TOKEN \
+--az-configs "examples/pretrain-llama/data-processing/merge_shard/azure_login_configs.json" \

@@ -2,6 +2,6 @@
     "az-subscription": "c7209a17-0d9f-41df-8e45-e0172343698d",
     "az-resource-group": "LLM-Test",
     "az-workspace-name": "Provisioning-Test",
-    "az-sas-token": "sp=racwdli&st=2023-11-26T15:25:43Z&se=2023-11-26T23:25:43Z&spr=https&sv=2022-11-02&sr=c&sig=GeRcxL%2Bvl%2FCyis3P0Gmu8qFJY8jLdu5zyswbDfNPKb4%3D",
+    "az-sas-token": "sp=racwdli&st=2023-11-26T23:40:14Z&se=2023-11-27T07:40:14Z&spr=https&sv=2022-11-02&sr=c&sig=TPKX%2BtFgVo%2FFGtl0ic%2BOmdi6Txm2Qi191QmOlZclHak%3D",
     "az-sample-yaml-job-file": "examples/pretrain-llama/data-processing/tokenize/tokenize.yaml"
 }
