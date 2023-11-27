@@ -689,7 +689,7 @@ class ParallelAttention(MegatronModule):
             mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
             # [sq, b, nkv, (nq // nkv + 2), hn] --> 3 [sq, b, np, hn]
-            (query_layer
+            (query_layer,
              key_layer,
              value_layer) = self.split_tensor(mixed_x_layer)
 
