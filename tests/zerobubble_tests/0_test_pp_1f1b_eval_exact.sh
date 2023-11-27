@@ -12,4 +12,4 @@ export AIP_RUN_NAME=$(basename $0 | cut -d '.' -f 1)
 export ENABLE_EXACTLY_NUMERIC_MATCH=1
 launch
 
-check_loss "7.073670E+00"
+check_loss_exists

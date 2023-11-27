@@ -379,12 +379,12 @@ class PipelineGraph(object):
             ))
             # If a recv with intersects with previous computation, reorder them so that recv
             # is executed before computation and hence can be overlapped.
-            # for i in range(len(local_order[rank])):
-            #     if i > 0 and local_order[rank][i - 1].type in {'F', 'B', 'W'} and \
-            #         local_order[rank][i].type.startswith('RECV') and \
-            #         "POST_VALIDATION" not in local_order[rank][i].type and \
-            #         local_order[rank][i].start_time <= local_order[rank][i - 1].completion_time:
-            #         local_order[rank][i], local_order[rank][i - 1] = local_order[rank][i - 1], local_order[rank][i]
+            for i in range(len(local_order[rank])):
+                if i > 0 and local_order[rank][i - 1].type in {'F', 'B', 'W'} and \
+                    local_order[rank][i].type.startswith('RECV') and \
+                    "POST_VALIDATION" not in local_order[rank][i].type and \
+                    local_order[rank][i].start_time <= local_order[rank][i - 1].completion_time:
+                    local_order[rank][i], local_order[rank][i - 1] = local_order[rank][i - 1], local_order[rank][i]
 
         local_order_with_rollback = [[] for _ in range(self.n_stage)]
         for rank in range(self.n_stage):

@@ -9,6 +9,8 @@ from .. import parallel_state
 from ..transformer.module import MegatronModule
 from ..transformer.transformer_config import TransformerConfig
 from .grad_buffer import GradBuffer
+from megatron import get_args
+from ..utils import get_attr_wrapped_model
 
 
 class DistributedDataParallel(MegatronModule):
@@ -76,11 +78,26 @@ class DistributedDataParallel(MegatronModule):
         # Group parameters by their gradient type.
         grad_dtype_to_params = {}
         param_to_name = {}
+        weight_for_zero_bubble = set()
+        self.weight_grad_buffers = {}
+        if get_args().enable_zero_bubble and self.overlap_grad_reduce:
+            from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+            for name, sub_module in self.module.named_modules():
+                if isinstance(sub_module, (ColumnParallelLinear, RowParallelLinear)):
+                    weight_for_zero_bubble.add(sub_module.weight)
+            model_module = get_attr_wrapped_model(self.module, 'pre_process', return_model_obj=True)
+            if model_module.post_process:
+                from megatron.model.gpt_model import GPTModel
+                assert isinstance(model_module, GPTModel)
+                weight_for_zero_bubble.add(model_module.word_embeddings.weight)
+
         for name, param in self.module.named_parameters():
             if param.requires_grad and getattr(param, 'allreduce', True):
                 param.grad_added_to_main_grad = False
                 param_to_name[param] = name
                 dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+                if param in weight_for_zero_bubble:
+                    continue
 
                 params = grad_dtype_to_params.get(dtype, [])
                 params.append(param)
@@ -102,6 +119,22 @@ class DistributedDataParallel(MegatronModule):
             self.grad_buffer_param_index_map[dtype] = self.grad_buffers[dtype].param_index_map
             for param in params:
                 self.param_to_grad_buffer[param] = self.grad_buffers[dtype]
+
+        for name, param in self.module.named_parameters():
+            if not param.requires_grad or not getattr(param, 'allreduce', True):
+                continue
+            if param not in weight_for_zero_bubble:
+                continue
+            dtype = torch.float if accumulate_allreduce_grads_in_fp32 else param.dtype
+            self.weight_grad_buffers[param] = self.param_to_grad_buffer[param] = GradBuffer(
+                dtype,
+                [param],
+                data_parallel_group,
+                bucket_size,
+                param_to_name,
+                self.overlap_grad_reduce,
+                self.use_distributed_optimizer,
+            )
 
         # Allocate separate buffer for MoE params' grads.
         for param in self.module.parameters():
@@ -163,10 +196,14 @@ class DistributedDataParallel(MegatronModule):
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.is_last_microbatch = False
+        for grad_buffer in self.weight_grad_buffers.values():
+            grad_buffer.is_last_microbatch = False
         try:
             yield
         finally:
             for grad_buffer in self.grad_buffers.values():
+                grad_buffer.is_last_microbatch = True
+            for grad_buffer in self.weight_grad_buffers.values():
                 grad_buffer.is_last_microbatch = True
 
     def start_grad_sync(self, *unused):
@@ -178,6 +215,7 @@ class DistributedDataParallel(MegatronModule):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
+        assert not get_args().enable_zero_bubble and len(self.weight_grad_buffers) == 0
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.start_grad_sync()
 
@@ -192,9 +230,23 @@ class DistributedDataParallel(MegatronModule):
         """
         for grad_buffer in self.grad_buffers.values():
             grad_buffer.finish_grad_sync()
+        for grad_buffer in self.weight_grad_buffers.values():
+            grad_buffer.finish_grad_sync()
 
         for expert_grad in self.expert_grads:
             expert_grad /= self.data_parallel_world_size
+
+    def async_reduce_grad(self, weight=None):
+        assert get_args().enable_zero_bubble and self.overlap_grad_reduce
+        handles = []
+        if weight is None:
+            for grad_buffer in self.grad_buffers.values():
+                handles += grad_buffer.async_reduce_grad()
+        else:
+            assert weight in self.weight_grad_buffers
+            grad_buffer = self.weight_grad_buffers[weight]
+            handles += grad_buffer.async_reduce_grad()
+        return handles
 
     def zero_grad_buffer(self, zero_buffer):
         """
@@ -207,6 +259,8 @@ class DistributedDataParallel(MegatronModule):
             if param.requires_grad:
                 param.grad_added_to_main_grad = False
         for grad_buffer in self.grad_buffers.values():
+            grad_buffer.reset(zero_buffer)
+        for grad_buffer in self.weight_grad_buffers.values():
             grad_buffer.reset(zero_buffer)
         for expert_grad in self.expert_grads:
             expert_grad.zero_()

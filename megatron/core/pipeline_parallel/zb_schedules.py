@@ -430,6 +430,7 @@ class ZeroBubbleVPipeScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
+                    self.flush()
                     updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     break
                 else:
@@ -452,6 +453,7 @@ class ZeroBubbleVPipeScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
+                    self.flush()
                     updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     # print(f"{rank} False post validation done")
                     break
@@ -482,6 +484,8 @@ class ZeroBubbleVPipeScheduler:
         return updated, grad_norm, rollback
 
     def run(self):
+        self.disable_grad_sync()
+
         if get_args().profile:
             torch.cuda.nvtx.range_push(f'iter_{torch.distributed.get_rank()}_{ScheduleTimers.iter_counter}')
 
@@ -520,14 +524,10 @@ class ZeroBubbleVPipeScheduler:
             # Launch any remaining grad reductions
             if self.no_sync_context is not None:
                 self.enable_grad_sync()
-                if self.config.grad_sync_func is not None:
-                    assert False
-                    self.config.grad_sync_func(self.model.parameters())
 
             if self.config.finalize_model_grads_func is not None:
                 # Finalize model grads (perform full grad all-reduce / reduce-scatter for
-                # data parallelism, layernorm all-reduce for sequence parallelism, and
-                # embedding all-reduce for pipeline parallelism).
+                # data parallelism, layernorm all-reduce for sequence parallelism).
                 self.config.finalize_model_grads_func(self.model)
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
@@ -587,7 +587,7 @@ class ZeroBubbleVPipeScheduler:
             no_sync_func = contextlib.nullcontext
         self.no_sync_func = no_sync_func
         self.no_sync_context = None
-        self.disable_grad_sync()
+
         assert config.param_sync_func is None, "Param sync func is not supported yet"
 
         # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -939,8 +939,6 @@ class ZeroBubbleScheduler:
         if not forward_only:
             ScheduleTimers.iter_counter += 1
 
-        self.disable_grad_sync()
-
         # Checkpoint the activations of partial Transformer layers in a number of micro-batches
         # within the maximum outstanding micro-batch backpropagations.
         # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -1018,6 +1016,7 @@ class ZeroBubbleScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
+                    self.flush()
                     updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     break
                 else:
@@ -1039,6 +1038,7 @@ class ZeroBubbleScheduler:
                 elif scheduled_node.type == "SEND_POST_VALIDATION":
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
+                    self.flush()
                     updated, grad_norm, rollback, succeed = optimizer.post_validation()
                     # print(f"{rank} False post validation done")
                     break
@@ -1066,6 +1066,8 @@ class ZeroBubbleScheduler:
         return updated, grad_norm, rollback
 
     def run(self):
+        self.disable_grad_sync()
+
         if get_args().profile:
             torch.cuda.nvtx.range_push(f'iter_{torch.distributed.get_rank()}_{ScheduleTimers.iter_counter}')
 
@@ -1109,14 +1111,10 @@ class ZeroBubbleScheduler:
             # Launch any remaining grad reductions
             if self.no_sync_context is not None:
                 self.enable_grad_sync()
-                if self.config.grad_sync_func is not None:
-                    assert False
-                    self.config.grad_sync_func(self.model.parameters())
 
             if self.config.finalize_model_grads_func is not None:
                 # Finalize model grads (perform full grad all-reduce / reduce-scatter for
-                # data parallelism, layernorm all-reduce for sequence parallelism, and
-                # embedding all-reduce for pipeline parallelism).
+                # data parallelism, layernorm all-reduce for sequence parallelism).
                 self.config.finalize_model_grads_func([self.model])
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
@@ -1182,7 +1180,7 @@ def update_schedule(scheduler, f, b, w, c):
             max(int(b_mid * 1000), 1),
             max(int(w_mid * 1000), 1),
             max(int(c * 1000), 1),
-            get_args().zero_bubble_max_pending_backward * 2
+            get_args().zero_bubble_max_pending_backward
         )
         ag_result = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(ag_result, schedule)
@@ -1197,7 +1195,15 @@ def update_schedule(scheduler, f, b, w, c):
 
 def get_zero_bubble_forward_backward_func():
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
-    # TODO: refactor
+    assert pipeline_model_parallel_size > 1, "zero bubble must be enabled with pipeline parallelism"
+
+    args = get_args()
+    hidden_size = args.hidden_size
+    num_attention_heads = args.num_attention_heads
+    seq_length = args.seq_length
+    f_mem = 34 * hidden_size + 5 * num_attention_heads * seq_length
+    w_mem = - 32 * hidden_size
+    b_mem = - f_mem - w_mem
 
     def wrapped_auto_schedule_forward_backward_func(func, scheduler):
         global schedule, is_auto_schedule
@@ -1216,56 +1222,42 @@ def get_zero_bubble_forward_backward_func():
             )
         return wrap_schedule
 
-    if pipeline_model_parallel_size > 1:
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-            def scheduler(nstages, nmb, f, b, w, c, mem):
-                return v_schedule.PipelineGraph(
-                    nstages,
-                    nmb,
-                    f,b,w,c,
-                    f_mem=2, b_mem=-1, w_mem=-1,
-                    max_mem=None
-                    # Mem ignored for now
-                ).get_v_schedule()
-            if get_args().zero_bubble_v_schedule:
-                global_zb_scheduler = get_zb_scheduler_instance()
-                forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler, scheduler=scheduler)
-                # forward_backward_func = wrapped_auto_schedule_forward_backward_func(forward_backward_pipelining_with_interleaving_auto_schedule,
-                #                                                                     scheduler=scheduler)
-            else:
-                raise ValueError("got virtual pipeline parallel but v_schedule is disabled")
-        else:
-            def scheduler(nstages, nmb, f, b, w, c, mem):
-                return auto_schedule.auto_schedule(
-                    nstages,
-                    nmb,
-                    auto_schedule.GraphConfig(
-                        cost_f=f,
-                        cost_b=b,
-                        cost_w=w,
-                        cost_comm=c,
-                        max_mem=mem,
-                        print_scaling=1000
-                    ),
-                )
-
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        def scheduler(nstages, nmb, f, b, w, c, mem):
+            return v_schedule.PipelineGraph(
+                nstages,
+                nmb,
+                f,b,w,c,
+                f_mem=f_mem, b_mem=b_mem, w_mem=w_mem,
+                max_mem=None
+                # Mem ignored for now
+            ).get_v_schedule()
+        if get_args().zero_bubble_v_schedule:
             global_zb_scheduler = get_zb_scheduler_instance()
             forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler, scheduler=scheduler)
+            # forward_backward_func = wrapped_auto_schedule_forward_backward_func(forward_backward_pipelining_with_interleaving_auto_schedule,
+            #                                                                     scheduler=scheduler)
+        else:
+            raise ValueError("got virtual pipeline parallel but v_schedule is disabled")
     else:
         def scheduler(nstages, nmb, f, b, w, c, mem):
             return auto_schedule.auto_schedule(
                 nstages,
                 nmb,
                 auto_schedule.GraphConfig(
-                    cost_f=1,
-                    cost_b=1,
-                    cost_w=1,
-                    cost_comm=0,
-                    max_mem=2,
+                    cost_f=f,
+                    cost_b=b,
+                    cost_w=w,
+                    cost_comm=c,
+                    mem_f=f_mem,
+                    mem_b=b_mem,
+                    mem_w=w_mem,
+                    max_mem=mem * f_mem,
+                    print_scaling=1000
                 ),
             )
 
         global_zb_scheduler = get_zb_scheduler_instance()
         forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler, scheduler=scheduler)
-    return forward_backward_func
 
+    return forward_backward_func

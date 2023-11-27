@@ -4,7 +4,7 @@ import queue
 from megatron import get_args, get_timers
 from megatron.core import parallel_state
 from megatron.core.distributed.finalize_model_grads import _allreduce_embedding_grads
-from megatron.core.utils import get_model_config
+from megatron.core.utils import get_model_config, get_attr_wrapped_model
 
 
 class WeightGradStore:
@@ -46,6 +46,9 @@ class WeightGradStore:
         # timers = get_timers()
         weight_params = []
         handles = []
+        if get_args().overlap_grad_reduce:
+            handles += model.async_reduce_grad()
+
         output_layer_weight = None
         if parallel_state.is_pipeline_last_stage():
             assert len(weight_grad_tasks) > 0
@@ -58,11 +61,23 @@ class WeightGradStore:
                 func(total_input, grad_output, weight.main_grad)
                 output_layer_grads[j] = None  # release memory
             weight_grad_tasks = weight_grad_tasks[1:]
+            if get_args().overlap_grad_reduce:
+                handles += model.async_reduce_grad(output_layer_weight)
+
+        if parallel_state.is_pipeline_first_stage() or parallel_state.is_pipeline_last_stage():
+            model_module = get_attr_wrapped_model(model, 'pre_process', return_model_obj=True)
+            if model_module.share_embeddings_and_output_weights:
+                # if share_embeddings_and_output_weights, wait all-reduce for embeddings
+                for handle in handles:
+                    if handle is not None:
+                        handle.wait()
+                handles = []
 
         config = get_model_config(model)
         # Do async all-reduce for embedding grads firstly, so that the rank 0 won't
         # be blocked
-        handles += _allreduce_embedding_grads([model], config, async_op=True)
+        embedding_handles = _allreduce_embedding_grads([model], config, async_op=True)
+        handles += embedding_handles
 
         for i in range(len(weight_grad_tasks)):
             tasks = weight_grad_tasks[i]
@@ -76,12 +91,13 @@ class WeightGradStore:
                 func(total_input, grad_output, weight.main_grad)
                 tasks[j] = None  # release memory
             weight_params.append(param)
-            # All-reduce param grad here
-            # handles += model.allreduce_weight_gradients([param])
+            if get_args().overlap_grad_reduce:
+                # All-reduce param grad here
+                handles += model.async_reduce_grad(param)
             weight_grad_tasks[i] = None  # release memory
 
         # timers('wait_all_reduce', log_level=1).start(barrier=False)
-        for handle in handles:
+        for handle in embedding_handles:
             if handle is not None:
                 handle.wait()
         # timers('wait_all_reduce').stop()

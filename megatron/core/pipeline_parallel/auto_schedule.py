@@ -562,10 +562,16 @@ def ilp_results(graph, F):
     comm_id_counter = 0
     post_validation_time = 0
     for i in range(graph.nstages - 1, -1, -1):
-        pv_id = min(2 * (graph.nstages - 1 - i), graph.nmb - 1)
+        warmup_f_count = -1
+        first_b_end = end_time[graph.get_id(1, i, 0)]
+        for j in range(graph.nmb):
+            if end_time[graph.get_id(0, i, j)] < first_b_end:
+                warmup_f_count += 1
+        assert warmup_f_count >= 0
+        pv_id = warmup_f_count
         _id = graph.get_id(0, i, pv_id)
         _cost = graph.get_cost(_id)
-        post_validation_time = max(post_validation_time, end_time[graph.get_id(0, i, pv_id)] - _cost - graph.config.cost_comm)
+        post_validation_time = max(post_validation_time, end_time[_id] - _cost - graph.config.cost_comm)
         # post_validation_time = 0
         # print(i, pv_id, post_validation_time)
         for it in ["RECV_", "SEND_", ""]:
@@ -644,11 +650,12 @@ def ilp_results(graph, F):
         ))
         # If a recv with intersects with previous computation, reorder them so that recv
         # is executed before computation and hence can be overlapped.
-        # for i in range(len(local_order[stage])):
-        #     if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W'} and \
-        #         local_order[stage][i].type.startswith('RECV') and \
-        #         local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
-        #         (local_order[stage][i], local_order[stage][i - 1]) = (local_order[stage][i - 1], local_order[stage][i])
+        for i in range(len(local_order[stage])):
+            if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W'} and \
+                local_order[stage][i].type.startswith('RECV') and \
+                "POST_VALIDATION" not in local_order[stage][i].type and \
+                local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
+                (local_order[stage][i], local_order[stage][i - 1]) = (local_order[stage][i - 1], local_order[stage][i])
         # print([(x.type, x.start_time, x.completion_time) for x in local_order[stage]])
 
     local_order_with_rollback = [[] for _ in range(graph.nstages)]
