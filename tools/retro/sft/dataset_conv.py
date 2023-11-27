@@ -4,6 +4,8 @@ import json
 import torch
 import numpy as np
 import glob
+from collections import OrderedDict
+
 from megatron import get_tokenizer, get_args, get_retro_args
 
 
@@ -137,6 +139,11 @@ class FtDataset(torch.utils.data.Dataset):
         self.dataset_name = name  # dataset_name equals to data_prefix in pretrain
         self.max_seq_length = max_seq_length
         self.desc = name
+
+        # For compatibility with Megatron Core BlendedDataset
+        self.unique_identifiers = OrderedDict()
+        self.unique_identifiers["class"] = type(self).__name__
+        self.unique_identifiers["name"] = name
 
         # Dataset.
         self.indexed_dataset = indexed_dataset

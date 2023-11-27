@@ -2,7 +2,7 @@
 
 import logging
 import math
-from typing import Any, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy
 import torch
@@ -15,7 +15,9 @@ from megatron.core.datasets.utils import Split, normalize
 
 logger = logging.getLogger(__name__)
 
-DistributedDataset = Union[BlendedDataset, MegatronDataset, MMapIndexedDataset]
+DistributedDataset = Union[
+    BlendedDataset, MegatronDataset, MMapIndexedDataset, torch.utils.data.Dataset
+]
 
 
 class BlendedMegatronDatasetBuilder(object):
@@ -103,8 +105,9 @@ class BlendedMegatronDatasetBuilder(object):
                 else:
                     assert all(is_none) or not any(is_none)
                     blended_datasets.append(
-                        self._build_generic_dataset(
+                        self.build_generic_dataset(
                             BlendedDataset,
+                            getattr(self.config, "is_built_on_rank"),
                             megatron_datasets[i],
                             weight_per_dataset,
                             size_per_split[i],
@@ -154,8 +157,9 @@ class BlendedMegatronDatasetBuilder(object):
                     size_per_split = list(map(sum, zip(*sizes_per_dataset)))
 
                     blended_datasets.append(
-                        self._build_generic_dataset(
+                        self.build_generic_dataset(
                             BlendedDataset,
+                            getattr(self.config, "is_built_on_rank"),
                             megatron_datasets,
                             weight_per_dataset,
                             size_per_split[i],
@@ -180,8 +184,11 @@ class BlendedMegatronDatasetBuilder(object):
         Returns:
             List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
         """
-        indexed_dataset = self._build_generic_dataset(
-            MMapIndexedDataset, path_prefix, self.cls.is_multimodal()
+        indexed_dataset = self.build_generic_dataset(
+            MMapIndexedDataset,
+            getattr(self.config, "is_built_on_rank"),
+            path_prefix,
+            self.cls.is_multimodal(),
         )
 
         if indexed_dataset is not None:
@@ -209,15 +216,22 @@ class BlendedMegatronDatasetBuilder(object):
                 megatron_datasets.append(None)
             else:
                 megatron_datasets.append(
-                    self._build_generic_dataset(
-                        self.cls, indexed_dataset, split_indices[i], sizes[i], _split, self.config
+                    self.build_generic_dataset(
+                        self.cls,
+                        getattr(self.config, "is_built_on_rank"),
+                        indexed_dataset,
+                        split_indices[i],
+                        sizes[i],
+                        _split,
+                        self.config,
                     )
                 )
 
         return megatron_datasets
 
-    def _build_generic_dataset(
-        self, cls: Type[DistributedDataset], *args: Any,
+    @staticmethod
+    def build_generic_dataset(
+        cls: Type[DistributedDataset], is_built_on_rank: Callable, *args: Any
     ) -> Optional[DistributedDataset]:
         """Build the DistributedDataset
 
@@ -242,7 +256,7 @@ class BlendedMegatronDatasetBuilder(object):
             dataset = None
 
             # First, build on rank 0
-            if rank == 0 and getattr(self.config, "is_built_on_rank")():
+            if rank == 0 and is_built_on_rank():
                 try:
                     dataset = cls(*args)
                 except OSError as err:
@@ -257,7 +271,7 @@ class BlendedMegatronDatasetBuilder(object):
             torch.distributed.barrier()
 
             # After, build on other ranks
-            if rank != 0 and getattr(self.config, "is_built_on_rank")():
+            if rank != 0 and is_built_on_rank():
                 dataset = cls(*args)
 
             return dataset

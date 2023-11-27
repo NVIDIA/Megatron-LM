@@ -192,22 +192,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
                  'for GPT ...')
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
-        splits_string=args.split,
         train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        train_data_prefix=args.train_data_path,
-        valid_data_prefix=args.valid_data_path,
-        test_data_prefix=args.test_data_path)
+        seq_length=args.seq_length)
     print_rank_0("> finished creating GPT datasets ...")
 
     return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":
+
+    # Temporary for transition to core datasets
+    train_valid_test_datasets_provider.is_distributed = True
+
     pretrain(train_valid_test_datasets_provider, model_provider,
-             ModelType.retro_decoder,  # ModelType.encoder_or_decoder,
-             forward_step,
-             extra_args_provider=get_tasks_args
-             )
+        ModelType.retro_decoder,  # ModelType.encoder_or_decoder,
+        forward_step,
+        extra_args_provider=get_tasks_args
+    )
