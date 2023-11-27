@@ -14,7 +14,7 @@ TENSORBOARD_LOGS_PATH=$6
 # )
 LR_RATE=1e-5
 
-for ENG_LANG_PROB in 50 75 90 5 1; do
+for ENG_LANG_PROB in 99 75 95 90 50; do
 
 GPT_MODEL_ARGS=(
     --seq-length 4096 
@@ -282,7 +282,7 @@ DATA_PATH=(
     0.03857181271212238 $BIN_IDX_PATH/en_scientific_arxiv_split_01_text_document_dc\=753086_sc\=753086_tc\=14656450466
 )
 
-elif [ "$ENG_LANG_PROB" -eq 5 ]; then
+elif [ "$ENG_LANG_PROB" -eq 95 ]; then
 # en 95 ar 5 
 DATA_PATH=(
     --data-path 
@@ -350,7 +350,7 @@ DATA_PATH=(
     0.04071469119612917 $BIN_IDX_PATH/en_scientific_arxiv_split_01_text_document_dc\=753086_sc\=753086_tc\=14656450466
 )
 
-elif [ "$ENG_LANG_PROB" -eq 1 ]; then
+elif [ "$ENG_LANG_PROB" -eq 99 ]; then
 # en 99 ar 1 
 DATA_PATH=(
     --data-path 
