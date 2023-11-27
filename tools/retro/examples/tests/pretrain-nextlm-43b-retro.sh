@@ -2,10 +2,10 @@
 
 #SBATCH -p luna
 #SBATCH --nodes=64
-#SBATCH -A llmservice_nlp_fm
+#SBATCH -A llmservice_nlp_retro
 #SBATCH -t 4:00:00
 #SBATCH --exclusive
-#SBATCH --job-name=llmservice_nlp_fm-retro:retro-nextlm-43b-test-mr
+#SBATCH --job-name=llmservice_nlp_retro-retro:retro-nextlm-43b-test-mr
 #SBATCH --ntasks-per-node=8
 #SBATCH --dependency=singleton
 
@@ -20,7 +20,7 @@
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 ADD_RETRIEVER=1
-REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/open-instructretro-megatron"
+REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/no-hack-open-instructretro-megatron"
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm/pretrain-checkpoint"
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -48,7 +48,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 LOG_DIR=$DIR/logs
 mkdir -p $LOG_DIR
 
-NAME="gpt3-43b-pretraining-retro-fitting-github-mr"
+NAME="gpt3-43b-pretraining-retro-fitting-github-mr-no-hacks"
 
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/checkpoints/retro-nvllm/${NAME}"
 
@@ -71,7 +71,7 @@ echo $LOAD_DIR
 
 ######## data blend. ########
 
-. /lustre/fsw/adlr/adlr-nlp/boxinw/megatron-lm-pretrain/scripts/lawrence_blend_oci.sh
+. /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/megatrons/instructretro-test/scripts/retro_custom_blend.sh
 
 ######## args. ########
 #    --sequence-parallel \
@@ -117,7 +117,7 @@ ARGS=" \
     --tokenizer-type GPTSentencePieceTokenizer \
     --tokenizer-model /lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
     --data-path ${DATA_BLEND} \
-    --split 98,2,0 \
+    --split 99,1,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
@@ -127,7 +127,6 @@ ARGS=" \
     --log-num-zeros-in-grad \
     --bf16 \
     --use-distributed-optimizer \
-    --retro-fix-sub-epoch \
 "
 
 ######## retro. ########

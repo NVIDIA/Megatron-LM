@@ -19,7 +19,7 @@
 # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
 ADD_RETRIEVER=1
-REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/open-instructretro-megatron"
+REPO_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/no-hack-open-instructretro-megatron"
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/next-llm/pretrain-checkpoint"
 
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
@@ -46,7 +46,7 @@ DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 LOG_DIR=$DIR/logs
 mkdir -p $LOG_DIR
 
-NAME="gpt3-800m-pretraining-retro-fitting-github-mr"
+NAME="gpt3-800m-pretraining-retro-fitting-github-mr-no-hacks"
 
 CHECKPOINT_DIR="/lustre/fsw/adlr/adlr-nlp/boxinw/checkpoints/retro-nvllm/${NAME}"
 
@@ -69,14 +69,13 @@ echo $LOAD_DIR
 
 ######## data blend. ########
 
-. /lustre/fsw/adlr/adlr-nlp/boxinw/megatron-lm-pretrain/scripts/lawrence_blend_oci.sh
+. /lustre/fsw/adlr/adlr-nlp/lmcafee/data/retro/megatrons/instructretro-test/scripts/retro_custom_blend.sh
 
 ######## args. ########
 
 
 TP=1
 ARGS=" \
-    --sequence-parallel \
     --recompute-activations \
     --use-flash-attn \
     --apply-layernorm-1p \
@@ -115,7 +114,7 @@ ARGS=" \
     --tokenizer-type GPTSentencePieceTokenizer \
     --tokenizer-model /lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model \
     --data-path ${DATA_BLEND} \
-    --split 98,2,0 \
+    --split 99,1,0 \
     --clip-grad 1.0 \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \
@@ -124,7 +123,6 @@ ARGS=" \
     --log-params-norm \
     --log-num-zeros-in-grad \
     --bf16 \
-    --retro-fix-sub-epoch \
 "
 
 ######## retro. ########
