@@ -159,7 +159,7 @@ def calculate_correct_answers(name, model, dataloader,
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
-        unreduced = torch.cuda.LongTensor([correct, total])
+        unreduced = torch.tensor([correct, total], dtype=torch.long, device='cuda')
         torch.distributed.all_reduce(unreduced,
                                      group=mpu.get_data_parallel_group())
 
