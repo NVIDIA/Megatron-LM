@@ -210,7 +210,7 @@ class Evaluator():
         self.results_path = results_path
         
         
-    def evaluate(self, max_batch_size = 256, max_length = 1024, adaptive_seqlen = False, num_fewshot = 0, eval_fp32 = False):
+    def evaluate(self, max_batch_size = 64, max_length = 2048, adaptive_seqlen = False, num_fewshot = 0, eval_fp32 = False):
         
         adaptor = MegatronEvaluateHarness(self.model, self.tokenizer,max_batch_size=max_batch_size, max_length = max_length)
         
@@ -234,7 +234,7 @@ if __name__ == '__main__':
     #checkpoint_path = "/workspace/ckpts_bf16_125m"
     
     # EXAMPLE COMMAND:
-    # torchrun --nproc_per_node 4 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 6000 evaluation.py --config examples/qanthony_tflops.sh --checkpoint /workspace/ckpts_bf16_125m --task-list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
+    # torchrun --nproc_per_node 8 --nnodes 1 --node_rank 0 --master_addr localhost --master_port 6000 evaluation.py --config /opt/Megatron-LM/examples/megarun_slurm/moe_1p3B_8E_bare.sh --checkpoint /checkpoints/megarun/ckpts_1p3B_bf16 --task-list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
     # task list openbookqa,arc_easy,winogrande,hellaswag,arc_challenge,piqa,boolq,lambada_openai
     parser = argparse.ArgumentParser(description='Download evaluation harness', allow_abbrev=False)
     parser.add_argument('--config', type=str, help='Path to the model config file.')
@@ -260,6 +260,7 @@ if __name__ == '__main__':
     evaluator = Evaluator(checkpoint_path = checkpoint_path, task_list = task_list)
     results = evaluator.evaluate()
     print("RESULTS: ", results)
+    evaluator.write_results(results, "./results.json")
     
     
     
