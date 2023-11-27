@@ -20,6 +20,8 @@ def get_args():
                        help='Total token to be sampled.')
     parser.add_argument('--verbose', action='store_true',
                        help='Print additional information')
+    parser.add_argument('--output-for-script', action='store_true',
+                       help='Print output for bash script content.')
     args = parser.parse_args()
     if args.source_prefix_paths is not None:
         assert args.prefix_paths_from_json is None
@@ -97,5 +99,6 @@ if __name__ == "__main__":
         if args.verbose:
             print(f"{prob} {os.path.basename(iterator_name)} {total_token_to_be_sampled:_} {total_token_exists:_} {total_token_to_be_sampled/total_token_exists}")
         else:
-            print(f"{prob} {os.path.basename(iterator_name)}")
+            __output_format = os.path.basename(iterator_name).replace('=', '\\=')
+            print(f"{prob} $BIN_IDX_PATH/{__output_format}")
     print(f"\n\nOut of {args.total_token} token, language wise token distribution.\n{json.dumps(lang_token, indent=4)}")

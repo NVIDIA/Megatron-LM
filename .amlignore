@@ -1,0 +1,4 @@
+.ipynb_checkpoints
+.azureml
+.git
+__pycache__
