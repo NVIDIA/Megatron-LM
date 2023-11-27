@@ -15,7 +15,9 @@ from megatron.core.datasets.utils import Split, normalize
 
 logger = logging.getLogger(__name__)
 
-DistributedDataset = Union[BlendedDataset, MegatronDataset, MMapIndexedDataset, torch.utils.data.Dataset]
+DistributedDataset = Union[
+    BlendedDataset, MegatronDataset, MMapIndexedDataset, torch.utils.data.Dataset
+]
 
 
 class BlendedMegatronDatasetBuilder(object):
@@ -183,7 +185,10 @@ class BlendedMegatronDatasetBuilder(object):
             List[Optional[MegatronDataset]]: The MegatronDatset (or None) per split
         """
         indexed_dataset = self.build_generic_dataset(
-            MMapIndexedDataset, getattr(self.config, "is_built_on_rank"), path_prefix, self.cls.is_multimodal()
+            MMapIndexedDataset,
+            getattr(self.config, "is_built_on_rank"),
+            path_prefix,
+            self.cls.is_multimodal(),
         )
 
         if indexed_dataset is not None:
@@ -212,14 +217,22 @@ class BlendedMegatronDatasetBuilder(object):
             else:
                 megatron_datasets.append(
                     self.build_generic_dataset(
-                        self.cls, getattr(self.config, "is_built_on_rank"), indexed_dataset, split_indices[i], sizes[i], _split, self.config
+                        self.cls,
+                        getattr(self.config, "is_built_on_rank"),
+                        indexed_dataset,
+                        split_indices[i],
+                        sizes[i],
+                        _split,
+                        self.config,
                     )
                 )
 
         return megatron_datasets
 
     @staticmethod
-    def build_generic_dataset(cls: Type[DistributedDataset], is_built_on_rank: Callable,  *args: Any) -> Optional[DistributedDataset]:
+    def build_generic_dataset(
+        cls: Type[DistributedDataset], is_built_on_rank: Callable, *args: Any
+    ) -> Optional[DistributedDataset]:
         """Build the DistributedDataset
 
         Return None if and only if the underlying MegatronDataset class is not built on the current
