@@ -5,9 +5,9 @@ setup;
 
 export WORLD_SIZE_IN_GPUS=8
 export GLOBAL_BATCH_SIZE=24
-export PIPELINE_SIZE=2
-export TP_SIZE=2
-
+export PIPELINE_SIZE=8
+export ZERO_BUBBLE_MEM_LIMIT=$(($PIPELINE_SIZE))
+export ENABLE_ZERO_BUBBLE=1
 export AIP_RUN_NAME=$(basename $0 | cut -d '.' -f 1)
 launch
 

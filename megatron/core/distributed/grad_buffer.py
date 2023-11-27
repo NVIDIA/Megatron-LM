@@ -7,6 +7,7 @@ from typing import Dict, List
 import torch
 
 from .. import parallel_state
+from megatron import get_args
 
 logger = getLogger(__name__)
 
@@ -109,6 +110,11 @@ class Bucket:
                 self.data, group=self.data_parallel_group, async_op=self.overlap_grad_reduce
             )
         self.communication_issued = True
+
+    def async_reduce_grad(self):
+        assert get_args().enable_zero_bubble and self.overlap_grad_reduce
+        self.start_grad_sync()
+        return self.communication_handle
 
     def finish_grad_sync(self):
         """
@@ -394,6 +400,13 @@ class GradBuffer:
         """
         for bucket in self.buckets:
             bucket.finish_grad_sync()
+
+    def async_reduce_grad(self):
+        assert get_args().enable_zero_bubble and self.overlap_grad_reduce
+        handles = []
+        for bucket in self.buckets:
+            handles.append(bucket.async_reduce_grad())
+        return handles
 
     def register_grad_ready(self, param: torch.nn.Parameter):
         """

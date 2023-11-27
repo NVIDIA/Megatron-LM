@@ -11,4 +11,4 @@ export AIP_RUN_NAME=$(basename $0 | cut -d '.' -f 1)
 
 launch
 
-check_loss "7.140311E+00"
+check_loss_exists

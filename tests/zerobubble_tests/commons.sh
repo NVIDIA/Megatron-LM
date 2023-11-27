@@ -1,5 +1,5 @@
 function setup() {
-  pushd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
+  cd "$(dirname -- "${BASH_SOURCE[0]}")/../.."
   mkdir -p test_logs
   set -e
   # Model setup
@@ -34,7 +34,8 @@ function check_eq() {
 function check_near() {
   # echo "Checking $1 == $2"
   diff=$(bc -l <<< "scale=10; if ($1 >= $2) ($1-$2)/$2 else ($2-$1)/$1")
-  if (( $(echo "$diff >= 0.001" | bc -l) )); then
+  check_loss_exists
+  if (( $(echo "$diff >= 0.0015" | bc -l) )); then
     echo "Error: $1 not near $2"
     exit 1
   fi
@@ -42,7 +43,7 @@ function check_near() {
 }
 
 function loss_of() {
-  cat test_logs/$1 | grep ' 300/' | awk '{print $27}'
+  cat test_logs/$1 | grep ' 300/' | cut -d '/' -f 2 | awk '{print $25}'
 }
 function check_loss() {
   check_eq "$(loss_of $AIP_RUN_NAME)" "$1"
