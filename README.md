@@ -35,7 +35,7 @@ The key of achieving zero bubble is to breaking a backward pass into a $B$ pass 
 ![image](https://hackmd.io/_uploads/Hy2GxwmEa.png)
 * ZB2P
 ![image](https://hackmd.io/_uploads/S10QgvmV6.png)
-* ZBV
+* ZBV - Each device is assigned to exactly 2 chunks (virtual stages), where white text colors represent the first chunk and black text colors represent the second chunk. The sequence of dependencies among model chunks follows a ”V” shape pattern for both the forward and backward passes.
 ![image](https://hackmd.io/_uploads/HkCgLKEET.png)
 
 
