@@ -75,7 +75,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --micro-batch-size ${MBS:-4} \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
-    --train-iters 501 \
+    --train-iters 1000 \
     --lr-decay-iters $MAX_STEPS \
     --lr-decay-style linear \
     --min-lr 0.00001 \
@@ -88,7 +88,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --transformer-impl $TRANSFORMER_IMPL \
     --use-mcore-models \
     --data-path $DATA_PATH \
-    --vocab-file /workspace/data/bert-large-cased-vocab.txt \
+    --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
@@ -100,6 +100,13 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --eval-iters 10 \
     --distributed-backend nccl \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
+
+command1="$command $torch_run_cmd"
+echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
+echo "$command1"
+echo "-----------------------------------------------------------------------------"
+echo "$command1" >> $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
+eval $command1
 
 echo 500 > $CHECKPOINT_PATH/latest_checkpointed_iteration.txt
 
@@ -120,7 +127,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --micro-batch-size ${MBS:-4} \
     --global-batch-size ${GBS:-32} \
     --lr 0.0001 \
-    --train-iters 1001 \
+    --train-iters 1000 \
     --lr-decay-iters $MAX_STEPS \
     --lr-decay-style linear \
     --min-lr 0.00001 \
@@ -133,7 +140,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --transformer-impl $TRANSFORMER_IMPL \
     --use-mcore-models \
     --data-path $DATA_PATH \
-    --vocab-file /workspace/data/bert-large-cased-vocab.txt \
+    --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
@@ -146,10 +153,10 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --distributed-backend nccl \
     ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS}"
 
-command="$command $torch_run_cmd"
+command2="$command $torch_run_cmd"
 echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN ------------"
-echo "$command"
+echo "$command2"
 echo "-----------------------------------------------------------------------------"
 
-echo "$command" > $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
-eval $command
+echo "$command2" >> $SCRIPTS_DIR/pretrain_t5_distributed_command.sh
+eval $command2
