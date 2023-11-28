@@ -110,24 +110,6 @@ class Graph:
                         assert False
                     parents.append(p)
 
-        def populate_ancestors_using_gpu(parents):
-            with torch.no_grad():
-                m = torch.zeros(nnodes, nnodes)
-                for i in range(nnodes):
-                    for j in parents[i]:
-                        m[j][i] = 1
-                m = m.cuda()
-                ones = torch.ones(nnodes, nnodes).cuda()
-                while True:
-                    om = (m @ m) + m
-                    om = torch.minimum(om, ones)
-                    if torch.equal(om, m):
-                        break
-                    m = om
-                m = (m > 0).cpu()
-            return m
-
-        g.precede = populate_ancestors_using_gpu(parents)
         g.name = name
         g.parents = parents
         return g
@@ -384,6 +366,24 @@ def initial_solution(graph):
 
 
 def build_ilp(graph):
+    def populate_ancestors_using_gpu(parents):
+        with torch.no_grad():
+            m = torch.zeros(graph.nnodes, graph.nnodes)
+            for i in range(graph.nnodes):
+                for j in parents[i]:
+                    m[j][i] = 1
+            m = m.cuda()
+            ones = torch.ones(graph.nnodes, graph.nnodes).cuda()
+            while True:
+                om = (m @ m) + m
+                om = torch.minimum(om, ones)
+                if torch.equal(om, m):
+                    break
+                m = om
+            m = (m > 0).cpu()
+        return m
+    graph.precede = populate_ancestors_using_gpu(graph.parents)
+
     best_time, order, complete_time = initial_solution(graph)
     # exit(0)
     prob = LpProblem()
