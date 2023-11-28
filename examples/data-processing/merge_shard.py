@@ -139,6 +139,3 @@ if __name__ == "__main__":
     shard_dict = list_shard_info(args, args.input_folder_path)
     groups = group_shards(shard_dict, args.shard_size)
     submit_jobs(args, groups, script_path)
-
-
-    

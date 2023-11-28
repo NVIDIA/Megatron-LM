@@ -9,7 +9,7 @@ At first convert the checkpoint from huggingface to Megatron format with propoer
 When data comes from a vendor and/or the data team, it usually comes in various shard sizes. Use the following code to merge different shards:
 
 ```
-bash examples/pretrain-llama/data-processing/merge_shard/merge_shard.sh
+bash examples/data-processing/merge_shard/merge_shard.sh
 ```
 
 Please check the arguments of `examples/pretrain-llama/data-processing/merge_shard/merge_shard.py` for a detailed description. It takes an Azure Blob Storage folder path and outputs the merged dataset in Azure Blob Storage. Processing `7`-`8` TB of data can often be cumbersome. This script launches smaller CPU jobs to the CPU cluster. 

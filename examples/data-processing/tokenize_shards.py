@@ -26,7 +26,6 @@ def get_args():
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
-    parser.add_argument("--tokenizer-module", type = str, default='megatron', choices=['megatron', 'nemo'], help="Conpute targets.")
     
     args = parser.parse_args()
 
@@ -99,7 +98,6 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
         cmd = cmd + f' \"{args.tokenizer_model}\"'
         cmd = cmd + f' \"{args.num_proc}\"'
         cmd = cmd + f' \"{args.log_interval}\"'
-        cmd = cmd + f' \"{args.tokenizer_module}\"'
         cmd = cmd + f' \"{sas_token}\"'
         
         print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")

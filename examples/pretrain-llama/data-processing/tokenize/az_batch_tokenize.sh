@@ -13,8 +13,6 @@ python examples/pretrain-llama/data-processing/tokenize/az_batch_tokenize.py \
 --az-configs "examples/pretrain-llama/data-processing/tokenize/azure_login_configs.json" \
 --num-proc 16
 
-
-
 TOK_MODEL="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/allam_data_2-1_splits-llama2-VE-indexed_data/tokenizer/tokenizer.model"
 TOK_TYPE="Llama2Tokenizer"
 INPUT_FOLDER_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-training-data/processed/merged_shards"
