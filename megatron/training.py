@@ -10,6 +10,7 @@ import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+from .theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -668,6 +669,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
+            if torch.distributed.get_rank() == 0:
+                num_microbatches = get_num_microbatches()
+                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
         timers.log(timers_to_log, normalizer=args.log_interval)
