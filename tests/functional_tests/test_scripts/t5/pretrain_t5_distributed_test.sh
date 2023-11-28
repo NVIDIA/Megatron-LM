@@ -87,7 +87,7 @@ torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
     --transformer-impl $TRANSFORMER_IMPL \
     --use-mcore-models \
     --data-path $DATA_PATH \
-    --vocab-file /workspace/data/bert-large-cased-vocab.txt \
+    --vocab-file $VOCAB_PATH \
     --tokenizer-type BertWordPieceCase \
     --split 99982,9,9 \
     --save $CHECKPOINT_PATH \
