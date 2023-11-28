@@ -84,7 +84,7 @@ class Attention(MegatronModule, ABC):
         te_version = packaging.version.Version(version("transformer-engine"))
         # need Kirthi to confirm the version when bshd is supported
         if (
-            te_version >= packaging.version.Version("0.12.0")
+            te_version >= packaging.version.Version("0.13.0")
             and self.config.apply_rope_fusion
             and HAVE_APPLY_ROPE_FUSION
         ):

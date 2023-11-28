@@ -390,7 +390,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if te_version > packaging.version.Version("0.12.0"):
             self.te_forward_mask_type = True
 
-        if te_version > packaging.version.Version("0.12.0"):
+        if te_version > packaging.version.Version("0.13.0"):
             extra_kwargs["qkv_format"] = qkv_format
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
