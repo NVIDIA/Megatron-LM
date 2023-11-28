@@ -14,7 +14,6 @@ from megatron import get_timers
 from megatron import get_tokenizer
 from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
-from tools.retro.sft.sft_gpt_dataset import build_train_valid_test_datasets
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group
@@ -190,9 +189,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     print_rank_0('> building train, validation, and test datasets '
                  'for GPT ...')
+    from tools.retro.sft.sft_gpt_dataset import build_train_valid_test_datasets
     train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
         data_prefix=args.data_path,
-        train_valid_test_num_samples=train_val_test_num_samples,
         seq_length=args.seq_length)
     print_rank_0("> finished creating GPT datasets ...")
 

@@ -28,9 +28,9 @@ def build_train_valid_test_datasets(data_prefix, seq_length):
     if len(data_prefix) == 1:
         processed_datasets = get_processed_dataset(data_prefix[0], args.data_folder)
 
-        train_ds = SFTDataset(prefixes[i], processed_datasets["train"], seq_length)
-        valid_ds = SFTDataset(prefixes[i], processed_datasets["valid"], seq_length)
-        test_ds = SFTDataset(prefixes[i], processed_datasets["test"], seq_length)
+        train_ds = SFTDataset(data_prefix[0], processed_datasets["train"], seq_length)
+        valid_ds = SFTDataset(data_prefix[0], processed_datasets["valid"], seq_length)
+        test_ds = SFTDataset(data_prefix[0], processed_datasets["test"], seq_length)
 
         return train_ds, valid_ds, test_ds
 

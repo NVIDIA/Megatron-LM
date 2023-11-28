@@ -16,7 +16,7 @@ train_iters=1000
 DATA_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/instruction_tuning_data/"
 data_folder="$DATA_HOME"
 
-SFT_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/github-version/retro/Megatron-LM"
+SFT_HOME="/lustre/fsw/adlr/adlr-nlp/boxinw/no-hack-open-instructretro-megatron"
 
 TOKENIZER_MODEL="/lustre/fsw/adlr/adlr-nlp/adlr-nlp-sharing/nvllm-1.1t/utils/mt_nlg_plus_multilingual_ja_zh_the_stack_frac_015_256k.model"
 
@@ -162,6 +162,7 @@ export NCCL_IB_SL=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 DOCKER="gitlab-master.nvidia.com/adlr/megatron-lm/boxinw/retro.23.04"
+DOCKER="/lustre/fsw/adlr/adlr-nlp/boxinw/images/retro.23.09.sqsh"
 MOUNTS="/lustre/fsw/"
 PARTITION="luna"
 LAUNCH="${ADLR_UTILS}/mp_launch"
