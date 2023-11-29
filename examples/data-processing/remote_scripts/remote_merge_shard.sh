@@ -6,6 +6,10 @@ if [ "$#" -lt 5 ]; then
     exit 1
 fi
 
+format_number() {
+    echo $1 | sed ':a;s/\B[0-9]\{3\}\>/_&/;ta'
+}
+
 # Assigning input arguments to variables
 input_folder=$1
 output_folder_name=$2
@@ -36,6 +40,12 @@ for arg in "$@"; do
     fi
 done
 
+word_count=$(jq -r '.text' $output_file | wc -w)
+formatted_word_count=$(format_number $word_count)
+
+new_output_file="${output_file%.jsonl}_wc_${formatted_word_count}.jsonl"
+mv $output_file $new_output_file
+output_file=$new_output_file
 
 if [ "$compute_target" = "local" ]; then
     echo "Your file is merged as $output_file"

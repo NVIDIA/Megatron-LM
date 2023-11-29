@@ -3,6 +3,7 @@ import json
 import yaml
 import argparse 
 import subprocess
+from datetime import datetime
 
 def get_args():
     parser = argparse.ArgumentParser(description="Azure batch job submission for tokenization")
@@ -120,7 +121,10 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
         print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
         if not args.dry_run:
             data['command'] = cmd
-            az_yaml_file = os.path.join(output_folder, 'output.yaml')
+            data['code'] = "../"
+            prefix_path = '.temp/'
+            os.makedirs(prefix_path, exist_ok=True)
+            az_yaml_file = os.path.join(prefix_path, f'tokenize_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml')
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
             cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {az_yaml_file}"
