@@ -40,12 +40,12 @@ for arg in "$@"; do
     fi
 done
 
-word_count=$(jq -r '.text' $output_file | wc -w)
-formatted_word_count=$(format_number $word_count)
+# word_count=$(jq -r '.text' $output_file | wc -w)
+# formatted_word_count=$(format_number $word_count)
 
-new_output_file="${output_file%.jsonl}_wc=${formatted_word_count}.jsonl"
-mv $output_file $new_output_file
-output_file=$new_output_file
+# new_output_file="${output_file%.jsonl}_wc=${formatted_word_count}.jsonl"
+# mv $output_file $new_output_file
+# output_file=$new_output_file
 
 if [ "$compute_target" = "local" ]; then
     echo "Your file is merged as $output_file"
