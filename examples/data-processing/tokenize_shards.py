@@ -17,6 +17,7 @@ def get_args():
     group = parser.add_argument_group(title='I/O params.')
     group.add_argument("--input-folder-path", type = str, help="Compute target folder path to input jsonl files, each job process a single jsonl file.")
     group.add_argument("--bin-idx-folder-path", type = str, help="Compute target folder path to output folder for bin and idx")
+    parser.add_argument("--tokenizer-module", type = str, default='megatron', choices=['megatron', 'nemo'], help="Which version of script will be used to tokenize the data.")
     group.add_argument("--tokenizer-model", type = str, help="Compute target path to the tokenizer.model file")
     group.add_argument("--tokenizer-type", type = str, help="Type of the tokenizer model", required=True)
     group.add_argument("--num-proc", type = int, help="Compute target number of workers per node", required=True)
@@ -26,7 +27,7 @@ def get_args():
     group = parser.add_argument_group(title='Misc. params.')
     parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
-    parser.add_argument("--tokenizer-module", type = str, default='megatron', choices=['megatron', 'nemo'], help="Conpute targets.")
+    
     
     args = parser.parse_args()
 
@@ -81,7 +82,7 @@ def match_pre_existing_bin_idx(input_shard_dict, output_shards_dict):
 
 def local_submit_job(args):
     num_file_workers = os.cpu_count()//args.num_proc
-    cmd = f"""python examples/pretrain-llama/data-processing/tokenize/multiprocess_runner.py --glob-input-path {args.input_folder_path} --output-folder {args.bin_idx_folder_path} --tokenizer-model {args.tokenizer_model} --tokenizer-type {args.tokenizer_model} --num-proc {args.num_proc} --num-file-workers {num_file_workers}"""
+    cmd = f"""python examples/data-processing/multiprocess_runner.py --glob-input-path {args.input_folder_path} --output-folder {args.bin_idx_folder_path} --tokenizer-model {args.tokenizer_model} --tokenizer-type {args.tokenizer_model} --num-proc {args.num_proc} --num-file-workers {num_file_workers}"""
     subprocess.check_output(cmd, shell=True)
 
 def azure_submit_jobs(args, input_shard_dict, script_path):
@@ -89,17 +90,17 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     sas_token = args.az_configs['az-sas-token']
-    prefix_command = f"""bash examples/pretrain-llama/data-processing/tokenize/remote_az_batch_tokenize.sh """
+    prefix_command = f"""bash examples/data-processing/remote_az_batch_tokenize.sh """
     for idx, (shard_name, size) in enumerate(input_shard_dict.items()):
         cmd= prefix_command
         cmd = cmd + f' \"{shard_name}\"'
         cmd = cmd + f' \"{args.input_folder_path}\"'
         cmd = cmd + f' \"{args.bin_idx_folder_path}\"'
+        cmd = cmd + f' \"{args.tokenizer_module}\"'
         cmd = cmd + f' \"{args.tokenizer_type}\"'
         cmd = cmd + f' \"{args.tokenizer_model}\"'
         cmd = cmd + f' \"{args.num_proc}\"'
         cmd = cmd + f' \"{args.log_interval}\"'
-        cmd = cmd + f' \"{args.tokenizer_module}\"'
         cmd = cmd + f' \"{sas_token}\"'
         
         print(f"RUN [{idx}][{shard_name}][{size/1000000000}GB]: {cmd}")
@@ -111,6 +112,16 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
             cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {az_yaml_file}"
             subprocess.check_output(cmd, shell=True)
 
+def list_files_with_size(folder_path):
+    file_path_with_size = {}
+    print(folder_path)
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            size = os.path.getsize(file_path)
+            file_path_with_size[file_path] = size
+    return file_path_with_size
+
 def submit_jobs(args, input_shard_dict, script_path):
     if args.compute_target == "local":
         local_submit_job(args)
@@ -119,9 +130,9 @@ def submit_jobs(args, input_shard_dict, script_path):
     else:
         raise NotImplementedError()
 
-def list_shard_info(args, shard_folder):
+def get_shard_info(args, shard_folder):
     if args.compute_target == "local":
-        raise NotImplementedError()
+        return list_files_with_size(shard_folder)
     elif args.compute_target == "azure":
         return azcopy_list(shard_folder, args.az_configs['az-sas-token'])
     else:
@@ -130,8 +141,9 @@ def list_shard_info(args, shard_folder):
 if __name__ == "__main__":
     script_path = os.path.abspath(__file__)
     args =  get_args()
-    input_shard_dict = list_shard_info(args, args.input_folder_path)
-    output_shards_dict = list_shard_info(args, args.bin_idx_folder_path)
-    if not args.overwrite:
-        input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
-    submit_jobs(args, input_shard_dict, script_path)
+    input_shard_dict = get_shard_info(args, args.input_folder_path)
+    print(input_shard_dict)
+    # output_shards_dict = get_shard_info(args, args.bin_idx_folder_path)
+    # if not args.overwrite:
+    #     input_shard_dict = match_pre_existing_bin_idx(input_shard_dict, output_shards_dict)
+    # submit_jobs(args, input_shard_dict, script_path)

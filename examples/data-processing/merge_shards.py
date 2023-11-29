@@ -148,7 +148,7 @@ def list_files_with_size(folder_path):
             file_path_with_size[file_path] = size
     return file_path_with_size
 
-def list_shard_info(args, shard_folder):
+def get_shard_info(args, shard_folder):
     if args.compute_target == "local":
         return list_files_with_size(shard_folder)
     elif args.compute_target == "azure":
@@ -158,6 +158,6 @@ def list_shard_info(args, shard_folder):
     
 if __name__ == "__main__":
     args =  get_args()
-    shard_dict = list_shard_info(args, args.input_folder_path)
+    shard_dict = get_shard_info(args, args.input_folder_path)
     groups = group_shards(shard_dict, args.shard_size)
     submit_jobs(args, groups)

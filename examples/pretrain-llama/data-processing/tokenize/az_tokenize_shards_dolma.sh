@@ -5,10 +5,11 @@ BIN_IDX_PATH="https://allamllmuksstandard.blob.core.windows.net/vocab-expanded-t
 AZJOB_FILE="examples/pretrain-llama/data-processing/tokenize/tokenize.yaml"
 MATCHING_PREFIX_NAME="ar_translated_"
 
-python examples/data-processing/az_batch_tokenize.py \
+python examples/data-processing/tokenize_shards.py \
 --input-folder-path "$INPUT_FOLDER_PATH" \
 --bin-idx-folder-path "$BIN_IDX_PATH" \
 --tokenizer-model "$TOK_MODEL" \
 --tokenizer-type $TOK_TYPE \
 --az-configs "examples/configs/azure_login_configs.json" \
---num-proc 16
+--num-proc 16 \
+--compute-target 'local'
