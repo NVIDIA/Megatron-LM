@@ -19,7 +19,7 @@ if [ ! -f $TOK_PATH ]; then
     azcopy copy  $AZURE_TOK_SAS_TOKEN $TOK_PATH --overwrite=false
 fi
 
-python examples/pretrain-llama/data-processing/tokenize/multiprocess_runner.py \
+python examples/data-processing/multiprocess_runner.py \
  --glob-input-path "$DATA_PATH/*.jsonl" \
  --output-folder $BIN_IDX_FOLDER \
  --tokenizer-model $TOK_PATH \
