@@ -25,7 +25,7 @@ def get_args():
     group.add_argument("--overwrite", action='store_true', help="Overwrite pre-existing bin-idx.")
 
     group = parser.add_argument_group(title='Misc. params.')
-    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets.")
+    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path, --bin-idx-folder-path and --tokenizer-model should use same compute target. TODO: Enable cross compute.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
     
     

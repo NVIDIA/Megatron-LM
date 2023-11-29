@@ -22,7 +22,7 @@ def get_args():
     parser.add_argument("--prefix-name", type = str, help="Prefix of the output file name.", required=True)
     
     group = parser.add_argument_group(title='Misc. params.')
-    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets.")
+    parser.add_argument("--compute-target", type = str, default='azure', choices=['local', 'azure'], help="Conpute targets. Both --input-folder-path and --output-folder-path should use same compute target. TODO: Enable cross compute.")
     group.add_argument("--dry-run", action='store_true', help="Simulate run before submitting jobs.")
 
     args = parser.parse_args()
