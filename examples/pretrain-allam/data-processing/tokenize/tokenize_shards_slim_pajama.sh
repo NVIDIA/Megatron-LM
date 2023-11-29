@@ -15,3 +15,12 @@ python examples/data-processing/tokenize_shards.py \
 --tokenizer-type 'sentencepiece' \
 --num-proc 16 \
 --compute-target 'local'
+
+python examples/data-processing/tokenize_shards.py \
+--input-folder-path "$INPUT_FOLDER_PATH" \
+--bin-idx-folder-path "$BIN_IDX_PATH" \
+--tokenizer-module "megatron" \
+--tokenizer-model "$TOK_MODEL" \
+--tokenizer-type 'Llama2Tokenizer' \
+--num-proc 16 \
+--compute-target 'local'

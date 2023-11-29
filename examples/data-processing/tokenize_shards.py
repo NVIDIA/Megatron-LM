@@ -111,6 +111,8 @@ def azure_submit_jobs(args, input_shard_dict, script_path):
         cmd = cmd + f' \"{args.tokenizer_module}\"'
         cmd = cmd + f' \"{args.tokenizer_type}\"'
         cmd = cmd + f' \"{args.tokenizer_model}\"'
+        cmd = cmd + f' \"{args.vocab_file}\"'
+        cmd = cmd + f' \"{args.merge_file}\"'
         cmd = cmd + f' \"{args.num_proc}\"'
         cmd = cmd + f' \"{args.log_interval}\"'
         cmd = cmd + f' \"{sas_token}\"'
