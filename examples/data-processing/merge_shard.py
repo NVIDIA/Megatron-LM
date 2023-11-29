@@ -4,6 +4,7 @@ import json
 import copy
 import argparse 
 import subprocess
+from datetime import datetime
 
 def get_args():
     parser = argparse.ArgumentParser(description="Azure batch job submission for tokenization")
@@ -17,7 +18,7 @@ def get_args():
     
     parser.add_argument("--input-folder-path", type = str, help="Azure blob folder path.", required=True)
     parser.add_argument("--output-folder-path", type = str, help="Azure blob folder path to output folder for bin and idx", required=True)
-    parser.add_argument("--shard-size", type = int, help="Size of the each merged shard.", required=True)
+    parser.add_argument("--shard-size", type = int, help="Estimated size of the each merged shard. (TODO: Fix to exact size)", required=True)
     parser.add_argument("--prefix-name", type = str, help="Prefix of the output file name.", required=True)
     
     group = parser.add_argument_group(title='Misc. params.')
@@ -74,68 +75,89 @@ def group_shards(shard_dict, shard_size_limit):
     if len(curr_group) > 0: groups.append((curr_group_size, curr_group))
     return groups
 
-def azure_submit_jobs(args, groups, script_path):
-    output_folder = os.path.dirname(script_path)
+def remote_submit_jobs(args, groups):
     with open(args.az_configs['az-sample-yaml-job-file']) as fileptr:
         data = yaml.safe_load(fileptr)
     sas_token = args.az_configs['az-sas-token']
-    prefix_command = f"""bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_shard.sh \\
+    if args.input_folder_path[-1] == "/": args.input_folder_path = args.input_folder_path.rstrip('/\\')
+    if args.output_folder_path.endswith("/"): args.output_folder_path = args.output_folder_path.rstrip('/\\')
+    prefix_command = f"""bash examples/data-processing/remote_scripts/remote_merge_shard.sh \\
 \"{args.input_folder_path}\" \\
 \"{args.output_folder_path}\" \\
 \"{sas_token}\" \\
+\"{args.compute_target}\" \\
 \"{args.prefix_name}"""
     for idx, (size, shards) in enumerate(groups):
         command = prefix_command
         command += f"{idx:03}.jsonl\""
         for shard in shards:
             command += f" \\\n\"{shard}\""
+        print(f"[{idx}][{args.prefix_name}{idx:03}.jsonl] {size/1000000000} GB")
         if not args.dry_run:
             data['command'] = command
-            az_yaml_file = os.path.join(output_folder, 'output.yaml')
+            data['code'] = "../"
+            prefix_path = '.temp/'
+            os.makedirs(prefix_path, exist_ok=True)
+            az_yaml_file = os.path.join(prefix_path, f'merge_shard_{datetime.now().strftime("%Y-%m-%d-%H-%M-%S")}.yaml')
             with open(az_yaml_file, 'w') as wrt_ptr:
                 yaml.dump(data, wrt_ptr, default_flow_style=False)
+            print(f"Submitting job via : {az_yaml_file}")
             cmd = f"az ml job create --subscription {args.az_configs['az-subscription']} --resource-group {args.az_configs['az-resource-group']} --workspace-name {args.az_configs['az-workspace-name']} --file {az_yaml_file}"
-            subprocess.check_output(cmd, shell=True)
-        print(f"[{args.prefix_name}][{idx}] {size/1000000000}GB")
-
-def local_submit_job(args, groups, script_path):
-    output_folder = os.path.dirname(script_path)
-    with open(args.sample_yaml_job_file) as fileptr:
-        data = yaml.safe_load(fileptr)
-    sas_token = args.az_configs['az-sas-token']
-    prefix_command = f"""bash examples/pretrain-llama/data-processing/merge_shard/remote_merge_shard.sh \\
+            try:
+                subprocess.check_output(cmd, shell=True)
+            except:
+                raise
+        
+def local_submit_job(args, groups):
+    if args.input_folder_path[-1] == "/": args.input_folder_path = args.input_folder_path.rstrip('/\\')
+    if args.output_folder_path.endswith("/"): args.output_folder_path = args.output_folder_path.rstrip('/\\')
+    prefix_command = f"""bash examples/data-processing/remote_scripts/remote_merge_shard.sh \\
 \"{args.input_folder_path}\" \\
 \"{args.output_folder_path}\" \\
-\"{sas_token}\" \\
+\"none\" \\
+\"{args.compute_target}\" \\
 \"{args.prefix_name}"""
     for idx, (size, shards) in enumerate(groups):
         command = prefix_command
         command += f"{idx:03}.jsonl\""
         for shard in shards:
             command += f" \\\n\"{shard}\""
+        print(f"[{args.prefix_name}][{idx}] {size/1000000000} GB")
         if not args.dry_run:
-            subprocess.check_output(command, shell=True)
-        print(f"[{args.prefix_name}][{idx}] {size/1000000000}GB")
+            try:
+                print(command)
+                subprocess.check_output(command, shell=True)
+            except:
+                raise
 
-def submit_jobs(args, groups, script_path):
+def submit_jobs(args, groups):
     if args.compute_target == "local":
-        raise NotImplementedError()
+        return local_submit_job(args, groups)
     elif args.compute_target == "azure":
-        return azure_submit_jobs(args, groups, script_path)
+        return remote_submit_jobs(args, groups)
     else:
         raise NotImplementedError()
 
+def list_files_with_size(folder_path):
+    file_path_with_size = {}
+    print(folder_path)
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            size = os.path.getsize(file_path)
+            file_path_with_size[file_path] = size
+    return file_path_with_size
+
 def list_shard_info(args, shard_folder):
     if args.compute_target == "local":
-        raise NotImplementedError()
+        return list_files_with_size(shard_folder)
     elif args.compute_target == "azure":
         return azcopy_list(shard_folder, args.az_configs['az-sas-token'])
     else:
         raise NotImplementedError()
     
 if __name__ == "__main__":
-    script_path = os.path.abspath(__file__)
     args =  get_args()
     shard_dict = list_shard_info(args, args.input_folder_path)
     groups = group_shards(shard_dict, args.shard_size)
-    submit_jobs(args, groups, script_path)
+    submit_jobs(args, groups)

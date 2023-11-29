@@ -17,3 +17,4 @@ user_logs
 .DS_Store
 examples/pretrain-llama/data-processing/tokenize/output.*
 examples/pretrain-llama/data-processing/merge_shard/output.yaml
+.temp/

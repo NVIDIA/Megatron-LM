@@ -2,3 +2,4 @@
 .azureml
 .git
 __pycache__
+.temp/
